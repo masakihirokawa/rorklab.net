@@ -137,7 +137,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               style={{
                 display: "inline-flex", alignItems: "center", gap: 8, padding: "14px 32px",
                 border: "1px solid var(--border-hover)", borderRadius: 6,
-                background: "var(--bg-surface)", color: "var(--text-muted)", fontSize: 14,
+                background: "var(--bg-surface)", color: "var(--text-secondary)", fontSize: 14,
                 cursor: "pointer", transition: "all 0.3s", textDecoration: "none", letterSpacing: "0.04em",
               }}
             >
