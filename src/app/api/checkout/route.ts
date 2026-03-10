@@ -10,19 +10,20 @@ function getStripe() {
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
-    const { locale } = await request.json();
+    const { locale, priceId, mode } = await request.json();
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://rorklab.net";
+    const prefix = locale === "en" ? "en/" : "";
 
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
+      mode: mode || "payment",
       line_items: [
         {
-          price: process.env.STRIPE_PRICE_ID!,
+          price: priceId || process.env.STRIPE_TIP_PRICE_ID!,
           quantity: 1,
         },
       ],
-      success_url: `${baseUrl}/${locale === "en" ? "en/" : ""}?subscribed=true`,
-      cancel_url: `${baseUrl}/${locale === "en" ? "en/" : ""}?cancelled=true`,
+      success_url: `${baseUrl}/${prefix}support?thanks=true`,
+      cancel_url: `${baseUrl}/${prefix}support`,
       locale: locale === "en" ? "en" : "ja",
     });
 

@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 interface PaymentMethod {
   name: string;
   icon: string;
@@ -15,10 +17,47 @@ interface SupportContent {
   heading: string;
   sub: string;
   note: string;
+  tipLabel: string;
+  tipSub: string;
   methods: PaymentMethod[];
 }
 
-export function SupportClient({ content }: { content: SupportContent }) {
+interface StripeTip {
+  priceId: string;
+}
+
+export function SupportClient({
+  content,
+  locale,
+  stripeTip,
+}: {
+  content: SupportContent;
+  locale: string;
+  stripeTip: StripeTip;
+}) {
+  const [loading, setLoading] = useState(false);
+
+  const handleTip = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          locale,
+          priceId: stripeTip.priceId,
+          mode: "payment",
+        }),
+      });
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      }
+    } catch {
+      setLoading(false);
+    }
+  };
+
   return (
     <main style={{ maxWidth: 640, margin: "0 auto", padding: "80px 24px 120px" }}>
       {/* Header */}
@@ -48,7 +87,63 @@ export function SupportClient({ content }: { content: SupportContent }) {
         </p>
       </div>
 
-      {/* Payment methods */}
+      {/* Stripe Tip Button */}
+      <button
+        onClick={handleTip}
+        disabled={loading}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          width: "100%",
+          padding: "18px 24px",
+          borderRadius: 10,
+          border: "1px solid var(--accent-coral)",
+          background: "color-mix(in srgb, var(--accent-coral) 8%, transparent)",
+          cursor: loading ? "wait" : "pointer",
+          textAlign: "left",
+          opacity: loading ? 0.7 : 1,
+          transition: "all 0.25s",
+          marginBottom: 24,
+        }}
+        onMouseEnter={(e) => {
+          if (!loading) {
+            e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 15%, transparent)";
+            e.currentTarget.style.transform = "translateY(-1px)";
+          }
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 8%, transparent)";
+          e.currentTarget.style.transform = "translateY(0)";
+        }}
+      >
+        <div
+          style={{
+            width: 44,
+            height: 44,
+            borderRadius: 10,
+            background: "color-mix(in srgb, var(--accent-coral) 20%, transparent)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 20,
+            flexShrink: 0,
+          }}
+        >
+          💳
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", marginBottom: 2 }}>
+            {loading ? "..." : content.tipLabel}
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+            {content.tipSub}
+          </div>
+        </div>
+        <span style={{ fontSize: 16, color: "var(--accent-coral)" }}>→</span>
+      </button>
+
+      {/* Other payment methods */}
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         {content.methods.map((m) => (
           <a
@@ -78,7 +173,6 @@ export function SupportClient({ content }: { content: SupportContent }) {
               e.currentTarget.style.transform = "translateY(0)";
             }}
           >
-            {/* Icon */}
             <div
               style={{
                 width: 44,
@@ -95,8 +189,6 @@ export function SupportClient({ content }: { content: SupportContent }) {
             >
               {m.icon}
             </div>
-
-            {/* Text */}
             <div style={{ flex: 1 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
                 <span style={{ fontSize: 15, fontWeight: 500, color: "var(--text-primary)" }}>
@@ -118,18 +210,10 @@ export function SupportClient({ content }: { content: SupportContent }) {
                   </span>
                 )}
               </div>
-              <div
-                style={{
-                  fontSize: 12,
-                  color: "var(--text-dim)",
-                  fontFamily: "'DM Mono', monospace",
-                }}
-              >
+              <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
                 {m.sub}
               </div>
             </div>
-
-            {/* Arrow */}
             <span style={{ fontSize: 16, color: "var(--text-faint)" }}>↗</span>
           </a>
         ))}
