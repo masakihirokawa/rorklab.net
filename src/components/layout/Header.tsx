@@ -29,6 +29,16 @@ export function Header() {
     };
   }, []);
 
+  // Lock body scroll when mobile menu is open
+  useEffect(() => {
+    if (mobileOpen) {
+      document.body.style.overflow = "hidden";
+    } else {
+      document.body.style.overflow = "";
+    }
+    return () => { document.body.style.overflow = ""; };
+  }, [mobileOpen]);
+
   // Load search data lazily
   useEffect(() => {
     if (!searchOpen || searchData.length > 0) return;
@@ -92,10 +102,10 @@ export function Header() {
         {/* Logo */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           <a href={prefix || "/"} style={{ display: "flex", alignItems: "center", gap: 10, textDecoration: "none" }}>
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, color: "var(--accent-coral)", fontWeight: 400 }}>
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, color: "var(--accent-coral)", fontWeight: 400, position: "relative", top: 2 }}>
               ◉
             </span>
-            <span style={{ fontSize: 15, fontWeight: 500, letterSpacing: "0.1em", color: "var(--text-primary)" }}>
+            <span style={{ fontSize: 15, fontWeight: 500, letterSpacing: "0.04em", color: "var(--text-primary)" }}>
               {t("site.name")}
             </span>
           </a>
@@ -255,8 +265,10 @@ export function Header() {
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            justifyContent: "center",
+            justifyContent: "flex-start",
+            paddingTop: 100,
             gap: 28,
+            overflow: "hidden",
           }}
         >
           <button

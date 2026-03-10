@@ -29,6 +29,7 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
       <a
         href={switchUrl}
         onClick={handleClick}
+        className="header-icon-btn"
         style={{
           width: 32,
           height: 32,
@@ -56,6 +57,7 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
     <a
       href={switchUrl}
       onClick={handleClick}
+      className="header-icon-btn"
       style={{
         fontSize: 10,
         color: "var(--text-dim)",

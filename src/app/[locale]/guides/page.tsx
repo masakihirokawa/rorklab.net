@@ -1,7 +1,16 @@
 import { getArticles, CATEGORIES } from "@/lib/content";
+import type { Metadata } from "next";
 
 interface Props {
   params: Promise<{ locale: string }>;
+}
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale } = await params;
+  const isJa = locale === "ja";
+  return {
+    title: isJa ? "学習ガイド | Rork Lab" : "Learning Guides | Rork Lab",
+  };
 }
 
 const GUIDE_TRACKS: Record<string, { title: Record<string, string>; desc: Record<string, string>; categories: string[] }[]> = {

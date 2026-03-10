@@ -1,10 +1,19 @@
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
+import type { Metadata } from "next";
 
 interface Props {
   params: Promise<{ locale: string }>;
   searchParams: Promise<{ page?: string; category?: string }>;
+}
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale } = await params;
+  const isJa = locale === "ja";
+  return {
+    title: isJa ? "記事一覧 | Rork Lab" : "Articles | Rork Lab",
+  };
 }
 
 const LEVEL_LABELS: Record<string, Record<string, string>> = {

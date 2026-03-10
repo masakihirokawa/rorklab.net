@@ -4,12 +4,11 @@ import { useTranslations, useLocale } from "next-intl";
 
 const SNS_LINKS = [
   { label: "X", href: "https://x.com/dolice" },
-  { label: "IG", href: "https://www.instagram.com/dolice/" },
-  { label: "TH", href: "https://www.threads.net/@dolice" },
-  { label: "note", href: "https://note.com/dolice" },
-  { label: "in", href: "https://www.linkedin.com/in/dolice/" },
-  { label: "FB", href: "https://www.facebook.com/masakihirokawa" },
-  { label: "TK", href: "https://www.tiktok.com/@masaki.hirokawa" },
+  { label: "Instagram", href: "https://www.instagram.com/dolice/" },
+  { label: "Threads", href: "https://www.threads.net/@dolice" },
+  { label: "LinkedIn", href: "https://www.linkedin.com/in/dolice/" },
+  { label: "Facebook", href: "https://www.facebook.com/masakihirokawa" },
+  { label: "TikTok", href: "https://www.tiktok.com/@masaki.hirokawa" },
 ];
 
 export function Footer() {

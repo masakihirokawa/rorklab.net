@@ -97,22 +97,17 @@ async function generateArticleIndex() {
           description: data.description || "",
           tags: data.tags || [],
           premium: data.premium || false,
-          featured: data.featured || false,
           content: html,
         });
       }
     }
 
-    // Sort: by creation date (newest on top).
-    // Within the same date, featured articles come first,
-    // then by updated time.
+    // Sort by creation date (newest on top), then by updated time
     result[locale].sort((a, b) => {
       const aDate = a.date || "";
       const bDate = b.date || "";
       if (aDate !== bDate) return aDate > bDate ? -1 : 1;
-      // Same creation date: featured articles come first
-      if (a.featured !== b.featured) return a.featured ? -1 : 1;
-      // Same creation date & featured: sort by updated time (most recent first)
+      // Same creation date: sort by updated time (most recent first)
       const aUpdated = a.updated || a.date || "";
       const bUpdated = b.updated || b.date || "";
       if (aUpdated !== bUpdated) return aUpdated > bUpdated ? -1 : 1;

@@ -1,5 +1,15 @@
+import type { Metadata } from "next";
+
 interface Props {
   params: Promise<{ locale: string }>;
+}
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale } = await params;
+  const isJa = locale === "ja";
+  return {
+    title: isJa ? "特定商取引法に基づく表記 | Rork Lab" : "Legal Notice | Rork Lab",
+  };
 }
 
 export default async function TokushoPage({ params }: Props) {

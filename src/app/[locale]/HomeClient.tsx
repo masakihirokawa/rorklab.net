@@ -108,7 +108,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
             {t("site.poweredBy")}
           </div>
 
-          <h1 style={{ fontSize: "clamp(32px, 5vw, 56px)", fontWeight: 300, lineHeight: 1.3, color: "var(--text-primary)", letterSpacing: "-0.02em", marginBottom: 16 }}>
+          <h1 style={{ fontSize: "clamp(32px, 5vw, 56px)", fontWeight: 300, lineHeight: 1.3, color: "var(--text-primary)", letterSpacing: "-0.01em", marginBottom: 16 }}>
             {t("hero.title1")}
             <br />
             <span style={{ fontWeight: 700 }}>{t("hero.title2")}</span>
@@ -175,7 +175,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
                 onMouseEnter={() => setHoveredCat(cat.id)}
                 onMouseLeave={() => setHoveredCat(null)}
               >
-                <div style={{ fontSize: 28, marginBottom: 16, color: cat.color, transition: "transform 0.3s", transform: hoveredCat === cat.id ? "scale(1.15)" : "scale(1)" }}>
+                <div style={{ fontSize: 28, marginBottom: 16, color: cat.color, transition: "transform 0.3s", transform: hoveredCat === cat.id ? "translateX(4px)" : "translateX(0)" }}>
                   {cat.icon}
                 </div>
                 <div style={{ fontSize: 16, fontWeight: 500, color: "var(--text-primary)", marginBottom: 6, letterSpacing: "0.02em" }}>

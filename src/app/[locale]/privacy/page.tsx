@@ -1,5 +1,15 @@
+import type { Metadata } from "next";
+
 interface Props {
   params: Promise<{ locale: string }>;
+}
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale } = await params;
+  const isJa = locale === "ja";
+  return {
+    title: isJa ? "プライバシーポリシー | Rork Lab" : "Privacy Policy | Rork Lab",
+  };
 }
 
 export default async function PrivacyPage({ params }: Props) {

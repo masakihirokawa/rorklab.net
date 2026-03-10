@@ -1,7 +1,16 @@
 import { getBlogPosts } from "@/lib/content";
+import type { Metadata } from "next";
 
 interface Props {
   params: Promise<{ locale: string }>;
+}
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale } = await params;
+  const isJa = locale === "ja";
+  return {
+    title: isJa ? "ブログ | Rork Lab" : "Blog | Rork Lab",
+  };
 }
 
 export default async function BlogPage({ params }: Props) {
