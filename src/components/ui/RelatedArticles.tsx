@@ -74,7 +74,7 @@ export function RelatedArticles({
                 >
                   {aCat?.icon} {article.category}
                 </span>
-                <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{article.date}</span>
+                <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{article.date?.split("T")[0]}</span>
               </div>
               <div
                 style={{

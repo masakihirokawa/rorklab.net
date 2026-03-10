@@ -194,7 +194,7 @@ export default async function ArticlePage({ params }: Props) {
           </span>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
           <span style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
-            {article.meta.date}
+            {article.meta.date?.split("T")[0]}
           </span>
           <LevelBadge
             level={article.meta.level}

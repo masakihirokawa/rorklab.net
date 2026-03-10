@@ -97,7 +97,7 @@ export default async function CategoryPage({ params }: Props) {
             >
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
-                  {article.date}
+                  {article.date?.split("T")[0]}
                 </span>
                 <LevelBadge
                   level={article.level}
