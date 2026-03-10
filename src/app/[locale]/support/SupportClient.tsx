@@ -37,8 +37,11 @@ export function SupportClient({
 }) {
   const [loading, setLoading] = useState(false);
 
+  const [error, setError] = useState("");
+
   const handleTip = async () => {
     setLoading(true);
+    setError("");
     try {
       const res = await fetch("/api/checkout", {
         method: "POST",
@@ -52,8 +55,12 @@ export function SupportClient({
       const data = await res.json();
       if (data.url) {
         window.location.href = data.url;
+      } else {
+        setError(data.error || "Checkout session failed");
+        setLoading(false);
       }
-    } catch {
+    } catch (e) {
+      setError("Network error");
       setLoading(false);
     }
   };
@@ -142,6 +149,10 @@ export function SupportClient({
         </div>
         <span style={{ fontSize: 16, color: "var(--accent-coral)" }}>→</span>
       </button>
+
+      {error && (
+        <p style={{ color: "#ef4444", fontSize: 13, textAlign: "center", marginBottom: 16 }}>{error}</p>
+      )}
 
       {/* Other payment methods */}
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
