@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import { getArticlesByCategory, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
+import type { Metadata } from "next";
 
 interface Props {
   params: Promise<{ locale: string; category: string }>;
@@ -36,6 +37,14 @@ const CATEGORY_DESC: Record<string, Record<string, string>> = {
     en: "App Store, monetization, analytics",
   },
 };
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale, category } = await params;
+  const catName = CATEGORY_NAMES[category]?.[locale] || category;
+  return {
+    title: catName,
+  };
+}
 
 export default async function CategoryPage({ params }: Props) {
   const { locale, category } = await params;
