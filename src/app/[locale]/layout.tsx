@@ -8,8 +8,25 @@ import { GrainOverlay } from "@/components/ui/GrainOverlay";
 import { NewsTicker } from "@/components/ui/NewsTicker";
 import { ScrollToTop } from "@/components/ui/ScrollToTop";
 
+import type { Metadata } from "next";
+
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
 const themeScript = `(function(){try{var t=localStorage.getItem('rorklab-theme');if(t){document.documentElement.setAttribute('data-theme',t)}}catch(e){}})()`;
+
+const LOCALE_TITLES: Record<string, string> = {
+  ja: "Rork Lab — Rork Max 日本語ナレッジベース",
+  en: "Rork Lab — Rork Max Knowledge Base",
+};
+
+export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> {
+  const { locale } = await params;
+  return {
+    title: {
+      default: LOCALE_TITLES[locale] || LOCALE_TITLES.ja,
+      template: "%s | Rork Lab",
+    },
+  };
+}
 
 export default async function LocaleLayout({
   children,
