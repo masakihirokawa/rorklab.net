@@ -179,6 +179,7 @@ export function Footer() {
           {[
             { label: "Claude Lab", href: "https://claudelab.net" },
             { label: "Antigravity Lab", href: "https://antigravitylab.net" },
+            { label: "Gemini Lab", href: "https://gemilab.net" },
           ].map((site) => (
             <a
               key={site.label}
