@@ -54,6 +54,7 @@ export function Footer() {
         </span>
         <a
           href={`${locale === "ja" ? "" : `/${locale}`}/support`}
+          className="support-btn"
           style={{
             display: "inline-flex",
             alignItems: "center",
@@ -67,7 +68,6 @@ export function Footer() {
             fontWeight: 500,
             textDecoration: "none",
             letterSpacing: "0.02em",
-            transition: "all 0.3s",
             whiteSpace: "nowrap",
           }}
         >

@@ -12,9 +12,9 @@ const LEVEL_LABELS: Record<string, Record<string, string>> = {
 };
 
 const CATEGORY_NAMES: Record<string, Record<string, string>> = {
-  "rork-basics": { ja: "Rork入門", en: "Getting Started" },
+  "rork-basics": { ja: "Rork 入門", en: "Getting Started" },
   "rork-dev": { ja: "開発ツール", en: "Dev Tools" },
-  "rork-ai": { ja: "AIモデル", en: "AI Models" },
+  "rork-ai": { ja: "AI モデル", en: "AI Models" },
   "rork-business": { ja: "ビジネス", en: "Business" },
 };
 

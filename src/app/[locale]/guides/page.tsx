@@ -7,36 +7,36 @@ interface Props {
 const GUIDE_TRACKS: Record<string, { title: Record<string, string>; desc: Record<string, string>; categories: string[] }[]> = {
   default: [
     {
-      title: { ja: "Claude.ai をはじめよう", en: "Getting Started with Claude.ai" },
+      title: { ja: "Rork Max をはじめよう", en: "Getting Started with Rork Max" },
       desc: {
-        ja: "Web・モバイルアプリの基本操作から活用テクニックまで",
-        en: "From basic operations to advanced techniques for the web and mobile apps",
+        ja: "初めてのアプリ生成から基本操作まで、Rork Max の使い方を学ぶ",
+        en: "Learn the basics of Rork Max, from your first app generation to core features",
       },
-      categories: ["claude-ai"],
+      categories: ["rork-basics"],
     },
     {
-      title: { ja: "Claude Code で開発を加速する", en: "Accelerate Development with Claude Code" },
+      title: { ja: "開発ツールと連携する", en: "Developer Tools & Integrations" },
       desc: {
-        ja: "CLI ツールのセットアップからプラグイン開発まで",
-        en: "From CLI tool setup to plugin development",
+        ja: "Xcode 連携・GitHub 統合・CI/CD パイプラインの構築ガイド",
+        en: "Guide to Xcode integration, GitHub workflows, and CI/CD pipelines",
       },
-      categories: ["claude-code"],
+      categories: ["rork-dev"],
     },
     {
-      title: { ja: "Cowork でデスクトップ作業を自動化", en: "Automate Desktop Tasks with Cowork" },
+      title: { ja: "AI モデルを活用する", en: "Leverage AI Models" },
       desc: {
-        ja: "タスク管理とファイル操作の自動化ガイド",
-        en: "Guide to task management and file operation automation",
+        ja: "Claude Opus 4.6 を中心とした AI 連携と高度なプロンプト活用術",
+        en: "AI integration with Claude Opus 4.6 and advanced prompting techniques",
       },
-      categories: ["cowork"],
+      categories: ["rork-ai"],
     },
     {
-      title: { ja: "API / SDK で Claude を組み込む", en: "Integrate Claude with API / SDK" },
+      title: { ja: "収益化と App Store 公開", en: "Monetization & App Store Publishing" },
       desc: {
-        ja: "開発者向け API 連携クイックスタート",
-        en: "API integration quickstart for developers",
+        ja: "App Store 審査対策からサブスクリプション設計・収益化戦略まで",
+        en: "From App Store review guidelines to subscription design and monetization",
       },
-      categories: ["api-sdk"],
+      categories: ["rork-business"],
     },
   ],
 };
@@ -61,8 +61,8 @@ export default async function GuidesPage({ params }: Props) {
         </h1>
         <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.7 }}>
           {locale === "ja"
-            ? "目的に合わせた体系的な学習パスで Claude を使いこなしましょう。"
-            : "Master Claude with systematic learning paths tailored to your goals."}
+            ? "目的に合わせた体系的な学習パスで Rork Max を使いこなしましょう。"
+            : "Master Rork Max with systematic learning paths tailored to your goals."}
         </p>
       </div>
 
@@ -75,12 +75,12 @@ export default async function GuidesPage({ params }: Props) {
           return (
             <div
               key={i}
+              className="guide-card"
               style={{
                 padding: "32px",
                 border: "1px solid var(--border-subtle)",
                 borderRadius: 8,
                 background: "var(--bg-surface)",
-                transition: "border-color 0.3s",
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>

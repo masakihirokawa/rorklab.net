@@ -292,7 +292,7 @@ export function BookRecommendation({ locale }: BookRecommendationProps) {
             : "* Contains affiliate links"}
         </div>
         <a
-          href={`/${locale === "en" ? "en/" : ""}articles/claude-ai/recommended-books`}
+          href={`/${locale === "en" ? "en/" : ""}articles/rork-ai`}
           style={{
             fontSize: 11,
             fontFamily: "'DM Mono', monospace",

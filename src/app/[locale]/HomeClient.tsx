@@ -122,23 +122,25 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
           <div style={{ display: "flex", gap: 16, justifyContent: "center", flexWrap: "wrap" }}>
             <a
               href="#guides"
+              className="hero-cta"
               style={{
                 display: "inline-flex", alignItems: "center", gap: 8, padding: "14px 32px",
                 border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
                 borderRadius: 6, background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
                 color: "var(--accent-coral)", fontSize: 14, cursor: "pointer",
-                transition: "all 0.3s", textDecoration: "none", letterSpacing: "0.04em",
+                textDecoration: "none", letterSpacing: "0.04em",
               }}
             >
               {t("hero.ctaGuide")}
             </a>
             <a
               href="#articles"
+              className="hero-cta"
               style={{
                 display: "inline-flex", alignItems: "center", gap: 8, padding: "14px 32px",
                 border: "1px solid var(--border-hover)", borderRadius: 6,
                 background: "var(--bg-surface)", color: "var(--text-secondary)", fontSize: 14,
-                cursor: "pointer", transition: "all 0.3s", textDecoration: "none", letterSpacing: "0.04em",
+                cursor: "pointer", textDecoration: "none", letterSpacing: "0.04em",
               }}
             >
               {t("hero.ctaLatest")}
@@ -263,11 +265,11 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
             <a
               key={i}
               href={guide.href}
-              className={mounted ? "animate-fade-up" : ""}
+              className={`guide-card${mounted ? " animate-fade-up" : ""}`}
               style={{
                 display: "block", padding: "32px 28px", borderRadius: 8,
                 background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
-                cursor: "pointer", transition: "all 0.4s cubic-bezier(0.16, 1, 0.3, 1)",
+                cursor: "pointer",
                 animationDelay: `${0.5 + i * 0.1}s`,
                 textDecoration: "none",
               }}

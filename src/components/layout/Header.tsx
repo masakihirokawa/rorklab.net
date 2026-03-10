@@ -148,6 +148,7 @@ export function Header() {
             <button
               onClick={() => setSearchOpen(true)}
               aria-label="Search"
+              className="header-icon-btn"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -162,7 +163,6 @@ export function Header() {
                 fontFamily: "'DM Mono', monospace",
                 letterSpacing: "0.04em",
                 whiteSpace: "nowrap",
-                transition: "all 0.3s",
               }}
             >
               <span>{t("nav.search")}</span>
