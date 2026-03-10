@@ -7,11 +7,11 @@ interface Props {
 
 const META: Record<string, { title: string; description: string }> = {
   ja: {
-    title: "Support Us — Rork Lab を応援する",
+    title: "Rork Lab を応援する",
     description: "Rork Lab の活動を支援していただける方へ。Ko-fi、PayPal、Wise、Revolut でサポートできます。",
   },
   en: {
-    title: "Support Us — Support Rork Lab",
+    title: "Support Rork Lab",
     description: "Support Rork Lab's work. You can contribute via Ko-fi, PayPal, Wise, or Revolut.",
   },
 };

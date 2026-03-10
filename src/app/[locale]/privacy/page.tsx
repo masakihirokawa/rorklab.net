@@ -8,7 +8,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const isJa = locale === "ja";
   return {
-    title: isJa ? "プライバシーポリシー | Rork Lab" : "Privacy Policy | Rork Lab",
+    title: isJa ? "プライバシーポリシー" : "Privacy Policy",
   };
 }
 

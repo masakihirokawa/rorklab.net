@@ -74,67 +74,6 @@ export function Footer() {
         </a>
       </div>
 
-      {/* Main row */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          flexWrap: "wrap",
-          gap: 16,
-          marginBottom: 20,
-        }}
-      >
-        <span
-          style={{
-            fontFamily: "'DM Mono', monospace",
-            fontSize: 13,
-            color: "var(--text-faint)",
-            letterSpacing: "0.08em",
-          }}
-        >
-          © 2026{" "}
-          <a
-            href="https://dolice.design"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              color: "var(--text-faint)",
-              textDecoration: "none",
-              transition: "color 0.3s",
-            }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
-            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
-          >
-            Dolice
-          </a>
-          {" - "}
-          <span style={{ color: "var(--text-faint)" }}>
-            {locale === "ja" ? "廣川政樹" : "Masaki Hirokawa"}
-          </span>
-        </span>
-        <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
-          {links.map(({ key, label, href }) => (
-            <a
-              key={key}
-              href={href}
-              style={{
-                fontSize: 12,
-                color: "var(--text-faint)",
-                textDecoration: "none",
-                fontFamily: "'DM Mono', monospace",
-                letterSpacing: "0.04em",
-                transition: "color 0.3s",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
-              onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
-            >
-              {label}
-            </a>
-          ))}
-        </div>
-      </div>
-
       {/* SNS row */}
       <div
         style={{
@@ -142,6 +81,7 @@ export function Footer() {
           gap: 16,
           flexWrap: "wrap",
           alignItems: "center",
+          marginBottom: 20,
         }}
       >
         {SNS_LINKS.map((sns) => (
@@ -167,13 +107,35 @@ export function Footer() {
         ))}
       </div>
 
+      {/* Legal links row */}
+      <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 12 }}>
+        {links.map(({ key, label, href }) => (
+          <a
+            key={key}
+            href={href}
+            style={{
+              fontSize: 12,
+              color: "var(--text-faint)",
+              textDecoration: "none",
+              fontFamily: "'DM Mono', monospace",
+              letterSpacing: "0.04em",
+              transition: "color 0.3s",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
+            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
+          >
+            {label}
+          </a>
+        ))}
+      </div>
+
       {/* Sister Sites */}
       <div style={{
         display: "flex",
         gap: 16,
         flexWrap: "wrap",
         alignItems: "center",
-        marginTop: 12,
+        marginBottom: 12,
       }}>
         <span style={{
           fontSize: 10,
@@ -208,6 +170,36 @@ export function Footer() {
           </a>
         ))}
       </div>
+
+      {/* Copyright row */}
+      <span
+        style={{
+          fontFamily: "'DM Mono', monospace",
+          fontSize: 13,
+          color: "var(--text-faint)",
+          letterSpacing: "0.08em",
+        }}
+      >
+        © 2026{" "}
+        <a
+          href="https://dolice.design"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            color: "var(--text-faint)",
+            textDecoration: "none",
+            transition: "color 0.3s",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
+          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
+        >
+          Dolice
+        </a>
+        {" - "}
+        <span style={{ color: "var(--text-faint)" }}>
+          {locale === "ja" ? "廣川政樹" : "Masaki Hirokawa"}
+        </span>
+      </span>
     </footer>
   );
 }
