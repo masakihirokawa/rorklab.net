@@ -102,7 +102,7 @@ export function Header() {
         {/* Logo */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           <a href={prefix || "/"} style={{ display: "flex", alignItems: "center", gap: 10, textDecoration: "none" }}>
-            <span className="logo-icon" style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, color: "var(--accent-coral)", fontWeight: 400, position: "relative", top: isMobile ? -1 : 2 }}>
+            <span className="logo-icon" style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, color: "var(--accent-coral)", fontWeight: 400, position: "relative", top: isMobile ? -4 : 2 }}>
               ◉
             </span>
             <span style={{ fontSize: 15, fontWeight: 500, letterSpacing: "0.04em", color: "var(--text-primary)" }}>
