@@ -26,7 +26,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const url = `https://rorklab.net${prefix}`;
 
   return {
-    title: m.title,
+    title: { absolute: m.title },
     description: m.description,
     openGraph: {
       title: m.title,
