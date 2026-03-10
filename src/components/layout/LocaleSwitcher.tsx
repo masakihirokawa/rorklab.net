@@ -29,7 +29,6 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
       <a
         href={switchUrl}
         onClick={handleClick}
-        className="header-icon-btn"
         style={{
           width: 32,
           height: 32,
@@ -46,6 +45,15 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
           cursor: "pointer",
           textDecoration: "none",
           paddingTop: 1,
+          transition: "color 0.3s, border-color 0.3s",
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.color = "var(--text-secondary)";
+          e.currentTarget.style.borderColor = "var(--text-faint)";
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.color = "var(--text-dim)";
+          e.currentTarget.style.borderColor = "var(--border-subtle)";
         }}
       >
         {locale === "ja" ? "EN" : "JP"}
@@ -57,7 +65,6 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
     <a
       href={switchUrl}
       onClick={handleClick}
-      className="header-icon-btn"
       style={{
         fontSize: 10,
         color: "var(--text-dim)",
@@ -68,8 +75,16 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
         border: "1px solid var(--border-subtle)",
         background: "var(--bg-surface)",
         cursor: "pointer",
-        transition: "all 0.3s",
+        transition: "color 0.3s, border-color 0.3s",
         textDecoration: "none",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.color = "var(--text-secondary)";
+        e.currentTarget.style.borderColor = "var(--text-faint)";
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.color = "var(--text-dim)";
+        e.currentTarget.style.borderColor = "var(--border-subtle)";
       }}
     >
       {locale === "ja" ? "EN" : "JP"}

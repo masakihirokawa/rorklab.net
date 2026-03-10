@@ -74,132 +74,134 @@ export function Footer() {
         </a>
       </div>
 
-      {/* SNS row */}
+      {/* Footer body — 2-row layout matching Claude Lab */}
+      <div className="footer-body" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* Row 1: Copyright + Legal links */}
       <div
+        className="footer-copyright"
         style={{
           display: "flex",
-          gap: 16,
-          flexWrap: "wrap",
+          justifyContent: "space-between",
           alignItems: "center",
-          marginBottom: 20,
+          flexWrap: "wrap",
+          gap: 16,
         }}
       >
-        {SNS_LINKS.map((sns) => (
+        <span
+          style={{
+            fontFamily: "'DM Mono', monospace",
+            fontSize: 13,
+            color: "var(--text-faint)",
+            letterSpacing: "0.08em",
+          }}
+        >
+          © 2026{" "}
           <a
-            key={sns.label}
-            href={sns.href}
+            href="https://dolice.design"
             target="_blank"
             rel="noopener noreferrer"
-            title={sns.label}
             style={{
-              fontSize: 11,
               color: "var(--text-faint)",
               textDecoration: "none",
-              fontFamily: "'DM Mono', monospace",
-              letterSpacing: "0.04em",
-              transition: "color 0.3s",
-            }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
-            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
-          >
-            {sns.label}
-          </a>
-        ))}
-      </div>
-
-      {/* Legal links row */}
-      <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 12 }}>
-        {links.map(({ key, label, href }) => (
-          <a
-            key={key}
-            href={href}
-            style={{
-              fontSize: 12,
-              color: "var(--text-faint)",
-              textDecoration: "none",
-              fontFamily: "'DM Mono', monospace",
-              letterSpacing: "0.04em",
               transition: "color 0.3s",
             }}
             onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
             onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
           >
-            {label}
+            Dolice
           </a>
-        ))}
-      </div>
-
-      {/* Sister Sites */}
-      <div style={{
-        display: "flex",
-        gap: 16,
-        flexWrap: "wrap",
-        alignItems: "center",
-        marginBottom: 12,
-      }}>
-        <span style={{
-          fontSize: 10,
-          color: "var(--text-dim)",
-          fontFamily: "'DM Mono', monospace",
-          letterSpacing: "0.12em",
-          textTransform: "uppercase",
-        }}>
-          Sister Sites
+          {" - "}
+          <span style={{ color: "var(--text-faint)" }}>
+            {locale === "ja" ? "廣川政樹" : "Masaki Hirokawa"}
+          </span>
         </span>
-        {[
-          { label: "Claude Lab", href: "https://claudelab.net" },
-          { label: "Antigravity Lab", href: "https://antigravitylab.net" },
-        ].map((site) => (
-          <a
-            key={site.label}
-            href={site.href}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              fontSize: 11,
-              color: "var(--text-faint)",
-              textDecoration: "none",
-              fontFamily: "'DM Mono', monospace",
-              letterSpacing: "0.04em",
-              transition: "color 0.3s",
-            }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
-            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
-          >
-            {site.label}
-          </a>
-        ))}
+        <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+          {links.map(({ key, label, href }) => (
+            <a
+              key={key}
+              href={href}
+              style={{
+                fontSize: 12,
+                color: "var(--text-faint)",
+                textDecoration: "none",
+                fontFamily: "'DM Mono', monospace",
+                letterSpacing: "0.04em",
+                transition: "color 0.3s",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
+              onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
+            >
+              {label}
+            </a>
+          ))}
+        </div>
       </div>
 
-      {/* Copyright row */}
-      <span
+      {/* Row 2: SNS + Sister sites */}
+      <div
+        className="footer-sns"
         style={{
-          fontFamily: "'DM Mono', monospace",
-          fontSize: 13,
-          color: "var(--text-faint)",
-          letterSpacing: "0.08em",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: 16,
         }}
       >
-        © 2026{" "}
-        <a
-          href="https://dolice.design"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            color: "var(--text-faint)",
-            textDecoration: "none",
-            transition: "color 0.3s",
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
-          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
-        >
-          Dolice
-        </a>
-        {" - "}
-        <span style={{ color: "var(--text-faint)" }}>
-          {locale === "ja" ? "廣川政樹" : "Masaki Hirokawa"}
-        </span>
-      </span>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
+          {SNS_LINKS.map((sns) => (
+            <a
+              key={sns.label}
+              href={sns.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={sns.label}
+              style={{
+                fontSize: 11,
+                color: "var(--text-faint)",
+                textDecoration: "none",
+                fontFamily: "'DM Mono', monospace",
+                letterSpacing: "0.04em",
+                transition: "color 0.3s",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
+              onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
+            >
+              {sns.label}
+            </a>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.1em" }}>
+            SISTER SITES
+          </span>
+          {[
+            { label: "Claude Lab", href: "https://claudelab.net" },
+            { label: "Antigravity Lab", href: "https://antigravitylab.net" },
+          ].map((site) => (
+            <a
+              key={site.label}
+              href={site.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                fontSize: 11,
+                color: "var(--text-faint)",
+                textDecoration: "none",
+                fontFamily: "'DM Mono', monospace",
+                letterSpacing: "0.04em",
+                transition: "color 0.3s",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
+              onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
+            >
+              ◉ {site.label}
+            </a>
+          ))}
+        </div>
+      </div>
+      </div>
     </footer>
   );
 }
