@@ -174,7 +174,7 @@ export function Footer() {
         </div>
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.1em" }}>
-            SISTER SITES
+            DOLICE LABS
           </span>
           {[
             { label: "Claude Lab", href: "https://claudelab.net" },
