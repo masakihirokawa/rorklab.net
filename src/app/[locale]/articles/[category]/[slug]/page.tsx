@@ -175,7 +175,7 @@ export default async function ArticlePage({ params }: Props) {
             letterSpacing: "0.06em",
           }}
         >
-          {category}
+          {CATEGORY_LABELS[locale]?.[category] || category}
         </span>
       </div>
 
@@ -190,7 +190,7 @@ export default async function ArticlePage({ params }: Props) {
               letterSpacing: "0.06em",
             }}
           >
-            {catInfo?.icon} {category}
+            {catInfo?.icon} {CATEGORY_LABELS[locale]?.[category] || category}
           </span>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
           <span style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
