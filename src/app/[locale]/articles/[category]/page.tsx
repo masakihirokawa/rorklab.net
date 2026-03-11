@@ -43,6 +43,14 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const catName = CATEGORY_NAMES[category]?.[locale] || category;
   return {
     title: catName,
+  
+    alternates: {
+      canonical: locale === "ja" ? `https://rorklab.net/articles/${category}` : `https://rorklab.net/en/articles/${category}`,
+      languages: {
+        ja: `https://rorklab.net/articles/${category}`,
+        en: `https://rorklab.net/en/articles/${category}`,
+      },
+    },
   };
 }
 

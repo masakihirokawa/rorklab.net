@@ -10,6 +10,13 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const isJa = locale === "ja";
   return {
     title: isJa ? "学習ガイド" : "Learning Guides",
+      alternates: {
+      canonical: locale === "ja" ? "https://rorklab.net/guides" : `https://rorklab.net/en/guides`,
+      languages: {
+        ja: "https://rorklab.net/guides",
+        en: "https://rorklab.net/en/guides",
+      },
+    },
   };
 }
 

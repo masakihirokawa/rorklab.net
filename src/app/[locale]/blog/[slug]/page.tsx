@@ -18,7 +18,15 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: post.meta.description,
       type: "article",
       publishedTime: post.meta.date,
+    
+    alternates: {
+      canonical: locale === "ja" ? `https://rorklab.net/blog/${slug}` : `https://rorklab.net/en/blog/${slug}`,
+      languages: {
+        ja: `https://rorklab.net/blog/${slug}`,
+        en: `https://rorklab.net/en/blog/${slug}`,
+      },
     },
+  },
   };
 }
 
