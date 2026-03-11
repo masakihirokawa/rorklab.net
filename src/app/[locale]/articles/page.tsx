@@ -12,7 +12,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const isJa = locale === "ja";
   return {
-    title: isJa ? "記事一覧" : "Articles",
+    title: isJa ? "すべての記事" : "All Articles",
   };
 }
 
