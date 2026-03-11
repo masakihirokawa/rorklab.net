@@ -23,8 +23,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
   // Static pages with alternates
   for (const page of staticPages) {
-    const jaUrl = `${baseUrl}${page.path || "/"}`;
-    const enUrl = `${baseUrl}/en${page.path || "/"}`;
+    const jaUrl = `${baseUrl}${page.path || ""}`;
+    const enUrl = `${baseUrl}/en${page.path || ""}`;
 
     entries.push({
       url: jaUrl,
