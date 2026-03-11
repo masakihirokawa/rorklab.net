@@ -22,7 +22,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
         window.location.href = data.url;
       }
     } catch {
-      console.error("Checkout failed");
+      // Checkout failed - error handling
     } finally {
       setLoading(false);
     }

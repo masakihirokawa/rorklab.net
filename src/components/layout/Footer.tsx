@@ -1,6 +1,7 @@
 "use client";
 
 import { useTranslations, useLocale } from "next-intl";
+import { localePrefix } from "@/lib/locale";
 
 const SNS_LINKS = [
   { label: "X", href: "https://x.com/dolice" },
@@ -11,10 +12,33 @@ const SNS_LINKS = [
   { label: "TikTok", href: "https://www.tiktok.com/@masaki.hirokawa" },
 ];
 
+const SISTER_SITES = [
+  { label: "Claude Lab", href: "https://claudelab.net" },
+  { label: "Antigravity Lab", href: "https://antigravitylab.net" },
+  { label: "Gemini Lab", href: "https://gemilab.net" },
+];
+
+const FOOTER_LINK = {
+  fontSize: 12,
+  color: "var(--text-faint)",
+  textDecoration: "none" as const,
+  fontFamily: "'DM Mono', monospace" as const,
+  letterSpacing: "0.04em",
+  transition: "color 0.3s",
+};
+
+function hoverFaint(e: React.MouseEvent<HTMLAnchorElement>) {
+  if (e.type === "mouseenter") {
+    e.currentTarget.style.color = "var(--text-muted)";
+  } else {
+    e.currentTarget.style.color = "var(--text-faint)";
+  }
+}
+
 export function Footer() {
   const t = useTranslations();
   const locale = useLocale();
-  const prefix = locale === "ja" ? "" : `/${locale}`;
+  const prefix = localePrefix(locale);
 
   const links = [
     { key: "privacy", label: t("footer.privacy"), href: `${prefix}/privacy` },
@@ -52,7 +76,7 @@ export function Footer() {
             : "Rork Lab is free to use. Your support helps us keep going."}
         </span>
         <a
-          href={`${locale === "ja" ? "" : `/${locale}`}/support`}
+          href={`${prefix}/support`}
           className="support-btn"
           style={{
             display: "inline-flex",
@@ -121,16 +145,9 @@ export function Footer() {
             <a
               key={key}
               href={href}
-              style={{
-                fontSize: 12,
-                color: "var(--text-faint)",
-                textDecoration: "none",
-                fontFamily: "'DM Mono', monospace",
-                letterSpacing: "0.04em",
-                transition: "color 0.3s",
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
-              onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
+              style={FOOTER_LINK}
+              onMouseEnter={hoverFaint}
+              onMouseLeave={hoverFaint}
             >
               {label}
             </a>
@@ -157,14 +174,7 @@ export function Footer() {
               target="_blank"
               rel="noopener noreferrer"
               title={sns.label}
-              style={{
-                fontSize: 11,
-                color: "var(--text-faint)",
-                textDecoration: "none",
-                fontFamily: "'DM Mono', monospace",
-                letterSpacing: "0.04em",
-                transition: "color 0.3s",
-              }}
+              style={{ ...FOOTER_LINK, fontSize: 11 }}
               onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
               onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
             >
@@ -176,24 +186,13 @@ export function Footer() {
           <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.1em" }}>
             DOLICE LABS
           </span>
-          {[
-            { label: "Claude Lab", href: "https://claudelab.net" },
-            { label: "Antigravity Lab", href: "https://antigravitylab.net" },
-            { label: "Gemini Lab", href: "https://gemilab.net" },
-          ].map((site) => (
+          {SISTER_SITES.map((site) => (
             <a
               key={site.label}
               href={site.href}
               target="_blank"
               rel="noopener noreferrer"
-              style={{
-                fontSize: 11,
-                color: "var(--text-faint)",
-                textDecoration: "none",
-                fontFamily: "'DM Mono', monospace",
-                letterSpacing: "0.04em",
-                transition: "color 0.3s",
-              }}
+              style={{ ...FOOTER_LINK, fontSize: 11 }}
               onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
               onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
             >

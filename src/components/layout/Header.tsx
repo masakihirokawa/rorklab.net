@@ -5,6 +5,27 @@ import { useTranslations, useLocale } from "next-intl";
 import { ThemeToggle } from "./ThemeToggle";
 import { LocaleSwitcher } from "./LocaleSwitcher";
 import { SearchModal } from "@/components/ui/SearchModal";
+import { localePrefix } from "@/lib/locale";
+
+interface SearchItem {
+  title: string;
+  slug: string;
+  category?: string;
+  description: string;
+  type: "article" | "blog";
+}
+
+const MOBILE_ICON_BTN = {
+  width: 32,
+  height: 32,
+  display: "flex" as const,
+  alignItems: "center" as const,
+  justifyContent: "center" as const,
+  borderRadius: 4,
+  border: "1px solid var(--border-subtle)",
+  background: "var(--bg-surface)",
+  cursor: "pointer" as const,
+};
 
 export function Header() {
   const t = useTranslations();
@@ -13,9 +34,7 @@ export function Header() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  const [searchData, setSearchData] = useState<
-    { title: string; slug: string; category?: string; description: string; type: "article" | "blog" }[]
-  >([]);
+  const [searchData, setSearchData] = useState<SearchItem[]>([]);
 
   useEffect(() => {
     const onScroll = () => setScrollY(window.scrollY);
@@ -68,7 +87,7 @@ export function Header() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const prefix = locale === "ja" ? "" : `/${locale}`;
+  const prefix = localePrefix(locale);
   const scrolled = scrollY > 50;
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
@@ -189,14 +208,7 @@ export function Header() {
               href={`${prefix}/support`}
               aria-label="Support us"
               style={{
-                width: 32,
-                height: 32,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                borderRadius: 4,
-                border: "1px solid var(--border-subtle)",
-                background: "var(--bg-surface)",
+                ...MOBILE_ICON_BTN,
                 color: "var(--text-dim)",
                 textDecoration: "none",
                 fontSize: 14,
@@ -208,16 +220,8 @@ export function Header() {
               onClick={() => setSearchOpen(true)}
               aria-label="Search"
               style={{
-                width: 32,
-                height: 32,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                borderRadius: 4,
-                border: "1px solid var(--border-subtle)",
-                background: "var(--bg-surface)",
+                ...MOBILE_ICON_BTN,
                 color: "var(--text-muted)",
-                cursor: "pointer",
                 fontSize: 14,
               }}
             >
@@ -229,16 +233,8 @@ export function Header() {
               onClick={() => setMobileOpen(true)}
               aria-label="Open menu"
               style={{
-                width: 32,
-                height: 32,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                borderRadius: 4,
-                border: "1px solid var(--border-subtle)",
-                background: "var(--bg-surface)",
+                ...MOBILE_ICON_BTN,
                 color: "var(--text-secondary)",
-                cursor: "pointer",
                 fontSize: 18,
                 lineHeight: 1,
                 paddingBottom: 4,

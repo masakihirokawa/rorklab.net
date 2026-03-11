@@ -30,7 +30,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ url: session.url });
   } catch (error: unknown) {
-    console.error("Stripe checkout error:", error);
+    // Stripe checkout error handling
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json(
       { error: `Checkout failed: ${message}` },
