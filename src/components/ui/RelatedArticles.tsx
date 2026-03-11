@@ -1,5 +1,11 @@
 import { getArticles, CATEGORIES, type ArticleMeta } from "@/lib/content";
 
+
+const CATEGORY_LABELS: Record<string, Record<string, string>> = {
+  ja: {"rork-basics": "Rork 入門", "rork-dev": "開発ツール", "rork-ai": "AI モデル", "rork-business": "ビジネス"},
+  en: {"rork-basics": "Getting Started", "rork-dev": "Dev Tools", "rork-ai": "AI Models", "rork-business": "Business"},
+};
+
 interface RelatedArticlesProps {
   locale: string;
   currentSlug: string;
@@ -72,7 +78,7 @@ export function RelatedArticles({
                     fontFamily: "'DM Mono', monospace",
                   }}
                 >
-                  {aCat?.icon} {article.category}
+                  {aCat?.icon} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                 </span>
                 <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{article.date?.split("T")[0]}</span>
               </div>

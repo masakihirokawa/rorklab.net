@@ -74,7 +74,7 @@ export default async function CategoryPage({ params }: Props) {
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: `color-mix(in srgb, ${cat?.color || "var(--accent-coral)"} 40%, transparent)` }} />
           <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
-            {cat?.icon} {category.toUpperCase()}
+            {cat?.icon} {catName}
           </span>
         </div>
         <h1 style={{ fontSize: "clamp(24px, 4vw, 36px)", fontWeight: 300, color: "var(--text-primary)", letterSpacing: "-0.02em", marginBottom: 8 }}>
