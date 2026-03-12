@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NEW — メモリインポート機能が全ユーザーに公開、ChatGPT・Geminiからの移行も対応",
-    "UPDATE — Claude Opus 4.6 リリース、100万トークンコンテキストウィンドウ（ベータ）対応",
-    "NEW — Agent Teams 発表、複数AIエージェントが並列でタスクを分担・協調",
-    "Cowork — macOS デスクトップ版が Pro プランで利用可能に、ローカルVM搭載",
-    "API — ウェブ検索ツールが正式GA、動的フィルタリングでトークンコスト削減",
-    "Claude Code — /loop コマンド追加、音声入力が10言語に拡大",
+    "Rork Max — ネイティブSwiftアプリをノーコードで生成、a16z出資で注目急上昇",
+    "NEW — Rork Max、iPhone/iPad/Apple Watch/Vision Proに対応、2タップでApp Store申請",
+    "UPDATE — Rork Max、ARKit・LiDARネイティブサポートでAR/空間コンピューティングも開発可能",
+    "Rork — 月間74.3万訪問、85%成長率でノーコードAIアプリビルダーが急拡大",
+    "Gartner — 2026年に低コード/ノーコードツールが新規開発の75%を占める見込み",
+    "Rork — 英語プロンプトだけでiOS/Android同時対応アプリを数分で生成",
   ],
   en: [
-    "NEW — Memory import now available to all users, migrate from ChatGPT & Gemini",
-    "UPDATE — Claude Opus 4.6 released with 1M token context window (beta)",
-    "NEW — Agent Teams launched, multiple AI agents collaborate on tasks in parallel",
-    "Cowork — macOS desktop available for Pro plan users with local VM support",
-    "API — Web search tool now GA with dynamic filtering for lower token costs",
-    "Claude Code — New /loop command added, voice STT expanded to 10 languages",
+    "Rork Max — Build native Swift apps with no code, backed by a16z",
+    "NEW — Rork Max supports iPhone, iPad, Apple Watch & Vision Pro with 2-tap App Store publish",
+    "UPDATE — Rork Max adds native ARKit & LiDAR support for AR and spatial computing apps",
+    "Rork — 743K monthly visits with 85% growth rate as AI app builder gains momentum",
+    "Gartner — Low-code/no-code tools projected to cover 75% of new app development in 2026",
+    "Rork — Build iOS & Android apps from plain-English prompts in minutes",
   ],
 };
 
