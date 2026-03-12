@@ -38,6 +38,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       languages: {
         ja: "https://rorklab.net",
         en: "https://rorklab.net/en",
+        "x-default": "https://rorklab.net/en",
       },
     },
   };
