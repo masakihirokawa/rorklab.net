@@ -5,75 +5,52 @@ export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
 export default async function Image() {
+  const brand  = "#E8B44C";
+  const bgFrom = "#080e0b";
+  const bgMid  = "#0a1210";
+  const bgTo   = "#0e1a14";
+
   return new ImageResponse(
     (
       <div
         style={{
-          width: "100%",
-          height: "100%",
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "linear-gradient(135deg, #0c0c14 0%, #16162a 60%, #1a1a32 100%)",
-          fontFamily: "sans-serif",
+          width: 1200, height: 630, display: "flex", position: "relative",
+          background: `linear-gradient(135deg, ${bgFrom} 0%, ${bgMid} 50%, ${bgTo} 100%)`,
+          overflow: "hidden", fontFamily: "sans-serif",
         }}
       >
-        {/* Logo mark — matches favicon */}
-        <div
-          style={{
-            width: 96,
-            height: 96,
-            borderRadius: 20,
-            background: "linear-gradient(135deg, #E8967D, #D4785E)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: 56,
-            fontWeight: 700,
-            color: "#0c0c14",
-            marginBottom: 36,
-            boxShadow: "0 8px 32px rgba(232, 150, 125, 0.3)",
-          }}
-        >
-          R
+        {/* Top accent */}
+        <div style={{ position:"absolute", top:0, left:0, width:1200, height:3, background:brand, opacity:0.75, display:"flex" }} />
+        {/* Right dot grid */}
+        <div style={{ position:"absolute", left:580, top:0, width:620, height:630,
+          backgroundImage:`radial-gradient(circle, ${brand}42 1.5px, transparent 1.5px)`,
+          backgroundSize:"26px 26px", display:"flex" }} />
+        {/* Glow */}
+        <div style={{ position:"absolute", left:620, top:65, width:560, height:500,
+          borderRadius:"50%", background:`radial-gradient(ellipse, ${brand}18 0%, transparent 65%)`, display:"flex" }} />
+        {/* Letter fill */}
+        <div style={{ position:"absolute", left:720, top:60, fontSize:420, fontWeight:800,
+          color:brand, opacity:0.10, lineHeight:1, display:"flex" }}>R</div>
+        {/* Letter outline */}
+        <div style={{ position:"absolute", left:720, top:60, fontSize:420, fontWeight:800,
+          color:"transparent", WebkitTextStroke:`3px ${brand}68`, lineHeight:1, display:"flex" }}>R</div>
+        {/* Content */}
+        <div style={{ position:"absolute", left:80, top:138, display:"flex", flexDirection:"column" }}>
+          <div style={{ display:"flex", alignItems:"center", backgroundColor:`${brand}22`,
+            border:`1px solid ${brand}44`, borderRadius:4, padding:"5px 14px", marginBottom:38 }}>
+            <span style={{ fontSize:12, fontWeight:700, letterSpacing:"1.8px", color:brand }}>RORK AI KNOWLEDGE BASE</span>
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", marginBottom:28 }}>
+            <span style={{ fontSize:84, fontWeight:800, color:"#ffffff", letterSpacing:"-2px", lineHeight:1 }}>Rork</span>
+            <span style={{ fontSize:84, fontWeight:300, color:"#ffffff", opacity:0.78, letterSpacing:"-2px", lineHeight:1 }}>Lab</span>
+          </div>
+          <span style={{ fontSize:22, color:brand, opacity:0.88, letterSpacing:"1px", marginBottom:22 }}>rorklab.net</span>
+          <div style={{ width:440, height:1, backgroundColor:`${brand}38`, display:"flex" }} />
         </div>
-
-        {/* Site name */}
-        <div
-          style={{
-            fontSize: 52,
-            fontWeight: 700,
-            color: "#f0f0f0",
-            letterSpacing: "-0.02em",
-            marginBottom: 12,
-          }}
-        >
-          Rork Lab
-        </div>
-
-        {/* URL */}
-        <div
-          style={{
-            fontSize: 20,
-            color: "#777",
-            textAlign: "center",
-            lineHeight: 1.5,
-          }}
-        >
-          rorklab.net
-        </div>
-
-        {/* Accent line */}
-        <div
-          style={{
-            width: 80,
-            height: 3,
-            borderRadius: 2,
-            background: "linear-gradient(90deg, #E8967D, transparent)",
-            marginTop: 32,
-          }}
-        />
+        {/* Credit */}
+        <div style={{ position:"absolute", left:80, bottom:34, fontSize:13, letterSpacing:"2.5px", color:"#ffffff", opacity:0.28, display:"flex" }}>DOLICE LABS</div>
+        {/* Bottom accent */}
+        <div style={{ position:"absolute", bottom:0, left:0, width:1200, height:3, background:brand, opacity:0.4, display:"flex" }} />
       </div>
     ),
     { ...size }
