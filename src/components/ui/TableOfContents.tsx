@@ -8,8 +8,13 @@ interface TocItem {
   level: number;
 }
 
-export function TableOfContents({ locale }: { locale: string }) {
-  const [items, setItems] = useState<TocItem[]>([]);
+interface Props {
+  locale: string;
+  initialItems?: TocItem[];
+}
+
+export function TableOfContents({ locale, initialItems = [] }: Props) {
+  const [items, setItems] = useState<TocItem[]>(initialItems);
   const [activeId, setActiveId] = useState<string>("");
   const label = locale === "ja" ? "目次" : "Contents";
 
