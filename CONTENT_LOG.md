@@ -61,7 +61,7 @@
 
 ---
 
-## Blog（ニュース・アップデート）— 計 4本 × 2言語
+## Blog（ニュース・アップデート）— 計 5本 × 2言語
 
 | Slug | Title (JA) | Date |
 |------|------------|------|
@@ -69,6 +69,7 @@
 | rork-max-launch | Rork Max がローンチ — ネイティブ Swift アプリを AI で構築する新時代 | 2026-03-10 |
 | rork-react-native-vs-swift | Rork の React Native と Rork Max の Swift — 技術選択ガイド | 2026-03-10 |
 | rork-app-store-submission-guide | Rork Max で作ったアプリを App Store に出すまで — 審査通過の実録 | 2026-03-13 |
+| rork-2026-updates | Rork 2026 アップデートまとめ — Fix Now・Companion・Rork Max の進化 | 2026-03-13 |
 
 ---
 
@@ -85,8 +86,8 @@
 ### Blog
 - Rork Max 新モデル対応まとめ
 - Rork × Google Play 公開事例
-- Rork 2026 アップデートまとめ
+~~- Rork 2026 アップデートまとめ~~ ✅ 2026-03-13 追加済み
 
 ---
 
-*最終更新: 2026-03-13*
+*最終更新: 2026-03-13 (blog: +1, 計5本)*
