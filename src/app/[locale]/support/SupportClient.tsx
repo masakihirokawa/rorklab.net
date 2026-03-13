@@ -105,7 +105,7 @@ export function SupportClient({
           <button
             onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
             disabled={loading === "pro"}
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "14px 24px", borderRadius: 10, border: "none", background: "var(--accent-coral)", color: "#fff", fontSize: 15, fontWeight: 600, cursor: loading === "pro" ? "wait" : "pointer", opacity: loading === "pro" ? 0.7 : 1, transition: "opacity 0.2s, transform 0.15s" }}
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "14px 24px", borderRadius: 10, border: "none", background: "var(--accent-coral)", color: "#0a2618", fontSize: 15, fontWeight: 600, cursor: loading === "pro" ? "wait" : "pointer", opacity: loading === "pro" ? 0.7 : 1, transition: "opacity 0.2s, transform 0.15s" }}
             onMouseEnter={(e) => { if (loading !== "pro") e.currentTarget.style.transform = "translateY(-1px)"; }}
             onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; }}
           >
