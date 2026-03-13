@@ -91,8 +91,16 @@ async function generateArticleIndex() {
         const { data, content } = matter(raw);
         const slug = file.replace(/\.mdx$/, "");
 
+        // Strip hardcoded "## 関連記事" / "## Related Articles" sections (RelatedArticles.tsx handles this dynamically)
+        let cleanedContent = content;
+        const relatedPattern = /\n---\s*\n+##\s*(関連記事|Related Articles)\s*\n[\s\S]*$/;
+        if (relatedPattern.test(cleanedContent)) {
+          console.warn(`  ⚠ AUTO-FIX: ${locale}/${category}/${file}: removed hardcoded related articles section (RelatedArticles.tsx handles this)`);
+          cleanedContent = cleanedContent.replace(relatedPattern, '\n');
+        }
+
         // Compile MDX/markdown to HTML at build time
-        const html = await compileMarkdown(content);
+        const html = await compileMarkdown(cleanedContent);
 
         // Validate: warn if compiled HTML still has hardcoded locale-prefixed article links
         if (/href="\/articles\/(ja|en)\//.test(html)) {
@@ -169,7 +177,15 @@ async function generateBlogIndex() {
       const { data, content } = matter(raw);
       const slug = file.replace(/\.mdx$/, "");
 
-      const html = await compileMarkdown(content);
+      // Strip hardcoded "## 関連記事" / "## Related Articles" sections (RelatedArticles.tsx handles this dynamically)
+      let cleanedContent = content;
+      const relatedPattern = /\n---\s*\n+##\s*(関連記事|Related Articles)\s*\n[\s\S]*$/;
+      if (relatedPattern.test(cleanedContent)) {
+        console.warn(`  ⚠ AUTO-FIX: ${locale}/${file}: removed hardcoded related articles section (RelatedArticles.tsx handles this)`);
+        cleanedContent = cleanedContent.replace(relatedPattern, '\n');
+      }
+
+      const html = await compileMarkdown(cleanedContent);
 
       result[locale].push({
         title: data.title || "",
