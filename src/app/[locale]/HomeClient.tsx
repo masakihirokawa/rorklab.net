@@ -14,15 +14,15 @@ const CATEGORIES = [
 ];
 
 const GUIDES_DARK = {
-  purple: "linear-gradient(135deg, #1a1a2e 0%, #2d1b3d 100%)",
-  green: "linear-gradient(135deg, #1a2e1a 0%, #1b3d2d 100%)",
-  red: "linear-gradient(135deg, #2e1a1a 0%, #3d1b1b 100%)",
+  purple: "linear-gradient(135deg, #0d0f2b 0%, #1a1060 55%, #280d78 100%)",
+  green: "linear-gradient(135deg, #0a1a10 0%, #0f3320 55%, #164528 100%)",
+  red: "linear-gradient(135deg, #1a0a0e 0%, #330f18 55%, #4a1525 100%)",
 };
 
 const GUIDES_LIGHT = {
-  purple: "linear-gradient(135deg, #f0eef5 0%, #e8e0f0 100%)",
-  green: "linear-gradient(135deg, #eef5ee 0%, #e0f0e3 100%)",
-  red: "linear-gradient(135deg, #f5eeee 0%, #f0e0e0 100%)",
+  purple: "linear-gradient(135deg, #edeeff 0%, #d8d5fc 55%, #c5bcf8 100%)",
+  green: "linear-gradient(135deg, #e8f8ee 0%, #cdf0d8 55%, #b5e8c6 100%)",
+  red: "linear-gradient(135deg, #fdedf2 0%, #f8d4de 55%, #f2bcc9 100%)",
 };
 
 const GUIDES: Record<string, { title: string; desc: string; articles: number; level: string; colorKey: keyof typeof GUIDES_DARK; href: string }[]> = {
