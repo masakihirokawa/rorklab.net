@@ -3,7 +3,6 @@ import { notFound } from "next/navigation";
 import { getArticle, getAllArticleSlugs, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { BookRecommendation } from "@/components/ui/BookRecommendation";
-import { PremiumPaywall } from "@/components/ui/PremiumPaywall";
 import { ShareButtons } from "@/components/ui/ShareButtons";
 import { RelatedArticles } from "@/components/ui/RelatedArticles";
 import { TableOfContents } from "@/components/ui/TableOfContents";
@@ -261,22 +260,16 @@ export default async function ArticlePage({ params }: Props) {
       {/* Table of Contents */}
       <TableOfContents locale={locale} initialItems={extractTocItems(article.content)} />
 
-      {/* Article Content (pre-compiled HTML) */}
-      {article.meta.premium ? (
-        <>
-          <div
-            className="article-content"
-            style={{ maxHeight: 600, overflow: "hidden" }}
-            dangerouslySetInnerHTML={{ __html: article.content }}
-          />
-          <PremiumPaywall locale={locale} />
-        </>
-      ) : (
-        <div
-          className="article-content"
-          dangerouslySetInnerHTML={{ __html: article.content }}
-        />
+      {/* Article Content — paywall temporarily disabled; full content shown */}
+      {article.meta.premium && (
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: 4, border: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace", marginBottom: 24 }}>
+          ✦ {locale === "ja" ? "プレミアム記事" : "Premium Article"}
+        </div>
       )}
+      <div
+        className="article-content"
+        dangerouslySetInnerHTML={{ __html: article.content }}
+      />
 
       {/* Share Buttons */}
       <ShareButtons

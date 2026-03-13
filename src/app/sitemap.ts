@@ -21,6 +21,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
   const entries: MetadataRoute.Sitemap = [];
 
+  // ⚠ Keep SITE_LAUNCHED fixed — never use new Date() for static pages (causes SEO churn)
+  const SITE_LAUNCHED = new Date("2026-01-01");
   // Static pages with alternates
   for (const page of staticPages) {
     const jaUrl = `${baseUrl}${page.path || ""}`;
@@ -28,7 +30,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
     entries.push({
       url: jaUrl,
-      lastModified: new Date(),
+      lastModified: SITE_LAUNCHED,
       changeFrequency: page.freq,
       priority: page.priority,
       alternates: {
@@ -37,7 +39,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: new Date(),
+      lastModified: SITE_LAUNCHED,
       changeFrequency: page.freq,
       priority: Math.max(page.priority - 0.1, 0.3),
       alternates: {
@@ -56,7 +58,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
     entries.push({
       url: jaUrl,
-      lastModified: date ? new Date(date) : new Date(),
+      lastModified: date ? new Date(date) : SITE_LAUNCHED,
       changeFrequency: "weekly",
       priority: 0.9,
       alternates: {
@@ -65,7 +67,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: date ? new Date(date) : new Date(),
+      lastModified: date ? new Date(date) : SITE_LAUNCHED,
       changeFrequency: "weekly",
       priority: 0.8,
       alternates: {
@@ -83,7 +85,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
     entries.push({
       url: jaUrl,
-      lastModified: post.date ? new Date(post.date) : new Date(),
+      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED,
       changeFrequency: "monthly",
       priority: 0.7,
       alternates: {
@@ -92,7 +94,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: post.date ? new Date(post.date) : new Date(),
+      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED,
       changeFrequency: "monthly",
       priority: 0.6,
       alternates: {
