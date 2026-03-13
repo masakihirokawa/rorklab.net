@@ -1,6 +1,10 @@
 /**
  * Pre-build script: Reads all MDX articles, compiles to HTML,
  * and generates a JSON index for runtime use on Cloudflare Workers.
+ *
+ * Performance note: The unified processor is created ONCE at module
+ * level and reused for all articles to avoid re-initializing shiki's
+ * WASM highlighter on every file (which caused OOM on Cloudflare Pages).
  */
 import fs from "fs";
 import path from "path";
@@ -14,6 +18,24 @@ import rehypePrettyCode from "rehype-pretty-code";
 
 const CONTENT_DIR = path.join(process.cwd(), "content");
 const OUTPUT_DIR = path.join(process.cwd(), "src", "generated");
+
+/**
+ * Single shared processor — created once so shiki is initialized only once.
+ * Calling .freeze() makes it safe to call .process() concurrently/repeatedly.
+ */
+const processor = unified()
+  .use(remarkParse)
+  .use(remarkRehype, { allowDangerousHtml: true })
+  .use(rehypeRaw)
+  .use(rehypePrettyCode, {
+    theme: {
+      dark: "github-dark-dimmed",
+      light: "github-light",
+    },
+    keepBackground: false,
+  })
+  .use(rehypeStringify)
+  .freeze();
 
 /**
  * Convert Callout syntax in MDX to HTML before markdown processing.
@@ -39,21 +61,7 @@ function processCallouts(content) {
 async function compileMarkdown(content) {
   // Process custom components first
   const processed = processCallouts(content);
-
-  const result = await unified()
-    .use(remarkParse)
-    .use(remarkRehype, { allowDangerousHtml: true })
-    .use(rehypeRaw)
-    .use(rehypePrettyCode, {
-      theme: {
-        dark: "github-dark-dimmed",
-        light: "github-light",
-      },
-      keepBackground: false,
-    })
-    .use(rehypeStringify)
-    .process(processed);
-
+  const result = await processor.process(processed);
   return String(result);
 }
 
