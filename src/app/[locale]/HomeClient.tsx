@@ -208,7 +208,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
             onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
             onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
           >
-            {t("sections.allArticles")}
+            {t("sections.allArticles").replace(" →", "")} ({articles.length}) →
           </a>
         </div>
 
