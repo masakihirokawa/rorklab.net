@@ -284,3 +284,52 @@ CLOUDFLARE_API_TOKEN=xxx npx wrangler pages deploy .open-next/assets --project-n
 | @opennextjs/cloudflare | ^1.17.1 | Cloudflare Pages アダプター |
 | tailwindcss | ^4 | スタイル |
 | wrangler | ^4.71.0 | Cloudflare CLI |
+
+
+---
+
+## ⚠ 既知の問題と対応（2026-03-13）
+
+### 1. MDX 内ハードコードの関連記事リンクによる架空記事表示
+
+**症状**: 記事ページに「関連記事」が2重に表示される。上側の関連記事がリンク切れ（404）になる。
+
+**原因**: 一部の MDX ファイルに `## 関連記事` / `## Related Articles` セクションがハードコードされており、
+動的な `RelatedArticles.tsx` コンポーネントとは別に表示されていた。
+さらにそのリンクのURLが `/articles/ja/category/slug`（正しくは `/articles/category/slug`）や
+`/articles/en/category/slug`（正しくは `/en/articles/category/slug`）という
+間違ったロケールプレフィックス形式だった。
+
+**正しいURL形式**（next-intl `localePrefix: "as-needed"` の場合）:
+- 日本語（デフォルトロケール）: `/articles/{category}/{slug}`
+- 英語: `/en/articles/{category}/{slug}`
+
+**対応**:
+1. MDX ファイル内のハードコード `## 関連記事` セクションを全削除（`RelatedArticles.tsx` が動的に処理するため不要）
+2. MDX 内に残るインラインリンクのロケールプレフィックスを修正
+3. `scripts/generate-content.mjs` にバリデーションを追加:
+   コンパイル後 HTML に `href="/articles/ja/` または `href="/articles/en/` が含まれる場合、
+   コンソールに `⚠ WARNING` を出力するようにした（誤ったリンクの早期検出のため）。
+
+### 2. Tailwind v4 Preflight によるリストスタイル消去
+
+**症状**: 記事本文の `<ul>` / `<ol>` リストに「・」や番号が表示されない。
+
+**原因**: `@import "tailwindcss"` （Tailwind v4）の Preflight CSS が `list-style: none` を全 `ul`/`ol` に適用する。
+
+**対応**: `globals.css` の `.article-content ul/ol` に `list-style-type` と `li::marker` スタイルを明示指定:
+```css
+.article-content ul { list-style-type: disc; }
+.article-content ul ul { list-style-type: circle; }
+.article-content ol { list-style-type: decimal; }
+.article-content li::marker { color: var(--text-secondary); }
+```
+
+### 3. パンくずリストのロケール未対応
+
+**症状**: 日本語ページの記事パンくずリストに「Articles」と英語表示になる。
+
+**対応**: `src/app/[locale]/articles/[category]/[slug]/page.tsx` のパンくずリストを修正:
+```tsx
+{locale === "ja" ? "記事一覧" : "Articles"}
+```

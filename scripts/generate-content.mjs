@@ -94,6 +94,11 @@ async function generateArticleIndex() {
         // Compile MDX/markdown to HTML at build time
         const html = await compileMarkdown(content);
 
+        // Validate: warn if compiled HTML still has hardcoded locale-prefixed article links
+        if (/href="\/articles\/(ja|en)\//.test(html)) {
+          console.warn(`  ⚠ WARNING: ${locale}/${category}/${file}: hardcoded locale-prefixed article link found. Fix: use /articles/... (JA) or /en/articles/... (EN)`);
+        }
+
         result[locale].push({
           title: data.title || "",
           slug,
