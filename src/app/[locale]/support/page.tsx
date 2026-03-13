@@ -7,12 +7,12 @@ interface Props {
 
 const META: Record<string, { title: string; description: string }> = {
   ja: {
-    title: "Rork Lab を応援する",
-    description: "Rork Lab の活動を支援していただける方へ。Ko-fi、PayPal、Wise、Revolut でサポートできます。",
+    title: "メンバーシップ & サポート — Rork Lab",
+    description: "Rork Lab Pro メンバーシップで全プレミアム記事にアクセス。月額 ¥500 または永久アクセス ¥2,980。",
   },
   en: {
-    title: "Support Rork Lab",
-    description: "Support Rork Lab's work. You can contribute via Ko-fi, PayPal, Wise, or Revolut.",
+    title: "Membership & Support — Rork Lab",
+    description: "Get full access to all premium articles with Rork Lab Pro. $5/month or $19 lifetime.",
   },
 };
 
@@ -30,13 +30,30 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 }
 
 const STRIPE_TIP: Record<string, { priceId: string }> = {
-  ja: { priceId: "price_1TALKCEGB5g6A54o7MmhnvBC" }, // ¥300 JPY
-  en: { priceId: "price_1TALKDEGB5g6A54os1T6NO1C" }, // $3 USD
+  ja: { priceId: "price_1TALKCEGB5g6A54o7MmhnvBC" },
+  en: { priceId: "price_1TALKDEGB5g6A54os1T6NO1C" },
+};
+
+const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; price: string }; premium: { priceId: string; label: string; price: string } }> = {
+  ja: {
+    pro: { priceId: "price_1T9XeNEGB5g6A54ofvfbFcSm", label: "Pro — 月額プラン", price: "¥500/月" },
+    premium: { priceId: "price_1T9XdUEGB5g6A54oZw62YMLI", label: "Premium — 永久アクセス", price: "¥2,980" },
+  },
+  en: {
+    pro: { priceId: "price_1TALKEEGB5g6A54oBmnhCclK", label: "Pro — Monthly", price: "$5/mo" },
+    premium: { priceId: "price_1TALKFEGB5g6A54oZp3kYK0z", label: "Premium — Lifetime", price: "$19" },
+  },
 };
 
 const CONTENT: Record<string, {
   heading: string;
   sub: string;
+  membershipHeading: string;
+  membershipSub: string;
+  features: string[];
+  proLabel: string;
+  premiumLabel: string;
+  tipHeading: string;
   note: string;
   tipLabel: string;
   tipSub: string;
@@ -48,97 +65,54 @@ const CONTENT: Record<string, {
     url: string;
     color: string;
     global?: boolean;
-    jp?: boolean;
   }[];
 }> = {
   ja: {
-    heading: "Rork Lab を応援する",
-    sub: "このサイトは広告なし・完全無料で運営しています。もし役に立ったと感じていただけたら、コーヒー一杯分のサポートをいただけると嬉しいです ♥",
-    note: "※ サポートは任意です。いただいたご支援はサーバー費用・コンテンツ制作に使わせていただきます。",
+    heading: "メンバーシップ & サポート",
+    sub: "Rork Lab の記事は無料でお読みいただけます。プレミアム記事や広告非表示をご希望の方は、Pro メンバーシップをご検討ください。",
+    membershipHeading: "Rork Lab Pro",
+    membershipSub: "すべてのプレミアム記事にアクセス",
+    features: [
+      "プレミアム記事が読み放題（週2本追加）",
+      "深掘り技術チュートリアル & 実践コード",
+      "広告なしの快適な閲覧体験",
+      "いつでもキャンセル可能",
+    ],
+    proLabel: "月額プランで始める",
+    premiumLabel: "永久アクセスを購入",
+    tipHeading: "チップで応援する",
+    note: "※ いただいたご支援はサーバー費用・コンテンツ制作に使わせていただきます。",
     tipLabel: "¥300 チップを送る",
     tipSub: "Stripe 決済（クレジットカード対応）",
     methods: [
-      {
-        name: "Ko-fi",
-        icon: "☕",
-        label: "Ko-fi でサポート",
-        sub: "ko-fi.com/dolice",
-        url: "https://ko-fi.com/dolice",
-        color: "#29ABE0",
-        global: true,
-      },
-      {
-        name: "PayPal",
-        icon: "🅿",
-        label: "PayPal で送金",
-        sub: "paypal.me/masakihirokawa",
-        url: "https://www.paypal.com/paypalme/masakihirokawa",
-        color: "#003087",
-        global: true,
-      },
-      {
-        name: "Wise",
-        icon: "🌍",
-        label: "Wise で送金",
-        sub: "wise.com/pay/me/masakih65",
-        url: "https://wise.com/pay/me/masakih65",
-        color: "#9FE870",
-        global: true,
-      },
-      {
-        name: "Revolut",
-        icon: "⚡",
-        label: "Revolut で送金",
-        sub: "@masakihirokawa",
-        url: "https://revolut.me/masakihirokawa",
-        color: "#191C1F",
-        global: true,
-      },
+      { name: "Ko-fi", icon: "☕", label: "Ko-fi でサポート", sub: "ko-fi.com/dolice", url: "https://ko-fi.com/dolice", color: "#29ABE0", global: true },
+      { name: "PayPal", icon: "🅿", label: "PayPal で送金", sub: "paypal.me/masakihirokawa", url: "https://www.paypal.com/paypalme/masakihirokawa", color: "#003087", global: true },
+      { name: "Wise", icon: "🌍", label: "Wise で送金", sub: "wise.com/pay/me/masakih65", url: "https://wise.com/pay/me/masakih65", color: "#9FE870", global: true },
+      { name: "Revolut", icon: "⚡", label: "Revolut で送金", sub: "@masakihirokawa", url: "https://revolut.me/masakihirokawa", color: "#191C1F", global: true },
     ],
   },
   en: {
-    heading: "Support Rork Lab",
-    sub: "Rork Lab is free and ad-free. If you've found it helpful, a small contribution means a lot and helps keep the site running ♥",
-    note: "* Support is entirely optional. All contributions go toward server costs and content creation.",
+    heading: "Membership & Support",
+    sub: "Rork Lab articles are free to read. For premium articles and an ad-free experience, consider joining Pro.",
+    membershipHeading: "Rork Lab Pro",
+    membershipSub: "Full access to all premium articles",
+    features: [
+      "Unlimited access to premium articles (2 new per week)",
+      "In-depth technical tutorials & working code",
+      "Ad-free reading experience",
+      "Cancel anytime",
+    ],
+    proLabel: "Start Monthly Plan",
+    premiumLabel: "Buy Lifetime Access",
+    tipHeading: "Leave a Tip",
+    note: "* All contributions go toward server costs and content creation.",
     tipLabel: "Send $3 Tip",
     tipSub: "Stripe checkout (credit card)",
     methods: [
-      {
-        name: "Ko-fi",
-        icon: "☕",
-        label: "Support on Ko-fi",
-        sub: "ko-fi.com/dolice",
-        url: "https://ko-fi.com/dolice",
-        color: "#29ABE0",
-        global: true,
-      },
-      {
-        name: "PayPal",
-        icon: "🅿",
-        label: "Send via PayPal",
-        sub: "paypal.me/masakihirokawa",
-        url: "https://www.paypal.com/paypalme/masakihirokawa",
-        color: "#003087",
-        global: true,
-      },
-      {
-        name: "Wise",
-        icon: "🌍",
-        label: "Send via Wise",
-        sub: "wise.com/pay/me/masakih65",
-        url: "https://wise.com/pay/me/masakih65",
-        color: "#9FE870",
-        global: true,
-      },
-      {
-        name: "Revolut",
-        icon: "⚡",
-        label: "Send via Revolut",
-        sub: "@masakihirokawa",
-        url: "https://revolut.me/masakihirokawa",
-        color: "#191C1F",
-        global: true,
-      },
+      { name: "Ko-fi", icon: "☕", label: "Support on Ko-fi", sub: "ko-fi.com/dolice", url: "https://ko-fi.com/dolice", color: "#29ABE0", global: true },
+      { name: "PayPal", icon: "🅿", label: "Send via PayPal", sub: "paypal.me/masakihirokawa", url: "https://www.paypal.com/paypalme/masakihirokawa", color: "#003087", global: true },
+      { name: "Wise", icon: "🌍", label: "Send via Wise", sub: "wise.com/pay/me/masakih65", url: "https://wise.com/pay/me/masakih65", color: "#9FE870", global: true },
+      { name: "Revolut", icon: "⚡", label: "Send via Revolut", sub: "@masakihirokawa", url: "https://revolut.me/masakihirokawa", color: "#191C1F", global: true },
     ],
   },
 };
@@ -146,6 +120,7 @@ const CONTENT: Record<string, {
 export default async function SupportPage({ params }: Props) {
   const { locale } = await params;
   const c = CONTENT[locale] || CONTENT.en;
+  const plans = STRIPE_PLANS[locale] || STRIPE_PLANS.en;
 
-  return <SupportClient content={c} locale={locale} stripeTip={STRIPE_TIP[locale] || STRIPE_TIP.en} />;
+  return <SupportClient content={c} locale={locale} stripeTip={STRIPE_TIP[locale] || STRIPE_TIP.en} plans={plans} />;
 }
