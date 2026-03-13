@@ -205,6 +205,8 @@ CLOUDFLARE_API_TOKEN=xxx npx wrangler pages deploy .open-next/assets --project-n
 - Build output directory: `.open-next/assets`
 - 環境変数: STRIPE_SECRET_KEY, STRIPE_PRICE_ID（必要に応じて）
 
+> ⚠️ **重要 — generate-content.mjs の OOM 対策**: `unified()` プロセッサをモジュール先頭で1回だけ作成し `.freeze()` を呼ぶこと。記事ごとに `unified()` を新規作成すると shiki WASM が毎回初期化されて Cloudflare Pages ビルドが OOM で失敗する。
+
 ### 8. Stripe 統合
 
 - `src/app/api/checkout/route.ts` — Checkout Session 作成（subscription mode）
