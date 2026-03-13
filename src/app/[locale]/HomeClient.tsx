@@ -14,9 +14,9 @@ const CATEGORIES = [
 ];
 
 const GUIDES_DARK = {
-  purple: "linear-gradient(135deg, #141632 0%, #1d1760 55%, #231470 100%)",
-  green: "linear-gradient(135deg, #0d2015 0%, #133825 55%, #183f28 100%)",
-  red: "linear-gradient(135deg, #1c1018 0%, #2e1322 55%, #3d1828 100%)",
+  purple: "linear-gradient(135deg, #20223e 0%, #29236c 55%, #2f207c 100%)",
+  green: "linear-gradient(135deg, #192c21 0%, #1f4431 55%, #244b34 100%)",
+  red: "linear-gradient(135deg, #281c24 0%, #3a1f2e 55%, #492434 100%)",
 };
 
 const GUIDES_LIGHT = {
