@@ -29,8 +29,9 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   };
 }
 
-const STRIPE_TIP = {
-  priceId: "price_1T9XUaEGB5g6A54oKJAHSNWu",
+const STRIPE_TIP: Record<string, { priceId: string }> = {
+  ja: { priceId: "price_1TALKCEGB5g6A54o7MmhnvBC" }, // ¥300 JPY
+  en: { priceId: "price_1TALKDEGB5g6A54os1T6NO1C" }, // $3 USD
 };
 
 const CONTENT: Record<string, {
@@ -54,7 +55,7 @@ const CONTENT: Record<string, {
     heading: "Rork Lab を応援する",
     sub: "このサイトは広告なし・完全無料で運営しています。もし役に立ったと感じていただけたら、コーヒー一杯分のサポートをいただけると嬉しいです ♥",
     note: "※ サポートは任意です。いただいたご支援はサーバー費用・コンテンツ制作に使わせていただきます。",
-    tipLabel: "¥100 チップを送る",
+    tipLabel: "¥300 チップを送る",
     tipSub: "Stripe 決済（クレジットカード対応）",
     methods: [
       {
@@ -99,7 +100,7 @@ const CONTENT: Record<string, {
     heading: "Support Rork Lab",
     sub: "Rork Lab is free and ad-free. If you've found it helpful, a small contribution means a lot and helps keep the site running ♥",
     note: "* Support is entirely optional. All contributions go toward server costs and content creation.",
-    tipLabel: "Send ¥100 Tip",
+    tipLabel: "Send $3 Tip",
     tipSub: "Stripe checkout (credit card)",
     methods: [
       {
@@ -146,5 +147,5 @@ export default async function SupportPage({ params }: Props) {
   const { locale } = await params;
   const c = CONTENT[locale] || CONTENT.en;
 
-  return <SupportClient content={c} locale={locale} stripeTip={STRIPE_TIP} />;
+  return <SupportClient content={c} locale={locale} stripeTip={STRIPE_TIP[locale] || STRIPE_TIP.en} />;
 }

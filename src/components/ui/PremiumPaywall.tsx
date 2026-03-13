@@ -6,6 +6,11 @@ interface PremiumPaywallProps {
   locale: string;
 }
 
+const PRO_PRICE: Record<string, string> = {
+  ja: "price_1T9XeNEGB5g6A54ofvfbFcSm", // ¥500/月 JPY
+  en: "price_1TALKEEGB5g6A54oBmnhCclK",  // $5/mo USD
+};
+
 export function PremiumPaywall({ locale }: PremiumPaywallProps) {
   const [loading, setLoading] = useState(false);
 
@@ -15,7 +20,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
       const res = await fetch("/api/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ locale }),
+        body: JSON.stringify({ locale, priceId: PRO_PRICE[locale] || PRO_PRICE.en, mode: "subscription" }),
       });
       const data = await res.json();
       if (data.url) {
@@ -77,7 +82,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
         >
           {locale === "ja"
             ? "この記事の続きを読むには Rork Lab Pro メンバーシップが必要です。月額 ¥500 ですべての有料記事にアクセスできます。"
-            : "A Rork Lab Pro membership is required to read the rest of this article. Get access to all premium articles for ¥500/month."}
+            : "A Rork Lab Pro membership is required to read the rest of this article. Get access to all premium articles for $5/month."}
         </p>
         <button
           onClick={handleCheckout}
@@ -104,7 +109,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
               : "Loading..."
             : locale === "ja"
               ? "Pro メンバーになる — ¥500/月"
-              : "Become a Pro Member — ¥500/mo"}
+              : "Become a Pro Member — $5/mo"}
         </button>
         <div
           style={{
