@@ -280,7 +280,7 @@ export default async function ArticlePage({ params }: Props) {
         <>
           <div
             className="article-content"
-            dangerouslySetInnerHTML={{ __html: article.content.slice(0, 2000) }}
+            dangerouslySetInnerHTML={{ __html: article.content.slice(0, 4500) }}
           />
           <PremiumPaywall locale={locale} />
         </>

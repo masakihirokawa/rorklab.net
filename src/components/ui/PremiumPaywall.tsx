@@ -44,10 +44,10 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
     <div
       style={{
         position: "relative",
-        marginTop: -120,
-        paddingTop: 120,
+        marginTop: -200,
+        paddingTop: 200,
         background:
-          "linear-gradient(to bottom, transparent 0%, var(--bg-primary) 40%)",
+          "linear-gradient(to bottom, transparent 0%, var(--bg-primary) 65%)",
       }}
     >
       <div

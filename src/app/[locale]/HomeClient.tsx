@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useTranslations } from "next-intl";
 import { useTheme } from "next-themes";
 import { LevelBadge } from "@/components/ui/LevelBadge";
@@ -58,12 +58,21 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
   const t = useTranslations();
   const { theme } = useTheme();
   const [mounted, setMounted] = useState(false);
+  const [skipAnim, setSkipAnim] = useState(false);
+  const [skipAnim, setSkipAnim] = useState(false);
   const [hoveredCat, setHoveredCat] = useState<string | null>(null);
   const [hoveredArticle, setHoveredArticle] = useState<number | null>(null);
 
-  useEffect(() => setMounted(true), []);
+  useEffect(() => {
+    if (sessionStorage.getItem('rorklab-hero-seen')) {
+      setSkipAnim(true);
+    } else {
+      sessionStorage.setItem('rorklab-hero-seen', '1');
+    }
+    setMounted(true);
+  }, []);
 
-  const isDark = !mounted || theme === "dark";
+  const isDark = (!mounted && !skipAnim) || theme === "dark";
 
   const catColor = (id: string) => CATEGORIES.find((c) => c.id === id)?.color || "var(--text-muted)";
 
@@ -101,8 +110,8 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
         />
 
         <div
-          className={mounted ? "animate-fade-up" : ""}
-          style={{ position: "relative", zIndex: 1, padding: "0 24px", opacity: mounted ? 1 : 0 }}
+          className={mounted && !skipAnim ? "animate-fade-up" : ""}
+          style={{ position: "relative", zIndex: 1, padding: "0 24px", opacity: mounted || skipAnim ? 1 : 0 }}
         >
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.2em", marginBottom: 24 }}>
             {t("site.poweredBy")}
@@ -162,7 +171,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               <a
                 key={cat.id}
                 href={`${prefix}/articles/${cat.id}`}
-                className={mounted ? "animate-fade-up" : ""}
+                className={mounted && !skipAnim ? "animate-fade-up" : ""}
                 style={{
                   display: "block", padding: "28px 24px", textDecoration: "none",
                   border: `1px solid ${hoveredCat === cat.id ? "var(--border-hover)" : "var(--border-subtle)"}`,
@@ -222,7 +231,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               <a
                 key={`${article.category}/${article.slug}`}
                 href={articleUrl(article)}
-                className={mounted ? "animate-fade-up" : ""}
+                className={mounted && !skipAnim ? "animate-fade-up" : ""}
                 style={{
                   display: "block", padding: "24px 0",
                   borderBottom: "1px solid var(--border-subtle)",
@@ -265,7 +274,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
             <a
               key={i}
               href={guide.href}
-              className={`guide-card${mounted ? " animate-fade-up" : ""}`}
+              className={`guide-card${mounted && !skipAnim ? " animate-fade-up" : ""}`}
               style={{
                 display: "block", padding: "32px 28px", borderRadius: 8,
                 background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
