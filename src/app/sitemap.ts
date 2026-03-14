@@ -41,7 +41,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       url: enUrl,
       lastModified: SITE_LAUNCHED,
       changeFrequency: page.freq,
-      priority: Math.max(page.priority - 0.1, 0.3),
+      priority: Number(Math.max(page.priority - 0.1, 0.3).toFixed(1)),
       alternates: {
         languages: { ja: jaUrl, en: enUrl },
       },

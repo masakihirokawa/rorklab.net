@@ -23,7 +23,7 @@ export async function POST(request: NextRequest) {
           quantity: 1,
         },
       ],
-      success_url: `${baseUrl}/${prefix}support?thanks=true`,
+      success_url: `${baseUrl}/${prefix}api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
       cancel_url: `${baseUrl}/${prefix}support`,
       locale: locale === "en" ? "en" : "ja",
     });

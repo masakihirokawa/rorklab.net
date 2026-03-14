@@ -85,7 +85,70 @@ export function SupportClient({
         </p>
       </div>
 
-      {/* Membership Section — temporarily hidden until billing is implemented */}
+      {/* Membership */}
+      <div
+        style={{
+          marginBottom: 40,
+          padding: 28,
+          borderRadius: 12,
+          border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+          background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
+        }}
+      >
+        <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8, textAlign: "center" }}>
+          {content.membershipHeading}
+        </h2>
+        <p style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", marginBottom: 20, lineHeight: 1.7 }}>
+          {content.membershipSub}
+        </p>
+        <ul style={{ listStyle: "none", padding: 0, margin: "0 0 24px", display: "flex", flexDirection: "column", gap: 8 }}>
+          {content.features.map((f, i) => (
+            <li key={i} style={{ fontSize: 14, color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ color: "var(--accent-coral)", fontSize: 12 }}>✓</span> {f}
+            </li>
+          ))}
+        </ul>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <button
+            onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+            disabled={!!loading}
+            style={{
+              width: "100%",
+              padding: "14px 24px",
+              borderRadius: 8,
+              border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+              background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+              color: "var(--accent-coral)",
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: loading ? "wait" : "pointer",
+              opacity: loading ? 0.7 : 1,
+              transition: "all 0.25s",
+            }}
+          >
+            {loading === "pro" ? "..." : `${plans.pro.label} — ${plans.pro.price}`}
+          </button>
+          <button
+            onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
+            disabled={!!loading}
+            style={{
+              width: "100%",
+              padding: "14px 24px",
+              borderRadius: 8,
+              border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+              background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+              color: "var(--accent-coral)",
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: loading ? "wait" : "pointer",
+              opacity: loading ? 0.7 : 1,
+              transition: "all 0.25s",
+            }}
+          >
+            {loading === "premium" ? "..." : `${plans.premium.label} — ${plans.premium.price}`}
+          </button>
+        </div>
+      </div>
 
       {error && <p style={{ color: "#ef4444", fontSize: 13, textAlign: "center", marginBottom: 16 }}>{error}</p>}
 
