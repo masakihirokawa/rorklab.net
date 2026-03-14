@@ -27,7 +27,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
       const res = await fetch("/api/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ locale, priceId, mode }),
+        body: JSON.stringify({ locale, priceId, mode, cancelUrl: window.location.href }),
       });
       const data = await res.json();
       if (data.url) {

@@ -11,9 +11,10 @@ function getStripe() {
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
-    const { locale, priceId, mode } = await request.json();
+    const { locale, priceId, mode, cancelUrl } = await request.json();
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://rorklab.net";
     const prefix = locale === "en" ? "en/" : "";
+    const fallbackCancel = `${baseUrl}/${prefix}support`;
 
     const session = await stripe.checkout.sessions.create({
       mode: mode || "payment",
@@ -24,7 +25,7 @@ export async function POST(request: NextRequest) {
         },
       ],
       success_url: `${baseUrl}/${prefix}api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
-      cancel_url: `${baseUrl}/${prefix}support`,
+      cancel_url: cancelUrl || fallbackCancel,
       locale: locale === "en" ? "en" : "ja",
     });
 
