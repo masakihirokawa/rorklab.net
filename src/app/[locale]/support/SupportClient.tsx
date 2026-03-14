@@ -114,6 +114,7 @@ export function SupportClient({
           </button>
           */}
 
+          {/* Premium one-time button — temporarily hidden until billing is implemented
           <button
             onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
             disabled={loading === "premium"}
@@ -123,6 +124,7 @@ export function SupportClient({
           >
             {loading === "premium" ? "..." : `${content.premiumLabel} — ${plans.premium.price}`}
           </button>
+          */}
         </div>
 
         <div style={{ marginTop: 14, fontSize: 11, color: "var(--text-faint)", textAlign: "center" }}>
