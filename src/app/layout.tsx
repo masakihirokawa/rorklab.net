@@ -23,9 +23,10 @@ export const metadata: Metadata = {
     description:
       "Rork Max の使い方・開発ツール連携・AI モデル統合・収益化まで。初心者〜上級者向け日英ナレッジベース。",
     url: "https://rorklab.net",
+    images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab" }],
   },
   twitter: {
-    card: "summary_large_image",
+    card: "summary",
     site: "@dolice",
     creator: "@dolice",
   },
