@@ -102,6 +102,7 @@ export function SupportClient({
         </ul>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {/* Pro subscription button — temporarily hidden until billing is implemented
           <button
             onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
             disabled={loading === "pro"}
@@ -111,6 +112,7 @@ export function SupportClient({
           >
             {loading === "pro" ? "..." : `${content.proLabel} — ${plans.pro.price}`}
           </button>
+          */}
 
           <button
             onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
