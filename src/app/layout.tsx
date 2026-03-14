@@ -55,5 +55,26 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  return children;
+  return (
+    <html>
+      <head>
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{
+            __html: JSON.stringify({
+              "@context": "https://schema.org",
+              "@type": "Organization",
+              name: "Rork Lab",
+              url: "https://rorklab.net",
+              logo: "https://rorklab.net/icon-512.png",
+              description: "Rork / Rork Max の実践ガイド＆ナレッジベース",
+              founder: { "@type": "Person", name: "Masaki Hirokawa", url: "https://dolice.design" },
+              sameAs: ["https://dolice.design", "https://dolice.net"],
+            }),
+          }}
+        />
+      </head>
+      {children}
+    </html>
+  );
 }
