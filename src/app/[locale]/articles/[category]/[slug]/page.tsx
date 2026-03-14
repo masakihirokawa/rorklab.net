@@ -7,6 +7,7 @@ import { ShareButtons } from "@/components/ui/ShareButtons";
 import { RelatedArticles } from "@/components/ui/RelatedArticles";
 import { TableOfContents } from "@/components/ui/TableOfContents";
 import { PremiumPaywall } from "@/components/ui/PremiumPaywall";
+import { MembershipCTA } from "@/components/ui/MembershipCTA";
 import { getPremiumAccess } from "@/lib/premium";
 
 interface Props {
@@ -293,6 +294,11 @@ export default async function ArticlePage({ params }: Props) {
         title={article.meta.title}
         url={`https://rorklab.net${prefix}/articles/${category}/${slug}`}
       />
+
+      {/* Membership CTA — shown only for non-members on free articles */}
+      {!canViewPremium && !article.meta.premium && (
+        <MembershipCTA locale={locale} />
+      )}
 
       {/* Related Articles */}
       <RelatedArticles
