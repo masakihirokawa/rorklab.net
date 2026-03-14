@@ -108,7 +108,7 @@ export function SupportClient({
             </li>
           ))}
         </ul>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
           <button
             onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
             disabled={!!loading}
