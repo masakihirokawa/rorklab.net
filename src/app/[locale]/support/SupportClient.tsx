@@ -85,52 +85,7 @@ export function SupportClient({
         </p>
       </div>
 
-      {/* Membership Section */}
-      <div style={{ borderRadius: 14, border: "1px solid var(--accent-coral)", background: "color-mix(in srgb, var(--accent-coral) 4%, var(--bg-surface))", padding: "36px 28px", marginBottom: 40 }}>
-        <div style={{ textAlign: "center", marginBottom: 24 }}>
-          <h2 style={{ fontSize: 22, fontWeight: 700, color: "var(--text-primary)", marginBottom: 6 }}>{content.membershipHeading}</h2>
-          <p style={{ fontSize: 14, color: "var(--text-muted)" }}>{content.membershipSub}</p>
-        </div>
-
-        <ul style={{ listStyle: "none", padding: 0, margin: "0 0 28px", display: "flex", flexDirection: "column", gap: 10 }}>
-          {content.features.map((f, i) => (
-            <li key={i} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 14, color: "var(--text-secondary)" }}>
-              <span style={{ color: "var(--accent-coral)", fontSize: 16, flexShrink: 0 }}>✓</span>
-              {f}
-            </li>
-          ))}
-        </ul>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {/* Pro subscription button — temporarily hidden until billing is implemented
-          <button
-            onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
-            disabled={loading === "pro"}
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "14px 24px", borderRadius: 10, border: "none", background: "var(--accent-coral)", color: "#0a2618", fontSize: 15, fontWeight: 600, cursor: loading === "pro" ? "wait" : "pointer", opacity: loading === "pro" ? 0.7 : 1, transition: "opacity 0.2s, transform 0.15s" }}
-            onMouseEnter={(e) => { if (loading !== "pro") e.currentTarget.style.transform = "translateY(-1px)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; }}
-          >
-            {loading === "pro" ? "..." : `${content.proLabel} — ${plans.pro.price}`}
-          </button>
-          */}
-
-          {/* Premium one-time button — temporarily hidden until billing is implemented
-          <button
-            onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
-            disabled={loading === "premium"}
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "14px 24px", borderRadius: 10, border: "1px solid var(--accent-coral)", background: "transparent", color: "var(--accent-coral)", fontSize: 15, fontWeight: 600, cursor: loading === "premium" ? "wait" : "pointer", opacity: loading === "premium" ? 0.7 : 1, transition: "opacity 0.2s, transform 0.15s" }}
-            onMouseEnter={(e) => { if (loading !== "premium") { e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 10%, transparent)"; e.currentTarget.style.transform = "translateY(-1px)"; } }}
-            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.transform = "translateY(0)"; }}
-          >
-            {loading === "premium" ? "..." : `${content.premiumLabel} — ${plans.premium.price}`}
-          </button>
-          */}
-        </div>
-
-        <div style={{ marginTop: 14, fontSize: 11, color: "var(--text-faint)", textAlign: "center" }}>
-          {locale === "ja" ? "Stripe による安全な決済 · いつでもキャンセル可能" : "Secure payment via Stripe · Cancel anytime"}
-        </div>
-      </div>
+      {/* Membership Section — temporarily hidden until billing is implemented */}
 
       {error && <p style={{ color: "#ef4444", fontSize: 13, textAlign: "center", marginBottom: 16 }}>{error}</p>}
 
