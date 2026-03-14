@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useLocale } from "next-intl";
 
 interface ShareButtonsProps {
@@ -7,64 +8,67 @@ interface ShareButtonsProps {
   url: string;
 }
 
+const XIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+  </svg>
+);
+
+const FacebookIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <path d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073C0 18.1 4.388 23.094 10.125 24v-8.437H7.078v-3.49h3.047v-2.66c0-3.025 1.791-4.697 4.533-4.697 1.313 0 2.686.236 2.686.236v2.971H15.83c-1.491 0-1.956.931-1.956 1.886v2.264h3.328l-.532 3.49h-2.796V24C19.612 23.094 24 18.1 24 12.073z" />
+  </svg>
+);
+
+const LinkedInIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 01-2.063-2.065 2.064 2.064 0 112.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
+  </svg>
+);
+
+const CopyIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+    <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+  </svg>
+);
+
+const CheckIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="20 6 9 17 4 12" />
+  </svg>
+);
+
 export function ShareButtons({ title, url }: ShareButtonsProps) {
   const locale = useLocale();
-  const label = locale === "ja" ? "シェア" : "Share";
+  const [copied, setCopied] = useState(false);
+  const isJa = locale === "ja";
 
-  const links = [
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard API not available
+    }
+  };
+
+  const shareLinks = [
     {
       name: "X",
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
-        </svg>
-      ),
-      href: `https://twitter.com/intent/tweet?text=${encodeURIComponent(title)}&url=${encodeURIComponent(url)}&via=dolice`,
-    },
-    {
-      name: "Threads",
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12.186 24h-.007c-3.581-.024-6.334-1.205-8.184-3.509C2.35 18.44 1.5 15.586 1.472 12.01v-.017c.03-3.579.879-6.43 2.525-8.482C5.851 1.205 8.604.024 12.18 0h.014c2.746.02 5.043.725 6.826 2.098 1.677 1.29 2.858 3.13 3.509 5.467l-2.04.569c-.514-1.927-1.404-3.396-2.682-4.43-1.348-1.048-3.195-1.6-5.51-1.616-2.855.02-5.09.978-6.64 2.876-1.44 1.885-2.17 4.403-2.197 7.49.027 3.052.755 5.543 2.18 7.425 1.538 1.927 3.77 2.908 6.64 2.93 2.34-.022 3.972-.553 5.291-1.744 1.43-1.274 2.16-3.005 2.301-5.302-.87.218-1.81.347-2.809.347-2.733 0-5.186-1.182-6.616-3.26l1.62-1.154c1.065 1.506 2.87 2.42 4.98 2.42 1.17 0 2.282-.251 3.24-.705-.115 2.516-.985 4.488-2.566 5.708-1.257.972-2.84 1.462-4.688 1.462-.102 0-.205-.002-.308-.006-2.149-.086-3.89-.863-5.03-2.247C2.455 17.43 1.9 15.657 1.9 13.7c0-.266.01-.536.03-.806l2.006.168a9.267 9.267 0 00-.021.638c0 1.602.424 2.986 1.225 3.992.803 1.007 1.996 1.57 3.435 1.628.088.003.176.005.263.005 1.414 0 2.622-.376 3.458-1.054 1.043-.845 1.607-2.217 1.64-3.969a8.41 8.41 0 00-1.418.117c-1.36.218-2.415.75-3.002 1.498-.35.449-.515.95-.49 1.485l-2-.097c-.045-.944.256-1.84.875-2.618.92-1.175 2.424-1.924 4.24-2.214.64-.103 1.32-.154 2.019-.154.42 0 .845.018 1.262.054-.062-1.256-.477-2.212-1.214-2.815-.713-.582-1.73-.858-3.019-.829l-.051 2.005c.915-.023 1.534.152 1.887.43.38.303.58.797.605 1.467z" />
-        </svg>
-      ),
-      href: `https://www.threads.net/intent/post?url=${encodeURIComponent(url)}&text=${encodeURIComponent(title)}`,
+      icon: <XIcon />,
+      href: `https://twitter.com/intent/tweet?text=${encodeURIComponent(title)}&url=${encodeURIComponent(url)}`,
     },
     {
       name: "Facebook",
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073C0 18.1 4.388 23.094 10.125 24v-8.437H7.078v-3.49h3.047v-2.66c0-3.025 1.791-4.697 4.533-4.697 1.313 0 2.686.236 2.686.236v2.971H15.83c-1.491 0-1.956.931-1.956 1.886v2.264h3.328l-.532 3.49h-2.796V24C19.612 23.094 24 18.1 24 12.073z" />
-        </svg>
-      ),
+      icon: <FacebookIcon />,
       href: `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}`,
     },
     {
       name: "LinkedIn",
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 01-2.063-2.065 2.064 2.064 0 112.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
-        </svg>
-      ),
+      icon: <LinkedInIcon />,
       href: `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(url)}`,
-    },
-    {
-      name: "はてブ",
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M20.47 2H3.53A1.45 1.45 0 002 3.38v17.24A1.45 1.45 0 003.53 22h16.94A1.45 1.45 0 0022 20.62V3.38A1.45 1.45 0 0020.47 2zM8.09 17.27a1.4 1.4 0 01-.56.22 3.21 3.21 0 01-.7.07H3.8V6.44h2.82a3.78 3.78 0 012.56.78 2.62 2.62 0 01.87 2.07 2.43 2.43 0 01-.41 1.42 2.31 2.31 0 01-1.18.89v.06a2.3 2.3 0 011.42.91 2.78 2.78 0 01.5 1.68 2.89 2.89 0 01-.37 1.47 2.6 2.6 0 01-.92 1.05zm5.83.42h-2.17V6.44h2.17zm6.28-1.19a2.66 2.66 0 01-1.11 1 3.89 3.89 0 01-1.73.37 3.84 3.84 0 01-1.72-.37 2.73 2.73 0 01-1.12-1 2.63 2.63 0 01-.39-1.42h2.17a.92.92 0 00.29.65 1.07 1.07 0 00.76.25 1 1 0 00.72-.24.86.86 0 00.27-.65.84.84 0 00-.27-.64 1 1 0 00-.72-.24h-.51v-1.55h.51a.83.83 0 00.63-.23.77.77 0 00.23-.59.74.74 0 00-.24-.57.87.87 0 00-.63-.22.94.94 0 00-.66.22.8.8 0 00-.25.57h-2.13a2.5 2.5 0 01.39-1.35 2.53 2.53 0 011.04-.93 3.47 3.47 0 011.54-.34 3.39 3.39 0 011.52.33 2.47 2.47 0 011 .89 2.23 2.23 0 01.36 1.22 1.94 1.94 0 01-.31 1.1 2.06 2.06 0 01-.87.72 2.13 2.13 0 01.97.78 2.16 2.16 0 01.35 1.22 2.54 2.54 0 01-.4 1.42z" />
-        </svg>
-      ),
-      href: `https://b.hatena.ne.jp/entry/s/${url.replace("https://", "")}`,
-    },
-    {
-      name: "LINE",
-      icon: (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M19.365 9.864c.218 0 .396.176.396.395 0 .219-.178.395-.396.395h-1.448v.917h1.448c.218 0 .396.177.396.396s-.178.395-.396.395h-1.843a.396.396 0 01-.396-.395V8.949c0-.219.177-.396.396-.396h1.843c.218 0 .396.177.396.395s-.178.396-.396.396h-1.448v.52h1.448zm-3.088 2.103a.395.395 0 01-.555-.073l-1.97-2.696v2.374c0 .219-.177.396-.395.396a.396.396 0 01-.396-.396V8.949c0-.219.177-.395.396-.395.124 0 .234.058.308.147l1.966 2.686V8.949c0-.219.178-.396.396-.396.219 0 .396.177.396.396v3.018a.396.396 0 01-.146.304zm-4.267.073a.396.396 0 01-.396-.396V8.949c0-.219.177-.396.396-.396.218 0 .395.177.395.396v3.018a.395.395 0 01-.395.396zm-1.483 0h-1.843a.396.396 0 01-.396-.396V8.949c0-.219.177-.396.396-.396.218 0 .395.177.395.396v2.622h1.448c.218 0 .396.177.396.396s-.177.395-.396.395zM12 2C6.477 2 2 5.82 2 10.426c0 4.159 3.685 7.644 8.667 8.314.337.073.796.223.912.511.104.261.068.67.034.93l-.149.895c-.044.26-.208 1.021.896.557 1.103-.465 5.949-3.506 8.114-6.002C22.204 13.663 22 12.142 22 10.426 22 5.82 17.523 2 12 2" />
-        </svg>
-      ),
-      href: `https://social-plugins.line.me/lineit/share?url=${encodeURIComponent(url)}`,
     },
   ];
 
@@ -73,7 +77,7 @@ export function ShareButtons({ title, url }: ShareButtonsProps) {
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 12,
+        gap: 8,
         marginTop: 40,
         paddingTop: 24,
         borderTop: "1px solid var(--border-subtle)",
@@ -85,42 +89,88 @@ export function ShareButtons({ title, url }: ShareButtonsProps) {
           fontSize: 11,
           color: "var(--text-dim)",
           fontFamily: "'DM Mono', monospace",
-          letterSpacing: "0.06em",
+          letterSpacing: "0.08em",
           textTransform: "uppercase",
+          marginRight: 4,
         }}
       >
-        {label}
+        {isJa ? "シェア" : "Share"}
       </span>
-      {links.map((link) => (
+
+      {shareLinks.map((link) => (
         <a
           key={link.name}
           href={link.href}
           target="_blank"
           rel="noopener noreferrer"
+          aria-label={link.name}
           title={link.name}
           style={{
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
-            width: 36,
-            height: 36,
+            width: 34,
+            height: 34,
             borderRadius: 6,
             border: "1px solid var(--border-subtle)",
             color: "var(--text-muted)",
-            transition: "all 0.2s ease",
+            transition: "border-color 0.2s, color 0.2s, background 0.2s",
+            textDecoration: "none",
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.borderColor = "var(--border-hover)";
-            e.currentTarget.style.color = "var(--accent-coral)";
+            e.currentTarget.style.color = "var(--text-secondary)";
+            e.currentTarget.style.background = "var(--bg-surface-hover)";
           }}
           onMouseLeave={(e) => {
             e.currentTarget.style.borderColor = "var(--border-subtle)";
             e.currentTarget.style.color = "var(--text-muted)";
+            e.currentTarget.style.background = "transparent";
           }}
         >
           {link.icon}
         </a>
       ))}
+
+      {/* Copy link */}
+      <button
+        onClick={handleCopy}
+        aria-label={isJa ? (copied ? "コピー済み" : "URLをコピー") : (copied ? "Copied!" : "Copy link")}
+        title={isJa ? (copied ? "コピー済み" : "URLをコピー") : (copied ? "Copied!" : "Copy link")}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "0 12px",
+          height: 34,
+          borderRadius: 6,
+          border: `1px solid ${copied ? "color-mix(in srgb, var(--accent-coral) 40%, transparent)" : "var(--border-subtle)"}`,
+          background: copied ? "color-mix(in srgb, var(--accent-coral) 8%, transparent)" : "transparent",
+          color: copied ? "var(--accent-coral)" : "var(--text-muted)",
+          fontSize: 11,
+          fontFamily: "'DM Mono', monospace",
+          letterSpacing: "0.04em",
+          cursor: "pointer",
+          transition: "all 0.2s ease",
+        }}
+        onMouseEnter={(e) => {
+          if (!copied) {
+            e.currentTarget.style.borderColor = "var(--border-hover)";
+            e.currentTarget.style.color = "var(--text-secondary)";
+            e.currentTarget.style.background = "var(--bg-surface-hover)";
+          }
+        }}
+        onMouseLeave={(e) => {
+          if (!copied) {
+            e.currentTarget.style.borderColor = "var(--border-subtle)";
+            e.currentTarget.style.color = "var(--text-muted)";
+            e.currentTarget.style.background = "transparent";
+          }
+        }}
+      >
+        {copied ? <CheckIcon /> : <CopyIcon />}
+        <span>{isJa ? (copied ? "コピー済み" : "コピー") : (copied ? "Copied!" : "Copy")}</span>
+      </button>
     </div>
   );
 }
