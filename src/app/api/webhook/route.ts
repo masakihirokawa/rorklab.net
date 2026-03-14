@@ -1,6 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
+interface KVNamespace {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
 export const runtime = "edge";
 
 export async function POST(request: NextRequest) {

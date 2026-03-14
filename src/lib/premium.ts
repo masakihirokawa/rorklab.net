@@ -1,5 +1,11 @@
 import { cookies } from "next/headers";
 
+interface KVNamespace {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
 export type PremiumType = "pro" | "premium" | null;
 
 export async function getPremiumAccess(): Promise<PremiumType> {
