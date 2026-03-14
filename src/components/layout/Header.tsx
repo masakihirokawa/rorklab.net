@@ -92,6 +92,7 @@ export function Header() {
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
+    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
     { key: "rorkBasics", label: t("nav.rorkBasics"), href: `${prefix}/articles/rork-basics` },
     { key: "rorkDev", label: t("nav.rorkDev"), href: `${prefix}/articles/rork-dev` },
     { key: "rorkAi", label: t("nav.rorkAi"), href: `${prefix}/articles/rork-ai` },
