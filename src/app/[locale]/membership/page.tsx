@@ -167,11 +167,12 @@ export default async function MembershipPage({ params }: Props) {
             display: "inline-block",
             fontSize: 14,
             fontWeight: 600,
-            color: "#fff",
+            color: "var(--accent-coral)",
             textDecoration: "none",
             padding: "12px 28px",
             borderRadius: 8,
-            background: "var(--accent-coral)",
+            border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
+            background: "color-mix(in srgb, var(--accent-coral) 8%, transparent)",
             transition: "opacity 0.2s",
           }}
         >
