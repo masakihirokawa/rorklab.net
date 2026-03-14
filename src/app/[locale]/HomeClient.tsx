@@ -59,7 +59,6 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
   const { theme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const [skipAnim, setSkipAnim] = useState(false);
-  const [skipAnim, setSkipAnim] = useState(false);
   const [hoveredCat, setHoveredCat] = useState<string | null>(null);
   const [hoveredArticle, setHoveredArticle] = useState<number | null>(null);
 
