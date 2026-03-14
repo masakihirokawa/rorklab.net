@@ -6,21 +6,28 @@ interface PremiumPaywallProps {
   locale: string;
 }
 
-const PRO_PRICE: Record<string, string> = {
-  ja: "price_1T9XeNEGB5g6A54ofvfbFcSm", // ¥500/月 JPY
-  en: "price_1TALKEEGB5g6A54oBmnhCclK",  // $5/mo USD
+const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
+  ja: {
+    pro: { priceId: "price_1T9XeNEGB5g6A54ofvfbFcSm", label: "Pro — ¥500/月" },
+    premium: { priceId: "price_1T9XdUEGB5g6A54oZw62YMLI", label: "Premium — ¥2,980（永久）" },
+  },
+  en: {
+    pro: { priceId: "price_1TALKEEGB5g6A54oBmnhCclK", label: "Pro — $5/mo" },
+    premium: { priceId: "price_1TALKFEGB5g6A54oZp3kYK0z", label: "Premium — $19 (lifetime)" },
+  },
 };
 
 export function PremiumPaywall({ locale }: PremiumPaywallProps) {
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState<string | null>(null);
+  const plans = PLANS[locale] || PLANS.en;
 
-  const handleCheckout = async () => {
-    setLoading(true);
+  const handleCheckout = async (priceId: string, mode: string, plan: string) => {
+    setLoading(plan);
     try {
       const res = await fetch("/api/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ locale, priceId: PRO_PRICE[locale] || PRO_PRICE.en, mode: "subscription" }),
+        body: JSON.stringify({ locale, priceId, mode }),
       });
       const data = await res.json();
       if (data.url) {
@@ -29,7 +36,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
     } catch {
       // Checkout failed - error handling
     } finally {
-      setLoading(false);
+      setLoading(null);
     }
   };
 
@@ -48,20 +55,13 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
           textAlign: "center",
           padding: "48px 24px",
           borderRadius: 12,
-          border: "1px solid var(--border-subtle)",
-          background: "var(--bg-surface)",
+          border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+          background: "color-mix(in srgb, var(--accent-coral) 4%, var(--bg-surface))",
           maxWidth: 480,
           margin: "0 auto",
         }}
       >
-        <div
-          style={{
-            fontSize: 32,
-            marginBottom: 16,
-          }}
-        >
-          🔒
-        </div>
+        <div style={{ fontSize: 28, marginBottom: 12 }}>✦</div>
         <h3
           style={{
             fontSize: 18,
@@ -70,47 +70,73 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
             marginBottom: 8,
           }}
         >
-          {locale === "ja" ? "プレミアム記事" : "Premium Article"}
+          {locale === "ja" ? "続きを読むには" : "Continue Reading"}
         </h3>
         <p
           style={{
             fontSize: 14,
             color: "var(--text-muted)",
             lineHeight: 1.7,
-            marginBottom: 24,
+            marginBottom: 28,
           }}
         >
           {locale === "ja"
-            ? "この記事の続きを読むには Rork Lab Pro メンバーシップが必要です。月額 ¥500 ですべての有料記事にアクセスできます。"
-            : "A Rork Lab Pro membership is required to read the rest of this article. Get access to all premium articles for $5/month."}
+            ? "この記事の続きは Rork Lab メンバー限定です。すべてのプレミアム記事にアクセスできます。"
+            : "The rest of this article is for Rork Lab members. Get access to all premium articles."}
         </p>
+
+        {/* Pro button */}
         <button
-          onClick={handleCheckout}
-          disabled={loading}
+          onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+          disabled={!!loading}
           style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "12px 32px",
+            display: "block",
+            width: "100%",
+            maxWidth: 320,
+            margin: "0 auto 12px",
+            padding: "12px 24px",
             borderRadius: 8,
-            border: "none",
-            background: "var(--accent-coral)",
-            color: "#fff",
+            border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+            background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+            color: "var(--accent-coral)",
             fontSize: 14,
             fontWeight: 600,
             cursor: loading ? "wait" : "pointer",
-            opacity: loading ? 0.7 : 1,
+            opacity: loading === "pro" ? 0.7 : 1,
             transition: "opacity 0.2s",
           }}
         >
-          {loading
-            ? locale === "ja"
-              ? "処理中..."
-              : "Loading..."
-            : locale === "ja"
-              ? "Pro メンバーになる — ¥500/月"
-              : "Become a Pro Member — $5/mo"}
+          {loading === "pro"
+            ? locale === "ja" ? "処理中..." : "Loading..."
+            : plans.pro.label}
         </button>
+
+        {/* Premium button */}
+        <button
+          onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
+          disabled={!!loading}
+          style={{
+            display: "block",
+            width: "100%",
+            maxWidth: 320,
+            margin: "0 auto",
+            padding: "12px 24px",
+            borderRadius: 8,
+            border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+            background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+            color: "var(--accent-coral)",
+            fontSize: 14,
+            fontWeight: 600,
+            cursor: loading ? "wait" : "pointer",
+            opacity: loading === "premium" ? 0.7 : 1,
+            transition: "opacity 0.2s",
+          }}
+        >
+          {loading === "premium"
+            ? locale === "ja" ? "処理中..." : "Loading..."
+            : plans.premium.label}
+        </button>
+
         <div
           style={{
             marginTop: 16,
