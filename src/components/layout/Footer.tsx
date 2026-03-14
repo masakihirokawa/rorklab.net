@@ -72,8 +72,8 @@ export function Footer() {
       >
         <span style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.6 }}>
           {locale === "ja"
-            ? "Rork Lab は無料で運営しています。応援いただけると励みになります。"
-            : "Rork Lab is free to use. Your support helps us keep going."}
+            ? "Rork Lab は無料・広告なし。ドメイン・サーバー代などの運営費は、サポーターの方々の応援で続けられています。"
+            : "Free and ad-free. Hosting and domain costs are covered by your support."}
         </span>
         <a
           href={`${prefix}/support`}

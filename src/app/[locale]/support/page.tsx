@@ -69,7 +69,7 @@ const CONTENT: Record<string, {
 }> = {
   ja: {
     heading: "メンバーシップ & サポート",
-    sub: "Rork Lab をご覧いただきありがとうございます。応援いただけると励みになります。",
+    sub: "Rork Lab をご覧いただきありがとうございます。広告なし・無料で公開しており、皆さまのサポートがドメイン・サーバー代などの運営費を支えています。",
     membershipHeading: "Rork Lab Pro",
     membershipSub: "すべてのプレミアム記事にアクセス",
     features: [
@@ -93,7 +93,7 @@ const CONTENT: Record<string, {
   },
   en: {
     heading: "Membership & Support",
-    sub: "Thank you for visiting Rork Lab. Your support helps us keep creating.",
+    sub: "Thank you for visiting Rork Lab. Ad-free and free to read — your support covers hosting and domain costs.",
     membershipHeading: "Rork Lab Pro",
     membershipSub: "Full access to all premium articles",
     features: [
