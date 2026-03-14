@@ -6,6 +6,8 @@ import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
 import { RelatedArticles } from "@/components/ui/RelatedArticles";
 import { TableOfContents } from "@/components/ui/TableOfContents";
+import { PremiumPaywall } from "@/components/ui/PremiumPaywall";
+import { getPremiumAccess } from "@/lib/premium";
 
 interface Props {
   params: Promise<{ locale: string; category: string; slug: string }>;
@@ -109,6 +111,9 @@ export default async function ArticlePage({ params }: Props) {
 
   const catInfo = CATEGORIES.find((c) => c.id === category);
   const prefix = locale === "ja" ? "" : `/${locale}`;
+
+  const premiumAccess = await getPremiumAccess();
+  const canViewPremium = !!premiumAccess;
 
   const articleUrl = `https://rorklab.net${prefix}/articles/${category}/${slug}`;
 
@@ -260,16 +265,28 @@ export default async function ArticlePage({ params }: Props) {
       {/* Table of Contents */}
       <TableOfContents locale={locale} initialItems={extractTocItems(article.content)} />
 
-      {/* Article Content — paywall temporarily disabled; full content shown */}
+      {/* Premium badge */}
       {article.meta.premium && (
         <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: 4, border: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace", marginBottom: 24 }}>
           ✦ {locale === "ja" ? "プレミアム記事" : "Premium Article"}
         </div>
       )}
-      <div
-        className="article-content"
-        dangerouslySetInnerHTML={{ __html: article.content }}
-      />
+
+      {/* Article Content with paywall */}
+      {article.meta.premium && !canViewPremium ? (
+        <>
+          <div
+            className="article-content"
+            dangerouslySetInnerHTML={{ __html: article.content.slice(0, 2000) }}
+          />
+          <PremiumPaywall locale={locale} />
+        </>
+      ) : (
+        <div
+          className="article-content"
+          dangerouslySetInnerHTML={{ __html: article.content }}
+        />
+      )}
 
       {/* Share Buttons */}
       <ShareButtons
