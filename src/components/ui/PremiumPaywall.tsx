@@ -34,7 +34,7 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
         window.location.href = data.url;
       }
     } catch {
-      // Checkout failed - error handling
+      // Checkout error handled silently
     } finally {
       setLoading(null);
     }
@@ -81,8 +81,8 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
           }}
         >
           {locale === "ja"
-            ? "この記事の続きは Rork Lab メンバー限定です。すべてのプレミアム記事にアクセスできます。"
-            : "The rest of this article is for Rork Lab members. Get access to all premium articles."}
+            ? "この記事の続きは Claude Lab メンバー限定です。すべてのプレミアム記事にアクセスできます。"
+            : "The rest of this article is for Claude Lab members. Get access to all premium articles."}
         </p>
 
         {/* Pro button */}
@@ -103,7 +103,17 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
             fontWeight: 600,
             cursor: loading ? "wait" : "pointer",
             opacity: loading === "pro" ? 0.7 : 1,
-            transition: "opacity 0.2s",
+            transition: "all 0.25s",
+          }}
+          onMouseEnter={(e) => {
+            if (!loading) {
+              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+              e.currentTarget.style.transform = "translateY(-1px)";
+            }
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+            e.currentTarget.style.transform = "translateY(0)";
           }}
         >
           {loading === "pro"
@@ -129,7 +139,17 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
             fontWeight: 600,
             cursor: loading ? "wait" : "pointer",
             opacity: loading === "premium" ? 0.7 : 1,
-            transition: "opacity 0.2s",
+            transition: "all 0.25s",
+          }}
+          onMouseEnter={(e) => {
+            if (!loading) {
+              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+              e.currentTarget.style.transform = "translateY(-1px)";
+            }
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+            e.currentTarget.style.transform = "translateY(0)";
           }}
         >
           {loading === "premium"

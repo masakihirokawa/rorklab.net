@@ -163,6 +163,7 @@ export default async function MembershipPage({ params }: Props) {
 
         <a
           href={`${prefix}/support`}
+          className="membership-cta"
           style={{
             display: "inline-block",
             fontSize: 14,
@@ -173,7 +174,7 @@ export default async function MembershipPage({ params }: Props) {
             borderRadius: 8,
             border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
             background: "color-mix(in srgb, var(--accent-coral) 8%, transparent)",
-            transition: "opacity 0.2s",
+            transition: "all 0.25s",
           }}
         >
           {t.cta}

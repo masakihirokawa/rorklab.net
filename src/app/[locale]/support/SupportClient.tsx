@@ -48,6 +48,7 @@ const RESTORE_TEXT: Record<string, {
   successPremium: string;
   errorNotFound: string;
   errorExpired: string;
+  errorEmpty: string;
   errorGeneric: string;
 }> = {
   ja: {
@@ -60,6 +61,7 @@ const RESTORE_TEXT: Record<string, {
     successPremium: "✓ Premium メンバーとして認証しました。このページを再読み込みしてください。",
     errorNotFound: "このメールアドレスでの登録が見つかりません。",
     errorExpired: "メンバーシップの有効期限が切れています。サポートまでご連絡ください。",
+    errorEmpty: "メールアドレスを入力してください。",
     errorGeneric: "エラーが発生しました。しばらくしてから再度お試しください。",
   },
   en: {
@@ -72,6 +74,7 @@ const RESTORE_TEXT: Record<string, {
     successPremium: "✓ Verified as Premium member. Please reload this page.",
     errorNotFound: "No membership found for this email address.",
     errorExpired: "Your membership has expired. Please contact support.",
+    errorEmpty: "Please enter your email address.",
     errorGeneric: "An error occurred. Please try again later.",
   },
 };
@@ -175,7 +178,10 @@ export function SupportClient({
   };
 
   const handleRestore = async () => {
-    if (!restoreEmail.trim()) return;
+    if (!restoreEmail.trim()) {
+      setRestoreResult({ type: "error", message: rt.errorEmpty });
+      return;
+    }
     setRestoreLoading(true);
     setRestoreResult(null);
     try {
@@ -271,6 +277,16 @@ export function SupportClient({
               opacity: loading ? 0.7 : 1,
               transition: "all 0.25s",
             }}
+            onMouseEnter={(e) => {
+              if (!loading) {
+                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+                e.currentTarget.style.transform = "translateY(-1px)";
+              }
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+              e.currentTarget.style.transform = "translateY(0)";
+            }}
           >
             {loading === "pro" ? "..." : `${plans.pro.label} — ${plans.pro.price}`}
           </button>
@@ -289,6 +305,16 @@ export function SupportClient({
               cursor: loading ? "wait" : "pointer",
               opacity: loading ? 0.7 : 1,
               transition: "all 0.25s",
+            }}
+            onMouseEnter={(e) => {
+              if (!loading) {
+                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+                e.currentTarget.style.transform = "translateY(-1px)";
+              }
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+              e.currentTarget.style.transform = "translateY(0)";
             }}
           >
             {loading === "premium" ? "..." : `${plans.premium.label} — ${plans.premium.price}`}
@@ -318,6 +344,14 @@ export function SupportClient({
             alignItems: "center",
             justifyContent: "space-between",
             transition: "all 0.2s",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.borderColor = "var(--border-hover)";
+            e.currentTarget.style.transform = "translateY(-1px)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.borderColor = "var(--border-subtle)";
+            e.currentTarget.style.transform = "translateY(0)";
           }}
         >
           <span>{rt.sectionLabel}</span>
@@ -360,7 +394,7 @@ export function SupportClient({
               />
               <button
                 onClick={handleRestore}
-                disabled={restoreLoading || !restoreEmail.trim()}
+                disabled={restoreLoading}
                 style={{
                   padding: "10px 18px",
                   borderRadius: 8,
@@ -372,6 +406,17 @@ export function SupportClient({
                   cursor: restoreLoading ? "wait" : "pointer",
                   opacity: restoreLoading ? 0.7 : 1,
                   whiteSpace: "nowrap",
+                  transition: "all 0.2s",
+                }}
+                onMouseEnter={(e) => {
+                  if (!restoreLoading) {
+                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 18%, transparent)";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 10%, transparent)";
+                  e.currentTarget.style.transform = "translateY(0)";
                 }}
               >
                 {restoreLoading ? rt.loading : rt.button}
