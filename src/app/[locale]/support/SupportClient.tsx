@@ -52,7 +52,7 @@ const RESTORE_TEXT: Record<string, {
   errorGeneric: string;
 }> = {
   ja: {
-    sectionLabel: "メンバーなのに広告が表示される方",
+    sectionLabel: "メンバーなのにプレミアム記事が全文読めない方（引き継ぎ）",
     description: "ブラウザを変えた・Cookie を削除した場合は、登録のメールアドレスを入力してください。",
     placeholder: "登録メールアドレス",
     button: "アクセスを復元する",
@@ -65,7 +65,7 @@ const RESTORE_TEXT: Record<string, {
     errorGeneric: "エラーが発生しました。しばらくしてから再度お試しください。",
   },
   en: {
-    sectionLabel: "Member but seeing ads?",
+    sectionLabel: "Member but can't read full articles? (Access Transfer)",
     description: "If you switched browsers or cleared cookies, enter your registration email to restore access.",
     placeholder: "Your registration email",
     button: "Restore Access",
@@ -89,7 +89,7 @@ const FAQ_TEXT: Record<string, { heading: string; items: { q: string; a: string 
       },
       {
         q: "スマホと PC の両方で使えますか？",
-        a: "はい。ただしブラウザごとに認証が必要です。「メンバーなのに広告が表示される方」から復元できます。",
+        a: "はい。ただしブラウザごとに認証が必要です。「メンバーなのにプレミアム記事が全文読めない方（引き継ぎ）」から復元できます。",
       },
       {
         q: "支払い方法は？",
@@ -110,7 +110,7 @@ const FAQ_TEXT: Record<string, { heading: string; items: { q: string; a: string 
       },
       {
         q: "Can I use it on both mobile and PC?",
-        a: "Yes. However, authentication is required per browser. You can restore access using the 'Member but seeing ads?' section above.",
+        a: "Yes. However, authentication is required per browser. You can restore access using the 'Member but can't read full articles? (Access Transfer)' section above.",
       },
       {
         q: "What payment methods are accepted?",
