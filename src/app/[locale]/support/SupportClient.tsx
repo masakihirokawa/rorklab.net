@@ -246,7 +246,7 @@ export function SupportClient({
           borderRadius: 12,
           border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
           background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
-          scrollMarginTop: 64,
+          scrollMarginTop: 96,
         }}
       >
         <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8, textAlign: "center" }}>

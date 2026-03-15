@@ -169,9 +169,9 @@ export default async function MembershipPage({ params }: Props) {
             }}
           >
             <span style={{
-              position: "absolute", top: -11, right: 12,
+              position: "absolute", top: -9, right: 12,
               fontSize: 9, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em",
-              padding: "2px 8px", borderRadius: 4,
+              padding: "3px 8px 1px", borderRadius: 4,
               background: "var(--accent-coral)", color: "var(--bg-primary)",
               fontWeight: 700,
             }}>
