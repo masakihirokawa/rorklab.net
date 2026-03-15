@@ -65,6 +65,7 @@ const CONTENT: Record<string, {
     url: string;
     color: string;
     global?: boolean;
+    mobileOnly?: boolean;
   }[];
 }> = {
   ja: {
