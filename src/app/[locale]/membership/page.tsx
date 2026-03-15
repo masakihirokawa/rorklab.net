@@ -154,7 +154,7 @@ export default async function MembershipPage({ params }: Props) {
         <div style={{ display: "flex", gap: 20, marginBottom: 32, flexWrap: "wrap" }}>
           {/* Pro — Recommended */}
           <a
-            href={`${prefix}/support`}
+            href={`${prefix}/support#membership`}
             className="plan-card"
             style={{
               display: "block",
@@ -183,7 +183,7 @@ export default async function MembershipPage({ params }: Props) {
           </a>
           {/* Premium */}
           <a
-            href={`${prefix}/support`}
+            href={`${prefix}/support#membership`}
             className="plan-card"
             style={{
               display: "block",

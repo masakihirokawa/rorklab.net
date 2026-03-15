@@ -239,12 +239,14 @@ export function SupportClient({
 
       {/* Membership */}
       <div
+        id="membership"
         style={{
           marginBottom: 40,
           padding: 28,
           borderRadius: 12,
           border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
           background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
+          scrollMarginTop: 80,
         }}
       >
         <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8, textAlign: "center" }}>
