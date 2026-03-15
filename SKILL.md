@@ -161,7 +161,7 @@ premium: false  # 有料記事の場合 true
 
 **ソートルール:** `updated` フィールドがあればそれを優先、なければ `date`。同日の記事は `updated` のタイムスタンプで順序を制御する。
 
-**プリコンパイル:** `scripts/generate-content.mjs` で MDX を HTML に変換し `src/generated/articles.json` に出力。ビルド時に自動実行（`prebuild` スクリプト）。
+**プリコンパイル:** `scripts/generate-content.mjs` で MDX を HTML に変換し `src/generated/articles.json` に出力。`npm run generate` で手動実行（**注意: `package.json` の `prebuild` は `generate` にリネームすること。`prebuild` のままだと `npm run build` のたびに自動実行されて Cloudflare Pages で OOM が発生する**）。
 
 **カテゴリ定義:** `src/lib/content.ts` の `CATEGORIES` 配列でアイコン・カラーを設定。
 
