@@ -355,8 +355,8 @@ export function SupportClient({
           }}
         >
           <span>{rt.sectionLabel}</span>
-          <span style={{ fontSize: 18, color: "var(--text-faint)", transition: "transform 0.2s", transform: showRestore ? "rotate(180deg)" : "none" }}>
-            ∨
+          <span style={{ fontSize: 14, color: "var(--text-faint)", transition: "transform 0.2s", transform: showRestore ? "rotate(180deg)" : "none" }}>
+            ▾
           </span>
         </button>
 
