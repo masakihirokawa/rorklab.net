@@ -24,6 +24,10 @@ export async function POST(request: NextRequest) {
           quantity: 1,
         },
       ],
+      // Pro（月額）のみ初月無料トライアルを付与
+      ...(mode === "subscription" && {
+        subscription_data: { trial_period_days: 30 },
+      }),
       success_url: `${baseUrl}/${prefix}api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
       cancel_url: cancelUrl || fallbackCancel,
       locale: locale === "en" ? "en" : "ja",
