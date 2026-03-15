@@ -90,7 +90,7 @@ const CONTENT: Record<string, {
       { name: "PayPal", icon: "🅿", label: "PayPal で送金", sub: "paypal.me/masakihirokawa", url: "https://www.paypal.com/paypalme/masakihirokawa", color: "#003087", global: true },
       { name: "Wise", icon: "🌍", label: "Wise で送金", sub: "wise.com/pay/me/masakih65", url: "https://wise.com/pay/me/masakih65", color: "#9FE870", global: true },
       { name: "Revolut", icon: "⚡", label: "Revolut で送金", sub: "@masakihirokawa", url: "https://revolut.me/masakihirokawa", color: "#191C1F", global: true },
-      { name: "PayPay", icon: "💴", label: "PayPay で送金", sub: "PayPay ID: dolice", url: "https://qr.paypay.ne.jp/p2p01_7DJRDSAMgMJfkjj9", color: "#E4007F", mobileOnly: true },
+      // { name: "PayPay", icon: "💴", label: "PayPay で送金", sub: "PayPay ID: dolice", url: "https://qr.paypay.ne.jp/p2p01_7DJRDSAMgMJfkjj9", color: "#E4007F", mobileOnly: true },
     ],
   },
   en: {
