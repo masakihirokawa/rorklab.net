@@ -34,12 +34,13 @@ export function NewsTicker() {
         left: 0,
         width: "100%",
         zIndex: 99,
-        height: 32,
+        height: 35,
         background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)",
         borderBottom: "1px solid var(--border-subtle)",
         display: "flex",
         alignItems: "center",
         overflow: "hidden",
+        paddingTop: 1,
       }}
     >
       <div
