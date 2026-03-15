@@ -65,12 +65,14 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
       "rork-dev": "開発ツール",
       "rork-ai": "AIモデル",
       "rork-business": "ビジネス",
+      "app-dev": "アプリ開発",
     },
     en: {
       "rork-basics": "Getting Started",
       "rork-dev": "Dev Tools",
       "rork-ai": "AI Models",
       "rork-business": "Business",
+      "app-dev": "App Dev",
     },
   };
 

@@ -2,8 +2,8 @@ import { getArticles, CATEGORIES, type ArticleMeta } from "@/lib/content";
 
 
 const CATEGORY_LABELS: Record<string, Record<string, string>> = {
-  ja: {"rork-basics": "Rork 入門", "rork-dev": "開発ツール", "rork-ai": "AI モデル", "rork-business": "ビジネス"},
-  en: {"rork-basics": "Getting Started", "rork-dev": "Dev Tools", "rork-ai": "AI Models", "rork-business": "Business"},
+  ja: {"rork-basics": "Rork 入門", "rork-dev": "開発ツール", "rork-ai": "AI モデル", "rork-business": "ビジネス", "app-dev": "アプリ開発"},
+  en: {"rork-basics": "Getting Started", "rork-dev": "Dev Tools", "rork-ai": "AI Models", "rork-business": "Business", "app-dev": "App Dev"},
 };
 
 interface RelatedArticlesProps {

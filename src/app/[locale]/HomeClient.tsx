@@ -164,7 +164,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
           <SectionLabel text={t("sections.categories")} />
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 16 }}>
           {CATEGORIES.map((cat, i) => {
             const prefix = locale === "ja" ? "" : `/${locale}`;
             return (
@@ -173,6 +173,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
                 href={`${prefix}/articles/${cat.id}`}
                 className={mounted && !skipAnim ? "animate-fade-up" : ""}
                 style={{
+                  gridColumn: i < 3 ? "span 2" : "span 3",
                   display: "block", padding: "28px 24px", textDecoration: "none",
                   border: `1px solid ${hoveredCat === cat.id ? "var(--border-hover)" : "var(--border-subtle)"}`,
                   borderRadius: 8, background: hoveredCat === cat.id ? "var(--bg-surface-hover)" : "var(--bg-surface)",

@@ -79,12 +79,14 @@ const CATEGORY_LABELS: Record<string, Record<string, string>> = {
     "rork-dev": "開発ツール",
     "rork-ai": "AIモデル",
     "rork-business": "ビジネス",
+    "app-dev": "アプリ開発",
   },
   en: {
     "rork-basics": "Getting Started",
     "rork-dev": "Dev Tools",
     "rork-ai": "AI Models",
     "rork-business": "Business",
+    "app-dev": "App Dev",
   },
 };
 

@@ -17,6 +17,7 @@ const CATEGORY_NAMES: Record<string, Record<string, string>> = {
   "rork-dev": { ja: "開発ツール", en: "Dev Tools" },
   "rork-ai": { ja: "AI モデル", en: "AI Models" },
   "rork-business": { ja: "ビジネス", en: "Business" },
+  "app-dev": { ja: "アプリ開発", en: "App Dev" },
 };
 
 const CATEGORY_DESC: Record<string, Record<string, string>> = {
@@ -35,6 +36,10 @@ const CATEGORY_DESC: Record<string, Record<string, string>> = {
   "rork-business": {
     ja: "App Store公開・収益化",
     en: "App Store, monetization, analytics",
+  },
+  "app-dev": {
+    ja: "React Native・Expo・アプリ設計",
+    en: "React Native, Expo, mobile architecture",
   },
 };
 
