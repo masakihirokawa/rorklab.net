@@ -83,6 +83,7 @@ export const CATEGORIES = [
   { id: "rork-dev", icon: "⬡", color: "var(--accent-blue)" },
   { id: "rork-ai", icon: "◉", color: "var(--accent-green)" },
   { id: "rork-business", icon: "⟐", color: "var(--accent-gold)" },
+  { id: "app-dev", icon: "◇", color: "var(--accent-purple)" },
 ] as const;
 
 // ── Blog ──
