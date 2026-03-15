@@ -69,7 +69,7 @@ export default async function LocaleLayout({
             <GrainOverlay />
             <Header />
             <NewsTicker />
-            <main style={{ paddingTop: 96 }}>{children}</main>
+            <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <ScrollToTop />
           </NextIntlClientProvider>
