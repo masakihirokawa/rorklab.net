@@ -8,11 +8,11 @@ interface Props {
 const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "メンバーシップ & サポート — Rork Lab",
-    description: "Rork Lab Pro メンバーシップで全プレミアム記事にアクセス。月額 ¥500 または永久アクセス ¥2,980。",
+    description: "Rork Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥500 または永久アクセス ¥2,980。",
   },
   en: {
     title: "Membership & Support — Rork Lab",
-    description: "Get full access to all premium articles with Rork Lab Pro. $5/month or $19 lifetime.",
+    description: "Get full access to all premium articles with Rork Lab Pro / Premium. $5/month or $19 lifetime.",
   },
 };
 
@@ -71,7 +71,7 @@ const CONTENT: Record<string, {
   ja: {
     heading: "メンバーシップ & サポート",
     sub: "Rork Lab をご覧いただきありがとうございます。広告なし・無料で公開しており、皆さまのサポートがドメイン・サーバー代などの運営費を支えています。",
-    membershipHeading: "Rork Lab Pro",
+    membershipHeading: "Rork Lab Pro / Premium",
     membershipSub: "すべてのプレミアム記事にアクセス",
     features: [
       "プレミアム記事が読み放題（週2本追加）",
@@ -96,7 +96,7 @@ const CONTENT: Record<string, {
   en: {
     heading: "Membership & Support",
     sub: "Thank you for visiting Rork Lab. Ad-free and free to read — your support covers hosting and domain costs.",
-    membershipHeading: "Rork Lab Pro",
+    membershipHeading: "Rork Lab Pro / Premium",
     membershipSub: "Full access to all premium articles",
     features: [
       "Unlimited access to premium articles (2 new per week)",
