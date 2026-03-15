@@ -38,6 +38,89 @@ interface StripeTip {
   priceId: string;
 }
 
+const RESTORE_TEXT: Record<string, {
+  sectionLabel: string;
+  description: string;
+  placeholder: string;
+  button: string;
+  loading: string;
+  successPro: string;
+  successPremium: string;
+  errorNotFound: string;
+  errorExpired: string;
+  errorGeneric: string;
+}> = {
+  ja: {
+    sectionLabel: "メンバーなのに広告が表示される方",
+    description: "ブラウザを変えた・Cookie を削除した場合は、登録のメールアドレスを入力してください。",
+    placeholder: "登録メールアドレス",
+    button: "アクセスを復元する",
+    loading: "確認中...",
+    successPro: "✓ Pro メンバーとして認証しました。このページを再読み込みしてください。",
+    successPremium: "✓ Premium メンバーとして認証しました。このページを再読み込みしてください。",
+    errorNotFound: "このメールアドレスでの登録が見つかりません。",
+    errorExpired: "メンバーシップの有効期限が切れています。サポートまでご連絡ください。",
+    errorGeneric: "エラーが発生しました。しばらくしてから再度お試しください。",
+  },
+  en: {
+    sectionLabel: "Member but seeing ads?",
+    description: "If you switched browsers or cleared cookies, enter your registration email to restore access.",
+    placeholder: "Your registration email",
+    button: "Restore Access",
+    loading: "Checking...",
+    successPro: "✓ Verified as Pro member. Please reload this page.",
+    successPremium: "✓ Verified as Premium member. Please reload this page.",
+    errorNotFound: "No membership found for this email address.",
+    errorExpired: "Your membership has expired. Please contact support.",
+    errorGeneric: "An error occurred. Please try again later.",
+  },
+};
+
+const FAQ_TEXT: Record<string, { heading: string; items: { q: string; a: string }[] }> = {
+  ja: {
+    heading: "よくある質問",
+    items: [
+      {
+        q: "月額プランはいつでも解約できますか？",
+        a: "はい、いつでもキャンセル可能です。Stripe のお客様ページから解約できます。",
+      },
+      {
+        q: "スマホと PC の両方で使えますか？",
+        a: "はい。ただしブラウザごとに認証が必要です。「メンバーなのに広告が表示される方」から復元できます。",
+      },
+      {
+        q: "支払い方法は？",
+        a: "クレジットカード・デビットカードに対応しています（Stripe 経由）。",
+      },
+      {
+        q: "領収書は発行されますか？",
+        a: "Stripe から自動的に領収書メールが届きます。",
+      },
+    ],
+  },
+  en: {
+    heading: "FAQ",
+    items: [
+      {
+        q: "Can I cancel my monthly plan anytime?",
+        a: "Yes, you can cancel at any time from the Stripe customer portal.",
+      },
+      {
+        q: "Can I use it on both mobile and PC?",
+        a: "Yes. However, authentication is required per browser. You can restore access using the 'Member but seeing ads?' section above.",
+      },
+      {
+        q: "What payment methods are accepted?",
+        a: "Credit and debit cards are accepted via Stripe.",
+      },
+      {
+        q: "Will I receive a receipt?",
+        a: "Yes, Stripe automatically sends a receipt email after each payment.",
+      },
+    ],
+  },
+};
+
 export function SupportClient({
   content,
   locale,
@@ -52,6 +135,15 @@ export function SupportClient({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [isMobile, setIsMobile] = useState(false);
+
+  // Restore access state
+  const [showRestore, setShowRestore] = useState(false);
+  const [restoreEmail, setRestoreEmail] = useState("");
+  const [restoreLoading, setRestoreLoading] = useState(false);
+  const [restoreResult, setRestoreResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
+
+  const rt = RESTORE_TEXT[locale] || RESTORE_TEXT.en;
+  const faq = FAQ_TEXT[locale] || FAQ_TEXT.en;
 
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768 || "ontouchstart" in window);
@@ -79,6 +171,34 @@ export function SupportClient({
     } catch {
       setError("Network error");
       setLoading(null);
+    }
+  };
+
+  const handleRestore = async () => {
+    if (!restoreEmail.trim()) return;
+    setRestoreLoading(true);
+    setRestoreResult(null);
+    try {
+      const res = await fetch("/api/restore-access", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: restoreEmail.trim() }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        const msg = data.type === "pro" ? rt.successPro : rt.successPremium;
+        setRestoreResult({ type: "success", message: msg });
+      } else {
+        const msg =
+          data.error === "not_found" ? rt.errorNotFound :
+          data.error === "expired" ? rt.errorExpired :
+          rt.errorGeneric;
+        setRestoreResult({ type: "error", message: msg });
+      }
+    } catch {
+      setRestoreResult({ type: "error", message: rt.errorGeneric });
+    } finally {
+      setRestoreLoading(false);
     }
   };
 
@@ -179,6 +299,99 @@ export function SupportClient({
       {error && (
         <p style={{ color: "#ef4444", fontSize: 13, textAlign: "center", marginBottom: 16 }}>{error}</p>
       )}
+
+      {/* Restore Access */}
+      <div style={{ marginBottom: 32 }}>
+        <button
+          onClick={() => setShowRestore((v) => !v)}
+          style={{
+            width: "100%",
+            padding: "14px 20px",
+            borderRadius: 10,
+            border: "1px solid var(--border-subtle)",
+            background: "var(--bg-surface)",
+            color: "var(--text-secondary)",
+            fontSize: 14,
+            fontWeight: 500,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            transition: "all 0.2s",
+          }}
+        >
+          <span>{rt.sectionLabel}</span>
+          <span style={{ fontSize: 18, color: "var(--text-faint)", transition: "transform 0.2s", transform: showRestore ? "rotate(180deg)" : "none" }}>
+            ∨
+          </span>
+        </button>
+
+        {showRestore && (
+          <div
+            style={{
+              marginTop: 8,
+              padding: "20px 20px 16px",
+              borderRadius: 10,
+              border: "1px solid var(--border-subtle)",
+              background: "var(--bg-surface)",
+            }}
+          >
+            <p style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.7 }}>
+              {rt.description}
+            </p>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <input
+                type="email"
+                value={restoreEmail}
+                onChange={(e) => setRestoreEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleRestore()}
+                placeholder={rt.placeholder}
+                style={{
+                  flex: 1,
+                  minWidth: 200,
+                  padding: "10px 14px",
+                  borderRadius: 8,
+                  border: "1px solid var(--border-subtle)",
+                  background: "var(--bg-primary)",
+                  color: "var(--text-primary)",
+                  fontSize: 14,
+                  outline: "none",
+                }}
+              />
+              <button
+                onClick={handleRestore}
+                disabled={restoreLoading || !restoreEmail.trim()}
+                style={{
+                  padding: "10px 18px",
+                  borderRadius: 8,
+                  border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
+                  background: "color-mix(in srgb, var(--accent-coral) 10%, transparent)",
+                  color: "var(--accent-coral)",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: restoreLoading ? "wait" : "pointer",
+                  opacity: restoreLoading ? 0.7 : 1,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {restoreLoading ? rt.loading : rt.button}
+              </button>
+            </div>
+            {restoreResult && (
+              <p
+                style={{
+                  marginTop: 12,
+                  fontSize: 13,
+                  color: restoreResult.type === "success" ? "var(--accent-coral)" : "#ef4444",
+                  lineHeight: 1.6,
+                }}
+              >
+                {restoreResult.message}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Tip Section */}
       <div style={{ marginBottom: 32 }}>
@@ -294,6 +507,33 @@ export function SupportClient({
               </div>
               <span style={{ fontSize: 16, color: "var(--text-faint)" }}>↗</span>
             </a>
+          ))}
+        </div>
+      </div>
+
+      {/* FAQ */}
+      <div style={{ marginBottom: 40 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 20, textAlign: "center" }}>
+          {faq.heading}
+        </h2>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {faq.items.map((item, i) => (
+            <div
+              key={i}
+              style={{
+                padding: "16px 20px",
+                borderRadius: 10,
+                border: "1px solid var(--border-subtle)",
+                background: "var(--bg-surface)",
+              }}
+            >
+              <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 6, lineHeight: 1.5 }}>
+                {item.q}
+              </p>
+              <p style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.7, margin: 0 }}>
+                {item.a}
+              </p>
+            </div>
           ))}
         </div>
       </div>
