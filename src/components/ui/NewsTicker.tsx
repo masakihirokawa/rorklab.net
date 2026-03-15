@@ -40,7 +40,7 @@ export function NewsTicker() {
         display: "flex",
         alignItems: "center",
         overflow: "hidden",
-        paddingTop: 1,
+        paddingTop: 2,
       }}
     >
       <div
