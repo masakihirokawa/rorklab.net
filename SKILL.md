@@ -17,18 +17,18 @@
 | ホスティング | Cloudflare Pages（OpenNext アダプター） |
 | 決済 | Stripe Checkout Sessions（サブスクリプション） |
 | 分析 | Google Analytics (gtag.js) |
-| OGP | Next.js ImageResponse — favicon ベースで全ページ共通 |
+| OGP | 静的 PNG（public/og/rorklab-og.png、1200×1200px）— 全ページ共通 |
 | 検索 | クライアントサイド検索（タグ・タイトル・説明文のスコアベースランキング） |
 | RSS | /feed.xml (ja), /en/feed.xml (en) — 最新50件 |
 | サイトマップ | 動的生成（hreflang付き、記事・ブログ・静的ページ） |
 
 ---
 
-## サイト規模（2026-03-13 現在）
+## サイト規模（2026-03-16 現在）
 
-- 記事: 36本 × 2言語 = 72エントリ
-- ブログ: 5本 × 2言語 = 10エントリ
-- カテゴリ: rork-basics (7), rork-dev (20), rork-ai (5), rork-business (4)
+- 記事: 77本 × 2言語 = 154エントリ
+- ブログ: 6本 × 2言語 = 12エントリ
+- カテゴリ: rork-dev (50), rork-basics (9), rork-ai (9), rork-business (6), app-dev (3)
 
 ---
 
@@ -61,7 +61,7 @@
 │   │   │   ├── layout.tsx              # ロケール別レイアウト（GA, フォント, テーマ, RSS link）
 │   │   │   ├── page.tsx                # ホームページ（JSON-LD WebSite schema）
 │   │   │   ├── HomeClient.tsx          # ホームページUI（クライアント）— 「すべての記事 (N) →」で総記事数を表示
-│   │   │   ├── opengraph-image.tsx     # 全ページ共通 OGP 画像（favicon ベース）
+│   │   │   ├── opengraph-image.tsx     # OGP fallback（実質未使用）
 │   │   │   ├── articles/
 │   │   │   │   ├── page.tsx            # 記事一覧（ページネーション + カテゴリフィルター）
 │   │   │   │   └── [category]/
@@ -75,15 +75,19 @@
 │   │   │   ├── guides/page.tsx
 │   │   │   ├── support/page.tsx        # サポートページ（Ko-fi, PayPal, Wise, Revolut）
 │   │   │   ├── privacy/page.tsx
+│   │   │   ├── membership/page.tsx     # メンバーシップページ（プラン一覧 + プレミアム記事一覧）
 │   │   │   ├── terms/page.tsx
 │   │   │   └── tokusho/page.tsx
 │   │   └── api/
-│   │       ├── checkout/route.ts       # Stripe Checkout Session 作成
+│   │       ├── checkout/route.ts       # Stripe Checkout Session 作成（Pro: subscription / Premium: payment）
 │   │       ├── customer-portal/route.ts # Stripe Customer Portal
+│   │       ├── verify-session/route.ts  # Stripe セッション検証 → KV 保存 → Cookie 発行
+│   │       ├── webhook/route.ts         # Stripe Webhook 受信 → KV 書き込み
+│   │       ├── restore-access/route.ts  # Cookie 消失時のアクセス復元
 │   │       └── search-data/route.ts    # 検索用 JSON API（タグ・レベル含む）
 │   ├── components/
 │   │   ├── layout/
-│   │   │   ├── Header.tsx              # 固定ヘッダー（検索, テーマ, 言語, ♥サポート）
+│   │   │   ├── Header.tsx              # 固定ヘッダー（検索, テーマ, 言語, ♥サポート, メンバーシップリンク）
 │   │   │   ├── Footer.tsx
 │   │   │   ├── LocaleSwitcher.tsx      # 言語切り替え
 │   │   │   ├── ThemeProvider.tsx        # ダーク/ライトモード
@@ -96,8 +100,9 @@
 │   │       ├── BookRecommendation.tsx  # Amazon アソシエイト書籍
 │   │       ├── GrainOverlay.tsx        # フィルムグレインエフェクト
 │   │       ├── LevelBadge.tsx          # 初級/中級/上級バッジ
+│   │       ├── MembershipCTA.tsx       # 無料記事末尾に自動表示するメンバーシップ誘導CTA
 │   │       ├── NewsTicker.tsx          # 画面上部のスクロールニュース
-│   │       ├── PremiumPaywall.tsx      # 有料記事のペイウォール
+│   │       ├── PremiumPaywall.tsx      # 有料記事のペイウォール（Pro/Premiumボタン）
 │   │       ├── RelatedArticles.tsx     # 関連記事（スコアベース: カテゴリ+3, タグ+2）
 │   │       ├── ScrollToTop.tsx         # フローティング「トップへ戻る」ボタン
 │   │       ├── SearchModal.tsx         # 検索モーダル（タグ検索, キーボード操作, ハイライト）
@@ -149,7 +154,7 @@ npm install -D rehype-pretty-code shiki @opennextjs/cloudflare wrangler
 title: "記事タイトル"
 slug: "url-slug"
 category: "category-name"
-level: "beginner|intermediate|advanced"
+level: "beginner|beginner-intermediate|intermediate|intermediate-advanced|advanced"
 date: "YYYY-MM-DD"
 updated: "YYYY-MM-DDTHH:MM"   # ソート優先度制御（任意）
 author: "サイト名"
@@ -173,7 +178,7 @@ premium: false  # 有料記事の場合 true
 
 ### 5. OGP 画像
 
-`src/app/[locale]/opengraph-image.tsx` に全ページ共通の OGP 画像を配置。favicon の「C」ロゴベースのシンプルなデザイン（1200×630px）。`ImageResponse` で動的生成。
+`public/og/rorklab-og.png`（1200×1200px 正方形）が全ページの OGP 画像として設定されている（`src/app/layout.tsx` の `openGraph.images` に直接 URL を指定）。LINE・Stripe Checkout のサムネイルにも正方形が最適。画像を更新する場合は `_material/OGP images/` のデザインを編集してから `public/og/rorklab-og.png` に上書きコピーし、push する。
 
 ※ 記事・ブログ個別の OGP 画像は削除済み。全ページが共通画像を継承する。
 
@@ -211,7 +216,14 @@ CLOUDFLARE_API_TOKEN=xxx npx wrangler pages deploy .open-next/assets --project-n
 
 - `src/app/api/checkout/route.ts` — Checkout Session 作成（subscription mode）
 - `src/app/api/customer-portal/route.ts` — Customer Portal リダイレクト
-- `PremiumPaywall.tsx` — 有料記事のペイウォール UI
+- `src/app/api/verify-session/route.ts` — Stripe セッション検証 → Cloudflare KV 保存 → Cookie 発行
+- `src/app/api/webhook/route.ts` — Stripe Webhook 受信 → KV 書き込み
+- `src/app/api/restore-access/route.ts` — Cookie 消失時にメールアドレスで再認証
+- `PremiumPaywall.tsx` — 有料記事のペイウォール UI（Pro/Premium 両ボタン）
+- `MembershipCTA.tsx` — 無料記事末尾に自動表示（非プレミアム会員にのみ表示）
+- `src/app/[locale]/membership/page.tsx` — メンバーシップページ（プラン比較 + premium記事一覧）
+- Cloudflare KV `PREMIUM_ACCESS` — メール→Cookie トークンの保存（wrangler.toml にバインディング設定済み）
+- `public/stripe.png` — Stripe 商品サムネイル（1200×1200px 正方形）
 
 ### 9. Google Analytics
 
@@ -255,7 +267,7 @@ CLOUDFLARE_API_TOKEN=xxx npx wrangler pages deploy .open-next/assets --project-n
 1. **CATEGORIES** を変更 — サイトのテーマに合わせたカテゴリ定義（`src/lib/content.ts`）
 2. **カラーパレット** — `globals.css` の CSS Variables を差し替え
 3. **フォント** — layout.tsx の Google Fonts URL を変更
-4. **OGP デザイン** — `opengraph-image.tsx` のロゴ文字・カラー・グラデーション
+4. **OGP デザイン** — `_material/OGP images/` のデザイン画像を `public/og/rorklab-og.png` として配置（1200×1200px）
 5. **favicon** — SVG → Pillow 等で全サイズを生成（16, 32, 48, 192, 512, apple-touch-icon）
 6. **i18n メッセージ** — `src/i18n/messages/` のUI翻訳テキスト
 7. **BookRecommendation** — Amazon Associates のストアID変更
