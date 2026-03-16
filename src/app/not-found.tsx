@@ -2,6 +2,9 @@ export default function GlobalNotFound() {
   return (
     <html lang="ja">
       <head>
+        <title>404 — ページが見つかりません | Rork Lab</title>
+        <meta name="robots" content="noindex, nofollow" />
+        <meta name="description" content="お探しのページは存在しないか、移動された可能性があります。" />
         <link
           href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400&family=DM+Sans:wght@300;400;500;700&display=swap"
           rel="stylesheet"
