@@ -36,10 +36,10 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       modifiedTime: article.meta.updated || article.meta.date,
       authors: [article.meta.author],
       tags: article.meta.tags,
-      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: article.meta.title }],
+      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: article.meta.title }],
     },
     twitter: {
-      card: "summary",
+      card: "summary_large_image",
       title: article.meta.title,
       description: article.meta.description,
       images: ["https://rorklab.net/og/rorklab-og.png"],
