@@ -164,7 +164,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
           <SectionLabel text={t("sections.categories")} />
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 16 }}>
+        <div className="categories-grid" style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 16 }}>
           {CATEGORIES.map((cat, i) => {
             const prefix = locale === "ja" ? "" : `/${locale}`;
             return (
