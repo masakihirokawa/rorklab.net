@@ -136,9 +136,16 @@ export function Footer() {
             Dolice
           </a>
           {" - "}
-          <span style={{ color: "var(--text-faint)" }}>
+          <a
+            href={locale === "ja" ? "https://note.com/dolice/n/n80a5e69535b0" : "https://dolice.design/profile"}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--text-faint)", textDecoration: "none", transition: "color 0.3s" }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
+            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
+          >
             {locale === "ja" ? "廣川政樹" : "Masaki Hirokawa"}
-          </span>
+          </a>
         </span>
         <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
           {links.map(({ key, label, href }) => (
