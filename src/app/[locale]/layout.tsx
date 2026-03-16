@@ -7,6 +7,7 @@ import { Footer } from "@/components/layout/Footer";
 import { GrainOverlay } from "@/components/ui/GrainOverlay";
 import { NewsTicker } from "@/components/ui/NewsTicker";
 import { ScrollToTop } from "@/components/ui/ScrollToTop";
+import { CookieBanner } from "@/components/layout/CookieBanner";
 
 import type { Metadata } from "next";
 
@@ -52,9 +53,7 @@ export default async function LocaleLayout({
         <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
         <link rel="icon" href="/favicon-48.png" type="image/png" sizes="48x48" />
         <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-        {/* Google Analytics */}
-        <script async src="https://www.googletagmanager.com/gtag/js?id=G-H9JTCV49KJ" />
-        <script dangerouslySetInnerHTML={{ __html: `window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-H9JTCV49KJ');` }} />
+        {/* Google Analytics is loaded via CookieBanner after consent */}
         <link rel="alternate" type="application/rss+xml" title="Rork Lab RSS" href={locale === "ja" ? "/feed.xml" : "/en/feed.xml"} />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
@@ -72,6 +71,12 @@ export default async function LocaleLayout({
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <ScrollToTop />
+            <CookieBanner
+              gaId="G-H9JTCV49KJ"
+              privacyHref={locale === "ja" ? "/privacy" : "/en/privacy"}
+              locale={locale}
+              storageKey="rorklab-cookie-consent"
+            />
           </NextIntlClientProvider>
         </ThemeProvider>
       </body>
