@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "Rork Max — ネイティブSwiftアプリをノーコードで生成、a16z出資で注目急上昇",
-    "NEW — Rork Max、iPhone/iPad/Apple Watch/Vision Proに対応、2タップでApp Store申請",
-    "UPDATE — Rork Max、ARKit・LiDARネイティブサポートでAR/空間コンピューティングも開発可能",
-    "Rork — 月間74.3万訪問、85%成長率でノーコードAIアプリビルダーが急拡大",
-    "Gartner — 2026年に低コード/ノーコードツールが新規開発の75%を占める見込み",
-    "Rork — 英語プロンプトだけでiOS/Android同時対応アプリを数分で生成",
+    "Rork Max — ネイティブ Swift アプリをノーコードで生成、a16z から $2.8M 調達で急成長",
+    "NEW — Rork Max、Metal + SceneKit で本格 3D ゲームも AI プロンプトで実現",
+    "UPDATE — Rork Max、ARKit・LiDAR ネイティブサポートで AR/空間コンピューティングも開発可能",
+    "Rork — 月間 74.3 万訪問・前年比 85% 成長、ノーコード AI アプリビルダー首位をキープ",
+    "Rork Max — iPhone/iPad/Apple Watch/Vision Pro 対応、2 タップで App Store 申請",
+    "Rork — 英語プロンプトだけで iOS/Android 同時対応アプリを数分で生成",
   ],
   en: [
-    "Rork Max — Build native Swift apps with no code, backed by a16z",
-    "NEW — Rork Max supports iPhone, iPad, Apple Watch & Vision Pro with 2-tap App Store publish",
+    "Rork Max — Build native Swift apps with no code; $2.8M raised from a16z",
+    "NEW — Rork Max enables full 3D game dev using Metal shaders & SceneKit via AI prompts",
     "UPDATE — Rork Max adds native ARKit & LiDAR support for AR and spatial computing apps",
-    "Rork — 743K monthly visits with 85% growth rate as AI app builder gains momentum",
-    "Gartner — Low-code/no-code tools projected to cover 75% of new app development in 2026",
+    "Rork — 743K monthly visits, 85% YoY growth as no-code AI app builder leads the market",
+    "Rork Max — Supports iPhone, iPad, Apple Watch & Vision Pro with 2-tap App Store publish",
     "Rork — Build iOS & Android apps from plain-English prompts in minutes",
   ],
 };
