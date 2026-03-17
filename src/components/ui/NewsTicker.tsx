@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "Rork Max — ネイティブ Swift アプリをノーコードで生成、a16z から $2.8M 調達で急成長",
-    "NEW — Rork Max、Metal + SceneKit で本格 3D ゲームも AI プロンプトで実現",
-    "UPDATE — Rork Max、ARKit・LiDAR ネイティブサポートで AR/空間コンピューティングも開発可能",
-    "Rork — 月間 74.3 万訪問・前年比 85% 成長、ノーコード AI アプリビルダー首位をキープ",
-    "Rork Max — iPhone/iPad/Apple Watch/Vision Pro 対応、2 タップで App Store 申請",
-    "Rork — 英語プロンプトだけで iOS/Android 同時対応アプリを数分で生成",
+    "Rork Max — Claude Opus 4.6 搭載、ネイティブ SwiftUI アプリをブラウザだけで開発（a16z 出資）",
+    "Growth — 月間 74.3 万訪問・前年比 85% 成長、AI ノーコードアプリビルダー首位を独走",
+    "NEW — Rork Max、Dynamic Island・Live Activities・Siri Intents・Core ML にネイティブ対応",
+    "3D/AR — Metal + SceneKit で 3D ゲーム、ARKit + LiDAR で空間コンピューティングまで対応",
+    "Apple — iPhone/iPad/Apple Watch/Vision Pro/Apple TV/iMessage の全デバイスに 2 タップ申請",
+    "Tutorial — スマホからでもアプリ開発できる Vibe Coding 体験記が Zenn で話題に",
   ],
   en: [
-    "Rork Max — Build native Swift apps with no code; $2.8M raised from a16z",
-    "NEW — Rork Max enables full 3D game dev using Metal shaders & SceneKit via AI prompts",
-    "UPDATE — Rork Max adds native ARKit & LiDAR support for AR and spatial computing apps",
-    "Rork — 743K monthly visits, 85% YoY growth as no-code AI app builder leads the market",
-    "Rork Max — Supports iPhone, iPad, Apple Watch & Vision Pro with 2-tap App Store publish",
-    "Rork — Build iOS & Android apps from plain-English prompts in minutes",
+    "Rork Max — Powered by Claude Opus 4.6, build native SwiftUI apps entirely in browser (a16z backed)",
+    "Growth — 743K monthly visits, 85% YoY growth; leading no-code AI app builder",
+    "NEW — Rork Max adds Dynamic Island, Live Activities, Siri Intents & Core ML native support",
+    "3D/AR — Full 3D games with Metal + SceneKit, spatial computing with ARKit + LiDAR",
+    "Apple — 2-tap App Store publish for iPhone, iPad, Apple Watch, Vision Pro, Apple TV & iMessage",
+    "Tutorial — Mobile-first Vibe Coding experience reports trending on Zenn",
   ],
 };
 
