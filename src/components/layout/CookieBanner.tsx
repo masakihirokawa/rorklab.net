@@ -23,17 +23,17 @@ export function CookieBanner({ gaId, privacyHref, locale, storageKey }: CookieBa
 
   function loadGA(id: string) {
     if (document.getElementById("ga-script")) return;
+    // Initialize dataLayer and gtag BEFORE loading the script (Google official order)
+    (window as any).dataLayer = (window as any).dataLayer || [];
+    (window as any).gtag = function () { (window as any).dataLayer.push(arguments); };
+    (window as any).gtag("js", new Date());
+    (window as any).gtag("config", id);
+    // Load gtag.js script
     const s = document.createElement("script");
     s.id = "ga-script";
     s.async = true;
     s.src = `https://www.googletagmanager.com/gtag/js?id=${id}`;
     document.head.appendChild(s);
-    s.onload = () => {
-      (window as any).dataLayer = (window as any).dataLayer || [];
-      function gtag(...args: any[]) { (window as any).dataLayer.push(args); }
-      gtag("js", new Date());
-      gtag("config", id);
-    };
   }
 
   function handleAccept() {
