@@ -2,7 +2,10 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Rork Lab — Rork Max 日本語ナレッジベース",
+  title: {
+    default: "Rork Lab — Rork Max 日本語ナレッジベース",
+    template: "%s | Rork Lab",
+  },
   description:
     "Rork Max（AI モバイルアプリビルダー）の使い方・チュートリアル・開発ツール連携・AI モデル統合・App Store 公開・収益化まで。初心者〜上級者向け日英ナレッジベース。",
   metadataBase: new URL("https://rorklab.net"),
@@ -23,7 +26,7 @@ export const metadata: Metadata = {
     description:
       "Rork Max の使い方・開発ツール連携・AI モデル統合・収益化まで。初心者〜上級者向け日英ナレッジベース。",
     url: "https://rorklab.net",
-    images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab" }],
+    images: [{ url: "https://rorklab.net/og/default.png", width: 1200, height: 630, alt: "Rork Lab" }],
   },
   twitter: {
     card: "summary_large_image",
@@ -36,6 +39,17 @@ export const metadata: Metadata = {
       "ja": "https://rorklab.net",
       "en": "https://rorklab.net/en",
     },
+  },
+  icons: {
+    icon: [
+      { url: "/favicon-48.png", sizes: "48x48", type: "image/png" },
+      { url: "/favicon-32.png", sizes: "32x32", type: "image/png" },
+      { url: "/favicon-16.png", sizes: "16x16", type: "image/png" },
+      { url: "/icon.svg", type: "image/svg+xml" },
+    ],
+    apple: [
+      { url: "/apple-touch-icon.png", sizes: "180x180" },
+    ],
   },
   robots: {
     index: true,
