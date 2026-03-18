@@ -1,0 +1,487 @@
+---
+title: "Rork Max × Supabase × Stripe Connect でサービスマーケットプレイスアプリを構築する完全ガイド"
+slug: "rork-max-marketplace-app-tutorial"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-03-19T07:00"
+updated: "2026-03-19T07:00"
+author: "Rork Lab"
+description: "Rork MaxとSupabase、Stripe Connectを組み合わせ、出品者と購入者をつなぐ本格サービスマーケットプレイスアプリをゼロから構築する上級者向け完全チュートリアル。"
+tags: ["Rork Max", "Stripe Connect", "Supabase", "マーケットプレイス", "アプリ開発", "収益化", "チュートリアル", "個人開発"]
+---
+
+## はじめに
+
+フリーランサープラットフォーム、スキルシェアサービス、フリマアプリ――これらはすべて「マーケットプレイス」という共通のビジネスモデルを持ちます。売り手と買い手をつなぎ、取引ごとに手数料を受け取るこのモデルは、個人開発者にとっても非常に魅力的な収益源です。
+
+しかし従来、マーケットプレイスアプリの構築には複数のバックエンドエンジニアと数ヶ月の開発期間が必要でした。**Rork Max × Supabase × Stripe Connect**の組み合わせを使えば、これを一人で、そして驚くほど短期間で実現できます。
+
+この記事では以下を実装します：
+
+- **出品者・購入者の二役ユーザー管理**（Supabase Auth）
+- **サービス出品・検索・予約フロー**
+- **Stripe Connect による分割決済**（プラットフォーム手数料の自動徴収）
+- **予約管理・メッセージング機能**
+- **App Store 申請までの公開フロー**
+
+対象読者はRork Maxの基本操作を習得済みで、Supabaseの基礎を理解している方です。Rorkが初めての方は [Rorkの始め方ガイド](/articles/rork-basics/getting-started) を先にお読みください。
+
+---
+
+## 前提知識・環境構築
+
+### 必要なアカウントとツール
+
+| ツール | 用途 | 料金 |
+|--------|------|------|
+| Rork Max | ネイティブSwiftアプリ生成 | Max プラン（$200/月） |
+| Supabase | DB・認証・リアルタイム | 無料枠あり（Pro $25/月〜） |
+| Stripe | 決済処理・Connect | 取引手数料制（2.9% + $0.30） |
+| Expo EAS | ビルド・TestFlight | 無料枠あり |
+
+### Stripe Connect のセットアップ
+
+Stripe Connectは「プラットフォームが出品者（Connected Accounts）の代わりに決済を受け取り、手数料を差し引いて送金する」仕組みです。マーケットプレイスには**Express アカウント**方式が最適です。
+
+Stripeダッシュボードで以下を設定します：
+
+1. **Connect** → **Settings** → **Account types** で「Express」を有効化
+2. **Webhooks** に `account.updated`、`payment_intent.succeeded`、`transfer.created` を登録
+3. Stripe CLI（`stripe listen --forward-to localhost:3000/api/webhook`）でローカルテスト
+
+### Supabase テーブル設計
+
+Rork Maxのチャット欄に「マーケットプレイスアプリのSupabaseテーブルを設計して」と入力すると、AIが初期SQLを生成してくれます。以下が本チュートリアルで使用するスキーマです：
+
+```sql
+-- ユーザープロフィール（出品者 / 購入者 共通）
+CREATE TABLE profiles (
+  id UUID REFERENCES auth.users(id) PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  bio TEXT,
+  avatar_url TEXT,
+  stripe_account_id TEXT,       -- 出品者のStripe Expressアカウント ID
+  is_seller BOOLEAN DEFAULT FALSE,
+  rating NUMERIC(3,2) DEFAULT 0,
+  review_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- サービス出品テーブル
+CREATE TABLE services (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  seller_id UUID REFERENCES profiles(id) NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  price INTEGER NOT NULL,        -- 金額（円、最小単位）
+  category TEXT NOT NULL,
+  delivery_days INTEGER DEFAULT 3,
+  thumbnail_url TEXT,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 予約・注文テーブル
+CREATE TABLE orders (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  service_id UUID REFERENCES services(id) NOT NULL,
+  buyer_id UUID REFERENCES profiles(id) NOT NULL,
+  seller_id UUID REFERENCES profiles(id) NOT NULL,
+  amount INTEGER NOT NULL,
+  platform_fee INTEGER NOT NULL,  -- プラットフォーム手数料
+  stripe_payment_intent_id TEXT,
+  stripe_transfer_id TEXT,
+  status TEXT DEFAULT 'pending',  -- pending / paid / in_progress / completed / cancelled
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  completed_at TIMESTAMPTZ
+);
+
+-- メッセージングテーブル
+CREATE TABLE messages (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  order_id UUID REFERENCES orders(id) NOT NULL,
+  sender_id UUID REFERENCES profiles(id) NOT NULL,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- レビューテーブル
+CREATE TABLE reviews (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  order_id UUID REFERENCES orders(id) NOT NULL,
+  reviewer_id UUID REFERENCES profiles(id) NOT NULL,
+  reviewee_id UUID REFERENCES profiles(id) NOT NULL,
+  rating INTEGER CHECK (rating BETWEEN 1 AND 5),
+  comment TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Row Level Security（RLS）も忘れずに設定します。Rork Maxのチャットに「上記テーブルのRLSポリシーを作成して」と入力すれば、適切なポリシーSQLを生成してくれます。
+
+---
+
+## 概念と設計思想
+
+### マーケットプレイスの決済フロー
+
+Stripe Connectのマーケットプレイス決済は以下の流れで動きます：
+
+```
+購入者 → プラットフォーム（あなたのStripeアカウント） → 出品者
+          ↑手数料を差し引いて自動転送
+```
+
+具体的には：
+1. 購入者が `PaymentIntent` を作成（`on_behalf_of: seller_stripe_account_id`）
+2. 支払い完了後、`Transfer` を作成して出品者のConnectedアカウントへ送金
+3. プラットフォームは差額（手数料）を自動保持
+
+**手数料設計の例（15%の場合）：**
+- サービス料金: ¥10,000
+- 出品者受取: ¥8,500
+- プラットフォーム手数料: ¥1,500（+ Stripe手数料）
+
+### Rork MaxでのAPI設計
+
+Rork MaxはSupabase Edge Functionsと連携して複雑なバックエンドロジックを実装できます。Stripe Connect の操作はクライアント側ではなく、必ずサーバーサイド（Edge Functions）で行ってください。
+
+---
+
+## ステップバイステップ実装
+
+### Step 1: Rork Maxで基本UIを生成する
+
+Rork Maxのプロジェクトを新規作成し、以下のプロンプトを送ります：
+
+> 「フリーランスサービスマーケットプレイスアプリを作って。ホーム（サービス一覧）、サービス詳細、出品者プロフィール、マイページ、メッセージ画面が必要。BottomTabNavigatorで構成して。カラーテーマはインディゴ×ホワイト。」
+
+Rork MaxのAIがSwiftUIのコードを生成します。次に、Supabase連携のプロンプトを追加します：
+
+> 「SupabaseのURLとanon keyを環境変数に設定して、servicesテーブルからサービス一覧を取得してホーム画面に表示して。画像はSupabase Storageから読み込む。」
+
+### Step 2: 出品者のStripe Connect オンボーディング
+
+出品者が初めて「出品を開始する」ボタンを押したとき、Stripe Expressアカウントの作成フローが走ります。Supabase Edge Functionで実装します：
+
+```typescript
+// supabase/functions/create-stripe-account/index.ts
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!);
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+Deno.serve(async (req) => {
+  const { userId } = await req.json();
+
+  // Stripe Expressアカウントを作成
+  const account = await stripe.accounts.create({
+    type: "express",
+    country: "JP",
+    capabilities: {
+      transfers: { requested: true },
+    },
+  });
+
+  // プロフィールにStripeアカウントIDを保存
+  await supabase
+    .from("profiles")
+    .update({ stripe_account_id: account.id, is_seller: true })
+    .eq("id", userId);
+
+  // オンボーディングURLを生成（出品者がKYC情報を入力するStripe画面）
+  const accountLink = await stripe.accountLinks.create({
+    account: account.id,
+    refresh_url: "https://yourapp.com/seller/onboarding/refresh",
+    return_url: "https://yourapp.com/seller/onboarding/complete",
+    type: "account_onboarding",
+  });
+
+  return new Response(JSON.stringify({ url: accountLink.url }), {
+    headers: { "Content-Type": "application/json" },
+  });
+});
+```
+
+Rork MaxでこのEdge Functionを呼び出し、返ってきた `url` をSafariViewで開きます。Rork Maxのチャットに「SafariViewControllerでURLを開く画面を実装して」と入力するだけでコードが生成されます。
+
+### Step 3: 分割決済の実装
+
+購入者がサービスを注文するとき、Stripe PaymentIntentを作成してから支払いを処理します：
+
+```typescript
+// supabase/functions/create-payment-intent/index.ts
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!);
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const PLATFORM_FEE_RATE = 0.15; // 15% プラットフォーム手数料
+
+Deno.serve(async (req) => {
+  const { serviceId, buyerId } = await req.json();
+
+  // サービス情報と出品者のStripeアカウントを取得
+  const { data: service } = await supabase
+    .from("services")
+    .select("*, profiles!seller_id(stripe_account_id, display_name)")
+    .eq("id", serviceId)
+    .single();
+
+  const sellerStripeAccountId = service.profiles.stripe_account_id;
+  const amount = service.price;
+  const platformFee = Math.round(amount * PLATFORM_FEE_RATE);
+
+  // PaymentIntentを作成（手数料を差し引いて出品者に転送）
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount,
+    currency: "jpy",
+    application_fee_amount: platformFee,
+    transfer_data: {
+      destination: sellerStripeAccountId,
+    },
+    metadata: {
+      serviceId,
+      buyerId,
+      sellerId: service.seller_id,
+    },
+  });
+
+  // 注文レコードを作成（status: 'pending'）
+  await supabase.from("orders").insert({
+    service_id: serviceId,
+    buyer_id: buyerId,
+    seller_id: service.seller_id,
+    amount,
+    platform_fee: platformFee,
+    stripe_payment_intent_id: paymentIntent.id,
+  });
+
+  return new Response(
+    JSON.stringify({ clientSecret: paymentIntent.client_secret }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+Rork MaxのチャットでStripe SDKの組み込みを依頼します：
+
+> 「Stripe PaymentSheetを実装して。clientSecretをAPIから取得して、Apple Pay・クレジットカードで支払えるようにして。支払い完了後に注文確認画面へ遷移する。」
+
+### Step 4: Supabase Realtimeでメッセージング
+
+注文後のやりとりをリアルタイム実装します。Rork Maxで以下のプロンプトを送ります：
+
+> 「Supabase Realtimeを使ったチャット画面を実装して。messagesテーブルを購読して、新着メッセージをリアルタイム表示する。送信ボタンとテキスト入力欄を下部に配置。」
+
+生成されたコードのポイント：
+
+```swift
+// Rork Maxが生成するチャット実装のポイント
+// （AIが完全なSwiftUIコードを自動生成します）
+.onAppear {
+    // Supabaseのリアルタイムチャンネルを購読
+    channel = supabase.realtimeV2.channel("messages-\(orderId)")
+    channel?.on("INSERT", filter: .init(event: "INSERT", schema: "public", table: "messages")) { payload in
+        // 新着メッセージをStateに追加
+        if let newMessage = try? JSONDecoder().decode(Message.self, from: payload.rawData) {
+            DispatchQueue.main.async {
+                messages.append(newMessage)
+            }
+        }
+    }
+    channel?.subscribe()
+}
+```
+
+### Step 5: レビュー・評価システムの実装
+
+取引完了後にレビューを書けるUIをRork Maxで生成します：
+
+> 「5段階の星評価と任意コメントを送信できるレビュー画面を作って。送信後にSupabaseのreviewsテーブルに保存し、profilesテーブルのrating（平均値）とreview_countも更新する。」
+
+レーティングの自動計算にはSupabase Database Functionを使います：
+
+```sql
+-- レビュー投稿後に自動でratingを更新するトリガー
+CREATE OR REPLACE FUNCTION update_seller_rating()
+RETURNS TRIGGER AS $$
+BEGIN
+  UPDATE profiles
+  SET
+    rating = (
+      SELECT AVG(rating)::NUMERIC(3,2)
+      FROM reviews
+      WHERE reviewee_id = NEW.reviewee_id
+    ),
+    review_count = (
+      SELECT COUNT(*)
+      FROM reviews
+      WHERE reviewee_id = NEW.reviewee_id
+    )
+  WHERE id = NEW.reviewee_id;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER after_review_insert
+AFTER INSERT ON reviews
+FOR EACH ROW EXECUTE FUNCTION update_seller_rating();
+```
+
+---
+
+## 応用パターン
+
+### カテゴリ・検索フィルタリング
+
+サービスが増えてくると検索機能が重要になります。SupabaseはPostgreSQL全文検索をサポートしています：
+
+```sql
+-- 全文検索インデックスを作成
+ALTER TABLE services ADD COLUMN search_vector TSVECTOR;
+UPDATE services SET search_vector = to_tsvector('japanese', title || ' ' || description);
+CREATE INDEX services_search_idx ON services USING GIN(search_vector);
+
+-- 検索クエリ
+SELECT * FROM services
+WHERE search_vector @@ plainto_tsquery('japanese', 'デザイン Web制作')
+ORDER BY ts_rank(search_vector, plainto_tsquery('japanese', 'デザイン Web制作')) DESC;
+```
+
+Rork Maxでは「検索バーと結果一覧を実装して、Supabaseのfull-text searchを使って」と入力するだけで対応コードが生成されます。
+
+### Webhookで注文ステータスを自動更新
+
+Stripe Webhookで支払い完了を検知し、注文ステータスを自動で更新します：
+
+```typescript
+// supabase/functions/stripe-webhook/index.ts
+Deno.serve(async (req) => {
+  const signature = req.headers.get("stripe-signature")!;
+  const body = await req.text();
+
+  const event = stripe.webhooks.constructEvent(
+    body,
+    signature,
+    Deno.env.get("STRIPE_WEBHOOK_SECRET")!
+  );
+
+  if (event.type === "payment_intent.succeeded") {
+    const paymentIntent = event.data.object;
+    await supabase
+      .from("orders")
+      .update({ status: "paid" })
+      .eq("stripe_payment_intent_id", paymentIntent.id);
+  }
+
+  return new Response(JSON.stringify({ received: true }));
+});
+```
+
+---
+
+## トラブルシューティング
+
+### よくあるエラーと対処法
+
+**エラー1: Stripe Connect オンボーディングが完了しない**
+- 原因: テストモードでは日本のStripe Expressアカウントが作れない場合がある
+- 対処: Stripeダッシュボードのテスト環境で「バイパスモード」を有効化、または `test_mode: true` オプションを使用
+
+**エラー2: PaymentIntent作成時に「No such account」エラー**
+- 原因: `stripe_account_id` がNULLまたは誤った値
+- 対処: `profiles` テーブルで対象出品者の `stripe_account_id` を確認。オンボーディング完了前に注文フローに進んでいないか確認
+
+**エラー3: Supabase Realtimeが接続されない**
+- 原因: RLSポリシーでRealtimeのサブスクリプションがブロックされている
+- 対処: `supabase.from('messages').select()` のRLSポリシーにRealtimeユーザーのアクセスを許可する設定を追加
+
+**エラー4: Rork Maxでビルドエラー（SwiftUI Preview失敗）**
+- 対処: Rork MaxのチャットにXcodeのエラーメッセージをそのまま貼り付けると、自動でデバッグしてくれます
+
+---
+
+## 公開・収益化のポイント
+
+### App Store 審査対策
+
+マーケットプレイスアプリはApp Store審査で厳しくチェックされます。以下に注意してください：
+
+- **デジタルサービスの購入にはIn-App Purchaseが必要**: フィジカル商品やサービス（人的作業）は例外。ただし審査担当者の判断によるため、App Store Reviewガイドラインを事前に確認すること
+- **成人向けコンテンツは審査前に完全排除**
+- **ユーザー間取引の安全性**: 不正出品・詐欺防止の仕組み（通報ボタン、AI審査）を実装しておくと審査が通りやすい
+
+Rork Maxを使えば、TestFlight配信からApp Store申請まで2クリックで完了します。詳細は [App Store 公開ガイド](/articles/rork-basics/app-store-publishing) をご覧ください。
+
+### 収益モデルの最適化
+
+マーケットプレイスの手数料設計は事業成功のカギです。一般的なプラットフォームの手数料相場：
+
+| プラットフォーム | 手数料率 |
+|---|---|
+| Airbnb | 3〜5%（ホスト）+ 14〜16%（ゲスト） |
+| Upwork | 5〜20%（出品者側のみ） |
+| Fiverr | 20%（出品者）+ 5.5%（購入者） |
+| Skeb | 20%（出品者） |
+
+初期はやや低めの手数料（10〜15%）で出品者を集め、プラットフォームに価値が出てきたら段階的に引き上げる戦略が有効です。Stripe Connectでは手数料率をコード1行で変更できます。
+
+収益化の全体戦略については [Rorkアプリの収益化完全ガイド](/articles/rork-business/rork-monetization-complete-guide) も参考にしてください。
+
+---
+
+## FAQ
+
+**Q1. Stripe Connectの審査（KYC）にどれくらいかかりますか？**
+
+A. 日本の法人・個人事業主の場合、通常1〜3営業日です。テストモードでは審査をバイパスできます。本番移行前に十分なテストを行ってください。
+
+**Q2. 出品者が日本在住でない場合、Stripe Connectは使えますか？**
+
+A. Stripe Expressアカウントは47カ国以上で利用可能です。ただし対応通貨と振込サイクルは国によって異なります。グローバル展開を想定する場合は、Stripeの対応国リストを事前に確認してください。
+
+**Q3. Rork Maxで生成したSwiftUIコードを自分で編集できますか？**
+
+A. はい。Rork Maxは完全なSwiftUIプロジェクトを出力するため、Xcodeでそのまま開いて編集できます。AIが生成したコードを起点に、細かいカスタマイズを加えることが可能です。
+
+**Q4. マーケットプレイスに必要な法的対応（特商法・資金決済法）を教えてください。**
+
+A. 日本でマーケットプレイスを運営する場合、特定商取引法に基づく表記（運営者情報・返金ポリシー等）が必要です。また、出品者への送金を伴う場合は資金移動業の登録が必要になる可能性があります。法的な要件については必ず専門家（弁護士・税理士）にご確認ください。
+
+**Q5. Stripe Connectの手数料（Stripe自体の費用）はいくらですか？**
+
+A. Stripe Expressアカウントへの国内送金手数料は無料です（ただし標準のStripe決済手数料2.9% + ¥30は発生します）。詳細はStripe公式サイトの料金ページを確認してください。
+
+**Q6. 出品者の本人確認（KYC）をアプリ内で完結させることはできますか？**
+
+A. Stripe Connectのオンボーディングリンクを使う場合、Stripeが提供するホスト型のKYCフォームをWebViewで表示する形になります。完全にアプリ内で完結させるには、Stripe Identity APIを別途実装する必要があります。Rork Maxのチャットに「Stripe Identityの実装を手伝って」と入力することで対応可能です。
+
+**Q7. SupabaseとFirebaseはどちらが向いていますか？**
+
+A. マーケットプレイスのような複雑なデータ構造にはSupabase（PostgreSQL）が適しています。リレーショナルデータ、Row Level Security、Full-text searchなどが標準で使えるためです。詳しくは [Supabase vs Firebase 完全比較](/articles/rork-dev/supabase-firebase-backend) をご覧ください。
+
+---
+
+## まとめ
+
+Rork Max × Supabase × Stripe Connectの組み合わせで、本格的なサービスマーケットプレイスアプリを一人で構築できることをご確認いただけたと思います。
+
+今回実装したポイントを振り返ります：
+
+- **Stripe Connect Express** による出品者オンボーディングと分割決済
+- **Supabase** を活用したリアルタイムチャットと評価システム
+- **Rork Max** のAI生成によるネイティブSwiftUI実装の高速化
+
+マーケットプレイスはネットワーク効果が働くビジネスモデルです。まずは小さなニッチ（例：特定のスキル領域）に絞り、早期にリリースしてフィードバックを集めることが成功への近道です。
+
+Stripe Connectのより詳細な活用法については [Stripe決済統合ガイド](/articles/rork-dev/rork-stripe-payment-integration) も合わせてご覧ください。
