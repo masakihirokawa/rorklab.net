@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 interface PremiumPaywallProps {
   locale: string;
@@ -19,6 +19,12 @@ const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: 
 
 export function PremiumPaywall({ locale }: PremiumPaywallProps) {
   const [loading, setLoading] = useState<string | null>(null);
+  const [isPremium, setIsPremium] = useState(false);
+
+  useEffect(() => {
+    const hasPremium = document.cookie.split(";").some((c) => c.trim().startsWith("premium_token="));
+    setIsPremium(hasPremium);
+  }, []);
   const plans = PLANS[locale] || PLANS.en;
 
   const handleCheckout = async (priceId: string, mode: string, plan: string) => {
@@ -39,6 +45,8 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
       setLoading(null);
     }
   };
+
+  if (isPremium) return null;
 
   return (
     <div

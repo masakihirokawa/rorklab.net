@@ -1,4 +1,5 @@
 import { localePrefix } from "@/lib/locale";
+import { cookies } from "next/headers";
 
 interface MembershipCTAProps {
   locale: string;
@@ -33,7 +34,11 @@ const CONTENT = {
   },
 };
 
-export function MembershipCTA({ locale }: MembershipCTAProps) {
+export async function MembershipCTA({ locale }: MembershipCTAProps) {
+  const cookieStore = await cookies();
+  const isPremium = !!cookieStore.get("premium_token")?.value;
+  if (isPremium) return null;
+
   const t = CONTENT[locale as keyof typeof CONTENT] || CONTENT.en;
   const prefix = localePrefix(locale);
 
