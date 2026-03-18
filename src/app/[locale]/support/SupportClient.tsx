@@ -136,6 +136,7 @@ export function SupportClient({
   plans: { pro: Plan; premium: Plan };
 }) {
   const [loading, setLoading] = useState<string | null>(null);
+  const [isPremium, setIsPremium] = useState(false);
   const [error, setError] = useState("");
   const [isMobile, setIsMobile] = useState(false);
 
@@ -149,6 +150,8 @@ export function SupportClient({
   const faq = FAQ_TEXT[locale] || FAQ_TEXT.en;
 
   useEffect(() => {
+    const hasPremium = document.cookie.split(";").some((c) => c.trim().startsWith("premium_token="));
+    setIsPremium(hasPremium);
     const check = () => setIsMobile(window.innerWidth < 768 || "ontouchstart" in window);
     check();
     window.addEventListener("resize", check);
@@ -249,6 +252,20 @@ export function SupportClient({
           scrollMarginTop: 110,
         }}
       >
+        {isPremium ? (
+          <div style={{ textAlign: "center", padding: "12px 0" }}>
+            <div style={{ fontSize: 28, marginBottom: 12 }}>&#x2764;</div>
+            <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 12 }}>
+              {locale === "ja" ? "ご支援ありがとうございます" : "Thank You for Your Support"}
+            </h2>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.8, margin: 0 }}>
+              {locale === "ja"
+                ? "プレミアムメンバーとしてすべての記事をお楽しみいただけます。いつも応援いただきありがとうございます。"
+                : "As a premium member, you have full access to all articles. Thank you for your continued support."}
+            </p>
+          </div>
+        ) : (
+          <>
         <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8, textAlign: "center" }}>
           {content.membershipHeading}
         </h2>
@@ -322,6 +339,8 @@ export function SupportClient({
             {loading === "premium" ? "..." : `${plans.premium.label} — ${plans.premium.price}`}
           </button>
         </div>
+          </>
+        )}
       </div>
 
       {error && (
