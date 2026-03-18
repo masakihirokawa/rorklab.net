@@ -31,6 +31,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       title: m.title,
       description: m.description,
       url,
+      type: "website",
+      siteName: "Rork Lab",
       locale: locale === "ja" ? "ja_JP" : "en_US",
       images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab" }],
     },

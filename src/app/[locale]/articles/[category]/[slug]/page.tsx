@@ -32,6 +32,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: article.meta.description,
       url,
       type: "article",
+      siteName: "Rork Lab",
       publishedTime: article.meta.date,
       modifiedTime: article.meta.updated || article.meta.date,
       authors: [article.meta.author],
