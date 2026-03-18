@@ -5,9 +5,9 @@
 
 ---
 
-## Articles（解説記事）— 計 36本 × 2言語
+## Articles（解説記事）— 計 39本 × 2言語
 
-### Rork 基本（rork-basics）— 7本
+### Rork 基本（rork-basics）— 8本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | what-is-rork | Rorkとは？ AIでモバイルアプリを作れる革命的プラットフォーム | beginner | 2026-03-10 |
@@ -17,8 +17,9 @@
 | fix-now-auto-debug | Rork の自動バグ修正機能「Fix Now」完全ガイド | beginner | 2026-03-12 |
 | rork-vs-lovable | Rork vs Lovable：AIアプリ開発ツール徹底比較【2026年版】 | beginner | 2026-03-13 |
 | rork-templates-guide | Rork テンプレートガイド — 素早くアプリを始めるための出発点 | beginner | 2026-03-13 |
+| rork-vs-lovable-vs-bolt-2026 | Rork vs Lovable vs Bolt — AI アプリビルダー3社比較 2026年版 | beginner | 2026-03-19 |
 
-### 開発実践（rork-dev）— 20本
+### 開発実践（rork-dev）— 21本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | app-store-publishing | Rorkで作ったアプリをApp StoreとGoogle Playに公開する方法 | intermediate | 2026-03-10 |
@@ -41,6 +42,7 @@
 | rork-animations-guide | Rork Max でアニメーションを実装する — React Native Animated 活用ガイド | intermediate | 2026-03-13 |
 | rork-offline-support | Rork Max でオフライン対応アプリを作る — AsyncStorage と SQLite 活用 | intermediate | 2026-03-13 |
 | rork-deeplink-guide | Rork Max でディープリンクを実装する — Universal Links と URL Schemes | intermediate | 2026-03-13 |
+| rork-max-storekit-2-in-app-purchase | Rork Max で StoreKit 2 の In-App Purchase を実装する — サブスクリプション課金の完全ガイド | advanced | 2026-03-19 |
 
 ### AI 活用（rork-ai）— 5本
 | Slug | Title (JA) | Level | Date |
@@ -51,13 +53,14 @@
 | rork-vs-flutterflow | Rork vs FlutterFlow：AI搭載ノーコード開発プラットフォームの比較 | beginner | 2026-03-10 |
 | lovable-vs-rork | Lovable vs Rork — AI アプリビルダー徹底比較 2026 | beginner | 2026-03-13 |
 
-### ビジネス活用（rork-business）— 4本
+### ビジネス活用（rork-business）— 5本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | rork-growth-story-2026 | Rorkの急成長ストーリー：バイラルツイートからa16z出資、Rork Max誕生まで | beginner | 2026-03-10 |
 | rork-pricing-plans | Rork料金プラン完全ガイド：無料枠からRork Maxまで徹底解説 | beginner | 2026-03-10 |
 | rork-use-cases | Rork活用事例10選：ポートフォリオからECアプリまで | beginner | 2026-03-10 |
 | solo-dev-app-business | 個人開発者のためのRork活用術：アプリビジネスの始め方 | intermediate | 2026-03-10 |
+| rork-max-2-click-publish-complete-guide | Rork Max の2クリック App Store 公開を完全解説 — Xcode 不要でアプリを世界に届ける | intermediate | 2026-03-19 |
 
 ---
 
@@ -76,7 +79,7 @@
 ## 未着手トピック候補（今後追加予定）
 
 ### Articles
-- rork-dev: In-App Purchase（StoreKit 2）実装ガイド
+~~- rork-dev: In-App Purchase（StoreKit 2）実装ガイド~~ ✅ 2026-03-19 追加済み
 - rork-dev: Rork Max × Core Data / CloudKit 永続化ガイド
 - rork-dev: TestFlight でのベータテスト配布ガイド
 - rork-ai: GPT-4o × Rork — OpenAI モデル活用ガイド
@@ -90,4 +93,4 @@
 
 ---
 
-*最終更新: 2026-03-13 (blog: +1, 計5本)*
+*最終更新: 2026-03-19 (articles: +3, 計39本)*
