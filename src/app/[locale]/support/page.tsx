@@ -8,11 +8,11 @@ interface Props {
 const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "メンバーシップ & サポート — Rork Lab",
-    description: "Rork Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥500 または永久アクセス ¥2,980。",
+    description: "Rork Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥380 または永久アクセス ¥1,480。",
   },
   en: {
     title: "Membership & Support — Rork Lab",
-    description: "Get full access to all premium articles with Rork Lab Pro / Premium. $5/month or $19 lifetime.",
+    description: "Get full access to all premium articles with Rork Lab Pro / Premium. $3/month or $10 lifetime.",
   },
 };
 
@@ -30,18 +30,18 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 }
 
 const STRIPE_TIP: Record<string, { priceId: string }> = {
-  ja: { priceId: "price_1TALKCEGB5g6A54o7MmhnvBC" },
-  en: { priceId: "price_1TALKDEGB5g6A54os1T6NO1C" },
+  ja: { priceId: "price_1TCQyPEGB5g6A54ofaB9e5to" },
+  en: { priceId: "price_1TCQyXEGB5g6A54oVQirhunP" },
 };
 
 const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; price: string }; premium: { priceId: string; label: string; price: string } }> = {
   ja: {
-    pro: { priceId: "price_1T9XeNEGB5g6A54ofvfbFcSm", label: "Pro — 月額プラン", price: "¥500/月" },
-    premium: { priceId: "price_1T9XdUEGB5g6A54oZw62YMLI", label: "Premium — 永久アクセス", price: "¥2,980" },
+    pro: { priceId: "price_1TCQyjEGB5g6A54opYFArVOk", label: "Pro — 月額プラン", price: "¥380/月" },
+    premium: { priceId: "price_1TCQyxEGB5g6A54oh8U6RHec", label: "Premium — 永久アクセス", price: "¥1,480" },
   },
   en: {
-    pro: { priceId: "price_1TALKEEGB5g6A54oBmnhCclK", label: "Pro — Monthly", price: "$5/mo" },
-    premium: { priceId: "price_1TALKFEGB5g6A54oZp3kYK0z", label: "Premium — Lifetime", price: "$19" },
+    pro: { priceId: "price_1TCQylEGB5g6A54oNYYQAjPX", label: "Pro — Monthly", price: "$3/mo" },
+    premium: { priceId: "price_1TCQyyEGB5g6A54oUojdhfBa", label: "Premium — Lifetime", price: "$10" },
   },
 };
 
@@ -84,7 +84,7 @@ const CONTENT: Record<string, {
     premiumLabel: "永久アクセスを購入",
     tipHeading: "チップで応援する",
     note: "※ いただいたご支援はサーバー費用・コンテンツ制作に使わせていただきます。",
-    tipLabel: "¥300 チップを送る",
+    tipLabel: "¥150 チップを送る",
     tipSub: "Stripe 決済（クレジットカード対応）",
     methods: [
       { name: "Ko-fi", icon: "☕", label: "Ko-fi でサポート", sub: "ko-fi.com/dolice", url: "https://ko-fi.com/dolice", color: "#29ABE0", global: true },
@@ -110,7 +110,7 @@ const CONTENT: Record<string, {
     premiumLabel: "Buy Lifetime Access",
     tipHeading: "Leave a Tip",
     note: "* All contributions go toward server costs and content creation.",
-    tipLabel: "Send $3 Tip",
+    tipLabel: "Send $1.50 Tip",
     tipSub: "Stripe checkout (credit card)",
     methods: [
       { name: "Ko-fi", icon: "☕", label: "Support on Ko-fi", sub: "ko-fi.com/dolice", url: "https://ko-fi.com/dolice", color: "#29ABE0", global: true },
