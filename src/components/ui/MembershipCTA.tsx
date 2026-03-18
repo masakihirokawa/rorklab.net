@@ -14,8 +14,8 @@ const CONTENT = {
       "毎週追加される限定コンテンツ",
       "上級テクニック・実践ガイド",
     ],
-    pro: "Pro プラン — ¥500/月",
-    premium: "Premium プラン — ¥2,980（永久アクセス）",
+    pro: "Pro プラン — ¥380/月",
+    premium: "Premium プラン — ¥1,480（永久アクセス）",
     link: "メンバーシップを見る →",
   },
   en: {
@@ -27,8 +27,8 @@ const CONTENT = {
       "New exclusive content added every week",
       "Advanced techniques & hands-on guides",
     ],
-    pro: "Pro Plan — $5/mo",
-    premium: "Premium Plan — $19 (lifetime access)",
+    pro: "Pro Plan — $3/mo",
+    premium: "Premium Plan — $10 (lifetime access)",
     link: "View Membership →",
   },
 };
