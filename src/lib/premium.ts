@@ -21,10 +21,24 @@ export async function getPremiumAccess(): Promise<PremiumType> {
     try {
       const kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
       if (kv) {
-        const data = await kv.get(`site:rorklab:email:${email}`);
+        const kvKey = `site:rorklab:email:${email}`;
+        const data = await kv.get(kvKey);
         if (!data) return null;
         const record = JSON.parse(data);
         if (new Date(record.expires_at) < new Date()) return null;
+
+        // Auto-extend: if Premium member's TTL is less than 5 years, extend to 10 years
+        if (record.type === "premium") {
+          const fiveYears = 5 * 365 * 24 * 3600 * 1000;
+          const remaining = new Date(record.expires_at).getTime() - Date.now();
+          if (remaining < fiveYears) {
+            const newTtl = 10 * 365 * 24 * 3600;
+            const newExpiry = new Date(Date.now() + newTtl * 1000);
+            const updated = { ...record, expires_at: newExpiry.toISOString() };
+            kv.put(kvKey, JSON.stringify(updated), { expirationTtl: newTtl }).catch(() => {});
+          }
+        }
+
         return record.type as PremiumType;
       }
     } catch {
