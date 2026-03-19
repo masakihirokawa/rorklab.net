@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "Rork Max — 2026年2月ローンチ：React Native から完全ネイティブ Swift へ移行した新プロダクト",
-    "NEW — Rork Max が Apple 全デバイス対応：iPhone・iPad・Watch・Vision Pro・Apple TV・iMessage",
-    "Funding — Rork が a16z から $280 万調達、月間 74.3 万訪問・85% 成長で急拡大中",
-    "Rork Max — AR/LiDAR・Metal 3D・Dynamic Island・Live Activities・HealthKit に完全ネイティブ対応",
-    "RANKING — 2026 年 AI ノーコードツール比較でネイティブモバイルアプリ開発 No.1 に選出",
-    "MVP — Rork を使えば数時間でネイティブアプリの MVP が完成、App Store 申請まで完結",
+    "MILESTONE — Rork Max がローンチ3日で ARR $1.5M を達成、ネイティブアプリ開発に革命",
+    "SwiftUI — Xcode 不要・Mac 不要、ブラウザだけで SwiftUI ネイティブアプリを開発・公開",
+    "2-Click — QR コードでデバイスにインストール → 2クリックで App Store 申請まで完結",
+    "全デバイス — iPhone/iPad/Apple Watch/Vision Pro/Apple TV/iMessage に 1 プロジェクトで対応",
+    "3D/AR — Metal シェーダー + SceneKit で 3D ゲーム、ARKit + LiDAR で空間アプリ開発",
+    "OpenClaw — NVIDIA NemoClaw 発表：OpenClaw エージェントをエンタープライズ対応に（GTC 2026）",
   ],
   en: [
-    "Rork Max — Launched Feb 2026: Major shift from React Native to fully native Swift apps",
-    "NEW — Rork Max supports entire Apple ecosystem: iPhone, iPad, Watch, Vision Pro, Apple TV & iMessage",
-    "Funding — Rork raises $2.8M from a16z; 743K monthly visits with 85% growth rate",
-    "Rork Max — Native AR/LiDAR, Metal 3D games, Dynamic Island, Live Activities & HealthKit support",
-    "RANKING — Rated #1 no-code AI tool for native mobile app development in 2026 reviews",
-    "MVP — Build a working native app MVP in hours with Rork, all the way to App Store submission",
+    "MILESTONE — Rork Max hits $1.5M ARR in 3 days, revolutionizing native app development",
+    "SwiftUI — No Xcode, no Mac required: build & publish native SwiftUI apps entirely in browser",
+    "2-Click — Install via QR code, submit to App Store in 2 clicks — all from the browser",
+    "All Devices — One project targets iPhone, iPad, Apple Watch, Vision Pro, Apple TV & iMessage",
+    "3D/AR — Full 3D games with Metal shaders + SceneKit, spatial apps with ARKit + LiDAR",
+    "OpenClaw — NVIDIA announces NemoClaw: enterprise-grade OpenClaw agents at GTC 2026",
   ],
 };
 
