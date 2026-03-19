@@ -34,7 +34,7 @@ export async function POST(request: NextRequest) {
     }
 
     const type = record.type as "pro" | "premium";
-    const ttlSeconds = type === "premium" ? 365 * 24 * 3600 : 31 * 24 * 3600;
+    const ttlSeconds = type === "premium" ? 10 * 365 * 24 * 3600 : 31 * 24 * 3600;
 
     try {
       await kv.put(kvKey, data, { expirationTtl: ttlSeconds });

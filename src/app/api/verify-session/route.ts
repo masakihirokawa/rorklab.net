@@ -41,7 +41,7 @@ export async function GET(request: NextRequest) {
     }
 
     const type = session.mode === "subscription" ? "pro" : "premium";
-    const ttlSeconds = type === "premium" ? 365 * 24 * 3600 : 31 * 24 * 3600;
+    const ttlSeconds = type === "premium" ? 10 * 365 * 24 * 3600 : 31 * 24 * 3600;
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
 
     try {
