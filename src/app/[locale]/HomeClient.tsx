@@ -228,7 +228,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               {locale === "ja" ? "記事を準備中です..." : "Articles coming soon..."}
             </p>
           ) : (
-            articles.slice(0, 5).map((article, i) => (
+            articles.slice(0, 10).map((article, i) => (
               <a
                 key={`${article.category}/${article.slug}`}
                 href={articleUrl(article)}
@@ -260,6 +260,34 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
                 </p>
               </a>
             ))
+          )}
+          {articles.length > 10 && (
+            <a
+              href={`${locale === "ja" ? "" : `/${locale}`}/articles`}
+              style={{
+                display: "inline-block",
+                marginTop: 32,
+                fontSize: 13,
+                fontWeight: 600,
+                color: "var(--accent-coral)",
+                textDecoration: "none",
+                padding: "10px 24px",
+                borderRadius: 6,
+                border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
+                background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
+                transition: "all 0.25s",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 14%, transparent)";
+                e.currentTarget.style.transform = "translateY(-1px)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 6%, transparent)";
+                e.currentTarget.style.transform = "translateY(0)";
+              }}
+            >
+              {locale === "ja" ? `すべての記事を見る (${articles.length}) →` : `View All Articles (${articles.length}) →`}
+            </a>
           )}
         </div>
       </section>
