@@ -8,12 +8,12 @@ interface PremiumPaywallProps {
 
 const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
   ja: {
-    pro: { priceId: "price_1T9XeNEGB5g6A54ofvfbFcSm", label: "Pro — ¥500/月" },
-    premium: { priceId: "price_1T9XdUEGB5g6A54oZw62YMLI", label: "Premium — ¥2,980（永久）" },
+    pro: { priceId: "price_1TCQyjEGB5g6A54opYFArVOk", label: "Pro — ¥380/月" },
+    premium: { priceId: "price_1TCQyxEGB5g6A54oh8U6RHec", label: "Premium — ¥1,480（永久）" },
   },
   en: {
-    pro: { priceId: "price_1TALKEEGB5g6A54oBmnhCclK", label: "Pro — $5/mo" },
-    premium: { priceId: "price_1TALKFEGB5g6A54oZp3kYK0z", label: "Premium — $19 (lifetime)" },
+    pro: { priceId: "price_1TCQylEGB5g6A54oNYYQAjPX", label: "Pro — $3/mo" },
+    premium: { priceId: "price_1TCQyyEGB5g6A54oUojdhfBa", label: "Premium — $10 (lifetime)" },
   },
 };
 

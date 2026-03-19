@@ -14,8 +14,8 @@ const CONTENT = {
       "毎週追加される限定コンテンツ",
       "無料記事の「続き」をすべて読める",
     ],
-    pro: "Pro プラン — ¥500/月",
-    premium: "Premium プラン — ¥2,980（永久アクセス）",
+    pro: "Pro プラン — ¥380/月（初月無料）",
+    premium: "Premium プラン — ¥1,480（永久アクセス）",
     link: "メンバーシップを見る →",
   },
   en: {
@@ -27,8 +27,8 @@ const CONTENT = {
       "New exclusive content added every week",
       "Full access to all premium \"deep dive\" articles",
     ],
-    pro: "Pro Plan — $5/mo",
-    premium: "Premium Plan — $19 (lifetime access)",
+    pro: "Pro Plan — $3/mo (first month free)",
+    premium: "Premium Plan — $10 (lifetime access)",
     link: "View Membership →",
   },
 };
