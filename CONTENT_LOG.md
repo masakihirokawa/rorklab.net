@@ -5,9 +5,9 @@
 
 ---
 
-## Articles（解説記事）— 計 39本 × 2言語
+## Articles（解説記事）— 計 JA 130本 / EN 107本
 
-### Rork 基本（rork-basics）— 8本
+### Rork 基本（rork-basics）— JA 19本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | what-is-rork | Rorkとは？ AIでモバイルアプリを作れる革命的プラットフォーム | beginner | 2026-03-10 |
@@ -19,7 +19,7 @@
 | rork-templates-guide | Rork テンプレートガイド — 素早くアプリを始めるための出発点 | beginner | 2026-03-13 |
 | rork-vs-lovable-vs-bolt-2026 | Rork vs Lovable vs Bolt — AI アプリビルダー3社比較 2026年版 | beginner | 2026-03-19 |
 
-### 開発実践（rork-dev）— 21本
+### 開発実践（rork-dev）— JA 78本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | app-store-publishing | Rorkで作ったアプリをApp StoreとGoogle Playに公開する方法 | intermediate | 2026-03-10 |
@@ -43,8 +43,9 @@
 | rork-offline-support | Rork Max でオフライン対応アプリを作る — AsyncStorage と SQLite 活用 | intermediate | 2026-03-13 |
 | rork-deeplink-guide | Rork Max でディープリンクを実装する — Universal Links と URL Schemes | intermediate | 2026-03-13 |
 | rork-max-storekit-2-in-app-purchase | Rork Max で StoreKit 2 の In-App Purchase を実装する — サブスクリプション課金の完全ガイド | advanced | 2026-03-19 |
+| rork-premium-best-practices-collection | Rork アプリ開発ベストプラクティス総集編 — 29本のプレミアム記事から厳選した実践テクニック集 | intermediate-advanced | 2026-03-20 |
 
-### AI 活用（rork-ai）— 5本
+### AI 活用（rork-ai）— JA 14本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | what-is-rork | AIアプリビルダー徹底比較：Rork・Bolt・Lovable・FlutterFlow | intermediate | 2026-03-10 |
@@ -53,7 +54,7 @@
 | rork-vs-flutterflow | Rork vs FlutterFlow：AI搭載ノーコード開発プラットフォームの比較 | beginner | 2026-03-10 |
 | lovable-vs-rork | Lovable vs Rork — AI アプリビルダー徹底比較 2026 | beginner | 2026-03-13 |
 
-### ビジネス活用（rork-business）— 5本
+### ビジネス活用（rork-business）— JA 15本
 | Slug | Title (JA) | Level | Date |
 |------|------------|-------|------|
 | rork-growth-story-2026 | Rorkの急成長ストーリー：バイラルツイートからa16z出資、Rork Max誕生まで | beginner | 2026-03-10 |
