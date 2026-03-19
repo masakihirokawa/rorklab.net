@@ -9,11 +9,11 @@ interface Props {
 const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "メンバーシップ & サポート — Rork Lab",
-    description: "Rork Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥500 または永久アクセス ¥2,980。",
+    description: "Rork Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ¥380 または永久アクセス ¥1,480。",
   },
   en: {
     title: "Membership & Support — Rork Lab",
-    description: "Get full access to all premium articles with Rork Lab Pro / Premium. $5/month or $19 lifetime.",
+    description: "Get full access to all premium articles with Rork Lab Pro / Premium. $3/month or $10 lifetime.",
   },
 };
 
