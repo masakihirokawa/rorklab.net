@@ -1,5 +1,4 @@
 import { localePrefix } from "@/lib/locale";
-import { cookies } from "next/headers";
 
 interface MembershipCTAProps {
   locale: string;
@@ -7,38 +6,34 @@ interface MembershipCTAProps {
 
 const CONTENT = {
   ja: {
-    heading: "さらに深く学びたい方へ",
+    heading: "お読みいただきありがとうございます",
     description:
-      "この記事を気に入っていただけましたか？Rork Lab メンバーシップでは、プレミアム限定の上級ガイドやチュートリアルにアクセスできます。",
+      "最後までお読みくださり、ありがとうございます。Rork Lab では、この記事の続きとなる上級実装ガイドや、完全なコード例を含むプレミアム記事もご用意しています。",
     features: [
-      "すべてのプレミアム記事が読み放題",
+      "実践的なコード例・ベンチマーク付き上級ガイド",
       "毎週追加される限定コンテンツ",
-      "上級テクニック・実践ガイド",
+      "無料記事の「続き」をすべて読める",
     ],
-    pro: "Pro プラン — ¥380/月",
-    premium: "Premium プラン — ¥1,480（永久アクセス）",
+    pro: "Pro プラン — ¥500/月",
+    premium: "Premium プラン — ¥2,980（永久アクセス）",
     link: "メンバーシップを見る →",
   },
   en: {
-    heading: "Want to Go Deeper?",
+    heading: "Thank You for Reading",
     description:
-      "Enjoyed this article? Rork Lab membership gives you access to exclusive premium guides and advanced tutorials.",
+      "Thank you for reading to the end. Rork Lab offers premium articles with advanced implementation guides, complete code examples, and benchmarks that go deeper into the topics covered here.",
     features: [
-      "Unlimited access to all premium articles",
+      "Advanced guides with working code & benchmarks",
       "New exclusive content added every week",
-      "Advanced techniques & hands-on guides",
+      "Full access to all premium \"deep dive\" articles",
     ],
-    pro: "Pro Plan — $3/mo",
-    premium: "Premium Plan — $10 (lifetime access)",
+    pro: "Pro Plan — $5/mo",
+    premium: "Premium Plan — $19 (lifetime access)",
     link: "View Membership →",
   },
 };
 
-export async function MembershipCTA({ locale }: MembershipCTAProps) {
-  const cookieStore = await cookies();
-  const isPremium = !!cookieStore.get("premium_token")?.value;
-  if (isPremium) return null;
-
+export function MembershipCTA({ locale }: MembershipCTAProps) {
   const t = CONTENT[locale as keyof typeof CONTENT] || CONTENT.en;
   const prefix = localePrefix(locale);
 
