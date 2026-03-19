@@ -129,14 +129,15 @@ export function SupportClient({
   locale,
   stripeTip,
   plans,
+  premiumAccess,
 }: {
   content: SupportContent;
   locale: string;
   stripeTip: StripeTip;
   plans: { pro: Plan; premium: Plan };
+  premiumAccess?: "pro" | "premium" | null;
 }) {
   const [loading, setLoading] = useState<string | null>(null);
-  const [isPremium, setIsPremium] = useState(false);
   const [error, setError] = useState("");
   const [isMobile, setIsMobile] = useState(false);
 
@@ -150,8 +151,6 @@ export function SupportClient({
   const faq = FAQ_TEXT[locale] || FAQ_TEXT.en;
 
   useEffect(() => {
-    const hasPremium = document.cookie.split(";").some((c) => c.trim().startsWith("premium_token="));
-    setIsPremium(hasPremium);
     const check = () => setIsMobile(window.innerWidth < 768 || "ontouchstart" in window);
     check();
     window.addEventListener("resize", check);
@@ -252,93 +251,89 @@ export function SupportClient({
           scrollMarginTop: 110,
         }}
       >
-        {isPremium ? (
-          <div style={{ textAlign: "center", padding: "12px 0" }}>
-            <div style={{ fontSize: 28, marginBottom: 12 }}>&#x2764;</div>
-            <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 12 }}>
-              {locale === "ja" ? "ご支援ありがとうございます" : "Thank You for Your Support"}
-            </h2>
-            <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.8, margin: 0 }}>
+        {premiumAccess ? (
+          <div style={{ textAlign: "center" }}>
+            <p style={{ fontSize: 15, color: "var(--text-primary)", lineHeight: 1.7 }}>
               {locale === "ja"
-                ? "プレミアムメンバーとしてすべての記事をお楽しみいただけます。いつも応援いただきありがとうございます。"
-                : "As a premium member, you have full access to all articles. Thank you for your continued support."}
+                ? `いつもご利用いただきありがとうございます。${premiumAccess === "pro" ? "Pro" : "Premium"} メンバーとして、すべてのプレミアム記事をお楽しみいただけます。`
+                : `Thank you for being a valued ${premiumAccess === "pro" ? "Pro" : "Premium"} member. You have full access to all premium articles.`}
             </p>
           </div>
         ) : (
           <>
-        <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8, textAlign: "center" }}>
-          {content.membershipHeading}
-        </h2>
-        <p style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", marginBottom: 20, lineHeight: 1.7 }}>
-          {content.membershipSub}
-        </p>
-        <ul style={{ listStyle: "none", padding: 0, margin: "0 0 24px", display: "flex", flexDirection: "column", gap: 8 }}>
-          {content.features.map((f, i) => (
-            <li key={i} style={{ fontSize: 14, color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ color: "var(--accent-coral)", fontSize: 12 }}>✓</span> {f}
-            </li>
-          ))}
-        </ul>
-        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <button
-            onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
-            disabled={!!loading}
-            style={{
-              width: "100%",
-              padding: "14px 24px",
-              borderRadius: 8,
-              border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-              background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-              color: "var(--accent-coral)",
-              fontSize: 14,
-              fontWeight: 600,
-              cursor: loading ? "wait" : "pointer",
-              opacity: loading ? 0.7 : 1,
-              transition: "all 0.25s",
-            }}
-            onMouseEnter={(e) => {
-              if (!loading) {
-                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
-                e.currentTarget.style.transform = "translateY(-1px)";
-              }
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
-              e.currentTarget.style.transform = "translateY(0)";
-            }}
-          >
-            {loading === "pro" ? "..." : `${plans.pro.label} — ${plans.pro.price}`}
-          </button>
-          <button
-            onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
-            disabled={!!loading}
-            style={{
-              width: "100%",
-              padding: "14px 24px",
-              borderRadius: 8,
-              border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-              background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-              color: "var(--accent-coral)",
-              fontSize: 14,
-              fontWeight: 600,
-              cursor: loading ? "wait" : "pointer",
-              opacity: loading ? 0.7 : 1,
-              transition: "all 0.25s",
-            }}
-            onMouseEnter={(e) => {
-              if (!loading) {
-                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
-                e.currentTarget.style.transform = "translateY(-1px)";
-              }
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
-              e.currentTarget.style.transform = "translateY(0)";
-            }}
-          >
-            {loading === "premium" ? "..." : `${plans.premium.label} — ${plans.premium.price}`}
-          </button>
-        </div>
+            <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8, textAlign: "center" }}>
+              {content.membershipHeading}
+            </h2>
+            <p style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", marginBottom: 20, lineHeight: 1.7 }}>
+              {content.membershipSub}
+            </p>
+            <ul style={{ listStyle: "none", padding: 0, margin: "0 0 24px", display: "flex", flexDirection: "column", gap: 8 }}>
+              {content.features.map((f, i) => (
+                <li key={i} style={{ fontSize: 14, color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ color: "var(--accent-coral)", fontSize: 12 }}>✓</span> {f}
+                </li>
+              ))}
+            </ul>
+            <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+              <button
+                onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+                disabled={!!loading}
+                style={{
+                  width: "100%",
+                  padding: "14px 24px",
+                  borderRadius: 8,
+                  border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+                  background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+                  color: "var(--accent-coral)",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: loading ? "wait" : "pointer",
+                  opacity: loading ? 0.7 : 1,
+                  transition: "all 0.25s",
+                }}
+                onMouseEnter={(e) => {
+                  if (!loading) {
+                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+                  e.currentTarget.style.transform = "translateY(0)";
+                }}
+              >
+                {loading === "pro" ? "..." : `${plans.pro.label} — ${plans.pro.price}`}
+              </button>
+              <button
+                onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
+                disabled={!!loading}
+                style={{
+                  width: "100%",
+                  padding: "14px 24px",
+                  borderRadius: 8,
+                  border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+                  background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+                  color: "var(--accent-coral)",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: loading ? "wait" : "pointer",
+                  opacity: loading ? 0.7 : 1,
+                  transition: "all 0.25s",
+                }}
+                onMouseEnter={(e) => {
+                  if (!loading) {
+                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+                  e.currentTarget.style.transform = "translateY(0)";
+                }}
+              >
+                {loading === "premium" ? "..." : `${plans.premium.label} — ${plans.premium.price}`}
+              </button>
+            </div>
           </>
         )}
       </div>

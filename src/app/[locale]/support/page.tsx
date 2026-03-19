@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { SupportClient } from "./SupportClient";
+import { getPremiumAccess } from "@/lib/premium";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -125,6 +126,7 @@ export default async function SupportPage({ params }: Props) {
   const { locale } = await params;
   const c = CONTENT[locale] || CONTENT.en;
   const plans = STRIPE_PLANS[locale] || STRIPE_PLANS.en;
+  const premiumAccess = await getPremiumAccess();
 
-  return <SupportClient content={c} locale={locale} stripeTip={STRIPE_TIP[locale] || STRIPE_TIP.en} plans={plans} />;
+  return <SupportClient content={c} locale={locale} stripeTip={STRIPE_TIP[locale] || STRIPE_TIP.en} plans={plans} premiumAccess={premiumAccess} />;
 }

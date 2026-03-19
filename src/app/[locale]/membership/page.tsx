@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 
@@ -106,9 +105,6 @@ export default async function MembershipPage({ params }: Props) {
   const t = PAGE_TEXT[locale as keyof typeof PAGE_TEXT] || PAGE_TEXT.en;
   const prefix = locale === "ja" ? "" : `/${locale}`;
 
-  const cookieStore = await cookies();
-  const isPremium = !!cookieStore.get("premium_token")?.value;
-
   const allArticles = getArticles(locale);
   const premiumArticles = allArticles.filter((a) => a.premium);
 
@@ -154,20 +150,6 @@ export default async function MembershipPage({ params }: Props) {
           ))}
         </ul>
 
-        {isPremium ? (
-          <div style={{ textAlign: "center", padding: "20px 0 8px", marginBottom: 32 }}>
-            <div style={{ fontSize: 28, marginBottom: 12 }}>&#x2764;</div>
-            <p style={{ fontSize: 16, fontWeight: 600, color: "var(--text-primary)", marginBottom: 8 }}>
-              {locale === "ja" ? "ご支援ありがとうございます" : "Thank You for Your Support"}
-            </p>
-            <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.8 }}>
-              {locale === "ja"
-                ? "プレミアムメンバーとしてすべての記事をお楽しみいただけます。"
-                : "As a premium member, you have full access to all articles below."}
-            </p>
-          </div>
-        ) : (
-        <>
         {/* Plans */}
         <div style={{ display: "flex", gap: 20, marginBottom: 32, flexWrap: "wrap" }}>
           {/* Pro — Recommended */}
@@ -238,8 +220,6 @@ export default async function MembershipPage({ params }: Props) {
         >
           {t.cta}
         </a>
-        </>
-        )}
       </section>
 
       {/* Premium Articles Section */}
