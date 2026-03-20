@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MILESTONE — Rork Max がローンチ3日で ARR $1.5M を達成、ネイティブアプリ開発に革命",
-    "SwiftUI — Xcode 不要・Mac 不要、ブラウザだけで SwiftUI ネイティブアプリを開発・公開",
-    "2-Click — QR コードでデバイスにインストール → 2クリックで App Store 申請まで完結",
-    "全デバイス — iPhone/iPad/Apple Watch/Vision Pro/Apple TV/iMessage に 1 プロジェクトで対応",
-    "3D/AR — Metal シェーダー + SceneKit で 3D ゲーム、ARKit + LiDAR で空間アプリ開発",
-    "OpenClaw — NVIDIA NemoClaw 発表：OpenClaw エージェントをエンタープライズ対応に（GTC 2026）",
+    "Rork Max — ネイティブ Swift アプリ生成モードが正式リリース（2月）",
+    "MILESTONE — Rork Max、ローンチ3日で ARR $1.5M 達成、開発者コミュニティで話題に",
+    "Apple — Vision Pro / Apple Watch / Apple TV 等 Apple 全デバイスをワンプロジェクトで対応",
+    "MARKET — ノーコード市場が $210億 突破、2029年には $900億 規模へ（Gartner）",
+    "TREND — 2026年末までにアプリ開発の 75% がローコード・ノーコードに移行予測",
+    "NATIVE — Metal / ARKit / HealthKit 等ネイティブ API にフルアクセス可能",
   ],
   en: [
-    "MILESTONE — Rork Max hits $1.5M ARR in 3 days, revolutionizing native app development",
-    "SwiftUI — No Xcode, no Mac required: build & publish native SwiftUI apps entirely in browser",
-    "2-Click — Install via QR code, submit to App Store in 2 clicks — all from the browser",
-    "All Devices — One project targets iPhone, iPad, Apple Watch, Vision Pro, Apple TV & iMessage",
-    "3D/AR — Full 3D games with Metal shaders + SceneKit, spatial apps with ARKit + LiDAR",
-    "OpenClaw — NVIDIA announces NemoClaw: enterprise-grade OpenClaw agents at GTC 2026",
+    "Rork Max — Native Swift app generation mode officially launched (February)",
+    "MILESTONE — Rork Max hits $1.5M ARR in 3 days, trending in developer community",
+    "Apple — Target Vision Pro, Apple Watch, Apple TV & more from a single project",
+    "MARKET — No-code market surpasses $21B, projected to reach $90B by 2029 (Gartner)",
+    "TREND — 75% of new app development to use low-code/no-code by end of 2026",
+    "NATIVE — Full access to Metal, ARKit, HealthKit and other native Apple APIs",
   ],
 };
 
