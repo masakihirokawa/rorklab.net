@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "Rork Max — ネイティブ Swift アプリ生成モードが正式リリース（2月）",
-    "MILESTONE — Rork Max、ローンチ3日で ARR $1.5M 達成、開発者コミュニティで話題に",
-    "Apple — Vision Pro / Apple Watch / Apple TV 等 Apple 全デバイスをワンプロジェクトで対応",
-    "MARKET — ノーコード市場が $210億 突破、2029年には $900億 規模へ（Gartner）",
-    "TREND — 2026年末までにアプリ開発の 75% がローコード・ノーコードに移行予測",
-    "NATIVE — Metal / ARKit / HealthKit 等ネイティブ API にフルアクセス可能",
+    "LAUNCH — Rork Max：Xcode 不要でネイティブ Swift アプリを構築する AI プラットフォーム（3/20）",
+    "RECORD — Rork Max が ARR $1.5M を 3日で達成（3/18）",
+    "APPLE — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage に対応（3/15）",
+    "NATIVE — AR/LiDAR・Metal 3D・ウィジェット・Dynamic Island・HealthKit 等ネイティブ API 完全対応（3/13）",
+    "CLOUD — クラウド Mac でコンパイル：Mac 不要・Xcode 不要で App Store 公開（3/10）",
+    "AI — Claude Code + Opus 4.6 で駆動：1プロンプトでフルアプリ生成（3/8）",
   ],
   en: [
-    "Rork Max — Native Swift app generation mode officially launched (February)",
-    "MILESTONE — Rork Max hits $1.5M ARR in 3 days, trending in developer community",
-    "Apple — Target Vision Pro, Apple Watch, Apple TV & more from a single project",
-    "MARKET — No-code market surpasses $21B, projected to reach $90B by 2029 (Gartner)",
-    "TREND — 75% of new app development to use low-code/no-code by end of 2026",
-    "NATIVE — Full access to Metal, ARKit, HealthKit and other native Apple APIs",
+    "LAUNCH — Rork Max: AI platform to build native Swift apps without Xcode (3/20)",
+    "RECORD — Rork Max hits $1.5M ARR in 3 days (3/18)",
+    "APPLE — Support for iPhone, iPad, Apple Watch, Apple TV, Vision Pro & iMessage (3/15)",
+    "NATIVE — Full native API support: AR/LiDAR, Metal 3D, widgets, Dynamic Island, HealthKit (3/13)",
+    "CLOUD — Cloud Mac compilation: publish to App Store without Mac or Xcode (3/10)",
+    "AI — Powered by Claude Code + Opus 4.6: generate full apps from one prompt (3/8)",
   ],
 };
 
