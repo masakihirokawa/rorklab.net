@@ -9,8 +9,12 @@ function getStripe() {
 }
 
 const PLAN_NAMES: Record<string, string> = {
+  // JA
+  "price_1TCQyPEGB5g6A54ofaB9e5to": "Rork Lab チップ（¥150）",
   "price_1TCQyjEGB5g6A54opYFArVOk": "Rork Lab Pro（月額プラン）",
   "price_1TCQyxEGB5g6A54oh8U6RHec": "Rork Lab Premium（永久アクセス）",
+  // EN
+  "price_1TCQyXEGB5g6A54oVQirhunP": "Rork Lab Tip ($1.50)",
   "price_1TCQylEGB5g6A54oNYYQAjPX": "Rork Lab Pro (Monthly)",
   "price_1TCQyyEGB5g6A54oUojdhfBa": "Rork Lab Premium (Lifetime)",
 };
