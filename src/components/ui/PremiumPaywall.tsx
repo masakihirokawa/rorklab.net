@@ -17,9 +17,86 @@ const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: 
   },
 };
 
+const RESTORE_TEXT: Record<string, {
+  sectionLabel: string;
+  description: string;
+  placeholder: string;
+  button: string;
+  loading: string;
+  successPro: string;
+  successPremium: string;
+  errorNotFound: string;
+  errorExpired: string;
+  errorEmpty: string;
+  errorGeneric: string;
+}> = {
+  ja: {
+    sectionLabel: "メンバーなのにプレミアム記事が全文読めない方（引き継ぎ）",
+    description: "ブラウザを変えた・Cookie を削除した場合は、登録のメールアドレスを入力してください。",
+    placeholder: "登録メールアドレス",
+    button: "アクセスを復元する",
+    loading: "確認中...",
+    successPro: "✓ Pro メンバーとして認証しました。このページを再読み込みしてください。",
+    successPremium: "✓ Premium メンバーとして認証しました。このページを再読み込みしてください。",
+    errorNotFound: "このメールアドレスでの登録が見つかりません。",
+    errorExpired: "メンバーシップの有効期限が切れています。サポートまでご連絡ください。",
+    errorEmpty: "メールアドレスを入力してください。",
+    errorGeneric: "エラーが発生しました。しばらくしてから再度お試しください。",
+  },
+  en: {
+    sectionLabel: "Member but can't read full articles? (Access Transfer)",
+    description: "If you switched browsers or cleared cookies, enter your registration email to restore access.",
+    placeholder: "Your registration email",
+    button: "Restore Access",
+    loading: "Checking...",
+    successPro: "✓ Verified as Pro member. Please reload this page.",
+    successPremium: "✓ Verified as Premium member. Please reload this page.",
+    errorNotFound: "No membership found for this email address.",
+    errorExpired: "Your membership has expired. Please contact support.",
+    errorEmpty: "Please enter your email address.",
+    errorGeneric: "An error occurred. Please try again later.",
+  },
+};
+
 export function PremiumPaywall({ locale }: PremiumPaywallProps) {
   const [loading, setLoading] = useState<string | null>(null);
+  const [showRestore, setShowRestore] = useState(false);
+  const [restoreEmail, setRestoreEmail] = useState("");
+  const [restoreLoading, setRestoreLoading] = useState(false);
+  const [restoreResult, setRestoreResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const plans = PLANS[locale] || PLANS.en;
+  const rt = RESTORE_TEXT[locale] || RESTORE_TEXT.en;
+
+  const handleRestore = async () => {
+    if (!restoreEmail.trim()) {
+      setRestoreResult({ type: "error", message: rt.errorEmpty });
+      return;
+    }
+    setRestoreLoading(true);
+    setRestoreResult(null);
+    try {
+      const res = await fetch("/api/restore-access", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: restoreEmail.trim() }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        const msg = data.type === "pro" ? rt.successPro : rt.successPremium;
+        setRestoreResult({ type: "success", message: msg });
+      } else {
+        const msg =
+          data.error === "not_found" ? rt.errorNotFound :
+          data.error === "expired" ? rt.errorExpired :
+          rt.errorGeneric;
+        setRestoreResult({ type: "error", message: msg });
+      }
+    } catch {
+      setRestoreResult({ type: "error", message: rt.errorGeneric });
+    } finally {
+      setRestoreLoading(false);
+    }
+  };
 
   const handleCheckout = async (priceId: string, mode: string, plan: string) => {
     setLoading(plan);
@@ -167,6 +244,114 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
           {locale === "ja"
             ? "Stripe による安全な決済 · いつでもキャンセル可能"
             : "Secure payment via Stripe · Cancel anytime"}
+        </div>
+
+        {/* Restore Access */}
+        <div style={{ marginTop: 24 }}>
+          <button
+            onClick={() => setShowRestore((v) => !v)}
+            style={{
+              width: "100%",
+              padding: "10px 16px",
+              borderRadius: 8,
+              border: "1px solid var(--border-subtle)",
+              background: "transparent",
+              color: "var(--text-muted)",
+              fontSize: 12,
+              fontWeight: 500,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              transition: "all 0.2s",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = "var(--border-hover)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = "var(--border-subtle)";
+            }}
+          >
+            <span>{rt.sectionLabel}</span>
+            <span style={{ fontSize: 12, color: "var(--text-faint)", transition: "transform 0.2s", transform: showRestore ? "rotate(180deg)" : "none" }}>
+              ▾
+            </span>
+          </button>
+
+          {showRestore && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: "16px",
+                borderRadius: 8,
+                border: "1px solid var(--border-subtle)",
+                background: "var(--bg-primary)",
+              }}
+            >
+              <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12, lineHeight: 1.7 }}>
+                {rt.description}
+              </p>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <input
+                  type="email"
+                  value={restoreEmail}
+                  onChange={(e) => setRestoreEmail(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleRestore()}
+                  placeholder={rt.placeholder}
+                  style={{
+                    flex: 1,
+                    minWidth: 180,
+                    padding: "8px 12px",
+                    borderRadius: 6,
+                    border: "1px solid var(--border-subtle)",
+                    background: "var(--bg-surface)",
+                    color: "var(--text-primary)",
+                    fontSize: 13,
+                    outline: "none",
+                  }}
+                />
+                <button
+                  onClick={handleRestore}
+                  disabled={restoreLoading}
+                  style={{
+                    padding: "8px 14px",
+                    borderRadius: 6,
+                    border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
+                    background: "color-mix(in srgb, var(--accent-coral) 10%, transparent)",
+                    color: "var(--accent-coral)",
+                    fontSize: 12,
+                    fontWeight: 600,
+                    cursor: restoreLoading ? "wait" : "pointer",
+                    opacity: restoreLoading ? 0.7 : 1,
+                    whiteSpace: "nowrap",
+                    transition: "all 0.2s",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!restoreLoading) {
+                      e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 18%, transparent)";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 10%, transparent)";
+                  }}
+                >
+                  {restoreLoading ? rt.loading : rt.button}
+                </button>
+              </div>
+              {restoreResult && (
+                <p
+                  style={{
+                    marginTop: 10,
+                    fontSize: 12,
+                    color: restoreResult.type === "success" ? "var(--accent-coral)" : "#ef4444",
+                    lineHeight: 1.6,
+                  }}
+                >
+                  {restoreResult.message}
+                </p>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
