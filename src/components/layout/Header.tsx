@@ -92,12 +92,12 @@ export function Header() {
   const scrolled = scrollY > 50;
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
-    { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
     { key: "rorkBasics", label: t("nav.rorkBasics"), href: `${prefix}/articles/rork-basics` },
     { key: "rorkDev", label: t("nav.rorkDev"), href: `${prefix}/articles/rork-dev` },
     { key: "rorkAi", label: t("nav.rorkAi"), href: `${prefix}/articles/rork-ai` },
     { key: "rorkBusiness", label: t("nav.rorkBusiness"), href: `${prefix}/articles/rork-business` },
+    { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
   ];
 
