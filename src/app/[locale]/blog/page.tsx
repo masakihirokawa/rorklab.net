@@ -13,6 +13,13 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     description: isJa
       ? "Rork Lab ブログ — Rork Max の最新ニュース・アップデート・開発者ストーリーをお届けします。"
       : "Rork Lab Blog — Latest news, updates, and developer stories about Rork Max.",
+    openGraph: {
+      title: isJa ? "ブログ" : "Blog",
+      description: isJa
+        ? "Rork Lab ブログ — Rork Max の最新ニュース・アップデート・開発者ストーリーをお届けします。"
+        : "Rork Lab Blog — Latest news, updates, and developer stories about Rork Max.",
+      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
+    },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/blog" : "https://rorklab.net/en/blog",
       languages: {

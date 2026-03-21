@@ -17,7 +17,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   return {
     title,
     description,
-    openGraph: { title, description },
+    openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
     alternates: {
       canonical: locale === "ja" ? `${base}/tags` : `${base}/en/tags`,
       languages: { ja: `${base}/tags`, en: `${base}/en/tags` },

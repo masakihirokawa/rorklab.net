@@ -13,6 +13,13 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     description: isJa
       ? "目的別の体系的な学習パスで Rork Max を使いこなす。入門・開発ツール連携・AI活用・収益化までステップバイステップで解説。"
       : "Master Rork Max with systematic, goal-oriented learning paths. Step-by-step guides from getting started to monetization.",
+    openGraph: {
+      title: isJa ? "学習ガイド" : "Learning Guides",
+      description: isJa
+        ? "目的別の体系的な学習パスで Rork Max を使いこなす。入門・開発ツール連携・AI活用・収益化までステップバイステップで解説。"
+        : "Master Rork Max with systematic, goal-oriented learning paths. Step-by-step guides from getting started to monetization.",
+      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
+    },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/guides" : "https://rorklab.net/en/guides",
       languages: {

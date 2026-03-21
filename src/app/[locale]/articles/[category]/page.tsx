@@ -54,6 +54,13 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     description: isJa
       ? `Rork Lab の「${catName}」カテゴリ記事一覧。${catDesc}`
       : `All articles in the "${catName}" category on Rork Lab. ${catDesc}`,
+    openGraph: {
+      title: catName,
+      description: isJa
+        ? `Rork Lab の「${catName}」カテゴリ記事一覧。${catDesc}`
+        : `All articles in the "${catName}" category on Rork Lab. ${catDesc}`,
+      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
+    },
     alternates: {
       canonical: locale === "ja" ? `https://rorklab.net/articles/${category}` : `https://rorklab.net/en/articles/${category}`,
       languages: {

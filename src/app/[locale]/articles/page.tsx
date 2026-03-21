@@ -19,6 +19,13 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
     description: isJa
       ? "Rork Max の使い方・開発テクニック・AI連携・収益化まで、すべての記事を一覧できます。"
       : "Browse all articles covering Rork Max usage, development techniques, AI integrations, and monetization strategies.",
+    openGraph: {
+      title: isJa ? "すべての記事" : "All Articles",
+      description: isJa
+        ? "Rork Max の使い方・開発テクニック・AI連携・収益化まで、すべての記事を一覧できます。"
+        : "Browse all articles covering Rork Max usage, development techniques, AI integrations, and monetization strategies.",
+      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
+    },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/articles" : "https://rorklab.net/en/articles",
       languages: {
