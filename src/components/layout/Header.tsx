@@ -35,6 +35,7 @@ export function Header() {
   const [isMobile, setIsMobile] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchData, setSearchData] = useState<SearchItem[]>([]);
+  const [levelOpen, setLevelOpen] = useState(false);
 
   useEffect(() => {
     const onScroll = () => setScrollY(window.scrollY);
@@ -92,11 +93,18 @@ export function Header() {
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
+    { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
     { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
     { key: "rorkBasics", label: t("nav.rorkBasics"), href: `${prefix}/articles/rork-basics` },
     { key: "rorkDev", label: t("nav.rorkDev"), href: `${prefix}/articles/rork-dev` },
     { key: "rorkAi", label: t("nav.rorkAi"), href: `${prefix}/articles/rork-ai` },
     { key: "rorkBusiness", label: t("nav.rorkBusiness"), href: `${prefix}/articles/rork-business` },
+  ];
+
+  const levelItems = [
+    { key: "beginner", label: t("levels.beginner"), href: `${prefix}/level/beginner`, icon: "◇", color: "var(--accent-green)" },
+    { key: "intermediate", label: t("levels.intermediate"), href: `${prefix}/level/intermediate`, icon: "◆", color: "var(--accent-gold)" },
+    { key: "advanced", label: t("levels.advanced"), href: `${prefix}/level/advanced`, icon: "◈", color: "var(--accent-coral)" },
   ];
 
   return (
@@ -153,6 +161,84 @@ export function Header() {
                 {label}
               </a>
             ))}
+            {/* Level Dropdown */}
+            <div style={{ position: "relative" }}>
+              <button
+                onClick={() => setLevelOpen(!levelOpen)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "var(--text-muted)",
+                  fontSize: 13,
+                  letterSpacing: "0.06em",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  transition: "color 0.3s",
+                  padding: 0,
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.color = "var(--text-primary)";
+                  setLevelOpen(true);
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.color = "var(--text-muted)";
+                }}
+              >
+                {t("nav.level")}
+                <span style={{ fontSize: 10, marginLeft: 2 }}>▼</span>
+              </button>
+              {levelOpen && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: "100%",
+                    left: 0,
+                    marginTop: 8,
+                    background: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                    borderRadius: 8,
+                    padding: "8px 0",
+                    minWidth: 160,
+                    zIndex: 1000,
+                    boxShadow: "0 8px 24px rgba(0, 0, 0, 0.12)",
+                  }}
+                  onMouseEnter={() => setLevelOpen(true)}
+                  onMouseLeave={() => setLevelOpen(false)}
+                >
+                  {levelItems.map(({ key, label, href, icon, color }) => (
+                    <a
+                      key={key}
+                      href={href}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "8px 16px",
+                        color: "var(--text-muted)",
+                        textDecoration: "none",
+                        fontSize: 12,
+                        letterSpacing: "0.04em",
+                        transition: "all 0.2s",
+                        whiteSpace: "nowrap",
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.color = color;
+                        e.currentTarget.style.background = `color-mix(in srgb, ${color} 8%, transparent)`;
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.color = "var(--text-muted)";
+                        e.currentTarget.style.background = "transparent";
+                      }}
+                    >
+                      <span style={{ fontSize: 11, color: color }}>{icon}</span>
+                      {label}
+                    </a>
+                  ))}
+                </div>
+              )}
+            </div>
             <a
               href={`${prefix}/support`}
               aria-label="Support us"
@@ -300,6 +386,44 @@ export function Header() {
               {label}
             </a>
           ))}
+          {/* Mobile Level Buttons */}
+          <div style={{ width: "100%", paddingTop: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, justifyContent: "center" }}>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+                LEVEL
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+              {levelItems.map(({ key, label, href, icon, color }) => (
+                <a
+                  key={key}
+                  href={href}
+                  onClick={() => setMobileOpen(false)}
+                  style={{
+                    fontSize: 12,
+                    fontFamily: "'DM Mono', monospace",
+                    padding: "6px 12px",
+                    borderRadius: 6,
+                    border: `1px solid ${color}`,
+                    background: `color-mix(in srgb, ${color} 10%, transparent)`,
+                    color: color,
+                    textDecoration: "none",
+                    transition: "all 0.2s",
+                    letterSpacing: "0.04em",
+                    whiteSpace: "nowrap",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = `color-mix(in srgb, ${color} 20%, transparent)`;
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = `color-mix(in srgb, ${color} 10%, transparent)`;
+                  }}
+                >
+                  {icon} {label}
+                </a>
+              ))}
+            </div>
+          </div>
           <a
             href={`${prefix}/support`}
             onClick={() => setMobileOpen(false)}
