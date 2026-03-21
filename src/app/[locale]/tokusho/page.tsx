@@ -14,6 +14,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       languages: {
         ja: "https://rorklab.net/tokusho",
         en: "https://rorklab.net/en/tokusho",
+        "x-default": "https://rorklab.net/en/tokusho",
       },
     },
   };

@@ -10,11 +10,15 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const isJa = locale === "ja";
   return {
     title: isJa ? "学習ガイド" : "Learning Guides",
-      alternates: {
-      canonical: locale === "ja" ? "https://rorklab.net/guides" : `https://rorklab.net/en/guides`,
+    description: isJa
+      ? "目的別の体系的な学習パスで Rork Max を使いこなす。入門・開発ツール連携・AI活用・収益化までステップバイステップで解説。"
+      : "Master Rork Max with systematic, goal-oriented learning paths. Step-by-step guides from getting started to monetization.",
+    alternates: {
+      canonical: locale === "ja" ? "https://rorklab.net/guides" : "https://rorklab.net/en/guides",
       languages: {
         ja: "https://rorklab.net/guides",
         en: "https://rorklab.net/en/guides",
+        "x-default": "https://rorklab.net/en/guides",
       },
     },
   };

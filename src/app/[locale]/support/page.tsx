@@ -26,6 +26,11 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     description: m.description,
     alternates: {
       canonical: `https://rorklab.net${prefix}/support`,
+      languages: {
+        ja: "https://rorklab.net/support",
+        en: "https://rorklab.net/en/support",
+        "x-default": "https://rorklab.net/en/support",
+      },
     },
   };
 }

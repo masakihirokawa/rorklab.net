@@ -46,14 +46,20 @@ const CATEGORY_DESC: Record<string, Record<string, string>> = {
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale, category } = await params;
   const catName = CATEGORY_NAMES[category]?.[locale] || category;
+  const catDesc = CATEGORY_DESC[category]?.[locale] || "";
+  const isJa = locale === "ja";
+
   return {
     title: catName,
-  
+    description: isJa
+      ? `Rork Lab の「${catName}」カテゴリ記事一覧。${catDesc}`
+      : `All articles in the "${catName}" category on Rork Lab. ${catDesc}`,
     alternates: {
       canonical: locale === "ja" ? `https://rorklab.net/articles/${category}` : `https://rorklab.net/en/articles/${category}`,
       languages: {
         ja: `https://rorklab.net/articles/${category}`,
         en: `https://rorklab.net/en/articles/${category}`,
+        "x-default": `https://rorklab.net/en/articles/${category}`,
       },
     },
   };

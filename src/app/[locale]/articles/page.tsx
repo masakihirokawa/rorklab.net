@@ -8,18 +8,28 @@ interface Props {
   searchParams: Promise<{ page?: string; category?: string }>;
 }
 
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
+export async function generateMetadata({ params, searchParams }: Props): Promise<Metadata> {
   const { locale } = await params;
+  const sp = await searchParams;
   const isJa = locale === "ja";
+  const page = parseInt(sp.page || "1", 10) || 1;
+
   return {
     title: isJa ? "すべての記事" : "All Articles",
-      alternates: {
-      canonical: locale === "ja" ? "https://rorklab.net/articles" : `https://rorklab.net/en/articles`,
+    description: isJa
+      ? "Rork Max の使い方・開発テクニック・AI連携・収益化まで、すべての記事を一覧できます。"
+      : "Browse all articles covering Rork Max usage, development techniques, AI integrations, and monetization strategies.",
+    alternates: {
+      canonical: locale === "ja" ? "https://rorklab.net/articles" : "https://rorklab.net/en/articles",
       languages: {
         ja: "https://rorklab.net/articles",
         en: "https://rorklab.net/en/articles",
+        "x-default": "https://rorklab.net/en/articles",
       },
     },
+    ...(page > 1 && {
+      robots: { index: false, follow: true },
+    }),
   };
 }
 

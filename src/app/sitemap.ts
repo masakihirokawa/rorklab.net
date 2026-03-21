@@ -34,7 +34,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: page.freq,
       priority: page.priority,
       alternates: {
-        languages: { ja: jaUrl, en: enUrl },
+        languages: { ja: jaUrl, en: enUrl, "x-default": enUrl },
       },
     });
     entries.push({
@@ -43,7 +43,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: page.freq,
       priority: Number(Math.max(page.priority - 0.1, 0.3).toFixed(1)),
       alternates: {
-        languages: { ja: jaUrl, en: enUrl },
+        languages: { ja: jaUrl, en: enUrl, "x-default": enUrl },
       },
     });
   }
@@ -62,7 +62,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "weekly",
       priority: 0.9,
       alternates: {
-        languages: { ja: jaUrl, en: enUrl },
+        languages: { ja: jaUrl, en: enUrl, "x-default": enUrl },
       },
     });
     entries.push({
@@ -71,7 +71,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "weekly",
       priority: 0.8,
       alternates: {
-        languages: { ja: jaUrl, en: enUrl },
+        languages: { ja: jaUrl, en: enUrl, "x-default": enUrl },
       },
     });
   }
@@ -89,7 +89,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "monthly",
       priority: 0.7,
       alternates: {
-        languages: { ja: jaUrl, en: enUrl },
+        languages: { ja: jaUrl, en: enUrl, "x-default": enUrl },
       },
     });
     entries.push({
@@ -98,7 +98,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "monthly",
       priority: 0.6,
       alternates: {
-        languages: { ja: jaUrl, en: enUrl },
+        languages: { ja: jaUrl, en: enUrl, "x-default": enUrl },
       },
     });
   }
