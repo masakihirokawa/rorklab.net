@@ -26,16 +26,16 @@ const GUIDES_LIGHT = {
   red: "linear-gradient(135deg, #f7eef0 0%, #f0dde2 55%, #e8d0d7 100%)",
 };
 
-const GUIDES: Record<string, { title: string; desc: string; articles: number; level: string; colorKey: keyof typeof GUIDES_DARK; href: string }[]> = {
+const GUIDES: Record<string, { title: string; desc: string; categories: string[]; level: string; colorKey: keyof typeof GUIDES_DARK; href: string }[]> = {
   ja: [
-    { title: "Rork Max 完全入門ガイド", desc: "初めての方はここから", articles: 12, level: "beginner", colorKey: "purple", href: "/articles/rork-basics" },
-    { title: "開発ツール連携マニュアル", desc: "外部ツールとの統合を完全解説", articles: 18, level: "intermediate", colorKey: "green", href: "/articles/rork-dev" },
-    { title: "AI連携 × App Store 公開ハンドブック", desc: "AIを組み込んで本格アプリを公開", articles: 15, level: "intermediate", colorKey: "red", href: "/articles/rork-business" },
+    { title: "Rork Max 完全入門ガイド", desc: "初めての方はここから", categories: ["rork-basics"], level: "beginner", colorKey: "purple", href: "/articles/rork-basics" },
+    { title: "開発ツール連携マニュアル", desc: "外部ツールとの統合を完全解説", categories: ["rork-dev"], level: "intermediate", colorKey: "green", href: "/articles/rork-dev" },
+    { title: "AI連携 × App Store 公開ハンドブック", desc: "AIを組み込んで本格アプリを公開", categories: ["rork-business"], level: "intermediate", colorKey: "red", href: "/articles/rork-business" },
   ],
   en: [
-    { title: "Getting Started with Rork Max", desc: "Start here if you're new", articles: 12, level: "beginner", colorKey: "purple", href: "/en/articles/rork-basics" },
-    { title: "Developer Tools Integration", desc: "Complete guide to external tool integrations", articles: 18, level: "intermediate", colorKey: "green", href: "/en/articles/rork-dev" },
-    { title: "AI to App Store Handbook", desc: "Integrate AI and publish professional apps", articles: 15, level: "intermediate", colorKey: "red", href: "/en/articles/rork-business" },
+    { title: "Getting Started with Rork Max", desc: "Start here if you're new", categories: ["rork-basics"], level: "beginner", colorKey: "purple", href: "/en/articles/rork-basics" },
+    { title: "Developer Tools Integration", desc: "Complete guide to external tool integrations", categories: ["rork-dev"], level: "intermediate", colorKey: "green", href: "/en/articles/rork-dev" },
+    { title: "AI to App Store Handbook", desc: "Integrate AI and publish professional apps", categories: ["rork-business"], level: "intermediate", colorKey: "red", href: "/en/articles/rork-business" },
   ],
 };
 
@@ -299,33 +299,38 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16 }}>
-          {(GUIDES[locale] || GUIDES.ja).map((guide, i) => (
-            <a
-              key={i}
-              href={guide.href}
-              className={`guide-card${mounted && !skipAnim ? " animate-fade-up" : ""}`}
-              style={{
-                display: "block", padding: "32px 28px", borderRadius: 8,
-                background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
-                cursor: "pointer",
-                animationDelay: `${0.5 + i * 0.1}s`,
-                textDecoration: "none",
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
-                <LevelBadge level={guide.level} label={t(`levels.${guide.level}`)} />
-                <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
-                  {t("articles.count", { count: guide.articles })}
-                </span>
-              </div>
-              <h3 style={{ fontSize: 18, fontWeight: 500, color: "var(--text-primary)", marginBottom: 8, letterSpacing: "0.01em" }}>
-                {guide.title}
-              </h3>
-              <p style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.6 }}>
-                {guide.desc}
-              </p>
-            </a>
-          ))}
+          {(GUIDES[locale] || GUIDES.ja).map((guide, i) => {
+            const count = guide.categories.length > 0
+              ? articles.filter((a) => guide.categories.includes(a.category)).length
+              : articles.length;
+            return (
+              <a
+                key={i}
+                href={guide.href}
+                className={`guide-card${mounted && !skipAnim ? " animate-fade-up" : ""}`}
+                style={{
+                  display: "block", padding: "32px 28px", borderRadius: 8,
+                  background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
+                  cursor: "pointer",
+                  animationDelay: `${0.5 + i * 0.1}s`,
+                  textDecoration: "none",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+                  <LevelBadge level={guide.level} label={t(`levels.${guide.level}`)} />
+                  <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+                    {t("articles.count", { count })}
+                  </span>
+                </div>
+                <h3 style={{ fontSize: 18, fontWeight: 500, color: "var(--text-primary)", marginBottom: 8, letterSpacing: "0.01em" }}>
+                  {guide.title}
+                </h3>
+                <p style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.6 }}>
+                  {guide.desc}
+                </p>
+              </a>
+            );
+          })}
         </div>
       </section>
 
