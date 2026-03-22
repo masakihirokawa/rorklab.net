@@ -349,9 +349,10 @@ export function Header() {
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "flex-start",
-            paddingTop: 100,
-            gap: 28,
-            overflow: "hidden",
+            paddingTop: 56,
+            gap: 14,
+            overflowY: "auto",
+            WebkitOverflowScrolling: "touch",
           }}
         >
           <button
@@ -371,9 +372,9 @@ export function Header() {
             ×
           </button>
           {/* Mobile Level Buttons — top position */}
-          <div style={{ width: "100%", paddingBottom: 8 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, justifyContent: "center" }}>
-              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <div style={{ width: "100%", paddingBottom: 4 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, justifyContent: "center" }}>
+              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
                 LEVEL
               </span>
             </div>
@@ -384,9 +385,9 @@ export function Header() {
                   href={href}
                   onClick={() => setMobileOpen(false)}
                   style={{
-                    fontSize: 12,
+                    fontSize: 11,
                     fontFamily: "'DM Mono', monospace",
-                    padding: "6px 12px",
+                    padding: "5px 10px",
                     borderRadius: 6,
                     border: `1px solid ${color}`,
                     background: `color-mix(in srgb, ${color} 10%, transparent)`,
@@ -417,9 +418,9 @@ export function Header() {
               style={{
                 color: "var(--text-secondary)",
                 textDecoration: "none",
-                fontSize: 18,
-                letterSpacing: "0.08em",
-                fontWeight: 300,
+                fontSize: 14,
+                letterSpacing: "0.06em",
+                fontWeight: 400,
               }}
             >
               {label}
@@ -431,8 +432,9 @@ export function Header() {
             style={{
               color: "var(--text-dim)",
               textDecoration: "none",
-              fontSize: 22,
-              marginTop: 8,
+              fontSize: 16,
+              marginTop: 4,
+              paddingBottom: 40,
               transition: "color 0.3s",
             }}
           >
