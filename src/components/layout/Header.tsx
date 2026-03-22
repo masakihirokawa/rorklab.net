@@ -92,13 +92,13 @@ export function Header() {
   const scrolled = scrollY > 50;
   const navItems = [
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
-    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
     { key: "rorkBasics", label: t("nav.rorkBasics"), href: `${prefix}/articles/rork-basics` },
     { key: "rorkDev", label: t("nav.rorkDev"), href: `${prefix}/articles/rork-dev` },
     { key: "rorkAi", label: t("nav.rorkAi"), href: `${prefix}/articles/rork-ai` },
     { key: "rorkBusiness", label: t("nav.rorkBusiness"), href: `${prefix}/articles/rork-business` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
+    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
   ];
 
   const levelItems = [
@@ -143,24 +143,6 @@ export function Header() {
         {/* Desktop Nav */}
         {!isMobile && (
           <nav style={{ display: "flex", gap: 24, alignItems: "center" }}>
-            {navItems.map(({ key, label, href }) => (
-              <a
-                key={key}
-                href={href}
-                style={{
-                  color: "var(--text-muted)",
-                  textDecoration: "none",
-                  fontSize: 13,
-                  letterSpacing: "0.06em",
-                  transition: "color 0.3s",
-                  whiteSpace: "nowrap",
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-primary)")}
-                onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
-              >
-                {label}
-              </a>
-            ))}
             {/* Level Dropdown */}
             <div style={{ position: "relative" }}>
               <button
@@ -239,6 +221,24 @@ export function Header() {
                 </div>
               )}
             </div>
+            {navItems.map(({ key, label, href }) => (
+              <a
+                key={key}
+                href={href}
+                style={{
+                  color: "var(--text-muted)",
+                  textDecoration: "none",
+                  fontSize: 13,
+                  letterSpacing: "0.06em",
+                  transition: "color 0.3s",
+                  whiteSpace: "nowrap",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-primary)")}
+                onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
+              >
+                {label}
+              </a>
+            ))}
             <a
               href={`${prefix}/support`}
               aria-label="Support us"
@@ -370,24 +370,8 @@ export function Header() {
           >
             ×
           </button>
-          {navItems.map(({ key, label, href }) => (
-            <a
-              key={key}
-              href={href}
-              onClick={() => setMobileOpen(false)}
-              style={{
-                color: "var(--text-secondary)",
-                textDecoration: "none",
-                fontSize: 18,
-                letterSpacing: "0.08em",
-                fontWeight: 300,
-              }}
-            >
-              {label}
-            </a>
-          ))}
-          {/* Mobile Level Buttons */}
-          <div style={{ width: "100%", paddingTop: 8 }}>
+          {/* Mobile Level Buttons — top position */}
+          <div style={{ width: "100%", paddingBottom: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, justifyContent: "center" }}>
               <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
                 LEVEL
@@ -424,6 +408,23 @@ export function Header() {
               ))}
             </div>
           </div>
+          <div style={{ width: "100%", maxWidth: 280, borderTop: "1px solid var(--border-subtle)", margin: "0 auto" }} />
+          {navItems.map(({ key, label, href }) => (
+            <a
+              key={key}
+              href={href}
+              onClick={() => setMobileOpen(false)}
+              style={{
+                color: "var(--text-secondary)",
+                textDecoration: "none",
+                fontSize: 18,
+                letterSpacing: "0.08em",
+                fontWeight: 300,
+              }}
+            >
+              {label}
+            </a>
+          ))}
           <a
             href={`${prefix}/support`}
             onClick={() => setMobileOpen(false)}
