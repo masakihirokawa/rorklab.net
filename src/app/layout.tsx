@@ -73,6 +73,7 @@ export default function RootLayout({
   return (
     <html>
       <head>
+        <link rel="alternate" type="application/json+oembed" href="https://rorklab.net/api/oembed?url=https://rorklab.net" title="Rork Lab" />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{

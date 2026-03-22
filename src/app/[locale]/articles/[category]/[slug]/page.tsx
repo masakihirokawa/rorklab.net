@@ -170,6 +170,7 @@ export default async function ArticlePage({ params }: Props) {
 
   return (
     <>
+    <link rel="alternate" type="application/json+oembed" href={`https://rorklab.net/api/oembed?url=${encodeURIComponent(articleUrl)}`} title="Rork Lab" />
     <script
       type="application/ld+json"
       dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
