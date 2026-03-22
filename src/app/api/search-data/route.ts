@@ -23,5 +23,12 @@ export async function GET(request: NextRequest) {
     tags: b.tags,
   }));
 
-  return NextResponse.json({ articles, blog });
+  return NextResponse.json(
+    { articles, blog },
+    {
+      headers: {
+        "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
+      },
+    }
+  );
 }
