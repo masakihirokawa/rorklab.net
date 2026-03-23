@@ -8,6 +8,7 @@ import { RelatedArticles } from "@/components/ui/RelatedArticles";
 import { TableOfContents } from "@/components/ui/TableOfContents";
 import { PremiumPaywall } from "@/components/ui/PremiumPaywall";
 import { MembershipCTA } from "@/components/ui/MembershipCTA";
+import { TipCTA } from "@/components/ui/TipCTA";
 import { getPremiumAccess } from "@/lib/premium";
 
 interface Props {
@@ -306,6 +307,9 @@ export default async function ArticlePage({ params }: Props) {
       {!canViewPremium && !article.meta.premium && (
         <MembershipCTA locale={locale} />
       )}
+
+      {/* Tip CTA — shown on free articles for all readers */}
+      {!article.meta.premium && <TipCTA locale={locale} />}
 
       {/* Related Articles */}
       <RelatedArticles
