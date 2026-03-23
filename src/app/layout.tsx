@@ -70,27 +70,5 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  return (
-    <html>
-      <head>
-        <link rel="alternate" type="application/json+oembed" href="https://rorklab.net/api/oembed?url=https://rorklab.net" title="Rork Lab" />
-        <script
-          type="application/ld+json"
-          dangerouslySetInnerHTML={{
-            __html: JSON.stringify({
-              "@context": "https://schema.org",
-              "@type": "Organization",
-              name: "Rork Lab",
-              url: "https://rorklab.net",
-              logo: "https://rorklab.net/icon-512.png",
-              description: "Rork / Rork Max の実践ガイド＆ナレッジベース",
-              founder: { "@type": "Person", name: "Masaki Hirokawa", url: "https://dolice.design" },
-              sameAs: ["https://dolice.design", "https://dolice.net"],
-            }),
-          }}
-        />
-      </head>
-      {children}
-    </html>
-  );
+  return children;
 }
