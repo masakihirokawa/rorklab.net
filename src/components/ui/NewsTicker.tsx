@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "LAUNCH — Rork Max：Xcode 不要でネイティブ Swift アプリを構築する AI プラットフォーム（3/20）",
-    "RECORD — Rork Max が ARR $1.5M を 3日で達成（3/18）",
-    "APPLE — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage に対応（3/15）",
-    "NATIVE — AR/LiDAR・Metal 3D・ウィジェット・Dynamic Island・HealthKit 等ネイティブ API 完全対応（3/13）",
-    "CLOUD — クラウド Mac でコンパイル：Mac 不要・Xcode 不要で App Store 公開（3/10）",
-    "AI — Claude Code + Opus 4.6 で駆動：1プロンプトでフルアプリ生成（3/8）",
+    "MAX — Rork Max が急成長：ネイティブ Swift アプリを Xcode 不要で構築＆公開（3/22）",
+    "TEST — Rork Companion アプリ：有料開発者アカウント不要で実機テスト可能に（3/20）",
+    "CLOUD — クラウド Mac でコンパイル＆QR コードで実機インストール対応（3/18）",
+    "APPLE — iPhone・iPad・Apple Watch・Vision Pro・iMessage 全プラットフォーム対応（3/15）",
+    "NATIVE — AR/LiDAR・Metal 3D・ウィジェット・HealthKit 等ネイティブ API 完全対応（3/12）",
+    "TREND — ノーコードモバイル開発の主流に：AI 駆動ツールが App Store 公開を民主化（3/10）",
   ],
   en: [
-    "LAUNCH — Rork Max: AI platform to build native Swift apps without Xcode (3/20)",
-    "RECORD — Rork Max hits $1.5M ARR in 3 days (3/18)",
-    "APPLE — Support for iPhone, iPad, Apple Watch, Apple TV, Vision Pro & iMessage (3/15)",
-    "NATIVE — Full native API support: AR/LiDAR, Metal 3D, widgets, Dynamic Island, HealthKit (3/13)",
-    "CLOUD — Cloud Mac compilation: publish to App Store without Mac or Xcode (3/10)",
-    "AI — Powered by Claude Code + Opus 4.6: generate full apps from one prompt (3/8)",
+    "MAX — Rork Max growing fast: build & publish native Swift apps without Xcode (3/22)",
+    "TEST — Rork Companion app: test on real devices without a paid developer account (3/20)",
+    "CLOUD — Cloud Mac compilation with QR code install to your device (3/18)",
+    "APPLE — Full support for iPhone, iPad, Apple Watch, Vision Pro & iMessage (3/15)",
+    "NATIVE — Complete native API support: AR/LiDAR, Metal 3D, widgets, HealthKit & more (3/12)",
+    "TREND — No-code mobile dev goes mainstream: AI tools democratize App Store publishing (3/10)",
   ],
 };
 
