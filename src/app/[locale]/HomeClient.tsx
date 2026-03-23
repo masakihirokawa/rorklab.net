@@ -114,7 +114,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
           style={{ position: "relative", zIndex: 1, padding: "0 24px", opacity: mounted || skipAnim ? 1 : 0 }}
         >
           <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.2em", marginBottom: 24 }}>
-            {t("site.poweredBy")}
+            POWERED BY <a href="https://dolice.design" target="_blank" rel="noopener" style={{ color: "var(--text-dim)", textDecoration: "underline", textUnderlineOffset: "3px" }}>DOLICE</a>
           </div>
 
           <h1 style={{ fontSize: "clamp(32px, 5vw, 56px)", fontWeight: 300, lineHeight: 1.3, color: "var(--text-primary)", letterSpacing: "-0.01em", marginBottom: 16 }}>
