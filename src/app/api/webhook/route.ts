@@ -24,11 +24,13 @@ export async function POST(request: NextRequest) {
 
     let event: Stripe.Event;
     try {
-      // Use constructEventAsync for edge runtime (Web Crypto API)
+      // Use constructEventAsync with SubtleCryptoProvider for Cloudflare Workers (Web Crypto API)
       event = await stripe.webhooks.constructEventAsync(
         body,
         sig,
-        process.env.STRIPE_WEBHOOK_SECRET
+        process.env.STRIPE_WEBHOOK_SECRET,
+        undefined,
+        Stripe.createSubtleCryptoProvider()
       );
     } catch {
       return NextResponse.json({ error: "Webhook signature invalid" }, { status: 400 });
