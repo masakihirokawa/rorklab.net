@@ -24,8 +24,10 @@ interface Props {
 }
 
 /* ── Metadata ── */
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
+export async function generateMetadata({ params, searchParams }: Props): Promise<Metadata> {
   const { locale, tag } = await params;
+  const sp = await searchParams;
+  const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
   const decoded = decodeURIComponent(tag);
   const title = locale === "ja" ? `「${decoded}」の記事一覧` : `Articles tagged "${decoded}"`;
   const description =
@@ -35,7 +37,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
   const base = "https://rorklab.net";
   const encoded = encodeURIComponent(decoded);
-  return {
+  const metadata: Metadata = {
     title,
     description,
     openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
@@ -44,9 +46,16 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       languages: {
         ja: `${base}/tag/${encoded}`,
         en: `${base}/en/tag/${encoded}`,
+        "x-default": `${base}/en/tag/${encoded}`,
       },
     },
   };
+
+  if (currentPage > 1) {
+    metadata.robots = { index: false, follow: true };
+  }
+
+  return metadata;
 }
 
 /* ── Page ── */
