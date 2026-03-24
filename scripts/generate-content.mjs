@@ -99,6 +99,21 @@ async function generateArticleIndex() {
           cleanedContent = cleanedContent.replace(relatedPattern, '\n');
         }
 
+        // Validate & auto-remove broken internal article links (links to non-existent articles cause 404)
+        const internalLinkPattern = /\[([^\]]*)\]\(\/articles\/([^)#\s]+)\)/g;
+        let linkMatch;
+        while ((linkMatch = internalLinkPattern.exec(cleanedContent)) !== null) {
+          const linkTarget = linkMatch[2].replace(/^(ja|en)\//, '');
+          // linkTarget should be "category/slug" — check if that MDX file exists in any locale
+          const jaPath = path.join(CONTENT_DIR, "articles", "ja", ...linkTarget.split('/')) + '.mdx';
+          const enPath = path.join(CONTENT_DIR, "articles", "en", ...linkTarget.split('/')) + '.mdx';
+          if (!fs.existsSync(jaPath) && !fs.existsSync(enPath)) {
+            console.warn(`  ⚠ AUTO-FIX: ${locale}/${category}/${file}: removed broken link [${linkMatch[1]}](/articles/${linkMatch[2]}) — target article does not exist`);
+            // Remove the entire markdown link, keeping only the link text
+            cleanedContent = cleanedContent.replace(linkMatch[0], linkMatch[1]);
+          }
+        }
+
         // Compile MDX/markdown to HTML at build time
         const html = await compileMarkdown(cleanedContent);
 
