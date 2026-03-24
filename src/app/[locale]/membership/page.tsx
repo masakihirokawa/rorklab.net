@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
+import { MembershipPlans } from "@/components/ui/MembershipPlans";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -151,76 +152,14 @@ export default async function MembershipPage({ params }: Props) {
           ))}
         </ul>
 
-        {/* Plans */}
-        <div style={{ display: "flex", gap: 20, marginBottom: 32, flexWrap: "wrap" }}>
-          {/* Pro — Recommended */}
-          <a
-            href={`${prefix}/support#membership`}
-            className="plan-card"
-            style={{
-              display: "block",
-              padding: "16px 24px",
-              borderRadius: 10,
-              border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
-              background: "color-mix(in srgb, var(--accent-coral) 4%, var(--bg-primary))",
-              minWidth: 200,
-              textDecoration: "none",
-              position: "relative",
-              transition: "all 0.25s",
-            }}
-          >
-            <span style={{
-              position: "absolute", top: -9, right: 12,
-              fontSize: 9, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em",
-              padding: "3px 8px 1px", borderRadius: 4,
-              background: "var(--accent-coral)", color: "var(--bg-primary)",
-              fontWeight: 700,
-            }}>
-              {t.recommended}
-            </span>
-            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>{t.pro}</div>
-            <div style={{ fontSize: 22, fontWeight: 300, color: "var(--accent-coral)", marginBottom: 4 }}>{t.proPrice}</div>
-            <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{t.proDesc}</div>
-          </a>
-          {/* Premium */}
-          <a
-            href={`${prefix}/support#membership`}
-            className="plan-card"
-            style={{
-              display: "block",
-              padding: "16px 24px",
-              borderRadius: 10,
-              border: "1px solid var(--border-subtle)",
-              background: "var(--bg-primary)",
-              minWidth: 200,
-              textDecoration: "none",
-              transition: "all 0.25s",
-            }}
-          >
-            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>{t.premium}</div>
-            <div style={{ fontSize: 22, fontWeight: 300, color: "var(--accent-coral)", marginBottom: 4 }}>{t.premiumPrice}</div>
-            <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{t.premiumDesc}</div>
-          </a>
-        </div>
-
-        <a
-          href={`${prefix}/support`}
-          className="membership-cta"
-          style={{
-            display: "inline-block",
-            fontSize: 14,
-            fontWeight: 600,
-            color: "var(--accent-coral)",
-            textDecoration: "none",
-            padding: "12px 28px",
-            borderRadius: 8,
-            border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
-            background: "color-mix(in srgb, var(--accent-coral) 8%, transparent)",
-            transition: "all 0.25s",
+        {/* Plans + CTA (Client Component with Stripe Checkout) */}
+        <MembershipPlans
+          locale={locale}
+          stripeConfig={{
+            pro: { priceId: locale === "ja" ? "price_1TCQyjEGB5g6A54opYFArVOk" : "price_1TCQylEGB5g6A54oNYYQAjPX" },
+            premium: { priceId: locale === "ja" ? "price_1TCQyxEGB5g6A54oh8U6RHec" : "price_1TCQyyEGB5g6A54oUojdhfBa" },
           }}
-        >
-          {t.cta}
-        </a>
+        />
       </section>
 
       {/* Premium Articles Section */}
