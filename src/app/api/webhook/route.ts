@@ -8,8 +8,6 @@ interface KVNamespace {
   delete(key: string): Promise<void>;
 }
 
-export const runtime = "edge";
-
 export async function POST(request: NextRequest) {
   try {
     const body = await request.text();
