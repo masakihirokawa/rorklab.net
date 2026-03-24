@@ -8,7 +8,7 @@
  */
 import nextHandler from "./.open-next/worker";
 
-const CACHE_TTL = 3600; // 1 hour
+const CACHE_TTL = 14400; // 4 hours
 
 export default {
   async fetch(request, env, ctx) {
