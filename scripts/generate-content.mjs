@@ -133,6 +133,7 @@ async function generateArticleIndex() {
           description: data.description || "",
           tags: data.tags || [],
           premium: data.premium || false,
+          highlights: data.highlights || null,
           content: html,
         });
       }

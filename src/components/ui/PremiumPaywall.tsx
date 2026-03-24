@@ -4,6 +4,7 @@ import { useState } from "react";
 
 interface PremiumPaywallProps {
   locale: string;
+  highlights?: string[];
 }
 
 const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
@@ -58,7 +59,7 @@ const RESTORE_TEXT: Record<string, {
   },
 };
 
-export function PremiumPaywall({ locale }: PremiumPaywallProps) {
+export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
   const [loading, setLoading] = useState<string | null>(null);
   const [showRestore, setShowRestore] = useState(false);
   const [restoreEmail, setRestoreEmail] = useState("");
@@ -149,18 +150,73 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
         >
           {locale === "ja" ? "ここまでお読みいただきありがとうございます" : "Thank you for reading this far"}
         </h3>
-        <p
-          style={{
-            fontSize: 14,
-            color: "var(--text-muted)",
-            lineHeight: 1.7,
-            marginBottom: 28,
-          }}
-        >
-          {locale === "ja"
-            ? "この先には、実装コードやベンチマーク結果など、より実践的な内容をご用意しています。メンバーシップで続きをお読みいただけます。"
-            : "What follows includes implementation code, benchmarks, and more hands-on content. Membership unlocks the full article."}
-        </p>
+        {highlights && highlights.length > 0 ? (
+          <>
+            <p
+              style={{
+                fontSize: 14,
+                color: "var(--text-muted)",
+                lineHeight: 1.7,
+                marginBottom: 16,
+              }}
+            >
+              {locale === "ja"
+                ? "この記事の続きでは、以下の内容をお届けします。"
+                : "The rest of this article covers:"}
+            </p>
+            <ul
+              style={{
+                listStyle: "none",
+                padding: 0,
+                margin: "0 0 28px 0",
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+                textAlign: "left",
+                maxWidth: 400,
+                marginLeft: "auto",
+                marginRight: "auto",
+              }}
+            >
+              {highlights.map((h, i) => (
+                <li
+                  key={i}
+                  style={{
+                    fontSize: 13,
+                    color: "var(--text-dim)",
+                    paddingLeft: 20,
+                    position: "relative",
+                    lineHeight: 1.6,
+                  }}
+                >
+                  <span
+                    style={{
+                      position: "absolute",
+                      left: 0,
+                      color: "var(--accent-coral)",
+                    }}
+                  >
+                    ✦
+                  </span>
+                  {h}
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <p
+            style={{
+              fontSize: 14,
+              color: "var(--text-muted)",
+              lineHeight: 1.7,
+              marginBottom: 28,
+            }}
+          >
+            {locale === "ja"
+              ? "この先には、実装コードやベンチマーク結果など、より実践的な内容をご用意しています。メンバーシップで続きをお読みいただけます。"
+              : "What follows includes implementation code, benchmarks, and more hands-on content. Membership unlocks the full article."}
+          </p>
+        )}
 
         {/* Pro button */}
         <button

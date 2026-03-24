@@ -12,6 +12,7 @@ export interface ArticleMeta {
   description: string;
   tags: string[];
   premium?: boolean;
+  highlights?: string[];
 }
 
 export interface Article {
@@ -35,6 +36,7 @@ export function getArticles(locale: string): ArticleMeta[] {
     description: entry.description || "",
     tags: entry.tags || [],
     premium: entry.premium || false,
+    highlights: entry.highlights || undefined,
   }));
 }
 
@@ -62,6 +64,7 @@ export function getArticle(
       description: entry.description || "",
       tags: entry.tags || [],
       premium: entry.premium || false,
+      highlights: entry.highlights || undefined,
     },
     content: entry.content || "",
   };
