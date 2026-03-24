@@ -2,17 +2,16 @@
  * Cache wrapper for OpenNext Cloudflare Worker
  * Uses Cloudflare Workers Cache API to cache HTML responses at the edge.
  * Reduces TTFB from ~3-5s (full SSR) to ~50ms (edge cache hit).
+ *
+ * This file is bundled by wrangler (esbuild) at deploy time,
+ * NOT by Next.js, so it must stay outside the TS compilation.
  */
 import nextHandler from "./.open-next/worker";
 
 const CACHE_TTL = 3600; // 1 hour
 
 export default {
-  async fetch(
-    request: Request,
-    env: Record<string, unknown>,
-    ctx: ExecutionContext
-  ): Promise<Response> {
+  async fetch(request, env, ctx) {
     // Only cache GET requests
     if (request.method !== "GET") {
       return nextHandler.fetch(request, env, ctx);
