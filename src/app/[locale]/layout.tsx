@@ -1,4 +1,3 @@
-import Script from "next/script";
 import { NextIntlClientProvider, hasLocale } from "next-intl";
 import { notFound } from "next/navigation";
 import { routing } from "@/i18n/routing";
@@ -8,9 +7,6 @@ import { Footer } from "@/components/layout/Footer";
 import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner } from "@/components/layout/DynamicComponents";
 
 import type { Metadata } from "next";
-
-// Polyfill for esbuild's __name helper (required by next-themes ThemeProvider inline script in Turbopack builds)
-const namePolyfill = `if(typeof __name==="undefined"){var __name=function(fn,name){Object.defineProperty(fn,"name",{value:name,configurable:true});return fn}}`;
 
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
 const themeScript = `(function(){try{var t=localStorage.getItem('rorklab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
@@ -52,8 +48,6 @@ export default async function LocaleLayout({
   return (
     <html lang={locale} suppressHydrationWarning>
       <head>
-        {/* Polyfill: esbuild __name helper for next-themes Turbopack compatibility */}
-        <Script id="name-polyfill" strategy="beforeInteractive" dangerouslySetInnerHTML={{ __html: namePolyfill }} />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{

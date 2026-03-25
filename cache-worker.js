@@ -10,6 +10,22 @@ import nextHandler from "./.open-next/worker";
 
 const CACHE_TTL = 14400; // 4 hours
 
+// __name polyfill — injected before any Next.js scripts to prevent
+// "ReferenceError: __name is not defined" caused by esbuild helpers
+// in next-themes ThemeProvider during SSR streaming.
+const NAME_POLYFILL =
+  '<script>if(typeof __name==="undefined"){var __name=function(fn,name){Object.defineProperty(fn,"name",{value:name,configurable:true});return fn}}</script>';
+
+class HeadHandler {
+  element(element) {
+    element.prepend(NAME_POLYFILL, { html: true });
+  }
+}
+
+function injectPolyfill(response) {
+  return new HTMLRewriter().on("head", new HeadHandler()).transform(response);
+}
+
 export default {
   async fetch(request, env, ctx) {
     // Only cache GET requests
@@ -43,7 +59,8 @@ export default {
     if (cached) {
       const resp = new Response(cached.body, cached);
       resp.headers.set("X-Cache", "HIT");
-      return resp;
+      // Inject __name polyfill into cached HTML response
+      return injectPolyfill(resp);
     }
 
     // Cache miss — run SSR via OpenNext
@@ -67,7 +84,8 @@ export default {
         // Store in edge cache (non-blocking)
         ctx.waitUntil(cache.put(cacheKey, toCache.clone()));
 
-        return toCache;
+        // Inject __name polyfill into fresh HTML response
+        return injectPolyfill(toCache);
       }
     }
 
