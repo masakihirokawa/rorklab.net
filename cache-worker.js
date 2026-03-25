@@ -34,6 +34,10 @@ function shouldSkipCache(url, request) {
   if (p.startsWith("/api/") || p === "/feed.xml" || p.startsWith("/_next/")) return true;
   if (p.includes(".") && !p.endsWith("/")) return true;
   if (request.headers.get("rsc")) return true;
+  // Skip cache for authenticated users — personalized content (MembershipCTA etc.)
+  // must not be served from edge cache. Only non-authenticated responses are cached.
+  const cookie = request.headers.get("cookie") || "";
+  if (cookie.includes("premium_token")) return true;
   return false;
 }
 
