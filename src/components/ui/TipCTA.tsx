@@ -1,25 +1,60 @@
-import { localePrefix } from "@/lib/locale";
+"use client";
+
+import { useState } from "react";
 
 interface TipCTAProps {
   locale: string;
 }
+
+const STRIPE_TIP: Record<string, string> = {
+  ja: "price_1TCQyPEGB5g6A54ofaB9e5to", // ¥150 JPY
+  en: "price_1TCQyXEGB5g6A54oVQirhunP", // $1.50 USD
+};
 
 const CONTENT = {
   ja: {
     message:
       "この記事がお役に立ちましたら、チップ（¥150）で応援いただけると今後の執筆の励みになります。",
     link: "チップで応援する →",
+    sending: "決済ページへ移動中...",
+    error: "エラーが発生しました。もう一度お試しください。",
   },
   en: {
     message:
       "If you found this article helpful, a small tip ($1.50) would really encourage us to keep writing.",
     link: "Leave a Tip →",
+    sending: "Redirecting to checkout...",
+    error: "Something went wrong. Please try again.",
   },
 };
 
 export function TipCTA({ locale }: TipCTAProps) {
   const t = CONTENT[locale as keyof typeof CONTENT] || CONTENT.en;
-  const prefix = localePrefix(locale);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleTip = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const priceId = STRIPE_TIP[locale] || STRIPE_TIP.en;
+      const res = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locale, priceId, mode: "payment" }),
+      });
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        setError(t.error);
+        setLoading(false);
+      }
+    } catch {
+      setError(t.error);
+      setLoading(false);
+    }
+  };
 
   return (
     <div
@@ -37,38 +72,58 @@ export function TipCTA({ locale }: TipCTAProps) {
         flexWrap: "wrap",
       }}
     >
-      <p
-        style={{
-          fontSize: 13,
-          color: "var(--text-muted)",
-          lineHeight: 1.7,
-          margin: 0,
-          flex: "1 1 280px",
-        }}
-      >
-        {t.message}
-      </p>
-      <a
-        href={`${prefix}/support#tip`}
+      <div style={{ flex: "1 1 280px" }}>
+        <p
+          style={{
+            fontSize: 13,
+            color: "var(--text-muted)",
+            lineHeight: 1.7,
+            margin: 0,
+          }}
+        >
+          {t.message}
+        </p>
+        {error && (
+          <p style={{ fontSize: 12, color: "#ef4444", margin: "6px 0 0" }}>
+            {error}
+          </p>
+        )}
+      </div>
+      <button
+        onClick={handleTip}
+        disabled={loading}
         style={{
           display: "inline-block",
           fontSize: 13,
           fontWeight: 600,
           color: "var(--accent-coral)",
-          textDecoration: "none",
           padding: "8px 20px",
           borderRadius: 6,
           border:
             "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
           background:
             "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
-          transition: "background 0.2s",
+          transition: "background 0.2s, transform 0.2s",
           whiteSpace: "nowrap",
           flexShrink: 0,
+          cursor: loading ? "wait" : "pointer",
+          opacity: loading ? 0.7 : 1,
+        }}
+        onMouseEnter={(e) => {
+          if (!loading) {
+            e.currentTarget.style.background =
+              "color-mix(in srgb, var(--accent-coral) 14%, transparent)";
+            e.currentTarget.style.transform = "translateY(-1px)";
+          }
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background =
+            "color-mix(in srgb, var(--accent-coral) 6%, transparent)";
+          e.currentTarget.style.transform = "translateY(0)";
         }}
       >
-        {t.link}
-      </a>
+        {loading ? t.sending : t.link}
+      </button>
     </div>
   );
 }
