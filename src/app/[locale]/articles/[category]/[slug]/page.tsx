@@ -302,8 +302,8 @@ export default async function ArticlePage({ params }: Props) {
         url={`https://rorklab.net${prefix}/articles/${category}/${slug}`}
       />
 
-      {/* Membership CTA — shown only for non-members on free articles */}
-      {!canViewPremium && !article.meta.premium && (
+      {/* Membership CTA — always shown on free articles to guide readers to premium content */}
+      {!article.meta.premium && (
         <MembershipCTA locale={locale} />
       )}
 
