@@ -7,167 +7,313 @@ interface Book {
   author: string;
   url: string;
   tag: string;
+  topics: string[];
 }
 
 const BOOKS: Record<string, Book[]> = {
   ja: [
-    // LLM / AI 基礎
+    // ── LLM / AI 基礎 ──
     {
       title: "大規模言語モデル入門",
       author: "山田育矢",
-      url: "https://www.amazon.co.jp/dp/B0D1KLJPYJ?tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/B0D1KLJPYJ/?tag=pinocchio-22",
       tag: "LLM開発",
+      topics: ["ai", "llm", "api"],
     },
     {
       title: "生成AIプロンプトエンジニアリング入門",
       author: "我妻幸長",
-      url: "https://www.amazon.co.jp/s?k=%E7%94%9F%E6%88%90AI%E3%83%97%E3%83%AD%E3%83%B3%E3%83%97%E3%83%88%E3%82%A8%E3%83%B3%E3%82%B8%E3%83%8B%E3%82%A2%E3%83%AA%E3%83%B3%E3%82%B0%E5%85%A5%E9%96%80&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/4798181986/?tag=pinocchio-22",
       tag: "プロンプト",
+      topics: ["ai", "prompt", "beginner"],
     },
     {
-      title: "AI・データサイエンスの全体像",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=AI+%E3%83%87%E3%83%BC%E3%82%BF%E3%82%B5%E3%82%A4%E3%82%A8%E3%83%B3%E3%82%B9+%E5%85%A5%E9%96%80+2025&tag=pinocchio-22",
+      title: "データサイエンス入門",
+      author: "上田雅夫",
+      url: "https://www.amazon.co.jp/dp/4641166110/?tag=pinocchio-22",
       tag: "AI入門",
+      topics: ["ai", "data", "beginner"],
     },
-    // プログラミング / 開発
+    {
+      title: "AIエージェント開発／運用入門",
+      author: "御田稔・大坪悠・塚田真規",
+      url: "https://www.amazon.co.jp/dp/4815636605/?tag=pinocchio-22",
+      tag: "エージェント",
+      topics: ["ai", "agent", "dev"],
+    },
+    {
+      title: "生成AIプロンプトエンジニア検定 2026年度版",
+      author: "生成AIプロンプト研究所",
+      url: "https://www.amazon.co.jp/dp/4911384093/?tag=pinocchio-22",
+      tag: "資格",
+      topics: ["ai", "prompt", "beginner"],
+    },
+    {
+      title: "ゼロからはじめる ChatGPT活用術",
+      author: "マイカ",
+      url: "https://www.amazon.co.jp/dp/4297136015/?tag=pinocchio-22",
+      tag: "AI活用",
+      topics: ["ai", "prompt", "beginner"],
+    },
+    {
+      title: "生成AIのプロンプトエンジニアリング",
+      author: "James Phoenix・Mike Taylor（訳:田村広平）",
+      url: "https://www.amazon.co.jp/dp/4814401248/?tag=pinocchio-22",
+      tag: "プロンプト",
+      topics: ["ai", "prompt", "dev"],
+    },
+    // ── プログラミング / 開発 ──
     {
       title: "プロを目指す人のためのTypeScript入門",
       author: "鈴木僚太",
-      url: "https://www.amazon.co.jp/s?k=%E3%83%97%E3%83%AD%E3%82%92%E7%9B%AE%E6%8C%87%E3%81%99%E4%BA%BA%E3%81%AE%E3%81%9F%E3%82%81%E3%81%AETypeScript%E5%85%A5%E9%96%80&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/4297127474/?tag=pinocchio-22",
       tag: "TypeScript",
+      topics: ["dev", "typescript", "frontend"],
     },
     {
-      title: "React実践入門",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=React+%E5%AE%9F%E8%B7%B5%E5%85%A5%E9%96%80+2025&tag=pinocchio-22",
+      title: "これからはじめるReact実践入門",
+      author: "山田祥寛",
+      url: "https://www.amazon.co.jp/dp/4815619484/?tag=pinocchio-22",
       tag: "React",
+      topics: ["dev", "react", "frontend"],
     },
     {
       title: "実践Next.js — App Routerで進化するWebアプリ開発",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=%E5%AE%9F%E8%B7%B5Next.js+App+Router&tag=pinocchio-22",
+      author: "吉井健文",
+      url: "https://www.amazon.co.jp/dp/4297140616/?tag=pinocchio-22",
       tag: "Next.js",
+      topics: ["dev", "react", "frontend", "nextjs"],
     },
-    // API / バックエンド
     {
       title: "Web API設計実践入門",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=Web+API+%E8%A8%AD%E8%A8%88+%E5%AE%9F%E8%B7%B5+%E5%85%A5%E9%96%80&tag=pinocchio-22",
+      author: "柴田芳樹",
+      url: "https://www.amazon.co.jp/dp/4297142937/?tag=pinocchio-22",
       tag: "API設計",
+      topics: ["dev", "api", "backend"],
     },
     {
-      title: "Python実践データ分析100本ノック",
-      author: "下山輝昌",
-      url: "https://www.amazon.co.jp/s?k=Python+%E5%AE%9F%E8%B7%B5%E3%83%87%E3%83%BC%E3%82%BF%E5%88%86%E6%9E%90+100%E6%9C%AC%E3%83%8E%E3%83%83%E3%82%AF&tag=pinocchio-22",
+      title: "Python実践データ分析100本ノック 第3版",
+      author: "下山輝昌・松田雄馬・三木孝行",
+      url: "https://www.amazon.co.jp/dp/4798075663/?tag=pinocchio-22",
       tag: "Python",
+      topics: ["dev", "python", "data"],
     },
-    // AI エージェント / 自動化
+    // ── インフラ / DevOps ──
     {
-      title: "AIエージェント入門 — 生成AIで変わるソフトウェア開発",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=AI%E3%82%A8%E3%83%BC%E3%82%B8%E3%82%A7%E3%83%B3%E3%83%88+%E5%85%A5%E9%96%80+%E7%94%9F%E6%88%90AI&tag=pinocchio-22",
-      tag: "エージェント",
-    },
-    {
-      title: "ChatGPT/Claudeで始めるAI活用術",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=ChatGPT+Claude+AI%E6%B4%BB%E7%94%A8&tag=pinocchio-22",
-      tag: "AI活用",
-    },
-    // インフラ / DevOps
-    {
-      title: "Cloudflare Workers実践ガイド",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=Cloudflare+Workers+%E5%AE%9F%E8%B7%B5&tag=pinocchio-22",
+      title: "Web開発者のための入門 Cloudflare Workers",
+      author: "福岡秀一郎（syumai）他",
+      url: "https://www.amazon.co.jp/dp/4297154382/?tag=pinocchio-22",
       tag: "Cloudflare",
+      topics: ["dev", "infra", "cloudflare"],
     },
     {
       title: "GitHub Actions実践入門",
-      author: "各社刊行",
-      url: "https://www.amazon.co.jp/s?k=GitHub+Actions+%E5%AE%9F%E8%B7%B5%E5%85%A5%E9%96%80&tag=pinocchio-22",
+      author: "宮田淳平",
+      url: "https://www.amazon.co.jp/dp/4844378716/?tag=pinocchio-22",
       tag: "CI/CD",
+      topics: ["dev", "infra", "cicd"],
+    },
+    {
+      title: "GitHub CI/CD実践ガイド",
+      author: "野村友規",
+      url: "https://www.amazon.co.jp/dp/4297141736/?tag=pinocchio-22",
+      tag: "CI/CD",
+      topics: ["dev", "infra", "cicd"],
+    },
+    // ── AI応用 / ビジネス ──
+    {
+      title: "AI・データ分析プロジェクトのすべて",
+      author: "大城信晃（監修）他",
+      url: "https://www.amazon.co.jp/dp/4297117584/?tag=pinocchio-22",
+      tag: "AI実務",
+      topics: ["ai", "data", "business"],
+    },
+    {
+      title: "AWSではじめるMCP実践ガイド",
+      author: "塚田真規・森田和明",
+      url: "https://www.amazon.co.jp/dp/4297154587/?tag=pinocchio-22",
+      tag: "MCP",
+      topics: ["ai", "agent", "api", "dev"],
+    },
+    {
+      title: "Amazon Bedrock 生成AIアプリ開発入門",
+      author: "御田稔・熊田寛・森田和明",
+      url: "https://www.amazon.co.jp/dp/4815626448/?tag=pinocchio-22",
+      tag: "生成AI",
+      topics: ["ai", "dev", "api"],
     },
   ],
   en: [
-    // LLM / AI
+    // ── LLM / AI ──
     {
       title: "Build a Large Language Model (From Scratch)",
       author: "Sebastian Raschka",
-      url: "https://www.amazon.co.jp/s?k=Build+Large+Language+Model+From+Scratch+Raschka&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/1633437167/?tag=pinocchio-22",
       tag: "LLM Dev",
+      topics: ["ai", "llm", "dev"],
     },
     {
       title: "Prompt Engineering for LLMs",
       author: "Berryman & Ziegler",
-      url: "https://www.amazon.co.jp/s?k=Prompt+Engineering+for+LLMs+O%27Reilly&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/1098156153/?tag=pinocchio-22",
       tag: "Prompting",
+      topics: ["ai", "prompt", "dev"],
+    },
+    {
+      title: "AI Engineering",
+      author: "Chip Huyen",
+      url: "https://www.amazon.co.jp/dp/1098166302/?tag=pinocchio-22",
+      tag: "AI Eng",
+      topics: ["ai", "llm", "dev"],
+    },
+    {
+      title: "Hands-On Machine Learning (3rd ed.)",
+      author: "Aurélien Géron",
+      url: "https://www.amazon.co.jp/dp/1098125975/?tag=pinocchio-22",
+      tag: "ML",
+      topics: ["ai", "data", "python"],
     },
     {
       title: "Designing Multi-Agent Systems",
       author: "Victor Dibia",
       url: "https://www.amazon.co.jp/s?k=Designing+Multi-Agent+Systems+Dibia&tag=pinocchio-22",
       tag: "Agents",
+      topics: ["ai", "agent", "dev"],
     },
-    // Development
     {
-      title: "Effective TypeScript",
+      title: "Prompt Engineering for Generative AI",
+      author: "James Phoenix & Mike Taylor",
+      url: "https://www.amazon.co.jp/dp/109815343X/?tag=pinocchio-22",
+      tag: "Prompting",
+      topics: ["ai", "prompt", "beginner"],
+    },
+    // ── Development ──
+    {
+      title: "Effective TypeScript (2nd ed.)",
       author: "Dan Vanderkam",
-      url: "https://www.amazon.co.jp/s?k=Effective+TypeScript+Vanderkam&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/1098155068/?tag=pinocchio-22",
       tag: "TypeScript",
+      topics: ["dev", "typescript", "frontend"],
     },
     {
       title: "Learning React: Modern Patterns",
       author: "Eve Porcello & Alex Banks",
-      url: "https://www.amazon.co.jp/s?k=Learning+React+Modern+Patterns+O%27Reilly&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/1492051721/?tag=pinocchio-22",
       tag: "React",
+      topics: ["dev", "react", "frontend"],
     },
     {
       title: "The Art of Clean Code",
       author: "Christian Mayer",
-      url: "https://www.amazon.co.jp/s?k=Art+of+Clean+Code+Mayer&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/1718502184/?tag=pinocchio-22",
       tag: "Clean Code",
-    },
-    // AI / ML
-    {
-      title: "AI Engineering",
-      author: "Chip Huyen",
-      url: "https://www.amazon.co.jp/s?k=AI+Engineering+Chip+Huyen&tag=pinocchio-22",
-      tag: "AI Eng",
+      topics: ["dev", "beginner"],
     },
     {
-      title: "Hands-On Machine Learning (3rd ed.)",
-      author: "Aurélien Géron",
-      url: "https://www.amazon.co.jp/s?k=Hands+On+Machine+Learning+Geron+3rd&tag=pinocchio-22",
-      tag: "ML",
-    },
-    // Infrastructure
-    {
-      title: "Web Development with Node and Express",
+      title: "Web Development with Node and Express (2nd ed.)",
       author: "Ethan Brown",
-      url: "https://www.amazon.co.jp/s?k=Web+Development+Node+Express+Brown&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/1492053511/?tag=pinocchio-22",
       tag: "Node.js",
+      topics: ["dev", "backend", "frontend"],
     },
+    // ── Architecture / System Design ──
     {
       title: "System Design Interview",
       author: "Alex Xu",
-      url: "https://www.amazon.co.jp/s?k=System+Design+Interview+Alex+Xu&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/B08CMF2CQF/?tag=pinocchio-22",
       tag: "System Design",
+      topics: ["dev", "infra", "backend"],
     },
     {
       title: "Designing Data-Intensive Applications",
       author: "Martin Kleppmann",
-      url: "https://www.amazon.co.jp/s?k=Designing+Data+Intensive+Applications+Kleppmann&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/1449373321/?tag=pinocchio-22",
       tag: "Architecture",
+      topics: ["dev", "infra", "backend", "data"],
     },
     {
-      title: "The Pragmatic Programmer",
+      title: "The Pragmatic Programmer (20th Anniversary)",
       author: "Hunt & Thomas",
-      url: "https://www.amazon.co.jp/s?k=Pragmatic+Programmer+20th+Anniversary&tag=pinocchio-22",
+      url: "https://www.amazon.co.jp/dp/0135957052/?tag=pinocchio-22",
       tag: "Classic",
+      topics: ["dev", "beginner"],
+    },
+    // ── Additional titles ──
+    {
+      title: "Building AI-Powered Products",
+      author: "Marily Nika",
+      url: "https://www.amazon.co.jp/dp/B0DX84DPF8/?tag=pinocchio-22",
+      tag: "AI Product",
+      topics: ["ai", "business", "beginner"],
+    },
+    {
+      title: "System Design Interview – Vol. 2",
+      author: "Alex Xu & Sahn Lam",
+      url: "https://www.amazon.co.jp/dp/1736049119/?tag=pinocchio-22",
+      tag: "System Design",
+      topics: ["dev", "infra", "backend"],
     },
   ],
 };
+
+// Category → topic mapping for relevance scoring
+const CATEGORY_TOPICS: Record<string, string[]> = {
+  // Claude Lab
+  "claude-ai": ["ai", "llm", "prompt"],
+  "claude-code": ["dev", "typescript", "frontend", "infra"],
+  cowork: ["ai", "agent", "prompt"],
+  "api-sdk": ["api", "dev", "llm", "backend"],
+  // Rork Lab
+  "app-dev": ["dev", "react", "frontend", "typescript"],
+  "rork-ai": ["ai", "agent", "prompt"],
+  "rork-basics": ["dev", "beginner", "react"],
+  "rork-business": ["business", "ai", "beginner"],
+  "rork-dev": ["dev", "typescript", "api", "backend"],
+  // Gemini Lab
+  "gemini-basics": ["ai", "prompt", "beginner"],
+  "gemini-advanced": ["ai", "llm", "dev"],
+  "gemini-api": ["api", "dev", "ai", "llm"],
+  "gemini-dev": ["dev", "typescript", "api"],
+  "gemini-updates": ["ai", "llm"],
+  "gemini-workspace": ["ai", "business", "beginner"],
+  // Antigravity Lab
+  antigravity: ["ai", "llm", "agent"],
+  agents: ["agent", "ai", "dev"],
+  "ai-tools": ["ai", "prompt", "beginner"],
+  editor: ["dev", "typescript", "frontend"],
+  integrations: ["api", "dev", "infra"],
+  tips: ["dev", "beginner"],
+};
+
+function pickBooks(allBooks: Book[], category?: string, count = 3): Book[] {
+  const topics = category ? CATEGORY_TOPICS[category] || [] : [];
+
+  if (topics.length === 0) {
+    return shuffleAndPick(allBooks, count);
+  }
+
+  // Score each book by topic overlap
+  const scored = allBooks.map((book) => ({
+    book,
+    score: book.topics.filter((t) => topics.includes(t)).length,
+  }));
+
+  // Split into relevant (score > 0) and others
+  const relevant = scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score);
+  const others = scored.filter((s) => s.score === 0);
+
+  // Pick 2 relevant (shuffled among top matches) + 1 random from others
+  const topScore = relevant.length > 0 ? relevant[0].score : 0;
+  const topMatches = relevant.filter((s) => s.score >= topScore - 1);
+  const picked = shuffleAndPick(topMatches, Math.min(2, topMatches.length)).map((s) => s.book);
+
+  if (picked.length < count) {
+    const remaining = [...shuffleAndPick(relevant.filter((s) => !picked.includes(s.book)), count - picked.length - 1).map((s) => s.book), ...shuffleAndPick(others, count - picked.length).map((s) => s.book)];
+    picked.push(...remaining.slice(0, count - picked.length));
+  }
+
+  return picked.slice(0, count);
+}
 
 function shuffleAndPick<T>(arr: T[], count: number): T[] {
   const shuffled = [...arr];
@@ -180,14 +326,15 @@ function shuffleAndPick<T>(arr: T[], count: number): T[] {
 
 interface BookRecommendationProps {
   locale: string;
+  category?: string;
 }
 
-export function BookRecommendation({ locale }: BookRecommendationProps) {
+export function BookRecommendation({ locale, category }: BookRecommendationProps) {
   const allBooks = BOOKS[locale] || BOOKS.ja;
   const [books, setBooks] = useState<Book[]>([]);
 
   useEffect(() => {
-    setBooks(shuffleAndPick(allBooks, 3));
+    setBooks(pickBooks(allBooks, category, 3));
   }, []);
 
   // SSR fallback: show first 3
@@ -292,7 +439,7 @@ export function BookRecommendation({ locale }: BookRecommendationProps) {
             : "* Contains affiliate links"}
         </div>
         <a
-          href={`/${locale === "en" ? "en/" : ""}articles/rork-ai`}
+          href={`/${locale === "en" ? "en/" : ""}articles/rork-ai/recommended-books`}
           style={{
             fontSize: 11,
             fontFamily: "'DM Mono', monospace",

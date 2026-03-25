@@ -321,7 +321,7 @@ export default async function ArticlePage({ params }: Props) {
       />
 
       {/* Book Recommendations */}
-      <BookRecommendation locale={locale} />
+      <BookRecommendation locale={locale} category={category} />
     </article>
     </>
   );
