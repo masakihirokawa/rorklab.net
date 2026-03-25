@@ -44,6 +44,7 @@ export function Footer() {
     { key: "privacy", label: t("footer.privacy"), href: `${prefix}/privacy` },
     { key: "terms", label: t("footer.terms"), href: `${prefix}/terms` },
     { key: "tokusho", label: t("footer.tokusho"), href: `${prefix}/tokusho` },
+    { key: "about", label: t("footer.about"), href: `${prefix}/about` },
   ];
 
   return (
@@ -137,9 +138,7 @@ export function Footer() {
           </a>
           {" - "}
           <a
-            href={locale === "ja" ? "https://note.com/dolice/n/n80a5e69535b0" : "https://dolice.design/profile"}
-            target="_blank"
-            rel="noopener noreferrer"
+            href={`${prefix}/about`}
             style={{ color: "var(--text-faint)", textDecoration: "none", transition: "color 0.3s" }}
             onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
             onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-faint)")}
