@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "REVIEW — Rork Max レビュー高評価：SwiftUI ネイティブ + 2クリック App Store 公開が好評（3/25）",
-    "ARR — Rork Max が3日で$1.5M ARR 達成：AI ネイティブアプリ開発の需要を実証（3/24）",
+    "ARR — Rork Max が3日で$1.5M ARR 達成：ネイティブ Swift 開発の需要を実証（3/24）",
     "FUND — Rork が a16z (Andreessen Horowitz) から$2.8M プレシード資金調達に成功（3/22）",
+    "MAX — Rork Max が急成長：ネイティブ Swift アプリを Xcode 不要で構築＆公開（3/20）",
     "GROWTH — Rork 月間訪問数74万超え、成長率85%でノーコード市場をリード（3/18）",
-    "NATIVE — Rork Max：AR/LiDAR・Metal 3D・Dynamic Island・HealthKit 等ネイティブ機能に完全対応（3/15）",
-    "APPLE — Vision Pro・Apple Watch・iPad・iMessage 含む全 Apple プラットフォームをサポート（3/12）",
+    "CLOUD — クラウド Mac でコンパイル＆QR コードで実機インストール対応（3/15）",
+    "APPLE — iPhone・iPad・Apple Watch・Vision Pro・iMessage 全プラットフォーム対応（3/12）",
   ],
   en: [
-    "REVIEW — Rork Max earns strong reviews: SwiftUI native + 2-click App Store publishing praised (3/25)",
-    "ARR — Rork Max hits $1.5M ARR in just 3 days, proving demand for AI native app development (3/24)",
+    "ARR — Rork Max hits $1.5M ARR in just 3 days, proving demand for native Swift development (3/24)",
     "FUND — Rork secures $2.8M pre-seed funding from a16z (Andreessen Horowitz) (3/22)",
+    "MAX — Rork Max growing fast: build & publish native Swift apps without Xcode (3/20)",
     "GROWTH — Rork surpasses 743K monthly visits with 85% growth rate, leading no-code market (3/18)",
-    "NATIVE — Rork Max: full native access to AR/LiDAR, Metal 3D, Dynamic Island, HealthKit & more (3/15)",
-    "APPLE — Full Apple ecosystem support including Vision Pro, Apple Watch, iPad & iMessage (3/12)",
+    "CLOUD — Cloud Mac compilation with QR code install to your device (3/15)",
+    "APPLE — Full support for iPhone, iPad, Apple Watch, Vision Pro & iMessage (3/12)",
   ],
 };
 

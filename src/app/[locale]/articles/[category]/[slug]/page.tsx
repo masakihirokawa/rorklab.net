@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { getArticle, getArticles, getAllArticleSlugs, CATEGORIES } from "@/lib/content";
+import { getArticle, getAllArticleSlugs, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
@@ -124,24 +124,6 @@ export default async function ArticlePage({ params }: Props) {
   const canViewPremium = !!premiumAccess;
 
   const articleUrl = `https://rorklab.net${prefix}/articles/${category}/${slug}`;
-
-  // Find related premium articles for MembershipCTA (free articles only)
-  const relatedPremiumArticles = !article.meta.premium ? (() => {
-    const all = getArticles(locale);
-    return all
-      .filter((a) => a.premium && a.slug !== slug)
-      .map((a) => {
-        let score = 0;
-        if (a.category === category) score += 3;
-        const shared = a.tags.filter((t) => article.meta.tags.includes(t)).length;
-        score += shared * 2;
-        return { article: a, score };
-      })
-      .filter((s) => s.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 2)
-      .map((s) => s.article);
-  })() : [];
 
   const jsonLd = {
     "@context": "https://schema.org",
@@ -305,7 +287,7 @@ export default async function ArticlePage({ params }: Props) {
             className="article-content"
             dangerouslySetInnerHTML={{ __html: article.content.slice(0, 10000) }}
           />
-          <PremiumPaywall locale={locale} highlights={article.meta.highlights} />
+          <PremiumPaywall locale={locale} />
         </>
       ) : (
         <div
@@ -322,7 +304,7 @@ export default async function ArticlePage({ params }: Props) {
 
       {/* Membership CTA — shown only for non-members on free articles */}
       {!canViewPremium && !article.meta.premium && (
-        <MembershipCTA locale={locale} relatedPremiumArticles={relatedPremiumArticles} />
+        <MembershipCTA locale={locale} />
       )}
 
       {/* Tip CTA — shown on free articles for all readers */}

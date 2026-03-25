@@ -10,7 +10,7 @@ const CONTENT = {
   ja: {
     heading: "お読みいただきありがとうございます",
     description:
-      "最後までお読みくださり、ありがとうございます。Claude Lab では、この記事の続きとなる上級実装ガイドや、完全なコード例を含むプレミアム記事もご用意しています。",
+      "最後までお読みくださり、ありがとうございます。Rork Lab では、この記事の続きとなる上級実装ガイドや、完全なコード例を含むプレミアム記事もご用意しています。",
     features: [
       "実践的なコード例・ベンチマーク付き上級ガイド",
       "毎週追加される限定コンテンツ",
@@ -23,7 +23,7 @@ const CONTENT = {
   en: {
     heading: "Thank You for Reading",
     description:
-      "Thank you for reading to the end. Claude Lab offers premium articles with advanced implementation guides, complete code examples, and benchmarks that go deeper into the topics covered here.",
+      "Thank you for reading to the end. Rork Lab offers premium articles with advanced implementation guides, complete code examples, and benchmarks that go deeper into the topics covered here.",
     features: [
       "Advanced guides with working code & benchmarks",
       "New exclusive content added every week",
