@@ -91,6 +91,7 @@ export function Header() {
   const prefix = localePrefix(locale);
   const scrolled = scrollY > 50;
   const navItems = [
+    { key: "premium", label: t("nav.premium"), href: `${prefix}/membership` },
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
     { key: "rorkBasics", label: t("nav.rorkBasics"), href: `${prefix}/articles/rork-basics` },
     { key: "rorkDev", label: t("nav.rorkDev"), href: `${prefix}/articles/rork-dev` },
@@ -98,7 +99,6 @@ export function Header() {
     { key: "rorkBusiness", label: t("nav.rorkBusiness"), href: `${prefix}/articles/rork-business` },
     { key: "blog", label: t("nav.blog"), href: `${prefix}/blog` },
     { key: "tags", label: t("nav.tags"), href: `${prefix}/tags` },
-    { key: "membership", label: t("nav.membership"), href: `${prefix}/membership` },
   ];
 
   const levelItems = [
