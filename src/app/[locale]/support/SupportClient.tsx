@@ -140,6 +140,7 @@ export function SupportClient({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [isMobile, setIsMobile] = useState(false);
+  const [thanksTip, setThanksTip] = useState(false);
 
   // Restore access state
   const [showRestore, setShowRestore] = useState(false);
@@ -155,6 +156,14 @@ export function SupportClient({
     check();
     window.addEventListener("resize", check);
     return () => window.removeEventListener("resize", check);
+  }, []);
+
+  // Detect ?thanks=tip in URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("thanks") === "tip") {
+      setThanksTip(true);
+    }
   }, []);
 
   const handleCheckout = async (priceId: string, mode: "payment" | "subscription", key: string) => {
@@ -238,6 +247,26 @@ export function SupportClient({
           {content.sub}
         </p>
       </div>
+
+      {/* Tip Thank You Banner */}
+      {thanksTip && (
+        <div
+          style={{
+            marginBottom: 24,
+            padding: "20px 24px",
+            borderRadius: 12,
+            border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+            background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
+            textAlign: "center",
+          }}
+        >
+          <p style={{ fontSize: 15, color: "var(--text-primary)", lineHeight: 1.7, margin: 0 }}>
+            {locale === "ja"
+              ? "チップをお送りいただきありがとうございます！いただいたご支援は、サーバー費用やコンテンツ制作に大切に使わせていただきます。"
+              : "Thank you so much for your tip! Your support goes directly toward server costs and content creation."}
+          </p>
+        </div>
+      )}
 
       {/* Membership */}
       <div

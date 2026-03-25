@@ -34,6 +34,15 @@ export async function GET(request: NextRequest) {
       return NextResponse.redirect(new URL(`${prefix}/support?error=payment`, request.url));
     }
 
+    // Check plan_type from metadata to distinguish tip from membership
+    const planType = session.metadata?.plan_type;
+
+    // Tip payments: just say thanks, no premium access granted
+    if (planType === "tip") {
+      const prefix = locale === "en" ? "/en" : "";
+      return NextResponse.redirect(new URL(`${prefix}/support?thanks=tip`, request.url));
+    }
+
     const email = session.customer_details?.email;
     if (!email) {
       const prefix = locale === "en" ? "/en" : "";

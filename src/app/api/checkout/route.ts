@@ -19,6 +19,12 @@ const PLAN_NAMES: Record<string, string> = {
   "price_1TCQyyEGB5g6A54oUojdhfBa": "Rork Lab Premium (Lifetime)",
 };
 
+// Tip price IDs — these should NOT grant premium access
+const TIP_PRICE_IDS = new Set([
+  "price_1TCQyPEGB5g6A54ofaB9e5to", // ¥150 JPY
+  "price_1TCQyXEGB5g6A54oVQirhunP", // $1.50 USD
+]);
+
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
@@ -28,6 +34,9 @@ export async function POST(request: NextRequest) {
     const fallbackCancel = `${baseUrl}/${prefix}support`;
     const planName = PLAN_NAMES[priceId] || "Rork Lab Membership";
 
+    // Determine plan type for verify-session to handle correctly
+    const planType = mode === "subscription" ? "pro" : TIP_PRICE_IDS.has(priceId) ? "tip" : "premium";
+
     const session = await stripe.checkout.sessions.create({
       mode: mode || "payment",
       line_items: [
@@ -36,6 +45,7 @@ export async function POST(request: NextRequest) {
           quantity: 1,
         },
       ],
+      metadata: { plan_type: planType },
       // Pro（月額）のみ初月無料トライアルを付与
       ...(mode === "subscription" && {
         subscription_data: { trial_period_days: 30, description: planName },
@@ -50,7 +60,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ url: session.url });
   } catch (error: unknown) {
-    // Stripe checkout error handling
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json(
       { error: `Checkout failed: ${message}` },
