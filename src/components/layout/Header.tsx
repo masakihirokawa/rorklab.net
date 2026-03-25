@@ -91,8 +91,8 @@ export function Header() {
   const prefix = localePrefix(locale);
   const scrolled = scrollY > 50;
   const navItems = [
-    { key: "premium", label: t("nav.premium"), href: `${prefix}/membership` },
     { key: "guides", label: t("nav.guides"), href: `${prefix}/guides` },
+    { key: "premium", label: t("nav.premium"), href: `${prefix}/membership` },
     { key: "rorkBasics", label: t("nav.rorkBasics"), href: `${prefix}/articles/rork-basics` },
     { key: "rorkDev", label: t("nav.rorkDev"), href: `${prefix}/articles/rork-dev` },
     { key: "rorkAi", label: t("nav.rorkAi"), href: `${prefix}/articles/rork-ai` },
