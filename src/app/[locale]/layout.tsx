@@ -1,3 +1,4 @@
+import Script from "next/script";
 import { NextIntlClientProvider, hasLocale } from "next-intl";
 import { notFound } from "next/navigation";
 import { routing } from "@/i18n/routing";
@@ -52,7 +53,7 @@ export default async function LocaleLayout({
     <html lang={locale} suppressHydrationWarning>
       <head>
         {/* Polyfill: esbuild __name helper for next-themes Turbopack compatibility */}
-        <script dangerouslySetInnerHTML={{ __html: namePolyfill }} />
+        <Script id="name-polyfill" strategy="beforeInteractive" dangerouslySetInnerHTML={{ __html: namePolyfill }} />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
