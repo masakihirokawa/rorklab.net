@@ -49,6 +49,39 @@ export async function POST(request: NextRequest) {
 
     try {
       switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object as Stripe.Checkout.Session;
+          const email = session.customer_details?.email;
+          if (email) {
+            const kvKey = `site:rorklab:email:${email}`;
+            const now = new Date();
+            let plan: string;
+            let ttlSeconds: number;
+
+            if (session.mode === "subscription") {
+              // Pro monthly plan
+              plan = "pro";
+              ttlSeconds = 31 * 24 * 3600;
+            } else if ((session.amount_total ?? 0) >= 500) {
+              // Premium lifetime
+              plan = "premium";
+              ttlSeconds = 10 * 365 * 24 * 3600; // 10 years
+            } else {
+              // Tip / supporter
+              plan = "supporter";
+              ttlSeconds = 365 * 24 * 3600; // 1 year
+            }
+
+            const record = {
+              plan,
+              granted_at: now.toISOString(),
+              expires_at: new Date(now.getTime() + ttlSeconds * 1000).toISOString(),
+              source: "checkout",
+            };
+            await kv.put(kvKey, JSON.stringify(record), { expirationTtl: ttlSeconds });
+          }
+          break;
+        }
         case "customer.subscription.updated": {
           const sub = event.data.object as Stripe.Subscription;
           const email = (sub as unknown as { customer_email?: string }).customer_email;
