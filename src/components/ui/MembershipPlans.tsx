@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 interface StripeConfig {
   pro: { priceId: string };
@@ -46,6 +46,18 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState("");
 
+  // Reset loading state when returning from Stripe via browser back button (bfcache)
+  useEffect(() => {
+    const handlePageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) {
+        setLoading(null);
+        setError("");
+      }
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, []);
+
   const handleCheckout = async (priceId: string, mode: "payment" | "subscription", key: string) => {
     setLoading(key);
     setError("");
@@ -53,7 +65,12 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
       const res = await fetch("/api/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ locale, priceId, mode }),
+        body: JSON.stringify({
+          locale,
+          priceId,
+          mode,
+          cancelUrl: `${window.location.origin}/${locale === "en" ? "en/" : ""}membership`,
+        }),
       });
       const data = await res.json();
       if (data.url) {

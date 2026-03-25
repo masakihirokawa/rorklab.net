@@ -151,6 +151,18 @@ export function SupportClient({
   const rt = RESTORE_TEXT[locale] || RESTORE_TEXT.en;
   const faq = FAQ_TEXT[locale] || FAQ_TEXT.en;
 
+  // Reset loading state when returning from Stripe via browser back button (bfcache)
+  useEffect(() => {
+    const handlePageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) {
+        setLoading(null);
+        setError("");
+      }
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, []);
+
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768 || "ontouchstart" in window);
     check();
