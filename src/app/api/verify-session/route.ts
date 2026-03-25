@@ -38,7 +38,14 @@ export async function GET(request: NextRequest) {
     const planType = session.metadata?.plan_type;
 
     // Tip payments: just say thanks, no premium access granted
+    // If return_url is set (e.g. from article page), redirect back to the article
     if (planType === "tip") {
+      const returnUrl = session.metadata?.return_url;
+      if (returnUrl) {
+        const dest = new URL(returnUrl);
+        dest.searchParams.set("thanks", "tip");
+        return NextResponse.redirect(dest.toString());
+      }
       const prefix = locale === "en" ? "/en" : "";
       return NextResponse.redirect(new URL(`${prefix}/support?thanks=tip`, request.url));
     }

@@ -28,7 +28,7 @@ const TIP_PRICE_IDS = new Set([
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
-    const { locale, priceId, mode, cancelUrl } = await request.json();
+    const { locale, priceId, mode, cancelUrl, returnUrl } = await request.json();
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://rorklab.net";
     const prefix = locale === "en" ? "en/" : "";
     const fallbackCancel = `${baseUrl}/${prefix}support`;
@@ -45,7 +45,7 @@ export async function POST(request: NextRequest) {
           quantity: 1,
         },
       ],
-      metadata: { plan_type: planType },
+      metadata: { plan_type: planType, ...(returnUrl && { return_url: returnUrl }) },
       // Pro（月額）のみ初月無料トライアルを付与
       ...(mode === "subscription" && {
         subscription_data: { trial_period_days: 30, description: planName },

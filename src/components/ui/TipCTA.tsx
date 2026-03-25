@@ -38,10 +38,11 @@ export function TipCTA({ locale }: TipCTAProps) {
     setError("");
     try {
       const priceId = STRIPE_TIP[locale] || STRIPE_TIP.en;
+      const currentUrl = window.location.href;
       const res = await fetch("/api/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ locale, priceId, mode: "payment" }),
+        body: JSON.stringify({ locale, priceId, mode: "payment", cancelUrl: currentUrl, returnUrl: currentUrl }),
       });
       const data = await res.json();
       if (data.url) {
