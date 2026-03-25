@@ -52,12 +52,16 @@ export default {
     // ── Manual cache purge ────────────────────────────────────
     if (url.pathname === "/api/purge-cache") {
       const cache = caches.default;
-      const paths = ["/", "/ja", "/en", "/ja/articles", "/en/articles",
-                     "/ja/membership", "/en/membership",
-                     "/ja/blog", "/en/blog",
-                     "/ja/tags", "/en/tags",
-                     "/ja/guides", "/en/guides",
-                     "/ja/support", "/en/support"];
+      const paths = ["/", "/ja", "/en",
+                     "/articles", "/ja/articles", "/en/articles",
+                     "/membership", "/ja/membership", "/en/membership",
+                     "/blog", "/ja/blog", "/en/blog",
+                     "/tags", "/ja/tags", "/en/tags",
+                     "/guides", "/ja/guides", "/en/guides",
+                     "/support", "/ja/support", "/en/support",
+                     "/level/beginner", "/level/intermediate", "/level/advanced",
+                     "/ja/level/beginner", "/ja/level/intermediate", "/ja/level/advanced",
+                     "/en/level/beginner", "/en/level/intermediate", "/en/level/advanced"];
       const purged = [];
       for (const p of paths) {
         const key = new Request(new URL(p, url.origin).toString(), { method: "GET" });
