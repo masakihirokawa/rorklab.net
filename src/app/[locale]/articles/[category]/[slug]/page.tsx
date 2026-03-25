@@ -307,8 +307,8 @@ export default async function ArticlePage({ params }: Props) {
         <MembershipCTA locale={locale} />
       )}
 
-      {/* Tip CTA — shown on free articles for all readers */}
-      {!article.meta.premium && <TipCTA locale={locale} />}
+      {/* Tip CTA — shown when full article content is visible */}
+      {(!article.meta.premium || canViewPremium) && <TipCTA locale={locale} />}
 
       {/* Related Articles */}
       <RelatedArticles
