@@ -1,5 +1,25 @@
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 import articlesData from "@/generated/articles.json";
 import blogData from "@/generated/blog.json";
+
+/**
+ * Read a static asset from Cloudflare Workers ASSETS binding.
+ * This avoids self-fetch (which Cloudflare blocks) by using the
+ * internal binding directly.
+ */
+async function readStaticAsset(path: string): Promise<string> {
+  try {
+    const { env } = getCloudflareContext();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const assets = (env as any).ASSETS;
+    if (!assets?.fetch) return "";
+    const res = await assets.fetch(new URL(path, "https://assets.local"));
+    if (!res.ok) return "";
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
 
 export interface ArticleMeta {
   title: string;
@@ -139,32 +159,12 @@ export async function getArticleContent(
   category: string,
   slug: string
 ): Promise<string> {
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://rorklab.net";
-  try {
-    const res = await fetch(
-      `${siteUrl}/content/articles/${locale}/${category}/${slug}.html`,
-      { cache: "force-cache" }
-    );
-    if (!res.ok) return "";
-    return await res.text();
-  } catch {
-    return "";
-  }
+  return readStaticAsset(`/content/articles/${locale}/${category}/${slug}.html`);
 }
 
 export async function getBlogContent(
   locale: string,
   slug: string
 ): Promise<string> {
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://rorklab.net";
-  try {
-    const res = await fetch(
-      `${siteUrl}/content/blog/${locale}/${slug}.html`,
-      { cache: "force-cache" }
-    );
-    if (!res.ok) return "";
-    return await res.text();
-  } catch {
-    return "";
-  }
+  return readStaticAsset(`/content/blog/${locale}/${slug}.html`);
 }
