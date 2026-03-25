@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 interface TipCTAProps {
   locale: string;
@@ -18,6 +18,8 @@ const CONTENT = {
     link: "チップで応援する →",
     sending: "決済ページへ移動中...",
     error: "エラーが発生しました。もう一度お試しください。",
+    thanks:
+      "チップをお送りいただきありがとうございます！いただいたご支援は、サーバー費用やコンテンツ制作に大切に使わせていただきます。",
   },
   en: {
     message:
@@ -25,6 +27,8 @@ const CONTENT = {
     link: "Leave a Tip →",
     sending: "Redirecting to checkout...",
     error: "Something went wrong. Please try again.",
+    thanks:
+      "Thank you so much for your tip! Your support goes directly toward server costs and content creation.",
   },
 };
 
@@ -32,6 +36,17 @@ export function TipCTA({ locale }: TipCTAProps) {
   const t = CONTENT[locale as keyof typeof CONTENT] || CONTENT.en;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [showThanks, setShowThanks] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("thanks") === "tip") {
+      setShowThanks(true);
+      const url = new URL(window.location.href);
+      url.searchParams.delete("thanks");
+      window.history.replaceState({}, "", url.toString());
+    }
+  }, []);
 
   const handleTip = async () => {
     setLoading(true);
@@ -56,6 +71,36 @@ export function TipCTA({ locale }: TipCTAProps) {
       setLoading(false);
     }
   };
+
+  if (showThanks) {
+    return (
+      <div
+        style={{
+          marginTop: 32,
+          marginBottom: 8,
+          padding: "20px 24px",
+          borderRadius: 10,
+          border:
+            "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
+          background:
+            "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
+          textAlign: "center",
+        }}
+      >
+        <p
+          style={{
+            fontSize: 14,
+            color: "var(--accent-coral)",
+            lineHeight: 1.8,
+            margin: 0,
+            fontWeight: 500,
+          }}
+        >
+          {t.thanks}
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div
