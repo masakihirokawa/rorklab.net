@@ -18,6 +18,7 @@ import rehypePrettyCode from "rehype-pretty-code";
 
 const CONTENT_DIR = path.join(process.cwd(), "content");
 const OUTPUT_DIR = path.join(process.cwd(), "src", "generated");
+const CONTENT_HTML_DIR = path.join(process.cwd(), "public", "content");
 
 /**
  * Single shared processor — created once so shiki is initialized only once.
@@ -122,6 +123,13 @@ async function generateArticleIndex() {
           console.warn(`  ⚠ WARNING: ${locale}/${category}/${file}: hardcoded locale-prefixed article link found. Fix: use /articles/... (JA) or /en/articles/... (EN)`);
         }
 
+        // Write HTML content to separate file
+        const htmlDir = path.join(CONTENT_HTML_DIR, "articles", locale, category);
+        if (!fs.existsSync(htmlDir)) {
+          fs.mkdirSync(htmlDir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(htmlDir, `${slug}.html`), html, "utf-8");
+
         result[locale].push({
           title: data.title || "",
           slug,
@@ -133,8 +141,6 @@ async function generateArticleIndex() {
           description: data.description || "",
           tags: data.tags || [],
           premium: data.premium || false,
-          highlights: data.highlights || null,
-          content: html,
         });
       }
     }
@@ -203,6 +209,13 @@ async function generateBlogIndex() {
 
       const html = await compileMarkdown(cleanedContent);
 
+      // Write HTML content to separate file
+      const htmlDir = path.join(CONTENT_HTML_DIR, "blog", locale);
+      if (!fs.existsSync(htmlDir)) {
+        fs.mkdirSync(htmlDir, { recursive: true });
+      }
+      fs.writeFileSync(path.join(htmlDir, `${slug}.html`), html, "utf-8");
+
       result[locale].push({
         title: data.title || "",
         slug,
@@ -210,7 +223,6 @@ async function generateBlogIndex() {
         author: data.author || "Rork Lab",
         description: data.description || "",
         tags: data.tags || [],
-        content: html,
       });
     }
 
