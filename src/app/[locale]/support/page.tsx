@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { SupportClient } from "./SupportClient";
 import { getPremiumAccess } from "@/lib/premium";
-import { STRIPE_PRICE_IDS, PLAN_LABELS, PRICES } from "@/config/pricing";
+import { STRIPE_PRICE_IDS, PRICES } from "@/config/pricing";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -118,12 +118,12 @@ export default async function SupportPage({ params }: Props) {
   const c = CONTENT[locale] || CONTENT.en;
   const plans = {
     ja: {
-      pro: { priceId: STRIPE_PRICE_IDS.ja.pro, label: `Pro — ${PLAN_LABELS.ja.pro}`, price: PRICES.ja.pro },
-      premium: { priceId: STRIPE_PRICE_IDS.ja.premium, label: `Premium — ${PLAN_LABELS.ja.premium}`, price: PRICES.ja.premium },
+      pro: { priceId: STRIPE_PRICE_IDS.ja.pro, label: "Pro — 月額プラン", price: PRICES.ja.pro },
+      premium: { priceId: STRIPE_PRICE_IDS.ja.premium, label: "Premium — 永久アクセス", price: PRICES.ja.premium },
     },
     en: {
-      pro: { priceId: STRIPE_PRICE_IDS.en.pro, label: `Pro — ${PLAN_LABELS.en.pro}`, price: PRICES.en.pro },
-      premium: { priceId: STRIPE_PRICE_IDS.en.premium, label: `Premium — ${PLAN_LABELS.en.premium}`, price: PRICES.en.premium },
+      pro: { priceId: STRIPE_PRICE_IDS.en.pro, label: "Pro — Monthly", price: PRICES.en.pro },
+      premium: { priceId: STRIPE_PRICE_IDS.en.premium, label: "Premium — Lifetime", price: PRICES.en.premium },
     },
   };
   const stripeTip = {
