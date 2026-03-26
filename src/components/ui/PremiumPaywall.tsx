@@ -4,6 +4,7 @@ import { useState } from "react";
 
 interface PremiumPaywallProps {
   locale: string;
+  highlights?: string[];
 }
 
 const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
@@ -58,7 +59,7 @@ const RESTORE_TEXT: Record<string, {
   },
 };
 
-export function PremiumPaywall({ locale }: PremiumPaywallProps) {
+export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
   const [loading, setLoading] = useState<string | null>(null);
   const [showRestore, setShowRestore] = useState(false);
   const [restoreEmail, setRestoreEmail] = useState("");
@@ -147,20 +148,33 @@ export function PremiumPaywall({ locale }: PremiumPaywallProps) {
             marginBottom: 8,
           }}
         >
-          {locale === "ja" ? "ここまでお読みいただきありがとうございます" : "Thank you for reading this far"}
+          {locale === "ja" ? "この記事の続きを読む" : "Continue Reading"}
         </h3>
         <p
           style={{
             fontSize: 14,
             color: "var(--text-muted)",
             lineHeight: 1.7,
-            marginBottom: 28,
+            marginBottom: highlights && highlights.length > 0 ? 16 : 28,
           }}
         >
           {locale === "ja"
-            ? "この先には、実装コードやベンチマーク結果など、より実践的な内容をご用意しています。メンバーシップで続きをお読みいただけます。"
-            : "What follows includes implementation code, benchmarks, and more hands-on content. Membership unlocks the full article."}
+            ? "この先には、実装コードやベンチマーク結果など、すぐに使える実践的な内容をご用意しています。"
+            : "What follows includes implementation code, benchmarks, and hands-on content you can use right away."}
         </p>
+        {highlights && highlights.length > 0 && (
+          <div style={{ textAlign: "left", marginBottom: 28, padding: "12px 16px", borderRadius: 8, background: "color-mix(in srgb, var(--accent-coral) 2%, var(--bg-primary))" }}>
+            <div style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em", color: "var(--accent-coral)", marginBottom: 8 }}>
+              {locale === "ja" ? "この記事で得られること" : "WHAT YOU'LL LEARN"}
+            </div>
+            {highlights.map((h, i) => (
+              <div key={i} style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6, paddingLeft: 16, position: "relative", marginBottom: i < highlights.length - 1 ? 4 : 0 }}>
+                <span style={{ position: "absolute", left: 0, color: "var(--accent-coral)", fontSize: 11 }}>✦</span>
+                {h}
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* Pro button */}
         <button

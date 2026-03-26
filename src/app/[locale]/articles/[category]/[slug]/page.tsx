@@ -289,7 +289,7 @@ export default async function ArticlePage({ params }: Props) {
             className="article-content"
             dangerouslySetInnerHTML={{ __html: content.slice(0, 10000) }}
           />
-          <PremiumPaywall locale={locale} />
+          <PremiumPaywall locale={locale} highlights={article.meta.highlights} />
         </>
       ) : (
         <div

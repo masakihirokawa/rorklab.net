@@ -8,30 +8,26 @@ interface MembershipCTAProps {
 
 const CONTENT = {
   ja: {
-    heading: "お読みいただきありがとうございます",
+    heading: "さらに深く学びたい方へ",
     description:
-      "最後までお読みくださり、ありがとうございます。Rork Lab では、この記事の続きとなる上級実装ガイドや、完全なコード例を含むプレミアム記事もご用意しています。",
+      "Rork Lab では、この記事の内容をさらに掘り下げた上級ガイドをプレミアム記事として公開しています。実装コード・ベンチマーク・本番設計パターンなど、すぐに使える実践的な内容です。",
     features: [
-      "実践的なコード例・ベンチマーク付き上級ガイド",
-      "毎週追加される限定コンテンツ",
-      "無料記事の「続き」をすべて読める",
+      "コピー&ペーストで使える実装コード付き",
+      "毎週新しい上級ガイドを追加",
+      "¥380/月 または ¥1,480 の永久アクセス",
     ],
-    pro: "Pro プラン — ¥380/月（初月無料）",
-    premium: "Premium プラン — ¥1,480（永久アクセス）",
-    link: "メンバーシップを見る →",
+    link: "Premium 記事を見る →",
   },
   en: {
-    heading: "Thank You for Reading",
+    heading: "Go Deeper",
     description:
-      "Thank you for reading to the end. Rork Lab offers premium articles with advanced implementation guides, complete code examples, and benchmarks that go deeper into the topics covered here.",
+      "Rork Lab publishes premium articles that go deeper into the topics covered here — with implementation code, benchmarks, and production-ready design patterns.",
     features: [
-      "Advanced guides with working code & benchmarks",
-      "New exclusive content added every week",
-      "Full access to all premium \"deep dive\" articles",
+      "Copy-paste ready implementation code",
+      "New advanced guides published every week",
+      "$3/mo or $10 for lifetime access",
     ],
-    pro: "Pro Plan — $3/mo (first month free)",
-    premium: "Premium Plan — $10 (lifetime access)",
-    link: "View Membership →",
+    link: "View Premium Articles →",
   },
 };
 
@@ -103,19 +99,6 @@ export function MembershipCTA({ locale, relatedPremiumArticles }: MembershipCTAP
           </li>
         ))}
       </ul>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 8,
-          fontSize: 12,
-          color: "var(--text-faint)",
-          marginBottom: 16,
-        }}
-      >
-        <span>{t.pro}</span>
-        <span>{t.premium}</span>
-      </div>
       {relatedPremiumArticles && relatedPremiumArticles.length > 0 && (
         <div style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 8 }}>
           {relatedPremiumArticles.map((a) => (
