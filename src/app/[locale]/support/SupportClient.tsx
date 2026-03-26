@@ -315,64 +315,67 @@ export function SupportClient({
                 </li>
               ))}
             </ul>
-            <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-              <button
-                onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
-                disabled={!!loading}
-                style={{
-                  width: "100%",
-                  padding: "14px 24px",
-                  borderRadius: 8,
-                  border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-                  background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-                  color: "var(--accent-coral)",
-                  fontSize: 14,
-                  fontWeight: 600,
-                  cursor: loading ? "wait" : "pointer",
-                  opacity: loading ? 0.7 : 1,
-                  transition: "all 0.25s",
-                }}
-                onMouseEnter={(e) => {
-                  if (!loading) {
-                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
-                    e.currentTarget.style.transform = "translateY(-1px)";
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
-                  e.currentTarget.style.transform = "translateY(0)";
-                }}
-              >
-                {loading === "pro" ? "..." : `${plans.pro.label} — ${plans.pro.price}`}
-              </button>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {/* Premium — primary CTA */}
               <button
                 onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
                 disabled={!!loading}
                 style={{
                   width: "100%",
-                  padding: "14px 24px",
+                  padding: "16px 24px",
                   borderRadius: 8,
-                  border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-                  background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+                  border: "1px solid var(--accent-coral)",
+                  background: "var(--accent-coral)",
+                  color: "#fff",
+                  fontSize: 15,
+                  fontWeight: 700,
+                  cursor: loading ? "wait" : "pointer",
+                  opacity: loading ? 0.7 : 1,
+                  transition: "all 0.25s",
+                  letterSpacing: "-0.01em",
+                }}
+                onMouseEnter={(e) => {
+                  if (!loading) {
+                    e.currentTarget.style.opacity = "0.9";
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.opacity = loading ? "0.7" : "1";
+                  e.currentTarget.style.transform = "translateY(0)";
+                }}
+              >
+                {loading === "premium" ? "..." : content.premiumLabel}
+              </button>
+              {/* Pro — secondary CTA */}
+              <button
+                onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+                disabled={!!loading}
+                style={{
+                  width: "100%",
+                  padding: "12px 24px",
+                  borderRadius: 8,
+                  border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+                  background: "transparent",
                   color: "var(--accent-coral)",
-                  fontSize: 14,
-                  fontWeight: 600,
+                  fontSize: 13,
+                  fontWeight: 500,
                   cursor: loading ? "wait" : "pointer",
                   opacity: loading ? 0.7 : 1,
                   transition: "all 0.25s",
                 }}
                 onMouseEnter={(e) => {
                   if (!loading) {
-                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
+                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 8%, transparent)";
                     e.currentTarget.style.transform = "translateY(-1px)";
                   }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
+                  e.currentTarget.style.background = "transparent";
                   e.currentTarget.style.transform = "translateY(0)";
                 }}
               >
-                {loading === "premium" ? "..." : `${plans.premium.label} — ${plans.premium.price}`}
+                {loading === "pro" ? "..." : content.proLabel}
               </button>
             </div>
           </>
