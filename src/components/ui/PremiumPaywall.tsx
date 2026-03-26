@@ -10,11 +10,11 @@ interface PremiumPaywallProps {
 const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
   ja: {
     pro: { priceId: "price_1TCQyjEGB5g6A54opYFArVOk", label: "Pro — ¥380/月" },
-    premium: { priceId: "price_1TCQyxEGB5g6A54oh8U6RHec", label: "Premium — ¥1,480（永久）" },
+    premium: { priceId: "price_1TCQyxEGB5g6A54oh8U6RHec", label: "Premium — ¥1,480（おすすめ）" },
   },
   en: {
     pro: { priceId: "price_1TCQylEGB5g6A54oNYYQAjPX", label: "Pro — $3/mo" },
-    premium: { priceId: "price_1TCQyyEGB5g6A54oUojdhfBa", label: "Premium — $10 (lifetime)" },
+    premium: { priceId: "price_1TCQyyEGB5g6A54oUojdhfBa", label: "Premium — $10 (Recommended)" },
   },
 };
 
@@ -176,43 +176,7 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
           </div>
         )}
 
-        {/* Pro button */}
-        <button
-          onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
-          disabled={!!loading}
-          style={{
-            display: "block",
-            width: "100%",
-            maxWidth: 320,
-            margin: "0 auto 12px",
-            padding: "12px 24px",
-            borderRadius: 8,
-            border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
-            background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-            color: "var(--accent-coral)",
-            fontSize: 14,
-            fontWeight: 600,
-            cursor: loading ? "wait" : "pointer",
-            opacity: loading === "pro" ? 0.7 : 1,
-            transition: "all 0.25s",
-          }}
-          onMouseEnter={(e) => {
-            if (!loading) {
-              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 20%, transparent)";
-              e.currentTarget.style.transform = "translateY(-1px)";
-            }
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
-            e.currentTarget.style.transform = "translateY(0)";
-          }}
-        >
-          {loading === "pro"
-            ? locale === "ja" ? "処理中..." : "Loading..."
-            : plans.pro.label}
-        </button>
-
-        {/* Premium button */}
+        {/* Premium — primary CTA */}
         <button
           onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
           disabled={!!loading}
@@ -220,17 +184,18 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
             display: "block",
             width: "100%",
             maxWidth: 320,
-            margin: "0 auto",
-            padding: "12px 24px",
+            margin: "0 auto 10px",
+            padding: "14px 24px",
             borderRadius: 8,
             border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
             background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
             color: "var(--accent-coral)",
             fontSize: 14,
-            fontWeight: 600,
+            fontWeight: 700,
             cursor: loading ? "wait" : "pointer",
             opacity: loading === "premium" ? 0.7 : 1,
             transition: "all 0.25s",
+            letterSpacing: "-0.01em",
           }}
           onMouseEnter={(e) => {
             if (!loading) {
@@ -246,6 +211,42 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
           {loading === "premium"
             ? locale === "ja" ? "処理中..." : "Loading..."
             : plans.premium.label}
+        </button>
+
+        {/* Pro — secondary */}
+        <button
+          onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+          disabled={!!loading}
+          style={{
+            display: "block",
+            width: "100%",
+            maxWidth: 320,
+            margin: "0 auto",
+            padding: "14px 24px",
+            borderRadius: 8,
+            border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
+            background: "transparent",
+            color: "var(--accent-coral)",
+            fontSize: 14,
+            fontWeight: 500,
+            cursor: loading ? "wait" : "pointer",
+            opacity: loading === "pro" ? 0.7 : 1,
+            transition: "all 0.25s",
+          }}
+          onMouseEnter={(e) => {
+            if (!loading) {
+              e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 8%, transparent)";
+              e.currentTarget.style.transform = "translateY(-1px)";
+            }
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "transparent";
+            e.currentTarget.style.transform = "translateY(0)";
+          }}
+        >
+          {loading === "pro"
+            ? locale === "ja" ? "処理中..." : "Loading..."
+            : plans.pro.label}
         </button>
 
         <div
