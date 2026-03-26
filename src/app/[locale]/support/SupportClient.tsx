@@ -315,19 +315,19 @@ export function SupportClient({
                 </li>
               ))}
             </ul>
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {/* Premium — primary CTA */}
               <button
                 onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
                 disabled={!!loading}
                 style={{
                   width: "100%",
-                  padding: "16px 24px",
+                  padding: "14px 24px",
                   borderRadius: 8,
-                  border: "1px solid var(--accent-coral)",
-                  background: "var(--accent-coral)",
-                  color: "#fff",
-                  fontSize: 15,
+                  border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
+                  background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
+                  color: "var(--accent-coral)",
+                  fontSize: 14,
                   fontWeight: 700,
                   cursor: loading ? "wait" : "pointer",
                   opacity: loading ? 0.7 : 1,
@@ -336,12 +336,12 @@ export function SupportClient({
                 }}
                 onMouseEnter={(e) => {
                   if (!loading) {
-                    e.currentTarget.style.opacity = "0.9";
+                    e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 18%, transparent)";
                     e.currentTarget.style.transform = "translateY(-1px)";
                   }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.opacity = loading ? "0.7" : "1";
+                  e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 12%, transparent)";
                   e.currentTarget.style.transform = "translateY(0)";
                 }}
               >
@@ -353,12 +353,12 @@ export function SupportClient({
                 disabled={!!loading}
                 style={{
                   width: "100%",
-                  padding: "12px 24px",
+                  padding: "14px 24px",
                   borderRadius: 8,
                   border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
                   background: "transparent",
                   color: "var(--accent-coral)",
-                  fontSize: 13,
+                  fontSize: 14,
                   fontWeight: 500,
                   cursor: loading ? "wait" : "pointer",
                   opacity: loading ? 0.7 : 1,

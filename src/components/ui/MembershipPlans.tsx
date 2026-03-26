@@ -89,24 +89,24 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
     <>
       {/* Plans */}
       <div style={{ display: "flex", gap: 20, marginBottom: 32, flexWrap: "wrap" }}>
-        {/* Pro — Recommended */}
+        {/* Premium — Recommended */}
         <button
-          onClick={() => handleCheckout(stripeConfig.pro.priceId, "subscription", "pro")}
+          onClick={() => handleCheckout(stripeConfig.premium.priceId, "payment", "premium")}
           disabled={loading !== null}
           className="plan-card"
           style={{
             display: "block",
             padding: "16px 24px",
             borderRadius: 10,
-            border: `1px solid color-mix(in srgb, ${accent} 30%, transparent)`,
-            background: `color-mix(in srgb, ${accent} 4%, var(--bg-primary))`,
+            border: `1px solid color-mix(in srgb, ${accent} 50%, transparent)`,
+            background: `color-mix(in srgb, ${accent} 8%, var(--bg-primary))`,
             minWidth: 200,
             textDecoration: "none",
             position: "relative",
             transition: "all 0.25s",
             cursor: loading ? "wait" : "pointer",
             textAlign: "left" as const,
-            opacity: loading && loading !== "pro" ? 0.5 : 1,
+            opacity: loading && loading !== "premium" ? 0.5 : 1,
           }}
         >
           <span style={{
@@ -119,18 +119,18 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
             {t.recommended}
           </span>
           <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>
-            {t.pro}
+            {t.premium}
           </div>
           <div style={{ fontSize: 22, fontWeight: 300, color: accent, marginBottom: 4 }}>
-            {t.proPrice}
+            {t.premiumPrice}
           </div>
           <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
-            {loading === "pro" ? t.processing : t.proDesc}
+            {loading === "premium" ? t.processing : t.premiumDesc}
           </div>
         </button>
-        {/* Premium */}
+        {/* Pro */}
         <button
-          onClick={() => handleCheckout(stripeConfig.premium.priceId, "payment", "premium")}
+          onClick={() => handleCheckout(stripeConfig.pro.priceId, "subscription", "pro")}
           disabled={loading !== null}
           className="plan-card"
           style={{
@@ -144,24 +144,24 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
             transition: "all 0.25s",
             cursor: loading ? "wait" : "pointer",
             textAlign: "left" as const,
-            opacity: loading && loading !== "premium" ? 0.5 : 1,
+            opacity: loading && loading !== "pro" ? 0.5 : 1,
           }}
         >
           <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>
-            {t.premium}
+            {t.pro}
           </div>
           <div style={{ fontSize: 22, fontWeight: 300, color: accent, marginBottom: 4 }}>
-            {t.premiumPrice}
+            {t.proPrice}
           </div>
           <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
-            {loading === "premium" ? t.processing : t.premiumDesc}
+            {loading === "pro" ? t.processing : t.proDesc}
           </div>
         </button>
       </div>
 
       {/* CTA */}
       <button
-        onClick={() => handleCheckout(stripeConfig.pro.priceId, "subscription", "pro-cta")}
+        onClick={() => handleCheckout(stripeConfig.premium.priceId, "payment", "premium-cta")}
         disabled={loading !== null}
         className="membership-cta"
         style={{
@@ -175,10 +175,10 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
           background: `color-mix(in srgb, ${accent} 8%, transparent)`,
           transition: "all 0.25s",
           cursor: loading ? "wait" : "pointer",
-          opacity: loading && loading !== "pro-cta" ? 0.5 : 1,
+          opacity: loading && loading !== "premium-cta" ? 0.5 : 1,
         }}
       >
-        {loading === "pro-cta" ? t.processing : t.cta}
+        {loading === "premium-cta" ? t.processing : t.cta}
       </button>
 
       {error && (
