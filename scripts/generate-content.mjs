@@ -145,15 +145,16 @@ async function generateArticleIndex() {
       }
     }
 
-    // Sort by creation date (newest on top), then by updated time
+    // Sort: by creation date (newest first).
+    // Same date-time: non-premium articles first so premium doesn't always top the list.
     result[locale].sort((a, b) => {
       const aDate = a.date || "";
       const bDate = b.date || "";
       if (aDate !== bDate) return aDate > bDate ? -1 : 1;
-      // Same creation date: sort by updated time (most recent first)
-      const aUpdated = a.updated || a.date || "";
-      const bUpdated = b.updated || b.date || "";
-      if (aUpdated !== bUpdated) return aUpdated > bUpdated ? -1 : 1;
+      // Same creation date: non-premium before premium
+      const aPrem = a.premium ? 1 : 0;
+      const bPrem = b.premium ? 1 : 0;
+      if (aPrem !== bPrem) return aPrem - bPrem;
       return a.title.localeCompare(b.title);
     });
   }
