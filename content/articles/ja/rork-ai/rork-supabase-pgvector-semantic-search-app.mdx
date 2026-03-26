@@ -1,0 +1,698 @@
+---
+title: "Rork × Supabase pgvector でセマンティック検索アプリを構築する — ベクトル埋め込みによる AI レコメンデーションの実装"
+slug: "rork-supabase-pgvector-semantic-search-app"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-03-26T20:00"
+updated: "2026-03-26T20:00"
+author: "Rork Lab"
+description: "Supabase pgvector とベクトル埋め込みを活用し、Rork アプリにセマンティック検索と AI レコメンデーション機能を実装する上級ガイド。OpenAI Embeddings API の統合からコサイン類似度検索まで完全解説。"
+tags: ["rork", "supabase", "pgvector", "semantic-search", "vector-embeddings", "AI", "recommendation", "advanced"]
+highlights:
+  - "Supabase pgvector のセットアップからベクトルインデックス最適化まで、本番運用レベルの設計を理解できる"
+  - "OpenAI Embeddings API と Edge Functions を組み合わせた高速セマンティック検索パイプラインを構築できる"
+  - "コサイン類似度・ユーザー行動ハイブリッドのレコメンデーションエンジンを Rork アプリに実装できる"
+---
+
+## はじめに
+
+従来のキーワード検索では、ユーザーが「ランニングに最適なイヤホン」と入力しても「ジョギング用ワイヤレスヘッドフォン」はヒットしません。セマンティック検索は、テキストの「意味」をベクトル空間に変換し、意味的に近いコンテンツを発見する技術です。
+
+この記事では、Rork で構築したモバイルアプリに **Supabase pgvector** を使ったセマンティック検索とAIレコメンデーション機能を実装します。対象読者は Rork と Supabase の基本操作に慣れている中〜上級者です。Supabase の認証やリアルタイム機能については [Rork × Supabase 認証＆リアルタイム機能実装ガイド](/articles/rork-dev/rork-supabase-auth-realtime-guide) を参照してください。
+
+この記事で構築するアプリの全体像は次の通りです。
+
+1. ユーザーが検索クエリを自然言語で入力する
+2. Supabase Edge Function が OpenAI Embeddings API でクエリをベクトル化する
+3. pgvector がコサイン類似度でデータベースを検索する
+4. 結果をスコア付きで Rork アプリに返却する
+
+## 前提知識と環境準備
+
+### 必要なもの
+
+- **Rork Max** アカウント（プロジェクト作成済み）
+- **Supabase** プロジェクト（Free プランでも pgvector は利用可能）
+- **OpenAI API キー**（Embeddings API 用）
+- Node.js 18 以上（Edge Functions のローカルテスト用）
+
+### ベクトル埋め込みとは
+
+ベクトル埋め込み（Vector Embedding）は、テキストや画像などのデータを高次元の数値ベクトルに変換する技術です。例えば OpenAI の `text-embedding-3-small` モデルでは、任意のテキストを 1536 次元の浮動小数点数配列に変換します。
+
+意味的に似たテキストは、ベクトル空間上で近い位置に配置されます。「犬の散歩」と「ペットとウォーキング」は、キーワードは異なりますが、ベクトル間の距離は非常に近くなります。
+
+## Supabase pgvector のセットアップ
+
+### 拡張機能の有効化
+
+Supabase ダッシュボードの SQL Editor で以下を実行します。
+
+```sql
+-- pgvector 拡張を有効化
+create extension if not exists vector with schema extensions;
+
+-- 商品テーブル（セマンティック検索対象）
+create table products (
+  id bigserial primary key,
+  name text not null,
+  description text not null,
+  category text not null,
+  price numeric(10,2) not null,
+  image_url text,
+  -- 1536次元のベクトルカラム（OpenAI text-embedding-3-small 対応）
+  embedding vector(1536),
+  created_at timestamptz default now()
+);
+
+-- コサイン類似度検索用のインデックス
+-- ivfflat は中規模データ（〜100万件）に適したインデックスタイプ
+create index on products
+  using ivfflat (embedding vector_cosine_ops)
+  with (lists = 100);
+
+-- RLS（行レベルセキュリティ）を有効化
+alter table products enable row level security;
+
+-- 認証済みユーザーは全商品を閲覧可能
+create policy "Products are viewable by authenticated users"
+  on products for select
+  to authenticated
+  using (true);
+```
+
+### 検索用 RPC 関数の作成
+
+pgvector でセマンティック検索を行う PostgreSQL 関数を作成します。この関数が検索パイプラインの核です。
+
+```sql
+-- セマンティック検索関数
+-- query_embedding: 検索クエリのベクトル
+-- match_threshold: 類似度の閾値（0〜1、高いほど厳密）
+-- match_count: 返却する最大件数
+create or replace function match_products(
+  query_embedding vector(1536),
+  match_threshold float default 0.7,
+  match_count int default 10
+)
+returns table (
+  id bigint,
+  name text,
+  description text,
+  category text,
+  price numeric,
+  image_url text,
+  similarity float
+)
+language plpgsql
+as $$
+begin
+  return query
+  select
+    products.id,
+    products.name,
+    products.description,
+    products.category,
+    products.price,
+    products.image_url,
+    -- コサイン類似度を計算（1 - コサイン距離）
+    1 - (products.embedding <=> query_embedding) as similarity
+  from products
+  where 1 - (products.embedding <=> query_embedding) > match_threshold
+  order by products.embedding <=> query_embedding
+  limit match_count;
+end;
+$$;
+```
+
+`<=>` 演算子はコサイン距離を計算する pgvector のオペレーターです。`1 - コサイン距離` でコサイン類似度に変換し、値が 1 に近いほど意味的に似ていることを示します。
+
+## Edge Function によるベクトル化パイプライン
+
+### 検索クエリのベクトル化
+
+Supabase Edge Functions を使い、検索クエリを OpenAI Embeddings API でベクトル化し、pgvector で検索する関数を作成します。
+
+```typescript
+// supabase/functions/semantic-search/index.ts
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+// 環境変数から取得
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+serve(async (req) => {
+  try {
+    const { query, threshold = 0.7, limit = 10 } = await req.json();
+
+    if (!query || typeof query !== "string") {
+      return new Response(
+        JSON.stringify({ error: "query is required" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // Step 1: OpenAI Embeddings API でクエリをベクトル化
+    const embeddingResponse = await fetch(
+      "https://api.openai.com/v1/embeddings",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "text-embedding-3-small",
+          input: query,
+        }),
+      }
+    );
+
+    const embeddingData = await embeddingResponse.json();
+    const queryEmbedding = embeddingData.data[0].embedding;
+    // 期待する出力: 1536次元の浮動小数点数配列
+
+    // Step 2: Supabase pgvector でセマンティック検索
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+    const { data: results, error } = await supabase.rpc("match_products", {
+      query_embedding: queryEmbedding,
+      match_threshold: threshold,
+      match_count: limit,
+    });
+
+    if (error) throw error;
+
+    return new Response(
+      JSON.stringify({ results, query }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ error: err.message }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+});
+```
+
+### 商品データのベクトル化（バッチ処理）
+
+既存の商品データにベクトル埋め込みを付与するバッチ処理も作成します。
+
+```typescript
+// supabase/functions/generate-embeddings/index.ts
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+serve(async (req) => {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  // embedding が null の商品を取得（バッチサイズ: 50）
+  const { data: products, error } = await supabase
+    .from("products")
+    .select("id, name, description, category")
+    .is("embedding", null)
+    .limit(50);
+
+  if (error) throw error;
+  if (!products || products.length === 0) {
+    return new Response(JSON.stringify({ message: "No products to process" }));
+  }
+
+  let processed = 0;
+
+  for (const product of products) {
+    // 名前・説明・カテゴリを結合してベクトル化
+    const textToEmbed = `${product.name}. ${product.description}. Category: ${product.category}`;
+
+    const embeddingResponse = await fetch(
+      "https://api.openai.com/v1/embeddings",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "text-embedding-3-small",
+          input: textToEmbed,
+        }),
+      }
+    );
+
+    const embeddingData = await embeddingResponse.json();
+    const embedding = embeddingData.data[0].embedding;
+
+    // ベクトルを products テーブルに保存
+    await supabase
+      .from("products")
+      .update({ embedding })
+      .eq("id", product.id);
+
+    processed++;
+  }
+
+  return new Response(
+    JSON.stringify({ processed, total: products.length }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+// 期待する出力: { "processed": 50, "total": 50 }
+```
+
+## Rork アプリへの統合
+
+### セマンティック検索コンポーネント
+
+Rork プロジェクトに検索画面を作成します。ポイントは、ユーザーが自然言語で入力したテキストをそのまま Edge Function に送信し、セマンティック検索結果をリアルタイムで表示することです。
+
+```typescript
+// app/search.tsx — Rork のメインスクリーン
+import React, { useState, useCallback } from "react";
+import {
+  View, TextInput, FlatList, Text, Image,
+  StyleSheet, ActivityIndicator, TouchableOpacity,
+} from "react-native";
+import { supabase } from "@/lib/supabase";
+
+interface Product {
+  id: number;
+  name: string;
+  description: string;
+  category: string;
+  price: number;
+  image_url: string | null;
+  similarity: number;
+}
+
+export default function SemanticSearchScreen() {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<Product[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const handleSearch = useCallback(async () => {
+    if (!query.trim()) return;
+    setLoading(true);
+
+    try {
+      // Supabase Edge Function を呼び出し
+      const { data, error } = await supabase.functions.invoke(
+        "semantic-search",
+        { body: { query, threshold: 0.65, limit: 20 } }
+      );
+
+      if (error) throw error;
+      setResults(data.results || []);
+    } catch (err) {
+      console.error("Search failed:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, [query]);
+
+  const renderProduct = ({ item }: { item: Product }) => (
+    <TouchableOpacity style={styles.card}>
+      {item.image_url && (
+        <Image source={{ uri: item.image_url }} style={styles.image} />
+      )}
+      <View style={styles.info}>
+        <Text style={styles.name}>{item.name}</Text>
+        <Text style={styles.description} numberOfLines={2}>
+          {item.description}
+        </Text>
+        <View style={styles.meta}>
+          <Text style={styles.price}>¥{item.price.toLocaleString()}</Text>
+          {/* 類似度スコアをパーセント表示 */}
+          <Text style={styles.similarity}>
+            {Math.round(item.similarity * 100)}% match
+          </Text>
+        </View>
+      </View>
+    </TouchableOpacity>
+  );
+
+  return (
+    <View style={styles.container}>
+      <TextInput
+        style={styles.searchInput}
+        placeholder="何をお探しですか？（例: 雨の日でも使えるスニーカー）"
+        value={query}
+        onChangeText={setQuery}
+        onSubmitEditing={handleSearch}
+        returnKeyType="search"
+      />
+      {loading ? (
+        <ActivityIndicator size="large" style={styles.loader} />
+      ) : (
+        <FlatList
+          data={results}
+          keyExtractor={(item) => item.id.toString()}
+          renderItem={renderProduct}
+          ListEmptyComponent={
+            query ? (
+              <Text style={styles.empty}>
+                該当する商品が見つかりませんでした
+              </Text>
+            ) : null
+          }
+        />
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#f8f9fa" },
+  searchInput: {
+    margin: 16, padding: 14, backgroundColor: "#fff",
+    borderRadius: 12, fontSize: 16, borderWidth: 1, borderColor: "#e0e0e0",
+  },
+  card: {
+    flexDirection: "row", marginHorizontal: 16, marginBottom: 12,
+    backgroundColor: "#fff", borderRadius: 12, overflow: "hidden",
+    shadowColor: "#000", shadowOpacity: 0.05, shadowRadius: 8,
+    elevation: 2,
+  },
+  image: { width: 100, height: 100 },
+  info: { flex: 1, padding: 12 },
+  name: { fontSize: 16, fontWeight: "600", marginBottom: 4 },
+  description: { fontSize: 13, color: "#666", marginBottom: 8 },
+  meta: { flexDirection: "row", justifyContent: "space-between" },
+  price: { fontSize: 15, fontWeight: "700", color: "#1a73e8" },
+  similarity: { fontSize: 12, color: "#888", alignSelf: "center" },
+  loader: { marginTop: 40 },
+  empty: { textAlign: "center", color: "#999", marginTop: 40, fontSize: 15 },
+});
+```
+
+## AI レコメンデーションエンジンの構築
+
+セマンティック検索を応用し、ユーザーの閲覧履歴に基づくパーソナライズドレコメンデーションを実装します。
+
+### ハイブリッドスコアリングの設計
+
+単純なベクトル類似度だけでなく、ユーザーの行動データを組み合わせたハイブリッドスコアリングが効果的です。
+
+```sql
+-- ユーザー閲覧履歴テーブル
+create table user_views (
+  id bigserial primary key,
+  user_id uuid references auth.users(id),
+  product_id bigint references products(id),
+  viewed_at timestamptz default now()
+);
+
+-- ユーザーの閲覧傾向ベクトルを計算する関数
+-- 直近20件の閲覧商品ベクトルの平均を「ユーザー嗜好ベクトル」とする
+create or replace function get_user_preference_vector(p_user_id uuid)
+returns vector(1536)
+language plpgsql
+as $$
+declare
+  pref_vector vector(1536);
+begin
+  select avg(p.embedding)::vector(1536) into pref_vector
+  from user_views uv
+  join products p on p.id = uv.product_id
+  where uv.user_id = p_user_id
+    and p.embedding is not null
+  order by uv.viewed_at desc
+  limit 20;
+
+  return pref_vector;
+end;
+$$;
+
+-- ハイブリッドレコメンデーション関数
+-- ベクトル類似度 70% + 人気度 20% + 新着度 10% のスコアで順位付け
+create or replace function recommend_products(
+  p_user_id uuid,
+  p_limit int default 10
+)
+returns table (
+  id bigint,
+  name text,
+  description text,
+  category text,
+  price numeric,
+  image_url text,
+  score float
+)
+language plpgsql
+as $$
+declare
+  user_vector vector(1536);
+begin
+  user_vector := get_user_preference_vector(p_user_id);
+
+  if user_vector is null then
+    -- 閲覧履歴がない場合は人気商品を返す
+    return query
+    select p.id, p.name, p.description, p.category,
+           p.price, p.image_url, 0.5::float as score
+    from products p
+    order by p.created_at desc
+    limit p_limit;
+    return;
+  end if;
+
+  return query
+  select
+    p.id, p.name, p.description, p.category,
+    p.price, p.image_url,
+    (
+      -- ベクトル類似度（70%）
+      0.7 * (1 - (p.embedding <=> user_vector))
+      -- 人気度：閲覧数の対数スケール（20%）
+      + 0.2 * least(log(2 + coalesce(vc.view_count, 0)) / 5, 1)
+      -- 新着度：7日以内は加点（10%）
+      + 0.1 * case
+          when p.created_at > now() - interval '7 days' then 1
+          when p.created_at > now() - interval '30 days' then 0.5
+          else 0
+        end
+    ) as score
+  from products p
+  left join (
+    select product_id, count(*) as view_count
+    from user_views
+    group by product_id
+  ) vc on vc.product_id = p.id
+  where p.embedding is not null
+    -- 既に閲覧した商品は除外
+    and p.id not in (
+      select product_id from user_views where user_id = p_user_id
+    )
+  order by score desc
+  limit p_limit;
+end;
+$$;
+```
+
+### Rork アプリのレコメンデーション画面
+
+```typescript
+// app/recommendations.tsx — パーソナライズドレコメンデーション
+import React, { useEffect, useState } from "react";
+import { View, FlatList, Text, StyleSheet, RefreshControl } from "react-native";
+import { supabase } from "@/lib/supabase";
+import { ProductCard } from "@/components/ProductCard";
+
+interface RecommendedProduct {
+  id: number;
+  name: string;
+  description: string;
+  category: string;
+  price: number;
+  image_url: string | null;
+  score: number;
+}
+
+export default function RecommendationsScreen() {
+  const [products, setProducts] = useState<RecommendedProduct[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const fetchRecommendations = async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+
+    const { data, error } = await supabase.rpc("recommend_products", {
+      p_user_id: user.id,
+      p_limit: 20,
+    });
+
+    if (!error && data) {
+      setProducts(data);
+    }
+  };
+
+  useEffect(() => {
+    fetchRecommendations();
+  }, []);
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await fetchRecommendations();
+    setRefreshing(false);
+  };
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>あなたへのおすすめ</Text>
+      <FlatList
+        data={products}
+        keyExtractor={(item) => item.id.toString()}
+        renderItem={({ item }) => (
+          <ProductCard product={item} showScore />
+        )}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
+        ListEmptyComponent={
+          <Text style={styles.empty}>
+            商品を閲覧すると、あなたの好みに合ったおすすめが表示されます
+          </Text>
+        }
+      />
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#f8f9fa" },
+  title: {
+    fontSize: 22, fontWeight: "700", padding: 16, paddingBottom: 8,
+  },
+  empty: {
+    textAlign: "center", color: "#999", marginTop: 60,
+    fontSize: 15, paddingHorizontal: 32,
+  },
+});
+```
+
+## パフォーマンス最適化
+
+### インデックス戦略
+
+pgvector には 2 種類の近似最近傍探索インデックスがあります。
+
+**IVFFlat** は、ベクトルをクラスタに分割して検索範囲を絞り込むアルゴリズムです。データ量が 10 万〜100 万件の範囲で高速に動作し、`lists` パラメータでクラスタ数を調整します。目安はデータ件数の平方根です。
+
+**HNSW（Hierarchical Navigable Small World）** は、グラフ構造を使った探索アルゴリズムで、IVFFlat より高い精度を実現しますが、インデックス構築に時間がかかります。100 万件以上のデータには HNSW が推奨されます。
+
+```sql
+-- HNSW インデックス（大規模データ向け）
+-- m: グラフの接続数（大きいほど精度が上がるがメモリ消費が増える）
+-- ef_construction: インデックス構築時の探索幅
+create index on products
+  using hnsw (embedding vector_cosine_ops)
+  with (m = 16, ef_construction = 64);
+```
+
+### エッジキャッシュの活用
+
+頻繁に検索されるクエリにはキャッシュが有効です。Supabase Edge Function にキャッシュレイヤーを追加する設計も検討してください。AI バックエンドのキャッシュ戦略については [Rork Max × Cloudflare Workers AI バックエンド完全ガイド](/articles/rork-dev/rork-cloudflare-ai-backend) が参考になります。
+
+```typescript
+// キャッシュキーの生成（クエリの正規化）
+function generateCacheKey(query: string): string {
+  return query.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+// Edge Function 内でのキャッシュ例（Supabase のテーブルを利用）
+async function getCachedResult(cacheKey: string) {
+  const { data } = await supabase
+    .from("search_cache")
+    .select("results, cached_at")
+    .eq("cache_key", cacheKey)
+    .single();
+
+  if (data) {
+    const age = Date.now() - new Date(data.cached_at).getTime();
+    // 1時間以内のキャッシュを返す
+    if (age < 3600000) return data.results;
+  }
+  return null;
+}
+```
+
+### Embedding の次元削減
+
+OpenAI の `text-embedding-3-small` は 1536 次元ですが、`dimensions` パラメータで次元数を削減できます。512 次元でも多くのユースケースで十分な精度が得られ、ストレージとクエリ速度が大幅に改善します。
+
+```typescript
+// 512次元に削減（ストレージ約 67% 削減）
+const embeddingResponse = await fetch(
+  "https://api.openai.com/v1/embeddings",
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: query,
+      dimensions: 512,  // デフォルトは 1536
+    }),
+  }
+);
+// 期待する出力: 512次元の浮動小数点数配列
+```
+
+次元を変更する場合は、テーブル定義とインデックスも合わせて変更が必要です。
+
+## よくあるエラーと対処法
+
+### pgvector の型エラー
+
+`ERROR: column "embedding" is of type vector but expression is of type text` が出る場合は、ベクトルデータが文字列として送信されています。Supabase JavaScript クライアントでは、配列を直接渡せば自動で `vector` 型にキャストされます。
+
+### Edge Function のタイムアウト
+
+OpenAI API の応答が遅い場合、Edge Function がタイムアウトすることがあります。バッチ処理では、1 回の呼び出しで処理する件数を 50 件以内に抑え、必要に応じて複数回呼び出す設計にしてください。
+
+### インデックスの再構築
+
+データを大量に追加・削除した後は、IVFFlat インデックスの精度が低下する場合があります。定期的に `REINDEX INDEX` を実行してください。
+
+```sql
+-- インデックスの再構築
+reindex index products_embedding_idx;
+```
+
+## FAQ
+
+### Q: pgvector は Supabase の無料プランで使えますか？
+
+はい、Supabase の Free プランでも pgvector 拡張は利用可能です。ただし、データベースサイズの制限（500 MB）があるため、大量のベクトルデータを扱う場合は Pro プラン以上を検討してください。1536 次元のベクトル 1 件あたり約 6 KB のストレージを消費するため、1 万件で約 60 MB です。
+
+### Q: OpenAI 以外の Embedding モデルは使えますか？
+
+はい。Cohere の `embed-multilingual-v3.0`、Google の `text-embedding-004`、オープンソースの `all-MiniLM-L6-v2` など、任意の Embedding モデルが使えます。モデルによって次元数が異なるため、テーブル定義の `vector(N)` を合わせて変更してください。多言語対応が必要なアプリでは Cohere のモデルが特に効果的です。
+
+### Q: セマンティック検索と全文検索を併用できますか？
+
+できます。pgvector のセマンティック検索と PostgreSQL の `tsvector` 全文検索を組み合わせたハイブリッド検索は、精度と再現率の両方を高める効果的なアプローチです。セマンティック検索で意味的に近い結果を取得し、全文検索でキーワード完全一致の結果を補完する設計が推奨されます。
+
+### Q: ベクトル化のコストはどのくらいですか？
+
+OpenAI の `text-embedding-3-small` は 100 万トークンあたり $0.02 と非常に安価です。平均的な商品説明（100 トークン程度）であれば、1 万件のベクトル化で約 $0.002（約 0.3 円）です。検索クエリのベクトル化も同じ料金体系で、実用上のコストはほぼ無視できる水準です。
+
+## まとめ
+
+この記事では、Supabase pgvector を使ったセマンティック検索の基盤構築から、ユーザー行動データを組み合わせたハイブリッドレコメンデーションエンジンの実装まで解説しました。
+
+キーポイントは 3 つです。まず、pgvector の IVFFlat / HNSW インデックスを適切に選択すること。次に、Edge Function でベクトル化パイプラインを構築し、Rork アプリからシームレスに呼び出すこと。そして、コサイン類似度だけでなく人気度・新着度を組み合わせたハイブリッドスコアリングで、レコメンデーションの品質を引き上げることです。
+
+Claude API との連携でさらに高度な AI 機能を追加したい場合は [Rork × Claude API で作る AI アシスタントアプリ](/articles/rork-ai/rork-claude-api-ai-assistant-app) も参考にしてください。
+
+本記事のテーマをさらに深めたい方には「[ベクトル検索の基礎と応用 — 大規模データの類似検索アルゴリズム](https://www.amazon.co.jp/dp/4297141078/?tag=pinocchio-22)」（著者: 笛田 薫 著）がおすすめです。
