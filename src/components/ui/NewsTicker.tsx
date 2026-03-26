@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MARKET — AI ノーコード市場が急拡大：$29B（2026年）→ $264B（2032年）の成長予測（3/26）",
-    "NEWLY — 競合 Newly が $2M 調達＆参入するも、Rork Max のネイティブ Swift 路線は唯一無二（3/24）",
+    "APPLE — Apple が Gemini からオンデバイス AI 蒸留へ：Core ML 活用の SwiftUI アプリに追い風（3/26）",
+    "MARKET — AI アプリ開発コストが40%削減、小規模チームでもエンタープライズ品質が実現可能に（3/26）",
+    "NEWLY — 競合 Newly が $2M 調達で参入するも、Rork Max のネイティブ Swift 路線は唯一無二（3/24）",
     "ARR — Rork Max が3日で $1.5M ARR 達成：ネイティブ Swift 開発の圧倒的需要を実証（3/24）",
-    "FUND — Rork が a16z (Andreessen Horowitz) から $2.8M プレシード資金調達に成功（3/22）",
-    "APPLE — Apple が iOS 26.4 で Gemini AI 連携を拡大、モバイル AI 開発の新時代へ（3/25）",
-    "GROWTH — Rork 月間訪問数74万超え、成長率85%でノーコード AI アプリビルダー市場をリード（3/18）",
+    "FUND — Rork が a16z から $2.8M プレシード調達、ノーコード AI アプリ開発の未来に投資（3/22）",
+    "GROWTH — Rork 月間訪問数 74 万超え、成長率 85% で AI アプリビルダー市場をリード中（3/18）",
   ],
   en: [
-    "MARKET — AI no-code market surging: projected growth from $29B (2026) to $264B by 2032 (3/26)",
+    "APPLE — Apple to distill on-device AI from Gemini: a tailwind for Core ML & SwiftUI apps (3/26)",
+    "MARKET — AI cuts app development costs by 40%, enabling small teams to build enterprise quality (3/26)",
     "NEWLY — Competitor Newly raises $2M, but Rork Max's native Swift approach remains unmatched (3/24)",
-    "ARR — Rork Max hits $1.5M ARR in just 3 days, proving massive demand for native Swift (3/24)",
-    "FUND — Rork secures $2.8M pre-seed from a16z (Andreessen Horowitz) (3/22)",
-    "APPLE — Apple expands Gemini AI integration in iOS 26.4, opening new era for mobile AI dev (3/25)",
-    "GROWTH — Rork surpasses 743K monthly visits with 85% growth, leading no-code AI app builder market (3/18)",
+    "ARR — Rork Max hits $1.5M ARR in just 3 days, proving massive demand for native Swift dev (3/24)",
+    "FUND — Rork secures $2.8M pre-seed from a16z, investing in the future of no-code AI apps (3/22)",
+    "GROWTH — Rork surpasses 743K monthly visits with 85% growth rate, leading AI app builder market (3/18)",
   ],
 };
 
