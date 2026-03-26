@@ -113,24 +113,27 @@ const CONTENT: Record<string, {
   },
 };
 
+const STRIPE_TIP: Record<string, { priceId: string }> = {
+  ja: { priceId: STRIPE_PRICE_IDS.ja.tip },
+  en: { priceId: STRIPE_PRICE_IDS.en.tip },
+};
+
+const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; price: string }; premium: { priceId: string; label: string; price: string } }> = {
+  ja: {
+    pro: { priceId: STRIPE_PRICE_IDS.ja.pro, label: "Pro — 月額プラン", price: PRICES.ja.pro },
+    premium: { priceId: STRIPE_PRICE_IDS.ja.premium, label: "Premium — 永久アクセス", price: PRICES.ja.premium },
+  },
+  en: {
+    pro: { priceId: STRIPE_PRICE_IDS.en.pro, label: "Pro — Monthly", price: PRICES.en.pro },
+    premium: { priceId: STRIPE_PRICE_IDS.en.premium, label: "Premium — Lifetime", price: PRICES.en.premium },
+  },
+};
+
 export default async function SupportPage({ params }: Props) {
   const { locale } = await params;
   const c = CONTENT[locale] || CONTENT.en;
-  const plans = {
-    ja: {
-      pro: { priceId: STRIPE_PRICE_IDS.ja.pro, label: "Pro — 月額プラン", price: PRICES.ja.pro },
-      premium: { priceId: STRIPE_PRICE_IDS.ja.premium, label: "Premium — 永久アクセス", price: PRICES.ja.premium },
-    },
-    en: {
-      pro: { priceId: STRIPE_PRICE_IDS.en.pro, label: "Pro — Monthly", price: PRICES.en.pro },
-      premium: { priceId: STRIPE_PRICE_IDS.en.premium, label: "Premium — Lifetime", price: PRICES.en.premium },
-    },
-  };
-  const stripeTip = {
-    ja: { priceId: STRIPE_PRICE_IDS.ja.tip },
-    en: { priceId: STRIPE_PRICE_IDS.en.tip },
-  };
+  const plans = STRIPE_PLANS[locale] || STRIPE_PLANS.en;
   const premiumAccess = await getPremiumAccess();
 
-  return <SupportClient content={c} locale={locale} stripeTip={stripeTip[locale] || stripeTip.en} plans={plans[locale] || plans.en} premiumAccess={premiumAccess} />;
+  return <SupportClient content={c} locale={locale} stripeTip={STRIPE_TIP[locale] || STRIPE_TIP.en} plans={plans} premiumAccess={premiumAccess} />;
 }
