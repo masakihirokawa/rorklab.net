@@ -32,6 +32,7 @@ export interface ArticleMeta {
   description: string;
   tags: string[];
   premium?: boolean;
+  highlights?: string[];
 }
 
 export interface Article {
