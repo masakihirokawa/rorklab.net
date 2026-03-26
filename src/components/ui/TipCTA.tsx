@@ -1,20 +1,16 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { getPriceIds, PRICES } from "@/config/pricing";
 
 interface TipCTAProps {
   locale: string;
 }
 
-const STRIPE_TIP: Record<string, string> = {
-  ja: "price_1TCQyPEGB5g6A54ofaB9e5to", // ¥150 JPY
-  en: "price_1TCQyXEGB5g6A54oVQirhunP", // $1.50 USD
-};
-
 const CONTENT = {
   ja: {
     message:
-      "この記事がお役に立ちましたら、チップ（¥150）で応援いただけると今後の執筆の励みになります。",
+      `この記事がお役に立ちましたら、チップ（${PRICES.ja.tip}）で応援いただけると今後の執筆の励みになります。`,
     link: "チップで応援する →",
     sending: "決済ページへ移動中...",
     error: "エラーが発生しました。もう一度お試しください。",
@@ -23,7 +19,7 @@ const CONTENT = {
   },
   en: {
     message:
-      "If you found this article helpful, a small tip ($1.50) would really encourage us to keep writing.",
+      `If you found this article helpful, a small tip (${PRICES.en.tip}) would really encourage us to keep writing.`,
     link: "Leave a Tip →",
     sending: "Redirecting to checkout...",
     error: "Something went wrong. Please try again.",
@@ -42,6 +38,7 @@ export function TipCTA({ locale }: TipCTAProps) {
     const params = new URLSearchParams(window.location.search);
     if (params.get("thanks") === "tip") {
       setShowThanks(true);
+      // Clean up URL without reload
       const url = new URL(window.location.href);
       url.searchParams.delete("thanks");
       window.history.replaceState({}, "", url.toString());
@@ -52,7 +49,7 @@ export function TipCTA({ locale }: TipCTAProps) {
     setLoading(true);
     setError("");
     try {
-      const priceId = STRIPE_TIP[locale] || STRIPE_TIP.en;
+      const priceId = getPriceIds(locale).tip;
       const currentUrl = window.location.href;
       const res = await fetch("/api/checkout", {
         method: "POST",

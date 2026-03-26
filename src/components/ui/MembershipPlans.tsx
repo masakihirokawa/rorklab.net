@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { PRICES } from "@/config/pricing";
 
 interface StripeConfig {
   pro: { priceId: string };
@@ -16,10 +17,10 @@ interface MembershipPlansProps {
 const TEXT = {
   ja: {
     pro: "Pro プラン",
-    proPrice: "¥380/月",
+    proPrice: PRICES.ja.pro,
     proDesc: "月額制で全プレミアム記事にアクセス",
     premium: "Premium プラン",
-    premiumPrice: "¥1,480",
+    premiumPrice: PRICES.ja.premium,
     premiumDesc: "一括払いで永久アクセス",
     recommended: "おすすめ",
     cta: "メンバーシップに登録する →",
@@ -28,10 +29,10 @@ const TEXT = {
   },
   en: {
     pro: "Pro Plan",
-    proPrice: "$3/mo",
+    proPrice: PRICES.en.pro,
     proDesc: "Monthly access to all premium articles",
     premium: "Premium Plan",
-    premiumPrice: "$10",
+    premiumPrice: PRICES.en.premium,
     premiumDesc: "One-time payment for lifetime access",
     recommended: "RECOMMENDED",
     cta: "Join Membership →",

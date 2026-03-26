@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { localePrefix } from "@/lib/locale";
+import { PRICES } from "@/config/pricing";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -140,9 +141,9 @@ export default async function TokushoPage({ params }: Props) {
               <a href={`${prefix}/about`} style={LINK}>運営者について</a>
             </Row>
             <Row label="販売価格">
-              Tip（応援）: ¥150（税込）<br />
-              Pro メンバーシップ（月額）: ¥380（税込）<br />
-              Premium メンバーシップ（永久アクセス）: ¥1,480（税込）
+              Tip（応援）: {PRICES.ja.tip}（税込）<br />
+              Pro メンバーシップ（月額）: {PRICES.ja.pro.replace("/月", "")}（税込）<br />
+              Premium メンバーシップ（永久アクセス）: {PRICES.ja.premium}（税込）
             </Row>
             <Row label="販売価格以外の必要料金">
               インターネット接続料金、通信料金等はお客様のご負担となります。
@@ -196,9 +197,9 @@ export default async function TokushoPage({ params }: Props) {
               <a href={`${prefix}/about`} style={LINK}>About page</a>
             </Row>
             <Row label="Pricing">
-              Tip: $1.50 (incl. tax)<br />
-              Pro Membership (monthly): $3.00 (incl. tax)<br />
-              Premium Membership (lifetime): $10.00 (incl. tax)
+              Tip: {PRICES.en.tip} (incl. tax)<br />
+              Pro Membership (monthly): {PRICES.en.pro.replace("/mo", "")}.00 (incl. tax)<br />
+              Premium Membership (lifetime): {PRICES.en.premium}.00 (incl. tax)
             </Row>
             <Row label="Additional Costs">
               Internet connection fees and data charges are borne by the customer.

@@ -1,22 +1,12 @@
 "use client";
 
 import { useState } from "react";
+import { getPriceIds, getLabels } from "@/config/pricing";
 
 interface PremiumPaywallProps {
   locale: string;
   highlights?: string[];
 }
-
-const PLANS: Record<string, { pro: { priceId: string; label: string }; premium: { priceId: string; label: string } }> = {
-  ja: {
-    pro: { priceId: "price_1TCQyjEGB5g6A54opYFArVOk", label: "Pro — ¥380/月" },
-    premium: { priceId: "price_1TCQyxEGB5g6A54oh8U6RHec", label: "Premium — ¥1,480（おすすめ）" },
-  },
-  en: {
-    pro: { priceId: "price_1TCQylEGB5g6A54oNYYQAjPX", label: "Pro — $3/mo" },
-    premium: { priceId: "price_1TCQyyEGB5g6A54oUojdhfBa", label: "Premium — $10 (Recommended)" },
-  },
-};
 
 const RESTORE_TEXT: Record<string, {
   sectionLabel: string;
@@ -65,7 +55,8 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
   const [restoreEmail, setRestoreEmail] = useState("");
   const [restoreLoading, setRestoreLoading] = useState(false);
   const [restoreResult, setRestoreResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  const plans = PLANS[locale] || PLANS.en;
+  const priceIds = getPriceIds(locale);
+  const labels = getLabels(locale);
   const rt = RESTORE_TEXT[locale] || RESTORE_TEXT.en;
 
   const handleRestore = async () => {
@@ -178,7 +169,7 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
 
         {/* Premium — primary CTA */}
         <button
-          onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
+          onClick={() => handleCheckout(priceIds.premium, "payment", "premium")}
           disabled={!!loading}
           style={{
             display: "block",
@@ -210,12 +201,12 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
         >
           {loading === "premium"
             ? locale === "ja" ? "処理中..." : "Loading..."
-            : plans.premium.label}
+            : labels.premiumButton}
         </button>
 
         {/* Pro — secondary */}
         <button
-          onClick={() => handleCheckout(plans.pro.priceId, "subscription", "pro")}
+          onClick={() => handleCheckout(priceIds.pro, "subscription", "pro")}
           disabled={!!loading}
           style={{
             display: "block",
@@ -246,7 +237,7 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
         >
           {loading === "pro"
             ? locale === "ja" ? "処理中..." : "Loading..."
-            : plans.pro.label}
+            : labels.proButton}
         </button>
 
         <div

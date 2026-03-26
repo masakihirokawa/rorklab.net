@@ -1,5 +1,6 @@
 import { localePrefix } from "@/lib/locale";
 import type { ArticleMeta } from "@/lib/content";
+import { PLAN_LABELS } from "@/config/pricing";
 
 interface MembershipCTAProps {
   locale: string;
@@ -14,7 +15,7 @@ const CONTENT = {
     features: [
       "コピー&ペーストで使える実装コード付き",
       "毎週新しい上級ガイドを追加",
-      "¥380/月 または ¥1,480 の永久アクセス",
+      PLAN_LABELS.ja.proFeature,
     ],
     link: "Premium 記事を見る →",
   },
@@ -25,7 +26,7 @@ const CONTENT = {
     features: [
       "Copy-paste ready implementation code",
       "New advanced guides published every week",
-      "$3/mo or $10 for lifetime access",
+      PLAN_LABELS.en.proFeature,
     ],
     link: "View Premium Articles →",
   },

@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { MembershipPlans } from "@/components/ui/MembershipPlans";
+import { PRICES, STRIPE_PRICE_IDS } from "@/config/pricing";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -11,12 +12,12 @@ const META = {
   ja: {
     title: "メンバーシップ",
     description:
-      "Rork Lab メンバーシップで、プレミアム限定の上級ガイドやチュートリアルにアクセス。Pro プラン（¥380/月）と Premium プラン（¥1,480 永久アクセス）をご用意しています。",
+      `Rork Lab メンバーシップで、プレミアム限定の上級ガイドやチュートリアルにアクセス。Pro プラン（${PRICES.ja.pro.replace("/月", "")}/月）と Premium プラン（${PRICES.ja.premium} 永久アクセス）をご用意しています。`,
   },
   en: {
     title: "Membership",
     description:
-      "Access exclusive premium guides and advanced tutorials with Rork Lab Membership. Choose from Pro ($3/mo) or Premium ($10 lifetime).",
+      `Access exclusive premium guides and advanced tutorials with Rork Lab Membership. Choose from Pro (${PRICES.en.pro.replace("/mo", "")}/mo) or Premium (${PRICES.en.premium} lifetime).`,
   },
 };
 
@@ -64,10 +65,10 @@ const PAGE_TEXT = {
       "本番環境で使える設計パターン・ベストプラクティス",
     ],
     pro: "Pro プラン",
-    proPrice: "¥380/月",
+    proPrice: `${PRICES.ja.pro}`,
     proDesc: "月額制で全プレミアム記事にアクセス",
     premium: "Premium プラン",
-    premiumPrice: "¥1,480",
+    premiumPrice: `${PRICES.ja.premium}`,
     premiumDesc: "一括払いで永久アクセス",
     recommended: "おすすめ",
     cta: "メンバーシップに登録する →",
@@ -85,13 +86,13 @@ const PAGE_TEXT = {
     features: [
       "Unlimited access to all premium articles",
       "New advanced guides with code published every week",
-      "Production-ready design patterns \& best practices",
+      "Production-ready design patterns & best practices",
     ],
     pro: "Pro Plan",
-    proPrice: "$3/mo",
+    proPrice: `${PRICES.en.pro}`,
     proDesc: "Monthly access to all premium articles",
     premium: "Premium Plan",
-    premiumPrice: "$10",
+    premiumPrice: `${PRICES.en.premium}`,
     premiumDesc: "One-time payment for lifetime access",
     recommended: "RECOMMENDED",
     cta: "Join Membership →",
@@ -156,8 +157,8 @@ export default async function MembershipPage({ params }: Props) {
         <MembershipPlans
           locale={locale}
           stripeConfig={{
-            pro: { priceId: locale === "ja" ? "price_1TCQyjEGB5g6A54opYFArVOk" : "price_1TCQylEGB5g6A54oNYYQAjPX" },
-            premium: { priceId: locale === "ja" ? "price_1TCQyxEGB5g6A54oh8U6RHec" : "price_1TCQyyEGB5g6A54oUojdhfBa" },
+            pro: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].pro },
+            premium: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].premium },
           }}
         />
       </section>
