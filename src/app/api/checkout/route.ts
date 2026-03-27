@@ -80,6 +80,7 @@ export async function POST(request: NextRequest) {
                 product_data: {
                   name: PRODUCT_NAMES[planType]?.[locale]?.name || PRODUCT_NAMES[planType]?.en?.name || planName,
                   description: PRODUCT_NAMES[planType]?.[locale]?.description || PRODUCT_NAMES[planType]?.en?.description || "",
+                  images: [`${baseUrl}/images/stripe-product.png`],
                 },
                 unit_amount: PRICE_CONFIG[priceId].amount,
                 ...(PRICE_CONFIG[priceId].recurring && { recurring: PRICE_CONFIG[priceId].recurring }),
