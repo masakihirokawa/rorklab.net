@@ -322,6 +322,8 @@ export function SupportClient({
               {CAMPAIGN.enabled && (
                 <div style={{
                   display: "inline-block",
+                  alignSelf: "center",
+                  width: "fit-content",
                   marginBottom: 10,
                   padding: "3px 10px 2px",
                   borderRadius: 4,

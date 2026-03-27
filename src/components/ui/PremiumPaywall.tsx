@@ -172,7 +172,8 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
         {campaign.enabled && (
           <div style={{
             display: "inline-block",
-            marginBottom: 12,
+            width: "fit-content",
+            margin: "0 auto 12px",
             padding: "3px 10px 2px",
             borderRadius: 4,
             background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
