@@ -302,6 +302,8 @@ export default async function ArticlePage({ params }: Props) {
       <ShareButtons
         title={article.meta.title}
         url={`https://rorklab.net${prefix}/articles/${category}/${slug}`}
+        tags={article.meta.tags}
+        siteName="RorkLab"
       />
 
       {/* Membership CTA — shown only for non-members on free articles */}

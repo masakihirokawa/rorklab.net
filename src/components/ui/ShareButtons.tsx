@@ -6,6 +6,8 @@ import { useLocale } from "next-intl";
 interface ShareButtonsProps {
   title: string;
   url: string;
+  tags?: string[];
+  siteName?: string;
 }
 
 const XIcon = () => (
@@ -39,14 +41,32 @@ const CheckIcon = () => (
   </svg>
 );
 
-export function ShareButtons({ title, url }: ShareButtonsProps) {
+function formatHashtag(tag: string): string {
+  return "#" + tag
+    .split(/[-\s]+/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join("");
+}
+
+export function ShareButtons({ title, url, tags = [], siteName = "" }: ShareButtonsProps) {
   const locale = useLocale();
   const [copied, setCopied] = useState(false);
   const isJa = locale === "ja";
 
+  const buildCopyText = () => {
+    const lines = [title, url];
+    const hashtags: string[] = [];
+    if (siteName) hashtags.push("#" + siteName.replace(/\s+/g, ""));
+    tags.forEach((tag) => hashtags.push(formatHashtag(tag)));
+    if (hashtags.length > 0) {
+      lines.push("", hashtags.join(" "));
+    }
+    return lines.join("\n");
+  };
+
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(url);
+      await navigator.clipboard.writeText(buildCopyText());
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
@@ -135,8 +155,8 @@ export function ShareButtons({ title, url }: ShareButtonsProps) {
       {/* Copy link */}
       <button
         onClick={handleCopy}
-        aria-label={isJa ? (copied ? "コピー済み" : "URLをコピー") : (copied ? "Copied!" : "Copy link")}
-        title={isJa ? (copied ? "コピー済み" : "URLをコピー") : (copied ? "Copied!" : "Copy link")}
+        aria-label={isJa ? (copied ? "コピー済み" : "記事情報をコピー") : (copied ? "Copied!" : "Copy to share")}
+        title={isJa ? (copied ? "コピー済み" : "記事情報をコピー") : (copied ? "Copied!" : "Copy to share")}
         style={{
           display: "inline-flex",
           alignItems: "center",
