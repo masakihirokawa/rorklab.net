@@ -114,7 +114,7 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
         >
           <span style={{
             position: "absolute" as const, top: -9, right: 12,
-            fontSize: 9, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em",
+            fontSize: 9, fontFamily: "'DM Mono', monospace", letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
             padding: "3px 8px 1px", borderRadius: 4,
             background: CAMPAIGN.enabled ? "linear-gradient(135deg, #b8860b, #daa520, #f0c040)" : accent,
             color: CAMPAIGN.enabled ? "#fff" : "var(--bg-primary)",

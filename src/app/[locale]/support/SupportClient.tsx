@@ -331,7 +331,7 @@ export function SupportClient({
                   fontSize: 10,
                   fontFamily: "'DM Mono', monospace",
                   fontWeight: 700,
-                  letterSpacing: "0.1em",
+                  letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
                   color: "#fff",
                 }}>
                   {CAMPAIGN.name[locale as "ja" | "en"] || CAMPAIGN.name.en}
