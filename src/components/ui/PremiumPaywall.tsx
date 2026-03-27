@@ -231,7 +231,7 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
                   <span style={{ textDecoration: "line-through", opacity: 0.5, fontWeight: 400, marginRight: 6 }}>
                     {campaign.originalPrice}
                   </span>
-                  {labels.premiumButton}
+                  {`Premium — ${campaign.price}`}
                 </>
               : labels.premiumButton}
         </button>
