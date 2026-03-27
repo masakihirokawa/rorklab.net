@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { MembershipPlans } from "@/components/ui/MembershipPlans";
-import { PRICES, STRIPE_PRICE_IDS } from "@/config/pricing";
+import { PRICES, STRIPE_PRICE_IDS, CAMPAIGN } from "@/config/pricing";
 import { getPremiumAccess } from "@/lib/premium";
 
 interface Props {
@@ -171,7 +171,9 @@ export default async function MembershipPage({ params }: Props) {
               locale={locale}
               stripeConfig={{
                 pro: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].pro },
-                premium: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].premium },
+                premium: { priceId: CAMPAIGN.enabled
+                  ? (locale === "ja" ? CAMPAIGN.priceIds.ja : CAMPAIGN.priceIds.en)
+                  : (locale === "ja" ? STRIPE_PRICE_IDS.ja.premium : STRIPE_PRICE_IDS.en.premium) },
               }}
             />
           </>
