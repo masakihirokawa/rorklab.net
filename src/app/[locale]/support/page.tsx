@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { SupportClient } from "./SupportClient";
 import { getPremiumAccess } from "@/lib/premium";
-import { STRIPE_PRICE_IDS, PRICES } from "@/config/pricing";
+import { STRIPE_PRICE_IDS, PRICES, CAMPAIGN, getPriceIds } from "@/config/pricing";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -118,14 +118,24 @@ const STRIPE_TIP: Record<string, { priceId: string }> = {
   en: { priceId: STRIPE_PRICE_IDS.en.tip },
 };
 
-const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; price: string }; premium: { priceId: string; label: string; price: string } }> = {
+const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; price: string }; premium: { priceId: string; label: string; price: string; originalPrice?: string } }> = {
   ja: {
     pro: { priceId: STRIPE_PRICE_IDS.ja.pro, label: "Pro — 月額プラン", price: PRICES.ja.pro },
-    premium: { priceId: STRIPE_PRICE_IDS.ja.premium, label: "Premium — 永久アクセス", price: PRICES.ja.premium },
+    premium: {
+      priceId: CAMPAIGN.enabled ? CAMPAIGN.priceIds.ja : STRIPE_PRICE_IDS.ja.premium,
+      label: CAMPAIGN.enabled ? `永久アクセス — ${CAMPAIGN.prices.ja}（${CAMPAIGN.name.ja}）` : "Premium — 永久アクセス",
+      price: CAMPAIGN.enabled ? CAMPAIGN.prices.ja : PRICES.ja.premium,
+      ...(CAMPAIGN.enabled && { originalPrice: PRICES.ja.premium }),
+    },
   },
   en: {
     pro: { priceId: STRIPE_PRICE_IDS.en.pro, label: "Pro — Monthly", price: PRICES.en.pro },
-    premium: { priceId: STRIPE_PRICE_IDS.en.premium, label: "Premium — Lifetime", price: PRICES.en.premium },
+    premium: {
+      priceId: CAMPAIGN.enabled ? CAMPAIGN.priceIds.en : STRIPE_PRICE_IDS.en.premium,
+      label: CAMPAIGN.enabled ? `Lifetime Access — ${CAMPAIGN.prices.en} (${CAMPAIGN.name.en})` : "Premium — Lifetime",
+      price: CAMPAIGN.enabled ? CAMPAIGN.prices.en : PRICES.en.premium,
+      ...(CAMPAIGN.enabled && { originalPrice: PRICES.en.premium }),
+    },
   },
 };
 

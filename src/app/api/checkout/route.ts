@@ -13,10 +13,12 @@ const PLAN_NAMES: Record<string, string> = {
   "price_1TCQyPEGB5g6A54ofaB9e5to": "Rork Lab チップ（¥150）",
   "price_1TCQyjEGB5g6A54opYFArVOk": "Rork Lab Pro（月額プラン）",
   "price_1TCQyxEGB5g6A54oh8U6RHec": "Rork Lab Premium（永久アクセス）",
+  "price_1TFRyLEGB5g6A54oCoY0I3Dc": "Rork Lab Premium（感謝価格 ¥980）",
   // EN
   "price_1TCQyXEGB5g6A54oVQirhunP": "Rork Lab Tip ($1.50)",
   "price_1TCQylEGB5g6A54oNYYQAjPX": "Rork Lab Pro (Monthly)",
   "price_1TCQyyEGB5g6A54oUojdhfBa": "Rork Lab Premium (Lifetime)",
+  "price_1TFRyLEGB5g6A54opRFYkqzY": "Rork Lab Premium (Thank You Price $7)",
 };
 
 // Tip price IDs — these should NOT grant premium access

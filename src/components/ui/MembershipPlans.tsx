@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { PRICES } from "@/config/pricing";
+import { PRICES, CAMPAIGN } from "@/config/pricing";
 
 interface StripeConfig {
   pro: { priceId: string };
@@ -20,9 +20,10 @@ const TEXT = {
     proPrice: PRICES.ja.pro,
     proDesc: "月額制で全プレミアム記事にアクセス",
     premium: "Premium プラン",
-    premiumPrice: PRICES.ja.premium,
+    premiumPrice: CAMPAIGN.enabled ? CAMPAIGN.prices.ja : PRICES.ja.premium,
+    premiumOriginalPrice: CAMPAIGN.enabled ? PRICES.ja.premium : null,
     premiumDesc: "一括払いで永久アクセス",
-    recommended: "おすすめ",
+    recommended: CAMPAIGN.enabled ? CAMPAIGN.name.ja : "おすすめ",
     cta: "メンバーシップに登録する →",
     processing: "処理中…",
     error: "エラーが発生しました。もう一度お試しください。",
@@ -32,9 +33,10 @@ const TEXT = {
     proPrice: PRICES.en.pro,
     proDesc: "Monthly access to all premium articles",
     premium: "Premium Plan",
-    premiumPrice: PRICES.en.premium,
+    premiumPrice: CAMPAIGN.enabled ? CAMPAIGN.prices.en : PRICES.en.premium,
+    premiumOriginalPrice: CAMPAIGN.enabled ? PRICES.en.premium : null,
     premiumDesc: "One-time payment for lifetime access",
-    recommended: "RECOMMENDED",
+    recommended: CAMPAIGN.enabled ? CAMPAIGN.name.en : "RECOMMENDED",
     cta: "Join Membership →",
     processing: "Processing…",
     error: "An error occurred. Please try again.",
@@ -114,7 +116,8 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
             position: "absolute" as const, top: -9, right: 12,
             fontSize: 9, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em",
             padding: "3px 8px 1px", borderRadius: 4,
-            background: accent, color: "var(--bg-primary)",
+            background: CAMPAIGN.enabled ? "linear-gradient(135deg, #b8860b, #daa520, #f0c040)" : accent,
+            color: CAMPAIGN.enabled ? "#fff" : "var(--bg-primary)",
             fontWeight: 700,
           }}>
             {t.recommended}
@@ -122,8 +125,24 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
           <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>
             {t.premium}
           </div>
-          <div style={{ fontSize: 22, fontWeight: 300, color: accent, marginBottom: 4 }}>
-            {t.premiumPrice}
+          <div style={{ fontSize: 22, fontWeight: 300, marginBottom: 4, display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+            {t.premiumOriginalPrice && (
+              <span style={{
+                fontSize: 15,
+                color: "var(--text-dim)",
+                textDecoration: "line-through",
+                textDecorationColor: "var(--text-faint)",
+                fontWeight: 400,
+              }}>
+                {t.premiumOriginalPrice}
+              </span>
+            )}
+            <span style={{
+              color: CAMPAIGN.enabled ? "#daa520" : accent,
+              fontWeight: CAMPAIGN.enabled ? 600 : 300,
+            }}>
+              {t.premiumPrice}
+            </span>
           </div>
           <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
             {loading === "premium" ? t.processing : t.premiumDesc}

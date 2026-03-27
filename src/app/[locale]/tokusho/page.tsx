@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { localePrefix } from "@/lib/locale";
-import { PRICES } from "@/config/pricing";
+import { PRICES, CAMPAIGN } from "@/config/pricing";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -143,7 +143,11 @@ export default async function TokushoPage({ params }: Props) {
             <Row label="販売価格">
               Tip（応援）: {PRICES.ja.tip}（税込）<br />
               Pro メンバーシップ（月額）: {PRICES.ja.pro.replace("/月", "")}（税込）<br />
-              Premium メンバーシップ（永久アクセス）: {PRICES.ja.premium}（税込）
+              Premium メンバーシップ（永久アクセス）: {CAMPAIGN.enabled ? (
+                <>{CAMPAIGN.prices.ja}（税込・{CAMPAIGN.name.ja}）<span style={{ fontSize: 12, color: "var(--text-faint)" }}>（通常価格 {PRICES.ja.premium}）</span></>
+              ) : (
+                <>{PRICES.ja.premium}（税込）</>
+              )}
             </Row>
             <Row label="販売価格以外の必要料金">
               インターネット接続料金、通信料金等はお客様のご負担となります。
@@ -199,7 +203,11 @@ export default async function TokushoPage({ params }: Props) {
             <Row label="Pricing">
               Tip: {PRICES.en.tip} (incl. tax)<br />
               Pro Membership (monthly): {PRICES.en.pro.replace("/mo", "")}.00 (incl. tax)<br />
-              Premium Membership (lifetime): {PRICES.en.premium}.00 (incl. tax)
+              Premium Membership (lifetime): {CAMPAIGN.enabled ? (
+                <>{CAMPAIGN.prices.en} (incl. tax · {CAMPAIGN.name.en})<span style={{ fontSize: 12, color: "var(--text-faint)" }}> (Regular price {PRICES.en.premium}.00)</span></>
+              ) : (
+                <>{PRICES.en.premium}.00 (incl. tax)</>
+              )}
             </Row>
             <Row label="Additional Costs">
               Internet connection fees and data charges are borne by the customer.
