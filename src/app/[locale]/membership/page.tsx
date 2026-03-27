@@ -3,6 +3,7 @@ import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { MembershipPlans } from "@/components/ui/MembershipPlans";
 import { PRICES, STRIPE_PRICE_IDS } from "@/config/pricing";
+import { getPremiumAccess } from "@/lib/premium";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -76,6 +77,7 @@ const PAGE_TEXT = {
     premiumCount: (n: number) => `${n} 本の限定記事`,
     noArticles: "プレミアム記事は準備中です。",
     locked: "PREMIUM",
+    thankYou: (plan: string) => `いつもご利用いただきありがとうございます。${plan} メンバーとして、すべてのプレミアム記事をお楽しみいただけます。`,
   },
   en: {
     badge: "PREMIUM",
@@ -100,6 +102,7 @@ const PAGE_TEXT = {
     premiumCount: (n: number) => `${n} exclusive article${n !== 1 ? "s" : ""}`,
     noArticles: "Premium articles coming soon.",
     locked: "PREMIUM",
+    thankYou: (plan: string) => `Thank you for being a valued ${plan} member. You have full access to all premium articles.`,
   },
 };
 
@@ -107,6 +110,8 @@ export default async function MembershipPage({ params }: Props) {
   const { locale } = await params;
   const t = PAGE_TEXT[locale as keyof typeof PAGE_TEXT] || PAGE_TEXT.en;
   const prefix = locale === "ja" ? "" : `/${locale}`;
+
+  const premiumAccess = await getPremiumAccess();
 
   const allArticles = getArticles(locale);
   const premiumArticles = allArticles.filter((a) => a.premium);
@@ -144,23 +149,33 @@ export default async function MembershipPage({ params }: Props) {
           {t.description}
         </p>
 
-        <ul style={{ listStyle: "none", padding: 0, margin: "0 0 32px 0", display: "flex", flexDirection: "column", gap: 8 }}>
-          {t.features.map((f) => (
-            <li key={f} style={{ fontSize: 13, color: "var(--text-muted)", paddingLeft: 20, position: "relative" }}>
-              <span style={{ position: "absolute", left: 0, color: "var(--accent-coral)" }}>✦</span>
-              {f}
-            </li>
-          ))}
-        </ul>
+        {premiumAccess ? (
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <p style={{ fontSize: 15, color: "var(--text-primary)", lineHeight: 1.7 }}>
+              {t.thankYou(premiumAccess === "pro" ? "Pro" : "Premium")}
+            </p>
+          </div>
+        ) : (
+          <>
+            <ul style={{ listStyle: "none", padding: 0, margin: "0 0 32px 0", display: "flex", flexDirection: "column", gap: 8 }}>
+              {t.features.map((f) => (
+                <li key={f} style={{ fontSize: 13, color: "var(--text-muted)", paddingLeft: 20, position: "relative" }}>
+                  <span style={{ position: "absolute", left: 0, color: "var(--accent-coral)" }}>✦</span>
+                  {f}
+                </li>
+              ))}
+            </ul>
 
-        {/* Plans + CTA (Client Component with Stripe Checkout) */}
-        <MembershipPlans
-          locale={locale}
-          stripeConfig={{
-            pro: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].pro },
-            premium: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].premium },
-          }}
-        />
+            {/* Plans + CTA (Client Component with Stripe Checkout) */}
+            <MembershipPlans
+              locale={locale}
+              stripeConfig={{
+                pro: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].pro },
+                premium: { priceId: STRIPE_PRICE_IDS[locale as keyof typeof STRIPE_PRICE_IDS].premium },
+              }}
+            />
+          </>
+        )}
       </section>
 
       {/* Premium Articles Section */}
