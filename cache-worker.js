@@ -10,7 +10,7 @@
 import nextHandler from "./.open-next/worker";
 
 // ── Config ──────────────────────────────────────────────────────
-const DEPLOY_VERSION = "2026-03-25-v2";
+const DEPLOY_VERSION = "2026-03-27-campaign";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 // ── __name polyfill (Turbopack / esbuild compat) ────────────────
@@ -34,10 +34,6 @@ function shouldSkipCache(url, request) {
   if (p.startsWith("/api/") || p === "/feed.xml" || p.startsWith("/_next/")) return true;
   if (p.includes(".") && !p.endsWith("/")) return true;
   if (request.headers.get("rsc")) return true;
-  // Skip cache for authenticated users — personalized content (MembershipCTA etc.)
-  // must not be served from edge cache. Only non-authenticated responses are cached.
-  const cookie = request.headers.get("cookie") || "";
-  if (cookie.includes("premium_token")) return true;
   return false;
 }
 
