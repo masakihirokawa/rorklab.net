@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
+import { STRIPE_PRICE_IDS, CAMPAIGN } from "@/config/pricing";
 
 function getStripe() {
   return new Stripe(process.env.STRIPE_SECRET_KEY!, {
@@ -27,6 +28,27 @@ const TIP_PRICE_IDS = new Set([
   "price_1TCQyXEGB5g6A54oVQirhunP", // $1.50 USD
 ]);
 
+// ── Locale-aware product names for Stripe Checkout ─────────────
+const PRODUCT_NAMES: Record<string, Record<string, string>> = {
+  tip: { ja: "Rork Lab チップ", en: "Rork Lab Tip" },
+  pro: { ja: "Rork Lab Pro（月額プラン）", en: "Rork Lab Pro (Monthly)" },
+  premium: { ja: "Rork Lab プレミアム（永久アクセス）", en: "Rork Lab Premium (Lifetime)" },
+};
+
+// Map priceId → { amount, currency, recurring? } for price_data
+const PRICE_CONFIG: Record<string, { amount: number; currency: string; recurring?: { interval: "month" } }> = {
+  [STRIPE_PRICE_IDS.ja.tip]: { amount: 150, currency: "jpy" },
+  [STRIPE_PRICE_IDS.ja.pro]: { amount: 380, currency: "jpy", recurring: { interval: "month" } },
+  [STRIPE_PRICE_IDS.ja.premium]: { amount: 1480, currency: "jpy" },
+  [STRIPE_PRICE_IDS.en.tip]: { amount: 150, currency: "usd" },
+  [STRIPE_PRICE_IDS.en.pro]: { amount: 300, currency: "usd", recurring: { interval: "month" } },
+  [STRIPE_PRICE_IDS.en.premium]: { amount: 1000, currency: "usd" },
+  ...(CAMPAIGN.enabled ? {
+    [CAMPAIGN.priceIds.ja]: { amount: 980, currency: "jpy" },
+    [CAMPAIGN.priceIds.en]: { amount: 700, currency: "usd" },
+  } : {}),
+};
+
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
@@ -42,10 +64,19 @@ export async function POST(request: NextRequest) {
     const session = await stripe.checkout.sessions.create({
       mode: mode || "payment",
       line_items: [
-        {
-          price: priceId || process.env.STRIPE_TIP_PRICE_ID!,
-          quantity: 1,
-        },
+        PRICE_CONFIG[priceId]
+          ? {
+              price_data: {
+                currency: PRICE_CONFIG[priceId].currency,
+                product_data: {
+                  name: PRODUCT_NAMES[planType]?.[locale] || PRODUCT_NAMES[planType]?.en || planName,
+                },
+                unit_amount: PRICE_CONFIG[priceId].amount,
+                ...(PRICE_CONFIG[priceId].recurring && { recurring: PRICE_CONFIG[priceId].recurring }),
+              },
+              quantity: 1,
+            }
+          : { price: priceId, quantity: 1 },
       ],
       metadata: { plan_type: planType, ...(returnUrl && { return_url: returnUrl }) },
       // Pro（月額）のみ初月無料トライアルを付与
