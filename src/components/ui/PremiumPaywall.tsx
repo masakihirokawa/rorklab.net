@@ -168,25 +168,6 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
           </div>
         )}
 
-        {/* Campaign badge */}
-        {campaign.enabled && (
-          <div style={{
-            display: "inline-block",
-            width: "fit-content",
-            margin: "0 auto 12px",
-            padding: "3px 10px 2px",
-            borderRadius: 4,
-            background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
-            fontSize: 10,
-            fontFamily: "'DM Mono', monospace",
-            fontWeight: 700,
-            letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
-            color: "#fff",
-          }}>
-            {campaign.name}
-          </div>
-        )}
-
         {/* Premium — primary CTA */}
         <button
           onClick={() => handleCheckout(priceIds.premium, "payment", "premium")}
@@ -211,6 +192,8 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
             opacity: loading === "premium" ? 0.7 : 1,
             transition: "all 0.25s",
             letterSpacing: "-0.01em",
+            position: "relative" as const,
+            overflow: "visible",
           }}
           onMouseEnter={(e) => {
             if (!loading) {
@@ -225,6 +208,25 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
             e.currentTarget.style.transform = "translateY(0)";
           }}
         >
+          {campaign.enabled && (
+            <span style={{
+              position: "absolute" as const,
+              top: -10,
+              left: "50%",
+              transform: "translateX(-50%)",
+              padding: "3px 10px 2px",
+              borderRadius: 4,
+              background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
+              fontSize: 10,
+              fontFamily: "'DM Mono', monospace",
+              fontWeight: 700,
+              letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
+              color: "#fff",
+              whiteSpace: "nowrap" as const,
+            }}>
+              {campaign.name}
+            </span>
+          )}
           {loading === "premium"
             ? locale === "ja" ? "処理中..." : "Loading..."
             : campaign.enabled

@@ -318,25 +318,6 @@ export function SupportClient({
               ))}
             </ul>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {/* Campaign badge */}
-              {CAMPAIGN.enabled && (
-                <div style={{
-                  display: "inline-block",
-                  alignSelf: "center",
-                  width: "fit-content",
-                  marginBottom: 10,
-                  padding: "3px 10px 2px",
-                  borderRadius: 4,
-                  background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
-                  fontSize: 10,
-                  fontFamily: "'DM Mono', monospace",
-                  fontWeight: 700,
-                  letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
-                  color: "#fff",
-                }}>
-                  {CAMPAIGN.name[locale as "ja" | "en"] || CAMPAIGN.name.en}
-                </div>
-              )}
               {/* Premium — primary CTA */}
               <button
                 onClick={() => handleCheckout(plans.premium.priceId, "payment", "premium")}
@@ -358,6 +339,8 @@ export function SupportClient({
                   opacity: loading ? 0.7 : 1,
                   transition: "all 0.25s",
                   letterSpacing: "-0.01em",
+                  position: "relative" as const,
+                  overflow: "visible",
                 }}
                 onMouseEnter={(e) => {
                   if (!loading) {
@@ -372,6 +355,25 @@ export function SupportClient({
                   e.currentTarget.style.transform = "translateY(0)";
                 }}
               >
+                {CAMPAIGN.enabled && (
+                  <span style={{
+                    position: "absolute" as const,
+                    top: -10,
+                    left: "50%",
+                    transform: "translateX(-50%)",
+                    padding: "3px 10px 2px",
+                    borderRadius: 4,
+                    background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
+                    fontSize: 10,
+                    fontFamily: "'DM Mono', monospace",
+                    fontWeight: 700,
+                    letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
+                    color: "#fff",
+                    whiteSpace: "nowrap" as const,
+                  }}>
+                    {CAMPAIGN.name[locale as "ja" | "en"] || CAMPAIGN.name.en}
+                  </span>
+                )}
                 {loading === "premium" ? "..." : (
                   CAMPAIGN.enabled && plans.premium.originalPrice ? (
                     <>
