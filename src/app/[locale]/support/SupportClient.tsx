@@ -358,12 +358,12 @@ export function SupportClient({
                 {CAMPAIGN.enabled && (
                   <span style={{
                     position: "absolute" as const,
-                    top: -9,
+                    top: -10,
                     right: 12,
-                    padding: "3px 8px 1px",
+                    padding: "3px 9px 1px",
                     borderRadius: 4,
                     background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
-                    fontSize: 9,
+                    fontSize: 10,
                     fontFamily: "'DM Mono', monospace",
                     fontWeight: 700,
                     letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
