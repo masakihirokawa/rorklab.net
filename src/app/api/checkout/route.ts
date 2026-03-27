@@ -29,10 +29,19 @@ const TIP_PRICE_IDS = new Set([
 ]);
 
 // ── Locale-aware product names for Stripe Checkout ─────────────
-const PRODUCT_NAMES: Record<string, Record<string, string>> = {
-  tip: { ja: "Rork Lab チップ", en: "Rork Lab Tip" },
-  pro: { ja: "Rork Lab Pro（月額プラン）", en: "Rork Lab Pro (Monthly)" },
-  premium: { ja: "Rork Lab プレミアム（永久アクセス）", en: "Rork Lab Premium (Lifetime)" },
+const PRODUCT_NAMES: Record<string, Record<string, { name: string; description: string }>> = {
+  tip: {
+    ja: { name: "Rork Lab チップ", description: "運営へのサポート。ありがとうございます！" },
+    en: { name: "Rork Lab Tip", description: "Support for site operations. Thank you!" },
+  },
+  pro: {
+    ja: { name: "Rork Lab Pro（月額プラン）", description: "月額制で全プレミアム記事にアクセス。いつでもキャンセル可能。" },
+    en: { name: "Rork Lab Pro (Monthly)", description: "Monthly access to all premium articles. Cancel anytime." },
+  },
+  premium: {
+    ja: { name: "Rork Lab プレミアム（永久アクセス）", description: "一括払いで全プレミアム記事に永久アクセス。実装コード付きの上級ガイドが読み放題。" },
+    en: { name: "Rork Lab Premium (Lifetime)", description: "One-time payment for lifetime access to all premium articles with production-ready code." },
+  },
 };
 
 // Map priceId → { amount, currency, recurring? } for price_data
@@ -69,7 +78,8 @@ export async function POST(request: NextRequest) {
               price_data: {
                 currency: PRICE_CONFIG[priceId].currency,
                 product_data: {
-                  name: PRODUCT_NAMES[planType]?.[locale] || PRODUCT_NAMES[planType]?.en || planName,
+                  name: PRODUCT_NAMES[planType]?.[locale]?.name || PRODUCT_NAMES[planType]?.en?.name || planName,
+                  description: PRODUCT_NAMES[planType]?.[locale]?.description || PRODUCT_NAMES[planType]?.en?.description || "",
                 },
                 unit_amount: PRICE_CONFIG[priceId].amount,
                 ...(PRICE_CONFIG[priceId].recurring && { recurring: PRICE_CONFIG[priceId].recurring }),

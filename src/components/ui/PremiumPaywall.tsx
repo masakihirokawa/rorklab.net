@@ -211,13 +211,12 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
           {campaign.enabled && (
             <span style={{
               position: "absolute" as const,
-              top: -10,
-              left: "50%",
-              transform: "translateX(-50%)",
-              padding: "3px 10px 2px",
+              top: -9,
+              right: 12,
+              padding: "3px 8px 1px",
               borderRadius: 4,
               background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
-              fontSize: 10,
+              fontSize: 9,
               fontFamily: "'DM Mono', monospace",
               fontWeight: 700,
               letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
