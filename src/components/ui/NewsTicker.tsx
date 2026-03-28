@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MARKET — AI アプリビルダー市場が $264B（2032 年予測）へ成長、Rork Max が先行者優位を拡大（3/28）",
-    "APPLE — Apple × Gemini AI 提携で Core ML 強化：SwiftUI ネイティブの Rork Max に大きな追い風（3/26）",
-    "COST — AI 活用でアプリ開発コスト 40% 削減＆バグ率 20% 低下、小規模チームの品質革命（3/26）",
-    "COMPANION — Rork Companion でリアルタイム実機テスト＆QR インストールが好評（3/25）",
-    "ARR — Rork Max が 3 日で $1.5M ARR 達成：ネイティブ Swift 2 クリック公開の需要を実証（3/24）",
-    "FUND — Rork が a16z から $2.8M 調達、ノーコード AI × ネイティブアプリの新時代を牽引（3/22）",
+    "LOWCODE — Gartner：2026 年はローコードが新規開発の 75% を占める、Rork の追い風さらに強まる（3/29）",
+    "COST — AI アプリビルダーで開発コスト最大 80% 削減、スタートアップの参入障壁が劇的に低下（3/28）",
+    "$264B — AI アプリビルダー市場が 2032 年に $264B 規模へ成長予測、Rork Max が先行者優位を拡大（3/28）",
+    "APPLE — iOS 26.4 で Apple × Gemini AI 統合が本格化、SwiftUI ネイティブの Rork Max に好機（3/26）",
+    "TOP4 — 2026 年の AI モバイルアプリビルダー TOP 4 に Rork が選出、ネイティブ生成で差別化（3/27）",
+    "ARR — Rork Max が 3 日で $1.5M ARR を達成、ノーコード × ネイティブの需要を証明（3/24）",
   ],
   en: [
-    "MARKET — AI app builder market projected to hit $264B by 2032, Rork Max extends first-mover edge (3/28)",
-    "APPLE — Apple-Gemini AI deal strengthens Core ML: major tailwind for Rork Max's SwiftUI approach (3/26)",
-    "COST — AI cuts app dev costs 40% & bugs 20%, enabling small teams to ship enterprise quality (3/26)",
-    "COMPANION — Rork Companion gains traction with real-time on-device testing & QR install (3/25)",
-    "ARR — Rork Max hits $1.5M ARR in 3 days, proving massive demand for native Swift 2-click publish (3/24)",
-    "FUND — Rork secures $2.8M from a16z, leading the no-code AI × native app revolution (3/22)",
+    "LOWCODE — Gartner: low-code to account for 75% of new apps in 2026, strengthening Rork's tailwind (3/29)",
+    "COST — AI app builders slash dev costs up to 80%, dramatically lowering barriers for startups (3/28)",
+    "$264B — AI app builder market projected to reach $264B by 2032, Rork Max extends first-mover lead (3/28)",
+    "APPLE — iOS 26.4 deepens Apple-Gemini AI integration, creating opportunity for Rork Max's SwiftUI (3/26)",
+    "TOP4 — Rork named among top 4 AI mobile app builders for 2026, differentiated by native generation (3/27)",
+    "ARR — Rork Max hits $1.5M ARR in 3 days, proving massive demand for no-code native apps (3/24)",
   ],
 };
 
