@@ -1,0 +1,898 @@
+---
+title: "Rork アプリのプッシュ通知マスタープラン — セグメント配信・A/Bテスト・自動化パイプラインの実装ガイド"
+slug: "rork-push-notification-advanced-segmentation-automation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-03-29T05:00"
+updated: "2026-03-29T05:00"
+author: "Rork Lab"
+description: "Rork アプリにおけるプッシュ通知の上級実装ガイド。ユーザーセグメント配信、A/Bテスト、自動化パイプライン、リテンション向上戦略まで体系的に解説します。"
+tags: ["Rork", "プッシュ通知", "セグメント配信", "A/Bテスト", "Firebase Cloud Messaging", "Expo Notifications", "リテンション", "自動化"]
+highlights:
+  - "ユーザー属性・行動データに基づくセグメント配信の設計と実装パターンを習得できる"
+  - "通知文面・配信タイミングのA/Bテスト基盤を自前で構築する方法を理解できる"
+  - "Supabase Edge Functions を活用した通知自動化パイプラインの本番運用設計を学べる"
+---
+
+## はじめに — なぜ「送るだけ」の通知では足りないのか
+
+プッシュ通知はモバイルアプリのリテンション施策として最も強力なチャネルです。しかし、全ユーザーに同じメッセージを一斉送信するだけでは、通知疲れによるオプトアウト率の上昇を招き、逆効果になりかねません。
+
+実際に App Store や Google Play のトップアプリを分析すると、ほぼすべてがユーザーの行動履歴や属性に基づいた**セグメント配信**を行い、通知文面や配信タイミングを**A/Bテスト**で最適化しています。さらに、これらを手動で運用するのではなく、イベントドリブンな**自動化パイプライン**で回しているのが特徴です。
+
+この記事では、Rork（React Native / Expo）アプリにおいて、プッシュ通知をプロダクションレベルで運用するための設計パターンと実装手法を体系的に解説します。基本的なプッシュ通知の実装経験がある方（[プッシュ通知の基本実装ガイド](/articles/rork-dev/rork-push-notifications) を読了済みの方）を対象としています。
+
+## セグメント配信の設計 — ユーザーを「理解して」届ける
+
+### セグメントの種類と設計原則
+
+効果的なセグメント配信を行うには、まずユーザーをどのような軸で分類するかを設計する必要があります。実務で使われる代表的なセグメント軸は以下の通りです。
+
+**属性ベースセグメント**: ユーザー登録時の情報（言語、地域、プラン種別、登録日）に基づく分類です。最もシンプルですが、パーソナライズの精度は限定的です。
+
+**行動ベースセグメント**: アプリ内のアクション（最終利用日、利用頻度、特定機能の使用回数、課金履歴）に基づく分類です。ユーザーの「今の状態」を反映するため、精度の高い通知配信が可能になります。
+
+**ライフサイクルセグメント**: ユーザーの利用段階（新規・アクティブ・休眠・離脱リスク・復帰）に基づく分類です。段階に応じて最適なメッセージを送り分けることで、リテンション率を大幅に改善できます。
+
+### Supabase でセグメント管理テーブルを設計する
+
+セグメント情報を管理するためのデータベース設計を見てみましょう。Supabase（PostgreSQL）を使った実装例です。
+
+```sql
+-- ユーザーセグメント管理テーブル
+CREATE TABLE user_segments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+  -- 属性セグメント
+  locale TEXT DEFAULT 'ja',
+  plan_type TEXT DEFAULT 'free', -- free / pro / premium
+  registered_at TIMESTAMPTZ NOT NULL,
+  -- 行動セグメント
+  last_active_at TIMESTAMPTZ,
+  session_count INTEGER DEFAULT 0,
+  feature_usage JSONB DEFAULT '{}',
+  -- ライフサイクルセグメント（自動計算）
+  lifecycle_stage TEXT GENERATED ALWAYS AS (
+    CASE
+      WHEN last_active_at IS NULL THEN 'new'
+      WHEN last_active_at > NOW() - INTERVAL '3 days' THEN 'active'
+      WHEN last_active_at > NOW() - INTERVAL '14 days' THEN 'inactive'
+      WHEN last_active_at > NOW() - INTERVAL '30 days' THEN 'at_risk'
+      ELSE 'churned'
+    END
+  ) STORED,
+  -- 通知設定
+  push_token TEXT,
+  push_enabled BOOLEAN DEFAULT true,
+  quiet_hours_start TIME DEFAULT '22:00',
+  quiet_hours_end TIME DEFAULT '08:00',
+  timezone TEXT DEFAULT 'Asia/Tokyo',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- セグメントクエリ用インデックス
+CREATE INDEX idx_segments_lifecycle ON user_segments(lifecycle_stage);
+CREATE INDEX idx_segments_plan ON user_segments(plan_type);
+CREATE INDEX idx_segments_push ON user_segments(push_enabled) WHERE push_token IS NOT NULL;
+```
+
+ポイントは `lifecycle_stage` カラムです。PostgreSQL の `GENERATED ALWAYS AS ... STORED` を使うことで、`last_active_at` が更新されるたびにライフサイクルステージが自動的に再計算されます。アプリケーション側でのロジック管理が不要になり、常に最新の状態を参照できます。
+
+### Rork アプリ側でのセグメントデータ更新
+
+ユーザーの行動データをリアルタイムでセグメントテーブルに反映するフックを実装します。
+
+```typescript
+// hooks/useSegmentTracker.ts
+import { useEffect, useCallback } from 'react';
+import { AppState, AppStateStatus } from 'react-native';
+import { supabase } from '@/lib/supabase';
+import { useAuth } from '@/hooks/useAuth';
+
+export function useSegmentTracker() {
+  const { user } = useAuth();
+
+  // アプリがフォアグラウンドに復帰したときにセッションを記録
+  useEffect(() => {
+    if (!user) return;
+
+    const subscription = AppState.addEventListener(
+      'change',
+      (nextState: AppStateStatus) => {
+        if (nextState === 'active') {
+          updateActivity(user.id);
+        }
+      }
+    );
+
+    // 初回マウント時にも記録
+    updateActivity(user.id);
+
+    return () => subscription.remove();
+  }, [user]);
+
+  const updateActivity = useCallback(async (userId: string) => {
+    const { error } = await supabase
+      .from('user_segments')
+      .upsert(
+        {
+          user_id: userId,
+          last_active_at: new Date().toISOString(),
+          session_count: supabase.rpc('increment_session_count', {
+            target_user_id: userId,
+          }),
+        },
+        { onConflict: 'user_id' }
+      );
+
+    if (error) {
+      console.warn('Segment update failed:', error.message);
+    }
+  }, []);
+
+  // 特定機能の利用を記録するヘルパー
+  const trackFeatureUsage = useCallback(
+    async (featureName: string) => {
+      if (!user) return;
+
+      const { data: current } = await supabase
+        .from('user_segments')
+        .select('feature_usage')
+        .eq('user_id', user.id)
+        .single();
+
+      const usage = (current?.feature_usage as Record<string, number>) || {};
+      usage[featureName] = (usage[featureName] || 0) + 1;
+
+      await supabase
+        .from('user_segments')
+        .update({ feature_usage: usage })
+        .eq('user_id', user.id);
+    },
+    [user]
+  );
+
+  return { trackFeatureUsage };
+}
+```
+
+このフックをアプリのルートレイアウトで呼び出すことで、ユーザーのセッション情報が自動的に記録されます。`trackFeatureUsage` は特定の画面やアクションで個別に呼び出し、機能ごとの利用回数を蓄積します。
+
+## セグメント別通知配信サービスの構築
+
+### 配信ロジックの設計
+
+セグメントデータが蓄積されたら、それを活用して通知を配信するサービスを構築します。Supabase Edge Functions を使ったサーバーサイドの実装例です。
+
+```typescript
+// supabase/functions/send-segmented-push/index.ts
+import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+interface NotificationPayload {
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}
+
+interface SegmentFilter {
+  lifecycle_stages?: string[];
+  plan_types?: string[];
+  locales?: string[];
+  min_session_count?: number;
+  feature_used?: string;
+}
+
+serve(async (req: Request) => {
+  const { segment_filter, notification, respect_quiet_hours = true } =
+    await req.json() as {
+      segment_filter: SegmentFilter;
+      notification: NotificationPayload;
+      respect_quiet_hours?: boolean;
+    };
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+
+  // セグメントに該当するユーザーを取得
+  let query = supabase
+    .from('user_segments')
+    .select('user_id, push_token, timezone, quiet_hours_start, quiet_hours_end, locale')
+    .eq('push_enabled', true)
+    .not('push_token', 'is', null);
+
+  if (segment_filter.lifecycle_stages?.length) {
+    query = query.in('lifecycle_stage', segment_filter.lifecycle_stages);
+  }
+  if (segment_filter.plan_types?.length) {
+    query = query.in('plan_type', segment_filter.plan_types);
+  }
+  if (segment_filter.locales?.length) {
+    query = query.in('locale', segment_filter.locales);
+  }
+  if (segment_filter.min_session_count) {
+    query = query.gte('session_count', segment_filter.min_session_count);
+  }
+
+  const { data: users, error } = await query;
+
+  if (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+    });
+  }
+
+  // クワイエットアワーのフィルタリング
+  const eligibleUsers = respect_quiet_hours
+    ? users.filter((u) => !isInQuietHours(u))
+    : users;
+
+  // Expo Push API でバッチ送信
+  const tokens = eligibleUsers.map((u) => u.push_token);
+  const result = await sendExpoPushBatch(tokens, notification);
+
+  // 配信ログを記録
+  await supabase.from('notification_logs').insert({
+    segment_filter,
+    notification,
+    total_targeted: users.length,
+    total_sent: eligibleUsers.length,
+    expo_response: result,
+    sent_at: new Date().toISOString(),
+  });
+
+  return new Response(
+    JSON.stringify({
+      targeted: users.length,
+      sent: eligibleUsers.length,
+      skipped_quiet_hours: users.length - eligibleUsers.length,
+    }),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+});
+
+function isInQuietHours(user: {
+  timezone: string;
+  quiet_hours_start: string;
+  quiet_hours_end: string;
+}): boolean {
+  // ユーザーのタイムゾーンで現在時刻を取得
+  const now = new Date();
+  const userTime = new Date(
+    now.toLocaleString('en-US', { timeZone: user.timezone })
+  );
+  const hours = userTime.getHours();
+  const minutes = userTime.getMinutes();
+  const currentMinutes = hours * 60 + minutes;
+
+  const [startH, startM] = user.quiet_hours_start.split(':').map(Number);
+  const [endH, endM] = user.quiet_hours_end.split(':').map(Number);
+  const startMinutes = startH * 60 + startM;
+  const endMinutes = endH * 60 + endM;
+
+  // 日をまたぐ場合の処理（例: 22:00〜08:00）
+  if (startMinutes > endMinutes) {
+    return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+  }
+  return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+}
+
+async function sendExpoPushBatch(
+  tokens: string[],
+  notification: NotificationPayload
+): Promise<unknown> {
+  // Expo Push API は1リクエスト100件まで
+  const BATCH_SIZE = 100;
+  const results = [];
+
+  for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
+    const batch = tokens.slice(i, i + BATCH_SIZE);
+    const messages = batch.map((token) => ({
+      to: token,
+      sound: 'default',
+      title: notification.title,
+      body: notification.body,
+      data: notification.data || {},
+    }));
+
+    const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(messages),
+    });
+
+    results.push(await response.json());
+  }
+
+  return results;
+}
+```
+
+このEdge Functionは、セグメントフィルタを受け取り、該当するユーザーのプッシュトークンを取得し、クワイエットアワーを考慮した上でExpo Push APIにバッチ送信します。配信結果は `notification_logs` テーブルに自動的に記録されます。
+
+## A/Bテスト基盤の実装 — データで通知を最適化する
+
+### テスト設計テーブル
+
+通知のA/Bテストを体系的に行うためのデータ構造を設計します。
+
+```sql
+-- A/Bテストキャンペーン管理
+CREATE TABLE notification_ab_tests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  status TEXT DEFAULT 'draft', -- draft / running / completed
+  segment_filter JSONB NOT NULL,
+  -- バリアント定義（最大4つ）
+  variants JSONB NOT NULL,
+  -- 例: [
+  --   { "id": "A", "weight": 50, "title": "新機能を試そう", "body": "..." },
+  --   { "id": "B", "weight": 50, "title": "アプリが進化しました", "body": "..." }
+  -- ]
+  -- 成果指標
+  winning_metric TEXT DEFAULT 'open_rate', -- open_rate / click_rate / conversion_rate
+  confidence_level NUMERIC DEFAULT 0.95,
+  -- タイムライン
+  started_at TIMESTAMPTZ,
+  ended_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 各ユーザーへの配信記録（どのバリアントを受け取ったか）
+CREATE TABLE ab_test_assignments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  test_id UUID REFERENCES notification_ab_tests(id),
+  user_id UUID REFERENCES auth.users(id),
+  variant_id TEXT NOT NULL,
+  -- トラッキング
+  delivered_at TIMESTAMPTZ DEFAULT NOW(),
+  opened_at TIMESTAMPTZ,
+  clicked_at TIMESTAMPTZ,
+  converted_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_ab_assignments_test ON ab_test_assignments(test_id);
+CREATE INDEX idx_ab_assignments_variant ON ab_test_assignments(test_id, variant_id);
+```
+
+### バリアント分配とテスト実行
+
+```typescript
+// supabase/functions/run-ab-test/index.ts
+import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+interface Variant {
+  id: string;
+  weight: number;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}
+
+serve(async (req: Request) => {
+  const { test_id } = await req.json();
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+
+  // テスト定義を取得
+  const { data: test } = await supabase
+    .from('notification_ab_tests')
+    .select('*')
+    .eq('id', test_id)
+    .single();
+
+  if (!test || test.status !== 'draft') {
+    return new Response(JSON.stringify({ error: 'Invalid test' }), {
+      status: 400,
+    });
+  }
+
+  // 対象ユーザーを取得
+  const { data: users } = await supabase
+    .from('user_segments')
+    .select('user_id, push_token')
+    .eq('push_enabled', true)
+    .not('push_token', 'is', null);
+
+  if (!users?.length) {
+    return new Response(JSON.stringify({ error: 'No eligible users' }), {
+      status: 400,
+    });
+  }
+
+  const variants = test.variants as Variant[];
+
+  // 重み付きランダム分配
+  const assignments = users.map((user) => {
+    const variant = weightedRandomSelect(variants);
+    return {
+      test_id,
+      user_id: user.user_id,
+      variant_id: variant.id,
+      push_token: user.push_token,
+      title: variant.title,
+      body: variant.body,
+      data: variant.data,
+    };
+  });
+
+  // 分配結果を記録
+  await supabase.from('ab_test_assignments').insert(
+    assignments.map(({ test_id, user_id, variant_id }) => ({
+      test_id,
+      user_id,
+      variant_id,
+    }))
+  );
+
+  // バリアントごとにバッチ送信
+  for (const variant of variants) {
+    const variantUsers = assignments.filter(
+      (a) => a.variant_id === variant.id
+    );
+    const tokens = variantUsers.map((u) => u.push_token);
+
+    await sendExpoPushBatch(tokens, {
+      title: variant.title,
+      body: variant.body,
+      data: {
+        ...variant.data,
+        ab_test_id: test_id,
+        variant_id: variant.id,
+      },
+    });
+  }
+
+  // テストステータスを更新
+  await supabase
+    .from('notification_ab_tests')
+    .update({ status: 'running', started_at: new Date().toISOString() })
+    .eq('id', test_id);
+
+  const summary = variants.map((v) => ({
+    variant: v.id,
+    count: assignments.filter((a) => a.variant_id === v.id).length,
+  }));
+
+  return new Response(JSON.stringify({ success: true, summary }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+});
+
+function weightedRandomSelect(variants: Variant[]): Variant {
+  const totalWeight = variants.reduce((sum, v) => sum + v.weight, 0);
+  let random = Math.random() * totalWeight;
+
+  for (const variant of variants) {
+    random -= variant.weight;
+    if (random <= 0) return variant;
+  }
+
+  return variants[variants.length - 1];
+}
+```
+
+### アプリ側での開封トラッキング
+
+通知の開封率を正確に計測するため、アプリ側にトラッキングロジックを組み込みます。
+
+```typescript
+// hooks/useNotificationTracking.ts
+import { useEffect } from 'react';
+import * as Notifications from 'expo-notifications';
+import { supabase } from '@/lib/supabase';
+import { useAuth } from '@/hooks/useAuth';
+
+export function useNotificationTracking() {
+  const { user } = useAuth();
+
+  useEffect(() => {
+    if (!user) return;
+
+    // 通知を開封した（タップした）ときのリスナー
+    const responseSubscription =
+      Notifications.addNotificationResponseReceivedListener(
+        async (response) => {
+          const data = response.notification.request.content.data;
+          const abTestId = data?.ab_test_id as string | undefined;
+          const variantId = data?.variant_id as string | undefined;
+
+          if (abTestId && variantId) {
+            // A/Bテストの開封記録を更新
+            await supabase
+              .from('ab_test_assignments')
+              .update({ opened_at: new Date().toISOString() })
+              .eq('test_id', abTestId)
+              .eq('user_id', user.id)
+              .eq('variant_id', variantId);
+          }
+
+          // ディープリンク先があれば遷移（通知のclick_through）
+          const targetScreen = data?.screen as string | undefined;
+          if (targetScreen) {
+            // React Navigation や Expo Router で画面遷移
+            // router.push(targetScreen);
+          }
+        }
+      );
+
+    // 通知が配信された（フォアグラウンドで受信した）ときのリスナー
+    const receivedSubscription =
+      Notifications.addNotificationReceivedListener(async (notification) => {
+        const data = notification.request.content.data;
+        const abTestId = data?.ab_test_id as string | undefined;
+
+        if (abTestId) {
+          await supabase
+            .from('ab_test_assignments')
+            .update({ delivered_at: new Date().toISOString() })
+            .eq('test_id', abTestId)
+            .eq('user_id', user.id);
+        }
+      });
+
+    return () => {
+      responseSubscription.remove();
+      receivedSubscription.remove();
+    };
+  }, [user]);
+}
+```
+
+### テスト結果の集計と統計的有意性の判定
+
+A/Bテストの結果を集計し、どのバリアントが勝者かを統計的に判定するクエリです。
+
+```sql
+-- バリアントごとの成果指標を集計
+SELECT
+  variant_id,
+  COUNT(*) AS total_sent,
+  COUNT(opened_at) AS total_opened,
+  COUNT(clicked_at) AS total_clicked,
+  COUNT(converted_at) AS total_converted,
+  ROUND(COUNT(opened_at)::NUMERIC / COUNT(*) * 100, 2) AS open_rate,
+  ROUND(COUNT(clicked_at)::NUMERIC / NULLIF(COUNT(opened_at), 0) * 100, 2) AS click_rate
+FROM ab_test_assignments
+WHERE test_id = 'YOUR_TEST_ID'
+GROUP BY variant_id
+ORDER BY open_rate DESC;
+```
+
+統計的有意性の判定には、サンプルサイズが十分（各バリアント300件以上推奨）であることを確認した上で、Z検定を適用します。Supabase Edge Function 内で計算するか、集計結果をダッシュボードに表示して判断します。
+
+## 自動化パイプラインの設計 — イベントドリブン通知
+
+### ライフサイクル通知の自動配信
+
+ユーザーのライフサイクルステージに応じた通知を自動的に配信するパイプラインを構築します。これにより、手動運用を排除しつつ最適なタイミングでユーザーにリーチできます。
+
+```typescript
+// supabase/functions/lifecycle-notifications/index.ts
+// Supabase の pg_cron または外部 cron で定期実行する
+import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+// ライフサイクルステージごとの通知テンプレート
+const LIFECYCLE_TEMPLATES: Record<
+  string,
+  { ja: { title: string; body: string }; en: { title: string; body: string } }
+> = {
+  // 新規ユーザー（登録後24時間）
+  new_onboarding: {
+    ja: {
+      title: 'はじめの一歩を踏み出しましょう',
+      body: 'チュートリアルを完了すると、アプリの可能性が広がります。今すぐ始めてみませんか？',
+    },
+    en: {
+      title: "Let's take the first step",
+      body: 'Complete the tutorial to unlock the full potential of the app. Start now!',
+    },
+  },
+  // 非アクティブユーザー（7日間利用なし）
+  inactive_reminder: {
+    ja: {
+      title: 'お久しぶりです！新機能が追加されました',
+      body: '前回のご利用から1週間が経ちました。最新のアップデートをチェックしてみてください。',
+    },
+    en: {
+      title: "We've missed you! New features await",
+      body: "It's been a week since your last visit. Check out the latest updates!",
+    },
+  },
+  // 離脱リスクユーザー（14日間利用なし）
+  at_risk_winback: {
+    ja: {
+      title: '特別なお知らせがあります',
+      body: 'あなたのアカウントに限定オファーをご用意しました。ぜひご確認ください。',
+    },
+    en: {
+      title: 'A special offer just for you',
+      body: "We've prepared an exclusive offer for your account. Come check it out!",
+    },
+  },
+};
+
+serve(async () => {
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+
+  const results: Record<string, number> = {};
+
+  // 1. 新規ユーザーへのオンボーディング通知（登録後24時間）
+  const { data: newUsers } = await supabase
+    .from('user_segments')
+    .select('user_id, push_token, locale')
+    .eq('lifecycle_stage', 'new')
+    .eq('push_enabled', true)
+    .not('push_token', 'is', null)
+    .lt('registered_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+    .gt('registered_at', new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString());
+
+  if (newUsers?.length) {
+    await sendLocalizedBatch(newUsers, LIFECYCLE_TEMPLATES.new_onboarding);
+    results['new_onboarding'] = newUsers.length;
+  }
+
+  // 2. 非アクティブユーザーへのリマインダー（7日間）
+  const { data: inactiveUsers } = await supabase
+    .from('user_segments')
+    .select('user_id, push_token, locale')
+    .eq('lifecycle_stage', 'inactive')
+    .eq('push_enabled', true)
+    .not('push_token', 'is', null);
+
+  if (inactiveUsers?.length) {
+    await sendLocalizedBatch(
+      inactiveUsers,
+      LIFECYCLE_TEMPLATES.inactive_reminder
+    );
+    results['inactive_reminder'] = inactiveUsers.length;
+  }
+
+  // 3. 離脱リスクユーザーへのウィンバック通知
+  const { data: atRiskUsers } = await supabase
+    .from('user_segments')
+    .select('user_id, push_token, locale')
+    .eq('lifecycle_stage', 'at_risk')
+    .eq('push_enabled', true)
+    .not('push_token', 'is', null);
+
+  if (atRiskUsers?.length) {
+    await sendLocalizedBatch(
+      atRiskUsers,
+      LIFECYCLE_TEMPLATES.at_risk_winback
+    );
+    results['at_risk_winback'] = atRiskUsers.length;
+  }
+
+  return new Response(JSON.stringify({ sent: results }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+});
+
+async function sendLocalizedBatch(
+  users: Array<{ push_token: string; locale: string }>,
+  template: { ja: { title: string; body: string }; en: { title: string; body: string } }
+) {
+  const messages = users.map((u) => {
+    const localized = u.locale === 'ja' ? template.ja : template.en;
+    return {
+      to: u.push_token,
+      sound: 'default',
+      title: localized.title,
+      body: localized.body,
+    };
+  });
+
+  // 100件ずつバッチ送信
+  for (let i = 0; i < messages.length; i += 100) {
+    await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(messages.slice(i, i + 100)),
+    });
+  }
+}
+```
+
+### pg_cron によるスケジュール実行
+
+Supabase の `pg_cron` 拡張を使って、ライフサイクル通知を毎日定時に自動実行します。
+
+```sql
+-- 毎日午前10時（UTC+9 = JST）にライフサイクル通知を配信
+-- UTC 01:00 = JST 10:00
+SELECT cron.schedule(
+  'lifecycle-notifications',
+  '0 1 * * *',
+  $$
+  SELECT net.http_post(
+    url := 'https://your-project.supabase.co/functions/v1/lifecycle-notifications',
+    headers := jsonb_build_object(
+      'Authorization', 'Bearer ' || current_setting('app.supabase_service_role_key')
+    ),
+    body := '{}'
+  );
+  $$
+);
+```
+
+## リテンション向上のための通知戦略
+
+### 通知頻度の最適化
+
+通知の送りすぎはオプトアウトの最大の原因です。以下のルールをシステムに組み込むことを推奨します。
+
+**頻度制限（Rate Limiting）**: 1ユーザーあたりの通知上限を設定します。目安として、マーケティング通知は週2〜3回、トランザクション通知（決済確認など）は制限なしとします。
+
+```typescript
+// 過去7日間の通知送信数をチェックする関数
+async function checkRateLimit(
+  supabase: SupabaseClient,
+  userId: string,
+  maxPerWeek: number = 3
+): Promise<boolean> {
+  const sevenDaysAgo = new Date(
+    Date.now() - 7 * 24 * 60 * 60 * 1000
+  ).toISOString();
+
+  const { count } = await supabase
+    .from('notification_delivery_log')
+    .select('id', { count: 'exact' })
+    .eq('user_id', userId)
+    .eq('notification_type', 'marketing')
+    .gte('sent_at', sevenDaysAgo);
+
+  return (count || 0) < maxPerWeek;
+}
+```
+
+**パーソナライズされた配信タイミング**: 各ユーザーの過去の開封パターンを分析し、最も開封率の高い時間帯に配信します。
+
+```sql
+-- ユーザーごとの最適送信時間帯を算出
+SELECT
+  user_id,
+  EXTRACT(HOUR FROM opened_at AT TIME ZONE timezone) AS open_hour,
+  COUNT(*) AS open_count
+FROM ab_test_assignments a
+JOIN user_segments s ON a.user_id = s.user_id
+WHERE opened_at IS NOT NULL
+GROUP BY user_id, open_hour
+ORDER BY user_id, open_count DESC;
+```
+
+### リッチ通知でエンゲージメントを高める
+
+Expo Notifications はリッチ通知（画像付き、アクションボタン付き）に対応しています。これを活用すると、通知の開封率とクリック率を大幅に向上させられます。
+
+```typescript
+// リッチ通知の送信例
+const richNotification = {
+  to: pushToken,
+  sound: 'default',
+  title: '今週のおすすめ記事',
+  body: 'Rork Max の新機能で開発効率が2倍になった話',
+  data: {
+    screen: '/articles/rork-dev/rork-max-ai-features',
+    ab_test_id: testId,
+  },
+  // カテゴリを設定すると、通知にアクションボタンが表示される
+  categoryId: 'article_recommendation',
+};
+
+// アクションカテゴリの事前登録（アプリ初期化時に実行）
+await Notifications.setNotificationCategoryAsync('article_recommendation', [
+  {
+    identifier: 'read_now',
+    buttonTitle: '今すぐ読む',
+    options: { opensAppToForeground: true },
+  },
+  {
+    identifier: 'save_later',
+    buttonTitle: 'あとで読む',
+    options: { opensAppToForeground: false },
+  },
+]);
+```
+
+## 本番運用のモニタリングと改善サイクル
+
+### 通知ダッシュボードの主要KPI
+
+本番環境でプッシュ通知を運用する際に追跡すべき主要KPIを整理します。
+
+**配信率（Delivery Rate）**: 送信した通知のうち、実際にデバイスに到達した割合です。90%以下の場合、古い・無効なプッシュトークンが多い可能性があります。定期的にトークンをクリーンアップしましょう。
+
+**開封率（Open Rate）**: 配信された通知のうち、ユーザーがタップして開いた割合です。業界平均は5〜15%程度です。20%以上を目標にセグメンテーションとA/Bテストを繰り返します。
+
+**オプトアウト率（Opt-out Rate）**: 通知を無効化したユーザーの割合です。月間2%以上であれば、通知頻度や内容を見直す必要があります。
+
+**コンバージョン率（Conversion Rate）**: 通知経由でアプリを開いたユーザーのうち、目標アクション（課金・機能利用等）を達成した割合です。
+
+### 無効トークンのクリーンアップ
+
+Expo Push API のレシート機能を使って、配信に失敗したトークンを定期的に削除します。
+
+```typescript
+// supabase/functions/cleanup-push-tokens/index.ts
+// 毎日深夜に実行して無効トークンを削除する
+async function cleanupInvalidTokens(supabase: SupabaseClient) {
+  // 過去24時間の配信レシートを確認
+  const receiptIds = await getRecentReceiptIds();
+
+  const response = await fetch(
+    'https://exp.host/--/api/v2/push/getReceipts',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: receiptIds }),
+    }
+  );
+
+  const { data: receipts } = await response.json();
+
+  const invalidTokens: string[] = [];
+
+  for (const [, receipt] of Object.entries(receipts)) {
+    const r = receipt as { status: string; details?: { error?: string }; expoPushToken?: string };
+    if (
+      r.status === 'error' &&
+      r.details?.error === 'DeviceNotRegistered'
+    ) {
+      if (r.expoPushToken) {
+        invalidTokens.push(r.expoPushToken);
+      }
+    }
+  }
+
+  if (invalidTokens.length > 0) {
+    // 無効なトークンをクリア
+    await supabase
+      .from('user_segments')
+      .update({ push_token: null, push_enabled: false })
+      .in('push_token', invalidTokens);
+
+    console.log(`Cleaned up ${invalidTokens.length} invalid push tokens`);
+  }
+}
+```
+
+## よくある質問（FAQ）
+
+### Q1: Firebase Cloud Messaging（FCM）と Expo Push Notifications はどちらを使うべきですか？
+
+Rork（Expo）環境では、Expo Push Notifications を起点にするのが最もスムーズです。Expo の Push API は内部で FCM（Android）と APNs（iOS）の両方に対応しており、プラットフォーム差を吸収してくれます。ただし、FCM の Topic 機能やデータメッセージなど高度な機能が必要な場合は、Expo の上に FCM を直接統合することも可能です。詳しくは [Firebase Analytics でのA/Bテスト実装ガイド](/articles/rork-dev/rork-max-firebase-analytics-ab-testing) も参考にしてください。
+
+### Q2: A/Bテストのサンプルサイズはどのくらい必要ですか？
+
+統計的に有意な結果を得るには、各バリアントに最低300件の配信が目安です。開封率の差が小さい場合（例: 10% vs 12%）は、さらに大きなサンプルサイズが必要になります。ユーザー基盤が小さい段階では、テスト対象をタイトルと本文に絞り、1つの要素だけを変えてテストするのが効率的です。
+
+### Q3: クワイエットアワーの設定はユーザーに委ねるべきですか？
+
+はい、ユーザーが自分で通知の受信時間帯を設定できるようにするのがベストプラクティスです。デフォルト値（22:00〜08:00）を設定した上で、アプリの設定画面から変更可能にします。これにより、ユーザーの生活リズムに合わせた配信が可能になり、オプトアウト率の低下に直結します。
+
+### Q4: 通知の開封率が低いときに最初に見直すべきポイントは何ですか？
+
+まずタイトルを見直してください。通知のタイトルは全角20文字（英語40文字）以内が理想で、ユーザーにとっての「価値」を明確に伝える必要があります。次に配信タイミングを検証します。多くのアプリでは昼休み（12:00〜13:00）と通勤時間帯（18:00〜19:00）が開封率のピークになります。これらをA/Bテストで確認した上で、セグメントごとに最適なタイミングを設定しましょう。
+
+## まとめ
+
+プッシュ通知の上級実装は、セグメント設計 → 配信ロジック → A/Bテスト → 自動化パイプライン → モニタリング改善という一連のサイクルで成り立っています。本記事で紹介したパターンを段階的に導入することで、通知のオプトアウト率を下げながらリテンションとコンバージョンを改善できます。
+
+まずはセグメントテーブルの設計と行動トラッキングの実装から始め、データが蓄積されたらA/Bテストを導入する段階的なアプローチがおすすめです。基本的なプッシュ通知の実装にまだ不安がある方は、[Expo Notifications でのプッシュ通知実装ガイド](/articles/rork-dev/rork-push-notifications) から始めてみてください。
+
+本記事のテーマをさらに深めたい方には「[プッシュ通知 ―アプリマーケティングの切り札](https://www.amazon.co.jp/dp/4798145076/?tag=pinocchio-22)」（高橋雅弘 著）がおすすめです。
