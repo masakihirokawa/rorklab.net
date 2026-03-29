@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "LOWCODE — Gartner：2026 年はローコードが新規開発の 75% を占める、Rork の追い風さらに強まる（3/29）",
-    "COST — AI アプリビルダーで開発コスト最大 80% 削減、スタートアップの参入障壁が劇的に低下（3/28）",
-    "$264B — AI アプリビルダー市場が 2032 年に $264B 規模へ成長予測、Rork Max が先行者優位を拡大（3/28）",
-    "APPLE — iOS 26.4 で Apple × Gemini AI 統合が本格化、SwiftUI ネイティブの Rork Max に好機（3/26）",
-    "TOP4 — 2026 年の AI モバイルアプリビルダー TOP 4 に Rork が選出、ネイティブ生成で差別化（3/27）",
-    "ARR — Rork Max が 3 日で $1.5M ARR を達成、ノーコード × ネイティブの需要を証明（3/24）",
+    "GROWTH — Rork が月間 74 万訪問・成長率 85% を達成、ノーコード AI アプリビルダー市場をリード（3/30）",
+    "FUND — Rork が a16z から $2.8M のプレシード資金調達に成功、プラットフォーム拡充を加速（3/28）",
+    "MAX — Rork Max が 3 日で $1.5M ARR を達成、ネイティブ Swift 開発の圧倒的需要を証明（3/24）",
+    "NATIVE — Rork Max が Dynamic Island・HealthKit・NFC・App Clips・Core ML など Apple ネイティブ機能に完全対応（3/30）",
+    "LOWCODE — Gartner：2026 年はローコードが新規開発の 75%、AI エージェント搭載アプリは前年比 8 倍に（3/29）",
+    "PUBLISH — Rork Max の 2 クリック App Store 公開：クラウド Mac ビルド → ライブシミュレーター → 審査提出（3/26）",
   ],
   en: [
-    "LOWCODE — Gartner: low-code to account for 75% of new apps in 2026, strengthening Rork's tailwind (3/29)",
-    "COST — AI app builders slash dev costs up to 80%, dramatically lowering barriers for startups (3/28)",
-    "$264B — AI app builder market projected to reach $264B by 2032, Rork Max extends first-mover lead (3/28)",
-    "APPLE — iOS 26.4 deepens Apple-Gemini AI integration, creating opportunity for Rork Max's SwiftUI (3/26)",
-    "TOP4 — Rork named among top 4 AI mobile app builders for 2026, differentiated by native generation (3/27)",
-    "ARR — Rork Max hits $1.5M ARR in 3 days, proving massive demand for no-code native apps (3/24)",
+    "GROWTH — Rork hits 743K monthly visits with 85% growth, leading the no-code AI app builder market (3/30)",
+    "FUND — Rork secures $2.8M pre-seed from a16z to accelerate platform expansion (3/28)",
+    "MAX — Rork Max reaches $1.5M ARR in just 3 days, proving massive demand for native Swift dev (3/24)",
+    "NATIVE — Rork Max supports Dynamic Island, HealthKit, NFC, App Clips & Core ML natively (3/30)",
+    "LOWCODE — Gartner: low-code to drive 75% of new apps in 2026, AI agents up 8x year-over-year (3/29)",
+    "PUBLISH — Rork Max 2-click App Store publishing: cloud Mac build → live simulator → submit (3/26)",
   ],
 };
 
