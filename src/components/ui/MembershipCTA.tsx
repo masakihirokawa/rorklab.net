@@ -1,34 +1,37 @@
 import { localePrefix } from "@/lib/locale";
 import type { ArticleMeta } from "@/lib/content";
-import { PLAN_LABELS } from "@/config/pricing";
+import { CAMPAIGN, PLAN_LABELS } from "@/config/pricing";
 
 interface MembershipCTAProps {
   locale: string;
   relatedPremiumArticles?: ArticleMeta[];
 }
 
+const proFeatureJa = CAMPAIGN.enabled ? CAMPAIGN.labels.ja.proFeature : PLAN_LABELS.ja.proFeature;
+const proFeatureEn = CAMPAIGN.enabled ? CAMPAIGN.labels.en.proFeature : PLAN_LABELS.en.proFeature;
+
 const CONTENT = {
   ja: {
-    heading: "さらに深く学びたい方へ",
+    heading: "お読みいただきありがとうございます",
     description:
-      "Rork Lab では、この記事の内容をさらに掘り下げた上級ガイドをプレミアム記事として公開しています。実装コード・ベンチマーク・本番設計パターンなど、すぐに使える実践的な内容です。",
+      "Rork Lab では、実装コード・ベンチマーク・本番設計パターンなど、実務ですぐにお役立ていただけるプレミアム記事をご用意しています。もしご興味がありましたら、ぜひご覧ください。",
     features: [
       "コピー&ペーストで使える実装コード付き",
       "毎週新しい上級ガイドを追加",
-      PLAN_LABELS.ja.proFeature,
+      proFeatureJa,
     ],
-    link: "Premium 記事を見る →",
+    link: "メンバーシップを見る →",
   },
   en: {
-    heading: "Go Deeper",
+    heading: "Thank You for Reading",
     description:
-      "Rork Lab publishes premium articles that go deeper into the topics covered here — with implementation code, benchmarks, and production-ready design patterns.",
+      "Rork Lab offers premium articles with implementation code, benchmarks, and production-ready design patterns — practical content we hope you'll find useful.",
     features: [
       "Copy-paste ready implementation code",
       "New advanced guides published every week",
-      PLAN_LABELS.en.proFeature,
+      proFeatureEn,
     ],
-    link: "View Premium Articles →",
+    link: "View Membership →",
   },
 };
 

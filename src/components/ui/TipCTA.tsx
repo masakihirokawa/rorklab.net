@@ -10,21 +10,21 @@ interface TipCTAProps {
 const CONTENT = {
   ja: {
     message:
-      `この記事がお役に立ちましたら、チップ（${PRICES.ja.tip}）で応援いただけると今後の執筆の励みになります。`,
+      `もしこの記事がお役に立ちましたら、チップ（${PRICES.ja.tip}）で応援いただけると大変励みになります。広告なしでの運営を続けるため、皆さまのご支援が大きな力になっています。`,
     link: "チップで応援する →",
     sending: "決済ページへ移動中...",
     error: "エラーが発生しました。もう一度お試しください。",
     thanks:
-      "チップをお送りいただきありがとうございます！いただいたご支援は、サーバー費用やコンテンツ制作に大切に使わせていただきます。",
+      "温かいご支援をいただき、心より感謝申し上げます。いただいたチップは、サーバー費用やコンテンツ制作に大切に使わせていただきます。",
   },
   en: {
     message:
-      `If you found this article helpful, a small tip (${PRICES.en.tip}) would really encourage us to keep writing.`,
+      `If you found this article helpful, a small tip (${PRICES.en.tip}) would mean a lot to us. Your support helps keep this site ad-free and covers server and hosting costs.`,
     link: "Leave a Tip →",
     sending: "Redirecting to checkout...",
     error: "Something went wrong. Please try again.",
     thanks:
-      "Thank you so much for your tip! Your support goes directly toward server costs and content creation.",
+      "Thank you so much for your generous support! Your tip goes directly toward server costs and content creation.",
   },
 };
 

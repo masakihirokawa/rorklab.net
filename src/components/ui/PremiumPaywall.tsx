@@ -132,6 +132,18 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
         }}
       >
         <div style={{ fontSize: 28, marginBottom: 12 }}>✦</div>
+        <p
+          style={{
+            fontSize: 13,
+            color: "var(--text-dim)",
+            lineHeight: 1.7,
+            marginBottom: 12,
+          }}
+        >
+          {locale === "ja"
+            ? "ここまでお読みいただきありがとうございます。"
+            : "Thank you for reading this far."}
+        </p>
         <h3
           style={{
             fontSize: 18,
@@ -151,8 +163,8 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
           }}
         >
           {locale === "ja"
-            ? "この先には、実装コードやベンチマーク結果など、すぐに使える実践的な内容をご用意しています。"
-            : "What follows includes implementation code, benchmarks, and hands-on content you can use right away."}
+            ? "この先には、実装コードやベンチマーク結果など、実務でお役に立てる内容をご用意しています。もしよろしければ、メンバーシップでご覧いただけますと幸いです。"
+            : "What follows includes implementation code, benchmarks, and practical content we hope you'll find useful. We'd be grateful if you'd consider joining our membership."}
         </p>
         {highlights && highlights.length > 0 && (
           <div style={{ textAlign: "left", marginBottom: 28, padding: "12px 16px", borderRadius: 8, background: "color-mix(in srgb, var(--accent-coral) 2%, var(--bg-primary))" }}>
@@ -165,6 +177,25 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
                 {h}
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Campaign badge */}
+        {campaign.enabled && (
+          <div style={{
+            display: "inline-block",
+            width: "fit-content",
+            margin: "0 auto 12px",
+            padding: "3px 10px 2px",
+            borderRadius: 4,
+            background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
+            fontSize: 10,
+            fontFamily: "'DM Mono', monospace",
+            fontWeight: 700,
+            letterSpacing: "0.1em",
+            color: "#fff",
+          }}>
+            {campaign.name}
           </div>
         )}
 
@@ -192,8 +223,6 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
             opacity: loading === "premium" ? 0.7 : 1,
             transition: "all 0.25s",
             letterSpacing: "-0.01em",
-            position: "relative" as const,
-            overflow: "visible",
           }}
           onMouseEnter={(e) => {
             if (!loading) {
@@ -208,24 +237,6 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
             e.currentTarget.style.transform = "translateY(0)";
           }}
         >
-          {campaign.enabled && (
-            <span style={{
-              position: "absolute" as const,
-              top: -10,
-              right: 12,
-              padding: "3px 9px 1px",
-              borderRadius: 4,
-              background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
-              fontSize: 10,
-              fontFamily: "'DM Mono', monospace",
-              fontWeight: 700,
-              letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
-              color: "#fff",
-              whiteSpace: "nowrap" as const,
-            }}>
-              {campaign.name}
-            </span>
-          )}
           {loading === "premium"
             ? locale === "ja" ? "処理中..." : "Loading..."
             : campaign.enabled

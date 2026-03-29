@@ -11,14 +11,14 @@ interface Props {
 
 const META = {
   ja: {
-    title: "メンバーシップ",
+    title: "メンバーシップ — Rork Lab",
     description:
-      `Rork Lab メンバーシップで、プレミアム限定の上級ガイドやチュートリアルにアクセス。Pro プラン（${PRICES.ja.pro.replace("/月", "")}/月）と Premium プラン（${PRICES.ja.premium} 永久アクセス）をご用意しています。`,
+      `Rork Lab メンバーシップで、実装コード付きの上級ガイドが読み放題。Pro プラン（${PRICES.ja.pro}）と Premium プラン（${PRICES.ja.premium} 永久アクセス）をご用意しています。`,
   },
   en: {
-    title: "Membership",
+    title: "Membership — Rork Lab",
     description:
-      `Access exclusive premium guides and advanced tutorials with Rork Lab Membership. Choose from Pro (${PRICES.en.pro.replace("/mo", "")}/mo) or Premium (${PRICES.en.premium} lifetime).`,
+      `Get unlimited access to advanced guides with production-ready code. Choose from Pro (${PRICES.en.pro}) or Premium (${PRICES.en.premium} lifetime).`,
   },
 };
 
@@ -55,15 +55,16 @@ const CATEGORY_LABELS: Record<string, Record<string, string>> = {
 
 const PAGE_TEXT = {
   ja: {
-    badge: "PREMIUM",
-    heading: "Premium",
+    badge: "MEMBERSHIP",
+    heading: "メンバーシップ",
     subheading: "実装コード付きの上級ガイドが読み放題",
     description:
-      "コピー&ペーストで使える実装コード、ベンチマーク結果、本番設計パターンを含む上級ガイドを毎週追加しています。無料記事で基礎を学んだ後の「次の一歩」として、実務ですぐに活用できる内容です。",
+      "Rork Lab をご覧いただきありがとうございます。コピー&ペーストで使える実装コード、ベンチマーク結果、本番設計パターンを含む上級ガイドを毎週追加しています。無料記事で基礎を学んだ後の「次の一歩」として、お役に立てれば幸いです。",
     features: [
       "すべてのプレミアム記事が読み放題",
       "毎週追加される実装コード付き上級ガイド",
       "本番環境で使える設計パターン・ベストプラクティス",
+      "広告なしの快適な閲覧体験",
     ],
     pro: "Pro プラン",
     proPrice: `${PRICES.ja.pro}`,
@@ -80,15 +81,16 @@ const PAGE_TEXT = {
     thankYou: (plan: string) => `いつもご利用いただきありがとうございます。${plan} メンバーとして、すべてのプレミアム記事をお楽しみいただけます。`,
   },
   en: {
-    badge: "PREMIUM",
-    heading: "Premium",
+    badge: "MEMBERSHIP",
+    heading: "メンバーシップ",
     subheading: "Advanced guides with production-ready code",
     description:
-      "Copy-paste ready implementation code, benchmark results, and production design patterns — published weekly. The practical next step after our free articles, built for real-world use.",
+      "Thank you for visiting Rork Lab. We publish advanced guides weekly with copy-paste ready code, benchmarks, and production design patterns — practical content we hope you'll find useful as the next step after our free articles.",
     features: [
       "Unlimited access to all premium articles",
       "New advanced guides with code published every week",
       "Production-ready design patterns & best practices",
+      "Ad-free reading experience",
     ],
     pro: "Pro Plan",
     proPrice: `${PRICES.en.pro}`,
