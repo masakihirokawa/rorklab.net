@@ -50,9 +50,9 @@ export const PLAN_LABELS = {
   ja: {
     tipButton: "¥150 チップを送る",
     tipDescription: "もしお役に立ちましたら、チップ（¥150）で応援いただけると大変励みになります",
-    proButton: "Pro — ¥280/月",
+    proButton: "プロ — ¥280/月",
     proLong: "月額プラン — ¥280/月",
-    premiumButton: "Premium — ¥1,480（おすすめ）",
+    premiumButton: "プレミアム — ¥1,480（おすすめ）",
     premiumLong: "永久アクセス — ¥1,480（おすすめ）",
     proFeature: "¥280/月 または ¥1,480 の永久アクセス",
   },
@@ -97,7 +97,7 @@ export const CAMPAIGN = {
   /** ボタンラベル */
   labels: {
     ja: {
-      premiumButton: "Premium — ¥980（感謝価格）",
+      premiumButton: "プレミアム — ¥980（感謝価格）",
       premiumLong: "永久アクセス — ¥980（感謝価格）",
       proFeature: "¥280/月 または ¥980 の永久アクセス",
     },

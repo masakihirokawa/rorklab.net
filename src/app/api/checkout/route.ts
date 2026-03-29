@@ -11,9 +11,9 @@ function getStripe() {
 const PLAN_NAMES: Record<string, string> = {
   // JA
   "price_1TCQyPEGB5g6A54ofaB9e5to": "Rork Lab — チップ（¥150）ご支援ありがとうございます",
-  "price_1TGSqUEGB5g6A54oxdnDOxOU": "Rork Lab メンバーシップ — Pro（月額プラン）",
-  "price_1TCQyxEGB5g6A54oh8U6RHec": "Rork Lab メンバーシップ — Premium（永久アクセス）",
-  "price_1TFRyLEGB5g6A54oCoY0I3Dc": "Rork Lab メンバーシップ — Premium（感謝価格 ¥980）",
+  "price_1TGSqUEGB5g6A54oxdnDOxOU": "Rork Lab メンバーシップ — プロ（月額プラン）",
+  "price_1TCQyxEGB5g6A54oh8U6RHec": "Rork Lab メンバーシップ — プレミアム（永久アクセス）",
+  "price_1TFRyLEGB5g6A54oCoY0I3Dc": "Rork Lab メンバーシップ — プレミアム（感謝価格 ¥980）",
   // EN
   "price_1TCQyXEGB5g6A54oVQirhunP": "Rork Lab — Tip ($1.50) Thank you for your support",
   "price_1TGSqWEGB5g6A54oTOwX2C6I": "Rork Lab Membership — Pro (Monthly)",
@@ -34,7 +34,7 @@ export async function POST(request: NextRequest) {
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://rorklab.net";
     const prefix = locale === "en" ? "en/" : "";
     const fallbackCancel = `${baseUrl}/${prefix}support`;
-    const planName = PLAN_NAMES[priceId] || "Rork Lab メンバーシップ";
+    const planName = PLAN_NAMES[priceId] || (locale === "en" ? "Rork Lab Membership" : "Rork Lab メンバーシップ");
 
     // Determine plan type for verify-session to handle correctly
     const planType = mode === "subscription" ? "pro" : TIP_PRICE_IDS.has(priceId) ? "tip" : "premium";
