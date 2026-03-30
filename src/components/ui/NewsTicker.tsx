@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GROWTH — Rork が月間 74 万訪問・成長率 85% を達成、ノーコード AI アプリビルダー市場をリード（3/30）",
-    "FUND — Rork が a16z から $2.8M のプレシード資金調達に成功、プラットフォーム拡充を加速（3/28）",
-    "MAX — Rork Max が 3 日で $1.5M ARR を達成、ネイティブ Swift 開発の圧倒的需要を証明（3/24）",
-    "NATIVE — Rork Max が Dynamic Island・HealthKit・NFC・App Clips・Core ML など Apple ネイティブ機能に完全対応（3/30）",
-    "LOWCODE — Gartner：2026 年はローコードが新規開発の 75%、AI エージェント搭載アプリは前年比 8 倍に（3/29）",
-    "PUBLISH — Rork Max の 2 クリック App Store 公開：クラウド Mac ビルド → ライブシミュレーター → 審査提出（3/26）",
+    "COMPARE — 2026 AI アプリビルダー比較：Rork が Lovable（47 分）・Bolt.new（52 分）をプロト生成速度で凌駕（3/31）",
+    "MAX — Rork Max が Claude Code + Opus 4.6 搭載で SwiftUI ネイティブアプリを自動生成、Xcode 完全不要（3/31）",
+    "FUND — Rork が a16z から $2.8M のプレシード調達に成功、月間 74 万訪問・成長率 85% を記録（3/28）",
+    "VISIONPRO — Rork Max が Vision Pro・Apple Watch・Apple TV にも対応、マルチデバイス展開をワンプロンプトで実現（3/30）",
+    "NATIVE — Rork Max の Apple ネイティブ機能：AR/LiDAR・Metal 3D・Dynamic Island・Live Activities・Core ML（3/30）",
+    "PUBLISH — Rork Max なら 2 クリックで App Store 公開、Companion アプリで有料開発者アカウント不要のテストも可能（3/26）",
   ],
   en: [
-    "GROWTH — Rork hits 743K monthly visits with 85% growth, leading the no-code AI app builder market (3/30)",
-    "FUND — Rork secures $2.8M pre-seed from a16z to accelerate platform expansion (3/28)",
-    "MAX — Rork Max reaches $1.5M ARR in just 3 days, proving massive demand for native Swift dev (3/24)",
-    "NATIVE — Rork Max supports Dynamic Island, HealthKit, NFC, App Clips & Core ML natively (3/30)",
-    "LOWCODE — Gartner: low-code to drive 75% of new apps in 2026, AI agents up 8x year-over-year (3/29)",
-    "PUBLISH — Rork Max 2-click App Store publishing: cloud Mac build → live simulator → submit (3/26)",
+    "COMPARE — 2026 AI app builder showdown: Rork outpaces Lovable (47 min) & Bolt.new (52 min) in prototyping (3/31)",
+    "MAX — Rork Max generates native SwiftUI apps with Claude Code + Opus 4.6, no Xcode required (3/31)",
+    "FUND — Rork secures $2.8M pre-seed from a16z, hits 743K monthly visits with 85% growth rate (3/28)",
+    "VISIONPRO — Rork Max now supports Vision Pro, Apple Watch & Apple TV for multi-device deployment (3/30)",
+    "NATIVE — Rork Max unlocks AR/LiDAR, Metal 3D, Dynamic Island, Live Activities & Core ML natively (3/30)",
+    "PUBLISH — Rork Max: 2-click App Store publishing, test on real iPhones via Companion without paid dev account (3/26)",
   ],
 };
 
