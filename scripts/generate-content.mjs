@@ -160,6 +160,40 @@ async function generateArticleIndex() {
     });
   }
 
+
+  // ── Premium flag consistency check (JA is source of truth) ──
+  if (result.ja && result.en) {
+    const jaMap = new Map(result.ja.map(a => [a.slug, a]));
+    const enMap = new Map(result.en.map(a => [a.slug, a]));
+    let fixCount = 0;
+    for (const [slug, jaArticle] of jaMap) {
+      const enArticle = enMap.get(slug);
+      if (!enArticle) continue;
+      if (jaArticle.premium !== enArticle.premium) {
+        console.warn(`  ⚠ AUTO-FIX: premium flag mismatch for "${slug}": JA=${jaArticle.premium}, EN=${enArticle.premium} → aligning EN to JA`);
+        enArticle.premium = jaArticle.premium;
+        if (enArticle.premium && !enArticle.highlights) {
+          enArticle.highlights = jaArticle.highlights || null;
+        }
+        fixCount++;
+      }
+      if (jaArticle.level !== enArticle.level) {
+        console.warn(`  ⚠ AUTO-FIX: level mismatch for "${slug}": JA=${jaArticle.level}, EN=${enArticle.level} → aligning EN to JA`);
+        enArticle.level = jaArticle.level;
+        fixCount++;
+      }
+    }
+    if (fixCount > 0) {
+      console.log(`  ✓ Fixed ${fixCount} JA/EN metadata inconsistencies`);
+    }
+    const jaPremium = result.ja.filter(a => a.premium).length;
+    const enPremium = result.en.filter(a => a.premium).length;
+    if (jaPremium !== enPremium) {
+      console.error(`  ✗ ERROR: Premium article count still differs after fixes: JA=${jaPremium}, EN=${enPremium}`);
+      process.exit(1);
+    }
+  }
+
   // Ensure output directory exists
   if (!fs.existsSync(OUTPUT_DIR)) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -241,6 +275,40 @@ async function generateBlogIndex() {
       if (aUpdated !== bUpdated) return aUpdated > bUpdated ? -1 : 1;
       return a.title.localeCompare(b.title);
     });
+  }
+
+
+  // ── Premium flag consistency check (JA is source of truth) ──
+  if (result.ja && result.en) {
+    const jaMap = new Map(result.ja.map(a => [a.slug, a]));
+    const enMap = new Map(result.en.map(a => [a.slug, a]));
+    let fixCount = 0;
+    for (const [slug, jaArticle] of jaMap) {
+      const enArticle = enMap.get(slug);
+      if (!enArticle) continue;
+      if (jaArticle.premium !== enArticle.premium) {
+        console.warn(`  ⚠ AUTO-FIX: premium flag mismatch for "${slug}": JA=${jaArticle.premium}, EN=${enArticle.premium} → aligning EN to JA`);
+        enArticle.premium = jaArticle.premium;
+        if (enArticle.premium && !enArticle.highlights) {
+          enArticle.highlights = jaArticle.highlights || null;
+        }
+        fixCount++;
+      }
+      if (jaArticle.level !== enArticle.level) {
+        console.warn(`  ⚠ AUTO-FIX: level mismatch for "${slug}": JA=${jaArticle.level}, EN=${enArticle.level} → aligning EN to JA`);
+        enArticle.level = jaArticle.level;
+        fixCount++;
+      }
+    }
+    if (fixCount > 0) {
+      console.log(`  ✓ Fixed ${fixCount} JA/EN metadata inconsistencies`);
+    }
+    const jaPremium = result.ja.filter(a => a.premium).length;
+    const enPremium = result.en.filter(a => a.premium).length;
+    if (jaPremium !== enPremium) {
+      console.error(`  ✗ ERROR: Premium article count still differs after fixes: JA=${jaPremium}, EN=${enPremium}`);
+      process.exit(1);
+    }
   }
 
   // Ensure output directory exists
