@@ -11,20 +11,20 @@ function getStripe() {
 const PLAN_NAMES: Record<string, string> = {
   // JA
   "price_1TCQyPEGB5g6A54ofaB9e5to": "Rork Lab — チップ（¥150）ご支援ありがとうございます",
-  "price_1TGSqUEGB5g6A54oxdnDOxOU": "Rork Lab メンバーシップ — プロ（月額プラン）",
-  "price_1TCQyxEGB5g6A54oh8U6RHec": "Rork Lab メンバーシップ — プレミアム（永久アクセス）",
-  "price_1TFRyLEGB5g6A54oCoY0I3Dc": "Rork Lab メンバーシップ — プレミアム（感謝価格 ¥980）",
+  "price_1TGSqUEGB5g6A54oxdnDOxOU": "Rork Lab メンバーシップ — Pro（月額プラン）",
+  "price_1TCQyxEGB5g6A54oh8U6RHec": "Rork Lab メンバーシップ — Premium（永久アクセス）",
+  "price_1TFRyLEGB5g6A54oCoY0I3Dc": "Rork Lab メンバーシップ — Premium（感謝価格 ¥980）",
   // EN
-  "price_1TCQyXEGB5g6A54oVQirhunP": "Rork Lab — Tip ($1.50) Thank you for your support",
-  "price_1TGSqWEGB5g6A54oTOwX2C6I": "Rork Lab Membership — Pro (Monthly)",
-  "price_1TCQyyEGB5g6A54oUojdhfBa": "Rork Lab Membership — Premium (Lifetime Access)",
-  "price_1TFRyLEGB5g6A54opRFYkqzY": "Rork Lab Membership — Premium (Thank You Price $7)",
+  "price_1TGTQMEGB5g6A54o6VMWCFNr": "Rork Lab — Tip ($1.50) Thank you for your support",
+  "price_1TGTQMEGB5g6A54oI8AwS76H": "Rork Lab Membership — Pro (Monthly)",
+  "price_1TGTQNEGB5g6A54oGbFKBsq7": "Rork Lab Membership — Premium (Lifetime Access)",
+  "price_1TGTQNEGB5g6A54oCroqkbv3": "Rork Lab Membership — Premium (Thank You Price $7)",
 };
 
 // Tip price IDs — these should NOT grant premium access
 const TIP_PRICE_IDS = new Set([
   "price_1TCQyPEGB5g6A54ofaB9e5to", // ¥150 JPY
-  "price_1TCQyXEGB5g6A54oVQirhunP", // $1.50 USD
+  "price_1TGTQMEGB5g6A54o6VMWCFNr", // $1.50 USD
 ]);
 
 export async function POST(request: NextRequest) {

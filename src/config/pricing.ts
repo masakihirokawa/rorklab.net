@@ -23,9 +23,9 @@ export const STRIPE_PRICE_IDS = {
     premium: "price_1TCQyxEGB5g6A54oh8U6RHec",
   },
   en: {
-    tip: "price_1TCQyXEGB5g6A54oVQirhunP",
-    pro: "price_1TGSqWEGB5g6A54oTOwX2C6I",
-    premium: "price_1TCQyyEGB5g6A54oUojdhfBa",
+    tip: "price_1TGTQMEGB5g6A54o6VMWCFNr",
+    pro: "price_1TGTQMEGB5g6A54oI8AwS76H",
+    premium: "price_1TGTQNEGB5g6A54oGbFKBsq7",
   },
 } as const;
 
@@ -50,9 +50,9 @@ export const PLAN_LABELS = {
   ja: {
     tipButton: "¥150 チップを送る",
     tipDescription: "もしお役に立ちましたら、チップ（¥150）で応援いただけると大変励みになります",
-    proButton: "プロ — ¥280/月",
+    proButton: "Pro — ¥280/月",
     proLong: "月額プラン — ¥280/月",
-    premiumButton: "プレミアム — ¥1,480（おすすめ）",
+    premiumButton: "Premium — ¥1,480（おすすめ）",
     premiumLong: "永久アクセス — ¥1,480（おすすめ）",
     proFeature: "¥280/月 または ¥1,480 の永久アクセス",
   },
@@ -79,7 +79,7 @@ export const CAMPAIGN = {
   /** キャンペーン用 Stripe Price IDs (Premium のみ) */
   priceIds: {
     ja: "price_1TFRyLEGB5g6A54oCoY0I3Dc",  // ¥980
-    en: "price_1TFRyLEGB5g6A54opRFYkqzY",  // $7
+    en: "price_1TGTQNEGB5g6A54oCroqkbv3",  // $7
   },
 
   /** キャンペーン価格の表示テキスト */
@@ -97,7 +97,7 @@ export const CAMPAIGN = {
   /** ボタンラベル */
   labels: {
     ja: {
-      premiumButton: "プレミアム — ¥980（感謝価格）",
+      premiumButton: "Premium — ¥980（感謝価格）",
       premiumLong: "永久アクセス — ¥980（感謝価格）",
       proFeature: "¥280/月 または ¥980 の永久アクセス",
     },
