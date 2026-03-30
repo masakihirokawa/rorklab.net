@@ -17,7 +17,7 @@ const CONTENT = {
       "Rork Lab では、実装コード・ベンチマーク・本番設計パターンなど、実務ですぐにお役立ていただけるプレミアム記事をご用意しています。もしご興味がありましたら、ぜひご覧ください。",
     features: [
       "コピー&ペーストで使える実装コード付き",
-      "毎週新しい上級ガイドを追加",
+      "毎日新しい上級ガイドを追加",
       proFeatureJa,
     ],
     link: "メンバーシップを見る →",
@@ -28,7 +28,7 @@ const CONTENT = {
       "Rork Lab offers premium articles with implementation code, benchmarks, and production-ready design patterns — practical content we hope you'll find useful.",
     features: [
       "Copy-paste ready implementation code",
-      "New advanced guides published every week",
+      "New advanced guides published daily",
       proFeatureEn,
     ],
     link: "View Membership →",

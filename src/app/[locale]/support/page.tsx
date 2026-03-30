@@ -67,9 +67,8 @@ const CONTENT: Record<string, {
     membershipSub: "実装コード付きの上級ガイドが読み放題",
     features: [
       "コピー&ペーストで使える実装コード付き",
-      "毎週追加される上級ガイド",
+      "毎日追加される上級ガイド",
       "本番環境で使える設計パターン",
-      "広告なしの快適な閲覧体験",
       "いつでもキャンセル可能",
     ],
     proLabel: `月額プラン — ${PRICES.ja.pro}`,
@@ -93,9 +92,8 @@ const CONTENT: Record<string, {
     membershipSub: "Advanced guides with production-ready code",
     features: [
       "Copy-paste ready implementation code",
-      "New advanced guides published every week",
+      "New advanced guides published daily",
       "Production-ready design patterns",
-      "Ad-free reading experience",
       "Cancel anytime",
     ],
     proLabel: `Monthly — ${PRICES.en.pro}`,

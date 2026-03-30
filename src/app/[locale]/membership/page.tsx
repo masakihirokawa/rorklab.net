@@ -59,12 +59,11 @@ const PAGE_TEXT = {
     heading: "メンバーシップ",
     subheading: "実装コード付きの上級ガイドが読み放題",
     description:
-      "Rork Lab をご覧いただきありがとうございます。コピー&ペーストで使える実装コード、ベンチマーク結果、本番設計パターンを含む上級ガイドを毎週追加しています。無料記事で基礎を学んだ後の「次の一歩」として、お役に立てれば幸いです。",
+      "Rork Lab をご覧いただきありがとうございます。コピー&ペーストで使える実装コード、ベンチマーク結果、本番設計パターンを含む上級ガイドを毎日追加しています。無料記事で基礎を学んだ後の「次の一歩」として、お役に立てれば幸いです。",
     features: [
       "すべてのプレミアム記事が読み放題",
-      "毎週追加される実装コード付き上級ガイド",
+      "毎日追加される実装コード付き上級ガイド",
       "本番環境で使える設計パターン・ベストプラクティス",
-      "広告なしの快適な閲覧体験",
     ],
     pro: "Pro プラン",
     proPrice: `${PRICES.ja.pro}`,
@@ -85,12 +84,11 @@ const PAGE_TEXT = {
     heading: "メンバーシップ",
     subheading: "Advanced guides with production-ready code",
     description:
-      "Thank you for visiting Rork Lab. We publish advanced guides weekly with copy-paste ready code, benchmarks, and production design patterns — practical content we hope you'll find useful as the next step after our free articles.",
+      "Thank you for visiting Rork Lab. We publish advanced guides daily with copy-paste ready code, benchmarks, and production design patterns — practical content we hope you'll find useful as the next step after our free articles.",
     features: [
       "Unlimited access to all premium articles",
-      "New advanced guides with code published every week",
+      "New advanced guides with code published daily",
       "Production-ready design patterns & best practices",
-      "Ad-free reading experience",
     ],
     pro: "Pro Plan",
     proPrice: `${PRICES.en.pro}`,
