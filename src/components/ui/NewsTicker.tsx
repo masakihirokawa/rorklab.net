@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "COMPARE — 2026 AI アプリビルダー比較：Rork が Lovable（47 分）・Bolt.new（52 分）をプロト生成速度で凌駕（3/31）",
-    "MAX — Rork Max が Claude Code + Opus 4.6 搭載で SwiftUI ネイティブアプリを自動生成、Xcode 完全不要（3/31）",
-    "FUND — Rork が a16z から $2.8M のプレシード調達に成功、月間 74 万訪問・成長率 85% を記録（3/28）",
-    "VISIONPRO — Rork Max が Vision Pro・Apple Watch・Apple TV にも対応、マルチデバイス展開をワンプロンプトで実現（3/30）",
-    "NATIVE — Rork Max の Apple ネイティブ機能：AR/LiDAR・Metal 3D・Dynamic Island・Live Activities・Core ML（3/30）",
-    "PUBLISH — Rork Max なら 2 クリックで App Store 公開、Companion アプリで有料開発者アカウント不要のテストも可能（3/26）",
+    "MARKET — 2026 年 4 月最新：ノーコード AI モバイル市場は 2032 年に $264B 規模へ、AI アプリビルダーが急成長（4/1）",
+    "ARR — Rork Max がローンチ 3 日間で $1.5M ARR を達成、a16z $2.8M 調達・月間 74 万訪問・成長率 85%（3/28）",
+    "MAX — Rork Max の SwiftUI ネイティブアプリ：クラウド Mac ビルド＋ライブシミュレーターで Xcode 不要（4/1）",
+    "NATIVE — Rork Max が AR/LiDAR・Metal 3D・Dynamic Island・Live Activities・HealthKit を完全サポート（4/1）",
+    "VISION — Rork Max が Vision Pro・Apple Watch・Apple TV・iMessage・App Clips を単一プロンプトで生成（4/1）",
+    "PUBLISH — Rork Max は 2 クリックで App Store 公開、Rork Companion で有料開発者アカウント不要の実機テストも（4/1）",
   ],
   en: [
-    "COMPARE — 2026 AI app builder showdown: Rork outpaces Lovable (47 min) & Bolt.new (52 min) in prototyping (3/31)",
-    "MAX — Rork Max generates native SwiftUI apps with Claude Code + Opus 4.6, no Xcode required (3/31)",
-    "FUND — Rork secures $2.8M pre-seed from a16z, hits 743K monthly visits with 85% growth rate (3/28)",
-    "VISIONPRO — Rork Max now supports Vision Pro, Apple Watch & Apple TV for multi-device deployment (3/30)",
-    "NATIVE — Rork Max unlocks AR/LiDAR, Metal 3D, Dynamic Island, Live Activities & Core ML natively (3/30)",
-    "PUBLISH — Rork Max: 2-click App Store publishing, test on real iPhones via Companion without paid dev account (3/26)",
+    "MARKET — April 2026: No-code AI mobile market projected to hit $264B by 2032, with AI app builders leading growth (4/1)",
+    "ARR — Rork Max hit $1.5M ARR in 3 days post-launch; a16z $2.8M funding, 743K monthly visits, 85% growth rate (3/28)",
+    "MAX — Rork Max builds native SwiftUI apps via cloud Mac builds and a live simulator — zero Xcode needed (4/1)",
+    "NATIVE — Rork Max supports AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, HealthKit & HomeKit natively (4/1)",
+    "VISION — Rork Max generates apps for Vision Pro, Apple Watch, Apple TV, iMessage & App Clips from one prompt (4/1)",
+    "PUBLISH — Rork Max ships to App Store in 2 clicks; Rork Companion enables real-device testing without a paid dev account (4/1)",
   ],
 };
 
