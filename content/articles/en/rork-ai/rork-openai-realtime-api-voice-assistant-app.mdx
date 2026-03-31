@@ -1,0 +1,905 @@
+---
+title: "Rork × OpenAI Realtime API: Complete Guide to Building a Voice AI Assistant App"
+slug: "rork-openai-realtime-api-voice-assistant-app"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-03-31T11:30"
+updated: "2026-03-31T11:30"
+author: "Rork Lab"
+description: "A comprehensive guide to integrating OpenAI's Realtime API with Rork to build a production-quality voice AI assistant app with sub-100ms latency. Covers WebSocket setup, audio pipeline design, cost optimization, and more."
+tags: ["OpenAI", "Realtime API", "Voice AI", "WebSocket", "React Native", "GPT-4o", "Speech Recognition", "TTS", "Rork Max"]
+highlights:
+  - "Learn how to implement OpenAI Realtime API WebSocket connections in React Native to achieve sub-100ms voice conversation latency"
+  - "Master the complete real-time audio pipeline design: recording, streaming, and playback working in concert"
+  - "Get a full production workflow — cost optimization, error handling, and App Store deployment — with working code examples"
+---
+
+## Introduction: How the Realtime API Changes Voice App Development
+
+Building voice interaction into a mobile app used to mean stitching together a clunky pipeline: record audio → transcribe with Whisper → generate a reply with GPT-4o → convert text back to speech with TTS. Every step added hundreds of milliseconds to seconds of latency, and users experienced awkward, unnatural silences while waiting for a response.
+
+OpenAI's **Realtime API**, released in October 2024, solves this problem at a fundamental level. Voice input, LLM inference, and voice output are all processed in parallel within a single persistent WebSocket session, bringing end-to-end latency below 100ms. Because audio flows directly through the model without an intermediate transcription step, the system also preserves tone, emotion, and the natural rhythm of conversation.
+
+In this guide, we'll integrate the Realtime API into a Rork Max React Native app from scratch, building a production-ready voice AI assistant complete with reconnection logic, cost controls, and UX polish. All code examples are production-grade TypeScript.
+
+This guide assumes you already have experience building apps in Rork and understand the basics of API integration. For a primer on [using GPT-4o for chat apps in Rork](/articles/rork-ai/gpt-4o-rork-openai-app-development), check out our earlier article.
+
+---
+
+## Understanding the OpenAI Realtime API
+
+### The WebSocket Session Model
+
+Unlike REST APIs, the Realtime API operates over a **persistent, bidirectional WebSocket connection**. Client and server exchange events as JSON messages, with audio data sent and received as base64-encoded binary chunks.
+
+Here's the core event flow:
+
+- `session.created` — Received immediately after connection is established
+- `input_audio_buffer.append` — Client sends an audio chunk
+- `input_audio_buffer.commit` — Client signals end of speech (manual mode only)
+- `response.audio.delta` — Server sends an audio chunk back
+- `response.text.delta` — A text transcript arrives simultaneously
+- `response.done` — Response generation is complete
+
+### Voice Activity Detection (VAD) Modes
+
+The Realtime API supports two speech detection modes.
+
+**server_vad mode (recommended):** The server automatically detects when the user starts and stops speaking. Responses are generated automatically when speech ends, creating a natural conversational flow. Use this for most apps.
+
+**none mode (manual control):** Your app explicitly sends `input_audio_buffer.commit` to signal the end of speech — ideal for a push-to-talk interface or noisy environments where automatic detection would be unreliable.
+
+### Audio Format Requirements
+
+Both input and output use **PCM16 (16-bit signed PCM, 24kHz, mono)**. React Native's `expo-av` and `react-native-audio-record` don't produce this format out of the box, so you'll need to handle sample rate conversion — we'll cover that in detail below.
+
+---
+
+## Project Setup and Dependencies
+
+### Creating the Project in Rork Max
+
+In the Rork Max prompt editor, initialize your project with a prompt like this:
+
+```
+Create a voice AI assistant app with the following features:
+- A push-to-talk button that records while held
+- A scrollable conversation history list showing both user and AI turns
+- A waveform animation that reacts to recording and playback
+- Dark mode support throughout
+```
+
+### Adding Required Packages
+
+Add the following to your `package.json` via Rork Max's terminal or package manager panel:
+
+```json
+{
+  "dependencies": {
+    "expo-av": "^15.0.0",
+    "expo-permissions": "^16.0.0",
+    "react-native-audio-record": "^0.2.2",
+    "eventemitter3": "^5.0.1"
+  }
+}
+```
+
+`expo-av` handles audio playback, while `react-native-audio-record` gives us low-level access to raw audio buffers during recording.
+
+### Securing Your OpenAI API Key
+
+Never hardcode API keys. Use Expo's `Constants.expoConfig.extra` pattern to inject them via environment variables:
+
+```typescript
+// app.config.ts
+export default {
+  expo: {
+    extra: {
+      openaiApiKey: process.env.OPENAI_API_KEY,
+    },
+  },
+};
+```
+
+```typescript
+// src/config/openai.ts
+import Constants from 'expo-constants';
+
+export const OPENAI_API_KEY = Constants.expoConfig?.extra?.openaiApiKey ?? '';
+// In production, inject the real key via environment variables —
+// never commit YOUR_OPENAI_API_KEY or similar placeholder strings to source control
+```
+
+---
+
+## Implementing the WebSocket Connection Layer
+
+### The RealtimeClient Class
+
+We'll create a clean client class that encapsulates all connection management and event routing:
+
+```typescript
+// src/services/RealtimeClient.ts
+import { EventEmitter } from 'eventemitter3';
+import { OPENAI_API_KEY } from '../config/openai';
+
+const REALTIME_URL =
+  'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
+
+export type RealtimeEvent =
+  | { type: 'session.created'; session: SessionConfig }
+  | { type: 'response.audio.delta'; delta: string }  // base64-encoded PCM16
+  | { type: 'response.text.delta'; delta: string }
+  | { type: 'response.done' }
+  | { type: 'input_audio_buffer.speech_started' }
+  | { type: 'input_audio_buffer.speech_stopped' }
+  | { type: 'error'; error: { message: string; code: string } };
+
+export interface SessionConfig {
+  modalities: ('audio' | 'text')[];
+  voice: 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer';
+  turn_detection: { type: 'server_vad' } | { type: 'none' } | null;
+  instructions?: string;
+  temperature?: number;
+  max_response_output_tokens?: number | 'inf';
+}
+
+export class RealtimeClient extends EventEmitter {
+  private ws: WebSocket | null = null;
+  private isConnected = false;
+
+  async connect(sessionConfig: SessionConfig): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(REALTIME_URL, [], {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'realtime=v1',
+        },
+      });
+
+      this.ws.onopen = () => {
+        this.isConnected = true;
+        // Send session configuration immediately after connecting
+        this.send({
+          type: 'session.update',
+          session: sessionConfig,
+        });
+      };
+
+      this.ws.onmessage = (event) => {
+        try {
+          const data: RealtimeEvent = JSON.parse(event.data);
+          this.emit(data.type, data);
+
+          if (data.type === 'session.created') {
+            resolve();
+          }
+        } catch (e) {
+          console.error('[RealtimeClient] JSON parse error:', e);
+        }
+      };
+
+      this.ws.onerror = (error) => {
+        this.isConnected = false;
+        reject(new Error(`WebSocket error: ${JSON.stringify(error)}`));
+      };
+
+      this.ws.onclose = (event) => {
+        this.isConnected = false;
+        this.emit('disconnected', { code: event.code, reason: event.reason });
+      };
+
+      // Connection timeout (10 seconds)
+      setTimeout(() => {
+        if (!this.isConnected) {
+          reject(new Error('Connection timeout'));
+        }
+      }, 10000);
+    });
+  }
+
+  sendAudioChunk(base64Audio: string): void {
+    if (!this.isConnected) return;
+    this.send({
+      type: 'input_audio_buffer.append',
+      audio: base64Audio,
+    });
+  }
+
+  commitAudio(): void {
+    if (!this.isConnected) return;
+    this.send({ type: 'input_audio_buffer.commit' });
+    this.send({ type: 'response.create' });
+  }
+
+  interrupt(): void {
+    if (!this.isConnected) return;
+    this.send({ type: 'response.cancel' });
+    this.send({ type: 'input_audio_buffer.clear' });
+  }
+
+  disconnect(): void {
+    this.ws?.close();
+    this.ws = null;
+    this.isConnected = false;
+  }
+
+  private send(event: object): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(event));
+    }
+  }
+}
+```
+
+---
+
+## Building the Audio Recording and Playback Pipeline
+
+### Sample Rate Conversion Utilities
+
+React Native records audio at 44.1kHz by default, but the Realtime API requires 24kHz. Here's a utility module to handle the conversion:
+
+```typescript
+// src/utils/audioConverter.ts
+
+/**
+ * Downsample a 44100Hz Float32Array to a 24000Hz Int16Array
+ */
+export function downsampleAudio(
+  input: Float32Array,
+  inputSampleRate: number,
+  outputSampleRate: number = 24000
+): Int16Array {
+  const ratio = inputSampleRate / outputSampleRate;
+  const outputLength = Math.floor(input.length / ratio);
+  const output = new Int16Array(outputLength);
+
+  for (let i = 0; i < outputLength; i++) {
+    const srcIndex = Math.floor(i * ratio);
+    // Convert Float32 (-1.0 to 1.0) to Int16 (-32768 to 32767)
+    const sample = Math.max(-1, Math.min(1, input[srcIndex]));
+    output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+  }
+
+  return output;
+}
+
+/**
+ * Convert an ArrayBuffer to a base64 string
+ */
+export function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Convert a base64-encoded PCM16 string into a playable WAV ArrayBuffer
+ */
+export function pcm16ToWav(
+  base64Pcm: string,
+  sampleRate: number = 24000
+): ArrayBuffer {
+  const pcmData = Uint8Array.from(atob(base64Pcm), (c) => c.charCodeAt(0));
+  const wavHeader = createWavHeader(pcmData.length, sampleRate);
+  const wav = new Uint8Array(wavHeader.byteLength + pcmData.byteLength);
+  wav.set(new Uint8Array(wavHeader), 0);
+  wav.set(pcmData, wavHeader.byteLength);
+  return wav.buffer;
+}
+
+function createWavHeader(dataLength: number, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44);
+  const view = new DataView(buffer);
+  view.setUint32(0, 0x52494646, false); // "RIFF"
+  view.setUint32(4, 36 + dataLength, true);
+  view.setUint32(8, 0x57415645, false); // "WAVE"
+  view.setUint32(12, 0x666d7420, false); // "fmt "
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);           // PCM
+  view.setUint16(22, 1, true);           // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  view.setUint32(36, 0x64617461, false); // "data"
+  view.setUint32(40, dataLength, true);
+  return buffer;
+}
+```
+
+### The useVoiceRecorder Hook
+
+A custom hook that wraps recording start/stop and audio chunk delivery:
+
+```typescript
+// src/hooks/useVoiceRecorder.ts
+import { useState, useRef, useCallback } from 'react';
+import { Audio } from 'expo-av';
+import AudioRecord from 'react-native-audio-record';
+import type { RealtimeClient } from '../services/RealtimeClient';
+
+export function useVoiceRecorder(client: RealtimeClient | null) {
+  const [isRecording, setIsRecording] = useState(false);
+  const isRecordingRef = useRef(false);
+
+  const startRecording = useCallback(async () => {
+    const { status } = await Audio.requestPermissionsAsync();
+    if (status !== 'granted') {
+      throw new Error('Microphone permission is required');
+    }
+
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: true,
+      playsInSilentModeIOS: true,
+      staysActiveInBackground: false,
+    });
+
+    AudioRecord.init({
+      sampleRate: 24000,   // Matches Realtime API requirement
+      channels: 1,
+      bitsPerSample: 16,
+      audioSource: 6,      // VOICE_RECOGNITION
+      wavFile: 'temp.wav',
+    });
+
+    AudioRecord.on('data', (data: string) => {
+      if (!isRecordingRef.current || !client) return;
+      // data is already base64-encoded PCM16 from react-native-audio-record
+      client.sendAudioChunk(data);
+    });
+
+    AudioRecord.start();
+    isRecordingRef.current = true;
+    setIsRecording(true);
+  }, [client]);
+
+  const stopRecording = useCallback(() => {
+    AudioRecord.stop();
+    isRecordingRef.current = false;
+    setIsRecording(false);
+    // In manual (none VAD) mode, commit the audio buffer
+    client?.commitAudio();
+  }, [client]);
+
+  return { isRecording, startRecording, stopRecording };
+}
+```
+
+---
+
+## Audio Playback and UI State Management
+
+### The useAudioPlayer Hook
+
+The server streams audio back in small chunks. This hook buffers them and plays them sequentially without gaps:
+
+```typescript
+// src/hooks/useAudioPlayer.ts
+import { useRef, useCallback } from 'react';
+import { Audio } from 'expo-av';
+import { pcm16ToWav } from '../utils/audioConverter';
+
+export function useAudioPlayer() {
+  const audioQueue = useRef<string[]>([]);
+  const isPlaying = useRef(false);
+  const currentSound = useRef<Audio.Sound | null>(null);
+
+  const enqueueChunk = useCallback((base64Chunk: string) => {
+    audioQueue.current.push(base64Chunk);
+    if (!isPlaying.current) {
+      playNext();
+    }
+  }, []);
+
+  const playNext = useCallback(async () => {
+    if (audioQueue.current.length === 0) {
+      isPlaying.current = false;
+      return;
+    }
+
+    isPlaying.current = true;
+    const chunk = audioQueue.current.shift()!;
+
+    try {
+      const wavBuffer = pcm16ToWav(chunk);
+      const base64Wav = btoa(
+        String.fromCharCode(...new Uint8Array(wavBuffer))
+      );
+      const uri = `data:audio/wav;base64,${base64Wav}`;
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri },
+        { shouldPlay: true }
+      );
+      currentSound.current = sound;
+
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.isLoaded && status.didJustFinish) {
+          sound.unloadAsync();
+          playNext();
+        }
+      });
+    } catch (e) {
+      console.error('[AudioPlayer] playback error:', e);
+      playNext(); // Skip on error and continue the queue
+    }
+  }, []);
+
+  const stopAll = useCallback(() => {
+    audioQueue.current = [];
+    isPlaying.current = false;
+    currentSound.current?.stopAsync().catch(() => {});
+    currentSound.current?.unloadAsync().catch(() => {});
+  }, []);
+
+  return { enqueueChunk, stopAll };
+}
+```
+
+### The Main Screen Component
+
+Putting it all together in a complete screen component:
+
+```typescript
+// src/screens/VoiceAssistantScreen.tsx
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import {
+  View, Text, ScrollView, Pressable, StyleSheet, ActivityIndicator,
+} from 'react-native';
+import { RealtimeClient, SessionConfig } from '../services/RealtimeClient';
+import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
+import { useAudioPlayer } from '../hooks/useAudioPlayer';
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  timestamp: Date;
+}
+
+const SESSION_CONFIG: SessionConfig = {
+  modalities: ['audio', 'text'],
+  voice: 'shimmer',
+  turn_detection: { type: 'server_vad' },
+  instructions:
+    'You are a friendly, knowledgeable assistant. Respond concisely and naturally.',
+  temperature: 0.8,
+  max_response_output_tokens: 1024,
+};
+
+export default function VoiceAssistantScreen() {
+  const clientRef = useRef<RealtimeClient | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [isAISpeaking, setIsAISpeaking] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [currentTranscript, setCurrentTranscript] = useState('');
+  const scrollViewRef = useRef<ScrollView>(null);
+
+  const { enqueueChunk, stopAll } = useAudioPlayer();
+  const { isRecording, startRecording, stopRecording } = useVoiceRecorder(
+    clientRef.current
+  );
+
+  useEffect(() => {
+    const client = new RealtimeClient();
+    clientRef.current = client;
+
+    client.connect(SESSION_CONFIG)
+      .then(() => setIsConnected(true))
+      .catch((e) => console.error('Connection failed:', e));
+
+    client.on('response.audio.delta', ({ delta }) => {
+      setIsAISpeaking(true);
+      enqueueChunk(delta);
+    });
+
+    client.on('response.text.delta', ({ delta }) => {
+      setCurrentTranscript((prev) => prev + delta);
+    });
+
+    client.on('response.done', () => {
+      setIsAISpeaking(false);
+      setCurrentTranscript((prev) => {
+        if (prev.trim()) {
+          setMessages((msgs) => [
+            ...msgs,
+            {
+              id: Date.now().toString(),
+              role: 'assistant',
+              text: prev.trim(),
+              timestamp: new Date(),
+            },
+          ]);
+        }
+        return '';
+      });
+    });
+
+    client.on('input_audio_buffer.speech_started', () => {
+      // If the user starts speaking while AI is talking, interrupt immediately
+      stopAll();
+      client.interrupt();
+    });
+
+    return () => {
+      client.disconnect();
+    };
+  }, []);
+
+  const handleMicPress = useCallback(async () => {
+    if (isRecording) {
+      stopRecording();
+      setMessages((msgs) => [
+        ...msgs,
+        {
+          id: Date.now().toString(),
+          role: 'user',
+          text: '(voice input)',
+          timestamp: new Date(),
+        },
+      ]);
+    } else {
+      await startRecording();
+    }
+  }, [isRecording, startRecording, stopRecording]);
+
+  return (
+    <View style={styles.container}>
+      <ScrollView
+        ref={scrollViewRef}
+        style={styles.messageList}
+        onContentSizeChange={() => scrollViewRef.current?.scrollToEnd()}
+      >
+        {messages.map((msg) => (
+          <View
+            key={msg.id}
+            style={[
+              styles.bubble,
+              msg.role === 'user' ? styles.userBubble : styles.aiBubble,
+            ]}
+          >
+            <Text style={styles.bubbleText}>{msg.text}</Text>
+          </View>
+        ))}
+        {currentTranscript ? (
+          <View style={[styles.bubble, styles.aiBubble, styles.streamingBubble]}>
+            <Text style={styles.bubbleText}>{currentTranscript}</Text>
+            <ActivityIndicator size="small" color="#888" style={{ marginTop: 4 }} />
+          </View>
+        ) : null}
+      </ScrollView>
+
+      <Text style={styles.status}>
+        {!isConnected
+          ? 'Connecting...'
+          : isRecording
+          ? '🎙️ Recording...'
+          : isAISpeaking
+          ? '🤖 Responding...'
+          : 'Ready'}
+      </Text>
+
+      <Pressable
+        style={[styles.micButton, isRecording && styles.micButtonActive]}
+        onPressIn={handleMicPress}
+        onPressOut={isRecording ? stopRecording : undefined}
+        disabled={!isConnected}
+      >
+        <Text style={styles.micIcon}>{isRecording ? '⏹' : '🎙️'}</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#0d0d0d', paddingBottom: 20 },
+  messageList: { flex: 1, padding: 16 },
+  bubble: {
+    maxWidth: '80%', borderRadius: 16, padding: 12, marginBottom: 8,
+  },
+  userBubble: { alignSelf: 'flex-end', backgroundColor: '#1a73e8' },
+  aiBubble: { alignSelf: 'flex-start', backgroundColor: '#2a2a2a' },
+  streamingBubble: { opacity: 0.85 },
+  bubbleText: { color: '#fff', fontSize: 15, lineHeight: 22 },
+  status: { color: '#888', textAlign: 'center', paddingVertical: 8, fontSize: 13 },
+  micButton: {
+    width: 72, height: 72, borderRadius: 36,
+    backgroundColor: '#1a73e8', alignSelf: 'center',
+    alignItems: 'center', justifyContent: 'center', marginBottom: 16,
+  },
+  micButtonActive: { backgroundColor: '#d32f2f', transform: [{ scale: 1.1 }] },
+  micIcon: { fontSize: 28 },
+});
+```
+
+---
+
+## Production-Quality Error Handling and Reconnection
+
+### Exponential Backoff Reconnection
+
+WebSocket connections drop. A robust app recovers silently:
+
+```typescript
+// src/hooks/useRealtimeConnection.ts
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { RealtimeClient, SessionConfig } from '../services/RealtimeClient';
+
+const MAX_RETRIES = 5;
+const BASE_DELAY_MS = 1000;
+
+export function useRealtimeConnection(sessionConfig: SessionConfig) {
+  const [client, setClient] = useState<RealtimeClient | null>(null);
+  const [connectionState, setConnectionState] = useState<
+    'disconnected' | 'connecting' | 'connected' | 'error'
+  >('disconnected');
+  const retryCount = useRef(0);
+  const retryTimer = useRef<ReturnType<typeof setTimeout>>();
+
+  const connect = useCallback(async () => {
+    setConnectionState('connecting');
+    const newClient = new RealtimeClient();
+
+    try {
+      await newClient.connect(sessionConfig);
+      retryCount.current = 0;
+      setClient(newClient);
+      setConnectionState('connected');
+
+      newClient.on('disconnected', () => {
+        setConnectionState('disconnected');
+        scheduleRetry();
+      });
+    } catch (e) {
+      newClient.disconnect();
+      setConnectionState('error');
+      scheduleRetry();
+    }
+  }, [sessionConfig]);
+
+  const scheduleRetry = useCallback(() => {
+    if (retryCount.current >= MAX_RETRIES) {
+      console.error('[Connection] Maximum retry count reached');
+      setConnectionState('error');
+      return;
+    }
+
+    const delay = BASE_DELAY_MS * Math.pow(2, retryCount.current);
+    retryCount.current += 1;
+    console.log(`[Connection] Retrying in ${delay}ms... (${retryCount.current}/${MAX_RETRIES})`);
+    retryTimer.current = setTimeout(connect, delay);
+  }, [connect]);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      clearTimeout(retryTimer.current);
+      client?.disconnect();
+    };
+  }, []);
+
+  return { client, connectionState };
+}
+```
+
+### Monitoring Token Usage for Cost Control
+
+The `response.done` event includes detailed usage information. Log it to keep costs in check:
+
+```typescript
+client.on('response.done', (event) => {
+  const usage = event.response?.usage;
+  if (usage) {
+    console.log('[Cost Monitor]', {
+      inputAudioTokens: usage.input_token_details?.audio_tokens,
+      outputAudioTokens: usage.output_token_details?.audio_tokens,
+      inputTextTokens: usage.input_token_details?.text_tokens,
+      totalTokens: usage.total_tokens,
+    });
+    // Approximate pricing: audio input ~$0.06/1K tokens, audio output ~$0.24/1K tokens
+  }
+});
+```
+
+Practical cost optimization tips:
+
+- Set `max_response_output_tokens` to a reasonable limit (default is `inf`)
+- Keep system prompts concise — every token counts
+- Disconnect when the app goes to the background; reconnect on foreground return
+- Consider aggregating short silence periods before sending audio to reduce token consumption
+
+---
+
+## Security: Protecting Your API Key in Production
+
+### The Risk of Client-Side API Keys
+
+The architecture described so far connects directly from the mobile client to OpenAI's servers, which means the API key lives inside your app bundle. This is acceptable for development and prototyping, but a decompiled APK or IPA can expose the key.
+
+For production, always route through a **server-side proxy**:
+
+```
+User Device
+    ↕ WebSocket (custom app JWT)
+Your Backend Server (Cloudflare Workers / Node.js)
+    ↕ WebSocket
+OpenAI Realtime API (OpenAI API key)
+```
+
+### Minimal Proxy Server (Node.js / ws)
+
+```typescript
+// server/realtimeProxy.ts
+import { WebSocketServer, WebSocket } from 'ws';
+import { verifyAppToken } from './auth'; // Your own auth logic
+
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on('connection', async (clientWs, req) => {
+  const token = req.headers['x-app-token'] as string;
+  const user = await verifyAppToken(token);
+  if (!user) {
+    clientWs.close(4001, 'Unauthorized');
+    return;
+  }
+
+  // API key stays on the server — never sent to the client
+  const openaiWs = new WebSocket(
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'realtime=v1',
+      },
+    }
+  );
+
+  // Bidirectional proxy
+  clientWs.on('message', (data) => openaiWs.send(data));
+  openaiWs.on('message', (data) => clientWs.send(data));
+
+  clientWs.on('close', () => openaiWs.close());
+  openaiWs.on('close', () => clientWs.close());
+});
+```
+
+For deploying this kind of backend on Cloudflare Workers, see our [Cloudflare AI backend guide for Rork](/articles/rork-dev/rork-cloudflare-ai-backend).
+
+---
+
+## Adding a Waveform Animation
+
+Visual feedback makes the conversation feel alive. Here's a simple animated waveform component:
+
+```typescript
+// src/components/WaveformIndicator.tsx
+import React, { useEffect, useRef } from 'react';
+import { View, StyleSheet, Animated } from 'react-native';
+
+interface Props {
+  isActive: boolean;
+  color?: string;
+  barCount?: number;
+}
+
+export function WaveformIndicator({
+  isActive,
+  color = '#1a73e8',
+  barCount = 5,
+}: Props) {
+  const animations = useRef(
+    Array.from({ length: barCount }, () => new Animated.Value(0.3))
+  ).current;
+
+  useEffect(() => {
+    if (!isActive) {
+      animations.forEach((anim) => anim.setValue(0.3));
+      return;
+    }
+
+    const loops = animations.map((anim, i) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(i * 80),
+          Animated.timing(anim, {
+            toValue: 1,
+            duration: 300,
+            useNativeDriver: true,
+          }),
+          Animated.timing(anim, {
+            toValue: 0.3,
+            duration: 300,
+            useNativeDriver: true,
+          }),
+        ])
+      )
+    );
+
+    loops.forEach((loop) => loop.start());
+    return () => loops.forEach((loop) => loop.stop());
+  }, [isActive]);
+
+  return (
+    <View style={styles.container}>
+      {animations.map((anim, i) => (
+        <Animated.View
+          key={i}
+          style={[
+            styles.bar,
+            { backgroundColor: color, transform: [{ scaleY: anim }] },
+          ]}
+        />
+      ))}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    height: 40,
+  },
+  bar: { width: 4, height: 30, borderRadius: 2 },
+});
+```
+
+---
+
+## Frequently Asked Questions
+
+**Q: My WebSocket connection fails immediately. What should I check?**
+
+A: The Realtime API is still in beta and requires an OpenAI API key with Realtime API access enabled. Log into the OpenAI dashboard and confirm your key has the feature enabled. Also check whether your network environment (corporate proxy, firewall) is blocking persistent WebSocket connections — they behave differently from standard HTTPS requests.
+
+**Q: The audio plays back with crackling noise or static.**
+
+A: The most common cause is a sample rate mismatch. Make sure `AudioRecord.init` has `sampleRate: 24000` to match the API's expected format. If the noise persists, the chunk size may be too small for stable buffering — try increasing the buffer size in `react-native-audio-record`'s configuration.
+
+**Q: In server_vad mode, the AI keeps cutting itself off mid-sentence.**
+
+A: The VAD sensitivity may be too high. Add these parameters to your `turn_detection` config:
+
+```json
+"turn_detection": {
+  "type": "server_vad",
+  "threshold": 0.5,
+  "prefix_padding_ms": 300,
+  "silence_duration_ms": 600
+}
+```
+
+Increasing `silence_duration_ms` gives the user more time to pause naturally without triggering a premature response.
+
+**Q: Costs are running higher than expected. How do I reduce them?**
+
+A: A few things to check: Is the connection staying open while the app is in the background? (Disconnect in `AppState` background handlers and reconnect on foreground.) Is `max_response_output_tokens` unbounded? Set a reasonable cap like `512` or `1024`. Are your system instructions longer than necessary? Each token in the session configuration is counted toward usage.
+
+**Q: iOS audio stops playing when the app goes to the background.**
+
+A: Set `staysActiveInBackground: true` in `Audio.setAudioModeAsync`, and ensure `UIBackgroundModes` includes `audio` in your `Info.plist`. Rork Max can add this through the app configuration panel.
+
+---
+
+## Summary
+
+Integrating OpenAI's Realtime API into a Rork Max app enables voice conversations that feel genuinely natural — a quality that the traditional multi-step pipeline simply cannot match. Here's what we built:
+
+- **RealtimeClient**: A clean, event-driven WebSocket client with full connection lifecycle management
+- **useVoiceRecorder**: A hook that handles permissions, recording setup, and real-time audio chunk delivery
+- **useAudioPlayer**: A queued playback hook that plays streaming audio chunks without gaps or jitter
+- **useRealtimeConnection**: Robust reconnection with exponential backoff
+- **WaveformIndicator**: An animated visual cue that makes the conversation feel responsive
+
+As a natural next step, combining this voice interface with the [multi-AI orchestration patterns](/articles/rork-ai/rork-multi-ai-orchestration-guide) opens up the possibility of voice-controlled agents that can call external tools, query databases, or coordinate multiple specialized models — all via natural conversation.
+
+Voice AI is evolving at a remarkable pace, and the Realtime API sits at the frontier. Build something that genuinely surprises your users.
+
+For a deep dive into React Native audio and multimedia APIs, [*"React Native — Building Cross-Platform Mobile Apps"* by Nader Dabit](https://www.amazon.co.jp/dp/B0754N2N1T/?tag=pinocchio-22) remains one of the most comprehensive resources available.
