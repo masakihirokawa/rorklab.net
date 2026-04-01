@@ -1,0 +1,1013 @@
+---
+title: "Building a Production-Ready REST API with Rork, Hono.js & Cloudflare Workers — JWT Auth, D1, R2, and Rate Limiting"
+slug: "rork-hono-cloudflare-workers-rest-api-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-02T11:15"
+updated: "2026-04-02T11:15"
+author: "Rork Lab"
+description: "Build a production-grade REST API for your Rork app with Hono.js and Cloudflare Workers — JWT auth, D1 SQLite, R2 storage, and rate limiting, all from scratch."
+tags: ["Hono.js", "Cloudflare Workers", "REST API", "JWT", "D1", "R2", "rate limiting", "Rork", "backend", "TypeScript"]
+highlights:
+  - "Master Hono.js type-safe routing and built-in middleware to stand up a REST API on Cloudflare Workers in just a few hundred lines of code"
+  - "Learn how to combine JWT auth, KV session management, D1 (SQLite) persistence, and R2 file uploads into a unified middleware stack that holds up in production"
+  - "Walk through rate limiting, CORS, error handling, and CI/CD deployment with Wrangler — everything you need to scale a Rork app backend with confidence"
+---
+
+## Why Hono.js Changes the Backend Game for Indie Developers
+
+Every Rork app eventually needs a backend. User authentication, data persistence, third-party integrations — none of these can safely live on the client side. When indie developers hit this wall, the usual reflex is to reach for Express.js or NestJS. But in 2026, there is a smarter option: **Hono.js** running on **Cloudflare Workers**.
+
+Hono (Japanese for "flame") is an ultra-lightweight web framework built specifically for edge environments. Its core bundle weighs under 12 KB. Paired with Cloudflare Workers' zero-cold-start runtime, you get sub-millisecond API latency served from data centers around the world — with no server to manage.
+
+### Hono.js vs tRPC: When to Use Which
+
+We have already published a deep-dive on [type-safe backend development with tRPC and Cloudflare Workers](/articles/rork-dev/rork-trpc-cloudflare-workers-type-safe-backend-guide). So why cover Hono.js separately?
+
+tRPC shines in a fully TypeScript-first monorepo where every client is under your control. Hono.js is the better choice when you need traditional REST semantics — think external consumers, iOS native clients calling your API, or third-party webhook integrations. It also supports REST, GraphQL, and RPC patterns, making it significantly more flexible.
+
+---
+
+## Prerequisites and Environment Setup
+
+### What You Will Need
+
+- Node.js 20 or later
+- A Cloudflare account (free tier works)
+- Wrangler CLI (Cloudflare's official deployment tool)
+- A Rork or Rork Max account
+
+### Installing Wrangler and Authenticating
+
+```bash
+# Install Wrangler globally
+npm install -g wrangler
+
+# Authenticate with your Cloudflare account
+wrangler login
+
+# Confirm the version
+wrangler --version
+# Expected output: wrangler 3.x.x
+```
+
+### Scaffolding the Project
+
+```bash
+# Bootstrap from the Hono Cloudflare Workers template
+npm create hono@latest rork-api-backend
+# When prompted for a template, choose: cloudflare-workers
+
+cd rork-api-backend
+
+# Install additional packages
+npm install hono
+npm install --save-dev @cloudflare/workers-types wrangler
+```
+
+### Configuring wrangler.toml
+
+```toml
+# wrangler.toml
+name = "rork-api-backend"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+# D1 database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "rork_app_db"
+database_id = "YOUR_D1_DATABASE_ID"  # obtained via: wrangler d1 create
+
+# KV namespace binding (session management)
+[[kv_namespaces]]
+binding = "SESSION_KV"
+id = "YOUR_KV_NAMESPACE_ID"  # obtained via: wrangler kv:namespace create
+
+# R2 bucket binding (file storage)
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "rork-app-storage"
+
+# Environment variables (secrets go via: wrangler secret put)
+[vars]
+ENVIRONMENT = "production"
+```
+
+---
+
+## Designing the D1 Database Schema
+
+Start by defining your data model. This guide walks through a user-management API as a practical example.
+
+```sql
+-- migrations/001_initial.sql
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  display_name TEXT,
+  avatar_url TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT UNIQUE NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+```
+
+Applying the migration:
+
+```bash
+# Run locally first
+wrangler d1 execute rork_app_db --local --file=migrations/001_initial.sql
+
+# Then apply to production
+wrangler d1 execute rork_app_db --remote --file=migrations/001_initial.sql
+```
+
+---
+
+## The Main Application Entry Point
+
+```typescript
+// src/index.ts
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+import { logger } from 'hono/logger'
+import { secureHeaders } from 'hono/secure-headers'
+import { authRouter } from './routes/auth'
+import { usersRouter } from './routes/users'
+import { filesRouter } from './routes/files'
+import { rateLimitMiddleware } from './middleware/rateLimit'
+import { errorHandler } from './middleware/errorHandler'
+
+// Cloudflare Workers Bindings type
+type Bindings = {
+  DB: D1Database
+  SESSION_KV: KVNamespace
+  STORAGE: R2Bucket
+  JWT_SECRET: string
+  ENVIRONMENT: string
+}
+
+const app = new Hono<{ Bindings: Bindings }>()
+
+// Global middleware stack
+app.use('*', logger())
+app.use('*', secureHeaders())
+app.use('*', cors({
+  origin: ['https://yourrorkapp.com', 'exp://localhost'],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400,
+}))
+app.use('*', rateLimitMiddleware)
+
+// Global error handler
+app.onError(errorHandler)
+
+// Health check
+app.get('/health', (c) => c.json({
+  status: 'ok',
+  environment: c.env.ENVIRONMENT,
+  timestamp: new Date().toISOString(),
+}))
+
+// Route registration
+app.route('/api/v1/auth', authRouter)
+app.route('/api/v1/users', usersRouter)
+app.route('/api/v1/files', filesRouter)
+
+app.notFound((c) => c.json({ error: 'Not Found', path: c.req.path }, 404))
+
+export default app
+```
+
+---
+
+## JWT Authentication Middleware
+
+```typescript
+// src/middleware/auth.ts
+import { Context, Next } from 'hono'
+import { verify } from 'hono/jwt'
+
+export type JWTPayload = {
+  sub: string   // user ID
+  email: string
+  iat: number
+  exp: number
+}
+
+export const authMiddleware = async (c: Context, next: Next) => {
+  const authHeader = c.req.header('Authorization')
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized: No token provided' }, 401)
+  }
+
+  const token = authHeader.slice(7)
+
+  try {
+    const payload = await verify(token, c.env.JWT_SECRET) as JWTPayload
+
+    if (payload.exp < Math.floor(Date.now() / 1000)) {
+      return c.json({ error: 'Unauthorized: Token expired' }, 401)
+    }
+
+    c.set('jwtPayload', payload)
+    c.set('userId', payload.sub)
+
+    await next()
+  } catch {
+    return c.json({ error: 'Unauthorized: Invalid token' }, 401)
+  }
+}
+```
+
+### Auth Routes
+
+```typescript
+// src/routes/auth.ts
+import { Hono } from 'hono'
+import { sign } from 'hono/jwt'
+import { zValidator } from '@hono/zod-validator'
+import { z } from 'zod'
+import { hashPassword, verifyPassword } from '../utils/crypto'
+
+type Bindings = { DB: D1Database; SESSION_KV: KVNamespace; JWT_SECRET: string }
+
+export const authRouter = new Hono<{ Bindings: Bindings }>()
+
+const registerSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  displayName: z.string().min(1).max(50).optional(),
+})
+
+// Registration endpoint
+authRouter.post('/register', zValidator('json', registerSchema), async (c) => {
+  const { email, password, displayName } = c.req.valid('json')
+
+  const existing = await c.env.DB.prepare(
+    'SELECT id FROM users WHERE email = ?'
+  ).bind(email).first()
+
+  if (existing) {
+    return c.json({ error: 'An account with this email already exists' }, 409)
+  }
+
+  const passwordHash = await hashPassword(password)
+  const userId = crypto.randomUUID()
+
+  await c.env.DB.prepare(
+    'INSERT INTO users (id, email, password_hash, display_name) VALUES (?, ?, ?, ?)'
+  ).bind(userId, email, passwordHash, displayName ?? null).run()
+
+  const token = await sign(
+    {
+      sub: userId,
+      email,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30, // 30 days
+    },
+    c.env.JWT_SECRET
+  )
+
+  return c.json({ message: 'Account created', token, user: { id: userId, email, displayName } }, 201)
+})
+
+// Login endpoint
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+})
+
+authRouter.post('/login', zValidator('json', loginSchema), async (c) => {
+  const { email, password } = c.req.valid('json')
+
+  const user = await c.env.DB.prepare(
+    'SELECT id, email, password_hash, display_name FROM users WHERE email = ?'
+  ).bind(email).first<{ id: string; email: string; password_hash: string; display_name: string | null }>()
+
+  if (!user) {
+    // Constant-time response to prevent timing attacks
+    await hashPassword('dummy_timing_attack_prevention')
+    return c.json({ error: 'Invalid email or password' }, 401)
+  }
+
+  const isValid = await verifyPassword(password, user.password_hash)
+  if (!isValid) {
+    return c.json({ error: 'Invalid email or password' }, 401)
+  }
+
+  const token = await sign(
+    {
+      sub: user.id,
+      email: user.email,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30,
+    },
+    c.env.JWT_SECRET
+  )
+
+  return c.json({ token, user: { id: user.id, email: user.email, displayName: user.display_name } })
+})
+```
+
+---
+
+## R2 File Upload Implementation
+
+```typescript
+// src/routes/files.ts
+import { Hono } from 'hono'
+import { authMiddleware } from '../middleware/auth'
+
+type Bindings = { STORAGE: R2Bucket }
+type Variables = { userId: string }
+
+export const filesRouter = new Hono<{ Bindings: Bindings; Variables: Variables }>()
+
+filesRouter.use('*', authMiddleware)
+
+filesRouter.post('/upload', async (c) => {
+  const userId = c.get('userId')
+  const formData = await c.req.formData()
+  const file = formData.get('file') as File | null
+
+  if (!file) return c.json({ error: 'No file provided' }, 400)
+
+  const MAX_SIZE = 10 * 1024 * 1024 // 10 MB
+  if (file.size > MAX_SIZE) {
+    return c.json({ error: 'File exceeds 10 MB limit' }, 413)
+  }
+
+  const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+  if (!ALLOWED_TYPES.includes(file.type)) {
+    return c.json({ error: 'Supported formats: JPEG, PNG, WebP, GIF' }, 415)
+  }
+
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? 'bin'
+  const objectKey = `uploads/${userId}/${crypto.randomUUID()}.${ext}`
+
+  await c.env.STORAGE.put(objectKey, await file.arrayBuffer(), {
+    httpMetadata: {
+      contentType: file.type,
+      cacheControl: 'public, max-age=31536000',
+    },
+    customMetadata: {
+      uploadedBy: userId,
+      originalName: file.name,
+    },
+  })
+
+  const publicUrl = `https://assets.yourapp.com/${objectKey}`
+  return c.json({ url: publicUrl, key: objectKey }, 201)
+})
+
+filesRouter.delete('/:key', async (c) => {
+  const userId = c.get('userId')
+  const key = c.req.param('key')
+
+  const object = await c.env.STORAGE.head(`uploads/${userId}/${key}`)
+  if (!object) return c.json({ error: 'File not found' }, 404)
+
+  await c.env.STORAGE.delete(`uploads/${userId}/${key}`)
+  return c.json({ message: 'File deleted' })
+})
+```
+
+---
+
+## Rate Limiting Middleware
+
+```typescript
+// src/middleware/rateLimit.ts
+import { Context, Next } from 'hono'
+
+type Bindings = { SESSION_KV: KVNamespace }
+
+const RATE_LIMIT = {
+  windowMs: 60 * 1000,
+  maxRequests: 60,
+  authMaxRequests: 5,
+}
+
+export const rateLimitMiddleware = async (
+  c: Context<{ Bindings: Bindings }>,
+  next: Next
+) => {
+  const clientIp = c.req.header('CF-Connecting-IP') ?? '0.0.0.0'
+  const path = c.req.path
+  const now = Math.floor(Date.now() / 1000)
+  const windowStart = now - (now % 60)
+
+  const isAuthEndpoint = path.includes('/auth/')
+  const maxRequests = isAuthEndpoint
+    ? RATE_LIMIT.authMaxRequests
+    : RATE_LIMIT.maxRequests
+
+  const kvKey = `rate_limit:${clientIp}:${path.split('/')[3]}:${windowStart}`
+  const current = await c.env.SESSION_KV.get(kvKey)
+  const count = current ? parseInt(current, 10) + 1 : 1
+
+  if (count > maxRequests) {
+    return c.json(
+      {
+        error: 'Too Many Requests',
+        message: 'Rate limit exceeded. Please try again in a minute.',
+        retryAfter: windowStart + 60 - now,
+      },
+      429,
+      {
+        'Retry-After': String(windowStart + 60 - now),
+        'X-RateLimit-Limit': String(maxRequests),
+        'X-RateLimit-Remaining': '0',
+        'X-RateLimit-Reset': String(windowStart + 60),
+      }
+    )
+  }
+
+  await c.env.SESSION_KV.put(kvKey, String(count), { expirationTtl: 65 })
+  c.header('X-RateLimit-Limit', String(maxRequests))
+  c.header('X-RateLimit-Remaining', String(maxRequests - count))
+  c.header('X-RateLimit-Reset', String(windowStart + 60))
+
+  await next()
+}
+```
+
+---
+
+## Calling the API from Your Rork App
+
+```typescript
+// lib/apiClient.ts (inside your Rork project)
+import AsyncStorage from '@react-native-async-storage/async-storage'
+
+const API_BASE_URL = 'https://rork-api-backend.YOUR_SUBDOMAIN.workers.dev/api/v1'
+
+class ApiClient {
+  private async getToken(): Promise<string | null> {
+    return AsyncStorage.getItem('auth_token')
+  }
+
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const token = await this.getToken()
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (token) headers['Authorization'] = `Bearer ${token}`
+
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    })
+
+    if (!response.ok) {
+      const error = await response.json() as { error: string }
+      throw new Error(error.error ?? `HTTP ${response.status}`)
+    }
+
+    return response.json() as T
+  }
+
+  async register(email: string, password: string, displayName?: string) {
+    return this.request<{ token: string; user: User }>(
+      'POST', '/auth/register', { email, password, displayName }
+    )
+  }
+
+  async login(email: string, password: string) {
+    return this.request<{ token: string; user: User }>(
+      'POST', '/auth/login', { email, password }
+    )
+  }
+
+  async getProfile() {
+    return this.request<User>('GET', '/users/me')
+  }
+
+  async uploadAvatar(imageUri: string) {
+    const token = await this.getToken()
+    const formData = new FormData()
+    formData.append('file', { uri: imageUri, type: 'image/jpeg', name: 'avatar.jpg' } as unknown as Blob)
+
+    const response = await fetch(`${API_BASE_URL}/files/upload`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData,
+    })
+
+    if (!response.ok) throw new Error('Upload failed')
+    return response.json() as Promise<{ url: string }>
+  }
+}
+
+export const apiClient = new ApiClient()
+export type User = { id: string; email: string; displayName: string | null }
+```
+
+---
+
+## CI/CD with GitHub Actions and Wrangler
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: deploy --env production
+```
+
+Registering your JWT secret:
+
+```bash
+# Securely store the secret in Workers' encrypted environment
+wrangler secret put JWT_SECRET
+# Enter a random string of at least 32 characters when prompted
+
+# For local development only:
+echo 'JWT_SECRET="your-super-secret-key-minimum-32-chars"' >> .dev.vars
+```
+
+---
+
+## Performance Tuning for Production
+
+### Avoid N+1 Queries in D1
+
+```typescript
+// Avoid: fetching related data in a loop
+const users = await db.prepare('SELECT * FROM users').all()
+for (const user of users.results) {
+  const posts = await db.prepare('SELECT * FROM posts WHERE user_id = ?')
+    .bind(user.id).all()
+}
+
+// Prefer: a single JOIN query
+const { results } = await db.prepare(`
+  SELECT u.id, u.email, COUNT(p.id) as post_count
+  FROM users u
+  LEFT JOIN posts p ON p.user_id = u.id
+  GROUP BY u.id
+  LIMIT 50
+`).all()
+```
+
+### KV Caching to Reduce D1 Reads
+
+Caching frequently read records in KV drastically reduces D1 read costs and improves latency.
+
+```typescript
+async function getCachedUser(userId: string, kv: KVNamespace, db: D1Database) {
+  const cacheKey = `user:${userId}`
+  const cached = await kv.get(cacheKey, 'json')
+  if (cached) return cached
+
+  const user = await db.prepare(
+    'SELECT id, email, display_name, avatar_url FROM users WHERE id = ?'
+  ).bind(userId).first()
+
+  if (user) {
+    await kv.put(cacheKey, JSON.stringify(user), { expirationTtl: 300 }) // 5-minute TTL
+  }
+
+  return user
+}
+```
+
+### Structured Error Handling
+
+```typescript
+// src/middleware/errorHandler.ts
+import { Context } from 'hono'
+
+export const errorHandler = (err: Error, c: Context) => {
+  const isProd = c.env.ENVIRONMENT === 'production'
+
+  console.error('[Error]', {
+    path: c.req.path,
+    method: c.req.method,
+    error: err.message,
+    stack: err.stack,
+  })
+
+  if (err.name === 'ZodError') {
+    return c.json({ error: 'Validation Error', details: isProd ? undefined : err.message }, 400)
+  }
+
+  return c.json(
+    {
+      error: 'Internal Server Error',
+      message: isProd ? 'Something went wrong on our end.' : err.message,
+    },
+    500
+  )
+}
+```
+
+---
+
+## Advanced Patterns: Middleware Chaining and Typed Context
+
+One of Hono.js's most powerful features is its ability to attach typed variables to request context and chain middleware cleanly. This pattern is especially useful when building protected routes that need both authentication and role-based authorization.
+
+### Typed Context Variables
+
+```typescript
+// src/types/context.ts
+import type { JWTPayload } from '../middleware/auth'
+
+// Define all variables your middleware can set on the context
+export type AppVariables = {
+  jwtPayload: JWTPayload
+  userId: string
+  userRole: 'admin' | 'member' | 'guest'
+}
+
+// A reusable app type for authenticated routes
+export type AuthenticatedHono = Hono<{
+  Bindings: Bindings
+  Variables: AppVariables
+}>
+```
+
+### Role-Based Access Control Middleware
+
+```typescript
+// src/middleware/rbac.ts
+import { Context, Next } from 'hono'
+import { AppVariables } from '../types/context'
+
+type RequiredRole = 'admin' | 'member'
+
+export const requireRole = (role: RequiredRole) => {
+  return async (c: Context<{ Variables: AppVariables }>, next: Next) => {
+    const userRole = c.get('userRole')
+
+    const roleHierarchy: Record<string, number> = {
+      guest: 0,
+      member: 1,
+      admin: 2,
+    }
+
+    if ((roleHierarchy[userRole] ?? 0) < roleHierarchy[role]) {
+      return c.json(
+        { error: 'Forbidden', message: `This action requires ${role} permissions` },
+        403
+      )
+    }
+
+    await next()
+  }
+}
+
+// Usage in a route file:
+// adminRouter.delete('/users/:id', authMiddleware, requireRole('admin'), async (c) => { ... })
+```
+
+### Request Validation with Zod and Custom Error Messages
+
+The `@hono/zod-validator` package integrates Zod schemas directly into your route definitions, giving you runtime type safety that mirrors your TypeScript types:
+
+```typescript
+// src/routes/users.ts (partial)
+import { zValidator } from '@hono/zod-validator'
+import { z } from 'zod'
+
+const updateProfileSchema = z.object({
+  displayName: z
+    .string()
+    .min(1, 'Display name cannot be empty')
+    .max(50, 'Display name cannot exceed 50 characters')
+    .optional(),
+  avatarUrl: z
+    .string()
+    .url('Must be a valid URL')
+    .optional(),
+}).strict() // Rejects any extra keys sent by the client
+
+usersRouter.put(
+  '/me',
+  authMiddleware,
+  zValidator('json', updateProfileSchema, (result, c) => {
+    // Custom error response format
+    if (!result.success) {
+      return c.json({
+        error: 'Validation failed',
+        fields: result.error.flatten().fieldErrors,
+      }, 400)
+    }
+  }),
+  async (c) => {
+    const userId = c.get('userId')
+    const updates = c.req.valid('json')
+
+    const setClauses: string[] = []
+    const values: unknown[] = []
+
+    if (updates.displayName !== undefined) {
+      setClauses.push('display_name = ?')
+      values.push(updates.displayName)
+    }
+    if (updates.avatarUrl !== undefined) {
+      setClauses.push('avatar_url = ?')
+      values.push(updates.avatarUrl)
+    }
+
+    if (setClauses.length === 0) {
+      return c.json({ message: 'Nothing to update' })
+    }
+
+    setClauses.push('updated_at = datetime(\'now\')')
+    values.push(userId)
+
+    await c.env.DB.prepare(
+      `UPDATE users SET ${setClauses.join(', ')} WHERE id = ?`
+    ).bind(...values).run()
+
+    return c.json({ message: 'Profile updated successfully' })
+  }
+)
+```
+
+---
+
+## Monitoring and Observability
+
+A backend without visibility is a liability. Cloudflare Workers surfaces logs and metrics natively, but you can enhance observability significantly with structured logging and error aggregation.
+
+### Structured Request Logging
+
+```typescript
+// src/middleware/requestLogger.ts
+import { Context, Next } from 'hono'
+
+export const requestLogger = async (c: Context, next: Next) => {
+  const start = Date.now()
+  const method = c.req.method
+  const path = c.req.path
+  const ip = c.req.header('CF-Connecting-IP') ?? 'unknown'
+  const country = c.req.header('CF-IPCountry') ?? 'XX'
+
+  await next()
+
+  const duration = Date.now() - start
+  const status = c.res.status
+
+  // Cloudflare Workers captures console.log output in real-time logs
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    method,
+    path,
+    status,
+    duration_ms: duration,
+    ip,
+    country,
+    // Log slow requests (>200ms) for D1 query analysis
+    slow: duration > 200,
+  }))
+}
+```
+
+Access your live logs from the Cloudflare dashboard or via the CLI:
+
+```bash
+# Stream live logs from your production Worker
+wrangler tail --format pretty
+
+# Filter to errors only
+wrangler tail --format pretty --status error
+```
+
+### Tracking D1 Query Performance
+
+D1 is fast for most workloads, but query analysis helps you catch regressions before they hit users:
+
+```typescript
+// Utility for timed D1 queries in development
+async function timedQuery<T>(
+  label: string,
+  query: D1PreparedStatement
+): Promise<D1Result<T>> {
+  const start = Date.now()
+  const result = await query.all<T>()
+  const elapsed = Date.now() - start
+
+  if (elapsed > 100) {
+    console.warn(`[SLOW QUERY] ${label}: ${elapsed}ms`)
+  }
+
+  return result
+}
+
+// Usage
+const { results } = await timedQuery(
+  'list-users',
+  db.prepare('SELECT id, email FROM users ORDER BY created_at DESC LIMIT 20')
+)
+```
+
+---
+
+## Testing Your Hono.js Worker
+
+Cloudflare provides `@cloudflare/vitest-pool-workers` for running tests in a real Workers runtime environment, which means your D1 and KV bindings behave exactly as they would in production.
+
+### Setup
+
+```bash
+npm install --save-dev vitest @cloudflare/vitest-pool-workers
+```
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: {
+    pool: '@cloudflare/vitest-pool-workers',
+    poolOptions: {
+      workers: {
+        wrangler: { configPath: './wrangler.toml' },
+      },
+    },
+  },
+})
+```
+
+### Writing Integration Tests
+
+```typescript
+// src/routes/auth.test.ts
+import { describe, it, expect, beforeEach } from 'vitest'
+import { env, SELF } from 'cloudflare:test'
+import app from '../index'
+
+describe('POST /api/v1/auth/register', () => {
+  it('creates a new user and returns a JWT token', async () => {
+    const res = await SELF.fetch('http://localhost/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'test@example.com',
+        password: 'SecurePass123!',
+        displayName: 'Test User',
+      }),
+    })
+
+    expect(res.status).toBe(201)
+    const body = await res.json() as { token: string; user: { id: string } }
+    expect(body.token).toBeTruthy()
+    expect(body.user.id).toBeTruthy()
+  })
+
+  it('rejects duplicate email addresses', async () => {
+    // Register once
+    await SELF.fetch('http://localhost/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'dupe@example.com', password: 'SecurePass123!' }),
+    })
+
+    // Register again with the same email
+    const res = await SELF.fetch('http://localhost/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'dupe@example.com', password: 'AnotherPass456!' }),
+    })
+
+    expect(res.status).toBe(409)
+  })
+
+  it('returns 400 for invalid email format', async () => {
+    const res = await SELF.fetch('http://localhost/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'not-an-email', password: 'SecurePass123!' }),
+    })
+
+    expect(res.status).toBe(400)
+  })
+})
+```
+
+Run the test suite:
+
+```bash
+npx vitest run
+# Or in watch mode during development:
+npx vitest
+```
+
+---
+
+## Common Issues and How to Fix Them
+
+### CORS errors on the Rork client
+
+**Cause**: The `origin` array in your CORS middleware doesn't include your app's actual origin.
+
+**Fix**: Add `http://localhost:8081` (Expo dev server) during development, and your production domain for release builds. Double-check the allowed methods and headers as well.
+
+### D1 queries timing out
+
+**Cause**: Missing indexes causing full table scans on large datasets.
+
+**Fix**: Run `EXPLAIN QUERY PLAN` on slow queries. If an index is not being used, add one with `CREATE INDEX`. For very large tables, consider partitioning your data or moving to a caching strategy first.
+
+### R2 upload failures
+
+**Cause**: Workers CPU time limit (10ms on free tier) exceeded during large file processing.
+
+**Fix**: For large files, generate a presigned URL and let the client upload directly to R2. This bypasses the Worker entirely and removes the size constraint.
+
+---
+
+## FAQ
+
+**Q. Can I use the Cloudflare Workers free tier in production?**
+
+A. Yes — the free tier covers 100,000 requests per day, 500 MB of D1 storage, and 5 million D1 row reads per day. For most solo-dev apps in the early growth phase, that is more than enough. When you start seeing consistent traffic, the Workers Paid Plan ($5/month) unlocks much higher limits.
+
+**Q. How should I securely store the JWT token in my Rork app?**
+
+A. Avoid plain `AsyncStorage` for sensitive tokens. Use `expo-secure-store`, which writes to iOS Keychain and Android Keystore. For a deeper look at authentication architecture, check the [B2B SaaS Multitenant RBAC Guide](/articles/rork-dev/rork-b2b-saas-multitenant-rbac-complete-guide).
+
+**Q. Does Hono.js support WebSockets?**
+
+A. Yes. Combined with Cloudflare Durable Objects, Hono's `upgradeWebSocket()` helper enables bidirectional real-time communication — perfect for collaborative features or live dashboards.
+
+**Q. Can multiple Rork apps share the same backend?**
+
+A. Absolutely. Use environment variables to identify each app and apply Row-Level Security policies in D1 to keep data isolated. The [Supabase Edge Functions & RLS API Design Guide](/articles/rork-dev/rork-max-supabase-edge-functions-rls-api-design) shows patterns that translate directly to D1 as well.
+
+**Q. How do I handle database migrations safely in production?**
+
+A. Never run raw SQL against your production D1 database manually. Instead, version every schema change as a numbered SQL file under `migrations/` and run them through Wrangler: `wrangler d1 execute rork_app_db --remote --file=migrations/002_add_roles.sql`. Keep a `schema_migrations` table to track which migrations have run, and always test migrations against your local D1 first with the `--local` flag. For teams, consider wrapping this in a GitHub Actions step that runs migrations automatically before deploying the Worker.
+
+**Q. What is the best strategy for handling file uploads larger than 10 MB?**
+
+A. For large files, bypass the Worker entirely and use **R2 presigned upload URLs**. The flow is: your Worker generates a presigned URL (valid for a short window, e.g., 15 minutes) and returns it to the Rork client. The client then uploads directly from the device to R2, completely skipping the Worker's CPU and memory limits. Once the upload is complete, the client calls a lightweight Worker endpoint to record the file metadata in D1. This pattern scales to gigabytes without any Worker configuration changes.
+
+**Q. Is it possible to add real-time push notifications from this backend?**
+
+A. Yes. You have two good options. First, integrate with Expo's push notification service by calling the Expo Push API from a Worker endpoint whenever you need to notify a user — this keeps things simple and works well for most cases. Second, for truly real-time use cases (live feeds, collaborative editing), pair Cloudflare Durable Objects with Hono's WebSocket support for persistent bidirectional connections. Both approaches can coexist in the same Worker.
+
+---
+
+## Summary
+
+We have walked through building a full production-grade REST API backend for a Rork app using Hono.js and Cloudflare Workers — covering JWT authentication, D1 database operations, R2 file uploads, KV caching, rate limiting, error handling, and automated deployment via GitHub Actions.
+
+The key takeaway is that Hono.js lets you accomplish in a few hundred lines what would require a much heavier framework elsewhere, while Cloudflare Workers delivers global edge performance without any infrastructure management.
+
+To explore the RPC side of the equation, pair this guide with our [tRPC × Cloudflare Workers Type-Safe Backend Guide](/articles/rork-dev/rork-trpc-cloudflare-workers-type-safe-backend-guide) — together they give you a complete picture of modern edge-native API design.
+
+For teams scaling beyond solo development, the patterns covered here — typed context variables, role-based middleware, structured logging, and integration testing with real Cloudflare bindings — provide a solid foundation that grows with your product. Start lean, add layers as complexity demands, and let Cloudflare's global network handle the infrastructure.
+
+If you want to go deeper on the Cloudflare ecosystem, [The Cloudflare Workers Handbook](https://www.amazon.co.jp/dp/4798173339/?tag=pinocchio-22) is an excellent companion resource covering routing, security, and deployment patterns in detail.
