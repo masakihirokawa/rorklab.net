@@ -28,11 +28,11 @@ const BOOKS: Record<string, Book[]> = {
       topics: ["ai", "prompt", "beginner"],
     },
     {
-      title: "データサイエンス入門",
-      author: "上田雅夫",
-      url: "https://www.amazon.co.jp/dp/4641166110/?tag=pinocchio-22",
-      tag: "AI入門",
-      topics: ["ai", "data", "beginner"],
+      title: "Claude CodeによるAI駆動開発入門",
+      author: "平川知秀",
+      url: "https://www.amazon.co.jp/dp/4297152754/?tag=pinocchio-22",
+      tag: "AI駆動開発",
+      topics: ["ai", "dev", "agent", "claude"],
     },
     {
       title: "AIエージェント開発／運用入門",
@@ -174,11 +174,11 @@ const BOOKS: Record<string, Book[]> = {
       topics: ["ai", "data", "python"],
     },
     {
-      title: "Designing Multi-Agent Systems",
-      author: "Victor Dibia",
-      url: "https://www.amazon.co.jp/s?k=Designing+Multi-Agent+Systems+Dibia&tag=pinocchio-22",
-      tag: "Agents",
-      topics: ["ai", "agent", "dev"],
+      title: "AI Agents with MCP",
+      author: "Kyle Stratis",
+      url: "https://www.amazon.co.jp/dp/B0FYCBVGX7/?tag=pinocchio-22",
+      tag: "MCP/Agents",
+      topics: ["ai", "agent", "api", "dev"],
     },
     {
       title: "Prompt Engineering for Generative AI",
