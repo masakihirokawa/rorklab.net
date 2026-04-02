@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MARKET — 2026 年 4 月最新：ノーコード AI モバイル市場は 2032 年に $264B 規模へ、AI アプリビルダーが急成長（4/1）",
-    "ARR — Rork Max がローンチ 3 日間で $1.5M ARR を達成、a16z $2.8M 調達・月間 74 万訪問・成長率 85%（3/28）",
-    "MAX — Rork Max の SwiftUI ネイティブアプリ：クラウド Mac ビルド＋ライブシミュレーターで Xcode 不要（4/1）",
-    "NATIVE — Rork Max が AR/LiDAR・Metal 3D・Dynamic Island・Live Activities・HealthKit を完全サポート（4/1）",
-    "VISION — Rork Max が Vision Pro・Apple Watch・Apple TV・iMessage・App Clips を単一プロンプトで生成（4/1）",
-    "PUBLISH — Rork Max は 2 クリックで App Store 公開、Rork Companion で有料開発者アカウント不要の実機テストも（4/1）",
+    "RORKMAX — Rork Max が SwiftUI ネイティブアプリ生成で新時代へ、クラウド Mac ビルド＋ライブシミュレーター完備（4/3）",
+    "ARR — Rork が $2.8M a16z 調達、月間 74 万訪問・85% 成長・$1.5M ARR を 3 日で達成（4/3）",
+    "NATIVE — Rork Max が Vision Pro・Apple Watch・Apple TV・Dynamic Island・Live Activities・Core ML サポート（4/3）",
+    "PUBLISH — Rork Max は 2 クリックで App Store 公開、Rork Companion で実機テスト無料・開発者登録不要（4/3）",
+    "MARKET — ノーコード AI モバイル市場が 2032 年に $264B 規模へ、低コード開発が新規アプリの 75% を占める（4/3）",
+    "TEAM — Rork が Claude Opus 4.6・Gemini 3 Pro・GPT モデル統合で高精度コード生成、複数 AI バックエンド対応（4月）",
   ],
   en: [
-    "MARKET — April 2026: No-code AI mobile market projected to hit $264B by 2032, with AI app builders leading growth (4/1)",
-    "ARR — Rork Max hit $1.5M ARR in 3 days post-launch; a16z $2.8M funding, 743K monthly visits, 85% growth rate (3/28)",
-    "MAX — Rork Max builds native SwiftUI apps via cloud Mac builds and a live simulator — zero Xcode needed (4/1)",
-    "NATIVE — Rork Max supports AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, HealthKit & HomeKit natively (4/1)",
-    "VISION — Rork Max generates apps for Vision Pro, Apple Watch, Apple TV, iMessage & App Clips from one prompt (4/1)",
-    "PUBLISH — Rork Max ships to App Store in 2 clicks; Rork Companion enables real-device testing without a paid dev account (4/1)",
+    "RORKMAX — Rork Max launches native SwiftUI app generation with cloud Mac builds and live simulator preview (4/3)",
+    "ARR — Rork raises $2.8M a16z, hits 743K monthly visits, 85% growth, and $1.5M ARR in 3 days (4/3)",
+    "NATIVE — Rork Max supports Vision Pro, Apple Watch, Apple TV, Dynamic Island, Live Activities, and Core ML (4/3)",
+    "PUBLISH — Rork Max ships to App Store in 2 clicks; Rork Companion offers free real-device testing without paid dev account (4/3)",
+    "MARKET — No-code AI mobile market projected $264B by 2032; low-code will drive 75% of new development (4/3)",
+    "TEAM — Rork integrates Claude Opus 4.6, Gemini 3 Pro, and GPT models for multi-AI code generation backends (April)",
   ],
 };
 
