@@ -123,13 +123,14 @@ async function generateArticleIndex() {
           console.warn(`  ⚠ WARNING: ${locale}/${category}/${file}: hardcoded locale-prefixed article link found. Fix: use /articles/... (JA) or /en/articles/... (EN)`);
         }
 
-        // Write HTML content to separate file
+        // Write individual HTML content to public/content/articles/{locale}/{category}/{slug}.html
         const htmlDir = path.join(CONTENT_HTML_DIR, "articles", locale, category);
         if (!fs.existsSync(htmlDir)) {
           fs.mkdirSync(htmlDir, { recursive: true });
         }
         fs.writeFileSync(path.join(htmlDir, `${slug}.html`), html, "utf-8");
 
+        // Metadata only — content is served as a static asset
         result[locale].push({
           title: data.title || "",
           slug,
@@ -142,6 +143,7 @@ async function generateArticleIndex() {
           tags: data.tags || [],
           premium: data.premium || false,
           ...(data.highlights ? { highlights: data.highlights } : {}),
+          highlights: data.highlights || null,
         });
       }
     }
@@ -199,7 +201,7 @@ async function generateArticleIndex() {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   }
 
-  // Write articles index
+  // Write metadata-only articles index (content is in public/content/articles/)
   fs.writeFileSync(
     path.join(OUTPUT_DIR, "articles.json"),
     JSON.stringify(result, null, 2),
@@ -210,8 +212,9 @@ async function generateArticleIndex() {
     (sum, articles) => sum + articles.length,
     0
   );
+  const metaSize = (Buffer.byteLength(JSON.stringify(result)) / 1024).toFixed(0);
   console.log(
-    `✓ Generated article index: ${totalArticles} articles across ${locales.length} locales`
+    `✓ Generated article index: ${totalArticles} articles across ${locales.length} locales (metadata: ${metaSize} KB, content: public/content/articles/)`
   );
 }
 
@@ -235,23 +238,16 @@ async function generateBlogIndex() {
       const { data, content } = matter(raw);
       const slug = file.replace(/\.mdx$/, "");
 
-      // Strip hardcoded "## 関連記事" / "## Related Articles" sections (RelatedArticles.tsx handles this dynamically)
-      let cleanedContent = content;
-      const relatedPattern = /\n---\s*\n+##\s*(関連記事|Related Articles)\s*\n[\s\S]*$/;
-      if (relatedPattern.test(cleanedContent)) {
-        console.warn(`  ⚠ AUTO-FIX: ${locale}/${file}: removed hardcoded related articles section (RelatedArticles.tsx handles this)`);
-        cleanedContent = cleanedContent.replace(relatedPattern, '\n');
-      }
+      const html = await compileMarkdown(content);
 
-      const html = await compileMarkdown(cleanedContent);
-
-      // Write HTML content to separate file
+      // Write individual HTML content to public/content/blog/{locale}/{slug}.html
       const htmlDir = path.join(CONTENT_HTML_DIR, "blog", locale);
       if (!fs.existsSync(htmlDir)) {
         fs.mkdirSync(htmlDir, { recursive: true });
       }
       fs.writeFileSync(path.join(htmlDir, `${slug}.html`), html, "utf-8");
 
+      // Metadata only — content is served as a static asset
       result[locale].push({
         title: data.title || "",
         slug,
@@ -316,6 +312,7 @@ async function generateBlogIndex() {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   }
 
+  // Write metadata-only blog index (content is in public/content/blog/)
   fs.writeFileSync(
     path.join(OUTPUT_DIR, "blog.json"),
     JSON.stringify(result, null, 2),
@@ -327,7 +324,7 @@ async function generateBlogIndex() {
     0
   );
   console.log(
-    `✓ Generated blog index: ${totalPosts} posts across ${locales.length} locales`
+    `✓ Generated blog index: ${totalPosts} posts across ${locales.length} locales (content: public/content/blog/)`
   );
 }
 
