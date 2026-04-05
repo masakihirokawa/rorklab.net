@@ -1,0 +1,711 @@
+---
+title: "Rork Max × Swift Concurrency 完全実装ガイド——async/await・Actor・Structured Concurrency でアプリを根本から変える"
+slug: "rork-max-swift-concurrency-async-await-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-05T11:15"
+updated: "2026-04-05T11:15"
+author: "Rork Lab"
+description: "Rork Max で Swift Concurrency を完全活用するための実践ガイド。async/await の正しい使い方から Actor によるデータ競合防止、Structured Concurrency・TaskGroup・AsyncStream まで、プロダクション品質のコードを体系的に解説します。"
+tags: ["Swift Concurrency", "async/await", "Actor", "Rork Max", "iOS開発", "パフォーマンス"]
+highlights:
+  - "async/await・Actor・TaskGroup を正しく使い分けるための判断フレームワークを習得できる"
+  - "UIの固まり・データ競合・メモリリークを Swift Concurrency で根本解決する実践パターンを理解できる"
+  - "AsyncStream と Combine を組み合わせたリアルタイムデータフローの設計手法を身につけられる"
+---
+
+## はじめに：なぜ今 Swift Concurrency を学ぶのか
+
+Rork Max で iOS アプリを本格開発していると、必ずといっていいほど直面するのが「非同期処理の複雑さ」です。API 呼び出し、データベースアクセス、画像の読み込み——これらをすべて安全・効率的に扱うには、Swift Concurrency の深い理解が不可欠です。
+
+Swift 5.5（iOS 15以降）で導入された Swift Concurrency は、単なる糖衣構文ではありません。`async/await`、`Actor`、`Structured Concurrency`、`TaskGroup`、`AsyncStream` といった機能が有機的に連携し、**データ競合を型システムレベルで防ぎながら**、直感的に読めるコードを実現する仕組みです。
+
+この記事では、Rork Max のネイティブモジュール開発を前提に、Swift Concurrency の各機能を「なぜそう書くのか」から掘り下げ、プロダクション品質のコードを書くための実践的なパターンを体系的に解説します。
+
+### この記事で学べること
+
+- `async/await` の仕組みと、GCD（Grand Central Dispatch）との根本的な違い
+- `Actor` によるデータ競合の防止と `@MainActor` の正しい使い方
+- `TaskGroup` を使った並列処理と、適切なエラーハンドリング
+- `AsyncStream` でリアルタイムデータを扱うパターン
+- Rork Max のネイティブモジュールとの統合方法
+
+### 対象読者
+
+- Rork Max でネイティブ（Swift）コードを書いたことがある方
+- GCD や OperationQueue には慣れているが、Swift Concurrency への移行を検討中の方
+- データ競合やクラッシュの根本原因を理解したい方
+
+---
+
+## async/await の基礎と GCD との違い
+
+### GCD が抱える本質的な問題
+
+Swift Concurrency を理解するには、まず GCD が「何を解決できなかったか」を知ることが重要です。
+
+```swift
+// GCD の典型的な書き方（Rork Max のネイティブモジュール内）
+@objc func fetchUserData(_ userId: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        // ① ここからバックグラウンドスレッド
+        guard let url = URL(string: "https://api.example.com/users/\(userId)") else {
+            // ② reject はメインスレッドで呼ぶ必要があるのか？バックグラウンドで呼んでいい？
+            reject("INVALID_URL", "Invalid URL", nil)
+            return
+        }
+
+        URLSession.shared.dataTask(with: url) { data, response, error in
+            // ③ このクロージャはどのスレッドで動く？
+            if let error = error {
+                reject("FETCH_ERROR", error.localizedDescription, error)
+                return
+            }
+
+            guard let data = data else {
+                reject("NO_DATA", "No data received", nil)
+                return
+            }
+
+            DispatchQueue.main.async {
+                // ④ UI更新のためにメインスレッドに切り替え
+                resolve(String(data: data, encoding: .utf8))
+            }
+        }.resume()
+    }
+}
+```
+
+このコードには潜在的な問題が複数あります。スレッドの切り替えを手動で管理しなければならず、コールバックのネストが深くなると「どのスレッドで動いているか」の追跡が困難になります。また、`reject` や `resolve` を二重に呼び出してしまうバグも起きやすい構造です。
+
+### async/await で書き直す
+
+```swift
+// Swift Concurrency での書き方
+@objc func fetchUserData(_ userId: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+    Task {
+        do {
+            let data = try await UserAPI.fetchUser(userId: userId)
+            resolve(data)
+        } catch {
+            reject("FETCH_ERROR", error.localizedDescription, error)
+        }
+    }
+}
+
+// 実際のデータ取得ロジック（再利用可能な形で分離）
+enum UserAPI {
+    static func fetchUser(userId: String) async throws -> String {
+        guard let url = URL(string: "https://api.example.com/users/\(userId)") else {
+            throw APIError.invalidURL
+        }
+
+        // URLSession は async/await に対応済み
+        let (data, response) = try await URLSession.shared.data(from: url)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw APIError.invalidResponse
+        }
+
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+// 期待する動作: データが取得できれば resolve が呼ばれ、エラーがあれば reject が呼ばれる
+// スレッドの切り替えは Swift ランタイムが自動的に最適化する
+```
+
+`async/await` の重要な特性として、`await` は「スレッドをブロックしない」という点があります。GCD の `semaphore.wait()` や `DispatchGroup.wait()` とは根本的に異なり、現在のスレッドを解放して他の処理を実行させつつ、再開条件が満たされたら効率よく再開します。
+
+---
+
+## Actor によるデータ競合の根絶
+
+### データ競合が引き起こす問題
+
+マルチスレッド環境でもっとも厄介なバグが「データ競合（Data Race）」です。複数のスレッドが同時に同じメモリ領域に書き込もうとしたとき、クラッシュや予期しない挙動が発生します。
+
+```swift
+// 危険なコード：複数スレッドから同時にアクセスされる可能性がある
+class UserCache {
+    var cache: [String: User] = [:]  // ⚠️ スレッドセーフではない
+
+    func store(_ user: User) {
+        cache[user.id] = user  // 複数スレッドから呼ばれると競合する
+    }
+
+    func retrieve(id: String) -> User? {
+        return cache[id]  // 読み書きが同時に起きるとクラッシュの可能性
+    }
+}
+```
+
+### Actor で解決する
+
+```swift
+// Actor を使ったスレッドセーフなキャッシュ
+actor UserCache {
+    // Actor 内のプロパティへのアクセスは自動的に直列化される
+    private var cache: [String: User] = [:]
+    private var lastAccessTime: [String: Date] = [:]
+
+    // Actor メソッドはすべて async として扱われる
+    func store(_ user: User) {
+        cache[user.id] = user
+        lastAccessTime[user.id] = Date()
+    }
+
+    func retrieve(id: String) -> User? {
+        return cache[id]
+    }
+
+    // キャッシュの古いエントリを削除するメソッド
+    func pruneExpiredEntries(olderThan threshold: TimeInterval) {
+        let cutoff = Date().addingTimeInterval(-threshold)
+        let expiredKeys = lastAccessTime
+            .filter { $0.value < cutoff }
+            .map { $0.key }
+
+        expiredKeys.forEach { key in
+            cache.removeValue(forKey: key)
+            lastAccessTime.removeValue(forKey: key)
+        }
+    }
+}
+
+// 使い方
+let userCache = UserCache()
+
+// Actor の外からアクセスするときは await が必要
+Task {
+    await userCache.store(User(id: "u1", name: "Masaki"))
+    let user = await userCache.retrieve(id: "u1")
+    print(user?.name ?? "not found")  // "Masaki"
+}
+```
+
+Actor は「このクラスへのアクセスは一度に1つの呼び出しだけ」という保証をコンパイラレベルで提供します。`await` を付けることで「アクセスの順番待ちが発生する可能性がある」ことを明示し、他の処理をブロックせずに待機します。
+
+### @MainActor で UI 更新を安全に行う
+
+```swift
+// ViewModel に @MainActor を付けることで UI スレッドの安全性を保証
+@MainActor
+class ArticleViewModel: ObservableObject {
+    @Published var articles: [Article] = []
+    @Published var isLoading = false
+    @Published var errorMessage: String?
+
+    private let apiClient = ArticleAPIClient()
+
+    func loadArticles() async {
+        isLoading = true
+        errorMessage = nil
+
+        do {
+            // nonisolated なバックグラウンド処理から結果を受け取る
+            let fetchedArticles = try await apiClient.fetchAll()
+            // ここは @MainActor コンテキストなので UI の更新が安全
+            articles = fetchedArticles
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        isLoading = false
+    }
+}
+
+// APIClient は @MainActor でなくてよい（バックグラウンドで動く）
+struct ArticleAPIClient {
+    func fetchAll() async throws -> [Article] {
+        let url = URL(string: "https://api.rorklab.net/articles")!
+        let (data, _) = try await URLSession.shared.data(from: url)
+        return try JSONDecoder().decode([Article].self, from: data)
+    }
+}
+```
+
+`@MainActor` は「このクラスのすべてのメソッドとプロパティはメインスレッドで動く」という宣言です。SwiftUI の `@Published` プロパティへの変更は必ずメインスレッドから行う必要があるため、ViewModel に `@MainActor` を付けるのはベストプラクティスです。
+
+---
+
+## Structured Concurrency と TaskGroup
+
+### Structured Concurrency の考え方
+
+Swift Concurrency の「Structured」という言葉は、非同期処理の生存期間が明確な構造（スコープ）に縛られることを意味します。子タスクは親タスクより長く生き続けることができません。
+
+```swift
+// withTaskGroup を使った並列処理
+func fetchMultipleUsers(userIds: [String]) async throws -> [User] {
+    try await withThrowingTaskGroup(of: User.self) { group in
+        // 複数のユーザーを並列で取得
+        for userId in userIds {
+            group.addTask {
+                return try await UserAPI.fetchUser(userId: userId)
+            }
+        }
+
+        // すべてのタスクが完了するのを待って結果を集める
+        var users: [User] = []
+        for try await user in group {
+            users.append(user)
+        }
+        return users
+    }
+    // ここまで到達した時点で、group 内のすべてのタスクは完了している
+    // キャンセルや例外が発生した場合も、子タスクはすべて適切にクリーンアップされる
+}
+```
+
+`withThrowingTaskGroup` の重要な特性として、グループ内のどれか1つのタスクがエラーをスローすると、他のタスクに自動的にキャンセルシグナルが送られます。GCD の `DispatchGroup` では実現が難しかった「エラー発生時の全タスククリーンアップ」が自動的に行われます。
+
+### 実践的な並列処理パターン
+
+Rork Max で API から複数のリソースを並列取得する実装例です。
+
+```swift
+// Rork Max ネイティブモジュール：ダッシュボードデータの並列取得
+actor DashboardDataManager {
+    struct DashboardData {
+        let user: User
+        let recentArticles: [Article]
+        let notifications: [Notification]
+        let analytics: Analytics
+    }
+
+    func fetchDashboardData(userId: String) async throws -> DashboardData {
+        // 4つのAPIを並列で呼び出す
+        async let user = UserAPI.fetchUser(userId: userId)
+        async let articles = ArticleAPI.fetchRecent(limit: 10)
+        async let notifications = NotificationAPI.fetchUnread(userId: userId)
+        async let analytics = AnalyticsAPI.fetchSummary(userId: userId)
+
+        // すべての結果を同時に待つ
+        // どれか1つが失敗すると、全体が失敗として処理される
+        return try await DashboardData(
+            user: user,
+            recentArticles: articles,
+            notifications: notifications,
+            analytics: analytics
+        )
+        // 期待する動作: 4つのAPI呼び出しが並列で実行され、
+        // 直列実行より最大4倍高速になる（各APIが500msかかる場合、合計500ms程度で完了）
+    }
+}
+```
+
+`async let` は「この値の計算を今すぐ始めるが、値を使う時まで待たない」という宣言です。`withTaskGroup` が動的な数のタスクを扱うのに対し、`async let` は静的に決まった数の並列処理に向いています。
+
+### キャンセル処理の実装
+
+```swift
+// キャンセル可能なダウンロードタスク
+class ImageDownloadManager {
+    private var activeTasks: [String: Task<UIImage, Error>] = [:]
+
+    func downloadImage(url: URL, cacheKey: String) async throws -> UIImage {
+        // 既存のタスクがあればキャンセルして新しいタスクに置き換える
+        activeTasks[cacheKey]?.cancel()
+
+        let task = Task {
+            // キャンセルチェックポイント：定期的にチェックする
+            try Task.checkCancellation()
+
+            let (data, response) = try await URLSession.shared.data(from: url)
+
+            // もう一度キャンセルを確認（長時間の処理の途中でも確認する）
+            try Task.checkCancellation()
+
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200,
+                  let image = UIImage(data: data) else {
+                throw ImageError.invalidData
+            }
+
+            return image
+        }
+
+        activeTasks[cacheKey] = task
+
+        do {
+            let image = try await task.value
+            activeTasks.removeValue(forKey: cacheKey)
+            return image
+        } catch {
+            activeTasks.removeValue(forKey: cacheKey)
+            throw error
+        }
+    }
+
+    func cancelDownload(cacheKey: String) {
+        activeTasks[cacheKey]?.cancel()
+        activeTasks.removeValue(forKey: cacheKey)
+    }
+}
+```
+
+`Task.checkCancellation()` は、タスクがキャンセルされていた場合に `CancellationError` をスローします。適切な間隔でキャンセルチェックを挿入することで、ユーザーが画面を離れた後もダウンロードが続くような無駄なリソース消費を防げます。
+
+---
+
+## AsyncStream でリアルタイムデータを扱う
+
+### AsyncStream とは
+
+`AsyncStream` は「時間をかけて複数の値を生成する非同期シーケンス」を実現します。WebSocket、Bluetooth、センサーデータなど、継続的に値が届くデータソースを Swift Concurrency の世界でエレガントに扱えます。
+
+```swift
+// WebSocket のメッセージを AsyncStream で扱う
+class WebSocketManager {
+    private var webSocketTask: URLSessionWebSocketTask?
+
+    func messageStream(url: URL) -> AsyncStream<String> {
+        return AsyncStream { continuation in
+            // WebSocket 接続を開始
+            let session = URLSession(configuration: .default)
+            let task = session.webSocketTask(with: url)
+            self.webSocketTask = task
+
+            // メッセージを継続的に受信するための再帰的な関数
+            func receiveNext() {
+                task.receive { result in
+                    switch result {
+                    case .success(let message):
+                        switch message {
+                        case .string(let text):
+                            // 新しい値をストリームに送る
+                            continuation.yield(text)
+                        case .data(let data):
+                            if let text = String(data: data, encoding: .utf8) {
+                                continuation.yield(text)
+                            }
+                        @unknown default:
+                            break
+                        }
+                        // 次のメッセージを待つ
+                        receiveNext()
+
+                    case .failure(let error):
+                        print("WebSocket error: \(error)")
+                        // エラーが発生したらストリームを終了
+                        continuation.finish()
+                    }
+                }
+            }
+
+            task.resume()
+            receiveNext()
+
+            // ストリームがキャンセルされたとき（例：画面が閉じられた）のクリーンアップ
+            continuation.onTermination = { _ in
+                task.cancel(with: .goingAway, reason: nil)
+            }
+        }
+    }
+}
+
+// 使い方：SwiftUI View での統合
+struct LiveMessageView: View {
+    @StateObject private var viewModel = LiveMessageViewModel()
+
+    var body: some View {
+        List(viewModel.messages, id: \.self) { message in
+            Text(message)
+        }
+        .task {
+            // .task モディファイアは View が消えると自動的にキャンセルされる
+            await viewModel.startReceiving()
+        }
+    }
+}
+
+@MainActor
+class LiveMessageViewModel: ObservableObject {
+    @Published var messages: [String] = []
+
+    private let wsManager = WebSocketManager()
+
+    func startReceiving() async {
+        let url = URL(string: "wss://api.rorklab.net/ws/messages")!
+
+        for await message in wsManager.messageStream(url: url) {
+            // @MainActor コンテキストなので直接 @Published を更新できる
+            messages.insert(message, at: 0)
+
+            // 表示件数を制限
+            if messages.count > 100 {
+                messages = Array(messages.prefix(100))
+            }
+        }
+    }
+}
+```
+
+`.task` モディファイアの便利な点は、View のライフサイクルに自動的に紐づくことです。View が画面から消えると、`task` 内の処理は自動的にキャンセルされます。`onAppear/onDisappear` で手動管理していた時代に比べ、メモリリークやゾンビタスクのリスクが大幅に低下します。
+
+### AsyncStream と Combine の橋渡し
+
+既存の Combine コードがある場合、`AsyncStream` との相互運用が必要になることがあります。
+
+```swift
+// Combine Publisher を AsyncStream に変換するヘルパー
+extension Publisher where Failure == Never {
+    var asyncStream: AsyncStream<Output> {
+        AsyncStream { continuation in
+            let cancellable = sink { completion in
+                continuation.finish()
+            } receiveValue: { value in
+                continuation.yield(value)
+            }
+
+            continuation.onTermination = { _ in
+                cancellable.cancel()
+            }
+        }
+    }
+}
+
+// Combine の NotificationCenter を AsyncStream で使う例
+func batteryLevelStream() -> AsyncStream<Float> {
+    NotificationCenter.default
+        .publisher(for: UIDevice.batteryLevelDidChangeNotification)
+        .compactMap { _ in UIDevice.current.batteryLevel >= 0 ? UIDevice.current.batteryLevel : nil }
+        .asyncStream
+}
+
+// 使い方
+Task {
+    UIDevice.current.isBatteryMonitoringEnabled = true
+    for await level in batteryLevelStream() {
+        print("バッテリー残量: \(Int(level * 100))%")
+        if level < 0.2 {
+            // 低バッテリー警告をユーザーに表示
+            await showLowBatteryAlert()
+        }
+    }
+}
+```
+
+---
+
+## よくあるエラーと対処法
+
+### エラー1：`Sending 'X' risks causing data races`
+
+```swift
+// ❌ データ競合の警告が出るコード
+class DataService {
+    var data: [String] = []
+
+    func process() async {
+        // Warning: Sending 'self.data' risks causing data races
+        await Task.detached {
+            self.data.append("new item")  // 危険：data は Sendable でない
+        }.value
+    }
+}
+
+// ✅ Actor を使って修正
+actor DataService {
+    var data: [String] = []
+
+    func process() async {
+        data.append("new item")  // Actor 内なので安全
+    }
+}
+```
+
+### エラー2：デッドロック（MainActor のネスト）
+
+```swift
+// ❌ 同一の Actor コンテキストからブロッキング呼び出しをしてしまうパターン
+@MainActor
+class ViewModel {
+    func badPattern() {
+        // ❌ MainActor から Task.init して同じ MainActor を await すると
+        //    状況によってデッドロックが発生することがある
+        let result = Task {
+            await someMainActorWork()  // 同じ MainActor を待機
+        }
+        // result.value を同期的に待とうとすると問題が起きる
+    }
+
+    // ✅ 正しいパターン：async メソッドとして定義する
+    func goodPattern() async {
+        await someMainActorWork()
+    }
+}
+```
+
+### エラー3：Task のリーク
+
+```swift
+// ❌ Task がキャンセルされない
+class BadViewController: UIViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // この Task は viewController が解放されても動き続ける
+        Task {
+            for await update in dataStream() {
+                self.updateUI(update)  // self が解放されていても呼ばれる可能性
+            }
+        }
+    }
+}
+
+// ✅ Task を保持してキャンセルする
+class GoodViewController: UIViewController {
+    private var streamTask: Task<Void, Never>?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        streamTask = Task { [weak self] in
+            guard let self else { return }
+            for await update in dataStream() {
+                await MainActor.run {
+                    self.updateUI(update)
+                }
+            }
+        }
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        streamTask?.cancel()
+        streamTask = nil
+    }
+}
+```
+
+---
+
+## Rork Max ネイティブモジュールへの統合
+
+### React Native との境界での注意点
+
+Rork Max（React Native）のネイティブモジュールは、JS スレッドから呼び出されます。Swift Concurrency と RCT（React Native）の橋渡しには特有の注意点があります。
+
+```swift
+// Rork Max ネイティブモジュール：Swift Concurrency を正しく使った実装
+@objc(RorkDataModule)
+class RorkDataModule: NSObject {
+
+    // RCT_EXPORT_METHOD は同期コンテキストのため、Task でラップする
+    @objc func fetchData(_ query: String,
+                         resolve: @escaping RCTPromiseResolveBlock,
+                         reject: @escaping RCTPromiseRejectBlock) {
+        // detached Task を使うことで、呼び出し元の Actor 継承を避ける
+        Task.detached(priority: .userInitiated) {
+            do {
+                let result = try await DataService.shared.search(query: query)
+                // resolve/reject は JS スレッドで呼ばれることが期待されているため、
+                // メインスレッドからの呼び出しが安全
+                await MainActor.run {
+                    resolve(result)
+                }
+            } catch {
+                await MainActor.run {
+                    reject("SEARCH_ERROR", error.localizedDescription, error)
+                }
+            }
+        }
+    }
+}
+
+// 中核のデータサービス：Actor で実装
+actor DataService {
+    static let shared = DataService()
+
+    private var cache: [String: [SearchResult]] = [:]
+
+    func search(query: String) async throws -> [[String: Any]] {
+        // キャッシュヒット
+        if let cached = cache[query] {
+            return cached.map { $0.toDictionary() }
+        }
+
+        // API 呼び出し
+        let results = try await SearchAPI.search(query: query)
+        cache[query] = results
+
+        return results.map { $0.toDictionary() }
+    }
+}
+```
+
+`Task.detached` を使う理由は、`@objc` メソッドが呼ばれる時点の Actor コンテキスト（多くの場合、不定）を引き継がないためです。`Task { }` は現在のコンテキストを引き継ぐため、予期しない Actor 上で動く可能性があります。
+
+---
+
+## パフォーマンス計測と最適化
+
+Swift Concurrency に移行した後、効果を定量的に確認することが重要です。Xcode の Instruments（Time Profiler + Swift Concurrency テンプレート）を使うと、各 Task の実行時間や待機時間を可視化できます。
+
+```swift
+// パフォーマンス計測用のラッパー
+func measureAsync<T>(_ label: String, operation: () async throws -> T) async throws -> T {
+    let start = CFAbsoluteTimeGetCurrent()
+    let result = try await operation()
+    let elapsed = CFAbsoluteTimeGetCurrent() - start
+    print("⏱ \(label): \(String(format: "%.3f", elapsed * 1000))ms")
+    return result
+}
+
+// 使用例
+let dashboardData = try await measureAsync("ダッシュボード並列取得") {
+    try await dashboardManager.fetchDashboardData(userId: currentUserId)
+}
+// 期待する出力例: ⏱ ダッシュボード並列取得: 312.456ms
+// （直列なら約1200ms かかるところを並列化で1/4 に短縮）
+```
+
+関連する実装については、[Rork アプリ パフォーマンス最適化完全ガイド](/articles/rork-dev/rork-app-performance-optimization-complete-guide)も参考になります。また、本番環境でのクラッシュやエラー追跡については [Rork Max エラーハンドリング・デバッグ・本番監視の実践パターン](/articles/rork-dev/rork-max-error-handling-debugging-production-monitoring)と組み合わせることで、より堅牢なアプリが構築できます。
+
+Swift Concurrency の理解をさらに深めたい方には、[Swift Concurrency by Example（Paul Hudson 著）](https://www.amazon.co.jp/dp/B0C5S4XG7K/?tag=pinocchio-22) がおすすめです。実践的なコード例が豊富で、この記事で解説した内容をより詳しく学べます。
+
+---
+
+## FAQ
+
+### Q1. GCD（DispatchQueue）をすべて Swift Concurrency に置き換えるべきですか？
+
+必ずしもそうではありません。Swift Concurrency は iOS 15以降のみ対応です。iOS 14以前をサポートする必要がある場合は、GCD と共存させる設計にしましょう。ただし、新規コードは積極的に Swift Concurrency を採用することを推奨します。既存コードの段階的な移行については、`withCheckedContinuation` / `withCheckedThrowingContinuation` を使ってコールバックベースの API をラップする方法が有効です。
+
+```swift
+// 既存のコールバックAPIをawait可能にする
+func fetchLegacyData() async throws -> Data {
+    try await withCheckedThrowingContinuation { continuation in
+        LegacyAPI.fetchData { data, error in
+            if let error = error {
+                continuation.resume(throwing: error)
+            } else if let data = data {
+                continuation.resume(returning: data)
+            } else {
+                continuation.resume(throwing: DataError.noData)
+            }
+        }
+    }
+}
+```
+
+### Q2. Actor を使うとパフォーマンスが下がりますか？
+
+Actor へのアクセスには若干のオーバーヘッドがありますが、通常のアプリ開発では無視できるレベルです（マイクロ秒オーダー）。むしろデータ競合によるクラッシュやロック競合（Mutex）の方がパフォーマンスへの影響が大きいため、安全性のために Actor を使うのが正しい判断です。高頻度なアクセスが必要な場合は `nonisolated` メソッドの活用を検討してください。
+
+### Q3. `@MainActor` と `DispatchQueue.main.async` の違いは何ですか？
+
+機能的には似ていますが、`@MainActor` はコンパイラが静的に検証できる点が大きな違いです。`DispatchQueue.main.async` は実行時にのみ「メインスレッドで動いているか」が確認されますが、`@MainActor` を使うとコンパイル時にメインスレッド以外からの不正アクセスをエラーとして検出できます。SwiftUI と組み合わせる場合は `@MainActor` を採用することを強く推奨します。
+
+---
+
+## まとめ
+
+Swift Concurrency は、Rork Max でのネイティブ開発品質を根本から変える強力な仕組みです。今回解説した内容を振り返ります。
+
+`async/await` はコールバック地獄を解消し、線形に読めるコードを実現します。`Actor` はデータ競合をコンパイラレベルで防止し、`@MainActor` でUI更新の安全性を宣言的に保証できます。`TaskGroup` と `async let` で並列処理を表現し、`AsyncStream` でリアルタイムデータフローをエレガントに扱えます。そして Rork Max のネイティブモジュールとの統合では、`Task.detached` と `withCheckedContinuation` が橋渡し役として重要です。
+
+これらを組み合わせることで、GCD 時代には手動で管理しなければならなかったスレッド管理・競合防止・キャンセル処理が、大幅に簡素化されます。状態管理のパターンについては [Rorkアプリの状態管理パターン完全ガイド](/articles/rork-dev/rork-advanced-state-management-patterns)も参考にしてみてください。
+
+Swift Concurrency を深く理解したい方には、Apple のエンジニアが執筆した [Mastering Swift Concurrency（Swift by Sundell）](https://www.amazon.co.jp/dp/B0CQXV5XW7/?tag=pinocchio-22) もぜひご参照ください。より高度なパターンや実際のアプリケーション事例が詳しく解説されています。
