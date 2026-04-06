@@ -13,15 +13,22 @@ const PLAN_NAMES: Record<string, string> = {
   "price_1TCQyPEGB5g6A54ofaB9e5to": "Rork Lab — チップ（¥150）ご支援ありがとうございます",
   "price_1TGSqUEGB5g6A54oxdnDOxOU": "Rork Lab メンバーシップ — Pro（月額プラン）",
   "price_1TCQyxEGB5g6A54oh8U6RHec": "Rork Lab メンバーシップ — Premium（永久アクセス）",
-  "price_1TFRyLEGB5g6A54oCoY0I3Dc": "Rork Lab メンバーシップ — Premium（感謝価格 ¥980）",
+  "price_1TFRyLEGB5g6A54oCoY0I3Dc": "Rork Lab メンバーシップ — Premium（感謝価格 ¥1,480）",
   // EN
   "price_1TGTQMEGB5g6A54o6VMWCFNr": "Rork Lab — Tip ($1.50) Thank you for your support",
   "price_1TGTQMEGB5g6A54oI8AwS76H": "Rork Lab Membership — Pro (Monthly)",
   "price_1TGTQNEGB5g6A54oGbFKBsq7": "Rork Lab Membership — Premium (Lifetime Access)",
-  "price_1TGTQNEGB5g6A54oCroqkbv3": "Rork Lab Membership — Premium (Thank You Price $7)",
+  "price_1TGTQNEGB5g6A54oCroqkbv3": "Rork Lab Membership — Premium (Thank You Price $10)",
   // Article
   "price_1TJL6UEGB5g6A54oGAcqSCqR": "Rork Lab — 記事単体購入（¥250）",
   "price_1TJL6VEGB5g6A54o9xwzriXD": "Rork Lab — Single Article Purchase ($1.75)",
+
+  // New Pro (¥580/$5)
+  "price_1TJLvmEGB5g6A54oSPEqrpEc": "Rork Lab メンバーシップ — Pro（月額プラン）",
+  "price_1TJLvnEGB5g6A54oK3UQk2W8": "Rork Lab Membership — Pro (Monthly)",
+  // New Premium (¥2,480/$15)
+  "price_1TJLvzEGB5g6A54o2ONFo0sC": "Rork Lab メンバーシップ — Premium（永久アクセス）",
+  "price_1TJLw0EGB5g6A54oQ5957zbq": "Rork Lab Membership — Premium (Lifetime Access)",
 };
 
 // Tip price IDs — these should NOT grant premium access
