@@ -64,7 +64,8 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
     return (
       <div
         style={{
-          margin: "32px 0",
+          maxWidth: 480,
+          margin: "32px auto",
           padding: "20px 24px",
           borderRadius: 10,
           border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
@@ -94,7 +95,8 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
       style={{
         position: "relative",
         zIndex: 2,
-        margin: "32px 0 0",
+        maxWidth: 480,
+        margin: "32px auto 0",
         padding: "28px 24px",
         borderRadius: 10,
         border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",

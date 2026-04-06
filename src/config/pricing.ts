@@ -158,10 +158,9 @@ export function getCampaign(locale: string) {
 
 // ── Single Article Purchase ──────────────────────────────────────
 // Stripe Price IDs for per-article purchases (¥250 JA / $1.75 EN)
-// TODO: 商品登録後にここを更新してください
 export const ARTICLE_PRICE_IDS = {
-  ja: "price_ARTICLE_JA_RORKLAB",  // ¥250
-  en: "price_ARTICLE_EN_RORKLAB",  // $1.75
+  ja: "price_1TJL6UEGB5g6A54oGAcqSCqR",  // ¥250
+  en: "price_1TJL6VEGB5g6A54o9xwzriXD",  // $1.75
 } as const;
 
 export const ARTICLE_PRICES = {

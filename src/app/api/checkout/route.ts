@@ -19,6 +19,9 @@ const PLAN_NAMES: Record<string, string> = {
   "price_1TGTQMEGB5g6A54oI8AwS76H": "Rork Lab Membership — Pro (Monthly)",
   "price_1TGTQNEGB5g6A54oGbFKBsq7": "Rork Lab Membership — Premium (Lifetime Access)",
   "price_1TGTQNEGB5g6A54oCroqkbv3": "Rork Lab Membership — Premium (Thank You Price $7)",
+  // Article
+  "price_1TJL6UEGB5g6A54oGAcqSCqR": "Rork Lab — 記事単体購入（¥250）",
+  "price_1TJL6VEGB5g6A54o9xwzriXD": "Rork Lab — Single Article Purchase ($1.75)",
 };
 
 // Tip price IDs — these should NOT grant premium access
@@ -29,8 +32,8 @@ const TIP_PRICE_IDS = new Set([
 
 // Article price IDs — per-article purchases
 const ARTICLE_PRICE_IDS = new Set([
-  "price_ARTICLE_JA_RORKLAB",  // ¥250 JPY
-  "price_ARTICLE_EN_RORKLAB",  // $1.75 USD
+  "price_1TJL6UEGB5g6A54oGAcqSCqR",  // ¥250 JPY
+  "price_1TJL6VEGB5g6A54o9xwzriXD",  // $1.75 USD
 ]);
 
 export async function POST(request: NextRequest) {
