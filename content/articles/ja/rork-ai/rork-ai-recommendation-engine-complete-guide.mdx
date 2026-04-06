@@ -1,0 +1,600 @@
+---
+title: "Rork × AI 推薦エンジン完全実装ガイド：Supabase pgvector × Gemini Embedding でユーザーエンゲージメントを最大化する"
+slug: "rork-ai-recommendation-engine-complete-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-06T11:15"
+updated: "2026-04-06T11:15"
+author: "Rork Lab"
+description: "Supabase pgvector と Gemini Embedding API を組み合わせ、Rork アプリにパーソナライズされた推薦エンジンを実装する完全ガイド。ユーザー行動ログ設計からリアルタイム推薦APIの構築まで詳解します。"
+tags: ["Rork", "推薦エンジン", "Supabase", "pgvector", "Gemini", "Embedding", "パーソナライズ", "AI", "React Native", "Cloudflare Workers"]
+highlights:
+  - "Supabase pgvector と Gemini Embedding API を使ったコンテンツ推薦エンジンをゼロから実装できる"
+  - "ユーザー行動ログの設計・収集からベクトル類似検索まで、本番運用を見据えた実装パターンを習得できる"
+  - "Rork アプリへのリアルタイム推薦UI統合手法と、精度評価・改善サイクルの回し方を理解できる"
+---
+
+## なぜ推薦エンジンがモバイルアプリのリテンションを決定するのか
+
+「ユーザーが離れる最大の理由は？」と問われたとき、多くの開発者が「バグ」や「パフォーマンス」を挙げます。しかし実際には、**「自分に関係のないコンテンツを見せられ続けること」** による離脱が最も多いと言われています。
+
+Spotify が日本で爆発的に普及した要因のひとつは、Discover Weekly をはじめとするパーソナライズド推薦です。Netflix の視聴継続率を支えているのも推薦アルゴリズムです。これらは大企業だけの話ではありません。個人開発者であっても、適切なスタックを選べば同等の仕組みを実装できる時代になりました。
+
+本記事では、以下のスタックを使って Rork アプリに推薦エンジンを組み込む完全な手順を解説します。
+
+- **Rork / Rork Max**：アプリの UI 生成
+- **Supabase**：PostgreSQL + pgvector + リアルタイムDB + Edge Functions
+- **Gemini Embedding API**：テキスト・コンテンツのベクトル化
+- **Cloudflare Workers（Hono）**：推薦APIレイヤー（オプション）
+
+---
+
+## 推薦エンジンの基本設計：3つのアプローチを理解する
+
+推薦システムには大きく3つのアプローチがあります。本記事では **コンテンツベースフィルタリング** と **協調フィルタリング** を組み合わせたハイブリッドアプローチを採用します。
+
+### コンテンツベースフィルタリング
+
+ユーザーが過去に好んだアイテムと **属性的に類似した** アイテムを推薦する方法です。「このレシピを気に入った人には、同じく和食で調理時間30分以内のレシピを」といった推薦です。
+
+- **メリット**：コールドスタート（新規ユーザー）に比較的強い。説明しやすい
+- **デメリット**：属性の定義が難しい。似たアイテムばかり推薦されるフィルターバブル問題
+
+### 協調フィルタリング
+
+「似た行動をとるユーザーが好むアイテムを推薦する」方法です。
+
+- **メリット**：ドメイン知識不要。驚きのある推薦が生まれやすい
+- **デメリット**：データが少ない初期は精度が低い（コールドスタート問題）
+
+### ベクトル類似検索（Embedding ベース）
+
+テキストや画像を高次元ベクトルで表現し、ユークリッド距離やコサイン類似度で近いアイテムを探す方法です。今回のメインアプローチです。
+
+- **メリット**：意味的な類似性を捉えられる。スキーマ設計が単純
+- **デメリット**：Embedding 生成のコストと時間がかかる
+
+---
+
+## アーキテクチャ設計
+
+```
+[Rork App]
+   ↓ ユーザー行動（閲覧・いいね・スキップ）
+[Supabase]
+   ├── user_events テーブル（行動ログ）
+   ├── items テーブル（コンテンツ + embedding カラム）
+   └── user_profiles テーブル（ユーザー嗜好ベクトル）
+   
+[Gemini Embedding API]
+   ↑ アイテム登録時にコンテンツをベクトル化
+   ↑ ユーザープロファイル更新時に嗜好をベクトル化
+
+[推薦API]
+   ← pgvector の近傍探索で上位N件を返す
+   → Rork App に推薦リスト
+```
+
+---
+
+## Step 1：Supabase のデータベース設計
+
+### pgvector 拡張を有効化する
+
+Supabase の SQL エディタで以下を実行します。
+
+```sql
+-- pgvector 拡張を有効化
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- アイテムテーブル（推薦対象コンテンツ）
+CREATE TABLE items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title TEXT NOT NULL,
+  description TEXT,
+  category TEXT,
+  tags TEXT[],
+  -- Gemini text-embedding-004 は 768 次元
+  embedding VECTOR(768),
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ユーザー行動ログ
+CREATE TABLE user_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  item_id UUID NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL CHECK (event_type IN ('view', 'like', 'skip', 'share', 'purchase')),
+  -- スコア：like=1.0, view=0.3, skip=-0.5, share=1.5, purchase=2.0
+  score FLOAT DEFAULT 0.3,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ユーザー嗜好プロファイル（集計済みベクトル）
+CREATE TABLE user_profiles (
+  user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  preference_vector VECTOR(768),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ベクトル検索用インデックス（IVFFlat）
+CREATE INDEX ON items USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
+
+CREATE INDEX ON user_profiles USING ivfflat (preference_vector vector_cosine_ops)
+  WITH (lists = 10);
+```
+
+> **lists パラメータの目安**：アイテム数が N のとき、`lists = sqrt(N)` が経験則です。1万件なら100、100件なら10が目安です。
+
+### 推薦関数を作成する
+
+```sql
+-- ユーザーの嗜好ベクトルに基づいて上位N件を推薦する関数
+CREATE OR REPLACE FUNCTION get_recommendations(
+  p_user_id UUID,
+  p_limit INT DEFAULT 10,
+  p_category TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+  item_id UUID,
+  title TEXT,
+  description TEXT,
+  category TEXT,
+  tags TEXT[],
+  similarity FLOAT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_preference VECTOR(768);
+BEGIN
+  -- ユーザーの嗜好ベクトルを取得
+  SELECT preference_vector INTO v_preference
+  FROM user_profiles
+  WHERE user_id = p_user_id;
+
+  -- 嗜好ベクトルが未設定の場合はランダムな人気コンテンツを返す
+  IF v_preference IS NULL THEN
+    RETURN QUERY
+    SELECT i.id, i.title, i.description, i.category, i.tags, 0.0::FLOAT
+    FROM items i
+    WHERE (p_category IS NULL OR i.category = p_category)
+    ORDER BY i.created_at DESC
+    LIMIT p_limit;
+    RETURN;
+  END IF;
+
+  -- コサイン類似度でソートして推薦
+  RETURN QUERY
+  SELECT
+    i.id,
+    i.title,
+    i.description,
+    i.category,
+    i.tags,
+    (1 - (i.embedding <=> v_preference))::FLOAT AS similarity
+  FROM items i
+  WHERE i.embedding IS NOT NULL
+    AND (p_category IS NULL OR i.category = p_category)
+    -- 直近30日以内にスキップされたアイテムを除外
+    AND i.id NOT IN (
+      SELECT item_id FROM user_events
+      WHERE user_id = p_user_id
+        AND event_type = 'skip'
+        AND created_at > NOW() - INTERVAL '30 days'
+    )
+  ORDER BY i.embedding <=> v_preference
+  LIMIT p_limit;
+END;
+$$;
+```
+
+---
+
+## Step 2：Gemini Embedding API でコンテンツをベクトル化する
+
+### Supabase Edge Function でアイテム登録時に自動でベクトル化
+
+```typescript
+// supabase/functions/embed-item/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+serve(async (req) => {
+  const { item_id, title, description, tags } = await req.json();
+  
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  // ベクトル化するテキストを構成（タイトル・説明・タグを連結）
+  const textToEmbed = [
+    `タイトル: ${title}`,
+    description ? `説明: ${description}` : "",
+    tags?.length ? `タグ: ${tags.join(", ")}` : "",
+  ].filter(Boolean).join("\n");
+
+  // Gemini text-embedding-004 API を呼び出す
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "models/text-embedding-004",
+        content: { parts: [{ text: textToEmbed }] },
+        // セマンティック類似検索には SEMANTIC_SIMILARITY タスクタイプが最適
+        taskType: "SEMANTIC_SIMILARITY",
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    return new Response(
+      JSON.stringify({ error: "Embedding API error" }),
+      { status: 500 }
+    );
+  }
+
+  const { embedding } = await response.json();
+  const vector = embedding.values; // 768 次元の Float 配列
+
+  // Supabase にベクトルを保存
+  const { error } = await supabase
+    .from("items")
+    .update({ embedding: vector })
+    .eq("id", item_id);
+
+  if (error) {
+    return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+  }
+
+  return new Response(JSON.stringify({ success: true }), { status: 200 });
+});
+```
+
+> **コスト最適化のポイント**：`text-embedding-004` は1000トークンあたり約 $0.00001（2026年4月時点）と非常に安価です。コンテンツ登録時に1回だけ実行し、結果をDBに保存しておく設計が基本です。
+
+---
+
+## Step 3：ユーザー行動ログの収集と嗜好ベクトルの更新
+
+### ユーザー嗜好ベクトルを更新する Edge Function
+
+ユーザーがアイテムを操作するたびに、そのアイテムのベクトルを加重平均することでユーザーの嗜好ベクトルを更新します。
+
+```typescript
+// supabase/functions/update-user-profile/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const EVENT_SCORES: Record<string, number> = {
+  view: 0.3,
+  like: 1.0,
+  share: 1.5,
+  purchase: 2.0,
+  skip: -0.5,
+};
+
+serve(async (req) => {
+  const { user_id, item_id, event_type } = await req.json();
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  const score = EVENT_SCORES[event_type] ?? 0.1;
+
+  // イベントを記録
+  await supabase.from("user_events").insert({
+    user_id,
+    item_id,
+    event_type,
+    score,
+  });
+
+  // アイテムの embedding を取得
+  const { data: item } = await supabase
+    .from("items")
+    .select("embedding")
+    .eq("id", item_id)
+    .single();
+
+  if (!item?.embedding) return new Response("No embedding", { status: 200 });
+
+  // 現在の嗜好ベクトルを取得
+  const { data: profile } = await supabase
+    .from("user_profiles")
+    .select("preference_vector")
+    .eq("user_id", user_id)
+    .single();
+
+  const itemVector: number[] = item.embedding;
+  let newVector: number[];
+
+  if (!profile?.preference_vector) {
+    // 初回：アイテムベクトルをそのまま使用（scoreで重み付け）
+    newVector = itemVector.map((v) => v * score);
+  } else {
+    // 指数移動平均（EMA）で更新：alpha = 0.1（小さいほど安定）
+    const alpha = Math.abs(score) * 0.1;
+    const currentVector: number[] = profile.preference_vector;
+    newVector = currentVector.map(
+      (v, i) => v * (1 - alpha) + itemVector[i] * alpha * Math.sign(score)
+    );
+    
+    // ベクトルを正規化（コサイン類似度のため）
+    const magnitude = Math.sqrt(newVector.reduce((sum, v) => sum + v * v, 0));
+    if (magnitude > 0) {
+      newVector = newVector.map((v) => v / magnitude);
+    }
+  }
+
+  // 嗜好ベクトルを upsert
+  await supabase.from("user_profiles").upsert({
+    user_id,
+    preference_vector: newVector,
+    updated_at: new Date().toISOString(),
+  });
+
+  return new Response(JSON.stringify({ success: true }));
+});
+```
+
+---
+
+## Step 4：Rork アプリへの統合
+
+### 推薦リストコンポーネントを Rork で実装する
+
+Rork のプロンプトで以下のように指示して、推薦UIを生成します。
+
+```
+推薦コンテンツリストの画面を作成してください。
+
+要件：
+- 起動時に /api/recommendations エンドポイントから JSON を取得
+- スクロール可能なカード形式で表示（FlatList）
+- 各カードに：タイトル・説明・カテゴリタグ・いいね/スキップボタン
+- いいねボタン：ハートアイコン（赤）→ タップで Supabase に like イベントを記録
+- スキップボタン：× アイコン → タップで skip イベントを記録し、カードを非表示
+- 残り5件以下でスクロールが近づいたら追加読み込み（ページネーション）
+- ローディング中はスケルトンUI表示
+- エラー時はリトライボタン
+```
+
+生成後、以下のカスタムフックを追加します。
+
+```typescript
+// hooks/useRecommendations.ts
+import { useState, useCallback, useRef } from "react";
+import { supabase } from "@/lib/supabase";
+
+interface Item {
+  item_id: string;
+  title: string;
+  description: string;
+  category: string;
+  tags: string[];
+  similarity: number;
+}
+
+export function useRecommendations(category?: string) {
+  const [items, setItems] = useState<Item[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const pageRef = useRef(0);
+
+  const fetchRecommendations = useCallback(async () => {
+    if (loading || !hasMore) return;
+    setLoading(true);
+
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+
+    // Supabase の RPC 関数を呼び出す
+    const { data, error } = await supabase.rpc("get_recommendations", {
+      p_user_id: user.id,
+      p_limit: 10,
+      p_category: category ?? null,
+    });
+
+    if (error || !data?.length) {
+      setHasMore(false);
+    } else {
+      setItems((prev) => {
+        const existingIds = new Set(prev.map((i) => i.item_id));
+        const newItems = data.filter((i: Item) => !existingIds.has(i.item_id));
+        return [...prev, ...newItems];
+      });
+      pageRef.current += 1;
+      if (data.length < 10) setHasMore(false);
+    }
+
+    setLoading(false);
+  }, [loading, hasMore, category]);
+
+  const recordEvent = useCallback(
+    async (itemId: string, eventType: "like" | "skip" | "view" | "share") => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) return;
+
+      // 楽観的更新：スキップされたアイテムをローカルで即座に非表示
+      if (eventType === "skip") {
+        setItems((prev) => prev.filter((i) => i.item_id !== itemId));
+      }
+
+      // バックグラウンドで Edge Function を呼び出す
+      supabase.functions.invoke("update-user-profile", {
+        body: { user_id: user.id, item_id: itemId, event_type: eventType },
+      });
+    },
+    []
+  );
+
+  return { items, loading, hasMore, fetchRecommendations, recordEvent };
+}
+```
+
+### FlatList への組み込み例
+
+```tsx
+// screens/RecommendationsScreen.tsx
+import { FlatList, View, Text, TouchableOpacity } from "react-native";
+import { useRecommendations } from "@/hooks/useRecommendations";
+import { Heart, X } from "lucide-react-native";
+
+export default function RecommendationsScreen() {
+  const { items, loading, hasMore, fetchRecommendations, recordEvent } =
+    useRecommendations();
+
+  // 初回読み込み
+  useState(() => {
+    fetchRecommendations();
+  });
+
+  return (
+    <FlatList
+      data={items}
+      keyExtractor={(item) => item.item_id}
+      onEndReached={() => hasMore && fetchRecommendations()}
+      onEndReachedThreshold={0.5}
+      renderItem={({ item }) => (
+        <View className="bg-white rounded-2xl shadow-sm mx-4 my-2 p-4">
+          <Text className="text-lg font-bold">{item.title}</Text>
+          <Text className="text-gray-500 mt-1 text-sm">{item.description}</Text>
+          <View className="flex-row gap-2 mt-2">
+            {item.tags.map((tag) => (
+              <Text key={tag} className="bg-blue-100 text-blue-600 text-xs px-2 py-1 rounded-full">
+                {tag}
+              </Text>
+            ))}
+          </View>
+          <View className="flex-row justify-end gap-4 mt-3">
+            <TouchableOpacity onPress={() => recordEvent(item.item_id, "skip")}>
+              <X size={24} color="#9CA3AF" />
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => recordEvent(item.item_id, "like")}>
+              <Heart size={24} color="#EF4444" />
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+      ListFooterComponent={loading ? <LoadingSkeleton /> : null}
+    />
+  );
+}
+```
+
+---
+
+## Step 5：推薦精度の評価と改善サイクル
+
+実装後は、以下の指標を定期的に計測して精度を改善します。
+
+### 計測すべき KPI
+
+**エンゲージメント率**：
+```sql
+-- カテゴリ別のいいね率（直近7日）
+SELECT
+  i.category,
+  COUNT(CASE WHEN e.event_type = 'like' THEN 1 END) AS likes,
+  COUNT(CASE WHEN e.event_type = 'view' THEN 1 END) AS views,
+  ROUND(
+    COUNT(CASE WHEN e.event_type = 'like' THEN 1 END)::NUMERIC /
+    NULLIF(COUNT(CASE WHEN e.event_type = 'view' THEN 1 END), 0) * 100,
+    2
+  ) AS like_rate_pct
+FROM user_events e
+JOIN items i ON e.item_id = i.id
+WHERE e.created_at > NOW() - INTERVAL '7 days'
+GROUP BY i.category
+ORDER BY like_rate_pct DESC;
+```
+
+**ユーザーセッション深度**：1セッションで平均何件のアイテムを閲覧するか。推薦精度が上がると深度が伸びます。
+
+**新規ユーザーの初回エンゲージメント**：コールドスタート問題の深刻さを把握します。
+
+### A/Bテストによる改善
+
+新しい推薦ロジックを試す際は、RevenueCat や PostHog のフラグ機能でユーザーを分割し、エンゲージメント率を比較します。
+
+```typescript
+// A/Bテスト：Embedding 推薦 vs. 人気順
+const useVariant = userId.charCodeAt(0) % 2 === 0 ? "embedding" : "popular";
+
+const { data } = useVariant === "embedding"
+  ? await supabase.rpc("get_recommendations", { p_user_id: userId })
+  : await supabase.from("items").select("*").order("view_count", { ascending: false }).limit(10);
+```
+
+---
+
+## よくあるエラーと対処法
+
+### pgvector でインデックスが効かない
+
+**症状**：クエリが遅い（`EXPLAIN ANALYZE` で `Seq Scan`）。
+
+**原因と対処**：IVFFlat インデックスを作成してもデータ件数が少ないと Seq Scan が選ばれます。`SET enable_seqscan = OFF;` で強制使用するか、1000件以上のデータが揃うまではインデックスなしで運用するのが現実的です。
+
+### Embedding が一致しない・精度が低い
+
+**症状**：まったく関係ないアイテムが推薦される。
+
+**原因と対処**：タスクタイプの不一致が多いです。コンテンツのベクトル化とクエリのベクトル化に同じ `taskType`（`SEMANTIC_SIMILARITY`）を使用してください。異なるタスクタイプのベクトルは次元は同じでも意味空間が異なります。
+
+### ユーザーの嗜好が更新されない
+
+**症状**：いいねしても推薦が変わらない。
+
+**原因と対処**：Edge Function のデプロイ漏れ、または `SUPABASE_SERVICE_ROLE_KEY` の設定漏れが多いです。Supabase ダッシュボードの Edge Functions ログを確認してください。
+
+---
+
+## FAQ
+
+**Q：コンテンツ数が少ない（50件以下）段階でも推薦エンジンは有効ですか？**
+
+A：有効です。ただし、アイテム数が少ない場合は IVFFlat インデックスは不要で、Seq Scan の方が高速です。100件を超えたあたりでインデックスを検討してください。また少数のコンテンツでは「人気順 + カテゴリフィルター」との組み合わせが現実的です。
+
+**Q：Gemini Embedding 以外のモデルでも使えますか？**
+
+A：はい。OpenAI の `text-embedding-3-small`（1536次元）や Voyage AI の `voyage-3`（1024次元）も使えます。ただし次元数が異なるため、`VECTOR(次元数)` の定義をモデルに合わせて変更してください。コスト・精度・速度のバランスでは Gemini `text-embedding-004` が個人開発には最適です。
+
+**Q：プライバシー・個人情報の取り扱いはどうすべきですか？**
+
+A：行動ログは個人情報に該当します。プライバシーポリシーに「レコメンド目的での行動データ収集」を明記し、オプトアウト機能を設けることをお勧めします。Supabase の RLS（Row Level Security）を使ってユーザーが自身のデータのみアクセスできる設計を徹底してください。
+
+---
+
+## まとめ
+
+本記事では、Rork × Supabase pgvector × Gemini Embedding API を使ったパーソナライズド推薦エンジンの完全実装手順を解説しました。
+
+実装の要点を振り返ります。
+
+- **pgvector + IVFFlat インデックス**で高速なベクトル類似検索を実現
+- **Gemini text-embedding-004** でコンテンツを意味的にベクトル化
+- **指数移動平均（EMA）**でユーザーの嗜好ベクトルをリアルタイムに更新
+- **RPC 関数**でスキップ済みアイテムを除外しながら推薦を返す
+- **楽観的更新**でUIをなめらかに保つ
+
+推薦エンジンはリテンション改善の最も強力な施策のひとつです。まずは50件のコンテンツと100ユーザーから始め、データが蓄積するにつれて精度が自然と上がっていく点が醍醐味です。ぜひ自分のアプリに実装して、ユーザーの「また来たい」を生み出してみてください。
+
+推薦システムをさらに深く学びたい方には、[「推薦システム実践入門」（風間正弘 他 著）](https://www.amazon.co.jp/dp/4873119669/?tag=pinocchio-22) がおすすめです。理論から実装まで体系的にまとめられた一冊です。

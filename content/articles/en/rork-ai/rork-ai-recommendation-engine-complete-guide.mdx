@@ -1,0 +1,746 @@
+---
+title: "Rork × AI Recommendation Engine: A Complete Guide Using Supabase pgvector & Gemini Embeddings to Maximize User Engagement"
+slug: "rork-ai-recommendation-engine-complete-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-06T11:15"
+updated: "2026-04-06T11:15"
+author: "Rork Lab"
+description: "A comprehensive guide to building a personalized recommendation engine in Rork using Supabase pgvector and the Gemini Embedding API. From designing user behavior logs to building a real-time recommendation API."
+tags: ["Rork", "Recommendation Engine", "Supabase", "pgvector", "Gemini", "Embedding", "Personalization", "AI", "React Native", "Cloudflare Workers"]
+highlights:
+  - "Build a content recommendation engine from scratch using Supabase pgvector and the Gemini Embedding API"
+  - "Learn production-ready implementation patterns — from user behavior log design to vector similarity search"
+  - "Understand how to integrate real-time recommendation UI in your Rork app and run accuracy evaluation and improvement cycles"
+---
+
+## Why Recommendations Determine Mobile App Retention
+
+When asked "what's the biggest reason users churn?", many developers say bugs or poor performance. In practice, the most common cause is far simpler: **users are shown content that isn't relevant to them** and simply stop coming back.
+
+Spotify's rapid growth across new markets was driven by personalized playlists like Discover Weekly. Netflix's viewing retention is sustained by its recommendation algorithms. Pinterest's session depth is famously longer than almost any other social app — and recommendations are the reason. These aren't features exclusive to big tech companies. With the right infrastructure choices, indie developers can implement equivalent systems today, and the tooling has never been more accessible.
+
+This guide walks you through building a fully functional, production-ready recommendation engine for your Rork app using:
+
+- **Rork / Rork Max** — AI-driven UI generation
+- **Supabase** — PostgreSQL + pgvector + Realtime + Edge Functions
+- **Gemini Embedding API** — vectorizing content and user preference profiles
+- **Cloudflare Workers (Hono)** — optional recommendation API layer for caching and rate limiting
+
+By the end of this guide, you'll have a system that learns from user behavior in real time, filters out content the user has already skipped, and steadily improves its accuracy as your dataset grows.
+
+---
+
+## Understanding the Three Core Recommendation Approaches
+
+There are three major paradigms in recommendation systems. This guide uses a **hybrid approach** that combines the best of content-based filtering and vector similarity search, with a simple collaborative signal layered on top.
+
+### Content-Based Filtering
+
+Recommends items that are **attribute-similar** to what a user has previously engaged with. "You enjoyed this Japanese recipe — here are more Japanese recipes under 30 minutes."
+
+- **Pros**: Works reasonably well for new users who have little history. Results are interpretable and auditable.
+- **Cons**: Hard to define the right attributes. Prone to filter bubbles where users only see variations of what they've already liked.
+
+### Collaborative Filtering
+
+Recommends items liked by users with **similar behavioral patterns** — "users who liked X also liked Y."
+
+- **Pros**: Requires no domain knowledge. Tends to produce serendipitous, cross-genre recommendations.
+- **Cons**: Accuracy is poor early on when you have few users or little data (the cold start problem). Requires a larger dataset to shine.
+
+### Vector Similarity Search (Embedding-Based)
+
+Represents content and users as high-dimensional vectors and finds nearby items by measuring cosine similarity or Euclidean distance. This is the primary approach in this guide.
+
+- **Pros**: Captures **semantic** similarity — items that mean similar things, not just items that share surface attributes. Schema design is simple and extensible.
+- **Cons**: Embedding generation requires API calls and incurs cost. Vectors must be regenerated if the underlying model changes.
+
+For most indie apps, the embedding approach offers the best return on investment: a single Supabase table with a vector column plus a few Edge Functions is enough to get a working recommendation engine running in a day.
+
+---
+
+## Architecture Overview
+
+Before writing any code, it helps to see the full picture.
+
+```
+[Rork App]
+   ↓ User interactions (view, like, skip, share, purchase)
+[Supabase]
+   ├── items table         → content + 768-dim embedding column
+   ├── user_events table   → time-stamped behavior log with weighted scores
+   ├── user_profiles table → aggregated preference vector per user
+   └── RPC functions       → personalized recommendation queries
+   
+[Gemini Embedding API]
+   ↑ Called once per item at creation time
+   ↑ Called when computing query vectors (optional)
+   
+[Edge Functions (Supabase / Cloudflare Workers)]
+   ← Orchestrate embedding generation and profile updates
+   → Return recommendation lists to the Rork app
+```
+
+The key design principle here is **write-time vectorization**: embeddings are generated when content is created and stored in the database. At query time, you only perform a fast vector search — no LLM calls required in the hot path.
+
+---
+
+## Step 1: Database Design in Supabase
+
+### Enable the pgvector Extension
+
+Open the SQL Editor in your Supabase dashboard and run:
+
+```sql
+-- Enable pgvector
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Items table: stores content to be recommended
+CREATE TABLE items (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title       TEXT NOT NULL,
+  description TEXT,
+  category    TEXT,
+  tags        TEXT[],
+  -- Gemini text-embedding-004 produces 768-dimensional vectors
+  embedding   VECTOR(768),
+  view_count  INT DEFAULT 0,
+  like_count  INT DEFAULT 0,
+  metadata    JSONB DEFAULT '{}',
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- User behavior log: the raw signal for the recommendation engine
+CREATE TABLE user_events (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  item_id    UUID NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL CHECK (event_type IN ('view', 'like', 'skip', 'share', 'purchase')),
+  -- Weighted scores: like=1.0, view=0.3, skip=-0.5, share=1.5, purchase=2.0
+  score      FLOAT DEFAULT 0.3,
+  session_id TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Aggregated user preference vectors (updated incrementally)
+CREATE TABLE user_profiles (
+  user_id          UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  preference_vector VECTOR(768),
+  event_count      INT DEFAULT 0,
+  updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- IVFFlat index for fast approximate nearest neighbor search
+-- Rule of thumb: lists ≈ sqrt(row_count)
+CREATE INDEX ON items USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
+
+CREATE INDEX ON user_profiles USING ivfflat (preference_vector vector_cosine_ops)
+  WITH (lists = 10);
+```
+
+### Choosing the Right Index Type
+
+Supabase pgvector supports two index types: **IVFFlat** and **HNSW**.
+
+IVFFlat partitions vectors into lists and probes a subset at query time. It is memory-efficient and easy to reason about, making it the right default for most apps with fewer than 1 million items. HNSW uses a graph-based structure and offers better recall at the cost of higher memory usage — worth considering when your catalog grows past 500k items.
+
+For most indie apps starting out, IVFFlat with `lists = sqrt(N)` is the correct choice.
+
+### Creating the Recommendation RPC Function
+
+```sql
+-- Returns the top-N recommended items for a given user
+CREATE OR REPLACE FUNCTION get_recommendations(
+  p_user_id UUID,
+  p_limit   INT  DEFAULT 10,
+  p_category TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+  item_id     UUID,
+  title       TEXT,
+  description TEXT,
+  category    TEXT,
+  tags        TEXT[],
+  similarity  FLOAT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_preference VECTOR(768);
+BEGIN
+  -- Retrieve user preference vector
+  SELECT preference_vector INTO v_preference
+  FROM user_profiles
+  WHERE user_id = p_user_id;
+
+  -- Cold start fallback: return recent items for users with no history
+  IF v_preference IS NULL THEN
+    RETURN QUERY
+    SELECT i.id, i.title, i.description, i.category, i.tags, 0.0::FLOAT
+    FROM items i
+    WHERE (p_category IS NULL OR i.category = p_category)
+    ORDER BY i.created_at DESC
+    LIMIT p_limit;
+    RETURN;
+  END IF;
+
+  -- Return items ordered by cosine similarity, excluding recent skips
+  RETURN QUERY
+  SELECT
+    i.id,
+    i.title,
+    i.description,
+    i.category,
+    i.tags,
+    (1 - (i.embedding <=> v_preference))::FLOAT AS similarity
+  FROM items i
+  WHERE i.embedding IS NOT NULL
+    AND (p_category IS NULL OR i.category = p_category)
+    -- Suppress items the user skipped in the last 30 days
+    AND i.id NOT IN (
+      SELECT item_id
+      FROM user_events
+      WHERE user_id = p_user_id
+        AND event_type = 'skip'
+        AND created_at > NOW() - INTERVAL '30 days'
+    )
+    -- Also suppress items the user has already purchased
+    AND i.id NOT IN (
+      SELECT item_id
+      FROM user_events
+      WHERE user_id = p_user_id
+        AND event_type = 'purchase'
+    )
+  ORDER BY i.embedding <=> v_preference
+  LIMIT p_limit;
+END;
+$$;
+```
+
+---
+
+## Step 2: Vectorizing Content with the Gemini Embedding API
+
+### Why text-embedding-004?
+
+Google's `text-embedding-004` model produces 768-dimensional vectors and is tuned for semantic similarity tasks. As of April 2026, pricing is approximately $0.00001 per 1,000 tokens — making it the most cost-effective embedding model available. For an app with 1,000 content items and average descriptions of 100 tokens, embedding the entire catalog costs less than $0.10.
+
+### Supabase Edge Function: Auto-Embed Items on Creation
+
+Deploy this Edge Function to your Supabase project. Call it from your item creation workflow (admin panel, content API, or a database trigger).
+
+```typescript
+// supabase/functions/embed-item/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const GEMINI_API_KEY          = Deno.env.get("GEMINI_API_KEY")!;
+const SUPABASE_URL            = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+serve(async (req) => {
+  const { item_id, title, description, tags } = await req.json();
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  // Combine all textual signals into one input string
+  const textToEmbed = [
+    `Title: ${title}`,
+    description ? `Description: ${description}` : "",
+    tags?.length  ? `Tags: ${tags.join(", ")}`   : "",
+  ].filter(Boolean).join("\n");
+
+  // Call Gemini text-embedding-004
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`,
+    {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model:    "models/text-embedding-004",
+        content:  { parts: [{ text: textToEmbed }] },
+        taskType: "SEMANTIC_SIMILARITY",
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const err = await res.text();
+    console.error("Gemini error:", err);
+    return new Response(JSON.stringify({ error: "Embedding API failed" }), { status: 500 });
+  }
+
+  const { embedding } = await res.json();
+
+  const { error } = await supabase
+    .from("items")
+    .update({ embedding: embedding.values })
+    .eq("id", item_id);
+
+  if (error) {
+    return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+  }
+
+  return new Response(JSON.stringify({ success: true, dimensions: embedding.values.length }));
+});
+```
+
+> **Important**: Always use the same `taskType` for both content embeddings and user preference vectors. Mixing `SEMANTIC_SIMILARITY` and `RETRIEVAL_DOCUMENT` task types will produce vectors in incompatible semantic spaces, leading to poor recommendation quality.
+
+### Batch-Embedding Existing Content
+
+If you're migrating an existing catalog, run a one-time batch job:
+
+```typescript
+// scripts/batch-embed.ts
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+
+async function batchEmbed() {
+  // Fetch all items that don't have embeddings yet
+  const { data: items } = await supabase
+    .from("items")
+    .select("id, title, description, tags")
+    .is("embedding", null);
+
+  if (!items?.length) {
+    console.log("All items already embedded.");
+    return;
+  }
+
+  console.log(`Embedding ${items.length} items...`);
+
+  for (const item of items) {
+    await fetch(`${process.env.SUPABASE_URL}/functions/v1/embed-item`, {
+      method:  "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        Authorization:   `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify(item),
+    });
+
+    // Rate limit: Gemini Embedding API has a generous quota, but add a small delay
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  console.log("Batch embedding complete.");
+}
+
+batchEmbed();
+```
+
+---
+
+## Step 3: Collecting User Behavior and Updating Preference Vectors
+
+### Scoring User Actions
+
+Not all interactions carry equal signal. We assign different weights based on how strongly an action indicates preference:
+
+- **purchase (+2.0)**: Strongest positive signal — the user committed money
+- **share (+1.5)**: High intent; the user actively promoted the content
+- **like (+1.0)**: Clear, explicit positive feedback
+- **view (+0.3)**: Mild positive engagement; the user at least spent time on it
+- **skip (−0.5)**: Clear negative signal — don't show similar content again soon
+
+### Supabase Edge Function: Update User Preference Vector
+
+```typescript
+// supabase/functions/update-user-profile/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const EVENT_SCORES: Record<string, number> = {
+  view:     0.3,
+  like:     1.0,
+  share:    1.5,
+  purchase: 2.0,
+  skip:    -0.5,
+};
+
+serve(async (req) => {
+  const { user_id, item_id, event_type } = await req.json();
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  const score = EVENT_SCORES[event_type] ?? 0.1;
+
+  // Record the raw event
+  await supabase.from("user_events").insert({ user_id, item_id, event_type, score });
+
+  // Fetch the item's embedding
+  const { data: item } = await supabase
+    .from("items")
+    .select("embedding")
+    .eq("id", item_id)
+    .single();
+
+  if (!item?.embedding) {
+    return new Response(JSON.stringify({ skipped: "no embedding" }), { status: 200 });
+  }
+
+  // Fetch current user preference vector
+  const { data: profile } = await supabase
+    .from("user_profiles")
+    .select("preference_vector, event_count")
+    .eq("user_id", user_id)
+    .single();
+
+  const itemVector: number[] = item.embedding;
+  let newVector: number[];
+
+  if (!profile?.preference_vector) {
+    // First interaction: initialize with the item's vector
+    newVector = itemVector.map((v) => v * score);
+  } else {
+    // Exponential Moving Average update
+    // alpha: learning rate. Smaller = more stable. Larger = faster adaptation.
+    // We scale alpha by the strength of the signal.
+    const alpha = Math.min(Math.abs(score) * 0.1, 0.3);
+    const current: number[] = profile.preference_vector;
+
+    newVector = current.map((v, i) =>
+      v * (1 - alpha) + itemVector[i] * alpha * Math.sign(score)
+    );
+
+    // Normalize to unit vector (required for cosine similarity)
+    const mag = Math.sqrt(newVector.reduce((s, v) => s + v * v, 0));
+    if (mag > 0) newVector = newVector.map((v) => v / mag);
+  }
+
+  await supabase.from("user_profiles").upsert({
+    user_id,
+    preference_vector: newVector,
+    event_count: (profile?.event_count ?? 0) + 1,
+    updated_at: new Date().toISOString(),
+  });
+
+  return new Response(JSON.stringify({ success: true }));
+});
+```
+
+### Why Exponential Moving Average?
+
+A simple average of all past item vectors would treat a video a user watched three months ago the same as one they liked yesterday. EMA gives more weight to recent interactions, making the preference vector sensitive to changing interests without overreacting to a single signal. The `alpha` parameter controls this balance:
+
+- `alpha = 0.3`: adapts quickly (good for apps with rapidly changing interests)
+- `alpha = 0.05`: adapts slowly (good for apps where preferences are stable, like news or music genres)
+
+Scaling alpha by `|score|` means strong signals (purchases, skips) shift the vector more than weak ones (views), which reflects how humans actually update their preferences.
+
+---
+
+## Step 4: Building the Recommendation UI in Rork
+
+### Generating the Feed with a Rork Prompt
+
+Use this prompt in Rork to generate the recommendation feed screen:
+
+```
+Create a personalized recommendation feed screen.
+
+Requirements:
+- Fetch a JSON array of recommended items from /api/recommendations on mount
+- Display items as vertically scrollable cards using FlatList
+- Each card contains: title, description text (2 lines max), 
+  colored category badge, tags as pills, like button (heart), skip button (X)
+- Like button: red heart icon, tapping records a "like" event
+- Skip button: gray X icon, tapping records a "skip" event and removes the card
+  using an animated slide-out to the left
+- When 5 or fewer cards remain, automatically fetch the next batch
+- Show skeleton placeholder cards during loading
+- Show an empty state illustration with "Explore More" button when the list runs out
+- Error state: show a retry button with the error message
+```
+
+### Custom Hook: useRecommendations
+
+After Rork generates the screen, wire in this hook:
+
+```typescript
+// hooks/useRecommendations.ts
+import { useState, useCallback } from "react";
+import { supabase } from "@/lib/supabase";
+
+interface RecommendedItem {
+  item_id:     string;
+  title:       string;
+  description: string;
+  category:    string;
+  tags:        string[];
+  similarity:  number;
+}
+
+export function useRecommendations(category?: string) {
+  const [items,    setItems]    = useState<RecommendedItem[]>([]);
+  const [loading,  setLoading]  = useState(false);
+  const [hasMore,  setHasMore]  = useState(true);
+  const [error,    setError]    = useState<string | null>(null);
+
+  const fetchRecommendations = useCallback(async () => {
+    if (loading || !hasMore) return;
+    setLoading(true);
+    setError(null);
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { setLoading(false); return; }
+
+    const { data, error: rpcError } = await supabase.rpc("get_recommendations", {
+      p_user_id:  user.id,
+      p_limit:    10,
+      p_category: category ?? null,
+    });
+
+    if (rpcError) {
+      setError(rpcError.message);
+    } else if (!data?.length) {
+      setHasMore(false);
+    } else {
+      setItems((prev) => {
+        const seen = new Set(prev.map((i) => i.item_id));
+        return [...prev, ...data.filter((i: RecommendedItem) => !seen.has(i.item_id))];
+      });
+      if (data.length < 10) setHasMore(false);
+    }
+
+    setLoading(false);
+  }, [loading, hasMore, category]);
+
+  const recordEvent = useCallback(
+    async (
+      itemId: string,
+      eventType: "like" | "skip" | "view" | "share" | "purchase"
+    ) => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+
+      // Optimistic update: hide skipped items immediately
+      if (eventType === "skip") {
+        setItems((prev) => prev.filter((i) => i.item_id !== itemId));
+      }
+
+      // Fire-and-forget: update preference vector in the background
+      supabase.functions.invoke("update-user-profile", {
+        body: { user_id: user.id, item_id: itemId, event_type: eventType },
+      });
+    },
+    []
+  );
+
+  return { items, loading, hasMore, error, fetchRecommendations, recordEvent };
+}
+```
+
+### Animating the Skip Gesture
+
+For a polished feel, add a swipe-to-skip gesture using React Native Reanimated:
+
+```typescript
+// components/RecommendationCard.tsx
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withSpring,
+  runOnJS,
+} from "react-native-reanimated";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
+
+interface Props {
+  item:        RecommendedItem;
+  onLike:      () => void;
+  onSkip:      () => void;
+}
+
+export function RecommendationCard({ item, onLike, onSkip }: Props) {
+  const translateX = useSharedValue(0);
+  const opacity    = useSharedValue(1);
+
+  const panGesture = Gesture.Pan()
+    .onUpdate((e) => { translateX.value = e.translationX; })
+    .onEnd((e) => {
+      if (e.translationX < -80) {
+        // Swipe left = skip
+        translateX.value = withSpring(-400);
+        opacity.value    = withSpring(0);
+        runOnJS(onSkip)();
+      } else {
+        translateX.value = withSpring(0);
+      }
+    });
+
+  const animStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+    opacity:    opacity.value,
+  }));
+
+  return (
+    <GestureDetector gesture={panGesture}>
+      <Animated.View style={animStyle} className="bg-white rounded-2xl shadow mx-4 my-2 p-4">
+        {/* Card content */}
+      </Animated.View>
+    </GestureDetector>
+  );
+}
+```
+
+---
+
+## Step 5: Measuring and Improving Recommendation Accuracy
+
+A recommendation engine without measurement is just guesswork. Set up these queries in Supabase and review them weekly.
+
+### Core Metrics
+
+**Like rate by category** (last 7 days):
+
+```sql
+SELECT
+  i.category,
+  COUNT(CASE WHEN e.event_type = 'like'  THEN 1 END)             AS likes,
+  COUNT(CASE WHEN e.event_type = 'view'  THEN 1 END)             AS views,
+  COUNT(CASE WHEN e.event_type = 'skip'  THEN 1 END)             AS skips,
+  ROUND(
+    COUNT(CASE WHEN e.event_type = 'like' THEN 1 END)::NUMERIC /
+    NULLIF(COUNT(CASE WHEN e.event_type = 'view' THEN 1 END), 0) * 100, 2
+  )                                                               AS like_rate_pct
+FROM user_events e
+JOIN items i ON e.item_id = i.id
+WHERE e.created_at > NOW() - INTERVAL '7 days'
+GROUP BY i.category
+ORDER BY like_rate_pct DESC;
+```
+
+**Cold start effectiveness** (users with fewer than 5 events):
+
+```sql
+SELECT
+  AVG(CASE WHEN e.event_type = 'like' THEN 1.0 ELSE 0.0 END) AS like_rate
+FROM user_events e
+WHERE user_id IN (
+  SELECT user_id
+  FROM user_events
+  GROUP BY user_id
+  HAVING COUNT(*) < 5
+);
+```
+
+**Top-performing items** in the last 30 days:
+
+```sql
+SELECT
+  i.title,
+  i.category,
+  COUNT(CASE WHEN e.event_type = 'like'     THEN 1 END) AS likes,
+  COUNT(CASE WHEN e.event_type = 'purchase' THEN 1 END) AS purchases,
+  COUNT(CASE WHEN e.event_type = 'skip'     THEN 1 END) AS skips
+FROM items i
+JOIN user_events e ON e.item_id = i.id
+WHERE e.created_at > NOW() - INTERVAL '30 days'
+GROUP BY i.id, i.title, i.category
+ORDER BY likes DESC
+LIMIT 20;
+```
+
+### Running an A/B Test
+
+Split users between your embedding-based recommender and a simpler popularity baseline:
+
+```typescript
+// Deterministic A/B split based on userId
+const isEmbeddingGroup = parseInt(userId.slice(-2), 16) % 2 === 0;
+
+const { data } = isEmbeddingGroup
+  ? await supabase.rpc("get_recommendations", { p_user_id: userId })
+  : await supabase.from("items")
+      .select("id, title, description, category, tags")
+      .order("like_count", { ascending: false })
+      .limit(10);
+
+// Record which variant the user is in for analysis
+await supabase.from("user_events").insert({
+  user_id:    userId,
+  event_type: "ab_assignment",
+  metadata:   { variant: isEmbeddingGroup ? "embedding" : "popular" },
+});
+```
+
+After two weeks, compare like rates between the two groups. If the embedding group outperforms by more than 5 percentage points, it's a meaningful improvement worth keeping.
+
+---
+
+## Common Errors and How to Fix Them
+
+### IVFFlat Index Not Being Used
+
+**Symptom**: Queries are slow. `EXPLAIN ANALYZE` shows `Seq Scan on items`.
+
+**Fix**: With fewer than ~1,000 rows, the Postgres query planner correctly prefers a sequential scan over an index scan. This is normal behavior. Run `SET enable_seqscan = OFF;` temporarily to force index use during testing, but leave it enabled in production until your row count justifies the index.
+
+### Recommendations Are Not Personalized After Several Interactions
+
+**Symptom**: The same items appear regardless of what the user has liked or skipped.
+
+**Fix**: Check that the Edge Function `update-user-profile` is successfully being called. Open Supabase → Edge Functions → Logs and look for errors. The most common causes are: (1) incorrect `SUPABASE_SERVICE_ROLE_KEY` in the environment, or (2) a typo in the function name when invoking from the client.
+
+### Poor Recommendation Quality (Irrelevant Items Appearing)
+
+**Symptom**: Recommendations don't correlate with user behavior at all.
+
+**Fix**: Verify that `taskType: "SEMANTIC_SIMILARITY"` is used consistently for both item embeddings and preference vector lookups. Different task types produce vectors that live in incompatible semantic spaces — numerically similar, but semantically unrelated.
+
+### Cold Start Users Get No Recommendations
+
+**Symptom**: New users see an empty feed.
+
+**Fix**: Ensure the fallback branch of `get_recommendations` (when `preference_vector IS NULL`) is returning items. Check that your `items` table has populated rows and the `created_at` ordering is correct.
+
+---
+
+## FAQ
+
+**Q: Does a recommendation engine make sense when I only have 50 content items?**
+
+A: Yes, though your focus should be on getting the data model right, not on recommendation quality at this stage. At 50 items, any approach will have limited diversity. Combine the vector recommender with a "trending this week" or "new arrivals" fallback to fill out the feed. As your catalog grows past 200–300 items, you'll start to see genuine personalization emerge.
+
+**Q: Can I use embedding models other than Gemini?**
+
+A: Absolutely. OpenAI's `text-embedding-3-small` (1536 dimensions) and Voyage AI's `voyage-3` (1024 dimensions) are solid alternatives. Cohere's `embed-v3` is another good option. Just update `VECTOR(n)` in your schema to match the model's output dimensions. The rest of the architecture works identically. For cost-conscious indie developers, Gemini `text-embedding-004` is currently the most affordable option with strong multilingual performance.
+
+**Q: How should I handle privacy and data compliance?**
+
+A: Behavior logs are personal data. Your privacy policy must explicitly disclose that you collect interaction data to personalize recommendations. Provide an opt-out mechanism (users can disable personalization) and a data deletion endpoint (delete from `user_events` and `user_profiles` where `user_id = ?`). Use Supabase Row Level Security (RLS) to ensure users can only query and modify their own data. If you operate in the EU, GDPR applies; in Japan, the Act on the Protection of Personal Information (APPI) requires transparency about data processing purposes.
+
+**Q: How do I handle the case where a user clears their history or requests data deletion?**
+
+A: Simply delete the rows in `user_events` and `user_profiles` for that user. The next time they interact with content, a fresh preference vector will be initialized from scratch. Build a "Clear my recommendation history" button in your settings screen that calls a Supabase RPC function or Edge Function to perform the deletion.
+
+**Q: What happens when I add a new content category that no user has engaged with yet?**
+
+A: New content in an unexplored category won't be recommended to existing users unless their preference vector happens to be semantically close. A practical solution is to create a "new & featured" section in the UI that surfaces recently added content outside the recommendation algorithm — this bootstraps engagement data for new categories.
+
+---
+
+## Summary
+
+In this guide, we built a complete, production-ready personalized recommendation engine for a Rork app using Supabase pgvector and the Gemini Embedding API. Here is a recap of the key implementation decisions and why they matter.
+
+The **write-time vectorization** pattern keeps the recommendation query fast — no LLM calls in the hot path. Embeddings are computed once when content is added and stored as a database column. At query time, a single vector similarity search returns results in milliseconds.
+
+The **exponential moving average** approach to preference vector updates strikes the right balance between stability and responsiveness. Users' interests evolve over time, and EMA ensures the system reflects recent behavior more heavily than distant history without overreacting to single events.
+
+The **IVFFlat index** in pgvector provides scalable approximate nearest-neighbor search that works efficiently from a few hundred to hundreds of thousands of items. The `lists` parameter can be tuned as the catalog grows.
+
+The **optimistic UI update** pattern for skip events keeps the app feeling responsive. Removing the card immediately — before the server confirms the skip — gives a satisfying, app-like interaction that users expect from a polished product.
+
+Recommendation engines improve naturally with data. Start with 50 items and 100 users. Run the A/B test after two weeks. Tune the EMA alpha based on your category's engagement patterns. The system will compound on itself.
+
+For a deeper dive into recommendation system theory and production engineering, [*Practical Recommender Systems* by Kim Falk](https://www.amazon.co.jp/dp/1617292702/?tag=pinocchio-22) covers everything from collaborative filtering fundamentals to neural embedding-based approaches in a highly readable format.
