@@ -96,7 +96,7 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
         position: "relative",
         zIndex: 2,
         maxWidth: 480,
-        margin: "32px auto 24px",
+        margin: "32px auto 48px",
         padding: "28px 24px",
         borderRadius: 10,
         border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
