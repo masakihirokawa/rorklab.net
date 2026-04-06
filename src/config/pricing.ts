@@ -155,3 +155,46 @@ export function getCampaign(locale: string) {
     priceId: CAMPAIGN.priceIds[loc],
   };
 }
+
+// ── Single Article Purchase ──────────────────────────────────────
+// Stripe Price IDs for per-article purchases (¥250 JA / $1.75 EN)
+// TODO: 商品登録後にここを更新してください
+export const ARTICLE_PRICE_IDS = {
+  ja: "price_ARTICLE_JA_RORKLAB",  // ¥250
+  en: "price_ARTICLE_EN_RORKLAB",  // $1.75
+} as const;
+
+export const ARTICLE_PRICES = {
+  ja: "¥250",
+  en: "$1.75",
+} as const;
+
+export const ARTICLE_LABELS = {
+  ja: {
+    button: "この記事を ¥250 で購入",
+    description: "この記事のみ購入して全文をお読みいただけます（購入後はいつでも再読可）。",
+    orSeparator: "または",
+    memberNote: "メンバーシップなら全記事読み放題",
+  },
+  en: {
+    button: "Buy this article for $1.75",
+    description: "Purchase this article to read the full content anytime.",
+    orSeparator: "or",
+    memberNote: "Membership gives you access to all premium articles",
+  },
+} as const;
+
+export function getArticlePriceId(locale: string): string {
+  const loc = locale === "en" ? "en" : "ja";
+  return ARTICLE_PRICE_IDS[loc];
+}
+
+export function getArticlePrice(locale: string): string {
+  const loc = locale === "en" ? "en" : "ja";
+  return ARTICLE_PRICES[loc];
+}
+
+export function getArticleLabels(locale: string) {
+  const loc = locale === "en" ? "en" : "ja";
+  return ARTICLE_LABELS[loc];
+}

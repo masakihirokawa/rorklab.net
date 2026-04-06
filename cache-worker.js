@@ -34,6 +34,9 @@ function shouldSkipCache(url, request) {
   if (p.startsWith("/api/") || p === "/feed.xml" || p.startsWith("/_next/")) return true;
   if (p.includes(".") && !p.endsWith("/")) return true;
   if (request.headers.get("rsc")) return true;
+  // Skip cache for authenticated users (premium members and article buyers)
+  const cookies = request.headers.get("cookie") || "";
+  if (cookies.includes("premium_token=") || cookies.includes("article_purchases=")) return true;
   return false;
 }
 

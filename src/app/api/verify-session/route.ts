@@ -50,6 +50,56 @@ export async function GET(request: NextRequest) {
       return NextResponse.redirect(new URL(`${prefix}/support?thanks=tip`, request.url));
     }
 
+    // Article purchase: save per-article KV entry and set article_purchases cookie
+    if (planType === "article") {
+      const articleSlug = session.metadata?.article_slug;
+      const email = session.customer_details?.email;
+
+      if (!articleSlug || !email) {
+        const prefix = locale === "en" ? "/en" : "";
+        return NextResponse.redirect(new URL(`${prefix}/support?error=article`, request.url));
+      }
+
+      const ARTICLE_TTL = 10 * 365 * 24 * 3600; // 10 years
+
+      try {
+        const kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
+        if (kv) {
+          const kvKey = `site:rorklab:article:${email}:${articleSlug}`;
+          await kv.put(
+            kvKey,
+            JSON.stringify({
+              type: "article",
+              slug: articleSlug,
+              stripe_session_id: sessionId,
+              purchased_at: new Date().toISOString(),
+              expires_at: new Date(Date.now() + ARTICLE_TTL * 1000).toISOString(),
+            }),
+            { expirationTtl: ARTICLE_TTL }
+          );
+        }
+      } catch {
+        // KV not available — cookie-based fallback will apply
+      }
+
+      const returnUrl = session.metadata?.return_url;
+      const prefix = locale === "en" ? "/en" : "";
+      const dest = returnUrl
+        ? new URL(returnUrl)
+        : new URL(`${prefix}/articles/${articleSlug.split("/")[0]}/${articleSlug}`, request.url);
+      dest.searchParams.set("thanks", "article");
+
+      const articleResponse = NextResponse.redirect(dest.toString());
+      articleResponse.cookies.set("article_purchases", btoa(`${email}:article`), {
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+        maxAge: ARTICLE_TTL,
+        path: "/",
+      });
+      return articleResponse;
+    }
+
     const email = session.customer_details?.email;
     if (!email) {
       const prefix = locale === "en" ? "/en" : "";

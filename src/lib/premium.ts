@@ -50,3 +50,33 @@ export async function getPremiumAccess(): Promise<PremiumType> {
     return null;
   }
 }
+
+export async function getArticleAccess(slug: string): Promise<boolean> {
+  const cookieStore = await cookies();
+  const token = cookieStore.get("article_purchases")?.value;
+  if (!token) return false;
+
+  try {
+    const decoded = atob(token);
+    const [email] = decoded.split(":");
+    if (!email) return false;
+
+    try {
+      const kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
+      if (kv) {
+        const kvKey = `site:rorklab:article:${email}:${slug}`;
+        const data = await kv.get(kvKey);
+        if (!data) return false;
+        const record = JSON.parse(data);
+        return new Date(record.expires_at) > new Date();
+      }
+    } catch {
+      // KV not available — fall back to cookie presence
+    }
+
+    // Cookie present = grant access (KV unavailable fallback)
+    return true;
+  } catch {
+    return false;
+  }
+}

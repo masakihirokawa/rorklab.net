@@ -27,17 +27,37 @@ const TIP_PRICE_IDS = new Set([
   "price_1TGTQMEGB5g6A54o6VMWCFNr", // $1.50 USD
 ]);
 
+// Article price IDs — per-article purchases
+const ARTICLE_PRICE_IDS = new Set([
+  "price_ARTICLE_JA_RORKLAB",  // ¥250 JPY
+  "price_ARTICLE_EN_RORKLAB",  // $1.75 USD
+]);
+
 export async function POST(request: NextRequest) {
   try {
     const stripe = getStripe();
-    const { locale, priceId, mode, cancelUrl, returnUrl } = await request.json();
+    const { locale, priceId, mode, cancelUrl, returnUrl, articleSlug } = await request.json();
     const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://rorklab.net";
     const prefix = locale === "en" ? "en/" : "";
     const fallbackCancel = `${baseUrl}/${prefix}support`;
     const planName = PLAN_NAMES[priceId] || (locale === "en" ? "Rork Lab Membership" : "Rork Lab メンバーシップ");
 
     // Determine plan type for verify-session to handle correctly
-    const planType = mode === "subscription" ? "pro" : TIP_PRICE_IDS.has(priceId) ? "tip" : "premium";
+    let planType: string;
+    if (mode === "subscription") {
+      planType = "pro";
+    } else if (TIP_PRICE_IDS.has(priceId)) {
+      planType = "tip";
+    } else if (ARTICLE_PRICE_IDS.has(priceId)) {
+      planType = "article";
+    } else {
+      planType = "premium";
+    }
+
+    // Article purchases require a slug
+    if (planType === "article" && !articleSlug) {
+      return NextResponse.json({ error: "articleSlug is required for article purchases" }, { status: 400 });
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: mode || "payment",
@@ -47,7 +67,11 @@ export async function POST(request: NextRequest) {
           quantity: 1,
         },
       ],
-      metadata: { plan_type: planType, ...(returnUrl && { return_url: returnUrl }) },
+      metadata: {
+        plan_type: planType,
+        ...(returnUrl && { return_url: returnUrl }),
+        ...(articleSlug && { article_slug: articleSlug }),
+      },
       // Pro（月額）のみ初月無料トライアルを付与
       ...(mode === "subscription" && {
         subscription_data: { trial_period_days: 30, description: planName },
