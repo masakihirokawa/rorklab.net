@@ -211,7 +211,7 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
           e.currentTarget.style.transform = "translateY(0)";
         }}
       >
-        {labels.memberNote} →
+        {labels.memberNote}&nbsp;→
       </a>
     </div>
   );
