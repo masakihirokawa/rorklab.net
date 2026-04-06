@@ -1,0 +1,474 @@
+---
+title: "Rork × Cloudflare D1：エッジ SQLite でスケーラブルなバックエンドを構築する完全ガイド"
+slug: "rork-cloudflare-d1-sqlite-backend-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-07T10:00"
+updated: "2026-04-07T10:00"
+author: "Rork Lab"
+description: "Rork で作ったモバイルアプリのバックエンドに Cloudflare D1（エッジ SQLite）を接続する方法を解説。Hono REST API 経由でデータを読み書きし、グローバルに低レイテンシなアプリを実現する実践ガイド。"
+tags: ["Cloudflare D1", "SQLite", "Cloudflare Workers", "Hono", "バックエンド", "データベース", "Rork", "React Native"]
+---
+
+## Cloudflare D1 とは何か、なぜ Rork と相性が良いのか
+
+Cloudflare D1 は、Cloudflare Workers 上で動作する**サーバーレス SQLite データベース**です。従来のリレーショナルデータベース（PostgreSQL や MySQL）と異なり、特定のリージョンに縛られることなく、世界中の Cloudflare エッジネットワーク上で低レイテンシなクエリを実行できます。
+
+Rork で作ったモバイルアプリのバックエンドに D1 を採用する主なメリットは次の通りです。
+
+- **低コスト**: 無料枠で 1 日 5 万クエリ・5 GB のストレージが利用可能
+- **グローバル低レイテンシ**: ユーザーに最も近いエッジでクエリが処理される
+- **SQL 標準構文**: PostgreSQL や MySQL と似た SQL が書けるため学習コストが低い
+- **Workers との統合**: Hono などの軽量フレームワークと組み合わせて REST API を簡単に構築できる
+- **Cloudflare エコシステムとの相性**: R2（ファイルストレージ）や KV（キャッシュ）と組み合わせやすい
+
+すでに Cloudflare Workers 上でホスティングしているサービスや、[Rork + Hono で REST API を構築する方法](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide)を学んだ方にとって、D1 は自然な次のステップです。
+
+---
+
+## アーキテクチャ全体像
+
+この記事で構築するシステムの構成を整理します。
+
+- **フロントエンド**: Rork（React Native / Expo）で作ったモバイルアプリ
+- **API レイヤー**: Cloudflare Workers + Hono（REST API）
+- **データベース**: Cloudflare D1（SQLite）
+- **認証**: Bearer トークン（シンプルな実装例）
+
+Rork アプリ → HTTPS リクエスト → Cloudflare Workers（Hono）→ D1 クエリ → レスポンス返却
+
+この構成なら月額 $0〜数ドルで、ユーザー数が増えてもほぼ自動でスケールします。
+
+---
+
+## 事前準備
+
+以下が揃っていることを確認してください。
+
+- Cloudflare アカウント（無料プランで可）
+- Wrangler CLI（`npm install -g wrangler`）
+- Node.js 18 以上
+- Rork または Rork Max のアカウント
+- 基本的な JavaScript / TypeScript の知識
+
+---
+
+## Step 1: Cloudflare D1 データベースを作成する
+
+まず Wrangler CLI を使って D1 データベースを作成します。
+
+```bash
+# Cloudflare にログイン
+npx wrangler login
+
+# D1 データベースを作成
+npx wrangler d1 create rork-app-db
+
+# 出力例:
+# ✅ Successfully created DB 'rork-app-db'
+# database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+出力された `database_id` をメモしておきます。次のステップで使います。
+
+---
+
+## Step 2: Workers プロジェクトをセットアップする
+
+Hono を使った Workers プロジェクトを作成します。
+
+```bash
+# Hono テンプレートで Workers プロジェクトを作成
+npm create hono@latest rork-d1-api
+cd rork-d1-api
+
+# 必要なパッケージをインストール
+npm install
+```
+
+`wrangler.toml` を次のように編集して D1 バインディングを設定します。
+
+```toml
+# wrangler.toml
+name = "rork-d1-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rork-app-db"
+database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # ← Step 1 で取得した ID
+```
+
+---
+
+## Step 3: スキーマとマイグレーションを作成する
+
+D1 はマイグレーションファイルで管理するのがベストプラクティスです。`migrations/` ディレクトリを作成し、初期スキーマを定義します。
+
+```sql
+-- migrations/0001_init.sql
+CREATE TABLE IF NOT EXISTS items (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id   TEXT    NOT NULL,
+  title     TEXT    NOT NULL,
+  body      TEXT,
+  created_at TEXT   DEFAULT (datetime('now')),
+  updated_at TEXT   DEFAULT (datetime('now'))
+);
+
+-- インデックス: user_id 検索を高速化
+CREATE INDEX IF NOT EXISTS idx_items_user_id ON items(user_id);
+```
+
+マイグレーションをローカルとリモートに適用します。
+
+```bash
+# ローカル（開発用）に適用
+npx wrangler d1 migrations apply rork-app-db --local
+
+# リモート（本番）に適用
+npx wrangler d1 migrations apply rork-app-db
+```
+
+---
+
+## Step 4: Hono で CRUD API を実装する
+
+`src/index.ts` に CRUD エンドポイントを実装します。
+
+```typescript
+// src/index.ts
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+
+type Bindings = {
+  DB: D1Database
+}
+
+const app = new Hono<{ Bindings: Bindings }>()
+
+// CORS を許可（Rork アプリからのリクエストに対応）
+app.use('*', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+}))
+
+// ── 一覧取得 ──
+app.get('/items', async (c) => {
+  const userId = c.req.header('X-User-Id') ?? 'anonymous'
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM items WHERE user_id = ? ORDER BY created_at DESC'
+  ).bind(userId).all()
+  return c.json({ items: results })
+})
+
+// ── 新規作成 ──
+app.post('/items', async (c) => {
+  const userId = c.req.header('X-User-Id') ?? 'anonymous'
+  const { title, body } = await c.req.json<{ title: string; body?: string }>()
+
+  if (!title) {
+    return c.json({ error: 'title is required' }, 400)
+  }
+
+  const result = await c.env.DB.prepare(
+    'INSERT INTO items (user_id, title, body) VALUES (?, ?, ?) RETURNING *'
+  ).bind(userId, title, body ?? '').first()
+
+  return c.json({ item: result }, 201)
+})
+
+// ── 更新 ──
+app.put('/items/:id', async (c) => {
+  const userId = c.req.header('X-User-Id') ?? 'anonymous'
+  const id = c.req.param('id')
+  const { title, body } = await c.req.json<{ title?: string; body?: string }>()
+
+  const result = await c.env.DB.prepare(
+    `UPDATE items SET
+       title = COALESCE(?, title),
+       body  = COALESCE(?, body),
+       updated_at = datetime('now')
+     WHERE id = ? AND user_id = ?
+     RETURNING *`
+  ).bind(title ?? null, body ?? null, id, userId).first()
+
+  if (!result) return c.json({ error: 'Not found' }, 404)
+  return c.json({ item: result })
+})
+
+// ── 削除 ──
+app.delete('/items/:id', async (c) => {
+  const userId = c.req.header('X-User-Id') ?? 'anonymous'
+  const id = c.req.param('id')
+
+  const { meta } = await c.env.DB.prepare(
+    'DELETE FROM items WHERE id = ? AND user_id = ?'
+  ).bind(id, userId).run()
+
+  if (meta.changes === 0) return c.json({ error: 'Not found' }, 404)
+  return c.json({ success: true })
+})
+
+export default app
+```
+
+ローカルで動作確認します。
+
+```bash
+npx wrangler dev --local
+# → http://localhost:8787 で API が起動
+
+# テスト（別ターミナルで実行）
+curl -X POST http://localhost:8787/items \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: user_001" \
+  -d '{"title": "テストアイテム", "body": "Cloudflare D1 から保存"}'
+# → {"item":{"id":1,"user_id":"user_001","title":"テストアイテム",...}}
+```
+
+---
+
+## Step 5: Rork アプリから D1 API に接続する
+
+Rork のプロジェクトで、先ほどの API を呼び出す hooks を作成します。
+
+```typescript
+// hooks/useItems.ts（Rork プロジェクト内）
+import { useState, useEffect, useCallback } from 'react'
+
+const API_BASE = 'https://rork-d1-api.YOUR_SUBDOMAIN.workers.dev'
+
+// ユーザー識別子（実際のアプリでは認証トークンを使う）
+const USER_ID = 'user_001'
+
+type Item = {
+  id: number
+  user_id: string
+  title: string
+  body: string
+  created_at: string
+}
+
+export function useItems() {
+  const [items, setItems] = useState<Item[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-User-Id': USER_ID,
+  }
+
+  // 一覧取得
+  const fetchItems = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await fetch(`${API_BASE}/items`, { headers })
+      const data = await res.json<{ items: Item[] }>()
+      setItems(data.items)
+    } catch (e) {
+      setError('データの取得に失敗しました')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  // 新規作成
+  const createItem = async (title: string, body?: string) => {
+    const res = await fetch(`${API_BASE}/items`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ title, body }),
+    })
+    if (!res.ok) throw new Error('作成に失敗しました')
+    await fetchItems() // リストを更新
+  }
+
+  // 削除
+  const deleteItem = async (id: number) => {
+    await fetch(`${API_BASE}/items/${id}`, {
+      method: 'DELETE',
+      headers,
+    })
+    setItems((prev) => prev.filter((item) => item.id !== id))
+  }
+
+  useEffect(() => { fetchItems() }, [fetchItems])
+
+  return { items, loading, error, createItem, deleteItem, refetch: fetchItems }
+}
+```
+
+このカスタムフックを Rork の画面で使うと、D1 に接続したリアルなデータで動くリストが完成します。
+
+```tsx
+// screens/ItemListScreen.tsx（Rork プロジェクト内）
+import { View, Text, FlatList, TouchableOpacity, TextInput } from 'react-native'
+import { useItems } from '../hooks/useItems'
+import { useState } from 'react'
+
+export default function ItemListScreen() {
+  const { items, loading, createItem, deleteItem } = useItems()
+  const [newTitle, setNewTitle] = useState('')
+
+  const handleAdd = async () => {
+    if (!newTitle.trim()) return
+    await createItem(newTitle.trim())
+    setNewTitle('')
+  }
+
+  return (
+    <View style={{ flex: 1, padding: 16 }}>
+      <View style={{ flexDirection: 'row', marginBottom: 12 }}>
+        <TextInput
+          value={newTitle}
+          onChangeText={setNewTitle}
+          placeholder="新しいアイテムを追加"
+          style={{
+            flex: 1, borderWidth: 1, borderColor: '#ccc',
+            padding: 8, borderRadius: 6, marginRight: 8
+          }}
+        />
+        <TouchableOpacity
+          onPress={handleAdd}
+          style={{ backgroundColor: '#F48024', padding: 10, borderRadius: 6 }}
+        >
+          <Text style={{ color: '#fff' }}>追加</Text>
+        </TouchableOpacity>
+      </View>
+
+      {loading ? (
+        <Text>読み込み中...</Text>
+      ) : (
+        <FlatList
+          data={items}
+          keyExtractor={(item) => String(item.id)}
+          renderItem={({ item }) => (
+            <View style={{
+              flexDirection: 'row', alignItems: 'center',
+              padding: 12, borderBottomWidth: 1, borderColor: '#eee'
+            }}>
+              <Text style={{ flex: 1 }}>{item.title}</Text>
+              <TouchableOpacity onPress={() => deleteItem(item.id)}>
+                <Text style={{ color: 'red' }}>削除</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        />
+      )}
+    </View>
+  )
+}
+```
+
+---
+
+## Step 6: 本番環境にデプロイする
+
+API が完成したら Cloudflare にデプロイします。
+
+```bash
+cd rork-d1-api
+
+# 本番デプロイ
+npx wrangler deploy
+
+# 出力例:
+# ✅ Deployed to: https://rork-d1-api.YOUR_SUBDOMAIN.workers.dev
+```
+
+デプロイ後、Rork の `API_BASE` URL を本番 URL に変更して Rork アプリをビルドすれば完成です。
+
+---
+
+## よくあるエラーと対処法
+
+D1 を使う際によく直面するエラーをまとめました。
+
+**エラー: `D1_ERROR: no such table: items`**
+
+マイグレーションが適用されていません。以下を実行してください。
+
+```bash
+npx wrangler d1 migrations apply rork-app-db
+```
+
+**エラー: CORS エラーでモバイルから接続できない**
+
+`wrangler.toml` や Hono の CORS 設定を確認してください。`origin: '*'` の設定でほとんどのケースは解決します。本番環境では特定ドメインに絞ることを推奨します。
+
+**エラー: `TypeError: c.env.DB is undefined`**
+
+`wrangler.toml` の D1 バインディング設定が正しくない可能性があります。`database_id` が正確に記載されているか確認してください。
+
+---
+
+## 応用: D1 でページネーションを実装する
+
+大量データを扱うアプリでは、ページネーションが不可欠です。D1 の `LIMIT` と `OFFSET` を使います。
+
+```typescript
+// API 側: ページネーション付き一覧取得
+app.get('/items', async (c) => {
+  const userId = c.req.header('X-User-Id') ?? 'anonymous'
+  const page  = parseInt(c.req.query('page')  ?? '1')
+  const limit = parseInt(c.req.query('limit') ?? '20')
+  const offset = (page - 1) * limit
+
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM items WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?'
+  ).bind(userId, limit, offset).all()
+
+  const { results: countResult } = await c.env.DB.prepare(
+    'SELECT COUNT(*) as total FROM items WHERE user_id = ?'
+  ).bind(userId).all()
+
+  const total = (countResult[0] as { total: number }).total
+
+  return c.json({
+    items: results,
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+  })
+})
+```
+
+Rork 側でページネーション状態を管理すれば、無限スクロールや「次のページ」ボタンを実装できます。Rork の実装パターンについては、[Rork アプリのパフォーマンス最適化ガイド](/articles/rork-dev/rork-app-performance-optimization-complete-guide)も参考にしてください。
+
+---
+
+## FAQ
+
+**Q. Cloudflare D1 は無料で使えますか？**
+
+無料プランでは 1 日 5 万リクエスト・5 GB のストレージが利用できます。個人開発アプリやプロトタイプなら十分な容量です。ユーザー数が増えて無料枠を超えた場合は Workers Paid プラン（月 $5〜）にアップグレードすれば、さらに大規模なアクセスに対応できます。
+
+**Q. Supabase や Firebase の代わりに D1 を使うべきですか？**
+
+それぞれ得意分野が異なります。D1 は**シンプルな CRUD + 低コスト + Cloudflare エコシステムとの親和性**が強みです。一方、Supabase はリアルタイムサブスクリプションや認証機能が充実しており、チャットアプリやコラボツールに向いています。「まず動くものを安く作りたい」なら D1、「リアルタイム同期が必要」なら Supabase が選択肢になります。
+
+**Q. D1 のデータを管理画面から確認できますか？**
+
+Cloudflare ダッシュボード（`dash.cloudflare.com`）の「Workers & Pages」→「D1」からブラウザ上で SQL クエリを実行できます。また `npx wrangler d1 execute rork-app-db --command "SELECT * FROM items LIMIT 10"` でターミナルからも確認可能です。
+
+**Q. D1 はトランザクションに対応していますか？**
+
+はい、SQL 標準の `BEGIN` / `COMMIT` / `ROLLBACK` をサポートしています。複数テーブルへの原子的な書き込みが必要な場合に利用できます。ただし D1 は SQLite ベースのため、PostgreSQL の高度な機能（JSON 演算子、フルテキスト検索など）の一部は使えません。
+
+---
+
+## まとめ
+
+この記事では、Rork で作ったモバイルアプリに Cloudflare D1（エッジ SQLite）を接続してスケーラブルなバックエンドを構築する方法を解説しました。要点を振り返ります。
+
+- D1 は無料枠でも十分なキャパシティがあり、個人開発に最適
+- Hono + Workers で軽量な REST API を素早く構築できる
+- Rork の `fetch` から直接呼び出せるため、実装がシンプル
+- マイグレーション管理と D1 バインディングの設定が安定稼働の鍵
+
+Cloudflare R2（ファイルストレージ）や KV（セッション管理）と組み合わせることで、ほぼ全ての機能をエッジで完結させることも可能です。ぜひ自分のアプリに取り入れて、グローバルに速いモバイル体験を実現してみてください。
+
+バックエンド実装をさらに深く学びたい方には、[SQLiteの設計パターンとRust製ORMの活用（著: Alex Korban）](https://www.amazon.co.jp/dp/B0CXKQF7KP/?tag=pinocchio-22)がおすすめです。SQLite のパフォーマンス最適化から設計パターンまで体系的に学べます。
