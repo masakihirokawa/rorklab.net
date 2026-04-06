@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "ELOQUENT — Google AI Edge Eloquent が iOS でリリース。Gemma オンデバイスモデルが生声を即座にプロ品質テキストに変換（4/6）",
+    "APPLE — Apple が App Store から AI アプリビルダー「Anything」を削除。未審査コードの実行を禁じるポリシーを適用（4月）",
     "COMPARE — Lovable・Bolt・Rork を数週間実際に使って比較。どのツールが本番アプリ開発に最も向いているかを検証（4/6）",
     "RORKMAX — Rork Max が SwiftUI ネイティブアプリを生成。クラウド Mac ビルド＋ライブシミュレーターで Xcode 不要（4/4）",
     "NATIVE — Rork Max が Vision Pro・Apple Watch・Dynamic Island・Core ML・ARKit・LiDAR をフルサポート（4/4）",
-    "PUBLISH — Rork Max は 2 クリックで App Store 公開が可能。Rork Companion で無料の実機テストにも対応（4/4）",
     "GROWTH — Rork が a16z から $2.8M 調達、743K 月間訪問・85% 成長・$1.5M ARR を 3 日で達成（4月）",
-    "GEMMA4 — Gemma 4 が Android AICore 開発者プレビューに登場。2B〜31B のオンデバイスモデルがモバイル開発を加速（4/4）",
   ],
   en: [
+    "ELOQUENT — Google AI Edge Eloquent launches on iOS: Gemma on-device model instantly converts raw voice into polished professional text (4/6)",
+    "APPLE — Apple removes AI app builder 'Anything' from the App Store for executing unreviewed code, signaling tighter vibe-coding policies (Apr)",
     "COMPARE — A real-world weeks-long comparison of Lovable, Bolt, and Rork reveals which AI app builder best handles production app development (4/6)",
     "RORKMAX — Rork Max generates native SwiftUI apps with cloud Mac builds and live streaming simulator — no Xcode or Mac required (4/4)",
     "NATIVE — Rork Max offers full support for Vision Pro, Apple Watch, Dynamic Island, Core ML, ARKit, and LiDAR out of the box (4/4)",
-    "PUBLISH — Rork Max deploys to the App Store in just 2 clicks; Rork Companion provides free real-device testing for all users (4/4)",
     "GROWTH — Rork raises $2.8M from a16z, achieves 743K monthly visits, 85% growth rate, and $1.5M ARR in just 3 days (Apr)",
-    "GEMMA4 — Gemma 4 arrives in Android AICore Developer Preview across four sizes from 2B to 31B, accelerating on-device mobile AI development (4/4)",
   ],
 };
 
