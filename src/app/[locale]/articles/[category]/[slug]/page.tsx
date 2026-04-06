@@ -10,6 +10,7 @@ import { PremiumPaywall } from "@/components/ui/PremiumPaywall";
 import { MembershipCTA } from "@/components/ui/MembershipCTA";
 import { TipCTA } from "@/components/ui/TipCTA";
 import { SingleArticleCTA } from "@/components/ui/SingleArticleCTA";
+import { ArticlePurchaseThankYou } from "@/components/ui/ArticlePurchaseThankYou";
 import { getPremiumAccess, getArticleAccess } from "@/lib/premium";
 
 interface Props {
@@ -282,6 +283,11 @@ export default async function ArticlePage({ params }: Props) {
         <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: 4, border: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace", marginBottom: 24 }}>
           ✦ {locale === "ja" ? "プレミアム記事" : "Premium Article"}
         </div>
+      )}
+
+      {/* Article purchase thank-you banner (shown after redirect from Stripe) */}
+      {article.meta.premium && canViewArticle && !canViewPremium && (
+        <ArticlePurchaseThankYou locale={locale} />
       )}
 
       {/* Article Content with paywall */}
