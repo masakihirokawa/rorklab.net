@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
@@ -70,6 +71,11 @@ export default async function TagPage({ params, searchParams }: Props) {
   const articles = allArticles.filter((a) =>
     (a.tags || []).some((t) => t.toLowerCase() === decoded.toLowerCase())
   );
+
+  /* Return proper 404 for unknown tags — prevents soft 404 (#84) */
+  if (articles.length === 0) {
+    notFound();
+  }
 
   /* Pagination */
   const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);

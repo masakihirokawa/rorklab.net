@@ -14,6 +14,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/articles/rork-dev", priority: 0.8, freq: "daily" as const },
     { path: "/articles/rork-ai", priority: 0.8, freq: "daily" as const },
     { path: "/articles/rork-business", priority: 0.8, freq: "daily" as const },
+    { path: "/articles/app-dev", priority: 0.8, freq: "daily" as const },
     { path: "/privacy", priority: 0.3, freq: "monthly" as const },
     { path: "/terms", priority: 0.3, freq: "monthly" as const },
     { path: "/tokusho", priority: 0.3, freq: "monthly" as const },
