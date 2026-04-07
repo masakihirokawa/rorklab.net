@@ -74,8 +74,8 @@ export async function getArticleAccess(slug: string): Promise<boolean> {
       // KV not available — fall back to cookie presence
     }
 
-    // Cookie present = grant access (KV unavailable fallback)
-    return true;
+    // Fallback: deny access if KV unavailable (security-first)
+    return false;
   } catch {
     return false;
   }
