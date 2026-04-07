@@ -127,6 +127,11 @@ export default async function ArticlePage({ params }: Props) {
   const premiumAccess = await getPremiumAccess();
   const canViewPremium = !!premiumAccess;
   const canViewArticle = canViewPremium || await getArticleAccess(slug);
+  // Cut preview at the 2nd H2 to prevent full article exposure on short articles
+  const previewContent = (() => {
+    const h2s = Array.from(content.matchAll(/<h2[\s>]/g));
+    return h2s.length >= 2 ? content.slice(0, h2s[1].index) : content.slice(0, 3000);
+  })();
 
   const articleUrl = `https://rorklab.net${prefix}/articles/${category}/${slug}`;
 
@@ -295,7 +300,7 @@ export default async function ArticlePage({ params }: Props) {
         <>
           <div
             className="article-content"
-            dangerouslySetInnerHTML={{ __html: content.slice(0, 10000) }}
+            dangerouslySetInnerHTML={{ __html: previewContent }}
           />
           <SingleArticleCTA locale={locale} slug={slug} category={category} />
           <PremiumPaywall locale={locale} highlights={article.meta.highlights} />

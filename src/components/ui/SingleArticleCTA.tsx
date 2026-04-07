@@ -119,7 +119,7 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
 
       <p
         style={{
-          fontSize: 13,
+          fontSize: 14,
           color: "var(--text-muted)",
           lineHeight: 1.7,
           marginBottom: 20,
