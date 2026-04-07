@@ -127,10 +127,18 @@ export default async function ArticlePage({ params }: Props) {
   const premiumAccess = await getPremiumAccess();
   const canViewPremium = !!premiumAccess;
   const canViewArticle = canViewPremium || await getArticleAccess(slug);
-  // Cut preview at the 2nd H2 to prevent full article exposure on short articles
+  // Cut preview at roughly 50% of H2 sections (min 2 sections shown).
+  // This prevents full-article exposure while conveying enough value.
   const previewContent = (() => {
     const h2s = Array.from(content.matchAll(/<h2[\s>]/g));
-    return h2s.length >= 2 ? content.slice(0, h2s[1].index) : content.slice(0, 3000);
+    const cutIdx = h2s.length >= 4
+      ? Math.floor(h2s.length / 2)   // ≥4 H2s → cut at halfway
+      : h2s.length >= 2
+      ? h2s.length - 1               // 2-3 H2s → show all but last section
+      : 1;
+    return (h2s[cutIdx]?.index !== undefined)
+      ? content.slice(0, h2s[cutIdx].index)
+      : content.slice(0, Math.floor(content.length / 2));
   })();
 
   const articleUrl = `https://rorklab.net${prefix}/articles/${category}/${slug}`;
