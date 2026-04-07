@@ -172,14 +172,14 @@ export const ARTICLE_LABELS = {
   ja: {
     heading: "この記事を購入する",
     button: "¥250 で続きを読む",
-    description: "この先の内容をすべてお読みいただけます。一度のご購入で、いつでも何度でもアクセスできます。",
+    description: "この先の内容をすべてお読みいただけます。一度のご購入で、いつでも何度でもアクセスできます。このサイトは広告を掲載しておらず、皆さまのご支援がサーバー費用などの運営を支えています。",
     orSeparator: "または",
     memberNote: "メンバーシップなら全記事が読み放題",
   },
   en: {
     heading: "Unlock This Article",
     button: "Continue reading — $1.75",
-    description: "Get full access to the rest of this article. Buy once, read anytime.",
+    description: "Get full access to the rest of this article. Buy once, read anytime. This site is ad-free — your support goes directly toward keeping it running.",
     orSeparator: "or",
     memberNote: "Unlock all articles with Membership",
   },
