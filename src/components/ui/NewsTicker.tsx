@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ELOQUENT — Google AI Edge Eloquent が iOS でリリース。Gemma オンデバイスモデルが生声を即座にプロ品質テキストに変換（4/6）",
-    "APPLE — Apple が App Store から AI アプリビルダー「Anything」を削除。未審査コードの実行を禁じるポリシーを適用（4月）",
-    "COMPARE — Lovable・Bolt・Rork を数週間実際に使って比較。どのツールが本番アプリ開発に最も向いているかを検証（4/6）",
+    "GROWTH — Rork が a16z から $2.8M 調達、743K 月間訪問・85% 成長・$1.5M ARR を 3 日で達成（4月）",
+    "SURGE — AI ツール普及で App Store 新規アプリが前年比 84% 急増 ─ ノーコード開発者にとって追い風（4/6）",
     "RORKMAX — Rork Max が SwiftUI ネイティブアプリを生成。クラウド Mac ビルド＋ライブシミュレーターで Xcode 不要（4/4）",
     "NATIVE — Rork Max が Vision Pro・Apple Watch・Dynamic Island・Core ML・ARKit・LiDAR をフルサポート（4/4）",
-    "GROWTH — Rork が a16z から $2.8M 調達、743K 月間訪問・85% 成長・$1.5M ARR を 3 日で達成（4月）",
+    "COMPARE — Lovable・Bolt・Rork を数週間実際に使って比較。本番アプリ開発に最も向くツールを検証（4/6）",
+    "COMPANION — Rork Companion アプリで Apple Developer アカウント不要の実機テストが可能に（2026）",
   ],
   en: [
-    "ELOQUENT — Google AI Edge Eloquent launches on iOS: Gemma on-device model instantly converts raw voice into polished professional text (4/6)",
-    "APPLE — Apple removes AI app builder 'Anything' from the App Store for executing unreviewed code, signaling tighter vibe-coding policies (Apr)",
-    "COMPARE — A real-world weeks-long comparison of Lovable, Bolt, and Rork reveals which AI app builder best handles production app development (4/6)",
+    "GROWTH — Rork raises $2.8M from a16z, achieves 743K monthly visits, 85% growth rate, and $1.5M ARR in just 3 days (Apr)",
+    "SURGE — AI coding tools drive an 84% year-over-year surge in new App Store submissions — tailwind for no-code developers (4/6)",
     "RORKMAX — Rork Max generates native SwiftUI apps with cloud Mac builds and live streaming simulator — no Xcode or Mac required (4/4)",
     "NATIVE — Rork Max offers full support for Vision Pro, Apple Watch, Dynamic Island, Core ML, ARKit, and LiDAR out of the box (4/4)",
-    "GROWTH — Rork raises $2.8M from a16z, achieves 743K monthly visits, 85% growth rate, and $1.5M ARR in just 3 days (Apr)",
+    "COMPARE — A real-world weeks-long comparison of Lovable, Bolt, and Rork reveals which AI app builder best suits production development (4/6)",
+    "COMPANION — Rork Companion app enables on-device testing on a real iPhone without an Apple Developer account (2026)",
   ],
 };
 
