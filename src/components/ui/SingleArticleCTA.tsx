@@ -114,7 +114,7 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
           marginBottom: 10,
         }}
       >
-        {locale === "ja" ? "この記事を単体で購入する" : "Purchase This Article"}
+        {labels.heading}
       </h4>
 
       <p
@@ -186,29 +186,22 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
         <div style={{ flex: 1, height: 1, background: "var(--border-subtle)" }} />
       </div>
 
-      {/* Membership upsell */}
+      {/* Membership upsell — simple text link, not button-styled */}
       <a
         href={membershipHref}
         style={{
           display: "inline-block",
-          fontSize: 13,
-          color: "var(--accent-coral)",
-          padding: "8px 20px",
-          borderRadius: 6,
-          border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)",
-          background: "transparent",
+          fontSize: 12,
+          color: "var(--text-muted)",
           textDecoration: "none",
-          fontWeight: 500,
-          transition: "background 0.2s, transform 0.2s",
+          fontWeight: 400,
+          transition: "color 0.2s",
         }}
         onMouseEnter={(e) => {
-          e.currentTarget.style.background =
-            "color-mix(in srgb, var(--accent-coral) 8%, transparent)";
-          e.currentTarget.style.transform = "translateY(-1px)";
+          e.currentTarget.style.color = "var(--accent-coral)";
         }}
         onMouseLeave={(e) => {
-          e.currentTarget.style.background = "transparent";
-          e.currentTarget.style.transform = "translateY(0)";
+          e.currentTarget.style.color = "var(--text-muted)";
         }}
       >
         {labels.memberNote}&nbsp;→

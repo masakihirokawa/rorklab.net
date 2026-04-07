@@ -18,6 +18,7 @@ export async function getPremiumAccess(): Promise<PremiumType> {
     const [email] = decoded.split(":");
     if (!email) return null;
 
+    // Try Cloudflare KV lookup
     try {
       const kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
       if (kv) {
@@ -42,15 +43,28 @@ export async function getPremiumAccess(): Promise<PremiumType> {
         return record.type as PremiumType;
       }
     } catch {
-      // KV not available
+      // KV not available — fallback to cookie-only
     }
 
+    // Fallback: cookie exists = premium
     return "premium";
   } catch {
     return null;
   }
 }
 
+// ── Single Article Access ────────────────────────────────────────
+
+/**
+ * Check if the current user has purchased a specific article.
+ *
+ * Two-tier verification:
+ *   1. KV lookup: `site:rorklab:article:{email}:{slug}` — most accurate
+ *   2. Cookie fallback: `article_purchases` cookie contains JSON with slug list
+ *
+ * Cookie format (new): btoa(JSON.stringify({ email, slugs: ["slug1", "slug2"] }))
+ * Cookie format (old): btoa("email:article") — no slug info, treated as no access
+ */
 export async function getArticleAccess(slug: string): Promise<boolean> {
   const cookieStore = await cookies();
   const token = cookieStore.get("article_purchases")?.value;
@@ -58,9 +72,25 @@ export async function getArticleAccess(slug: string): Promise<boolean> {
 
   try {
     const decoded = atob(token);
-    const [email] = decoded.split(":");
+
+    // Parse cookie — support both new JSON format and old format
+    let email: string | null = null;
+    let slugsInCookie: string[] = [];
+
+    if (decoded.startsWith("{")) {
+      // New format: { email, slugs: [...] }
+      const parsed = JSON.parse(decoded);
+      email = parsed.email || null;
+      slugsInCookie = Array.isArray(parsed.slugs) ? parsed.slugs : [];
+    } else {
+      // Old format: "email:article"
+      const [e] = decoded.split(":");
+      email = e || null;
+    }
+
     if (!email) return false;
 
+    // Tier 1: KV lookup (most accurate, per-slug with expiry check)
     try {
       const kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
       if (kv) {
@@ -71,11 +101,11 @@ export async function getArticleAccess(slug: string): Promise<boolean> {
         return new Date(record.expires_at) > new Date();
       }
     } catch {
-      // KV not available — fall back to cookie presence
+      // KV not available — fall through to cookie check
     }
 
-    // Fallback: deny access if KV unavailable (security-first)
-    return false;
+    // Tier 2: Cookie slug list (fallback when KV unavailable)
+    return slugsInCookie.includes(slug);
   } catch {
     return false;
   }

@@ -170,16 +170,18 @@ export const ARTICLE_PRICES = {
 
 export const ARTICLE_LABELS = {
   ja: {
-    button: "この記事を ¥250 で購入する",
-    description: "記事の続き（実装コード・詳細解説・ベンチマーク等）をすべてお読みいただけます。一度ご購入いただければ、いつでも何度でもご覧いただけます。",
+    heading: "この記事を購入する",
+    button: "¥250 で続きを読む",
+    description: "この先の内容をすべてお読みいただけます。一度のご購入で、いつでも何度でもアクセスできます。",
     orSeparator: "または",
-    memberNote: "メンバーシップなら全プレミアム記事が読み放題",
+    memberNote: "メンバーシップなら全記事が読み放題",
   },
   en: {
-    button: "Buy this article — $1.75",
-    description: "Get full access to the rest of this article — implementation code, benchmarks, and everything in between. Purchase once and read anytime, as many times as you like.",
+    heading: "Unlock This Article",
+    button: "Continue reading — $1.75",
+    description: "Get full access to the rest of this article. Buy once, read anytime.",
     orSeparator: "or",
-    memberNote: "Get unlimited access to all premium articles with Membership",
+    memberNote: "Unlock all articles with Membership",
   },
 } as const;
 
