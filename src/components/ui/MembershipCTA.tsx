@@ -14,7 +14,7 @@ const CONTENT = {
   ja: {
     heading: "お読みいただきありがとうございます",
     description:
-      "Rork Lab では、実装コード・ベンチマーク・本番設計パターンなど、実務ですぐにお役立ていただけるプレミアム記事をご用意しています。もしご興味がありましたら、ぜひご覧ください。",
+      "Rork Lab は広告なしで運営しており、サーバー費用などの運営コストはメンバーシップのご支援で賄っています。実装コード・ベンチマーク・本番設計パターンなど、実務でお役立ていただける記事を毎日更新しています。もし読んでよかったと感じていただけましたら、ぜひご覧ください。",
     features: [
       "コピー&ペーストで使える実装コード付き",
       "毎日新しい上級ガイドを追加",
@@ -25,7 +25,7 @@ const CONTENT = {
   en: {
     heading: "Thank You for Reading",
     description:
-      "Rork Lab offers premium articles with implementation code, benchmarks, and production-ready design patterns — practical content we hope you'll find useful.",
+      "Rork Lab is ad-free, supported entirely by members like you. We publish practical guides daily with implementation code, benchmarks, and production-ready patterns. If you've found it useful, we'd love to have you on board.",
     features: [
       "Copy-paste ready implementation code",
       "New advanced guides published daily",

@@ -163,8 +163,8 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
           }}
         >
           {locale === "ja"
-            ? "この先には、実装コードやベンチマーク結果など、実務でお役に立てる内容をご用意しています。もしよろしければ、メンバーシップでご覧いただけますと幸いです。"
-            : "What follows includes implementation code, benchmarks, and practical content we hope you'll find useful. We'd be grateful if you'd consider joining our membership."}
+            ? "この先には、実装コードやベンチマーク結果など、実務でお役に立てる内容をご用意しています。このサイトは広告を掲載しておらず、サーバーや開発にかかる費用はメンバーの皆様のご支援で成り立っています。もしお役に立てていましたら、ご支援いただけますと大変ありがたいです。"
+            : "What follows includes implementation code, benchmarks, and practical content we hope you'll find useful. This site runs without ads — server and development costs are supported entirely by members like you. If it's been helpful, we'd be truly grateful for your support."}
         </p>
         {highlights && highlights.length > 0 && (
           <div style={{ textAlign: "left", marginBottom: 28, padding: "12px 16px", borderRadius: 8, background: "color-mix(in srgb, var(--accent-coral) 2%, var(--bg-primary))" }}>
