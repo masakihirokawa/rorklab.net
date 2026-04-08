@@ -1,0 +1,393 @@
+---
+title: "Rork Max × Apple サブスクリプション・課金エラー完全対処ガイド"
+slug: "rork-max-apple-subscription-billing-errors-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-08T11:30"
+author: "Rork Lab"
+description: "Rork Maxで開発したアプリのApple課金・サブスクリプション実装に関するエラーを完全網羅。StoreKit 2エラーコード・Sandboxテスト・審査リジェクト・復元処理・レシート検証まで、実装コード付きで徹底解説します。"
+tags: ["Rork Max", "StoreKit 2", "サブスクリプション", "課金", "App Store", "In-App Purchase"]
+highlights:
+  - "StoreKit 2の主要エラーコードと本番・Sandbox環境別の対処法"
+  - "サブスクリプション復元処理の正しい実装と審査通過のポイント"
+  - "課金エラーをゼロにするためのテスト戦略とApp Store審査対策"
+---
+
+Rork Max で開発したアプリに課金機能を実装すると、「Sandbox テストは成功したのに本番で決済エラーが出る」「サブスクリプションの復元ボタンが機能しない」「App Store 審査で課金フローを理由にリジェクトされた」といった問題に直面することがあります。
+
+Apple の課金システムは StoreKit の進化・審査基準の変更・Sandbox 環境の癖など、考慮すべき点が多くあります。本記事では、Rork Max で実装した課金機能の主要エラーパターンを体系的に整理し、実装コードと審査対策を含めて解説します。
+
+## StoreKit 2 の主要エラーコードと対処法
+
+Rork Max が生成する課金コードは、現在 StoreKit 2（Swift の async/await ベース）を使用しています。エラーは `StoreKitError` や `Product.PurchaseError` として返ってきます。
+
+### Product.PurchaseError の対処
+
+```swift
+import StoreKit
+
+func purchase(_ product: Product) async {
+    do {
+        let result = try await product.purchase()
+
+        switch result {
+        case .success(let verification):
+            switch verification {
+            case .verified(let transaction):
+                // ✅ 購入成功
+                await transaction.finish()
+                await updatePurchasedProducts(transaction)
+
+            case .unverified(let transaction, let error):
+                // ⚠️ 署名検証失敗（JWS検証エラー）
+                // 本番環境では原則として購入を拒否
+                print("検証失敗: \(error)")
+                // ユーザーへの通知
+                showError("購入の確認に失敗しました。サポートにお問い合わせください。")
+            }
+
+        case .userCancelled:
+            // ユーザーが意図的にキャンセル - エラー扱いにしない
+            print("ユーザーがキャンセルしました")
+
+        case .pending:
+            // ファミリー共有・Ask to Buyの承認待ち
+            showInfo("購入は保護者の承認待ちです")
+
+        @unknown default:
+            break
+        }
+
+    } catch let error as StoreKitError {
+        handleStoreKitError(error)
+    } catch {
+        print("予期しないエラー: \(error)")
+    }
+}
+
+func handleStoreKitError(_ error: StoreKitError) {
+    switch error {
+    case .notEntitled:
+        // ✅ 購入済みだが権限がない（復元が必要）
+        showError("購入の復元が必要です")
+
+    case .networkError(let urlError):
+        // ネットワークエラー - リトライを促す
+        if urlError.code == .notConnectedToInternet {
+            showError("インターネット接続を確認してください")
+        } else {
+            showError("通信エラーが発生しました。しばらくしてから再試行してください")
+        }
+
+    case .systemError(let nsError):
+        // システムエラー - App Store側の問題
+        print("システムエラー: \(nsError)")
+        showError("App Storeとの通信に問題が発生しています")
+
+    case .userCancelled:
+        // キャンセル - エラー扱いにしない
+        break
+
+    case .notAvailableInStorefront:
+        // この地域では購入不可
+        showError("この商品はご利用の地域では購入できません")
+
+    case .purchaseNotAllowed:
+        // 機内モード・ペアレンタルコントロール等
+        showError("現在の設定では購入できません。設定を確認してください")
+
+    @unknown default:
+        showError("予期しないエラーが発生しました")
+    }
+}
+```
+
+### Transaction.currentEntitlements の活用
+
+購入状態の確認には、レシートの手動検証ではなく `Transaction.currentEntitlements` を使うことが StoreKit 2 での推奨方法です。
+
+```swift
+class SubscriptionManager: ObservableObject {
+    @Published var isSubscribed = false
+    @Published var subscriptionExpiry: Date?
+
+    func checkSubscriptionStatus() async {
+        for await result in Transaction.currentEntitlements {
+            switch result {
+            case .verified(let transaction):
+                if transaction.productType == .autoRenewable {
+                    isSubscribed = true
+                    subscriptionExpiry = transaction.expirationDate
+
+                    // 期限切れの確認
+                    if let expiry = transaction.expirationDate, expiry < Date() {
+                        isSubscribed = false
+                    }
+                }
+            case .unverified:
+                // 署名検証失敗 - サブスクリプションなしとして扱う
+                isSubscribed = false
+            }
+        }
+    }
+
+    // アプリ起動時に呼び出す
+    func listenForTransactionUpdates() {
+        Task {
+            for await result in Transaction.updates {
+                switch result {
+                case .verified(let transaction):
+                    await transaction.finish()
+                    await checkSubscriptionStatus()
+                case .unverified:
+                    break
+                }
+            }
+        }
+    }
+}
+```
+
+## Sandbox テスト環境のよくあるトラブル
+
+### Sandbox テストが本番と異なる挙動を示す主な違い
+
+Sandbox と本番環境では、意図的にいくつかの違いがあります。これを知らないとデバッグで混乱します。
+
+**更新間隔の短縮：**
+Sandbox では自動更新の間隔が大幅に短縮されます。1ヶ月のサブスクリプションは Sandbox では約5分、1年のサブスクリプションは約1時間で更新されます。これはテストを迅速に行うための仕様です。
+
+**最大更新回数：**
+Sandbox では自動更新が最大6回で停止します（本番では無限に続く）。
+
+**テストフライトでの課金テスト：**
+TestFlight 経由のアプリは Sandbox 環境を使用します。本番 App Store の課金はテストできません。
+
+### Sandbox アカウントの設定トラブル
+
+```
+このApple IDはApp Storeで使用できません
+```
+
+このエラーは、Sandbox テストアカウントが正しく設定されていないか、実際の Apple ID を Sandbox 用に使おうとしている場合に発生します。
+
+**正しい Sandbox アカウントの設定手順：**
+
+1. App Store Connect → ユーザーとアクセス → Sandbox テスター
+2. 「＋」ボタンで新しい Sandbox テスターを作成（実在しないメールアドレスを使用）
+3. デバイスの設定 → App Store → Sandbox アカウントで設定したアカウントに切り替える
+
+**重要：** 実際の Apple ID を Sandbox テストに使用しないでください。本番環境のアカウント情報が Sandbox のテストデータで混在してしまいます。
+
+### Sandbox での購入復元エラー
+
+```swift
+// ❌ よくある間違い：復元ボタンで再購入処理を実行
+Button("購入を復元") {
+    // これは再購入になってしまう
+    Task { try? await product.purchase() }
+}
+
+// ✅ 正しい復元処理
+Button("購入を復元") {
+    Task { await restorePurchases() }
+}
+
+func restorePurchases() async {
+    do {
+        // StoreKit 2 での正しい復元処理
+        try await AppStore.sync()
+
+        // 復元後に購入状態を再チェック
+        await checkSubscriptionStatus()
+
+        if isSubscribed {
+            showSuccess("購入を復元しました")
+        } else {
+            showInfo("復元できる購入が見つかりませんでした")
+        }
+    } catch {
+        showError("復元に失敗しました: \(error.localizedDescription)")
+    }
+}
+```
+
+## App Store 審査でリジェクトされる課金フローのパターン
+
+### リジェクト理由1：「復元ボタン」が見つからない（Guideline 3.1.1）
+
+Apple の審査では、すべての課金機能を持つアプリに「購入を復元する」ボタンの実装が必須です。このボタンが見つからないとリジェクトされます。
+
+**審査通過のための実装要件：**
+- 課金画面に目立つ「購入を復元する」ボタンを配置する
+- ボタンは購入ボタンの近くに配置する（小さく目立たない場所はNG）
+- ボタンが動作して適切なフィードバックを返すこと
+
+### リジェクト理由2：アプリ内課金なしでは起動しない（Guideline 3.1.1a）
+
+アプリの基本機能にアクセスするためにサブスクリプション購入が必須であるかのような UI は審査でリジェクトされます。
+
+```swift
+// ❌ 起動直後に課金画面を強制表示（リジェクト対象）
+struct ContentView: View {
+    var body: some View {
+        if !isSubscribed {
+            PurchaseRequiredView() // これは問題
+        }
+    }
+}
+
+// ✅ 無料で基本機能を提供し、プレミアム機能のみをゲート
+struct ContentView: View {
+    var body: some View {
+        MainTabView()  // 基本機能は無料でアクセス可能
+            .sheet(isPresented: $showPremiumPrompt) {
+                PremiumUpgradeView()
+            }
+    }
+}
+```
+
+### リジェクト理由3：価格や期間の説明が不明瞭（Guideline 3.1.1b）
+
+課金画面には、価格・更新期間・キャンセル方法を明示することが必要です。
+
+```swift
+struct SubscriptionView: View {
+    let product: Product
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("プレミアムプラン")
+                .font(.title2.bold())
+
+            // ✅ 価格と期間を明示
+            Text("\(product.displayPrice) / 月")
+                .font(.title3)
+
+            // ✅ 無料トライアルがある場合は必ず明示
+            if let intro = product.subscription?.introductoryOffer {
+                Text("最初の\(intro.period.value)\(intro.period.unit == .month ? "ヶ月" : "日間")無料")
+                    .foregroundColor(.blue)
+            }
+
+            Button("プレミアムを開始") {
+                Task { await purchase(product) }
+            }
+            .buttonStyle(.borderedProminent)
+
+            // ✅ キャンセル方法のリンク
+            Link("キャンセル方法", destination: URL(string: "https://support.apple.com/ja-jp/118428")!)
+                .font(.caption)
+
+            // ✅ 利用規約・プライバシーポリシー
+            HStack {
+                Link("利用規約", destination: URL(string: "https://yourapp.com/terms")!)
+                Text("・")
+                Link("プライバシーポリシー", destination: URL(string: "https://yourapp.com/privacy")!)
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+    }
+}
+```
+
+### リジェクト理由4：Ask to Buy への対応なし
+
+未成年者のデバイスでは「Ask to Buy」機能が有効になっており、購入承認に保護者の承認が必要です。`.pending` ケースを処理していないとリジェクトになることがあります。
+
+前述の `purchase()` 関数内の `.pending` ケースの処理が必須です。
+
+## 本番環境の課金エラーモニタリング
+
+### RevenueCat を使ったエラー追跡
+
+本番環境での課金エラーを効率的にモニタリングするために、RevenueCat などのサービスを活用することを強く推奨します。
+
+```swift
+import RevenueCat
+
+// アプリ起動時に設定
+Purchases.configure(withAPIKey: "YOUR_REVENUECAT_API_KEY")
+
+// 購入処理
+func purchaseWithRevenueCat(package: Package) async {
+    do {
+        let result = try await Purchases.shared.purchase(package: package)
+
+        if result.userCancelled {
+            // キャンセル処理
+            return
+        }
+
+        // 購入成功
+        updateUI(customerInfo: result.customerInfo)
+
+    } catch let error as RevenueCat.ErrorCode {
+        switch error {
+        case .purchaseCancelledError:
+            break  // ユーザーキャンセルは無視
+
+        case .networkError:
+            showError("ネットワークエラー: 後ほど再試行してください")
+
+        case .purchaseNotAllowedError:
+            showError("現在の設定では購入できません")
+
+        case .receiptAlreadyInUseError:
+            showError("このApple IDは別のアカウントで使用されています")
+
+        default:
+            showError("購入処理中にエラーが発生しました: \(error.localizedDescription)")
+        }
+    }
+}
+```
+
+RevenueCat のダッシュボードでは、エラー率・チャーン率・MRR（月次経常収益）をリアルタイムで監視できます。
+
+### Cloud Logging による独自のエラー追跡
+
+RevenueCat を使わない場合は、少なくとも独自のエラーロギングを実装してください。
+
+```swift
+struct PurchaseErrorLogger {
+    static func log(error: Error, context: [String: Any] = [:]) {
+        var logData: [String: Any] = [
+            "error_type": String(describing: type(of: error)),
+            "error_message": error.localizedDescription,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        ]
+        logData.merge(context) { _, new in new }
+
+        // Firebase Crashlytics / Sentry 等に送信
+        // Crashlytics.crashlytics().record(error: error)
+        print("[課金エラー] \(logData)")
+    }
+}
+
+// 利用例
+PurchaseErrorLogger.log(
+    error: storeKitError,
+    context: ["product_id": product.id, "user_id": userId]
+)
+```
+
+## 審査提出前の課金機能チェックリスト
+
+提出前に以下を必ず確認してください。
+
+**UI・UX 面の確認事項**として、課金画面に価格・更新期間・無料トライアル情報を明示しているか、「購入を復元する」ボタンが目立つ位置に配置されているか、利用規約とプライバシーポリシーへのリンクが存在するか、そしてアプリの基本機能が課金なしで利用できるか、を確認してください。
+
+**技術的な確認事項**として、`.pending`（Ask to Buy）のケースを処理しているか、`.unverified`（署名検証失敗）を適切に扱っているか、Sandbox テストで購入・復元・更新の全フローが動作するか、`Transaction.updates` のリスナーを起動時に設定しているかを確認してください。
+
+**コンプライアンスの確認事項**として、特定地域での価格表示（日本では税込価格）が正しいか、自動更新のキャンセル方法を記載しているかを確認してください。
+
+## まとめ
+
+Rork Max で実装した課金機能のトラブルは、StoreKit 2 エラーコードの適切な処理、Sandbox 環境の特性理解、App Store 審査ガイドラインへの準拠の3点を押さえることで、大部分は予防・解決できます。
+
+課金機能は直接収益に直結するだけに、テストと審査対策は念入りに行ってください。皆さんのアプリが安心して課金を受け付けられるよう、このガイドがお役に立てれば幸いです。
