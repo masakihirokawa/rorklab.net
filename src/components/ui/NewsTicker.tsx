@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GROWTH — Rork が a16z から $2.8M 調達、743K 月間訪問・85% 成長・$1.5M ARR を 3 日で達成（4月）",
-    "SURGE — AI ツール普及で App Store 新規アプリが前年比 84% 急増 ─ ノーコード開発者にとって追い風（4/6）",
-    "RORKMAX — Rork Max が SwiftUI ネイティブアプリを生成。クラウド Mac ビルド＋ライブシミュレーターで Xcode 不要（4/4）",
-    "NATIVE — Rork Max が Vision Pro・Apple Watch・Dynamic Island・Core ML・ARKit・LiDAR をフルサポート（4/4）",
-    "COMPARE — Lovable・Bolt・Rork を数週間実際に使って比較。本番アプリ開発に最も向くツールを検証（4/6）",
-    "COMPANION — Rork Companion アプリで Apple Developer アカウント不要の実機テストが可能に（2026）",
+    "SURGE — AIアプリビルダー普及でApp Store新規アプリ提出が前年比84%急増 — ノーコード革命が加速中（4/6）",
+    "MAX — Rork Max：ネイティブSwiftアプリをXcode不要で構築・公開、iPhone・iPad・Apple Watch・Vision Proに対応（3/24）",
+    "FUND — Rork が a16z（Andreessen Horowitz）から280万ドルのプレシード資金調達に成功（3/22）",
+    "GROWTH — Rork月間訪問数74.3万超え、成長率85%でAIノーコードアプリビルダー市場をリード（3/18）",
+    "COMPANION — Rork Companion：Apple Developer登録不要で実機テストが可能、開発サイクルを大幅短縮（3/20）",
+    "TREND — Gartner予測：2026年末に新規アプリ開発の75%がローコード・ノーコードに移行",
   ],
   en: [
-    "GROWTH — Rork raises $2.8M from a16z, achieves 743K monthly visits, 85% growth rate, and $1.5M ARR in just 3 days (Apr)",
-    "SURGE — AI coding tools drive an 84% year-over-year surge in new App Store submissions — tailwind for no-code developers (4/6)",
-    "RORKMAX — Rork Max generates native SwiftUI apps with cloud Mac builds and live streaming simulator — no Xcode or Mac required (4/4)",
-    "NATIVE — Rork Max offers full support for Vision Pro, Apple Watch, Dynamic Island, Core ML, ARKit, and LiDAR out of the box (4/4)",
-    "COMPARE — A real-world weeks-long comparison of Lovable, Bolt, and Rork reveals which AI app builder best suits production development (4/6)",
-    "COMPANION — Rork Companion app enables on-device testing on a real iPhone without an Apple Developer account (2026)",
+    "SURGE — AI app builders drive an 84% YoY surge in new App Store submissions — the no-code revolution is accelerating (4/6)",
+    "MAX — Rork Max: build & publish native Swift apps without Xcode for iPhone, iPad, Apple Watch & Vision Pro (3/24)",
+    "FUND — Rork secures $2.8M pre-seed funding from a16z (Andreessen Horowitz) (3/22)",
+    "GROWTH — Rork surpasses 743K monthly visits with 85% growth rate, leading the AI no-code app builder market (3/18)",
+    "COMPANION — Rork Companion: test your app on a real device without an Apple Developer account (3/20)",
+    "TREND — Gartner: by 2026, 75% of new app development will use low-code/no-code platforms",
   ],
 };
 
