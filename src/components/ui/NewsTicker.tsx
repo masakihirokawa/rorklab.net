@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK MAX — Rork Max発表：React Native廃し、Swift専用Rorkで真のネイティブiOSアプリ開発を実現。エコシステム全体で次世代へ移行",
-    "FUNDING — Rorkが$2.8Mシード調達完了：a16z（Andreessen Horowitz）主導で、モバイルAIアプリ開発市場の急速拡大に対応",
-    "USERS — 743,000月間ユーザー達成、85%成長率を記録：ノーコードアプリ市場でLovable・Boltに次ぐ速度でシェア拡大中",
-    "PRICING — Rork 2026年料金体系：Free（35クレジット/月）・Junior（$25/月）・Senior（$100/月）で段階的なアイデア検証→MVP構築を支援",
-    "COMPARISON — Rork vs Lovable vs Bolt徹底比較：ネイティブモバイル専門（Rork）vs Webサービス高速構築（Lovable）の明確な棲み分けが確立",
-    "EXPO — React Native + Expo基盤でクロスプラットフォーム開発：iOS＆Androidを一度のAIプロンプトで同時構築、開発時間を90%削減",
+    "RORK MAX — 2026年2月リリース、ネイティブSwiftアプリビルダー。iPhone・iPad・Watch・TV・Vision Pro対応（4/12）",
+    "FUNDING — a16zからシリーズA $2.8M調達。743,000+月間訪問、85%成長率で急速拡大中（4/12）",
+    "NATIVE APPS — React Native + Expo基盤でiOS・Android同時デプロイ。Webビルダーとは異なるネイティブ品質（4/12）",
+    "MVP HOURS — 自然言語からプロダクション対応アプリまで数時間で完成。Lovable・Boltとは別のモバイル特化（4/12）",
+    "FREE TIER — 無料プラン: 月35クレジット（日5クレジット上限）。有料: $25/月で100クレジット・無制限（4/12）",
+    "MARKET POSITION — Newly AI・Fabricateとの差別化。唯一のトゥルーネイティブアプリビルダー（4/12）",
   ],
   en: [
-    "RORK MAX — Rork Max unveiled: abandon React Native, go pure Swift. True native iOS development with AI agents transforms entire ecosystem",
-    "FUNDING — Rork closes $2.8M seed led by a16z. Mobile AI app development reaches hypergrowth phase, capturing market momentum (2/2026)",
-    "USERS — 743,000 monthly users with 85% growth rate. Rork now dominates no-code mobile builders, closing gap with Lovable & Bolt",
-    "PRICING — Rork 2026 tiers: Free (35 credits/mo), Junior ($25/mo for demos), Senior ($100/mo for full MVPs). Pay-as-you-validate model",
-    "COMPARISON — Rork vs Lovable vs Bolt: mobile-native specialists (Rork) vs web-first builders (Lovable) define clear market segmentation",
-    "EXPO — React Native + Expo: single AI prompt generates iOS & Android simultaneously. 90% faster than traditional mobile development",
+    "RORK MAX — Launched February 2026, native Swift app builder. Support for iPhone, iPad, Watch, TV, Vision Pro (4/12)",
+    "FUNDING — Closes $2.8M Series A from a16z. 743,000+ monthly visits with 85% growth rate accelerating (4/12)",
+    "NATIVE APPS — React Native + Expo stack enables iOS and Android simultaneous deployment, true native quality (4/12)",
+    "MVP HOURS — Natural language to production-ready apps in hours. Distinct from web-only builders like Lovable and Bolt (4/12)",
+    "FREE TIER — Free plan: 35 credits/month with 5 daily cap. Paid: $25/month for 100 credits with no daily limits (4/12)",
+    "MARKET POSITION — Differentiated from Newly AI and Fabricate. Only true native app builder in its category (4/12)",
   ],
 };
 
