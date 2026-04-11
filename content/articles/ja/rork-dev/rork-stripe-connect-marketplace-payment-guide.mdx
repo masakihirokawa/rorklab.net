@@ -1,0 +1,779 @@
+---
+title: "Rork × Stripe Connect でマーケットプレイスアプリの決済を構築する完全ガイド"
+slug: "rork-stripe-connect-marketplace-payment-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-12T06:00"
+updated: "2026-04-12T06:00"
+author: "Rork Lab"
+description: "Rork と Stripe Connect を組み合わせ、出品者・購入者間の決済が動くマーケットプレイスアプリを構築する方法を体系的に解説。アカウント登録から収益分配・手数料設定まで完全網羅。"
+tags: ["Stripe Connect", "マーケットプレイス", "決済", "Stripe", "Rork Max", "Supabase", "サブスクリプション", "個人開発"]
+highlights:
+  - "Stripe Connect の設定で詰まっていた開発者が、Rork から出品者アカウント登録・審査・オンボーディングの完全フローを今日実装できる"
+  - "マーケットプレイス手数料（プラットフォームフィー）と出品者への自動送金ロジックをコピペで動くコードとして手に入れられる"
+  - "Supabase との連携・Webhook 処理・本番環境チェックリストまで、個人開発で収益化できるマーケットプレイスを一から完成させられる"
+---
+
+## はじめに：なぜマーケットプレイスアプリが今注目されるのか
+
+「ユーザー同士がモノやサービスを売り買いできるアプリ」——フリマアプリ、シェアリングエコノミー、コーチングや副業プラットフォームなど、マーケットプレイス型のビジネスモデルは2026年においても根強い需要があります。特に個人開発者にとって、プラットフォーム手数料が主要収益源となるため、ユーザー数が増えるほどに自動的に収益が拡大するという理想的な構造を持っています。
+
+しかし、「ユーザーAからユーザーBへ代金を送金し、その一部をプラットフォームが受け取る」という複雑な決済フローを実装するには、通常のStripe決済とはまったく異なる仕組みが必要です。それが **Stripe Connect** です。
+
+本記事では、Rork（およびRork Max）を使ってマーケットプレイスアプリを構築する際に、Stripe Connectをどのように組み込むかを、アカウント設計から本番リリースまで体系的に解説します。バックエンドにはSupabaseを活用し、個人開発でも運用可能な設計を採用します。
+
+### この記事で学べること
+
+- Stripe Connect の3つのアカウントタイプと、マーケットプレイスに適した選択肢
+- Rorkアプリ側のオンボーディング画面（出品者登録フロー）の実装
+- Supabaseを使ったバックエンド設計（出品者・商品・注文テーブル）
+- Stripe Connect Charges API による決済と手数料分配
+- Webhook処理による注文ステータスの自動更新
+- 本番公開前のコンプライアンスチェックリスト
+
+---
+
+## 1. Stripe Connect の基礎知識：3つのアカウントタイプ
+
+Stripe Connectには大きく3つのアカウントタイプがあります。マーケットプレイスの設計に大きく影響するため、まず整理しておきましょう。
+
+**Standard アカウント**はStripeの標準的なダッシュボードを出品者に提供します。出品者が自分でStripeアカウントを持ち、管理します。Stripeのオンボーディング画面がそのまま使えるため、実装コストが最も低い選択肢です。ただし、プラットフォーム側からの詳細な制御には制約があります。
+
+**Express アカウント**は最もよく使われるタイプで、Stripeがホストするシンプルなオンボーディング画面を出品者に表示します。KYC（本人確認）をStripeが代行するため、コンプライアンス上の負担を大幅に軽減できます。手数料はDestination Charges（送金先指定）方式と相性が良く、**個人開発のマーケットプレイスにはExpressが最適解**です。
+
+**Custom アカウント**はUI/UXを完全にカスタマイズできますが、KYC責任をプラットフォームが負うため、法的リスクとコストが高くなります。スタートアップ初期には不向きです。
+
+本記事では **Express アカウント × Destination Charges** の構成で進めます。
+
+---
+
+## 2. Supabase によるバックエンド設計
+
+RorkアプリのバックエンドにはSupabaseを使います。まず必要なテーブルを設計します。
+
+### テーブル設計
+
+```sql
+-- 出品者情報（Stripe Connectアカウント紐付け）
+create table sellers (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) not null,
+  stripe_account_id text unique,           -- Stripe Connect アカウントID (acct_xxxx)
+  onboarding_complete boolean default false,
+  charges_enabled boolean default false,
+  payouts_enabled boolean default false,
+  created_at timestamptz default now()
+);
+
+-- 商品テーブル
+create table products (
+  id uuid primary key default gen_random_uuid(),
+  seller_id uuid references sellers(id) not null,
+  title text not null,
+  description text,
+  price integer not null,                  -- 価格（円）
+  currency text default 'jpy',
+  image_url text,
+  status text default 'active',           -- active / sold / deleted
+  created_at timestamptz default now()
+);
+
+-- 注文テーブル
+create table orders (
+  id uuid primary key default gen_random_uuid(),
+  product_id uuid references products(id) not null,
+  buyer_user_id uuid references auth.users(id) not null,
+  seller_id uuid references sellers(id) not null,
+  amount integer not null,                 -- 決済金額（円）
+  platform_fee integer not null,           -- プラットフォーム手数料（円）
+  stripe_payment_intent_id text unique,
+  stripe_transfer_id text,
+  status text default 'pending',          -- pending / paid / shipped / completed / refunded
+  created_at timestamptz default now()
+);
+```
+
+### Row Level Security (RLS) の設定
+
+```sql
+-- 出品者は自分のレコードのみ参照・更新可能
+alter table sellers enable row level security;
+create policy "sellers_own_record" on sellers
+  for all using (auth.uid() = user_id);
+
+-- 商品は誰でも閲覧可能、変更は出品者のみ
+alter table products enable row level security;
+create policy "products_read_all" on products
+  for select using (status = 'active');
+create policy "products_write_own" on products
+  for all using (
+    seller_id in (select id from sellers where user_id = auth.uid())
+  );
+
+-- 注文は売り手・買い手のみ参照可能
+alter table orders enable row level security;
+create policy "orders_participant_only" on orders
+  for select using (
+    buyer_user_id = auth.uid() or
+    seller_id in (select id from sellers where user_id = auth.uid())
+  );
+```
+
+---
+
+## 3. Stripe Connect アカウントの作成とオンボーディング
+
+出品者がアプリ上でStripe Expressアカウントを作成し、本人確認を完了するフローを実装します。
+
+### バックエンドAPI（Supabase Edge Functions）
+
+```typescript
+// supabase/functions/stripe-connect-onboard/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  // ユーザー認証確認
+  const authHeader = req.headers.get("Authorization")\!;
+  const { data: { user } } = await supabase.auth.getUser(
+    authHeader.replace("Bearer ", "")
+  );
+  if (\!user) return new Response("Unauthorized", { status: 401 });
+
+  // 既存のStripe Connectアカウントを確認
+  const { data: existingSeller } = await supabase
+    .from("sellers")
+    .select("stripe_account_id")
+    .eq("user_id", user.id)
+    .single();
+
+  let accountId = existingSeller?.stripe_account_id;
+
+  // なければ新規作成
+  if (\!accountId) {
+    const account = await stripe.accounts.create({
+      type: "express",
+      country: "JP",
+      email: user.email,
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+      business_type: "individual",
+    });
+    accountId = account.id;
+
+    // Supabaseに保存
+    await supabase.from("sellers").upsert({
+      user_id: user.id,
+      stripe_account_id: accountId,
+    });
+  }
+
+  // オンボーディングURL生成（Stripeのホストする本人確認画面）
+  const accountLink = await stripe.accountLinks.create({
+    account: accountId,
+    refresh_url: `${Deno.env.get("APP_URL")}/seller/onboarding?reauth=true`,
+    return_url: `${Deno.env.get("APP_URL")}/seller/onboarding?success=true`,
+    type: "account_onboarding",
+  });
+
+  return new Response(
+    JSON.stringify({ url: accountLink.url }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+### Rorkアプリ側：オンボーディング画面
+
+```typescript
+// Rork で生成するオンボーディング画面のコア実装
+import React, { useState } from "react";
+import { View, Text, TouchableOpacity, Alert } from "react-native";
+import { WebView } from "react-native-webview";
+import { supabase } from "@/lib/supabase";
+
+export default function SellerOnboardingScreen() {
+  const [isLoading, setIsLoading] = useState(false);
+  const [onboardingUrl, setOnboardingUrl] = useState<string | null>(null);
+  const [isComplete, setIsComplete] = useState(false);
+
+  const startOnboarding = async () => {
+    setIsLoading(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const response = await fetch(
+        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/stripe-connect-onboard`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session?.access_token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      const { url } = await response.json();
+      setOnboardingUrl(url);
+    } catch (error) {
+      Alert.alert("エラー", "オンボーディングの開始に失敗しました");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  if (isComplete) {
+    return (
+      <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
+        <Text style={{ fontSize: 24 }}>✅</Text>
+        <Text style={{ fontSize: 18, marginTop: 16 }}>
+          出品者登録が完了しました！
+        </Text>
+        <Text style={{ color: "#666", marginTop: 8 }}>
+          審査完了後に販売を開始できます
+        </Text>
+      </View>
+    );
+  }
+
+  if (onboardingUrl) {
+    return (
+      <WebView
+        source={{ uri: onboardingUrl }}
+        onNavigationStateChange={(state) => {
+          // return_url に遷移したら完了とみなす
+          if (state.url.includes("success=true")) {
+            setIsComplete(true);
+            setOnboardingUrl(null);
+          }
+        }}
+      />
+    );
+  }
+
+  return (
+    <View style={{ flex: 1, padding: 24, justifyContent: "center" }}>
+      <Text style={{ fontSize: 22, fontWeight: "bold", marginBottom: 16 }}>
+        出品者として登録する
+      </Text>
+      <Text style={{ color: "#555", marginBottom: 32, lineHeight: 24 }}>
+        Stripe による本人確認（KYC）を完了すると、
+        商品を出品して売上を受け取ることができます。
+        確認作業は通常1〜2営業日で完了します。
+      </Text>
+      <TouchableOpacity
+        onPress={startOnboarding}
+        disabled={isLoading}
+        style={{
+          backgroundColor: "#5469D4",
+          padding: 16,
+          borderRadius: 8,
+          alignItems: "center",
+        }}
+      >
+        <Text style={{ color: "#fff", fontSize: 16, fontWeight: "600" }}>
+          {isLoading ? "準備中..." : "本人確認を開始する"}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+```
+
+---
+
+## 4. Destination Charges による決済と手数料分配
+
+購入者が決済すると、Stripeが自動的に出品者への送金とプラットフォーム手数料の分配を処理します。
+
+### 決済API（Supabase Edge Function）
+
+```typescript
+// supabase/functions/create-marketplace-payment/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+// プラットフォーム手数料率（10%）
+const PLATFORM_FEE_RATE = 0.10;
+
+serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  const { productId } = await req.json();
+
+  // ユーザー認証
+  const authHeader = req.headers.get("Authorization")\!;
+  const { data: { user } } = await supabase.auth.getUser(
+    authHeader.replace("Bearer ", "")
+  );
+  if (\!user) return new Response("Unauthorized", { status: 401 });
+
+  // 商品・出品者情報を取得
+  const { data: product } = await supabase
+    .from("products")
+    .select("*, sellers(stripe_account_id, charges_enabled)")
+    .eq("id", productId)
+    .eq("status", "active")
+    .single();
+
+  if (\!product) {
+    return new Response("Product not found", { status: 404 });
+  }
+
+  if (\!product.sellers.charges_enabled) {
+    return new Response("Seller not ready to accept payments", { status: 400 });
+  }
+
+  const amount = product.price;  // 円
+  const platformFee = Math.floor(amount * PLATFORM_FEE_RATE);
+
+  // PaymentIntent を作成（Destination Charges方式）
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount,
+    currency: "jpy",
+    // 出品者のStripe Connectアカウントに送金
+    transfer_data: {
+      destination: product.sellers.stripe_account_id,
+    },
+    // プラットフォーム手数料（自動的にプラットフォームアカウントに残る）
+    application_fee_amount: platformFee,
+    metadata: {
+      product_id: productId,
+      buyer_user_id: user.id,
+      seller_id: product.seller_id,
+    },
+  });
+
+  // 注文レコード作成
+  await supabase.from("orders").insert({
+    product_id: productId,
+    buyer_user_id: user.id,
+    seller_id: product.seller_id,
+    amount,
+    platform_fee: platformFee,
+    stripe_payment_intent_id: paymentIntent.id,
+    status: "pending",
+  });
+
+  return new Response(
+    JSON.stringify({
+      clientSecret: paymentIntent.client_secret,
+      amount,
+      platformFee,
+      sellerReceives: amount - platformFee,
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+### Rorkアプリ側：購入フロー
+
+```typescript
+// Rork の購入画面（Payment Sheet 使用）
+import React, { useState } from "react";
+import { View, Text, TouchableOpacity, Alert } from "react-native";
+import { useStripe } from "@stripe/stripe-react-native";
+import { supabase } from "@/lib/supabase";
+
+interface ProductPurchaseProps {
+  productId: string;
+  productTitle: string;
+  price: number;
+}
+
+export default function ProductPurchaseScreen({
+  productId,
+  productTitle,
+  price,
+}: ProductPurchaseProps) {
+  const { initPaymentSheet, presentPaymentSheet } = useStripe();
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handlePurchase = async () => {
+    setIsLoading(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+
+      // バックエンドからclientSecretを取得
+      const response = await fetch(
+        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/create-marketplace-payment`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session?.access_token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ productId }),
+        }
+      );
+      const { clientSecret, amount, sellerReceives } = await response.json();
+
+      // Payment Sheet の初期化
+      const { error: initError } = await initPaymentSheet({
+        paymentIntentClientSecret: clientSecret,
+        merchantDisplayName: "Your Marketplace",
+        primaryButtonLabel: `¥${amount.toLocaleString()} で購入する`,
+      });
+
+      if (initError) throw new Error(initError.message);
+
+      // Payment Sheet を表示
+      const { error: presentError } = await presentPaymentSheet();
+
+      if (presentError) {
+        if (presentError.code \!== "Canceled") {
+          Alert.alert("決済エラー", presentError.message);
+        }
+        return;
+      }
+
+      // 決済成功
+      Alert.alert(
+        "購入完了",
+        `「${productTitle}」の購入が完了しました。\n出品者への連絡をお待ちください。`
+      );
+    } catch (error) {
+      Alert.alert("エラー", "購入処理中にエラーが発生しました");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const platformFee = Math.floor(price * 0.10);
+
+  return (
+    <View style={{ padding: 24 }}>
+      <Text style={{ fontSize: 20, fontWeight: "bold", marginBottom: 8 }}>
+        {productTitle}
+      </Text>
+
+      <View style={{ backgroundColor: "#f8f9fa", padding: 16, borderRadius: 8, marginBottom: 24 }}>
+        <Text style={{ fontSize: 16, marginBottom: 4 }}>
+          価格: ¥{price.toLocaleString()}
+        </Text>
+        <Text style={{ fontSize: 13, color: "#666" }}>
+          ※ サービス手数料 ¥{platformFee.toLocaleString()} を含む
+        </Text>
+      </View>
+
+      <TouchableOpacity
+        onPress={handlePurchase}
+        disabled={isLoading}
+        style={{
+          backgroundColor: "#00a651",
+          padding: 16,
+          borderRadius: 8,
+          alignItems: "center",
+        }}
+      >
+        <Text style={{ color: "#fff", fontSize: 16, fontWeight: "600" }}>
+          {isLoading ? "処理中..." : `¥${price.toLocaleString()} で購入する`}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+```
+
+---
+
+## 5. Webhook 処理による注文ステータスの自動更新
+
+Stripeから送られるWebhookイベントを処理して、注文ステータスを自動更新します。これが実装されていないと、決済完了後も注文が「pending」のままになってしまいます。
+
+```typescript
+// supabase/functions/stripe-webhook/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+  httpClient: Stripe.createFetchHttpClient(),
+});
+
+const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET")\!;
+
+serve(async (req) => {
+  const body = await req.text();
+  const signature = req.headers.get("stripe-signature")\!;
+
+  let event: Stripe.Event;
+  try {
+    // Deno/Cloudflare Workers 環境では非同期バージョンが必須
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      webhookSecret,
+      undefined,
+      Stripe.createSubtleCryptoProvider()
+    );
+  } catch (err) {
+    console.error("Webhook signature verification failed:", err);
+    return new Response("Invalid signature", { status: 400 });
+  }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  switch (event.type) {
+    case "payment_intent.succeeded": {
+      const paymentIntent = event.data.object as Stripe.PaymentIntent;
+
+      // 注文ステータスを paid に更新
+      await supabase
+        .from("orders")
+        .update({ status: "paid" })
+        .eq("stripe_payment_intent_id", paymentIntent.id);
+
+      // 商品ステータスを sold に更新（1点物の場合）
+      const { data: order } = await supabase
+        .from("orders")
+        .select("product_id")
+        .eq("stripe_payment_intent_id", paymentIntent.id)
+        .single();
+
+      if (order) {
+        await supabase
+          .from("products")
+          .update({ status: "sold" })
+          .eq("id", order.product_id);
+      }
+      break;
+    }
+
+    case "payment_intent.payment_failed": {
+      const paymentIntent = event.data.object as Stripe.PaymentIntent;
+      await supabase
+        .from("orders")
+        .update({ status: "failed" })
+        .eq("stripe_payment_intent_id", paymentIntent.id);
+      break;
+    }
+
+    case "account.updated": {
+      // 出品者アカウントの審査状況を更新
+      const account = event.data.object as Stripe.Account;
+      await supabase
+        .from("sellers")
+        .update({
+          charges_enabled: account.charges_enabled,
+          payouts_enabled: account.payouts_enabled,
+          onboarding_complete: account.details_submitted,
+        })
+        .eq("stripe_account_id", account.id);
+      break;
+    }
+
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+
+  return new Response(JSON.stringify({ received: true }), {
+    headers: { "Content-Type": "application/json" },
+  });
+});
+```
+
+---
+
+## 6. 出品者ダッシュボード：売上・送金状況の確認
+
+出品者が自分の売上を確認できるダッシュボード画面を実装します。
+
+```typescript
+// supabase/functions/seller-dashboard/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  const authHeader = req.headers.get("Authorization")\!;
+  const { data: { user } } = await supabase.auth.getUser(
+    authHeader.replace("Bearer ", "")
+  );
+  if (\!user) return new Response("Unauthorized", { status: 401 });
+
+  const { data: seller } = await supabase
+    .from("sellers")
+    .select("stripe_account_id")
+    .eq("user_id", user.id)
+    .single();
+
+  if (\!seller?.stripe_account_id) {
+    return new Response("Seller not found", { status: 404 });
+  }
+
+  // Stripe Connect アカウントの残高を取得
+  const balance = await stripe.balance.retrieve({
+    stripeAccount: seller.stripe_account_id,
+  });
+
+  // 最近の送金履歴
+  const payouts = await stripe.payouts.list(
+    { limit: 5 },
+    { stripeAccount: seller.stripe_account_id }
+  );
+
+  return new Response(
+    JSON.stringify({
+      balance: {
+        available: balance.available[0]?.amount ?? 0,
+        pending: balance.pending[0]?.amount ?? 0,
+        currency: "jpy",
+      },
+      recentPayouts: payouts.data.map((p) => ({
+        amount: p.amount,
+        status: p.status,
+        arrivalDate: p.arrival_date,
+      })),
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+---
+
+## 7. 返金・紛争処理
+
+マーケットプレイスでは返金対応も必要です。Stripe Connectの返金は通常の返金よりも少し複雑で、出品者への送金を取り消す `reverse_transfer: true` の指定が重要です。
+
+```typescript
+// supabase/functions/process-refund/index.ts（管理者用）
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+serve(async (req) => {
+  const { orderId, reason } = await req.json();
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  const { data: order } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("id", orderId)
+    .single();
+
+  if (\!order || order.status \!== "paid") {
+    return new Response("Order not eligible for refund", { status: 400 });
+  }
+
+  // Destination Charges の返金
+  const refund = await stripe.refunds.create({
+    payment_intent: order.stripe_payment_intent_id,
+    reason: reason || "requested_by_customer",
+    reverse_transfer: true,          // 出品者への送金を取り消す
+    refund_application_fee: true,    // プラットフォーム手数料も返金
+  });
+
+  await supabase
+    .from("orders")
+    .update({ status: "refunded" })
+    .eq("id", orderId);
+
+  // 商品を再出品可能に戻す
+  await supabase
+    .from("products")
+    .update({ status: "active" })
+    .eq("id", order.product_id);
+
+  return new Response(
+    JSON.stringify({ refundId: refund.id, status: refund.status }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+---
+
+## 8. 本番公開前のコンプライアンスチェックリスト
+
+Stripe Connectを使ったマーケットプレイスを本番公開する前に、以下を必ず確認してください。
+
+**Stripe側の設定確認**として、まずStripeダッシュボードの「Connect設定」でプラットフォームの業種・説明・サポートメールアドレスを正確に登録します。Expressアカウントのオンボーディング画面にはプラットフォーム名とロゴが表示されるため、ブランドイメージに影響します。また「利用規約」ページでConnect利用規約を承認します（本番環境では必須）。
+
+**テスト環境での動作確認**では、テスト用カード（4242 4242 4242 4242）で購入フローが完了すること、Webhookがローカル環境で受信できること（`stripe listen --forward-to`を活用）、返金フローが正常に動作すること、`account.updated` Webhookで `charges_enabled: true` の受信とDB更新が動作することを確認します。
+
+**セキュリティ確認**として、Supabase RLSが全テーブルで有効化されていること、APIキーが環境変数で管理されソースコードに含まれていないこと、Webhook署名検証が有効であること、管理者専用エンドポイント（返金など）に適切な認証が設定されていることを確認します。
+
+**法的要件**については、日本でマーケットプレイスを運営する場合、資金決済法の規制対象になる可能性があります。Stripe ConnectのDestination Chargesを使う場合、資金の一時預かりが発生するため、資金移動業の登録が必要になるケースがあります。必ず法律の専門家への相談を行ってください。
+
+Stripe Connectを活用したサービス設計についてより深く学びたい方には、[「Stripe徹底入門 ──オンライン決済システム構築と運用のベストプラクティス」](https://www.amazon.co.jp/dp/4297138581/?tag=pinocchio-22)（技術評論社）がおすすめです。APIの使い方から法的な考慮点まで、実務に即した解説が充実しています。
+
+---
+
+## 9. よくある質問（FAQ）
+
+**Q: Stripe Expressアカウントの審査にはどのくらい時間がかかりますか？**
+
+個人（日本）の場合、本人確認書類（マイナンバーカード、運転免許証など）をStripeのオンボーディング画面にアップロードすると、通常1〜3営業日で審査が完了します。審査状況は `account.updated` Webhookの `charges_enabled` フィールドで確認できます。
+
+**Q: 手数料はどのくらいに設定するのが適切ですか？**
+
+フリマアプリでは10〜15%、スキルマーケットでは15〜20%が一般的です。Stripe自体の手数料（日本の場合は3.6%＋決済手数料）を差し引いた上で利益が出る率に設定します。手数料10%に設定した場合、Stripe手数料後の実質収益は約6〜7%となります。
+
+**Q: 日本円（JPY）以外の通貨にも対応できますか？**
+
+Stripe Connectはマルチカレンシーに対応しています。ただしJPYは最小通貨単位が1円（セントなし）であるため、他の通貨（USDなど）では金額に100を掛けたセント単位で指定する必要があります。グローバル展開する場合は通貨変換ロジックの実装が必要です。
+
+**Q: 出品者が複数の商品を出品できるようにするには？**
+
+上記のテーブル設計では既に対応しています。`products` テーブルに `seller_id` でリレーションを持たせているため、1人の出品者が複数の商品を登録できます。商品一覧画面では `seller_id` でフィルタリングすることで出品者の商品ページを実現できます。
+
+**Q: 自動定期送金（ペイアウト）のスケジュールは変更できますか？**
+
+Stripe Expressアカウントのデフォルトでは、審査完了後に自動ペイアウトが有効になります。送金スケジュール（日次・週次・月次）はStripeダッシュボードまたはAPIで変更可能です。開発時にはテストモードで即時ペイアウトをシミュレートできます。
+
+---
+
+## まとめ
+
+本記事では、Rork と Stripe Connect を組み合わせたマーケットプレイスアプリの構築方法を解説しました。
+
+ポイントとしては、出品者のアカウント管理にはExpress方式が最適で、KYCをStripeに委ねることでコンプライアンス負担を大幅に軽減できます。また、決済フローにはDestination Chargesを採用することで、手数料分配と出品者への自動送金が一度のAPI呼び出しで完結します。Webhook処理を確実に実装することで決済ステータスのリアルタイム同期が実現し、本番公開前には法的要件の確認とセキュリティ設定の徹底が不可欠です。
+
+Rorkの強力なUI生成能力と、SupabaseのEdge FunctionsおよびStripe Connectを組み合わせることで、個人開発者でもフルスタックなマーケットプレイスを短期間で実現できる時代になっています。本記事のコードをベースに、ぜひあなた独自のマーケットプレイスを構築してみてください。
+
+より発展的なStripe連携パターンについては、[Rork × Stripe サブスクリプション完全ガイド](/articles/rork-dev/rork-stripe-subscription-complete-guide)も合わせてご参照ください。また、バックエンドのSupabase設計については[Rork × Supabase 認証・リアルタイムガイド](/articles/rork-dev/rork-supabase-auth-realtime-guide)が参考になります。
+
+本記事をさらに深めたい方には、[「Supabase バックエンドを最速で作るための実践ガイド」](https://www.amazon.co.jp/dp/4297140829/?tag=pinocchio-22)（技術評論社）もおすすめです。Edge Functions の設計パターンから RLS の実践的な設定方法まで、体系的に学べます。

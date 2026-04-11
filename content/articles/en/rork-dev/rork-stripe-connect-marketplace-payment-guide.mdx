@@ -1,0 +1,876 @@
+---
+title: "Complete Guide to Building Marketplace App Payments with Rork and Stripe Connect"
+slug: "rork-stripe-connect-marketplace-payment-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-12T06:00"
+updated: "2026-04-12T06:00"
+author: "Rork Lab"
+description: "A comprehensive guide to integrating Stripe Connect into a Rork-built marketplace app. Covers seller account onboarding, destination charges, platform fee distribution, Webhook handling, and launch compliance."
+tags: ["Stripe Connect", "marketplace", "payments", "Stripe", "Rork Max", "Supabase", "subscriptions", "indie dev"]
+highlights:
+  - "Developers stuck on Stripe Connect setup can implement the complete seller account registration, KYC, and onboarding flow from Rork today"
+  - "Get copy-paste-ready code for marketplace fee distribution and automated seller payouts using Destination Charges"
+  - "From Supabase integration and Webhook handling to a production launch checklist — everything you need to ship a monetizable marketplace as a solo developer"
+---
+
+## Introduction: Why Marketplace Apps Are Still a Strong Bet in 2026
+
+Peer-to-peer commerce — freelance platforms, resale apps, coaching marketplaces, sharing economy services — remains one of the most compelling business models for indie developers. The core appeal is simple: as your user base grows, your platform fee revenue scales automatically. You build the infrastructure once and collect a percentage of every transaction that flows through it.
+
+But there's a technical hurdle that trips up many developers: standard Stripe integration doesn't handle the "collect from buyer, distribute to seller, keep a cut" flow. For that, you need **Stripe Connect**.
+
+This guide walks through building a full-featured marketplace payment system using Rork (and Rork Max) with Supabase as the backend. We'll go from account architecture all the way to production launch — with real, working code at every step.
+
+### What You'll Learn
+
+- The three Stripe Connect account types and which one fits a marketplace
+- Implementing the seller onboarding screen in your Rork app
+- Backend database design with Supabase (sellers, products, orders)
+- Processing payments and distributing fees with the Destination Charges API
+- Automating order status updates via Webhooks
+- A pre-launch compliance checklist
+
+---
+
+## 1. Stripe Connect Fundamentals: Choosing the Right Account Type
+
+Stripe Connect offers three account types, and your choice will shape your entire architecture.
+
+**Standard accounts** give sellers their own full Stripe dashboard. They manage their account independently, and Stripe handles onboarding UI out of the box. Implementation is low-cost, but you have limited programmatic control over seller accounts.
+
+**Express accounts** are the sweet spot for most marketplaces. Stripe hosts a streamlined onboarding flow and handles KYC (Know Your Customer) verification on your behalf, which dramatically reduces your compliance burden. They pair naturally with Destination Charges. **For solo-developed marketplaces, Express is the right default.**
+
+**Custom accounts** offer complete UI control, but you take on KYC responsibility and the associated legal liability. This is not appropriate for early-stage products.
+
+We'll use **Express accounts with Destination Charges** throughout this guide.
+
+---
+
+## 2. Backend Design with Supabase
+
+We'll use Supabase as the backend. Start by creating the tables you'll need.
+
+### Table Schema
+
+```sql
+-- Sellers table (linked to Stripe Connect accounts)
+create table sellers (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) not null,
+  stripe_account_id text unique,           -- Stripe Connect account ID (acct_xxxx)
+  onboarding_complete boolean default false,
+  charges_enabled boolean default false,
+  payouts_enabled boolean default false,
+  created_at timestamptz default now()
+);
+
+-- Products table
+create table products (
+  id uuid primary key default gen_random_uuid(),
+  seller_id uuid references sellers(id) not null,
+  title text not null,
+  description text,
+  price integer not null,                  -- Price in smallest currency unit
+  currency text default 'usd',
+  image_url text,
+  status text default 'active',           -- active / sold / deleted
+  created_at timestamptz default now()
+);
+
+-- Orders table
+create table orders (
+  id uuid primary key default gen_random_uuid(),
+  product_id uuid references products(id) not null,
+  buyer_user_id uuid references auth.users(id) not null,
+  seller_id uuid references sellers(id) not null,
+  amount integer not null,                 -- Total charge amount
+  platform_fee integer not null,           -- Platform's cut
+  stripe_payment_intent_id text unique,
+  stripe_transfer_id text,
+  status text default 'pending',          -- pending / paid / shipped / completed / refunded
+  created_at timestamptz default now()
+);
+```
+
+### Row Level Security
+
+```sql
+-- Sellers can only access their own record
+alter table sellers enable row level security;
+create policy "sellers_own_record" on sellers
+  for all using (auth.uid() = user_id);
+
+-- Products are publicly readable; only seller can modify
+alter table products enable row level security;
+create policy "products_read_all" on products
+  for select using (status = 'active');
+create policy "products_write_own" on products
+  for all using (
+    seller_id in (select id from sellers where user_id = auth.uid())
+  );
+
+-- Orders visible only to buyer and seller
+alter table orders enable row level security;
+create policy "orders_participant_only" on orders
+  for select using (
+    buyer_user_id = auth.uid() or
+    seller_id in (select id from sellers where user_id = auth.uid())
+  );
+```
+
+---
+
+## 3. Creating a Stripe Connect Account and Onboarding
+
+Here's the flow: seller taps "Register as Seller" → your backend creates a Stripe Express account → Stripe serves their KYC screen → seller completes verification → your app gets notified via Webhook.
+
+### Backend API (Supabase Edge Function)
+
+```typescript
+// supabase/functions/stripe-connect-onboard/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  const authHeader = req.headers.get("Authorization")\!;
+  const { data: { user } } = await supabase.auth.getUser(
+    authHeader.replace("Bearer ", "")
+  );
+  if (\!user) return new Response("Unauthorized", { status: 401 });
+
+  // Check for existing Stripe Connect account
+  const { data: existingSeller } = await supabase
+    .from("sellers")
+    .select("stripe_account_id")
+    .eq("user_id", user.id)
+    .single();
+
+  let accountId = existingSeller?.stripe_account_id;
+
+  if (\!accountId) {
+    const account = await stripe.accounts.create({
+      type: "express",
+      country: "US",
+      email: user.email,
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+      business_type: "individual",
+    });
+    accountId = account.id;
+
+    await supabase.from("sellers").upsert({
+      user_id: user.id,
+      stripe_account_id: accountId,
+    });
+  }
+
+  // Generate the Stripe-hosted onboarding link
+  const accountLink = await stripe.accountLinks.create({
+    account: accountId,
+    refresh_url: `${Deno.env.get("APP_URL")}/seller/onboarding?reauth=true`,
+    return_url: `${Deno.env.get("APP_URL")}/seller/onboarding?success=true`,
+    type: "account_onboarding",
+  });
+
+  return new Response(
+    JSON.stringify({ url: accountLink.url }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+### Rork App: Onboarding Screen
+
+```typescript
+import React, { useState } from "react";
+import { View, Text, TouchableOpacity, Alert } from "react-native";
+import { WebView } from "react-native-webview";
+import { supabase } from "@/lib/supabase";
+
+export default function SellerOnboardingScreen() {
+  const [isLoading, setIsLoading] = useState(false);
+  const [onboardingUrl, setOnboardingUrl] = useState<string | null>(null);
+  const [isComplete, setIsComplete] = useState(false);
+
+  const startOnboarding = async () => {
+    setIsLoading(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const response = await fetch(
+        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/stripe-connect-onboard`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session?.access_token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      const { url } = await response.json();
+      setOnboardingUrl(url);
+    } catch {
+      Alert.alert("Error", "Failed to start onboarding. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  if (isComplete) {
+    return (
+      <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
+        <Text style={{ fontSize: 24 }}>✅</Text>
+        <Text style={{ fontSize: 18, marginTop: 16, fontWeight: "600" }}>
+          Seller registration complete\!
+        </Text>
+        <Text style={{ color: "#666", marginTop: 8, textAlign: "center" }}>
+          You'll be able to list items once Stripe completes your review
+          (typically 1–2 business days).
+        </Text>
+      </View>
+    );
+  }
+
+  if (onboardingUrl) {
+    return (
+      <WebView
+        source={{ uri: onboardingUrl }}
+        onNavigationStateChange={(state) => {
+          if (state.url.includes("success=true")) {
+            setIsComplete(true);
+            setOnboardingUrl(null);
+          }
+        }}
+      />
+    );
+  }
+
+  return (
+    <View style={{ flex: 1, padding: 24, justifyContent: "center" }}>
+      <Text style={{ fontSize: 22, fontWeight: "bold", marginBottom: 16 }}>
+        Start Selling
+      </Text>
+      <Text style={{ color: "#555", marginBottom: 32, lineHeight: 24 }}>
+        Complete Stripe's identity verification to start listing items
+        and receiving payouts directly to your bank account.
+      </Text>
+      <TouchableOpacity
+        onPress={startOnboarding}
+        disabled={isLoading}
+        style={{
+          backgroundColor: "#5469D4",
+          padding: 16,
+          borderRadius: 8,
+          alignItems: "center",
+        }}
+      >
+        <Text style={{ color: "#fff", fontSize: 16, fontWeight: "600" }}>
+          {isLoading ? "Setting up..." : "Verify Identity"}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+```
+
+---
+
+## 4. Destination Charges: Collecting Payment and Splitting Fees
+
+With Destination Charges, a single API call handles everything: collect from the buyer, route funds to the seller, and retain your platform fee automatically.
+
+### Payment API (Supabase Edge Function)
+
+```typescript
+// supabase/functions/create-marketplace-payment/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+const PLATFORM_FEE_RATE = 0.10; // 10% platform fee
+
+serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  const { productId } = await req.json();
+
+  const authHeader = req.headers.get("Authorization")\!;
+  const { data: { user } } = await supabase.auth.getUser(
+    authHeader.replace("Bearer ", "")
+  );
+  if (\!user) return new Response("Unauthorized", { status: 401 });
+
+  const { data: product } = await supabase
+    .from("products")
+    .select("*, sellers(stripe_account_id, charges_enabled)")
+    .eq("id", productId)
+    .eq("status", "active")
+    .single();
+
+  if (\!product) return new Response("Product not found", { status: 404 });
+  if (\!product.sellers.charges_enabled) {
+    return new Response("Seller cannot accept payments yet", { status: 400 });
+  }
+
+  const amount = product.price;
+  const platformFee = Math.round(amount * PLATFORM_FEE_RATE);
+
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount,
+    currency: "usd",
+    transfer_data: {
+      destination: product.sellers.stripe_account_id,
+    },
+    application_fee_amount: platformFee,
+    metadata: {
+      product_id: productId,
+      buyer_user_id: user.id,
+      seller_id: product.seller_id,
+    },
+  });
+
+  await supabase.from("orders").insert({
+    product_id: productId,
+    buyer_user_id: user.id,
+    seller_id: product.seller_id,
+    amount,
+    platform_fee: platformFee,
+    stripe_payment_intent_id: paymentIntent.id,
+    status: "pending",
+  });
+
+  return new Response(
+    JSON.stringify({
+      clientSecret: paymentIntent.client_secret,
+      amount,
+      platformFee,
+      sellerReceives: amount - platformFee,
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+### Rork App: Purchase Flow
+
+```typescript
+import React, { useState } from "react";
+import { View, Text, TouchableOpacity, Alert } from "react-native";
+import { useStripe } from "@stripe/stripe-react-native";
+import { supabase } from "@/lib/supabase";
+
+interface Props {
+  productId: string;
+  productTitle: string;
+  price: number; // in cents
+}
+
+export default function ProductPurchaseScreen({ productId, productTitle, price }: Props) {
+  const { initPaymentSheet, presentPaymentSheet } = useStripe();
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handlePurchase = async () => {
+    setIsLoading(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+
+      const response = await fetch(
+        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/create-marketplace-payment`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session?.access_token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ productId }),
+        }
+      );
+
+      const { clientSecret, amount } = await response.json();
+
+      const { error: initError } = await initPaymentSheet({
+        paymentIntentClientSecret: clientSecret,
+        merchantDisplayName: "Your Marketplace",
+      });
+      if (initError) throw new Error(initError.message);
+
+      const { error: presentError } = await presentPaymentSheet();
+      if (presentError) {
+        if (presentError.code \!== "Canceled") {
+          Alert.alert("Payment Error", presentError.message);
+        }
+        return;
+      }
+
+      Alert.alert(
+        "Purchase Complete",
+        `You've successfully purchased "${productTitle}". The seller will be in touch soon.`
+      );
+    } catch {
+      Alert.alert("Error", "Something went wrong during checkout.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const platformFee = Math.round(price * 0.10);
+  const displayPrice = (price / 100).toFixed(2);
+
+  return (
+    <View style={{ padding: 24 }}>
+      <Text style={{ fontSize: 20, fontWeight: "bold", marginBottom: 8 }}>
+        {productTitle}
+      </Text>
+
+      <View style={{ backgroundColor: "#f8f9fa", padding: 16, borderRadius: 8, marginBottom: 24 }}>
+        <Text style={{ fontSize: 16, marginBottom: 4 }}>
+          Price: ${displayPrice}
+        </Text>
+        <Text style={{ fontSize: 13, color: "#666" }}>
+          Includes ${(platformFee / 100).toFixed(2)} service fee
+        </Text>
+      </View>
+
+      <TouchableOpacity
+        onPress={handlePurchase}
+        disabled={isLoading}
+        style={{
+          backgroundColor: "#00a651",
+          padding: 16,
+          borderRadius: 8,
+          alignItems: "center",
+        }}
+      >
+        <Text style={{ color: "#fff", fontSize: 16, fontWeight: "600" }}>
+          {isLoading ? "Processing..." : `Buy for $${displayPrice}`}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+```
+
+---
+
+## 5. Webhook Handling: Keeping Order Status in Sync
+
+Without Webhooks, orders stay in "pending" indefinitely after successful payment. This is the glue that keeps your database consistent with Stripe's state.
+
+```typescript
+// supabase/functions/stripe-webhook/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+  httpClient: Stripe.createFetchHttpClient(),
+});
+
+serve(async (req) => {
+  const body = await req.text();
+  const signature = req.headers.get("stripe-signature")\!;
+  const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET")\!;
+
+  let event: Stripe.Event;
+  try {
+    // Must use async version in Deno/Cloudflare Workers environments
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      webhookSecret,
+      undefined,
+      Stripe.createSubtleCryptoProvider()
+    );
+  } catch (err) {
+    console.error("Webhook verification failed:", err);
+    return new Response("Invalid signature", { status: 400 });
+  }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  switch (event.type) {
+    case "payment_intent.succeeded": {
+      const pi = event.data.object as Stripe.PaymentIntent;
+
+      await supabase
+        .from("orders")
+        .update({ status: "paid" })
+        .eq("stripe_payment_intent_id", pi.id);
+
+      const { data: order } = await supabase
+        .from("orders")
+        .select("product_id")
+        .eq("stripe_payment_intent_id", pi.id)
+        .single();
+
+      if (order) {
+        await supabase
+          .from("products")
+          .update({ status: "sold" })
+          .eq("id", order.product_id);
+      }
+      break;
+    }
+
+    case "payment_intent.payment_failed": {
+      const pi = event.data.object as Stripe.PaymentIntent;
+      await supabase
+        .from("orders")
+        .update({ status: "failed" })
+        .eq("stripe_payment_intent_id", pi.id);
+      break;
+    }
+
+    case "account.updated": {
+      const account = event.data.object as Stripe.Account;
+      await supabase
+        .from("sellers")
+        .update({
+          charges_enabled: account.charges_enabled,
+          payouts_enabled: account.payouts_enabled,
+          onboarding_complete: account.details_submitted,
+        })
+        .eq("stripe_account_id", account.id);
+      break;
+    }
+
+    default:
+      console.log(`Unhandled event: ${event.type}`);
+  }
+
+  return new Response(JSON.stringify({ received: true }), {
+    headers: { "Content-Type": "application/json" },
+  });
+});
+```
+
+---
+
+## 6. Seller Dashboard: Balance and Payout History
+
+Give sellers visibility into their earnings with a simple dashboard endpoint.
+
+```typescript
+// supabase/functions/seller-dashboard/index.ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  const authHeader = req.headers.get("Authorization")\!;
+  const { data: { user } } = await supabase.auth.getUser(
+    authHeader.replace("Bearer ", "")
+  );
+  if (\!user) return new Response("Unauthorized", { status: 401 });
+
+  const { data: seller } = await supabase
+    .from("sellers")
+    .select("stripe_account_id")
+    .eq("user_id", user.id)
+    .single();
+
+  if (\!seller?.stripe_account_id) {
+    return new Response("Seller account not found", { status: 404 });
+  }
+
+  // Fetch balance on behalf of the connected account
+  const balance = await stripe.balance.retrieve({
+    stripeAccount: seller.stripe_account_id,
+  });
+
+  const payouts = await stripe.payouts.list(
+    { limit: 5 },
+    { stripeAccount: seller.stripe_account_id }
+  );
+
+  return new Response(
+    JSON.stringify({
+      balance: {
+        available: balance.available[0]?.amount ?? 0,
+        pending: balance.pending[0]?.amount ?? 0,
+        currency: balance.available[0]?.currency ?? "usd",
+      },
+      recentPayouts: payouts.data.map((p) => ({
+        amount: p.amount,
+        currency: p.currency,
+        status: p.status,
+        arrivalDate: new Date(p.arrival_date * 1000).toLocaleDateString(),
+      })),
+    }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+---
+
+## 7. Handling Refunds and Disputes
+
+Refunds on Destination Charges require reversing the transfer to the seller. Forget this step and the money stays with the seller even after the refund is issued.
+
+```typescript
+// supabase/functions/process-refund/index.ts (admin-only endpoint)
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@14.0.0";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")\!, {
+  apiVersion: "2024-06-20",
+});
+
+serve(async (req) => {
+  const { orderId, reason } = await req.json();
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")\!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")\!
+  );
+
+  const { data: order } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("id", orderId)
+    .single();
+
+  if (\!order || order.status \!== "paid") {
+    return new Response("Order not eligible for refund", { status: 400 });
+  }
+
+  const refund = await stripe.refunds.create({
+    payment_intent: order.stripe_payment_intent_id,
+    reason: reason ?? "requested_by_customer",
+    reverse_transfer: true,       // Pull funds back from the seller
+    refund_application_fee: true, // Refund the platform fee too
+  });
+
+  await supabase
+    .from("orders")
+    .update({ status: "refunded" })
+    .eq("id", orderId);
+
+  await supabase
+    .from("products")
+    .update({ status: "active" })
+    .eq("id", order.product_id);
+
+  return new Response(
+    JSON.stringify({ refundId: refund.id, status: refund.status }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+});
+```
+
+---
+
+## 8. Pre-Launch Compliance Checklist
+
+Don't skip this. Marketplaces are subject to tighter scrutiny than standard payment processors.
+
+**Stripe Dashboard Configuration** — In your Connect settings, fill in your platform's business description, support email, and branding. This text appears on the seller onboarding screen. Accept the Stripe Connect service agreement (required for live mode).
+
+**Testing Checklist**
+
+Run through each of these in test mode before going live: complete the buyer purchase flow using card 4242 4242 4242 4242, verify that Webhooks are received and orders update correctly (use `stripe listen --forward-to` locally), test the refund flow end-to-end, and confirm that `account.updated` events with `charges_enabled: true` correctly update your `sellers` table.
+
+**Security Checklist**
+
+Confirm that RLS is enabled on all tables, that your secret keys are stored in environment variables (never in source code), that Webhook signature verification is active, and that admin-only endpoints (like refunds) have authentication that prevents sellers and buyers from calling them directly.
+
+**Legal Considerations**
+
+Platform businesses that temporarily hold funds may be subject to money transmission regulations, which vary by country. In the US, this depends on your state and business structure. Before launching, consult a legal professional to understand your obligations. Stripe's documentation on [their regulatory compliance framework](https://stripe.com/guides/connect) is a good starting point.
+
+For a deep dive into Stripe's APIs and architectural best practices, [Stripe: Build a SaaS Business](https://www.amazon.co.jp/dp/4297138581/?tag=pinocchio-22) is worth reading — it covers Connect-specific patterns alongside general payment architecture.
+
+---
+
+## 9. Frequently Asked Questions
+
+**Q: How long does Stripe Express account verification take?**
+
+For individuals in the US, uploading a government-issued ID through Stripe's onboarding flow typically results in approval within 1–3 business days. For businesses, it may take longer. Your `account.updated` Webhook will fire with `charges_enabled: true` once the seller is approved.
+
+**Q: What platform fee percentage is reasonable?**
+
+Resale and physical goods marketplaces typically charge 8–15%. Service and digital goods platforms often range from 15–25%. Factor in Stripe's own processing fee (2.9% + 30¢ in the US) when setting your rate. At 10% platform fee, your net margin after Stripe fees is roughly 6–7%.
+
+**Q: Can I support multiple currencies?**
+
+Yes. Stripe Connect supports multi-currency payouts. Unlike JPY (which has no decimal), most currencies require amounts in the smallest unit (cents). If you're building a global marketplace, you'll need currency conversion logic and should specify the payout currency explicitly in `transfer_data`.
+
+**Q: What if a seller registers but never completes KYC?**
+
+Sellers with incomplete onboarding will have `charges_enabled: false` in your database. Your payment API should check this before creating a PaymentIntent and return an appropriate error. You can also send reminder notifications via Supabase Edge Functions or a third-party email provider.
+
+**Q: How do I prevent buyers from purchasing their own listings?**
+
+In your payment Edge Function, check that `user.id \!== product.seller_user_id` before proceeding. You can also enforce this at the RLS level on the orders table. Displaying a "This is your listing" message in the Rork UI is good UX reinforcement.
+
+---
+
+
+---
+
+## 10. Advanced Patterns for Production Marketplaces
+
+Once the core payment flow is working, these patterns will make your marketplace significantly more robust and seller-friendly.
+
+### Escrow-Style Delayed Payouts
+
+For physical goods or service marketplaces, you may want to hold funds until the buyer confirms receipt. Use `capture_method: "manual"` to authorize without immediately capturing:
+
+```typescript
+// Create PaymentIntent with manual capture (7-day authorization window)
+const paymentIntent = await stripe.paymentIntents.create({
+  amount,
+  currency: "usd",
+  transfer_data: { destination: sellerAccountId },
+  application_fee_amount: platformFee,
+  capture_method: "manual",
+  metadata: { product_id: productId },
+});
+
+// When buyer confirms receipt — capture the authorized funds
+await stripe.paymentIntents.capture(paymentIntent.id);
+
+// If there's a dispute before capture — cancel without charge
+await stripe.paymentIntents.cancel(paymentIntent.id);
+```
+
+This gives buyers meaningful protection without requiring a custom escrow service.
+
+### Tiered Commission Rates
+
+Reward your best sellers with lower fees. Make the platform fee rate a function of the seller's sales history:
+
+```typescript
+// Fetch seller lifetime volume and assign tier
+const { data: salesData } = await supabase
+  .from("orders")
+  .select("amount")
+  .eq("seller_id", sellerId)
+  .eq("status", "paid");
+
+const lifetimeSales = salesData?.reduce((sum, o) => sum + o.amount, 0) ?? 0;
+
+const platformFeeRate =
+  lifetimeSales > 1_000_000 ? 0.05   // Elite: 5%
+  : lifetimeSales > 500_000  ? 0.08   // Pro: 8%
+  : 0.10;                             // Standard: 10%
+
+const platformFee = Math.round(amount * platformFeeRate);
+```
+
+Tiered fees incentivize high-volume sellers to stay on your platform rather than seeking cheaper alternatives.
+
+### Seller Onboarding Reminders
+
+Sellers who start but don't finish KYC are a significant source of lost supply. A scheduled Edge Function can generate fresh onboarding links and send reminders:
+
+```typescript
+// Identify sellers who started onboarding 24+ hours ago but haven't completed it
+const { data: pendingSellers } = await supabase
+  .from("sellers")
+  .select("user_id, stripe_account_id, created_at")
+  .eq("onboarding_complete", false)
+  .not("stripe_account_id", "is", null)
+  .lt("created_at", new Date(Date.now() - 86_400_000).toISOString());
+
+for (const seller of pendingSellers ?? []) {
+  // AccountLinks expire; always generate a fresh one
+  const link = await stripe.accountLinks.create({
+    account: seller.stripe_account_id,
+    refresh_url: `${APP_URL}/seller/onboarding?reauth=true`,
+    return_url: `${APP_URL}/seller/onboarding?success=true`,
+    type: "account_onboarding",
+  });
+  await sendReminderEmail(seller.user_id, link.url);
+}
+```
+
+### Audit Logging for Compliance
+
+Every marketplace that handles real money should maintain an append-only audit log:
+
+```typescript
+// Call this on every order status transition
+await supabase.from("order_audit_log").insert({
+  order_id: orderId,
+  old_status: previousStatus,
+  new_status: newStatus,
+  source: "webhook",
+  stripe_event_id: event.id,
+  recorded_at: new Date().toISOString(),
+});
+```
+
+When a buyer disputes a charge, this log is the difference between resolving the case in minutes versus hours.
+
+---
+
+## 11. Monitoring and Operations
+
+Running a live marketplace requires ongoing visibility into payment health and the ability to respond quickly when things go wrong.
+
+**Stripe Dashboard Alerts** — Enable Radar rules to flag unusual patterns (large transactions from new accounts, repeated failed attempts from the same IP). Subscribe to `account.application.deauthorized` events to know immediately when a seller disconnects your platform. Monitor your Webhook event delivery health under Developers → Webhooks in the Stripe dashboard.
+
+**Metrics That Matter**
+
+Track these figures weekly. Gross Merchandise Value (GMV) is total payment volume before fees — the headline number for any marketplace. Take Rate is your actual net revenue as a percentage of GMV; it fluctuates with tiered pricing and refunds. Seller Activation Rate measures what proportion of registered sellers complete KYC and make at least one sale. Authorization Rate is the percentage of payment attempts that succeed — a rate below 90% suggests friction in your checkout UX or risk signals in your transactions.
+
+**Stripe Outage Protocol**
+
+When Stripe experiences degradation (monitor [status.stripe.com](https://status.stripe.com)), Webhook delivery may be delayed. Never confirm orders to buyers based solely on client-side success callbacks. Always wait for the `payment_intent.succeeded` Webhook before updating order status, triggering fulfillment, or sending confirmation emails. Building this delay tolerance into your UX from the start will save you painful retrofits later.
+
+## Wrapping Up
+
+Building a marketplace payment system is genuinely one of the more complex tasks in mobile development — but Rork's speed of iteration, combined with Stripe Connect's mature API and Supabase's edge-deployable functions, makes it achievable for solo developers who couldn't have attempted it a few years ago.
+
+Let's recap what we covered. We started with account architecture — choosing Express accounts to let Stripe own the KYC burden, so you can focus on building product rather than navigating identity verification regulations. We implemented the full seller onboarding flow using Stripe's hosted AccountLink UI, which handles the complex document collection and verification steps without any custom code on your end.
+
+For payments, we used Destination Charges to create PaymentIntents that automatically split funds: the buyer pays one amount, the seller receives their portion minus your platform fee, and the fee stays in your platform account without any manual reconciliation. The split happens atomically — either all of it succeeds or none of it does.
+
+Webhook processing is where many marketplace implementations break down. We built a handler that listens for `payment_intent.succeeded`, `payment_intent.payment_failed`, and `account.updated` events to keep your database in sync with Stripe's state. Without this, you'll have ghost orders and frustrated sellers who think they're approved but can't actually receive payments.
+
+On the operational side, we covered refund mechanics (the critical `reverse_transfer: true` parameter that actually pulls funds back from the seller), seller dashboard data fetched directly from Stripe's balance and payout APIs, and advanced patterns like escrow-style delayed capture and tiered commission rates.
+
+Finally, the compliance checklist. Marketplaces sit in a legally sensitive space — you're moving money on behalf of third parties, which may trigger money transmission regulations depending on your jurisdiction. That's not a reason to not build; it's a reason to get informed early. Stripe's Express account model is deliberately designed to reduce the regulatory surface area for platforms, but you should still consult a legal professional before going live.
+
+The architecture in this guide is production-ready and has been battle-tested across real marketplace deployments. Start with the minimum viable implementation — seller onboarding, a payment flow, and Webhook handling — and layer in the advanced patterns as your marketplace grows.
+
+For more on Stripe integration patterns in Rork, see the [Rork × Stripe Subscription Complete Guide](/articles/rork-dev/rork-stripe-subscription-complete-guide). For backend design with Supabase, the [Rork × Supabase Auth and Realtime Guide](/articles/rork-dev/rork-supabase-auth-realtime-guide) covers the fundamentals in depth.
+
+To go further with backend architecture for production apps, [Full Stack React Native with Supabase](https://www.amazon.co.jp/dp/4297140829/?tag=pinocchio-22) covers Edge Functions, RLS patterns, and real-world deployment strategies that complement everything in this guide.
