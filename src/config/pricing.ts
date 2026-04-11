@@ -19,13 +19,13 @@
 export const STRIPE_PRICE_IDS = {
   ja: {
     tip: "price_1TCQyPEGB5g6A54ofaB9e5to",
-    pro: "price_1TJLvmEGB5g6A54oSPEqrpEc",
-    premium: "price_1TJLvzEGB5g6A54o2ONFo0sC",
+    pro: "price_1TGSqUEGB5g6A54oxdnDOxOU",
+    premium: "price_1TCQyxEGB5g6A54oh8U6RHec",
   },
   en: {
     tip: "price_1TGTQMEGB5g6A54o6VMWCFNr",
-    pro: "price_1TJLvnEGB5g6A54oK3UQk2W8",
-    premium: "price_1TJLw0EGB5g6A54oQ5957zbq",
+    pro: "price_1TGTQMEGB5g6A54oI8AwS76H",
+    premium: "price_1TGTQNEGB5g6A54oGbFKBsq7",
   },
 } as const;
 
@@ -34,13 +34,13 @@ export const STRIPE_PRICE_IDS = {
 export const PRICES = {
   ja: {
     tip: "¥150",
-    pro: "¥580/月",
-    premium: "¥2,480",
+    pro: "¥280/月",
+    premium: "¥1,480",
   },
   en: {
     tip: "$1.50",
-    pro: "$5/mo",
-    premium: "$15",
+    pro: "$2/mo",
+    premium: "$10",
   },
 } as const;
 
@@ -50,20 +50,20 @@ export const PLAN_LABELS = {
   ja: {
     tipButton: "¥150 チップを送る",
     tipDescription: "もしお役に立ちましたら、チップ（¥150）で応援いただけると大変励みになります",
-    proButton: "Pro — ¥580/月",
-    proLong: "月額プラン — ¥580/月",
-    premiumButton: "Premium — ¥2,480（おすすめ）",
-    premiumLong: "永久アクセス — ¥2,480（おすすめ）",
-    proFeature: "¥580/月 または ¥2,480 の永久アクセス",
+    proButton: "Pro — ¥280/月",
+    proLong: "月額プラン — ¥280/月",
+    premiumButton: "Premium — ¥1,480（おすすめ）",
+    premiumLong: "永久アクセス — ¥1,480（おすすめ）",
+    proFeature: "¥280/月 または ¥1,480 の永久アクセス",
   },
   en: {
     tipButton: "Send $1.50 Tip",
     tipDescription: "If you found this helpful, a small tip ($1.50) would mean a lot to us",
-    proButton: "Pro — $5/mo",
-    proLong: "Monthly — $5/mo",
-    premiumButton: "Premium — $15 (Recommended)",
-    premiumLong: "Lifetime Access — $15 (Recommended)",
-    proFeature: "$5/mo or $15 for lifetime access",
+    proButton: "Pro — $2/mo",
+    proLong: "Monthly — $2/mo",
+    premiumButton: "Premium — $10 (Recommended)",
+    premiumLong: "Lifetime Access — $10 (Recommended)",
+    proFeature: "$2/mo or $10 for lifetime access",
   },
 } as const;
 
@@ -78,33 +78,33 @@ export const CAMPAIGN = {
 
   /** キャンペーン用 Stripe Price IDs (Premium のみ) */
   priceIds: {
-    ja: "price_1TCQyxEGB5g6A54oh8U6RHec",  // ¥1,480
-    en: "price_1TGTQNEGB5g6A54oGbFKBsq7",  // $10
+    ja: "price_1TFRyLEGB5g6A54oCoY0I3Dc",  // ¥980
+    en: "price_1TGTQNEGB5g6A54oCroqkbv3",  // $7
   },
 
   /** キャンペーン価格の表示テキスト */
   prices: {
-    ja: "¥1,480",
-    en: "$10",
+    ja: "¥980",
+    en: "$7",
   },
 
   /** 通常価格（取り消し線で表示） */
   originalPrices: {
-    ja: "¥2,480",
-    en: "$15",
+    ja: "¥1,480",
+    en: "$10",
   },
 
   /** ボタンラベル */
   labels: {
     ja: {
-      premiumButton: "Premium — ¥1,480（感謝価格）",
-      premiumLong: "永久アクセス — ¥1,480（感謝価格）",
-      proFeature: "¥580/月 または ¥1,480 の永久アクセス",
+      premiumButton: "Premium — ¥980（感謝価格）",
+      premiumLong: "永久アクセス — ¥980（感謝価格）",
+      proFeature: "¥280/月 または ¥980 の永久アクセス",
     },
     en: {
-      premiumButton: "Premium — $10 (Thank You Price)",
-      premiumLong: "Lifetime Access — $10 (Thank You Price)",
-      proFeature: "$5/mo or $10 for lifetime access",
+      premiumButton: "Premium — $7 (Thank You Price)",
+      premiumLong: "Lifetime Access — $7 (Thank You Price)",
+      proFeature: "$2/mo or $7 for lifetime access",
     },
   },
 } as const;
@@ -157,28 +157,28 @@ export function getCampaign(locale: string) {
 }
 
 // ── Single Article Purchase ──────────────────────────────────────
-// Stripe Price IDs for per-article purchases (¥250 JA / $1.75 EN)
+// Stripe Price IDs for per-article purchases (¥200 JA / $1.50 EN)
 export const ARTICLE_PRICE_IDS = {
-  ja: "price_1TJL6UEGB5g6A54oGAcqSCqR",  // ¥250
-  en: "price_1TJL6VEGB5g6A54o9xwzriXD",  // $1.75
+  ja: "price_1TLBHOEGB5g6A54oYhH0GXnq",  // ¥200
+  en: "price_1TLBHOEGB5g6A54ocKsUFynB",  // $1.50
 } as const;
 
 export const ARTICLE_PRICES = {
-  ja: "¥250",
-  en: "$1.75",
+  ja: "¥200",
+  en: "$1.50",
 } as const;
 
 export const ARTICLE_LABELS = {
   ja: {
     heading: "この記事を購入する",
-    button: "¥250 で続きを読む",
+    button: "¥200 で続きを読む",
     description: "この先の内容をすべてお読みいただけます。一度のご購入で、いつでも何度でもアクセスできます。このサイトは広告を掲載しておらず、皆さまのご支援がサーバー費用などの運営を支えています。",
     orSeparator: "または",
     memberNote: "メンバーシップなら全記事が読み放題",
   },
   en: {
     heading: "Unlock This Article",
-    button: "Continue reading — $1.75",
+    button: "Continue reading — $1.50",
     description: "Get full access to the rest of this article. Buy once, read anytime. This site is ad-free — your support goes directly toward keeping it running.",
     orSeparator: "or",
     memberNote: "Unlock all articles with Membership",
