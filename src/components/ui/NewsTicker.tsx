@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK MAX — 2026年2月リリース、ネイティブSwiftアプリビルダー。iPhone・iPad・Watch・TV・Vision Pro対応（4/12）",
-    "FUNDING — a16zからシリーズA $2.8M調達。743,000+月間訪問、85%成長率で急速拡大中（4/12）",
-    "NATIVE APPS — React Native + Expo基盤でiOS・Android同時デプロイ。Webビルダーとは異なるネイティブ品質（4/12）",
-    "MVP HOURS — 自然言語からプロダクション対応アプリまで数時間で完成。Lovable・Boltとは別のモバイル特化（4/12）",
-    "FREE TIER — 無料プラン: 月35クレジット（日5クレジット上限）。有料: $25/月で100クレジット・無制限（4/12）",
-    "MARKET POSITION — Newly AI・Fabricateとの差別化。唯一のトゥルーネイティブアプリビルダー（4/12）",
+    "FUNDING — Rorkが1500万ドルのシード資金調達を完了、Left Lane Capital主導でPeak XV・True Ventures・Goodwater参加（4/10）",
+    "GROWTH — Rork MaxがXで800万表示超のバイラル、発表2週間で年間売上が倍増（4月時点）",
+    "SWIFT — Rork MaxはClaude Code + Opus 4.6搭載、React NativeからネイティブSwiftUIアプリ構築へ進化（2月〜）",
+    "APP STORE — AIコーディングツールの台頭でApp Store新規アプリが前年比84%急増（Q1 2026）",
+    "NO XCODE — Rork MaxはクラウドMacフリートでネイティブコンパイル、Xcode不要でブラウザからApp Store公開まで完結",
+    "MARKET — Rorkがウェブトラフィックでモバイルアプリ向けAIプラットフォーム世界最大に成長（4月時点）",
   ],
   en: [
-    "RORK MAX — Launched February 2026, native Swift app builder. Support for iPhone, iPad, Watch, TV, Vision Pro (4/12)",
-    "FUNDING — Closes $2.8M Series A from a16z. 743,000+ monthly visits with 85% growth rate accelerating (4/12)",
-    "NATIVE APPS — React Native + Expo stack enables iOS and Android simultaneous deployment, true native quality (4/12)",
-    "MVP HOURS — Natural language to production-ready apps in hours. Distinct from web-only builders like Lovable and Bolt (4/12)",
-    "FREE TIER — Free plan: 35 credits/month with 5 daily cap. Paid: $25/month for 100 credits with no daily limits (4/12)",
-    "MARKET POSITION — Differentiated from Newly AI and Fabricate. Only true native app builder in its category (4/12)",
+    "FUNDING — Rork raises $15M Seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater, a16z Speedrun (4/10)",
+    "GROWTH — Rork Max went viral with 8M+ views on X, doubling annual revenue within two weeks of launch (Apr)",
+    "SWIFT — Rork Max powered by Claude Code + Opus 4.6, builds native SwiftUI apps instead of React Native (Feb+)",
+    "APP STORE — New app submissions surge 84% YoY in Q1 2026 as AI coding tools drive the Great App Renaissance",
+    "NO XCODE — Rork Max uses cloud Mac fleet for native compilation: build, preview, install via QR, and ship to App Store",
+    "MARKET — Rork becomes the largest AI platform for building mobile apps in the world by web traffic (Apr)",
   ],
 };
 
