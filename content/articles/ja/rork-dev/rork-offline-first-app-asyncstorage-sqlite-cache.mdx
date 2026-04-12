@@ -1,0 +1,256 @@
+---
+title: "Rork でオフライン対応アプリを構築する — AsyncStorage と SQLite を使ったキャッシュ戦略の実践"
+slug: "rork-offline-first-app-asyncstorage-sqlite-cache"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-04-12T15:00"
+author: "Rork Lab"
+description: "Rork で生成したアプリにオフライン機能を実装する方法を、データの永続化からバックグラウンド同期まで段階的に解説。ユーザー離脱を防ぐキャッシュ設計の実践パターンを紹介します。"
+tags: ["rork", "offline-first", "asyncstorage", "sqlite", "cache-strategy"]
+highlights:
+  - "AsyncStorage と SQLite の使い分け基準と実装上の落とし穴"
+  - "オフライン時のUI状態管理とオプティミスティック更新パターン"
+  - "バックグラウンド同期の実装とコンフリクト解決戦略"
+---
+
+地下鉄の中でアプリを開いたら真っ白な画面。ローディングスピナーが回り続けて、5秒後に「ネットワークエラー」——ユーザーはアプリを閉じ、二度と戻ってこない。App Store のレビューには星1つが並ぶ。
+
+Rork で作ったアプリは API から取得したデータを表示するものが多い。だが、ネットワーク接続が不安定な環境を考慮していないアプリは、どれだけ機能が優れていても実用に耐えない。オフライン対応は「あると嬉しい機能」ではなく、アプリの生存に関わる基盤設計だ。
+
+## AsyncStorage と SQLite: 何をどちらに入れるか
+
+React Native（Rork の出力するコードの基盤）でデータを永続化する方法は主に2つある。AsyncStorage と SQLite だ。両者の選択を誤ると、後から移行するのは非常に困難になる。
+
+**AsyncStorage を使うべきデータ:**
+- ユーザー設定（テーマ、通知のON/OFF、言語設定）
+- 認証トークン
+- 最後に表示した画面のID
+- 10KB以下の小さなJSON
+
+**SQLite を使うべきデータ:**
+- 記事一覧、商品カタログなどの構造化データ
+- 検索やフィルタリングが必要なデータ
+- 100件以上のリストデータ
+- リレーションを持つデータ
+
+判断基準はシンプルだ。「このデータを条件付きで取得したいか？」——YES なら SQLite、NO なら AsyncStorage。AsyncStorage は key-value ストアであり、「カテゴリがXで、日付がY以降のデータ」のような条件検索には向かない。
+
+Rork で生成されたアプリに AsyncStorage を導入する基本パターン:
+
+```typescript
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// キャッシュの書き込み（TTL付き）
+const cacheData = async (key: string, data: unknown, ttlMinutes: number = 60) => {
+  const cacheEntry = {
+    data,
+    timestamp: Date.now(),
+    ttl: ttlMinutes * 60 * 1000,
+  };
+  await AsyncStorage.setItem(key, JSON.stringify(cacheEntry));
+};
+
+// キャッシュの読み取り（期限切れチェック付き）
+const getCachedData = async <T>(key: string): Promise<T | null> => {
+  const raw = await AsyncStorage.getItem(key);
+  if (\!raw) return null;
+
+  const entry = JSON.parse(raw);
+  const isExpired = Date.now() - entry.timestamp > entry.ttl;
+
+  if (isExpired) {
+    await AsyncStorage.removeItem(key);
+    return null;
+  }
+
+  return entry.data as T;
+};
+```
+
+このパターンで注意すべきは TTL（Time To Live）の設定だ。短すぎるとオフライン時にデータが消えてしまい、長すぎると古い情報が表示され続ける。私の経験では、ニュースフィード系は30分、ユーザープロフィール系は24時間、マスターデータ系は7日間が良いバランスだ。
+
+## SQLite でリスト画面のオフライン対応を実現する
+
+100件以上のデータを扱うリスト画面では、SQLite が必要になる。Rork のプロジェクトに `expo-sqlite` を組み込む手順:
+
+```typescript
+import * as SQLite from 'expo-sqlite';
+
+const db = SQLite.openDatabaseSync('app_cache.db');
+
+// テーブル初期化（アプリ起動時に1回実行）
+const initDatabase = () => {
+  db.execSync(`
+    CREATE TABLE IF NOT EXISTS articles (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      category TEXT,
+      content TEXT,
+      cached_at INTEGER,
+      is_synced INTEGER DEFAULT 1
+    )
+  `);
+  db.execSync(`
+    CREATE INDEX IF NOT EXISTS idx_articles_category 
+    ON articles(category)
+  `);
+};
+
+// データの一括キャッシュ（API レスポンス → SQLite）
+const cacheArticles = (articles: Article[]) => {
+  const now = Date.now();
+  const stmt = db.prepareSync(
+    'INSERT OR REPLACE INTO articles (id, title, category, content, cached_at) VALUES (?, ?, ?, ?, ?)'
+  );
+
+  db.execSync('BEGIN TRANSACTION');
+  for (const article of articles) {
+    stmt.executeSync(article.id, article.title, article.category, article.content, now);
+  }
+  db.execSync('COMMIT');
+};
+
+// カテゴリ別取得（オフラインでも高速検索可能）
+const getArticlesByCategory = (category: string): Article[] => {
+  return db.getAllSync<Article>(
+    'SELECT * FROM articles WHERE category = ? ORDER BY cached_at DESC',
+    category
+  );
+};
+```
+
+`BEGIN TRANSACTION` と `COMMIT` で一括挿入をラップしているのは重要なポイントだ。100件のデータを個別にINSERTすると5秒かかるところが、トランザクションで囲むと0.1秒以下になる。Rork で生成したアプリのパフォーマンスに大きく影響する部分だ。
+
+## オフライン時の UI 状態管理
+
+データのキャッシュだけでは十分ではない。ユーザーに「今オフラインだけどデータは見られる」と伝える UI も必要だ:
+
+```typescript
+import NetInfo from '@react-native-community/netinfo';
+import { useEffect, useState, useCallback } from 'react';
+
+const useNetworkAwareData = <T>(
+  fetchFn: () => Promise<T>,
+  cacheKey: string
+) => {
+  const [data, setData] = useState<T | null>(null);
+  const [source, setSource] = useState<'network' | 'cache' | 'none'>('none');
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const loadData = useCallback(async () => {
+    const netState = await NetInfo.fetch();
+
+    if (netState.isConnected) {
+      try {
+        setIsRefreshing(true);
+        const freshData = await fetchFn();
+        setData(freshData);
+        setSource('network');
+        await cacheData(cacheKey, freshData);
+      } catch {
+        // ネットワーク接続はあるが API が落ちている場合
+        const cached = await getCachedData<T>(cacheKey);
+        if (cached) {
+          setData(cached);
+          setSource('cache');
+        }
+      } finally {
+        setIsRefreshing(false);
+      }
+    } else {
+      // オフライン: キャッシュから読み取り
+      const cached = await getCachedData<T>(cacheKey);
+      if (cached) {
+        setData(cached);
+        setSource('cache');
+      }
+    }
+  }, [fetchFn, cacheKey]);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  return { data, source, isRefreshing, refresh: loadData };
+};
+```
+
+`source` フィールドを返しているのがポイントだ。これを使って UI にインジケーターを表示できる:
+
+```tsx
+const ArticleList = () => {
+  const { data, source, isRefreshing, refresh } = useNetworkAwareData(
+    fetchArticles,
+    'articles_list'
+  );
+
+  return (
+    <View>
+      {source === 'cache' && (
+        <View style={styles.offlineBanner}>
+          <Text>オフラインモード — 最後に取得したデータを表示中</Text>
+        </View>
+      )}
+      <FlatList
+        data={data}
+        refreshing={isRefreshing}
+        onRefresh={refresh}
+        renderItem={({ item }) => <ArticleCard article={item} />}
+      />
+    </View>
+  );
+};
+```
+
+## オプティミスティック更新: オフラインでの書き込み
+
+読み取りだけでなく、書き込み操作（いいね、ブックマーク、コメントなど）もオフラインで対応したい。ここで使うのがオプティミスティック更新パターンだ:
+
+```typescript
+const usePendingActions = () => {
+  const addPendingAction = async (action: PendingAction) => {
+    const pending = await getCachedData<PendingAction[]>('pending_actions') || [];
+    pending.push({ ...action, createdAt: Date.now() });
+    await cacheData('pending_actions', pending, 7 * 24 * 60); // 7日間保持
+  };
+
+  const syncPendingActions = async () => {
+    const pending = await getCachedData<PendingAction[]>('pending_actions') || [];
+    const failed: PendingAction[] = [];
+
+    for (const action of pending) {
+      try {
+        await executeAction(action);
+      } catch {
+        failed.push(action);
+      }
+    }
+
+    await cacheData('pending_actions', failed, 7 * 24 * 60);
+    return { synced: pending.length - failed.length, failed: failed.length };
+  };
+
+  return { addPendingAction, syncPendingActions };
+};
+```
+
+UI側では、ユーザーの操作を即座に反映し、バックグラウンドで同期する:
+
+```typescript
+const handleLike = async (articleId: string) => {
+  // 1. UI を即座に更新（楽観的）
+  setLiked(true);
+  setLikeCount(prev => prev + 1);
+
+  // 2. ペンディングアクションに追加
+  await addPendingAction({
+    type: 'like',
+    payload: { articleId },
+  });
+};
+```
+
+ネットワークが復帰したとき、`syncPendingActions` を実行すれば溜まった操作がサーバーに送信される。`NetInfo` のリスナーでネットワーク復帰を検知して自動同期するのが理想的だ。
+
+## 次のステップ
+
+まずは最もよく使われる画面のデータを AsyncStorage でキャッシュすることから始めてほしい。それだけで「地下鉄で開いたら真っ白」問題は解消する。書き込みのオフライン対応は、読み取りキャッシュが安定してから段階的に導入すれば十分だ。
