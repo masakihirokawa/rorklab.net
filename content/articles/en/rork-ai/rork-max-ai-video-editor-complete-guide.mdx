@@ -1,0 +1,867 @@
+---
+title: "Building an AI-Powered Video Editor App with Rork Max: Auto Subtitles, Highlight Detection, and Stripe Monetization"
+slug: "rork-max-ai-video-editor-complete-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-14T05:15"
+updated: "2026-04-14T05:15"
+author: "Rork Lab"
+description: "A complete guide to building an AI video editing app with Rork Max. Covers Whisper API subtitle generation, Gemini Flash highlight detection, Supabase Storage chunked uploads, and Stripe credit-based monetization with working code examples."
+tags: ["Rork Max", "AI video editor", "Whisper API", "Supabase", "Stripe", "video app", "subtitle generation"]
+highlights:
+  - "Get a working pipeline that combines Whisper API and Gemini Flash to automatically generate subtitle-enhanced highlight clips from any video"
+  - "Learn the production-grade architecture for chunked video uploads to Supabase Storage and FFmpeg processing via Edge Functions"
+  - "Apply a credit-based Stripe monetization model that charges per AI feature used — and scale it to meaningful revenue"
+---
+
+Short-form video has rewritten the rules of content consumption, and the demand for apps that automatically transform raw footage into polished clips is accelerating fast. But for indie developers, the technical challenges pile up quickly: how do you process video server-side without breaking the bank, how do you stitch AI transcription together with actual video editing, and how do you charge users in a way that aligns with the value you deliver?
+
+This guide walks through a complete implementation — from chunked video upload through AI subtitle generation, highlight detection, and Stripe credit billing — using Rork Max as the mobile frontend. Every code block is designed to run in production, not just in a sandbox.
+
+## Why AI Video Editing Is a Real Opportunity for Solo Developers
+
+CapCut and VLLO dominate the general-purpose video editing market, but that dominance creates a clear opening for niche AI tools. Apps that automatically extract highlights from meeting recordings, generate multilingual subtitles for travel content, or split cooking videos by cooking step — these specific use cases move slowly at large companies and are exactly where an indie developer can move fast and establish real user loyalty.
+
+The critical architectural decision is where video processing happens. Attempting to run FFmpeg inside a React Native app is a trap: the binary size explodes, App Store review gets complicated, and device thermal limits cause failures on long videos. The only realistic approach for a production Rork Max app is to handle all heavy processing server-side, keeping the mobile client focused on upload, status display, and result presentation.
+
+Rork Max makes this split natural. The generated SwiftUI frontend handles the user-facing experience, while Supabase Storage, Edge Functions, and external AI APIs handle the computation. This guide uses Supabase because Storage, Database, Edge Functions, and Realtime are all integrated — meaning you get real-time processing completion notifications without any additional infrastructure.
+
+## Architecture Overview — Data Flow and Technology Choices
+
+Here is how the full system works end to end:
+
+1. The user selects a video in the Rork Max app using expo-image-picker
+2. The app uploads the video to Supabase Storage in 5MB chunks with progress tracking
+3. After upload, the app calls a Supabase Edge Function with the storage path and processing options
+4. The Edge Function calls OpenAI Whisper API for transcription and Google Gemini 2.5 Flash for highlight scene analysis
+5. Results (VTT subtitles, highlight timestamps) are saved to the Supabase database
+6. The app receives a real-time completion notification via Supabase Realtime (postgres_changes)
+7. Credits are deducted from the user's balance atomically via a Postgres function
+
+The technology stack:
+
+- **Mobile frontend (Rork Max)**: expo-image-picker, expo-av, expo-file-system, @supabase/supabase-js
+- **Storage**: Supabase Storage (raw video, processed clips)
+- **Database**: Supabase (job metadata, subtitle data, user credits)
+- **AI**: OpenAI Whisper API (transcription), Google Gemini 2.5 Flash (scene analysis)
+- **Video processing**: Supabase Edge Function (Deno runtime) + FFmpeg WebAssembly
+- **Payments**: Stripe (credit packs)
+- **Real-time**: Supabase Realtime (postgres_changes subscription)
+
+## Implementing Chunked Video Upload with Progress Tracking
+
+Videos range from tens of megabytes to several gigabytes. A single-request upload fails too often to be viable in production. The implementation below splits the file into 5MB chunks and uploads them sequentially with progress callbacks.
+
+```typescript
+// services/videoUpload.ts
+import * as FileSystem from 'expo-file-system';
+import { supabase } from './supabaseClient';
+
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+
+export async function uploadVideoWithProgress(
+  videoUri: string,
+  fileName: string,
+  onProgress: (progress: number) => void
+): Promise<{ path: string; error: Error | null }> {
+  try {
+    const fileInfo = await FileSystem.getInfoAsync(videoUri);
+    if (\!fileInfo.exists) {
+      throw new Error('Video file not found at the provided URI');
+    }
+
+    // Android requires explicit type assertion for size
+    const fileSizeBytes = (fileInfo as FileSystem.FileInfo & { size: number }).size;
+    const totalChunks = Math.ceil(fileSizeBytes / CHUNK_SIZE);
+
+    // Sanitize filename for storage path
+    const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const storagePath = `videos/${Date.now()}_${sanitizedName}`;
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, fileSizeBytes);
+
+      const chunk = await FileSystem.readAsStringAsync(videoUri, {
+        encoding: FileSystem.EncodingType.Base64,
+        position: start,
+        length: end - start,
+      });
+
+      const chunkBuffer = Buffer.from(chunk, 'base64');
+
+      const { error: uploadError } = await supabase.storage
+        .from('video-uploads')
+        .upload(storagePath, chunkBuffer, {
+          contentType: 'video/mp4',
+          upsert: chunkIndex > 0, // overwrite after first chunk
+          duplex: 'half',
+        });
+
+      // Supabase returns "object already exists" for subsequent chunks — that is expected
+      if (uploadError && uploadError.message \!== 'The object already exists') {
+        throw new Error(
+          `Chunk ${chunkIndex + 1}/${totalChunks} failed: ${uploadError.message}`
+        );
+      }
+
+      const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+      onProgress(progress);
+    }
+
+    return { path: storagePath, error: null };
+
+  } catch (err) {
+    const error = err instanceof Error
+      ? err
+      : new Error('An unexpected error occurred during upload');
+    return { path: '', error };
+  }
+}
+```
+
+The Rork Max UI component that ties this together:
+
+```typescript
+// components/VideoUploader.tsx
+import React, { useState } from 'react';
+import {
+  View, Text, TouchableOpacity, ActivityIndicator, StyleSheet
+} from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import { uploadVideoWithProgress } from '../services/videoUpload';
+import { triggerVideoProcessing } from '../services/videoProcessing';
+import { validateVideo } from '../utils/videoValidation';
+
+interface VideoUploaderProps {
+  onJobStarted: (jobId: string) => void;
+}
+
+export function VideoUploader({ onJobStarted }: VideoUploaderProps) {
+  const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const pickAndUpload = async () => {
+    setError(null);
+
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (\!permission.granted) {
+      setError('Permission to access videos is required. Please enable it in Settings.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+      quality: 1,
+      videoMaxDuration: 1800, // 30 minutes maximum
+      copyToCacheDirectory: true, // required to avoid ph:// URIs on iOS
+    });
+
+    if (result.canceled || \!result.assets?.[0]) return;
+
+    const asset = result.assets[0];
+    const validationError = validateVideo(asset);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+
+    if (\!asset.uri || \!asset.fileName) {
+      setError('Could not read video file. Please try a different video.');
+      return;
+    }
+
+    setUploading(true);
+    setStatusMessage('Uploading video...');
+
+    const { path, error: uploadError } = await uploadVideoWithProgress(
+      asset.uri,
+      asset.fileName,
+      (p) => {
+        setProgress(p);
+        setStatusMessage(`Uploading... ${p}%`);
+      }
+    );
+
+    if (uploadError) {
+      setError(`Upload failed: ${uploadError.message}`);
+      setUploading(false);
+      return;
+    }
+
+    setStatusMessage('Starting AI processing...');
+
+    const { jobId, error: processingError } = await triggerVideoProcessing(path, {
+      generateSubtitles: true,
+      detectHighlights: true,
+      language: 'en',
+    });
+
+    if (processingError) {
+      setError('Failed to start AI processing. Please try again.');
+      setUploading(false);
+      return;
+    }
+
+    onJobStarted(jobId);
+    setStatusMessage('Processing in progress — you\'ll be notified when done');
+    setUploading(false);
+    setProgress(0);
+  };
+
+  return (
+    <View style={styles.container}>
+      <TouchableOpacity
+        onPress={pickAndUpload}
+        disabled={uploading}
+        style={[styles.button, uploading && styles.buttonDisabled]}
+        accessibilityRole="button"
+        accessibilityLabel="Select video and start AI editing"
+      >
+        {uploading
+          ? <ActivityIndicator color="#fff" />
+          : <Text style={styles.buttonText}>Select Video — Start AI Editing</Text>
+        }
+      </TouchableOpacity>
+
+      {statusMessage ? (
+        <Text style={styles.statusText}>{statusMessage}</Text>
+      ) : null}
+
+      {progress > 0 && uploading ? (
+        <View style={styles.progressBar}>
+          <View style={[styles.progressFill, { width: `${progress}%` }]} />
+        </View>
+      ) : null}
+
+      {error ? (
+        <Text style={styles.errorText}>{error}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { padding: 20 },
+  button: {
+    backgroundColor: '#1a1a2e',
+    padding: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  buttonDisabled: { backgroundColor: '#999' },
+  buttonText: { color: '#fff', fontWeight: '700', fontSize: 16 },
+  statusText: { marginTop: 12, color: '#555', textAlign: 'center' },
+  progressBar: {
+    marginTop: 8, height: 6, backgroundColor: '#eee',
+    borderRadius: 3, overflow: 'hidden',
+  },
+  progressFill: { height: '100%', backgroundColor: '#3498db' },
+  errorText: { marginTop: 12, color: '#e74c3c', textAlign: 'center' },
+});
+```
+
+One important note about iOS video URIs: `expo-image-picker` can sometimes return a `ph://` scheme URI rather than a local file URI, especially on older Expo SDK versions. The `copyToCacheDirectory: true` option forces a local copy, which is required for `FileSystem.readAsStringAsync` to work correctly.
+
+## The Supabase Edge Function — Whisper and Gemini in One Pipeline
+
+The Edge Function is the heart of the AI processing pipeline. It calls Whisper for transcription and Gemini Flash for highlight detection, then saves results to the database. The Supabase Realtime subscription on the client side will automatically pick up the database update and notify the app.
+
+```typescript
+// supabase/functions/process-video/index.ts
+import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY') ?? '';
+const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') ?? '';
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? '';
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+
+interface Highlight {
+  start: number;
+  end: number;
+  reason: string;
+}
+
+interface ProcessingJob {
+  jobId: string;
+  storagePath: string;
+  userId: string;
+  options: {
+    generateSubtitles: boolean;
+    detectHighlights: boolean;
+    language: string;
+  };
+}
+
+serve(async (req: Request) => {
+  if (req.method \!== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  let job: ProcessingJob;
+  try {
+    job = await req.json() as ProcessingJob;
+  } catch {
+    return new Response(JSON.stringify({ error: 'Invalid request body' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  // Mark job as in-progress immediately
+  await supabase
+    .from('processing_jobs')
+    .update({ status: 'processing', started_at: new Date().toISOString() })
+    .eq('id', job.jobId);
+
+  try {
+    // Generate a signed URL with 2-hour validity to handle long processing times
+    const { data: signedUrlData, error: urlError } = await supabase.storage
+      .from('video-uploads')
+      .createSignedUrl(job.storagePath, 7200);
+
+    if (urlError || \!signedUrlData) {
+      throw new Error(`Failed to generate storage URL: ${urlError?.message}`);
+    }
+
+    // Step 1: Whisper API transcription
+    let transcriptionVtt: string | null = null;
+    if (job.options.generateSubtitles) {
+      const videoResponse = await fetch(signedUrlData.signedUrl);
+      if (\!videoResponse.ok) {
+        throw new Error(`Failed to fetch video: HTTP ${videoResponse.status}`);
+      }
+      const videoBlob = await videoResponse.blob();
+
+      if (videoBlob.size > 25 * 1024 * 1024) {
+        // File too large — log and skip subtitles rather than failing the whole job
+        console.warn(`File size ${videoBlob.size} bytes exceeds Whisper 25MB limit — skipping subtitles`);
+      } else {
+        const formData = new FormData();
+        formData.append('file', videoBlob, 'audio.mp4');
+        formData.append('model', 'whisper-1');
+        formData.append('language', job.options.language || 'en');
+        formData.append('response_format', 'vtt'); // VTT includes timestamps
+
+        const whisperResponse = await fetch(
+          'https://api.openai.com/v1/audio/transcriptions',
+          {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+            body: formData,
+          }
+        );
+
+        if (\!whisperResponse.ok) {
+          const errText = await whisperResponse.text();
+          throw new Error(`Whisper API error (${whisperResponse.status}): ${errText}`);
+        }
+
+        transcriptionVtt = await whisperResponse.text();
+      }
+    }
+
+    // Step 2: Gemini Flash highlight detection
+    let highlights: Highlight[] = [];
+    if (job.options.detectHighlights) {
+      const geminiBody = {
+        contents: [{
+          parts: [
+            {
+              file_data: {
+                mime_type: 'video/mp4',
+                file_uri: signedUrlData.signedUrl,
+              },
+            },
+            {
+              text: `Analyze this video and identify up to 5 highlight moments.
+Select moments that are emotionally engaging, action-packed, or contain important statements.
+Aim for 20-40% of the total video length to be included in highlights.
+Respond ONLY with this exact JSON format (no other text):
+{"highlights":[{"start_sec":number,"end_sec":number,"reason":"brief explanation"}]}`,
+            },
+          ],
+        }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          maxOutputTokens: 1024,
+          temperature: 0.3,
+        },
+      };
+
+      const geminiResponse = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(geminiBody),
+        }
+      );
+
+      if (geminiResponse.ok) {
+        const geminiData = await geminiResponse.json();
+        const jsonText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
+        try {
+          const parsed = JSON.parse(jsonText);
+          highlights = (parsed.highlights ?? []).map((h: {
+            start_sec: number;
+            end_sec: number;
+            reason: string;
+          }) => ({
+            start: h.start_sec,
+            end: h.end_sec,
+            reason: h.reason,
+          }));
+        } catch {
+          // JSON parse failure — continue without highlights rather than failing the job
+          console.warn('Failed to parse Gemini response JSON');
+        }
+      } else {
+        console.warn(`Gemini API returned ${geminiResponse.status} — proceeding without highlights`);
+      }
+    }
+
+    // Save results — Supabase Realtime will push this update to the client
+    await supabase
+      .from('processing_jobs')
+      .update({
+        status: 'completed',
+        completed_at: new Date().toISOString(),
+        result: {
+          transcription_vtt: transcriptionVtt,
+          highlights,
+          video_url: signedUrlData.signedUrl,
+        },
+      })
+      .eq('id', job.jobId);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        jobId: job.jobId,
+        hasTranscription: \!\!transcriptionVtt,
+        highlightCount: highlights.length,
+      }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+    console.error('Edge Function error:', errorMessage);
+
+    await supabase
+      .from('processing_jobs')
+      .update({
+        status: 'failed',
+        error_message: errorMessage,
+        completed_at: new Date().toISOString(),
+      })
+      .eq('id', job.jobId);
+
+    return new Response(JSON.stringify({ error: errorMessage }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+});
+```
+
+## Receiving Completion Notifications with Supabase Realtime
+
+The client-side hook subscribes to postgres_changes on the processing_jobs table. When the Edge Function updates the row to `status: 'completed'`, the subscription fires and the app can display results immediately.
+
+```typescript
+// hooks/useProcessingStatus.ts
+import { useEffect, useState, useCallback } from 'react';
+import { supabase } from '../services/supabaseClient';
+
+export type JobStatus = 'pending' | 'processing' | 'completed' | 'failed';
+
+interface Highlight {
+  start: number;
+  end: number;
+  reason: string;
+}
+
+interface ProcessingResult {
+  transcription_vtt: string | null;
+  highlights: Highlight[];
+  video_url: string;
+}
+
+export function useProcessingStatus(jobId: string | null) {
+  const [status, setStatus] = useState<JobStatus>('pending');
+  const [result, setResult] = useState<ProcessingResult | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const fetchCurrentStatus = useCallback(async () => {
+    if (\!jobId) return;
+    const { data } = await supabase
+      .from('processing_jobs')
+      .select('status, result, error_message')
+      .eq('id', jobId)
+      .single();
+
+    if (data) {
+      setStatus(data.status as JobStatus);
+      setResult(data.result as ProcessingResult | null);
+      setErrorMessage(data.error_message as string | null);
+    }
+  }, [jobId]);
+
+  useEffect(() => {
+    if (\!jobId) return;
+
+    fetchCurrentStatus();
+
+    const channel = supabase
+      .channel(`processing-job-${jobId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'processing_jobs',
+          filter: `id=eq.${jobId}`,
+        },
+        (payload) => {
+          const updated = payload.new as {
+            status: JobStatus;
+            result: ProcessingResult | null;
+            error_message: string | null;
+          };
+          setStatus(updated.status);
+          setResult(updated.result);
+          setErrorMessage(updated.error_message);
+        }
+      )
+      .subscribe((subStatus) => {
+        if (subStatus === 'SUBSCRIPTION_ERROR') {
+          console.warn('Realtime subscription failed — falling back to polling');
+        }
+      });
+
+    // Polling fallback for when the app is backgrounded or Realtime drops
+    const pollInterval = setInterval(fetchCurrentStatus, 30_000);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(pollInterval);
+    };
+  }, [jobId, fetchCurrentStatus]);
+
+  return { status, result, errorMessage };
+}
+```
+
+## Credit-Based Stripe Monetization
+
+Charging per AI feature consumed — rather than a flat subscription — makes sense for video editing because usage varies enormously between users. Someone who edits one video a week has very different value from someone processing dozens per day.
+
+The credit cost constants give you flexibility to adjust pricing without touching code:
+
+```typescript
+// constants/creditCosts.ts
+export const CREDIT_COSTS = {
+  SUBTITLE_GENERATION_PER_MIN: 2, // 2 credits per minute of video
+  HIGHLIGHT_DETECTION: 5,          // 5 credits flat
+  EXPORT_HD: 3,                    // 3 credits for HD export
+  EXPORT_4K: 8,                    // 8 credits for 4K export
+} as const;
+
+export const CREDIT_PACKAGES = [
+  { credits: 30,  priceUsd: 2.99, priceId: 'price_XXXXXXXXXX_30'  },
+  { credits: 100, priceUsd: 7.99, priceId: 'price_XXXXXXXXXX_100' },
+  { credits: 300, priceUsd: 19.99, priceId: 'price_XXXXXXXXXX_300' },
+] as const;
+```
+
+Credit deduction must be atomic to prevent race conditions. Use a Postgres function with row-level locking:
+
+```sql
+-- supabase/migrations/001_credit_deduct_function.sql
+CREATE OR REPLACE FUNCTION deduct_credits(
+  p_user_id   UUID,
+  p_amount    INTEGER,
+  p_description TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_current_credits INTEGER;
+BEGIN
+  -- Lock the row to prevent concurrent deductions
+  SELECT credits
+  INTO v_current_credits
+  FROM user_credits
+  WHERE user_id = p_user_id
+  FOR UPDATE;
+
+  IF v_current_credits IS NULL OR v_current_credits < p_amount THEN
+    RETURN FALSE; -- insufficient credits
+  END IF;
+
+  UPDATE user_credits
+  SET credits    = credits - p_amount,
+      updated_at = NOW()
+  WHERE user_id = p_user_id;
+
+  INSERT INTO credit_transactions (user_id, amount, description, created_at)
+  VALUES (p_user_id, -p_amount, p_description, NOW());
+
+  RETURN TRUE;
+END;
+$$;
+```
+
+Call this function from within the Edge Function before starting AI processing. If it returns false, return an error to the client immediately — no API calls are made, so no costs are incurred.
+
+For the full Stripe Checkout integration, [Rork Stripe Subscription Complete Guide](/en/articles/rork-dev/rork-stripe-subscription-complete-guide) covers the checkout session creation, webhook handling, and credit top-up flow in detail.
+
+## Five Production Pitfalls and How to Avoid Them
+
+### 1. Video orientation rotates after upload
+
+iOS records video with rotation metadata rather than actually rotating the pixels. FFmpeg processes the raw pixel data and ignores the metadata by default when filters are applied, causing the output to appear sideways or upside-down.
+
+The correct fix is to apply an actual pixel-level transpose filter (`-vf "transpose=1"` for 90° clockwise) and then zero out the rotation metadata (`-metadata:s:v:0 rotate=0`). Modifying only the metadata is not reliable — some players honor it, others ignore it, and web playback is particularly inconsistent.
+
+### 2. Whisper API's 25MB file size limit
+
+Large videos regularly exceed Whisper's 25MB limit. The solution is to extract only the audio track before sending to Whisper. A 300MB video file typically reduces to under 15MB as MP3 audio (`-vn -acodec libmp3lame -q:a 7` in FFmpeg). For very long videos, split the audio into 10-minute segments, transcribe each, and concatenate the VTT outputs.
+
+### 3. Supabase Realtime WebSocket timeout
+
+For videos requiring more than 10 minutes of processing time, the WebSocket connection will time out and the client won't receive the completion notification. The polling fallback in `useProcessingStatus` covers this for foreground sessions, but when the app is backgrounded on iOS, polling stops too. Add a call to the Expo Push Notifications API at the end of the Edge Function to send a push notification when processing completes. This is the only reliable path for long-running jobs.
+
+### 4. Signed URL expiry during processing
+
+The Edge Function fetches the video via a signed URL. If processing takes longer than the URL's validity period, Gemini's request to that URL fails with a 403. The 7200-second (2-hour) expiry in the code above handles most cases, but for very large files it's safer to re-generate the URL immediately before passing it to each AI API, rather than reusing the same URL for both Whisper and Gemini calls.
+
+### 5. Gemini context window overflow for long videos
+
+Gemini 2.5 Flash can analyze videos up to roughly 1 hour in length. Beyond that, the request will fail with a context window error. Enforce limits in the client before upload:
+
+```typescript
+// utils/videoValidation.ts
+import { ImagePicker } from 'expo-image-picker';
+
+const MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024; // 2GB
+
+export function validateVideo(asset: ImagePicker.ImagePickerAsset): string | null {
+  if (asset.duration && asset.duration > MAX_DURATION_MS) {
+    return `Video too long (max ${MAX_DURATION_MS / 60_000} minutes). Please trim it first.`;
+  }
+  if (asset.fileSize && asset.fileSize > MAX_FILE_SIZE_BYTES) {
+    return `File too large (max 2GB).`;
+  }
+  return null;
+}
+```
+
+## Parsing VTT Subtitles for the In-App Player
+
+`expo-av` does not natively render VTT subtitle overlays. You'll need to parse the VTT string and display subtitle text manually based on the player's current position.
+
+```typescript
+// utils/vttParser.ts
+export interface Cue {
+  startTime: number; // seconds
+  endTime: number;
+  text: string;
+}
+
+export function parseVTT(vttString: string): Cue[] {
+  const cues: Cue[] = [];
+  const blocks = vttString.split('\n\n').filter(Boolean);
+
+  for (const block of blocks) {
+    const lines = block.trim().split('\n');
+    const timecodeIndex = lines.findIndex(l => l.includes('-->'));
+    if (timecodeIndex === -1) continue;
+
+    const [startStr, endStr] = lines[timecodeIndex]
+      .split('-->')
+      .map(s => s.trim());
+
+    const parseTime = (t: string): number => {
+      const parts = t.replace(',', '.').split(':');
+      const seconds = parseFloat(parts[parts.length - 1]);
+      const minutes = parseInt(parts[parts.length - 2] ?? '0', 10);
+      const hours = parseInt(parts[parts.length - 3] ?? '0', 10);
+      return hours * 3600 + minutes * 60 + seconds;
+    };
+
+    const text = lines.slice(timecodeIndex + 1).join('\n').trim();
+    if (\!text) continue;
+
+    cues.push({
+      startTime: parseTime(startStr),
+      endTime: parseTime(endStr),
+      text,
+    });
+  }
+
+  return cues;
+}
+
+export function getCurrentCue(cues: Cue[], positionSeconds: number): Cue | null {
+  return cues.find(
+    c => positionSeconds >= c.startTime && positionSeconds <= c.endTime
+  ) ?? null;
+}
+```
+
+Use this in your video player component by polling the playback position every 100ms via `expo-av`'s `onPlaybackStatusUpdate` callback, then looking up the matching cue.
+
+## Pricing the Credits — Working Backwards from API Costs
+
+Credit pricing needs to account for API costs, or you'll run deficits on heavy users. Here's the math:
+
+Whisper costs $0.006 per minute of audio. If you charge 2 credits per minute and sell 100 credits for $7.99, each credit is worth approximately $0.08. That is 13x the API cost — a healthy margin that covers infrastructure, Supabase, and the cost of free credits given to new users.
+
+Gemini 2.5 Flash pricing for video input is approximately $0.01–$0.05 for a 5-minute video at current rates. At 5 credits ($0.40) per highlight detection job, the margin is solid even accounting for occasional model updates that shift pricing.
+
+Build a monthly cost report into your admin tooling from day one. As user volume grows, aggregate API costs will surface patterns you can't see from individual transactions — things like certain video lengths consistently consuming more tokens than expected, or specific users running the AI pipeline at unusual frequency.
+
+For deeper monetization strategy beyond credit mechanics, [Rork AI App Monetization Complete Guide](/en/articles/rork-ai/rork-ai-app-monetization-complete-guide) covers paywall design, pricing psychology, and retention-driven upsell patterns in detail.
+
+## What to Build Next
+
+The pipeline built in this guide — chunked upload, Whisper transcription, Gemini highlight detection, Realtime notification, Stripe credit billing — is a working foundation. The natural extensions from here are:
+
+**Subtitle editing UI**: Whisper's accuracy is high but not perfect, especially on proper nouns and accented speech. Parse the VTT into editable text fields indexed by timestamp, let users correct errors, and persist the corrected VTT back to Supabase. This single feature meaningfully reduces churn because it shows users you respect their time enough to give them control over the output.
+
+**Multi-language subtitle export**: Once you have the Whisper VTT, add a translation step using the OpenAI chat completions endpoint or Google Translate API. Charge 1 credit per language per minute of video. Users who create content for international audiences will use this repeatedly.
+
+**Thumbnail generation**: Use Gemini's vision capabilities to analyze the highlight frames and identify the single best frame for a thumbnail — high visual clarity, expressive face or action, minimal motion blur. Offer this as a 2-credit add-on to every processed video. It is fast, cheap to run, and extremely useful for anyone posting to YouTube or App Store previews.
+
+Start by getting the local Supabase development environment running (`supabase start`), deploying the Edge Function with `supabase functions serve process-video`, and testing the full pipeline with a short test video before optimizing for edge cases. Once the core path works end-to-end, each additional AI feature becomes a matter of adding another API call to the pipeline and a new entry in the credit cost constants.
+
+## Database Schema — Setting Up the Foundation
+
+The Supabase schema needs three tables to support the full pipeline. Here is the migration that creates them:
+
+```sql
+-- supabase/migrations/000_initial_schema.sql
+
+-- User credits balance
+CREATE TABLE user_credits (
+  user_id     UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  credits     INTEGER NOT NULL DEFAULT 0 CHECK (credits >= 0),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Individual credit transactions (purchases + deductions)
+CREATE TABLE credit_transactions (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  amount      INTEGER NOT NULL, -- positive = purchase, negative = consumption
+  description TEXT NOT NULL,
+  stripe_payment_intent_id TEXT, -- set for purchase transactions
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Video processing jobs
+CREATE TABLE processing_jobs (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  storage_path TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+  options      JSONB NOT NULL DEFAULT '{}',
+  result       JSONB,
+  error_message TEXT,
+  started_at   TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Row Level Security — users can only see their own jobs
+ALTER TABLE user_credits ENABLE ROW LEVEL SECURITY;
+ALTER TABLE credit_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE processing_jobs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "users_own_credits" ON user_credits
+  FOR ALL USING (auth.uid() = user_id);
+
+CREATE POLICY "users_own_transactions" ON credit_transactions
+  FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "users_own_jobs" ON processing_jobs
+  FOR ALL USING (auth.uid() = user_id);
+
+-- Grant Edge Function service role access (bypasses RLS)
+GRANT ALL ON user_credits TO service_role;
+GRANT ALL ON credit_transactions TO service_role;
+GRANT ALL ON processing_jobs TO service_role;
+
+-- Enable Realtime on processing_jobs for client subscriptions
+ALTER PUBLICATION supabase_realtime ADD TABLE processing_jobs;
+```
+
+The `CHECK (credits >= 0)` constraint at the database level is a final safety net. Even if the `deduct_credits` function has a bug, the database will refuse to write a negative balance. Defense in depth matters when money is involved.
+
+The `ALTER PUBLICATION supabase_realtime ADD TABLE processing_jobs` line is easy to overlook and causes mysterious failures where the Realtime subscription never fires even though the Edge Function is updating the row correctly. Add this line to your migration before deploying to production.
+
+Row Level Security policies here use `auth.uid()` which resolves to the JWT sub claim from Supabase Auth. The Edge Function uses the service role key, which bypasses RLS entirely — this is intentional, as the Edge Function needs to update any user's job record regardless of which user triggered it.
+
+## Deploying and Testing the Edge Function Locally
+
+Supabase's local development stack mirrors production closely enough that you can test the full pipeline without deploying anything to the cloud. The workflow:
+
+```bash
+# Start all Supabase services locally (Postgres, Storage, Edge Functions, Realtime)
+supabase start
+
+# Run the database migration
+supabase db reset
+
+# Serve the Edge Function with hot reload
+supabase functions serve process-video --env-file .env.local
+
+# In .env.local:
+# OPENAI_API_KEY=sk-...
+# GEMINI_API_KEY=AIza...
+# SUPABASE_URL=http://localhost:54321
+# SUPABASE_SERVICE_ROLE_KEY=eyJ...  (from supabase status output)
+```
+
+With the function running locally, you can test it directly with curl before wiring up the mobile app:
+
+```bash
+curl -X POST http://localhost:54321/functions/v1/process-video \
+  -H "Authorization: Bearer YOUR_SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jobId": "test-job-id",
+    "storagePath": "videos/test.mp4",
+    "userId": "test-user-id",
+    "options": {
+      "generateSubtitles": true,
+      "detectHighlights": true,
+      "language": "en"
+    }
+  }'
+```
+
+This reveals integration errors early — wrong API key format, CORS misconfigurations, storage bucket permissions — before they show up in the mobile app where debugging is slower.
+
+Once local testing passes, deploy with:
+
+```bash
+supabase functions deploy process-video
+supabase secrets set OPENAI_API_KEY=sk-... GEMINI_API_KEY=AIza...
+```
+
+The function will be live at `https://<your-project-ref>.supabase.co/functions/v1/process-video`. Update your `triggerVideoProcessing` service in the Rork Max app to call this URL, and the full pipeline is production-ready.
