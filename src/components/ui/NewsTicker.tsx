@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — Rorkが1500万ドルのシード資金調達を完了、Left Lane Capital主導でPeak XV・True Ventures・Goodwater参加（4/10）",
-    "GROWTH — Rork MaxがXで800万表示超のバイラル、発表2週間で年間売上が倍増（4月時点）",
-    "SWIFT — Rork MaxはClaude Code + Opus 4.6搭載、React NativeからネイティブSwiftUIアプリ構築へ進化（2月〜）",
-    "APP STORE — AIコーディングツールの台頭でApp Store新規アプリが前年比84%急増（Q1 2026）",
-    "NO XCODE — Rork MaxはクラウドMacフリートでネイティブコンパイル、Xcode不要でブラウザからApp Store公開まで完結",
-    "MARKET — Rorkがウェブトラフィックでモバイルアプリ向けAIプラットフォーム世界最大に成長（4月時点）",
+    "FUNDING — Rorkが1500万ドルのシード調達完了、Left Lane Capital主導でPeak XV・True Ventures・Goodwater・a16z Speedrunが参加（4/10）",
+    "PAPERLINE — RorkがアプリビルダーのPaperlineを買収、エンジニアリング人材の獲得とプラットフォーム強化を加速（4月）",
+    "RORK MAX — Claude Code + Opus 4.6搭載、X上で800万インプレッション超のバイラルを記録し年間売上が2週間で倍増（4月）",
+    "NO XCODE — Rork MaxはクラウドMacフリートでネイティブSwiftUIアプリをコンパイル、XcodeなしでApp Store公開まで完結（4月）",
+    "MARKET — RorkがWebトラフィックでモバイルアプリ向けAIプラットフォーム世界最大に成長（4月時点）",
+    "APP STORE — AIコーディングツールの台頭でApp Store新規アプリが前年比84%急増、「Great App Renaissance」が到来（Q1 2026）",
   ],
   en: [
     "FUNDING — Rork raises $15M Seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater, a16z Speedrun (4/10)",
-    "GROWTH — Rork Max went viral with 8M+ views on X, doubling annual revenue within two weeks of launch (Apr)",
-    "SWIFT — Rork Max powered by Claude Code + Opus 4.6, builds native SwiftUI apps instead of React Native (Feb+)",
-    "APP STORE — New app submissions surge 84% YoY in Q1 2026 as AI coding tools drive the Great App Renaissance",
-    "NO XCODE — Rork Max uses cloud Mac fleet for native compilation: build, preview, install via QR, and ship to App Store",
-    "MARKET — Rork becomes the largest AI platform for building mobile apps in the world by web traffic (Apr)",
+    "PAPERLINE — Rork acquires app builder Paperline to accelerate engineering talent and platform expansion (Apr)",
+    "RORK MAX — Powered by Claude Code + Opus 4.6: went viral with 8M+ views on X, doubling annual revenue in two weeks (Apr)",
+    "NO XCODE — Rork Max compiles native SwiftUI apps via cloud Mac fleet — build, preview, and ship to App Store without Xcode (Apr)",
+    "MARKET — Rork becomes the world's largest AI platform for building mobile apps by web traffic (Apr)",
+    "APP STORE — New apps surge 84% YoY in Q1 2026 as AI tools spark the Great App Renaissance on the App Store",
   ],
 };
 
