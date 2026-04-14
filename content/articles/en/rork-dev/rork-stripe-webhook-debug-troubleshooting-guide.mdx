@@ -1,0 +1,232 @@
+---
+title: "5 Reasons Your Rork × Stripe Webhook Isn't Working — And How to Debug Each One"
+slug: "rork-stripe-webhook-debug-troubleshooting-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-14T09:45"
+updated: "2026-04-14T09:45"
+author: "Rork Lab"
+description: "Payment succeeded in Stripe but your app still shows the free plan? This guide covers the 5 most common Stripe webhook failures in Rork apps and how to fix each one."
+tags: ["Stripe", "webhook", "troubleshooting", "Cloudflare Workers", "payments"]
+---
+
+The payment went through. Stripe's dashboard confirms "Payment succeeded." But the user's subscription status in your app hasn't changed — they're still on the free tier.
+
+This gap between what Stripe processed and what your app believes is one of the most frustrating bugs to track down when building with Rork. Webhooks feel straightforward until they're not — and a misconfigured handler can silently discard every event Stripe sends your way. No error message. No log. Just broken behavior for paying customers.
+
+This guide covers the five most common causes, with the exact code you need to fix each one.
+
+## Why Webhooks Break Silently
+
+Before diving into the fixes, it's worth understanding why webhook bugs are hard to catch.
+
+Stripe sends a POST request to your endpoint when a payment completes. Your server must respond with a `200` status within 30 seconds, or Stripe marks the delivery as failed and retries. But from your app's perspective, the failure is invisible — the checkout redirect still works, the user lands on your success page, and nothing obviously looks wrong.
+
+The two most dangerous failure modes are:
+
+**Silent discard**: Your endpoint receives the request but returns a non-200 response. Stripe retries a few times over the next 24 hours, then gives up. The user never gets access.
+
+**Wrong branch**: Your endpoint receives and acknowledges the request, but the code runs the wrong logic. A tip payment grants Pro access, or a subscription purchase does nothing.
+
+Both require different debugging approaches, which is why having a structured checklist matters more than trial and error.
+
+## Are You Testing Webhooks Locally Without Stripe CLI?
+
+The first thing to confirm is whether you're receiving events during local development at all.
+
+If you've added `https://localhost:3000/api/webhook` to the Stripe dashboard, those events will never arrive — Stripe's servers cannot reach your local machine. You need either `ngrok` or Stripe's own CLI to bridge that gap.
+
+```bash
+# Install Stripe CLI (Mac)
+brew install stripe/stripe-cli/stripe
+
+# Forward webhook events to your local dev server
+stripe listen --forward-to localhost:3000/api/webhook
+
+# In a separate terminal, fire a test event
+stripe trigger checkout.session.completed
+```
+
+When `stripe listen` starts, it prints a temporary webhook signing secret — something like `whsec_test_...`. Copy this into your local `.env`:
+
+```bash
+STRIPE_WEBHOOK_SECRET=whsec_test_xxxx
+```
+
+This is crucial: the CLI's temporary secret is completely different from the signing secret shown in your Stripe dashboard. Use the CLI secret for local testing, and the dashboard secret for production. Mixing them up produces a signature mismatch error on every event.
+
+Run `stripe trigger checkout.session.completed` after setting everything up and watch your server logs. If you see the event arrive and your handler runs, local delivery is working. If nothing happens, the problem is at the forwarding layer — not in your handler code.
+
+## `constructEvent` Doesn't Work in Cloudflare Workers
+
+If your Rork Max app is deployed to Cloudflare Workers, this is the single most common cause of production webhook failures.
+
+The standard Stripe SDK's `stripe.webhooks.constructEvent()` relies on Node.js's built-in `crypto` module, which is not available in Cloudflare's V8 isolate environment. Calling it in a Worker silently fails or throws an error that your catch block may not surface clearly.
+
+The fix is to use the async version with Stripe's SubtleCrypto provider, which uses the Web Crypto API that Cloudflare Workers do support.
+
+```typescript
+// ❌ This will fail in Cloudflare Workers — no Node.js crypto
+const event = stripe.webhooks.constructEvent(
+  body,
+  signature,
+  process.env.STRIPE_WEBHOOK_SECRET\!
+);
+
+// ✅ Cloudflare Workers compatible — uses Web Crypto API
+const cryptoProvider = Stripe.createSubtleCryptoProvider();
+const event = await stripe.webhooks.constructEventAsync(
+  body,
+  signature,
+  process.env.STRIPE_WEBHOOK_SECRET\!,
+  undefined,
+  cryptoProvider
+);
+```
+
+Here is a complete, production-ready webhook handler for Next.js App Router deployed on Cloudflare Workers:
+
+```typescript
+// src/app/api/webhook/route.ts
+import Stripe from 'stripe';
+import { NextRequest, NextResponse } from 'next/server';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY\!);
+
+export async function POST(req: NextRequest) {
+  // req.text() preserves the raw body — required for signature verification
+  // req.json() parses and re-serializes, breaking the signature check
+  const body = await req.text();
+  const signature = req.headers.get('stripe-signature') ?? '';
+
+  let event: Stripe.Event;
+  try {
+    const cryptoProvider = Stripe.createSubtleCryptoProvider();
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET\!,
+      undefined,
+      cryptoProvider
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err);
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+
+  // Process the event here
+  console.log('Received event:', event.type, event.id);
+  return NextResponse.json({ received: true });
+}
+```
+
+Two things in this code are non-negotiable: `constructEventAsync` (not `constructEvent`), and `req.text()` (not `req.json()`). Either mistake independently causes every webhook delivery to fail.
+
+## Mismatched Endpoint URL or Wrong Signing Secret
+
+Stripe generates a unique signing secret for each registered webhook endpoint. If you have separate staging and production endpoints, each one has a different `whsec_...` value — and they cannot be swapped.
+
+Check the following in your Stripe dashboard under **Developers → Webhooks**:
+
+- The URL exactly matches your server route — `/api/webhook` and `/api/webhooks` are different paths
+- The signing secret you're using in code corresponds to the correct endpoint
+- You aren't reusing a staging secret in production, or vice versa
+
+For Cloudflare Workers deployments, environment variables set in `.env` files do not automatically appear in the Worker. You need to add them as secrets through wrangler:
+
+```bash
+# Store the webhook secret encrypted in Cloudflare
+wrangler secret put STRIPE_WEBHOOK_SECRET
+# You'll be prompted to paste the whsec_... value
+
+# Verify it was stored
+wrangler secret list
+```
+
+Never commit secrets to `wrangler.toml`. That file belongs in version control, which means anything written there is effectively public the moment you push to GitHub.
+
+## Missing `plan_type` Branching Breaks Access Control
+
+Stripe sends `checkout.session.completed` for every kind of purchase — tips, monthly subscriptions, lifetime access, individual articles. Your handler receives the same event type for all of them.
+
+If your `switch` statement doesn't branch on `plan_type` from the session metadata, you'll get unintended access grants. A user who pays a $1 tip might receive Pro subscription access. A user who purchases a lifetime plan might get nothing, because the handler ran tip logic instead.
+
+```typescript
+switch (event.type) {
+  case 'checkout.session.completed': {
+    const session = event.data.object as Stripe.Checkout.Session;
+    const planType = session.metadata?.plan_type;
+
+    if (planType === 'tip') {
+      // Show thank-you message only — never grant access for tips
+      await handleTipCompleted(session);
+    } else if (planType === 'pro') {
+      // Activate monthly Pro subscription, set expiry in KV
+      await handleProSubscription(session);
+    } else if (planType === 'premium') {
+      // Grant permanent premium access
+      await handlePremiumPurchase(session);
+    } else if (planType === 'article') {
+      // Record article slug in KV and cookie
+      await handleArticlePurchase(session);
+    } else {
+      // Log unknown types — don't let them silently pass
+      console.warn('Unhandled plan_type in webhook:', planType, session.id);
+    }
+    break;
+  }
+
+  case 'customer.subscription.updated': {
+    // Handle subscription renewals and plan changes
+    await handleSubscriptionUpdated(event.data.object as Stripe.Subscription);
+    break;
+  }
+
+  case 'customer.subscription.deleted': {
+    // Remove access when a subscription is cancelled
+    await handleSubscriptionDeleted(event.data.object as Stripe.Subscription);
+    break;
+  }
+}
+```
+
+Always log unrecognized `plan_type` values rather than silently ignoring them. If you add a new purchase type later and forget to update the webhook handler, the log entry will tell you exactly what went wrong.
+
+## Live Production Debugging with `wrangler tail`
+
+When local development works but production doesn't, Cloudflare's streaming log tool is the fastest path to an answer.
+
+```bash
+# Stream real-time logs from your production Worker
+wrangler tail --format pretty
+```
+
+With `wrangler tail` running, trigger a test event from Stripe CLI aimed at your production endpoint:
+
+```bash
+stripe trigger checkout.session.completed \
+  --override checkout_session:metadata.plan_type=pro
+```
+
+Every `console.log` and `console.error` from your Worker appears in the terminal in real time. You'll see the exact error message, the request headers, and the response your Worker sent back to Stripe.
+
+Meanwhile, in the Stripe dashboard under **Developers → Webhooks → [your endpoint] → Recent deliveries**, you can see the HTTP response code for each attempt. A `400` response means signature verification failed. A `500` means your handler threw an unhandled exception. A `200` with no effect means the event was received and acknowledged, but your business logic isn't running correctly — look at the `plan_type` branching.
+
+Pair `wrangler tail` with Stripe's delivery history and you can usually pinpoint the failure within five minutes.
+
+## A Structured Checklist for Stubborn Failures
+
+If you've tried the fixes above and webhooks are still not working, go through this list top to bottom. The problem almost always lives between steps 3 and 5.
+
+- Step 1: Is Stripe CLI forwarding events to your local server, using the CLI's own signing secret?
+- Step 2: Are you calling `constructEventAsync` with `Stripe.createSubtleCryptoProvider()`?
+- Step 3: Are you reading the request body with `req.text()` — not `req.json()`?
+- Step 4: Is `STRIPE_WEBHOOK_SECRET` stored as a Worker Secret via `wrangler secret put`?
+- Step 5: Are you setting `metadata: { plan_type: '...' }` when creating Checkout sessions?
+- Step 6: Does your `switch` statement handle every `plan_type` your app creates?
+- Step 7: Are you running `wrangler tail` to see live logs from the production Worker?
+
+Webhook bugs are particularly costly because they affect paying customers directly. A systematic approach — one fix at a time, verified with `stripe trigger` after each change — is faster than guessing and re-deploying repeatedly.
+
+For the complete Stripe integration setup from scratch, see [Rork Stripe Subscription Complete Guide](/en/articles/rork-dev/rork-stripe-subscription-complete-guide).

@@ -1,0 +1,189 @@
+---
+title: "Rork × Stripe でwebhookが動かない5つの原因と完全デバッグ手順"
+slug: "rork-stripe-webhook-debug-troubleshooting-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-14T09:45"
+updated: "2026-04-14T09:45"
+author: "Rork Lab"
+description: "Rorkで作ったアプリにStripe webhookを実装したのに決済後のステータスが更新されない問題を、5つの原因パターンと具体的なデバッグ手順で解決します。"
+tags: ["Stripe", "webhook", "トラブルシューティング", "Cloudflare Workers", "決済"]
+---
+
+決済が完了したのに、ユーザーのサブスクリプション状態が切り替わらない。Stripe の管理画面では「Payment succeeded」と表示されているのに、アプリ側では無料プランのまま——。
+
+Rork で課金機能を実装したとき、多くの開発者がこの壁にぶつかる。webhook の設定は一見シンプルだが、Cloudflare Workers 特有の制約や Stripe の署名検証の仕組みを知らないと、原因の特定に何時間もかかってしまう。
+
+この記事では、よくある失敗パターン5つと、それぞれの解決コードを順番に整理する。
+
+## Stripe CLI でローカル受信テストをスキップしていないか
+
+最初に確認したいのが、ローカル開発時の webhook 受信設定だ。
+
+`ngrok` や `Stripe CLI` を使わずに、Stripe ダッシュボードの webhook エンドポイントに `https://localhost:3000/api/webhook` を登録している場合、Stripe からのリクエストは当然届かない。
+
+```bash
+# Stripe CLI をインストール（Mac）
+brew install stripe/stripe-cli/stripe
+
+# ローカルサーバーに webhook をフォワード
+stripe listen --forward-to localhost:3000/api/webhook
+
+# 別ターミナルでテストイベントを送信
+stripe trigger checkout.session.completed
+```
+
+`stripe listen` を実行すると、ターミナルに `webhook signing secret` が表示される。これをローカルの `.env` に設定する。
+
+```bash
+STRIPE_WEBHOOK_SECRET=whsec_xxxx_（stripe listenが表示した値）
+```
+
+**注意**: 本番の `STRIPE_WEBHOOK_SECRET`（Stripe ダッシュボードで発行したもの）と、`stripe listen` が発行するローカル用のシークレットは別物。混同すると「署名検証エラー」が発生する。
+
+## Cloudflare Workers での `constructEvent` は動かない
+
+Rork Max でビルドしたアプリを Cloudflare Workers にデプロイしている場合、これが最も多い原因だ。
+
+Node.js 向けの Stripe ライブラリで一般的に使われる `Stripe.webhooks.constructEvent()` は、Cloudflare Workers の Web Crypto API 環境では動作しない。非同期版に切り替える必要がある。
+
+```typescript
+// ❌ これは Cloudflare Workers で動かない
+const event = stripe.webhooks.constructEvent(
+  body,
+  signature,
+  process.env.STRIPE_WEBHOOK_SECRET\!
+);
+
+// ✅ Cloudflare Workers では非同期版を使う
+const cryptoProvider = Stripe.createSubtleCryptoProvider();
+const event = await stripe.webhooks.constructEventAsync(
+  body,
+  signature,
+  process.env.STRIPE_WEBHOOK_SECRET\!,
+  undefined,
+  cryptoProvider
+);
+```
+
+また、リクエストボディを文字列として受け取る必要がある。Next.js の App Router を使っている場合は以下のように書く。
+
+```typescript
+// src/app/api/webhook/route.ts
+import Stripe from 'stripe';
+import { NextRequest, NextResponse } from 'next/server';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY\!);
+
+export async function POST(req: NextRequest) {
+  const body = await req.text(); // ← json() ではなく text() で受け取る
+  const signature = req.headers.get('stripe-signature') ?? '';
+
+  let event: Stripe.Event;
+  try {
+    const cryptoProvider = Stripe.createSubtleCryptoProvider();
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET\!,
+      undefined,
+      cryptoProvider
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err);
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+
+  // イベント処理...
+  return NextResponse.json({ received: true });
+}
+```
+
+`req.json()` でボディを受け取ると、Stripe の署名検証が必ず失敗する。これは Node.js 版でも共通のはまりどころだ。
+
+## webhook エンドポイントの URL と署名シークレットの不一致
+
+Stripe ダッシュボードの「Developers → Webhooks」で設定したエンドポイント URL と、実際のサーバー URL がずれているケースも多い。
+
+確認すべきポイント：
+
+- **エンドポイント URL**: `https://yourdomain.com/api/webhook` になっているか（`/api/webhooks` と複数形にしてしまっていないか）
+- **署名シークレット**: 各エンドポイントに固有の `whsec_...` が発行される。複数環境（ステージング・本番）でシークレットを共用していないか
+- **Cloudflare Worker の環境変数**: `STRIPE_WEBHOOK_SECRET` が Worker の「Settings → Variables and Secrets」に設定されているか（`.env` ファイルは本番 Worker に反映されない）
+
+```bash
+# Cloudflare Worker に環境変数を設定（wrangler CLI）
+wrangler secret put STRIPE_WEBHOOK_SECRET
+# → プロンプトに従って whsec_... を入力
+```
+
+`wrangler.toml` に秘密鍵を直接書くのは絶対に避けること。GitHub にコミットされたら即座に漏洩する。
+
+## `metadata.plan_type` の分岐漏れで誤った処理が走る
+
+`checkout.session.completed` イベントを受け取っても、処理が正しく分岐していないパターンだ。
+
+たとえば、チップ（Tip）の決済と月額サブスクリプション（Pro）の決済が同じエンドポイントに届くのに、`plan_type` で分岐していないと、チップを払ったユーザーに Pro 権限が付与されてしまう、あるいはその逆が起きる。
+
+```typescript
+switch (event.type) {
+  case 'checkout.session.completed': {
+    const session = event.data.object as Stripe.Checkout.Session;
+    const planType = session.metadata?.plan_type;
+
+    if (planType === 'tip') {
+      // チップのお礼処理のみ（権限付与しない）
+      await handleTipCompleted(session);
+    } else if (planType === 'pro') {
+      // Pro サブスクリプション開始
+      await handleProSubscription(session);
+    } else if (planType === 'premium') {
+      // 永久プレミアム付与
+      await handlePremiumPurchase(session);
+    } else if (planType === 'article') {
+      // 記事単体購入
+      await handleArticlePurchase(session);
+    } else {
+      console.warn('Unknown plan_type:', planType);
+    }
+    break;
+  }
+}
+```
+
+Stripe の Checkout セッション作成時（`/api/checkout/route.ts`）に `metadata: { plan_type: 'tip' }` のように設定していても、受信側で参照していなければ意味がない。両端を必ず確認する。
+
+## Cloudflare Workers のログで確認する本番デバッグ手順
+
+ローカルでは動くのに本番で動かない場合、まず Cloudflare の Workers ログをリアルタイムで確認する。
+
+```bash
+# Worker のライブログを表示
+wrangler tail --format pretty
+
+# 別ターミナルで Stripe CLI からテストイベントを本番エンドポイントへ送信
+stripe trigger checkout.session.completed \
+  --override checkout_session:metadata.plan_type=pro
+```
+
+`wrangler tail` を使えば、本番 Worker が実際に受け取ったリクエストとエラーをリアルタイムで確認できる。`console.log` の出力もここに流れる。
+
+また、Stripe ダッシュボードの「Developers → Webhooks → [エンドポイント] → Recent deliveries」で、各リクエストのレスポンスコードと本文を確認できる。ここに `400 Invalid signature` と表示されているなら、署名検証の問題だ。
+
+## 見落としがちな最終チェックリスト
+
+webhook が動かないときに確認すべき項目をまとめた。
+
+上から順に確認していくと、大抵の原因は Step 3 か Step 4 で見つかる。
+
+- Step 1: Stripe CLI でローカル受信テストは完了しているか
+- Step 2: `constructEventAsync` + `createSubtleCryptoProvider` を使っているか
+- Step 3: ボディを `req.text()` で受け取っているか（`req.json()` は NG）
+- Step 4: Cloudflare Worker の Secrets に `STRIPE_WEBHOOK_SECRET` が設定されているか
+- Step 5: Checkout 作成時に `metadata.plan_type` を正しく設定しているか
+- Step 6: `checkout.session.completed` の `switch` 文で全 plan_type を分岐しているか
+
+課金機能のバグは、ユーザーに直接影響する。`console.error` でのログ出力と `wrangler tail` によるリアルタイム監視を組み合わせれば、本番でも原因を素早く絞り込める。
+
+Rork × Stripe の実装全体については、[Rork で Stripe サブスクリプション課金を実装する完全ガイド](/articles/rork-dev/rork-stripe-subscription-complete-guide)も参考にしてほしい。
