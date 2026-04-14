@@ -1,0 +1,576 @@
+---
+title: "Rork × RevenueCat + Stripe Web 統合ガイド：iOS・Android・Web のサブスクリプションを1つのバックエンドで管理する"
+slug: "rork-revenuecat-stripe-web-unified-subscription-backend-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-15T06:00"
+updated: "2026-04-15T06:00"
+author: "Rork Lab"
+description: "Rorkアプリで iOS StoreKit・Android Google Play Billing・Stripe Web の3つの課金チャネルを RevenueCat で一元管理する実装ガイド。クロスプラットフォーム対応の落とし穴と本番運用まで解説します。"
+tags: ["RevenueCat", "Stripe", "StoreKit", "Google Play Billing", "サブスクリプション", "クロスプラットフォーム", "課金", "バックエンド"]
+highlights:
+  - "iOS・Android・Webの3チャネル課金を同一エンタイトルメントとして管理できる設計を今日から実装できる"
+  - "Stripe Webhook → RevenueCat Customer Info の自動同期コードと、詰まりやすいエンタイトルメント不一致の診断手順を習得できる"
+  - "本番環境でサブスクリプション状態が食い違うバグの根本原因を理解し、安定した課金システムを構築できる"
+---
+
+アプリをリリースしてしばらくすると、ほぼ確実に「Web でも同じサービスを販売したい」という要望が出てきます。iOS の App Store、Android の Google Play に加えて Stripe で Web 決済を追加したとき、エンタイトルメント（購入済み権限）の管理が一気に複雑になります。
+
+実際に経験してみると「Stripe で購入したユーザーが iOS アプリにログインしても権限が反映されない」「RevenueCat の Customer Info に Stripe の購入履歴が入らない」という問題にぶつかります。この記事では、Rork で開発したアプリを対象に、3チャネルの課金を統一管理するための実装パターンを具体的なコードで解説します。
+
+## なぜクロスプラットフォーム課金統合が難しいのか
+
+RevenueCat を使えば iOS と Android の課金は自動で同期されます。ところが Stripe は RevenueCat のエコシステム外にあるため、手動で連携させる必要があります。
+
+問題の核心は3点あります。
+
+まず、**エンタイトルメントの更新タイミングのズレ**です。Stripe の Webhook はサーバーに届きますが、RevenueCat へのデータ反映には API 呼び出しが必要で、この処理に失敗するとアプリ側でユーザーの権限が正しく表示されません。
+
+次に、**ユーザー識別の方法が異なる**という点です。RevenueCat はアプリ側の `appUserId` でユーザーを識別しますが、Stripe は `customerId` で管理します。この2つを正確に紐付けないと、同じユーザーが複数のIDを持つ状態になります。
+
+最後に、**レシート検証のタイミング問題**です。iOS・Android はデバイス側でレシートを生成して RevenueCat が検証しますが、Stripe は完全にサーバー側の処理です。リアルタイム性の担保方法が異なります。
+
+## アーキテクチャの全体像
+
+実装の前に、クロスプラットフォーム課金の全体設計を理解しておきます。
+
+```
+【iOS/Android ユーザー】
+  ↓ StoreKit 2 / Google Play Billing
+  ↓ RevenueCat SDK（自動でサーバー同期）
+  ↓ Cloudflare KV（RevenueCat Webhook で更新）
+  ↓ Rork アプリがエンタイトルメントを確認
+
+【Web ユーザー】
+  ↓ Stripe Checkout
+  ↓ Stripe Webhook → 自作バックエンド（Hono + Cloudflare Workers）
+  ↓ RevenueCat REST API でカスタムエンタイトルメントを付与
+  ↓ Cloudflare KV（バックエンドが更新）
+  ↓ Rork アプリがエンタイトルメントを確認
+```
+
+重要なのは、**アプリ側はどのチャネルで購入されたかを意識しない**設計にすることです。バックエンドが全チャネルの状態を RevenueCat と KV に反映し、アプリは1か所を見るだけでエンタイトルメントを確認できる状態を目指します。
+
+## 事前準備
+
+実装を始める前に、以下の設定が完了していることを確認してください。
+
+RevenueCat ダッシュボードで必要なもの:
+
+- **App の登録**: iOS・Android をそれぞれ追加
+- **エンタイトルメントの定義**: 例として `pro` というエンタイトルメントを作成
+- **API Key の取得**: Secret API Key（`sk_` から始まるもの）
+- **Webhook URL の設定**: バックエンドの `/api/revenuecat-webhook` エンドポイント
+
+Stripe ダッシュボードで必要なもの:
+
+- **Product と Price の作成**: 月額・年額のプランを作成
+- **Webhook の設定**: `checkout.session.completed`、`customer.subscription.updated`、`customer.subscription.deleted` のイベントを登録
+- **Customer Portal の有効化**: ユーザーが自分でサブスクリプションを管理できるようにする
+
+## Rork アプリ側の RevenueCat 実装
+
+Rork では React Native / Expo ベースのコードを生成するため、`react-native-purchases` パッケージで RevenueCat を統合します。
+
+まず、Rork のプロンプトで以下を指定してエンタイトルメント確認ロジックを生成します。
+
+```typescript
+// src/hooks/useEntitlements.ts
+import { useEffect, useState } from 'react';
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+
+const REVENUECAT_API_KEY_IOS = 'appl_xxxxxxxxxxxxxxxx';
+const REVENUECAT_API_KEY_ANDROID = 'goog_xxxxxxxxxxxxxxxx';
+
+export function useEntitlements() {
+  const [isPro, setIsPro] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [customerInfo, setCustomerInfo] = useState<CustomerInfo | null>(null);
+
+  useEffect(() => {
+    // プラットフォームに応じた API Key でセットアップ
+    const apiKey = Platform.OS === 'ios'
+      ? REVENUECAT_API_KEY_IOS
+      : REVENUECAT_API_KEY_ANDROID;
+
+    Purchases.configure({ apiKey });
+
+    // 現在のカスタマー情報を取得
+    Purchases.getCustomerInfo()
+      .then((info) => {
+        setCustomerInfo(info);
+        // 'pro' エンタイトルメントが有効かを確認
+        setIsPro(
+          info.entitlements.active['pro'] \!== undefined
+        );
+      })
+      .catch((error) => {
+        // エラー時はデフォルトで非プロ扱い（deny by default）
+        console.error('Failed to get customer info:', error);
+        setIsPro(false);
+      })
+      .finally(() => {
+        setIsLoading(false);
+      });
+
+    // 購入状態の変化をリアルタイムで受け取る
+    const purchaserInfoUpdateListener = Purchases.addCustomerInfoUpdateListener(
+      (info) => {
+        setCustomerInfo(info);
+        setIsPro(info.entitlements.active['pro'] \!== undefined);
+      }
+    );
+
+    return () => {
+      purchaserInfoUpdateListener.remove();
+    };
+  }, []);
+
+  return { isPro, isLoading, customerInfo };
+}
+```
+
+このフックが返す `isPro` は、iOS・Android・Web のいずれかで購入が完了していれば `true` になります（後述のバックエンド実装を完了した後に）。
+
+**よくある間違い1**: `Purchases.configure()` を `useEffect` の外で呼び出すと、コンポーネントが再マウントされるたびに設定が上書きされます。必ず `useEffect` 内で一度だけ呼び出してください。
+
+## ユーザー識別の設計
+
+クロスプラットフォーム課金で最も重要なのは、ユーザーの同一性を保証することです。
+
+```typescript
+// ログイン成功後に RevenueCat のユーザー ID を同期する
+async function syncRevenueCatUserId(appUserId: string) {
+  try {
+    const { customerInfo, created } = await Purchases.logIn(appUserId);
+    
+    if (created) {
+      // 新規ユーザー: Stripe Customer も新規作成が必要
+      await createStripeCustomer(appUserId);
+    }
+    
+    return customerInfo;
+  } catch (error) {
+    // ログイン失敗時も匿名ユーザーとして継続（購入はできないがアプリは動く）
+    console.error('RevenueCat login failed:', error);
+    return null;
+  }
+}
+
+// Stripe Customer をバックエンド API 経由で作成
+async function createStripeCustomer(appUserId: string) {
+  const response = await fetch('/api/create-stripe-customer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ appUserId }),
+  });
+  
+  if (\!response.ok) {
+    throw new Error(`Failed to create Stripe customer: ${response.status}`);
+  }
+  
+  return response.json();
+}
+```
+
+`appUserId` は、Supabase や Firebase の `uid` など、アプリ内でユーザーを一意に識別するIDを使います。これを RevenueCat と Stripe の両方で統一的に使うことで、チャネルをまたいだ同一ユーザーの識別が可能になります。
+
+**よくある間違い2**: Stripe の `customerId`（`cus_xxx` 形式）を RevenueCat の `appUserId` として使ってしまうケース。Stripe Customer は後から作られることがあり、iOS 購入が先行すると RevenueCat と Stripe でユーザーが別管理になります。必ず自前の `appUserId` を先に決め、それを両方のサービスに登録してください。
+
+## Stripe バックエンドの実装（Hono + Cloudflare Workers）
+
+Rork で生成したアプリのバックエンドを Hono + Cloudflare Workers で構築している場合、以下のように Stripe Webhook ハンドラーを実装します。
+
+```typescript
+// src/routes/stripe-webhook.ts
+import { Hono } from 'hono';
+import Stripe from 'stripe';
+
+const app = new Hono();
+
+app.post('/api/stripe-webhook', async (c) => {
+  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY);
+  const signature = c.req.header('stripe-signature') ?? '';
+  const rawBody = await c.req.text();
+
+  // Stripe の署名検証（必須 - これを省略するとセキュリティホールになる）
+  let event: Stripe.Event;
+  try {
+    event = await stripe.webhooks.constructEventAsync(
+      rawBody,
+      signature,
+      c.env.STRIPE_WEBHOOK_SECRET,
+      undefined,
+      Stripe.createSubtleCryptoProvider()
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err);
+    return c.json({ error: 'Invalid signature' }, 400);
+  }
+
+  // イベントタイプに応じた処理
+  switch (event.type) {
+    case 'checkout.session.completed':
+      await handleCheckoutCompleted(event.data.object, c.env);
+      break;
+    case 'customer.subscription.updated':
+      await handleSubscriptionUpdated(event.data.object, c.env);
+      break;
+    case 'customer.subscription.deleted':
+      await handleSubscriptionDeleted(event.data.object, c.env);
+      break;
+    default:
+      // 処理不要なイベントは無視（200 を返してリトライを防ぐ）
+      break;
+  }
+
+  return c.json({ received: true }, 200);
+});
+
+async function handleCheckoutCompleted(
+  session: Stripe.Checkout.Session,
+  env: Env
+) {
+  const appUserId = session.metadata?.appUserId;
+  if (\!appUserId) {
+    console.error('No appUserId in session metadata:', session.id);
+    return;
+  }
+
+  // RevenueCat にカスタムエンタイトルメントを付与
+  await grantRevenueCatEntitlement(
+    appUserId,
+    'pro',
+    getExpirationDate(session),
+    env
+  );
+
+  // Cloudflare KV にも保存（高速な権限確認のため）
+  await env.KV.put(
+    `subscription:${appUserId}`,
+    JSON.stringify({
+      status: 'active',
+      source: 'stripe',
+      stripeCustomerId: session.customer as string,
+      expiresAt: getExpirationDate(session),
+    }),
+    { expirationTtl: 60 * 60 * 24 * 400 } // 400日間保持
+  );
+}
+
+async function grantRevenueCatEntitlement(
+  appUserId: string,
+  entitlementId: string,
+  expiresAt: string | null,
+  env: Env
+) {
+  const url = `https://api.revenuecat.com/v1/subscribers/${appUserId}/entitlements/${entitlementId}/promotional`;
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.REVENUECAT_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      duration: 'monthly', // または 'annual', 'lifetime'
+      // expires_date は ISO 8601 形式で指定
+      ...(expiresAt ? { expires_date: expiresAt } : {}),
+    }),
+  });
+
+  if (\!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(
+      `RevenueCat entitlement grant failed: ${response.status} - ${errorBody}`
+    );
+  }
+
+  return response.json();
+}
+
+function getExpirationDate(session: Stripe.Checkout.Session): string | null {
+  // サブスクリプションの場合は次回更新日を返す
+  if (session.subscription) {
+    // 実際には Stripe API でサブスクリプション詳細を取得して current_period_end を使う
+    const thirtyDaysLater = new Date();
+    thirtyDaysLater.setDate(thirtyDaysLater.getDate() + 30);
+    return thirtyDaysLater.toISOString();
+  }
+  return null;
+}
+```
+
+**よくある間違い3**: Webhook で RevenueCat API 呼び出しが失敗したとき、`500` を返してしまうケース。Stripe は `5xx` を受け取るとリトライしますが、RevenueCat への付与が冪等でない場合、二重付与が発生します。失敗時のリトライロジックを実装するか、RevenueCat の API が冪等であることを確認した上で処理してください。
+
+## Stripe Checkout セッション作成時の appUserId 埋め込み
+
+Checkout セッション作成時に `metadata` へ `appUserId` を含めることで、Webhook ハンドラーでユーザーを特定できます。
+
+```typescript
+// src/routes/create-checkout.ts
+app.post('/api/create-checkout', async (c) => {
+  const { appUserId, priceId, successUrl, cancelUrl } = await c.req.json();
+  
+  if (\!appUserId) {
+    return c.json({ error: 'appUserId is required' }, 400);
+  }
+
+  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY);
+  
+  // 既存の Stripe Customer を検索するか新規作成
+  let stripeCustomerId = await getOrCreateStripeCustomer(appUserId, stripe, c.env);
+
+  const session = await stripe.checkout.sessions.create({
+    customer: stripeCustomerId,
+    payment_method_types: ['card'],
+    line_items: [{ price: priceId, quantity: 1 }],
+    mode: 'subscription',
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    metadata: {
+      appUserId, // Webhook で RevenueCat と紐付けるための必須フィールド
+    },
+    subscription_data: {
+      metadata: {
+        appUserId, // サブスクリプションの metadata にも必ず設定する
+      },
+    },
+  });
+
+  return c.json({ url: session.url });
+});
+
+async function getOrCreateStripeCustomer(
+  appUserId: string,
+  stripe: Stripe,
+  env: Env
+): Promise<string> {
+  // KV から既存の Stripe Customer ID を検索
+  const existing = await env.KV.get(`stripe_customer:${appUserId}`);
+  if (existing) {
+    return existing;
+  }
+
+  // 新規作成
+  const customer = await stripe.customers.create({
+    metadata: { appUserId },
+  });
+
+  // KV に保存（次回以降の検索を高速化）
+  await env.KV.put(`stripe_customer:${appUserId}`, customer.id);
+  
+  return customer.id;
+}
+```
+
+**重要**: `subscription_data.metadata` にも `appUserId` を設定しておくことを忘れないでください。`checkout.session.completed` の段階では `session.metadata` に入っていますが、後続の `customer.subscription.updated` や `customer.subscription.deleted` イベントでは `session.metadata` は参照できません。サブスクリプション側の `metadata` に `appUserId` が入っていれば、更新・解約イベントでも正しくユーザーを特定できます。
+
+## サブスクリプション更新・解約の処理
+
+サブスクリプションの状態変化を正確に RevenueCat に反映することが、安定した権限管理の要です。
+
+```typescript
+async function handleSubscriptionUpdated(
+  subscription: Stripe.Subscription,
+  env: Env
+) {
+  const appUserId = subscription.metadata?.appUserId;
+  if (\!appUserId) {
+    console.error('No appUserId in subscription metadata:', subscription.id);
+    return;
+  }
+
+  const isActive = ['active', 'trialing'].includes(subscription.status);
+  
+  if (isActive) {
+    // 更新成功: エンタイトルメントを延長
+    const expiresAt = new Date(subscription.current_period_end * 1000).toISOString();
+    await grantRevenueCatEntitlement(appUserId, 'pro', expiresAt, env);
+    
+    await env.KV.put(
+      `subscription:${appUserId}`,
+      JSON.stringify({
+        status: 'active',
+        source: 'stripe',
+        expiresAt,
+      }),
+      { expirationTtl: 60 * 60 * 24 * 400 }
+    );
+  } else {
+    // 支払い失敗・停止中: KV のみ更新し、RevenueCat は期限切れを待つ
+    await env.KV.put(
+      `subscription:${appUserId}`,
+      JSON.stringify({
+        status: subscription.status,
+        source: 'stripe',
+      })
+    );
+  }
+}
+
+async function handleSubscriptionDeleted(
+  subscription: Stripe.Subscription,
+  env: Env
+) {
+  const appUserId = subscription.metadata?.appUserId;
+  if (\!appUserId) return;
+
+  // RevenueCat のプロモーショナルエンタイトルメントを取り消す
+  const url = `https://api.revenuecat.com/v1/subscribers/${appUserId}/entitlements/pro/promotional`;
+  await fetch(url, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `Bearer ${env.REVENUECAT_SECRET_KEY}`,
+    },
+  });
+
+  // KV から削除
+  await env.KV.delete(`subscription:${appUserId}`);
+}
+```
+
+## アプリ側でのエンタイトルメント確認
+
+RevenueCat + KV の二重管理を活用し、アプリ側でも高速にエンタイトルメントを確認できるようにします。
+
+```typescript
+// src/hooks/useProAccess.ts
+export function useProAccess() {
+  const [hasAccess, setHasAccess] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const { user } = useAuth();
+
+  useEffect(() => {
+    if (\!user) {
+      setHasAccess(false);
+      setIsLoading(false);
+      return;
+    }
+
+    checkAccess(user.id);
+  }, [user]);
+
+  async function checkAccess(appUserId: string) {
+    try {
+      // まず RevenueCat SDK でローカルキャッシュを確認（高速）
+      const customerInfo = await Purchases.getCustomerInfo();
+      const revenueCatPro = customerInfo.entitlements.active['pro'] \!== undefined;
+
+      if (revenueCatPro) {
+        setHasAccess(true);
+        setIsLoading(false);
+        return;
+      }
+
+      // RevenueCat でプロでない場合、バックエンドの KV も確認（Stripe 経由の可能性）
+      const response = await fetch('/api/check-subscription', {
+        headers: { 'x-app-user-id': appUserId },
+      });
+      const data = await response.json();
+      
+      setHasAccess(data.isActive === true);
+    } catch (error) {
+      // エラー時はデフォルトで非プロ（deny by default 原則を遵守）
+      console.error('Access check failed:', error);
+      setHasAccess(false);
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  return { hasAccess, isLoading };
+}
+```
+
+```typescript
+// バックエンド側の /api/check-subscription エンドポイント
+app.get('/api/check-subscription', async (c) => {
+  const appUserId = c.req.header('x-app-user-id');
+  if (\!appUserId) {
+    return c.json({ isActive: false }, 401);
+  }
+
+  const cached = await c.env.KV.get(`subscription:${appUserId}`);
+  if (\!cached) {
+    return c.json({ isActive: false });
+  }
+
+  const data = JSON.parse(cached);
+  const isActive = data.status === 'active' && 
+    (\!data.expiresAt || new Date(data.expiresAt) > new Date());
+
+  return c.json({ isActive });
+});
+```
+
+## よくある落とし穴：診断チェックリスト
+
+実装後に問題が発生した場合は、以下の順で確認してください。
+
+**症状: Stripe で購入したのにアプリがプロにならない**
+
+1. Stripe Webhook ダッシュボードで `checkout.session.completed` が正常に配信されているか確認する
+2. バックエンドのログで `grantRevenueCatEntitlement` が呼び出されているか確認する
+3. RevenueCat ダッシュボードで対象ユーザーに `pro` エンタイトルメントが付与されているか確認する
+4. アプリ側で `Purchases.invalidateCustomerInfoCache()` を呼び出して、ローカルキャッシュを強制更新する
+
+**症状: iOS では動くが Android では課金が完了しない**
+
+1. Google Play Console でテストアカウントが正しく設定されているか確認する
+2. RevenueCat ダッシュボードの Android アプリ設定でパッケージ名が一致しているか確認する
+3. `react-native-purchases` の Android 側の初期化で正しい API Key を使っているか確認する
+
+**症状: サブスクリプション解約後もアプリがプロのまま**
+
+1. RevenueCat のプロモーショナルエンタイトルメントに有効期限が設定されているか確認する
+2. `customer.subscription.deleted` Webhook が正しく処理されているか確認する
+3. アプリのローカルキャッシュが古い場合があるため、強制ログアウト→再ログインで再確認する
+
+## 本番移行前のチェックリスト
+
+本番環境への移行前に、以下を必ず確認してください。
+
+実装チェック:
+
+- `checkout.session.completed`、`customer.subscription.updated`、`customer.subscription.deleted` の全イベントハンドラーが実装済みか
+- Stripe Webhook の署名検証が `constructEventAsync` で正しく実装されているか
+- `subscription_data.metadata` に `appUserId` が含まれているか
+- エラー時に `deny by default` になっているか（エラー時にアクセスを許可しない）
+- RevenueCat API の呼び出しに適切なエラーハンドリングがあるか
+
+テストチェック:
+
+- Stripe CLI でテスト Webhook を送信して全イベントの動作を確認する
+  ```bash
+  stripe trigger checkout.session.completed \
+    --add checkout_session:metadata.appUserId=test-user-001
+  ```
+- RevenueCat ダッシュボードでテストユーザーのエンタイトルメントが付与されることを確認する
+- アプリで強制ログアウト→再ログイン後もエンタイトルメントが維持されることを確認する
+- Stripe テストカード（`4242 4242 4242 4242`）で実際の購入フローをエンドツーエンドで確認する
+
+運用チェック:
+
+- Stripe Webhook の失敗通知を受け取るアラートを設定する
+- RevenueCat のダッシュボードで月次の収益サマリーが正しく集計されることを確認する
+- Cloudflare KV の容量とコストを試算する（1エントリ約500バイト × ユーザー数）
+
+## 実装の全体的な考え方
+
+この実装を振り返ると、クロスプラットフォーム課金の本質は「**単一の権限状態をどこで管理するか**」という設計判断です。
+
+RevenueCat は iOS・Android のエンタイトルメントを自動管理してくれますが、Stripe は手動連携が必要です。ここで「Stripe の購入を RevenueCat のプロモーショナルエンタイトルメントとして付与する」というアプローチを取ることで、アプリ側は RevenueCat という単一のソースだけを見ればよい状態になります。
+
+Cloudflare KV を二重保存するのは、RevenueCat の API レスポンスが遅い場合や一時的に不可用になった場合のフォールバックとしての役割を持たせるためです。本番環境では RevenueCat のサービス障害時にも正常に動作することが重要です。
+
+Rork でアプリを開発する際は、このアーキテクチャパターンをテンプレートとして活用し、ビジネスロジックの差分（プラン数・価格・エンタイトルメント名など）だけを変更して適用できます。
+
+## さらに深掘りするなら
+
+実装の参考に、[RevenueCatサブスクリプション実装ガイド](/articles/rork-dev/rork-revenuecat-subscription-monetization-guide)と[Stripeサブスクリプション完全ガイド](/articles/rork-dev/rork-stripe-subscription-complete-guide)も合わせて読んでみてください。
+
+また、Stripe のサブスクリプション管理について体系的に理解したい場合は、[『Stripe連携開発の教科書（著：Takuya Tejima）』](https://www.amazon.co.jp/dp/B09WKQLRW2/?tag=pinocchio-22)が実装上の細かいポイントまで丁寧に解説しています。
+
+次のステップとして、RevenueCat の Webhook を使ったアプリ内通知（「もうすぐ更新日です」「支払いに失敗しました」）の実装に挑戦してみてください。
