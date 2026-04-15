@@ -5,19 +5,19 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
     "FUNDING — Rorkが1500万ドルのシード調達完了、Left Lane Capital主導でPeak XV・True Ventures・Goodwater・a16z Speedrunが参加（4/10）",
-    "PAPERLINE — RorkがアプリビルダーのPaperlineを買収、エンジニアリング人材の獲得とプラットフォーム強化を加速（4月）",
-    "RORK MAX — Claude Code + Opus 4.6搭載、X上で800万インプレッション超のバイラルを記録し年間売上が2週間で倍増（4月）",
-    "NO XCODE — Rork MaxはクラウドMacフリートでネイティブSwiftUIアプリをコンパイル、XcodeなしでApp Store公開まで完結（4月）",
-    "MARKET — RorkがWebトラフィックでモバイルアプリ向けAIプラットフォーム世界最大に成長（4月時点）",
-    "APP STORE — AIコーディングツールの台頭でApp Store新規アプリが前年比84%急増、「Great App Renaissance」が到来（Q1 2026）",
+    "PAPERLINE — RorkがアプリビルダーのPaperlineを買収、エンジニアリング人材獲得とプラットフォーム強化を加速（4月）",
+    "RORK MAX — Claude Code + Opus 4.6搭載のSwiftUIビルダー、X上で800万インプレッション超のバイラルで年間売上が2週間で倍増（4月）",
+    "NO XCODE — Rork MaxはクラウドMacフリートでネイティブSwiftをコンパイル、XcodeなしでApp Store公開まで完結（4月）",
+    "MARKET — RorkがWebトラフィックでモバイルAIプラットフォーム世界最大に、nocode.mbaが詳細チュートリアルを公開（4月）",
+    "RENAISSANCE — AIコーディングツールの台頭でApp Store新規アプリが前年比84%急増、「Great App Renaissance」が到来（Q1 2026）",
   ],
   en: [
     "FUNDING — Rork raises $15M Seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater, a16z Speedrun (4/10)",
     "PAPERLINE — Rork acquires app builder Paperline to accelerate engineering talent and platform expansion (Apr)",
-    "RORK MAX — Powered by Claude Code + Opus 4.6: went viral with 8M+ views on X, doubling annual revenue in two weeks (Apr)",
+    "RORK MAX — Powered by Claude Code + Opus 4.6: viral with 8M+ views on X, doubling annual revenue in two weeks (Apr)",
     "NO XCODE — Rork Max compiles native SwiftUI apps via cloud Mac fleet — build, preview, and ship to App Store without Xcode (Apr)",
     "MARKET — Rork becomes the world's largest AI platform for building mobile apps by web traffic (Apr)",
-    "APP STORE — New apps surge 84% YoY in Q1 2026 as AI tools spark the Great App Renaissance on the App Store",
+    "RENAISSANCE — AI coding tools spark 84% YoY surge in new App Store submissions — the Great App Renaissance is here (Q1 2026)",
   ],
 };
 
