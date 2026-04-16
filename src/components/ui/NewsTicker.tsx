@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — Rorkが1500万ドルのシード調達完了、Left Lane Capital主導でPeak XV・True Ventures・Goodwater・a16z Speedrunが参加（4/9）",
-    "PAPERLINE — RorkがアプリビルダーのPaperlineを買収、エンジニアリング人材獲得とプラットフォーム強化を加速（4月）",
-    "LARGEST — Rorkがモバイルアプリ向けAIプラットフォームでWebトラフィック世界最大に、チーム9名でReplit・Boltを凌駕（4月）",
-    "RORK MAX — ネイティブSwiftUIアプリを自然言語から生成、Vision Pro・Apple Watch・ARKitにも対応（2月〜）",
-    "NO XCODE — クラウドMacフリートでネイティブSwiftをコンパイル、XcodeなしでApp Store公開まで完結（4月）",
-    "RENAISSANCE — AIコーディングツールの台頭でApp Store新規アプリが前年比84%急増、「Great App Renaissance」が到来（Q1 2026）",
+    "FUNDING — Rorkが1500万ドルのシード調達完了、Left Lane Capitalがリード、Peak XV・True Ventures・Goodwater・a16z Speedrun参加（4/9）",
+    "RORK MAX — Claude Code＋Claude Opus 4.6搭載のRork Maxが公開、Web上でXcodeを置き換える初のSwiftアプリビルダーに（4月）",
+    "8M VIEWS — Rork Max発表のXポストが800万閲覧を突破、発表から2週間で年間売上が2倍に（4月）",
+    "iOS 26 SDK — App Store Connectへのアップロードは4月28日からiOS 26 SDK以降でのビルドが必須に（4/28〜）",
+    "AGENTS — Android 17 Beta 2が自律AIエージェント向けプラットフォームを本格強化、アプリ開発の常識が揺らぎ始める（4月）",
+    "NO-CODE 70% — 2026年末までに新規業務アプリの70%がローコード／ノーコードで構築されるとGartnerが予測（4月）",
   ],
   en: [
-    "FUNDING — Rork raises $15M Seed led by Left Lane Capital; participants: Peak XV, True Ventures, Goodwater, a16z Speedrun (4/9)",
-    "PAPERLINE — Rork acquires app builder Paperline to accelerate engineering talent and platform expansion (Apr)",
-    "LARGEST — Rork becomes world's largest AI platform for mobile apps by traffic; 9-person team surpasses Replit & Bolt (Apr)",
-    "RORK MAX — Build native SwiftUI apps from natural language; supports Vision Pro, Apple Watch, ARKit, and more (Feb+)",
-    "NO XCODE — Rork Max compiles native Swift via cloud Mac fleet — build and ship to App Store without Xcode (Apr)",
-    "RENAISSANCE — AI coding tools spark 84% YoY surge in new App Store submissions — the Great App Renaissance is here (Q1 2026)",
+    "FUNDING — Rork closes a $15M Seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater, and a16z Speedrun (4/9)",
+    "RORK MAX — Rork Max launches powered by Claude Code and Claude Opus 4.6 — the first Swift app builder on the web to replace Xcode (Apr)",
+    "8M VIEWS — The Rork Max launch post drew 8M+ views on X and doubled annual revenue within two weeks (Apr)",
+    "iOS 26 SDK — Starting April 28, App Store Connect uploads must be built with the iOS 26 SDK or later (4/28+)",
+    "AGENTS — Android 17 Beta 2 lands with deeper platform hooks for autonomous AI agents, shifting what 'app development' means (Apr)",
+    "NO-CODE 70% — Gartner projects 70% of new business apps will be built with low-code / no-code platforms by end of 2026 (Apr)",
   ],
 };
 
