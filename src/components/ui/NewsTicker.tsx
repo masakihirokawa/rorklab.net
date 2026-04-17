@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — Rorkが1500万ドルのシード調達完了、Left Lane Capitalがリード、Peak XV・True Ventures・Goodwater・a16z Speedrun参加（4/9）",
-    "RORK MAX — Claude Code＋Claude Opus 4.6搭載のRork Maxが公開、Web上でXcodeを置き換える初のSwiftアプリビルダーに（4月）",
-    "8M VIEWS — Rork Max発表のXポストが800万閲覧を突破、発表から2週間で年間売上が2倍に（4月）",
-    "iOS 26 SDK — App Store Connectへのアップロードは4月28日からiOS 26 SDK以降でのビルドが必須に（4/28〜）",
-    "AGENTS — Android 17 Beta 2が自律AIエージェント向けプラットフォームを本格強化、アプリ開発の常識が揺らぎ始める（4月）",
-    "NO-CODE 70% — 2026年末までに新規業務アプリの70%がローコード／ノーコードで構築されるとGartnerが予測（4月）",
+    "FORBES — Forbes が Rork を特集「次世代モバイルアプリ開発者を支援する Rork の挑戦」（4/10）",
+    "SEED15M — Rork が1,500万ドルのシード調達、Left Lane Capital 主導・Peak XV・a16z 等が参加（4/9）",
+    "RORKMAX — Rork Max が Claude Code + Claude Opus 4.6 搭載で X に 800万ビュー超え、年収を2週間で倍増（2月）",
+    "NOCODE40 — エンタープライズアプリの 40% が 2026年末までに AI エージェント搭載予定（Gartner）",
+    "FIGMAMAKE — Figma Make が Kit コンテキスト＆アタッチメント機能を追加、プロトタイプ作成を強化（4月）",
+    "APPBLOCKED — Apple が AI コード生成アプリ（Replit・Vibecode 等）をアーキテクチャ問題でブロック（3月）",
   ],
   en: [
-    "FUNDING — Rork closes a $15M Seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater, and a16z Speedrun (4/9)",
-    "RORK MAX — Rork Max launches powered by Claude Code and Claude Opus 4.6 — the first Swift app builder on the web to replace Xcode (Apr)",
-    "8M VIEWS — The Rork Max launch post drew 8M+ views on X and doubled annual revenue within two weeks (Apr)",
-    "iOS 26 SDK — Starting April 28, App Store Connect uploads must be built with the iOS 26 SDK or later (4/28+)",
-    "AGENTS — Android 17 Beta 2 lands with deeper platform hooks for autonomous AI agents, shifting what 'app development' means (Apr)",
-    "NO-CODE 70% — Gartner projects 70% of new business apps will be built with low-code / no-code platforms by end of 2026 (Apr)",
+    "FORBES — Forbes features Rork: 'How Rork Aims To Help The Next Generation Of Mobile App Builders' (4/10)",
+    "SEED15M — Rork raises $15M seed led by Left Lane Capital with Peak XV, a16z Speedrun & more (4/9)",
+    "RORKMAX — Rork Max powered by Claude Code & Opus 4.6 hits 8M+ X views, doubles revenue in 2 weeks (Feb)",
+    "NOCODE40 — 40% of enterprise apps to feature AI agents by year-end 2026 (Gartner)",
+    "FIGMAMAKE — Figma Make adds Kit context & attachments for enhanced prototyping workflow (Apr)",
+    "APPBLOCKED — Apple blocks Replit & Vibecode over AI-coded app architecture concerns (Mar)",
   ],
 };
 
