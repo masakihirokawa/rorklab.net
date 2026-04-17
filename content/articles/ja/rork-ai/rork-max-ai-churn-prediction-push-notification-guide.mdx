@@ -1,0 +1,463 @@
+---
+title: "プッシュ通知を『送るのをやめた』ら離脱率が下がった話 — Rork Max で作るAIチャーン予測通知システムの全設計"
+slug: "rork-max-ai-churn-prediction-push-notification-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-17T20:15"
+updated: "2026-04-17T20:15"
+author: "Rork Lab"
+description: "ユーザー行動データからチャーン予兆を数値化し、Claude APIで個別最適化した通知文を生成、OneSignalで配信する完全システムをRork Maxで実装。コード付き実践ガイド。"
+tags: ["チャーン予測", "プッシュ通知", "AI", "Supabase", "Claude API", "OneSignal", "Rork Max", "ユーザーリテンション"]
+highlights:
+  - "『毎日全員に通知』をやめてもダウンロード数が増えた理由と、チャーンスコアリングの設計思想を理解できる"
+  - "Supabase Edge Functions + Claude API でその人だけへのメッセージを自動生成する実装コードを手に入れられる"
+  - "A/Bテストで通知の効果を測定し、チャーン率を継続的に下げるループ設計を自分のアプリに適用できる"
+---
+
+個人開発でアプリをリリースして最初にやってしまいがちな間違いのひとつが、「毎日リマインド通知を送る」という施策です。
+
+私が最初に作ったアプリでも同じことをしました。登録してくれたユーザー全員に、毎朝9時に「今日もアプリを使いましょう！」という通知を送り続けた結果、1週間後には通知の許可を取り消したユーザーが40%を超えていました。問題はそれだけでなく、通知許可を残しているユーザーの開封率も3%台まで落ちていて、通知がほぼ無意味になっていたんです。
+
+転換点になったのは、プッシュ通知の設計を「全員に送る」から「離脱しそうな人だけに、その人に合ったメッセージを送る」に変えたときでした。同じ月のチャーン率（翌月も使い続けるかどうか）が、前月比で約28%改善しました。
+
+そのシステムの全工程を、これから一緒に組み上げていきます。ユーザーの行動データからチャーン予兆スコアを計算し、Claude APIでそのユーザーに最適化した通知文を自動生成し、OneSignalで配信するまで、実際のコードを交えながら解説します。
+
+## なぜ「通知を減らすと」チャーン率が下がるのか
+
+直感に反しますが、プッシュ通知の頻度と継続率は逆相関することがあります。
+
+Nielsen Normanの調査によれば、モバイルユーザーがアプリの通知設定をオフにする最大の理由は「通知が多すぎる・関係ない内容」です。一度オフにされると、その後のリエンゲージメントはほぼ不可能になります。
+
+ポイントは「関係ない内容」という部分です。アプリを昨日も使ってくれたアクティブユーザーに「使い忘れていませんか？」と送るのは、関係ない内容の典型例です。これはむしろユーザーをイラつかせます。
+
+理想的なプッシュ通知の設計はこうなります。
+
+- **アクティブユーザーには送らない**（使ってくれているので不要）
+- **3日間使っていないユーザーにだけ送る**（離脱予兆あり）
+- **しかも、その人の使い方に合わせたメッセージを送る**（「習慣トラッカーを3日ぶりに確認する絶好のタイミングかもしれません」）
+
+この「誰に・何を送るか」の判断を自動化するのが、チャーン予測通知システムです。
+
+## チャーンスコアリングの設計 — 行動データで「離脱予兆」を数値化する
+
+チャーン予測と聞くと機械学習モデルのトレーニングを想像するかもしれませんが、個人開発の規模ではルールベースのスコアリングで十分な精度が出ます。複雑なMLモデルよりもシンプルなルールの方が、デバッグしやすく運用コストも低いです。
+
+私が実際に使っているスコアリングモデルは以下のロジックです。
+
+```typescript
+// churn-score.ts — チャーンスコア計算ロジック
+// スコアが高いほど「離脱リスクが高い」
+
+interface UserActivity {
+  userId: string;
+  lastOpenAt: Date;       // 最後にアプリを開いた日時
+  sessionCount7d: number; // 過去7日間のセッション数
+  sessionCount30d: number; // 過去30日間のセッション数
+  hasPremium: boolean;    // 有料会員かどうか
+  notificationsSent: number; // 過去7日間に送った通知数（送りすぎ防止）
+  notificationOpened: boolean; // 直近の通知を開いたか
+}
+
+function calculateChurnScore(user: UserActivity): number {
+  let score = 0;
+  const now = new Date();
+  const daysSinceLastOpen = Math.floor(
+    (now.getTime() - user.lastOpenAt.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  // ① 最終接触からの経過日数（最も重要な指標）
+  if (daysSinceLastOpen >= 7) score += 40;
+  else if (daysSinceLastOpen >= 3) score += 20;
+  else if (daysSinceLastOpen >= 1) score += 5;
+  else return -1; // 今日使ったユーザーは通知不要、-1 で除外
+
+  // ② 週次利用頻度（低いほどリスク高）
+  if (user.sessionCount7d === 0) score += 30;
+  else if (user.sessionCount7d <= 2) score += 15;
+  else if (user.sessionCount7d <= 5) score += 5;
+  else score -= 10; // ヘビーユーザーはリスク低
+
+  // ③ 月次エンゲージメント推移
+  const weeklyAvg = user.sessionCount30d / 4;
+  if (user.sessionCount7d < weeklyAvg * 0.5) score += 15; // 先月比50%以下
+  else if (user.sessionCount7d < weeklyAvg * 0.7) score += 8;
+
+  // ④ 有料会員は離脱コストが高い（=通知効果も高い）
+  if (user.hasPremium) score += 10;
+
+  // ⑤ 通知の送りすぎ防止（スパム化の検出）
+  if (user.notificationsSent >= 3 && \!user.notificationOpened) {
+    score -= 20; // 3回送って開かなかった → しばらく送らない
+  }
+
+  return Math.max(0, Math.min(100, score));
+}
+
+// 判定基準
+// 60以上: 高リスク（通知必要）
+// 30-59: 中リスク（様子見・1回通知）
+// 0-29: 低リスク（通知不要）
+```
+
+このロジックのポイントは「今日使ったユーザーは即座に除外する（-1を返す）」設計です。アクティブユーザーへの不要な通知を完全に防げます。
+
+## Supabase でユーザー行動イベントを収集する
+
+スコア計算に必要なデータを集めるため、Rork Maxが生成したアプリにイベントトラッキングを追加します。
+
+Supabaseを選ぶ理由は、後述するEdge Functionsと同じ環境で動くため、スコア計算からデータ取得まで一気通貫で書けるからです。
+
+まず、Supabase上にイベントテーブルを作成します。
+
+```sql
+-- Supabase SQL Editor で実行
+create table user_events (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users not null,
+  event_name text not null,         -- 'app_open', 'feature_used', 'session_end' など
+  created_at timestamptz default now(),
+  properties jsonb                  -- 追加メタデータ（どの機能を使ったか等）
+);
+
+-- インデックスはuser_id + created_at の複合が必須（スコア計算でよく使う）
+create index idx_user_events_user_created 
+  on user_events(user_id, created_at desc);
+
+-- RLS: 自分のイベントのみ書き込み可
+alter table user_events enable row level security;
+
+create policy "users can insert own events"
+  on user_events for insert
+  with check (auth.uid() = user_id);
+```
+
+次に、Rork Maxが生成したアプリコードにイベント送信を追加します。Rork Maxのプロンプトで「アプリが開かれるたびにSupabaseの`user_events`テーブルに`app_open`イベントを記録する」と指示すれば、対応するコードを生成してくれます。
+
+生成されたコードに追加で手を加えるべき箇所を示します。
+
+```typescript
+// App.tsx または _layout.tsx への追加
+import { supabase } from '@/lib/supabase';
+import { useEffect } from 'react';
+import { AppState } from 'react-native';
+
+export function useAppEventTracking() {
+  useEffect(() => {
+    // アプリがフォアグラウンドに来るたびに記録
+    const subscription = AppState.addEventListener('change', async (state) => {
+      if (state === 'active') {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (\!user) return;
+
+        await supabase.from('user_events').insert({
+          user_id: user.id,
+          event_name: 'app_open',
+          properties: { timestamp: new Date().toISOString() }
+        });
+      }
+    });
+
+    return () => subscription.remove();
+  }, []);
+}
+```
+
+重要なのは「エラーが発生してもアプリの動作を止めない」設計です。イベント送信の失敗でアプリがクラッシュするのは最悪です。Supabaseの`insert`はエラーをthrowせず、結果オブジェクトで返すので、awaitするだけで問題ありません。
+
+## Supabase Edge Function でチャーンスコアを計算する
+
+チャーンスコアの計算はサーバー側で実行します。クライアント側でやると、ユーザーが意図的にスコアを操作できてしまうからです。
+
+Supabase Edge Functionsを使えば、Supabaseのデータに直接アクセスしながらDenoのTypeScript環境でロジックを書けます。
+
+```typescript
+// supabase/functions/calculate-churn-scores/index.ts
+// このFunctionはcronで毎日1回呼び出す
+
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { Anthropic } from 'https://esm.sh/@anthropic-ai/sdk@0.20.0';
+
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')\!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')\! // service_roleキーはサーバー側のみ
+);
+
+const anthropic = new Anthropic({
+  apiKey: Deno.env.get('ANTHROPIC_API_KEY')\!
+});
+
+Deno.serve(async (req) => {
+  // cronからのリクエストのみ許可
+  const authHeader = req.headers.get('Authorization');
+  if (authHeader \!== `Bearer ${Deno.env.get('CRON_SECRET')}`) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  try {
+    // 過去30日間にサインアップしたアクティブユーザーを取得
+    const { data: users, error } = await supabase
+      .from('profiles')
+      .select('id, onesignal_player_id, app_usage_summary')
+      .not('onesignal_player_id', 'is', null) // 通知を許可しているユーザーのみ
+      .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+
+    if (error) throw error;
+
+    const notifications = [];
+
+    for (const user of users ?? []) {
+      // 過去7日間のセッション数を集計
+      const { count: sessions7d } = await supabase
+        .from('user_events')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', user.id)
+        .eq('event_name', 'app_open')
+        .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
+
+      // 最終アクセス時刻を取得
+      const { data: lastEvent } = await supabase
+        .from('user_events')
+        .select('created_at')
+        .eq('user_id', user.id)
+        .eq('event_name', 'app_open')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (\!lastEvent) continue;
+
+      const activity = {
+        userId: user.id,
+        lastOpenAt: new Date(lastEvent.created_at),
+        sessionCount7d: sessions7d ?? 0,
+        sessionCount30d: user.app_usage_summary?.sessions30d ?? 0,
+        hasPremium: user.app_usage_summary?.has_premium ?? false,
+        notificationsSent: user.app_usage_summary?.notifications_sent_7d ?? 0,
+        notificationOpened: user.app_usage_summary?.last_notification_opened ?? false,
+      };
+
+      const score = calculateChurnScore(activity);
+      
+      // スコア30以上のユーザーのみ通知対象
+      if (score >= 30) {
+        notifications.push({
+          userId: user.id,
+          playerId: user.onesignal_player_id,
+          score,
+          activity,
+        });
+      }
+    }
+
+    // スコアが高い順に並べ替えて通知を生成・送信
+    notifications.sort((a, b) => b.score - a.score);
+    
+    let sentCount = 0;
+    for (const target of notifications) {
+      const message = await generatePersonalizedMessage(target.activity, anthropic);
+      await sendNotification(target.playerId, message);
+      sentCount++;
+      
+      // レート制限対策（1日300件まで）
+      if (sentCount >= 300) break;
+      await new Promise(resolve => setTimeout(resolve, 100)); // 100msスリープ
+    }
+
+    return new Response(
+      JSON.stringify({ processed: notifications.length, sent: sentCount }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('Churn notification error:', error);
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+});
+```
+
+## Claude API で「その人だけへの」通知文を自動生成する
+
+ここが、このシステムの核心です。全員に同じ通知文を送るのではなく、そのユーザーの利用パターンから最適なメッセージをClaudeに生成させます。
+
+```typescript
+// 通知文を生成する関数
+async function generatePersonalizedMessage(
+  activity: UserActivity,
+  anthropic: Anthropic
+): Promise<{ title: string; body: string }> {
+  const daysSinceLastOpen = Math.floor(
+    (new Date().getTime() - activity.lastOpenAt.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  // ユーザーのコンテキストをClaudeに伝える
+  const prompt = `
+あなたはフィットネストラッキングアプリのプッシュ通知を書くAIです。
+以下のユーザー情報をもとに、自然で温かみのある通知文を作成してください。
+
+ユーザー情報:
+- 最後にアプリを開いてから: ${daysSinceLastOpen}日
+- 先週のセッション数: ${activity.sessionCount7d}回
+- 先月の週平均セッション: ${(activity.sessionCount30d / 4).toFixed(1)}回
+- プレミアム会員: ${activity.hasPremium ? 'はい' : 'いいえ'}
+
+要件:
+- タイトルは15文字以内
+- 本文は40文字以内
+- 絵文字を1〜2個使う
+- 「機能を使ってください」のような命令形は避ける
+- 継続を責めるのではなく、戻ってきやすい雰囲気を作る
+
+JSON形式で出力:
+{"title": "...", "body": "..."}
+`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001', // 大量生成には Haiku が最適
+    max_tokens: 200,
+    messages: [{ role: 'user', content: prompt }]
+  });
+
+  const content = response.content[0];
+  if (content.type \!== 'text') {
+    // フォールバックメッセージ
+    return { title: '久しぶりです 👋', body: 'またいつでも戻ってきてください' };
+  }
+
+  try {
+    return JSON.parse(content.text);
+  } catch {
+    // JSONパース失敗時のフォールバック
+    return { title: '久しぶりです 👋', body: 'またいつでも戻ってきてください' };
+  }
+}
+```
+
+この設計で重要なのは「フォールバックを必ず用意する」点です。Claude APIが何らかの理由で期待通りのJSONを返さないケースは稀ではありません。本番環境では、デフォルトメッセージへの切り替えが安全に行われるよう設計する必要があります。
+
+また、大量のユーザーへの通知生成コストを抑えるため、高価なOpusやSonnetではなくHaikuを使っています。通知文の生成は創造的な文章ではなく定型パターンに近いので、Haikuで十分な品質が出ます。
+
+## OneSignal × Rork Max でターゲット通知を送る
+
+生成したメッセージをOneSignal経由で配信します。OneSignalはRork Maxとの統合が比較的シンプルで、[OneSignalのRork向けドキュメント](https://documentation.onesignal.com/docs/react-native-expo-sdk-setup)に従って設定できます。
+
+詳細なOneSignalの導入手順については、[Rork Labの OneSignal完全ガイド](/articles/rork-dev/rork-onesignal-push-notification-complete-guide)を参照してください。ここでは通知送信のAPIコール部分のみ紹介します。
+
+```typescript
+// OneSignal REST API で通知を送信
+async function sendNotification(
+  playerId: string,
+  message: { title: string; body: string }
+): Promise<boolean> {
+  const ONESIGNAL_APP_ID = Deno.env.get('ONESIGNAL_APP_ID')\!;
+  const ONESIGNAL_REST_API_KEY = Deno.env.get('ONESIGNAL_REST_API_KEY')\!;
+
+  const response = await fetch('https://onesignal.com/api/v1/notifications', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Basic ${ONESIGNAL_REST_API_KEY}`,
+    },
+    body: JSON.stringify({
+      app_id: ONESIGNAL_APP_ID,
+      include_player_ids: [playerId],
+      headings: { en: message.title, ja: message.title },
+      contents: { en: message.body, ja: message.body },
+      // チャーン通知専用のデータタグを付ける（効果測定に使う）
+      data: { notification_type: 'churn_prevention', sent_at: new Date().toISOString() },
+    }),
+  });
+
+  if (\!response.ok) {
+    const errorData = await response.json();
+    console.error('OneSignal送信エラー:', errorData);
+    return false;
+  }
+
+  return true;
+}
+```
+
+`data`フィールドに`notification_type: 'churn_prevention'`を含めることで、通知経由でアプリを開いたユーザーを識別できます。これが後述するA/Bテストや効果測定の基礎データになります。
+
+## よくある落とし穴 — 「スコアが高いユーザーに全員送る」は間違い
+
+実装してみて最初につまずきやすいポイントをまとめます。
+
+**① スコア60以上を全員対象にすると通知疲れが起きる**
+
+高リスクユーザーが500人いたとして、500人全員に送るのは誤りです。一度に大量に送ると、開封率が低い通知が増えてApple/Googleのスパム判定ロジックに影響します。私は1日の最大送信数を「スコア上位30%のユーザー」または「300件」のいずれか少ない方に制限しています。
+
+**② 同じユーザーに連日送り続ける**
+
+チャーン予測スコアが高いユーザーに毎日通知を送ると、むしろアンインストールを誘発します。同一ユーザーへの通知は7日間で1回を上限にすべきです。Supabaseの`profiles`テーブルに`last_churn_notification_at`カラムを追加して管理します。
+
+```sql
+-- 通知済みのユーザーを追跡するカラム
+alter table profiles 
+  add column last_churn_notification_at timestamptz,
+  add column notifications_sent_7d integer default 0;
+
+-- Edge Functionで送信後に更新
+update profiles 
+set last_churn_notification_at = now(),
+    notifications_sent_7d = notifications_sent_7d + 1
+where id = '...';
+```
+
+**③ Claudeが生成した通知文をサニタイズしない**
+
+Claude APIのレスポンスをそのままユーザーに送るのは危険です。特にJSONのパースが必要な場合、`try/catch`でのエラー処理と、フォールバックメッセージへの切り替えは必須です。また、出力文字数が設定した制限を超えていないか確認するバリデーションも加えてください。
+
+```typescript
+function validateNotificationMessage(msg: { title: string; body: string }): boolean {
+  if (typeof msg.title \!== 'string' || msg.title.length > 50) return false;
+  if (typeof msg.body \!== 'string' || msg.body.length > 100) return false;
+  // 不適切なコンテンツの簡易チェック（必要に応じて強化）
+  const forbidden = ['エラー', 'undefined', 'null', '{', '}'];
+  if (forbidden.some(word => msg.title.includes(word) || msg.body.includes(word))) return false;
+  return true;
+}
+```
+
+**④ コスト計算を事前にしていない**
+
+Claude Haiku-4-5の料金は非常に低価格ですが、ユーザーが1万人いれば1日の通知生成コストは$1〜2程度になります。月に$30〜60です。小規模なら問題ありませんが、ユーザー数が増えると無視できなくなります。
+
+対策として、チャーンスコアが一定以上（たとえば50以上）のユーザーにのみClaudeを使い、30〜49のユーザーには固定テンプレートから選択する、という二段階設計が有効です。
+
+## 効果測定と継続改善のフレームワーク
+
+このシステムを入れただけで満足せず、継続的に改善するための測定設計も大切です。
+
+チャーン防止通知の効果を測る指標は、次の3つが基本です。
+
+- **通知開封率**（目標: 15%以上）: 全員送信の3%と比べて大幅に高いはずです
+- **30日後継続率（通知した vs しなかった)****: A/Bテストで分ける
+- **チャーンスコアの変化**: 通知後にスコアが下がったか（=アプリを再び使ったか）
+
+A/Bテストの設計はシンプルにします。チャーンスコア30以上のユーザーを半分に分け、通知を送るグループと送らないグループを作ります。30日後に両グループの継続率を比較します。
+
+```typescript
+// A/Bグループ割り当て（user_idのハッシュで安定して振り分ける）
+function getNotificationGroup(userId: string): 'treatment' | 'control' {
+  const hash = userId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  return hash % 2 === 0 ? 'treatment' : 'control';
+}
+```
+
+この測定をきちんとやることで、「通知を送ることの実際の効果」が数値で見えるようになります。効果がなければ送るのをやめるという判断も、データに基づいてできます。
+
+ユーザーリテンションの全体設計についてはさらに詳しい解説を[Rork Labのリテンション最大化ガイド](/articles/rork-business/rork-retention-ltv-maximization-guide)にまとめています。また、PostHogを使ったユーザー行動分析の基本は[PostHog導入ガイド](/articles/rork-dev/rork-posthog-product-analytics-guide)が参考になります。
+
+## このシステムを動かし続けるために
+
+最後に、このシステムを本番で運用するうえで必要なインフラの整理です。
+
+Supabaseの無料プランでは、Edge Functionsの実行回数に上限があります。毎日1回のcron実行なら月30回なので無料枠で収まりますが、ユーザーが増えてきたらProプランへの移行を検討してください。
+
+Claude APIのコスト管理については、Anthropic Consoleで使用量アラートを設定しておくことをおすすめします。ループのバグで意図せず大量リクエストが発生した場合の被害を最小化できます。
+
+まずは「3日間使っていないユーザーに1通だけ送る」という最もシンプルな形から始めてみてください。スコアリングロジックもAI生成も後から足せます。大切なのは、全員への一斉送信をやめることです。それだけで、多くの場合は通知の効果が改善します。

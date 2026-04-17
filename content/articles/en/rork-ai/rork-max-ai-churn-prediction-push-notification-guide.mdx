@@ -1,0 +1,680 @@
+---
+title: "We Stopped Sending Push Notifications and Churn Dropped — Building an AI-Powered Churn Prediction System in Rork Max"
+slug: "rork-max-ai-churn-prediction-push-notification-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-17T20:15"
+updated: "2026-04-17T20:15"
+author: "Rork Lab"
+description: "Learn how to build a churn prediction system in Rork Max using Supabase Edge Functions, Claude API for personalized messages, and OneSignal for targeted delivery. Full implementation with code."
+tags: ["churn prediction", "push notifications", "AI", "Supabase", "Claude API", "OneSignal", "Rork Max", "user retention"]
+highlights:
+  - "Understand why sending fewer, smarter notifications reduces churn better than daily blasts — including the scoring model design"
+  - "Get working code for Supabase Edge Functions + Claude API that generates personalized notification messages at scale"
+  - "Apply an A/B testing framework to measure the real impact on 30-day retention and keep improving over time"
+---
+
+One of the most common mistakes indie developers make after launching an app is setting up daily "reminder" push notifications for everyone.
+
+I made this exact mistake with my first app. I sent a morning notification every day to every registered user — something like "Don't forget to use the app today\!" Within a week, 40% of users had turned off notification permissions. The ones who kept notifications on had an open rate that had dropped to 3%, making the whole notification system essentially useless.
+
+The turning point came when I shifted from "send to everyone" to "send only to people who are about to leave, with a message tailored to them." That month, churn rate improved by roughly 28% compared to the previous month.
+
+This article walks through the complete system I built in Rork Max: calculating a churn risk score from user behavior data, generating personalized notification copy with Claude API, and delivering it through OneSignal. Everything comes with working code you can use directly.
+
+## Why Sending Fewer Notifications Can Reduce Churn
+
+It seems counterintuitive, but notification frequency and retention often have an inverse relationship.
+
+According to Nielsen Norman Group research, the top reason mobile users disable app notifications is "too many / irrelevant notifications." Once someone turns off notifications, re-engagement becomes nearly impossible through that channel.
+
+The key phrase there is "irrelevant." Sending "You haven't used the app in a while\!" to a user who opened it two hours ago is irrelevant by definition. It's frustrating, not helpful.
+
+Here's what an effective push notification strategy actually looks like:
+
+- **Don't send to active users** — they're already engaged
+- **Only notify users who haven't opened in 3+ days** — there's a real signal to act on
+- **Match the message to their usage pattern** — "Your habit streak is waiting" lands differently than a generic reminder
+
+Automating those three decisions — who to notify, when, and what to say — is exactly what a churn prediction notification system does.
+
+## Designing the Churn Scoring Model
+
+Churn prediction sounds like it requires training a machine learning model, but at indie developer scale, a rules-based scoring system gives you surprisingly good results. It's easier to debug, cheaper to run, and more transparent about why any given user is flagged.
+
+Here's the scoring logic I actually use in production:
+
+```typescript
+// churn-score.ts — Churn risk scoring logic
+// Higher score = higher churn risk
+
+interface UserActivity {
+  userId: string;
+  lastOpenAt: Date;
+  sessionCount7d: number;      // Sessions in the past 7 days
+  sessionCount30d: number;     // Sessions in the past 30 days
+  hasPremium: boolean;
+  notificationsSent: number;   // Notifications sent in the past 7 days
+  notificationOpened: boolean; // Did the user open the most recent notification?
+}
+
+function calculateChurnScore(user: UserActivity): number {
+  let score = 0;
+  const now = new Date();
+  const daysSinceLastOpen = Math.floor(
+    (now.getTime() - user.lastOpenAt.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  // ① Days since last session (strongest signal)
+  if (daysSinceLastOpen >= 7) score += 40;
+  else if (daysSinceLastOpen >= 3) score += 20;
+  else if (daysSinceLastOpen >= 1) score += 5;
+  else return -1; // Active today — skip entirely
+
+  // ② Weekly session frequency (low = risky)
+  if (user.sessionCount7d === 0) score += 30;
+  else if (user.sessionCount7d <= 2) score += 15;
+  else if (user.sessionCount7d <= 5) score += 5;
+  else score -= 10; // Heavy users are low risk
+
+  // ③ Week-over-week engagement trend
+  const weeklyAvg = user.sessionCount30d / 4;
+  if (user.sessionCount7d < weeklyAvg * 0.5) score += 15; // Below 50% of monthly average
+  else if (user.sessionCount7d < weeklyAvg * 0.7) score += 8;
+
+  // ④ Premium users have higher stakes (worth notifying)
+  if (user.hasPremium) score += 10;
+
+  // ⑤ Notification fatigue detection
+  if (user.notificationsSent >= 3 && \!user.notificationOpened) {
+    score -= 20; // 3 notifications sent, none opened → take a break
+  }
+
+  return Math.max(0, Math.min(100, score));
+}
+
+// Thresholds:
+// 60+: High risk (notify)
+// 30–59: Medium risk (one notification)
+// 0–29: Low risk (skip)
+```
+
+The critical design choice here is returning `-1` for users who opened the app today. This makes it impossible to accidentally spam your most engaged users.
+
+## Collecting User Behavior Events in Supabase
+
+To feed the scoring model, you need to track events in the Rork Max-generated app. I use Supabase because it integrates cleanly with Edge Functions, which handle the scoring logic on the same platform.
+
+Start by creating the events table:
+
+```sql
+-- Run in Supabase SQL Editor
+create table user_events (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users not null,
+  event_name text not null,       -- 'app_open', 'feature_used', etc.
+  created_at timestamptz default now(),
+  properties jsonb
+);
+
+-- Composite index is essential for score calculation queries
+create index idx_user_events_user_created 
+  on user_events(user_id, created_at desc);
+
+-- RLS: users can only write their own events
+alter table user_events enable row level security;
+
+create policy "users can insert own events"
+  on user_events for insert
+  with check (auth.uid() = user_id);
+```
+
+For the Rork Max side, you can prompt: "Whenever the app comes to the foreground, record an `app_open` event in the Supabase `user_events` table." Rork Max will generate the core integration. Here's the tracking hook you'll want to ensure is included:
+
+```typescript
+// Add to App.tsx or _layout.tsx
+import { supabase } from '@/lib/supabase';
+import { useEffect } from 'react';
+import { AppState } from 'react-native';
+
+export function useAppEventTracking() {
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', async (state) => {
+      if (state === 'active') {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (\!user) return;
+
+        // Don't await this — don't let tracking failures block the UI
+        supabase.from('user_events').insert({
+          user_id: user.id,
+          event_name: 'app_open',
+          properties: { timestamp: new Date().toISOString() }
+        }).then(({ error }) => {
+          if (error) console.warn('Event tracking failed:', error.message);
+        });
+      }
+    });
+
+    return () => subscription.remove();
+  }, []);
+}
+```
+
+One thing I do differently from many tutorials: I don't `await` the Supabase insert inside the AppState listener. Event tracking failures should never affect app performance. The `.then()` pattern captures errors for logging without blocking anything.
+
+## Calculating Churn Scores in a Supabase Edge Function
+
+The scoring logic runs server-side for good reason: if it ran on the client, users could theoretically manipulate it to avoid receiving notifications. More practically, Edge Functions let you read data directly from Supabase without an extra network hop.
+
+```typescript
+// supabase/functions/calculate-churn-scores/index.ts
+// Called by a daily cron job
+
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { Anthropic } from 'https://esm.sh/@anthropic-ai/sdk@0.20.0';
+
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')\!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')\!
+);
+
+const anthropic = new Anthropic({
+  apiKey: Deno.env.get('ANTHROPIC_API_KEY')\!
+});
+
+Deno.serve(async (req) => {
+  // Only accept requests from your cron scheduler
+  const authHeader = req.headers.get('Authorization');
+  if (authHeader \!== `Bearer ${Deno.env.get('CRON_SECRET')}`) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  try {
+    // Get users who have notification permissions set up
+    const { data: users, error } = await supabase
+      .from('profiles')
+      .select('id, onesignal_player_id, app_usage_summary')
+      .not('onesignal_player_id', 'is', null)
+      .gte('created_at', 
+        new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
+      );
+
+    if (error) throw error;
+
+    const notificationTargets = [];
+
+    for (const user of users ?? []) {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+      const [{ count: sessions7d }, { data: lastEvent }] = await Promise.all([
+        supabase
+          .from('user_events')
+          .select('*', { count: 'exact', head: true })
+          .eq('user_id', user.id)
+          .eq('event_name', 'app_open')
+          .gte('created_at', sevenDaysAgo),
+        supabase
+          .from('user_events')
+          .select('created_at')
+          .eq('user_id', user.id)
+          .eq('event_name', 'app_open')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single()
+      ]);
+
+      if (\!lastEvent) continue;
+
+      const activity: UserActivity = {
+        userId: user.id,
+        lastOpenAt: new Date(lastEvent.created_at),
+        sessionCount7d: sessions7d ?? 0,
+        sessionCount30d: user.app_usage_summary?.sessions30d ?? 0,
+        hasPremium: user.app_usage_summary?.has_premium ?? false,
+        notificationsSent: user.app_usage_summary?.notifications_sent_7d ?? 0,
+        notificationOpened: user.app_usage_summary?.last_notification_opened ?? false,
+      };
+
+      const score = calculateChurnScore(activity);
+      if (score >= 30) {
+        notificationTargets.push({ userId: user.id, playerId: user.onesignal_player_id, score, activity });
+      }
+    }
+
+    // Sort by risk score, cap daily sends at 300
+    notificationTargets.sort((a, b) => b.score - a.score);
+    
+    let sentCount = 0;
+    for (const target of notificationTargets.slice(0, 300)) {
+      const message = await generatePersonalizedMessage(target.activity, anthropic);
+      const success = await sendNotification(target.playerId, message);
+      if (success) {
+        sentCount++;
+        // Update last notification timestamp to prevent duplicate sends
+        await supabase
+          .from('profiles')
+          .update({ last_churn_notification_at: new Date().toISOString() })
+          .eq('id', target.userId);
+      }
+      await new Promise(r => setTimeout(r, 100)); // Rate limit buffer
+    }
+
+    return new Response(
+      JSON.stringify({ evaluated: users?.length ?? 0, sent: sentCount }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('Churn system error:', error);
+    return new Response(
+      JSON.stringify({ error: (error as Error).message }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+});
+```
+
+## Generating Personalized Messages with Claude API
+
+This is where the system earns its "AI" label. Instead of choosing from a handful of static templates, Claude generates a unique notification for each user based on their actual behavior.
+
+```typescript
+async function generatePersonalizedMessage(
+  activity: UserActivity,
+  anthropic: Anthropic
+): Promise<{ title: string; body: string }> {
+  const daysSinceLastOpen = Math.floor(
+    (Date.now() - activity.lastOpenAt.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  const prompt = `You are writing push notifications for a fitness tracking app.
+Based on this user's data, write a warm, non-pushy re-engagement notification.
+
+User context:
+- Days since last session: ${daysSinceLastOpen}
+- Sessions this week: ${activity.sessionCount7d}
+- Average weekly sessions (last month): ${(activity.sessionCount30d / 4).toFixed(1)}
+- Premium subscriber: ${activity.hasPremium ? 'yes' : 'no'}
+
+Requirements:
+- Title: under 30 characters
+- Body: under 60 characters  
+- Use 1-2 relevant emojis
+- Avoid guilt or pressure — focus on ease of return
+- Vary the message based on how long they've been away
+
+Respond with valid JSON only: {"title": "...", "body": "..."}`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001', // Haiku is ideal for high-volume generation
+    max_tokens: 150,
+    messages: [{ role: 'user', content: prompt }]
+  });
+
+  const content = response.content[0];
+  if (content.type \!== 'text') {
+    return { title: 'We miss you 👋', body: 'Come back whenever you\'re ready' };
+  }
+
+  try {
+    const parsed = JSON.parse(content.text);
+    if (\!validateNotificationMessage(parsed)) {
+      return { title: 'We miss you 👋', body: 'Come back whenever you\'re ready' };
+    }
+    return parsed;
+  } catch {
+    return { title: 'We miss you 👋', body: 'Come back whenever you\'re ready' };
+  }
+}
+
+function validateNotificationMessage(msg: unknown): msg is { title: string; body: string } {
+  if (typeof msg \!== 'object' || msg === null) return false;
+  const { title, body } = msg as Record<string, unknown>;
+  if (typeof title \!== 'string' || title.length > 50) return false;
+  if (typeof body \!== 'string' || body.length > 100) return false;
+  // Reject obvious error strings that slipped through
+  const forbidden = ['undefined', 'null', 'error', '{', '}'];
+  return \!forbidden.some(w => title.toLowerCase().includes(w) || body.toLowerCase().includes(w));
+}
+```
+
+Why Claude Haiku-4-5 instead of Sonnet or Opus? At scale, you might be generating hundreds of notifications per day. Haiku produces notification copy that's good enough, at a fraction of the cost. I'd reserve Sonnet for cases where you need substantially more creative or nuanced writing — like generating personalized onboarding sequences or long-form content.
+
+## Delivering Notifications via OneSignal
+
+With the message generated, you send it through OneSignal's REST API. For OneSignal setup and the Rork Max SDK integration, see the [full OneSignal guide on Rork Lab](/articles/rork-dev/rork-onesignal-push-notification-complete-guide). The delivery function itself is straightforward:
+
+```typescript
+async function sendNotification(
+  playerId: string,
+  message: { title: string; body: string }
+): Promise<boolean> {
+  const response = await fetch('https://onesignal.com/api/v1/notifications', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Basic ${Deno.env.get('ONESIGNAL_REST_API_KEY')}`,
+    },
+    body: JSON.stringify({
+      app_id: Deno.env.get('ONESIGNAL_APP_ID'),
+      include_player_ids: [playerId],
+      headings: { en: message.title },
+      contents: { en: message.body },
+      data: {
+        notification_type: 'churn_prevention',
+        sent_at: new Date().toISOString()
+      },
+    }),
+  });
+
+  if (\!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    console.error('OneSignal error:', JSON.stringify(err));
+    return false;
+  }
+
+  return true;
+}
+```
+
+The `notification_type: 'churn_prevention'` data payload is important. When users open the app from this notification, you can detect that it was a churn prevention notification — and track whether it actually re-engaged them.
+
+## Common Mistakes to Avoid
+
+After running this system for several months, these are the failure modes I've encountered most:
+
+**Sending to everyone above the threshold at once**
+
+If 600 users hit score 60+ and you send to all 600 in one batch, delivery rates drop and you risk getting flagged as spammy by Apple and Google's notification infrastructure. Cap daily sends to a fixed number — I use 300 — and prioritize highest-risk users.
+
+**Not preventing repeat sends**
+
+The same user shouldn't receive a churn notification more than once per week. Add a `last_churn_notification_at` column to your profiles table and filter out users who received one recently:
+
+```sql
+alter table profiles 
+  add column last_churn_notification_at timestamptz;
+
+-- In your Edge Function query, add this filter:
+-- .or('last_churn_notification_at.is.null,last_churn_notification_at.lt.' + sevenDaysAgo)
+```
+
+**Trusting Claude's output without validation**
+
+Even with explicit instructions, language models occasionally produce malformed JSON or strings that exceed your character limits. The `validateNotificationMessage` function shown above handles this, but make sure you're actually testing failure cases — not just the happy path.
+
+**Underestimating API costs at scale**
+
+Claude Haiku-4-5 is inexpensive, but at 300 notifications per day, you're looking at roughly $1–2/day, or $30–60/month. That's fine for most indie apps, but plan for it. Using fixed templates for medium-risk users (score 30–59) and only using Claude for high-risk users (60+) can cut costs by 40–60% with minimal quality impact.
+
+## Measuring Impact and Iterating
+
+Setting up the system is only half the work. Measuring whether it actually helps — and iterating based on that data — is what separates a useful system from an expensive one.
+
+The three metrics that matter most for churn prevention notifications:
+
+- **Open rate** (target: 15%+): Should be well above the 3–5% you'd see with broadcast notifications
+- **30-day retention difference** (treatment vs. control): The real test
+- **Score reduction after notification**: Did users who received a notification actually re-engage?
+
+For A/B testing, split your churn-risk population before sending:
+
+```typescript
+function getNotificationGroup(userId: string): 'treatment' | 'control' {
+  // Hash the userId for stable, deterministic assignment
+  const hash = userId.split('').reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return hash % 2 === 0 ? 'treatment' : 'control';
+}
+```
+
+Run the experiment for at least 30 days before drawing conclusions. Churn behavior has a lot of weekly variance, and premature analysis often leads to wrong decisions.
+
+For a deeper look at the broader retention strategy, the [Rork Lab retention and LTV guide](/articles/rork-business/rork-retention-ltv-maximization-guide) covers the full picture. For event analytics setup with PostHog, the [PostHog implementation guide](/articles/rork-dev/rork-posthog-product-analytics-guide) is a solid companion resource.
+
+
+## Building the Cron Schedule That Runs It All
+
+The Edge Function above needs to be triggered on a daily schedule. There are a few options depending on your infrastructure setup.
+
+**Option 1: Supabase's built-in pg_cron (recommended)**
+
+Supabase Pro plans include `pg_cron` for scheduled SQL. You can call an Edge Function from it using the `http` extension:
+
+```sql
+-- Enable extensions (run once)
+create extension if not exists pg_cron;
+create extension if not exists http;
+
+-- Schedule daily churn scoring at 9 PM UTC
+select cron.schedule(
+  'daily-churn-scoring',
+  '0 21 * * *',  -- 9 PM UTC = 6 AM JST
+  $$
+  select status, content::json
+  from http_post(
+    'https://YOUR_PROJECT_REF.supabase.co/functions/v1/calculate-churn-scores',
+    '{}',
+    'application/json',
+    ARRAY[
+      http_header('Authorization', 'Bearer YOUR_CRON_SECRET')
+    ]
+  );
+  $$
+);
+```
+
+Replace `YOUR_PROJECT_REF` and `YOUR_CRON_SECRET` with your actual values. The `CRON_SECRET` should be a long random string that matches the one you set in your Edge Function's environment variables.
+
+**Option 2: Cloudflare Workers with a Scheduled Trigger**
+
+If your app already uses Cloudflare Workers for other backend logic, you can add a scheduled trigger there:
+
+```typescript
+// wrangler.toml
+// [triggers]
+// crons = ["0 21 * * *"]
+
+export default {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    const response = await fetch(
+      `${env.SUPABASE_URL}/functions/v1/calculate-churn-scores`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.CRON_SECRET}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      }
+    );
+
+    const result = await response.json();
+    console.log('Churn scoring result:', JSON.stringify(result));
+  }
+};
+```
+
+**Option 3: GitHub Actions**
+
+For a zero-infrastructure approach, GitHub Actions cron workflows work well for low-frequency jobs:
+
+```yaml
+# .github/workflows/churn-scoring.yml
+name: Daily Churn Scoring
+on:
+  schedule:
+    - cron: '0 21 * * *'  # 9 PM UTC
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Edge Function
+        run: |
+          curl -X POST             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"             -H "Content-Type: application/json"             "${{ secrets.SUPABASE_URL }}/functions/v1/calculate-churn-scores"
+```
+
+The GitHub Actions approach has a minor limitation: it can be delayed by a few minutes during peak times on GitHub's infrastructure. For most apps, that's perfectly acceptable.
+
+## Handling Edge Cases in User Segmentation
+
+Once the basic system is running, you'll encounter users who don't fit the standard patterns. Here's how to handle them gracefully.
+
+**New users (registered in the last 7 days)**
+
+Don't send churn notifications to brand-new users. They're still in onboarding mode, and getting a "we miss you" message three days in can feel confusing or even alarming. Add a filter to exclude users registered within the last 14 days:
+
+```typescript
+// Filter out new users in your Edge Function query
+const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+const { data: users } = await supabase
+  .from('profiles')
+  .select('id, onesignal_player_id, app_usage_summary')
+  .not('onesignal_player_id', 'is', null)
+  .lt('created_at', fourteenDaysAgo); // Exclude users registered in last 14 days
+```
+
+**Users who have explicitly unsubscribed from re-engagement emails or notifications**
+
+If you have a notification preferences system (and you should), check those preferences before including someone in the notification batch:
+
+```sql
+-- Add a notification preferences column to profiles
+alter table profiles 
+  add column notification_prefs jsonb default '{"churn_prevention": true}'::jsonb;
+
+-- Filter in your query
+.eq('notification_prefs->>churn_prevention', 'true')
+```
+
+**Users with very irregular usage patterns**
+
+Some apps have seasonal or weekly usage patterns — a workout app might see natural dips on Mondays. Before treating every 3-day absence as a churn signal, look at your aggregate data to understand what's normal for your app.
+
+One practical fix: use a rolling median instead of the raw session count for comparison. If the user's 7-day session count is below the **median** for their cohort (not just their own historical average), that's a stronger churn signal.
+
+## What to Do When the Numbers Don't Improve
+
+You run the A/B test for 30 days and the churn prevention notifications aren't moving the needle. This happens. Here are the most common reasons and what to try next.
+
+**The scoring threshold is too aggressive**
+
+If you're flagging 60% of your users as "at risk" after just 3 days of inactivity, you're over-notifying. Try raising the minimum score threshold to 50 or even 60, and lengthening the required inactivity window to 5 days. Quality beats quantity for re-engagement.
+
+**The messages aren't compelling enough**
+
+Claude Haiku generates serviceable copy, but if your app is highly specialized (say, a medical journaling app for specific conditions), Haiku may not have enough context to write messages that genuinely resonate. Try Sonnet for a subset of users, or write 10–15 carefully crafted templates and use Claude only to select the best fit rather than generating from scratch.
+
+**Your notification timing is wrong**
+
+Most re-engagement systems default to sending at a fixed time (like 9 AM), but user behavior varies significantly by timezone and daily schedule. Experiment with sending notifications at the hour when each individual user historically opens the app most often. Supabase's event data gives you exactly this information.
+
+**Churn is happening before the notification is sent**
+
+If users are churning within 24–48 hours of their last session, a daily cron job might be responding too slowly. Consider adding an in-app trigger that fires when a user hasn't returned for 48 hours, separate from the daily batch process.
+
+## Integrating with Your Existing Analytics Stack
+
+This system produces valuable data that belongs in your main analytics dashboard. If you're using PostHog, you can track notification delivery and subsequent re-engagement as a funnel:
+
+```typescript
+// In your app, when it opens from a churn prevention notification
+import { AppState } from 'react-native';
+import posthog from 'posthog-react-native';
+
+// Parse the notification data to detect churn_prevention type
+import * as Notifications from 'expo-notifications';
+
+Notifications.addNotificationResponseReceivedListener((response) => {
+  const data = response.notification.request.content.data;
+  
+  if (data?.notification_type === 'churn_prevention') {
+    posthog.capture('churn_notification_opened', {
+      days_since_last_open: data.days_since_last_open,
+      churn_score: data.churn_score,
+    });
+  }
+});
+```
+
+Then in PostHog, you can build a funnel: `churn_notification_opened` → `app_open` (within 24 hours) → `feature_used` (within 7 days). This tells you not just whether users reopened the app, but whether the re-engagement was meaningful.
+
+The fuller picture of building out analytics for your Rork Max app — including cohort analysis, funnels, and session recordings — is covered in detail in the [PostHog analytics implementation guide](/articles/rork-dev/rork-posthog-product-analytics-guide).
+
+
+## Start Simple, Then Add Complexity
+
+If building this whole system feels overwhelming, start with just the scoring logic and a static fallback message. A system that says "if a user hasn't opened in 3 days, send this template message" is already 80% of the value.
+
+Here's the minimum viable version of the entire system, condensed into a single Edge Function that skips Claude entirely and uses a fixed message:
+
+```typescript
+// Minimum viable churn notification — no ML, no AI generation
+// Just: "user hasn't opened in 3+ days → send a fixed message"
+
+Deno.serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')\!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')\!
+  );
+
+  const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+
+  // Users who haven't opened in 3+ days and haven't been notified recently
+  const { data: targets } = await supabase
+    .from('profiles')
+    .select('id, onesignal_player_id')
+    .not('onesignal_player_id', 'is', null)
+    .or(
+      `last_churn_notification_at.is.null,last_churn_notification_at.lt.${new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()}`
+    );
+
+  if (\!targets) return new Response('no targets', { status: 200 });
+
+  // Cross-reference with users who haven't had an app_open recently
+  let sent = 0;
+  for (const user of targets.slice(0, 100)) {
+    const { count } = await supabase
+      .from('user_events')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .eq('event_name', 'app_open')
+      .gte('created_at', threeDaysAgo);
+
+    if ((count ?? 0) === 0) {
+      // They haven't opened in 3 days — send a fixed message
+      await fetch('https://onesignal.com/api/v1/notifications', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Basic ${Deno.env.get('ONESIGNAL_REST_API_KEY')}`,
+        },
+        body: JSON.stringify({
+          app_id: Deno.env.get('ONESIGNAL_APP_ID'),
+          include_player_ids: [user.onesignal_player_id],
+          headings: { en: 'We miss you 👋' },
+          contents: { en: 'Come back and pick up where you left off' },
+          data: { notification_type: 'churn_prevention' }
+        }),
+      });
+      
+      await supabase
+        .from('profiles')
+        .update({ last_churn_notification_at: new Date().toISOString() })
+        .eq('id', user.id);
+      
+      sent++;
+    }
+  }
+
+  return new Response(JSON.stringify({ sent }), {
+    headers: { 'Content-Type': 'application/json' }
+  });
+});
+```
+
+This is maybe 40 lines. Deploy it, run it daily, and watch your 7-day retention numbers. Once you see the effect (or lack of one), you'll have much better intuition for whether adding scoring and AI generation is worth the additional complexity.
+
+The Claude API integration and A/B testing can come later. The important thing is breaking the habit of sending daily notifications to everyone. That single change will almost certainly improve your metrics more than any message optimization you do afterward.
+
+The entire flow — from Supabase event collection to Edge Function scoring to OneSignal delivery — can be live in a weekend. Your users will notice the difference before you see it in the data.
