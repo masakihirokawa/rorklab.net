@@ -1,0 +1,919 @@
+---
+title: "Offline-First Architecture in Rork Apps: WatermelonDB + Supabase Sync Complete Guide"
+slug: "rork-offline-first-watermelondb-supabase-sync-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-19T11:00"
+author: "Rork Lab"
+description: "A complete guide to implementing offline-first architecture in Rork apps using WatermelonDB and Supabase Realtime. Covers local caching, optimistic updates, conflict resolution, and cross-device sync."
+tags: ["Rork", "offline", "WatermelonDB", "Supabase", "sync", "architecture", "React Native"]
+highlights:
+  - "Developers who want offline-capable apps but don't know where to start will be able to get WatermelonDB + Supabase Realtime running today"
+  - "Understand optimistic updates and conflict resolution patterns to build apps where data stays consistent across multiple devices"
+  - "Learn practical Rork prompt patterns that generate offline-first boilerplate efficiently"
+---
+
+One of the most common causes of one-star reviews on productivity apps is a variation of this: "App is useless without WiFi." Mobile users are in subways, rural areas, and cafes with unreliable connections. An app that stops working when the network drops isn't a reliable tool — it's a frustration.
+
+Offline-first is the architecture pattern that solves this. Instead of making API calls and waiting for responses, the app writes to a local database first, shows the user the result immediately, and syncs with the server in the background. Network connectivity becomes a background concern, not a prerequisite.
+
+This guide covers implementing offline-first in Rork apps using WatermelonDB for local persistence and Supabase Realtime for cross-device sync. We'll work through schema design, optimistic updates, the sync engine, conflict resolution, and keeping the implementation manageable with Rork's prompt-driven workflow.
+
+## Why WatermelonDB
+
+React Native has several local storage options: AsyncStorage, MMKV, SQLite, and WatermelonDB. For apps that need real data sync — not just caching a few settings — WatermelonDB is the right choice, and the reason is its design philosophy.
+
+WatermelonDB is built as an **observable database**. When a record changes, React components that observe that record re-render automatically. You don't poll for data, write `useEffect` refresh loops, or manually track whether the local state is stale. The database and the UI stay in sync at the framework level.
+
+It's also designed with lazy loading: a query that matches thousands of records only loads what the screen needs. Scrolling through a large task list stays smooth because WatermelonDB doesn't hydrate the entire result set into memory.
+
+The integration story with Supabase is also strong. WatermelonDB ships a Sync Protocol — a standardized pull/push format for bidirectional sync — which pairs well with Supabase's REST API and Realtime subscriptions.
+
+## Project Setup
+
+After creating your project in Rork, add WatermelonDB and the Supabase client:
+
+```bash
+npx expo install @nozbe/watermelondb @supabase/supabase-js
+npx expo install @nozbe/watermelondb/native
+```
+
+WatermelonDB uses native modules, so you need an Expo dev build rather than Expo Go. With Rork Pro or Max, you can create one via EAS Build:
+
+```bash
+eas build --profile development --platform ios
+```
+
+Add the required Babel plugins to `babel.config.js`:
+
+```javascript
+module.exports = function (api) {
+  api.cache(true);
+  return {
+    presets: ['babel-preset-expo'],
+    plugins: [
+      ['@babel/plugin-proposal-decorators', { legacy: true }],
+      ['@babel/plugin-proposal-class-properties', { loose: true }],
+    ],
+  };
+};
+```
+
+## Schema and Model Definitions
+
+WatermelonDB data structures are defined via a schema and Model classes. Using a task management app as the example:
+
+```typescript
+// db/schema.ts
+import { appSchema, tableSchema } from '@nozbe/watermelondb';
+
+export const schema = appSchema({
+  version: 1,
+  tables: [
+    tableSchema({
+      name: 'tasks',
+      columns: [
+        { name: 'title', type: 'string' },
+        { name: 'body', type: 'string', isOptional: true },
+        { name: 'is_completed', type: 'boolean' },
+        { name: 'priority', type: 'number' },
+        { name: 'project_id', type: 'string', isIndexed: true },
+        { name: 'user_id', type: 'string', isIndexed: true },
+        { name: 'synced_at', type: 'number', isOptional: true },
+        { name: 'is_deleted', type: 'boolean' },  // Soft delete
+        { name: 'created_at', type: 'number' },
+        { name: 'updated_at', type: 'number' },
+      ],
+    }),
+    tableSchema({
+      name: 'projects',
+      columns: [
+        { name: 'name', type: 'string' },
+        { name: 'color', type: 'string' },
+        { name: 'user_id', type: 'string', isIndexed: true },
+        { name: 'synced_at', type: 'number', isOptional: true },
+        { name: 'is_deleted', type: 'boolean' },
+        { name: 'created_at', type: 'number' },
+        { name: 'updated_at', type: 'number' },
+      ],
+    }),
+  ],
+});
+```
+
+```typescript
+// models/Task.ts
+import { Model } from '@nozbe/watermelondb';
+import { field, date, text, action, readonly } from '@nozbe/watermelondb/decorators';
+
+export class Task extends Model {
+  static table = 'tasks';
+  static associations = {
+    projects: { type: 'belongs_to' as const, key: 'project_id' },
+  };
+
+  @text('title') title\!: string;
+  @text('body') body\!: string;
+  @field('is_completed') isCompleted\!: boolean;
+  @field('priority') priority\!: number;
+  @field('project_id') projectId\!: string;
+  @field('user_id') userId\!: string;
+  @field('is_deleted') isDeleted\!: boolean;
+  @readonly @date('created_at') createdAt\!: Date;
+  @readonly @date('updated_at') updatedAt\!: Date;
+
+  @action async complete() {
+    await this.update(task => {
+      task.isCompleted = true;
+    });
+  }
+
+  @action async softDelete() {
+    await this.update(task => {
+      task.isDeleted = true;
+    });
+  }
+}
+```
+
+The `is_deleted` field is for soft deletes. Hard-deleting records (removing them from the local DB) means the deletion can't be communicated to the server during sync. Soft deletes turn "I deleted this" into a syncable change — the deletion propagates to the server and to other devices.
+
+## Database Initialization
+
+```typescript
+// db/index.ts
+import { Database } from '@nozbe/watermelondb';
+import SQLiteAdapter from '@nozbe/watermelondb/adapters/sqlite';
+import { schema } from './schema';
+import { Task } from '../models/Task';
+import { Project } from '../models/Project';
+
+const adapter = new SQLiteAdapter({
+  schema,
+  dbName: 'taskapp',
+  jsi: true,  // JSI for better performance on React Native 0.71+
+  onSetUpError: (error) => {
+    console.error('DB setup error:', error);
+  },
+});
+
+export const database = new Database({
+  adapter,
+  modelClasses: [Task, Project],
+});
+```
+
+```typescript
+// App.tsx
+import { DatabaseProvider } from '@nozbe/watermelondb/DatabaseProvider';
+import { database } from './db';
+
+export default function App() {
+  return (
+    <DatabaseProvider database={database}>
+      {/* rest of your app */}
+    </DatabaseProvider>
+  );
+}
+```
+
+## Optimistic Updates: Show Results Before Server Confirmation
+
+The core mechanic of offline-first is **optimistic updates**. When the user acts, write to the local DB immediately and update the UI — don't wait for server confirmation. Server sync happens in the background.
+
+```typescript
+// hooks/useTaskActions.ts
+import { useDatabase } from '@nozbe/watermelondb/DatabaseProvider';
+
+export function useTaskActions() {
+  const database = useDatabase();
+
+  const addTask = async (title: string, projectId: string, userId: string) => {
+    // Write to local DB immediately — no network call
+    await database.write(async () => {
+      await database.get<Task>('tasks').create(task => {
+        task.title = title;
+        task.projectId = projectId;
+        task.userId = userId;
+        task.isCompleted = false;
+        task.priority = 0;
+        task.isDeleted = false;
+      });
+    });
+    // UI is already updated at this point.
+    // Server sync happens separately in background.
+  };
+
+  const completeTask = async (task: Task) => {
+    await database.write(async () => {
+      await task.update(t => {
+        t.isCompleted = true;
+      });
+    });
+  };
+
+  const deleteTask = async (task: Task) => {
+    await database.write(async () => {
+      await task.update(t => {
+        t.isDeleted = true;  // Soft delete
+      });
+    });
+  };
+
+  return { addTask, completeTask, deleteTask };
+}
+```
+
+With WatermelonDB's `withObservables`, the component automatically re-renders when DB state changes:
+
+```typescript
+// components/TaskList.tsx
+import { withObservables } from '@nozbe/watermelondb';
+import { Q } from '@nozbe/watermelondb';
+
+const TaskList = ({ tasks }: { tasks: Task[] }) => (
+  <FlatList
+    data={tasks.filter(t => \!t.isDeleted)}
+    keyExtractor={item => item.id}
+    renderItem={({ item }) => <TaskItem task={item} />}
+  />
+);
+
+const enhance = withObservables(['projectId'], ({ projectId, database }) => ({
+  tasks: database.get<Task>('tasks').query(
+    Q.where('project_id', projectId),
+    Q.sortBy('created_at', Q.desc)
+  ).observe(),
+}));
+
+export default enhance(TaskList);
+```
+
+The `observe()` call turns the query into a reactive observable. No `useEffect`, no manual refresh, no loading states — the DB is the source of truth and the UI follows it.
+
+## Supabase Sync Engine
+
+The sync engine pulls server changes into the local DB and pushes local changes to the server. WatermelonDB's Sync Protocol defines the shape for this exchange.
+
+First, create the matching tables in Supabase:
+
+```sql
+CREATE TABLE tasks (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT,
+  is_completed BOOLEAN DEFAULT FALSE,
+  priority INTEGER DEFAULT 0,
+  project_id UUID REFERENCES projects(id),
+  user_id UUID REFERENCES auth.users(id),
+  is_deleted BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  _changed TEXT,   -- Column names of local changes (WatermelonDB sync field)
+  _status TEXT     -- 'created' | 'updated' | 'deleted'
+);
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users access own tasks"
+  ON tasks FOR ALL
+  USING (auth.uid() = user_id);
+```
+
+Then implement the sync engine:
+
+```typescript
+// sync/syncEngine.ts
+import { synchronize } from '@nozbe/watermelondb/sync';
+import { supabase } from '../lib/supabase';
+import { database } from '../db';
+
+class SyncEngine {
+  private syncPromise: Promise<void> | null = null;
+
+  async sync(): Promise<void> {
+    // Prevent double-sync
+    if (this.syncPromise) return this.syncPromise;
+
+    this.syncPromise = this._performSync().finally(() => {
+      this.syncPromise = null;
+    });
+    return this.syncPromise;
+  }
+
+  private async _performSync(): Promise<void> {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (\!user) return;
+
+    await synchronize({
+      database,
+
+      pullChanges: async ({ lastPulledAt }) => {
+        const timestamp = lastPulledAt
+          ? new Date(lastPulledAt).toISOString()
+          : '1970-01-01';
+
+        const [tasksRes, projectsRes] = await Promise.all([
+          supabase.from('tasks').select('*')
+            .eq('user_id', user.id).gt('updated_at', timestamp),
+          supabase.from('projects').select('*')
+            .eq('user_id', user.id).gt('updated_at', timestamp),
+        ]);
+
+        if (tasksRes.error) throw tasksRes.error;
+        if (projectsRes.error) throw projectsRes.error;
+
+        return {
+          changes: {
+            tasks: {
+              created: tasksRes.data.filter(r => r._status === 'created'),
+              updated: tasksRes.data.filter(r => r._status === 'updated'),
+              deleted: tasksRes.data
+                .filter(r => r.is_deleted)
+                .map(r => r.id),
+            },
+            projects: {
+              created: projectsRes.data.filter(r => r._status === 'created'),
+              updated: projectsRes.data.filter(r => r._status === 'updated'),
+              deleted: projectsRes.data
+                .filter(r => r.is_deleted)
+                .map(r => r.id),
+            },
+          },
+          timestamp: Date.now(),
+        };
+      },
+
+      pushChanges: async ({ changes }) => {
+        const { tasks, projects } = changes;
+
+        if (tasks) {
+          const toUpsert = [
+            ...(tasks.created || []),
+            ...(tasks.updated || []),
+          ].map(task => ({ ...task, user_id: user.id }));
+
+          if (toUpsert.length > 0) {
+            const { error } = await supabase
+              .from('tasks')
+              .upsert(toUpsert, { onConflict: 'id' });
+            if (error) throw error;
+          }
+
+          for (const id of tasks.deleted || []) {
+            await supabase.from('tasks')
+              .update({ is_deleted: true })
+              .eq('id', id).eq('user_id', user.id);
+          }
+        }
+
+        if (projects) {
+          const toUpsert = [
+            ...(projects.created || []),
+            ...(projects.updated || []),
+          ].map(p => ({ ...p, user_id: user.id }));
+
+          if (toUpsert.length > 0) {
+            await supabase.from('projects')
+              .upsert(toUpsert, { onConflict: 'id' });
+          }
+        }
+      },
+    });
+  }
+}
+
+export const syncEngine = new SyncEngine();
+```
+
+## Conflict Resolution
+
+The hardest problem in offline sync: Device A and Device B both edit the same task while offline. When they come back online, which version wins?
+
+Three common strategies:
+
+**Last Write Wins**: The record with the newer `updated_at` timestamp wins. Simplest to implement; works well for most personal apps. Vulnerable to clock skew and rapid edits.
+
+**Server Wins**: Pull changes always override local state during sync. Gives the server authority. Right for single-user apps where the server is the canonical source.
+
+**Field-Level Merge**: Track which fields were changed locally using WatermelonDB's `_changed` column (a comma-separated list of modified field names). On conflict, apply only the locally-changed fields on top of the server state. Two devices editing different fields — one changes the title, another marks it complete — both changes survive.
+
+```typescript
+// sync/conflictResolver.ts
+
+type ConflictStrategy = 'last-write-wins' | 'server-wins' | 'field-merge';
+
+export function resolveConflict(
+  local: Record<string, unknown>,
+  remote: Record<string, unknown>,
+  strategy: ConflictStrategy = 'field-merge'
+): Record<string, unknown> {
+  switch (strategy) {
+    case 'last-write-wins': {
+      const localTs = new Date(local.updated_at as string).getTime();
+      const remoteTs = new Date(remote.updated_at as string).getTime();
+      return localTs > remoteTs ? local : remote;
+    }
+
+    case 'server-wins':
+      return remote;
+
+    case 'field-merge': {
+      const localChangedFields = ((local._changed as string) || '')
+        .split(',')
+        .filter(Boolean);
+
+      const merged = { ...remote };
+
+      // Apply only the fields that were explicitly changed locally
+      for (const field of localChangedFields) {
+        if (field in local) {
+          merged[field] = local[field];
+        }
+      }
+
+      merged.updated_at = new Date().toISOString();
+      return merged;
+    }
+  }
+}
+```
+
+For solo note-taking and habit apps, last-write-wins is fine. For task managers or anything with collaborative potential, field-merge produces noticeably better behavior.
+
+## Realtime Sync Trigger via Supabase
+
+Rather than only syncing on a schedule, Supabase Realtime lets you push-trigger sync when the server sees changes from other devices:
+
+```typescript
+// hooks/useRealtimeSync.ts
+import { useEffect, useRef } from 'react';
+import { AppState } from 'react-native';
+import { supabase } from '../lib/supabase';
+import { syncEngine } from '../sync/syncEngine';
+
+export function useRealtimeSync(userId: string) {
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+
+  useEffect(() => {
+    channelRef.current = supabase
+      .channel(`tasks:${userId}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'tasks',
+        filter: `user_id=eq.${userId}`,
+      }, async () => {
+        await syncEngine.sync();
+      })
+      .subscribe();
+
+    // Also sync when app comes back to foreground
+    const sub = AppState.addEventListener('change', async state => {
+      if (state === 'active') await syncEngine.sync();
+    });
+
+    return () => {
+      channelRef.current?.unsubscribe();
+      sub.remove();
+    };
+  }, [userId]);
+}
+```
+
+This combination — Realtime push for immediate delivery, AppState foreground trigger for recovery after disconnection — covers the main sync scenarios without polling.
+
+## Showing Sync Status to Users
+
+Offline-first apps should be transparent about network state. Users need to know when they're offline and when changes are pending sync.
+
+```typescript
+// components/SyncStatusBar.tsx
+import NetInfo from '@react-native-community/netinfo';
+
+export function SyncStatusBar() {
+  const [isOnline, setIsOnline] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  useEffect(() => {
+    return NetInfo.addEventListener(async state => {
+      const online = state.isConnected ?? false;
+      setIsOnline(online);
+
+      if (online) {
+        setIsSyncing(true);
+        await syncEngine.sync();
+        setIsSyncing(false);
+      }
+    });
+  }, []);
+
+  if (\!isOnline) {
+    return (
+      <View style={styles.offlineBanner}>
+        <Text>Offline — changes will sync when connection returns</Text>
+      </View>
+    );
+  }
+
+  if (isSyncing) {
+    return (
+      <View style={styles.syncingBanner}>
+        <ActivityIndicator size="small" />
+        <Text>Syncing...</Text>
+      </View>
+    );
+  }
+
+  return null;
+}
+```
+
+A subtle but important detail: "your data is safe even offline" should feel obvious to the user, not something they have to figure out. A clear status indicator builds that confidence.
+
+## Managing Data Volume Over Time
+
+Offline-first databases accumulate data. A few strategies to keep the local DB from growing unbounded:
+
+**Binary data lives in cloud storage, not the local DB.** Store image URLs in WatermelonDB; store the actual images in Supabase Storage or Cloudflare R2. Sync metadata, not media.
+
+**Scope sync to a recent window.** For most apps, syncing the last 30 or 60 days covers 99% of user behavior. Older data can be fetched on demand from an archive endpoint.
+
+**Periodically hard-delete soft-deleted records.** Soft-deleted records (is_deleted = true) need to stay around long enough to propagate the deletion to all devices. After 30 days, they can be physically removed:
+
+```typescript
+export async function cleanupDeletedRecords() {
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+  await database.write(async () => {
+    const oldDeleted = await database
+      .get<Task>('tasks')
+      .query(
+        Q.where('is_deleted', true),
+        Q.where('updated_at', Q.lt(thirtyDaysAgo))
+      )
+      .fetch();
+
+    for (const task of oldDeleted) {
+      await task.destroyPermanently();
+    }
+  });
+}
+```
+
+Running this in a background task (via Expo Background Fetch or a similar mechanism) keeps the local DB clean without user impact.
+
+## Prompting Rork for Offline-First Boilerplate
+
+Rork generates offline-first boilerplate well when the prompt is explicit about the architecture:
+
+```
+Create a task management app with offline-first architecture.
+
+Requirements:
+- Local persistence via WatermelonDB (SQLite)
+- Bidirectional sync with Supabase (last-write-wins conflict resolution)
+- All features work without network connectivity
+- Optimistic updates for all task CRUD operations
+
+Tables: tasks (id, title, is_completed, user_id, updated_at, is_deleted)
+Auth: Supabase Auth (email/password)
+```
+
+After the initial generation, iterate on specific behaviors:
+
+```
+When a task is deleted, use a soft delete (set is_deleted to true) 
+rather than removing the record. Filter deleted tasks from the UI,
+and propagate is_deleted=true to the server during sync.
+```
+
+Rork handles these incremental refinements well. Building the architecture in layers — first the schema and models, then the sync engine, then conflict resolution — produces more coherent code than trying to specify everything in one large prompt.
+
+## The Payoff
+
+Offline-first architecture is an investment in perceived reliability. Users who can add a task on the subway and see it still there when they emerge from the station become users who give five-star reviews and recommend the app.
+
+The WatermelonDB + Supabase Realtime stack makes this achievable for solo developers. The observability model eliminates a category of UI state management bugs. The Sync Protocol gives bidirectional sync a defined structure rather than a custom implementation problem. And Rork's prompt-driven workflow means you can generate and iterate on the boilerplate without writing it from scratch.
+
+For the push notification side of this architecture — notifying users when their data changes on another device — the [Rork Push Notification guide](/articles/rork-dev/rork-push-notifications) covers the implementation.
+
+## Testing Offline Behavior: What to Verify Before Shipping
+
+Offline-first behavior is subtle enough that it needs deliberate testing. Here are the scenarios that catch the most bugs:
+
+**Scenario 1: Create while offline, sync when online**
+1. Turn on airplane mode
+2. Create several tasks
+3. Turn airplane mode off
+4. Verify all tasks appear in Supabase with correct data
+
+**Scenario 2: Edit on two devices while offline**
+1. Open the app on Device A and Device B (both online, data synced)
+2. Turn both to airplane mode
+3. On Device A, edit the title of Task X to "Device A version"
+4. On Device B, mark Task X as complete
+5. Bring Device A online, wait for sync
+6. Bring Device B online, wait for sync
+7. Verify: Task X has "Device A version" as the title AND is marked complete (field-merge working)
+
+**Scenario 3: Delete on one device, edit on another**
+1. Online state: Task Y exists on both devices
+2. Both devices go offline
+3. Device A deletes Task Y (soft delete)
+4. Device B edits Task Y's title
+5. Both come online
+6. Expected behavior: Task Y is deleted (deletion takes precedence). Verify it's gone from Device B's UI after sync.
+
+The delete-vs-edit conflict is the case most teams get wrong the first time. The simplest policy is "deletion always wins" — if any device soft-deletes a record, that deletion propagates and other changes to the same record are discarded. This matches user intent: if you explicitly deleted something, you don't want a stale edit from another device to resurrect it.
+
+Implement this in your push logic:
+
+```typescript
+pushChanges: async ({ changes }) => {
+  const { tasks } = changes;
+  if (\!tasks) return;
+
+  // Process deletions first — they override any concurrent edits
+  for (const id of tasks.deleted || []) {
+    await supabase
+      .from('tasks')
+      .update({ is_deleted: true, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('user_id', user.id);
+  }
+
+  // Only upsert non-deleted records
+  const toUpsert = [
+    ...(tasks.created || []),
+    ...(tasks.updated || []),
+  ].filter(t => \!t.is_deleted)
+   .map(task => ({ ...task, user_id: user.id }));
+
+  if (toUpsert.length > 0) {
+    await supabase.from('tasks').upsert(toUpsert, { onConflict: 'id' });
+  }
+},
+```
+
+**Scenario 4: Sync with a large local queue**
+
+After long offline periods (days, not minutes), the push queue can be large. Test with 50–100 queued changes:
+
+- Verify all records reach Supabase correctly
+- Check for rate limiting (Supabase has default rate limits on the free tier)
+- Verify the UI remains responsive during the sync
+
+For large queues, batch your upserts rather than sending all records in a single request:
+
+```typescript
+async function batchUpsert(
+  table: string,
+  records: Record<string, unknown>[],
+  batchSize = 50
+) {
+  for (let i = 0; i < records.length; i += batchSize) {
+    const batch = records.slice(i, i + batchSize);
+    const { error } = await supabase
+      .from(table)
+      .upsert(batch, { onConflict: 'id' });
+    if (error) throw error;
+    // Small delay to avoid overwhelming the API
+    if (i + batchSize < records.length) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+}
+```
+
+## Error Handling and Sync Recovery
+
+The sync engine will fail. Network errors, Supabase rate limits, schema mismatches after app updates — there are many failure modes. The engine needs to fail gracefully and retry automatically.
+
+```typescript
+class SyncEngine {
+  private retryDelays = [1000, 3000, 10000, 30000]; // ms
+  private consecutiveFailures = 0;
+
+  async sync(): Promise<{ success: boolean; error?: string }> {
+    if (this.syncPromise) return this.syncPromise.then(() => ({ success: true }));
+
+    try {
+      await this._performSync();
+      this.consecutiveFailures = 0;
+      return { success: true };
+    } catch (error) {
+      this.consecutiveFailures++;
+      const delay = this.retryDelays[
+        Math.min(this.consecutiveFailures - 1, this.retryDelays.length - 1)
+      ];
+
+      console.warn(`Sync failed (attempt ${this.consecutiveFailures}), retrying in ${delay}ms:`, error);
+
+      setTimeout(() => this.sync(), delay);
+      return { success: false, error: String(error) };
+    }
+  }
+
+  // Reset failure count when network comes back
+  onNetworkRestore() {
+    this.consecutiveFailures = 0;
+    this.sync();
+  }
+}
+```
+
+The exponential backoff pattern (1s, 3s, 10s, 30s) prevents hammering the API when there's a persistent failure, while still recovering quickly from transient errors.
+
+One specific failure mode worth handling explicitly: **schema version mismatch**. If you ship an app update that adds a column, users with the old schema in their local DB need a migration. WatermelonDB handles migrations through its `migrations` object:
+
+```typescript
+import { schemaMigrations, createTable, addColumns } from '@nozbe/watermelondb/Schema/migrations';
+
+export const migrations = schemaMigrations({
+  migrations: [
+    {
+      toVersion: 2,
+      steps: [
+        addColumns({
+          table: 'tasks',
+          columns: [
+            { name: 'due_date', type: 'number', isOptional: true },
+          ],
+        }),
+      ],
+    },
+  ],
+});
+```
+
+Pass `migrations` to the SQLiteAdapter alongside `schema`. WatermelonDB runs the appropriate migration steps when the app opens and detects an older local schema version.
+
+## Sync Performance Monitoring
+
+In production, you want visibility into how the sync engine is performing across your user base. Logging key metrics to PostHog (or similar) gives you this:
+
+```typescript
+async _performSync(): Promise<void> {
+  const startTime = Date.now();
+  let pulledCount = 0;
+  let pushedCount = 0;
+
+  await synchronize({
+    database,
+    pullChanges: async (params) => {
+      const result = await this._pullFromSupabase(params);
+      pulledCount = Object.values(result.changes).reduce((sum, table) => {
+        return sum + (table.created?.length ?? 0) + (table.updated?.length ?? 0);
+      }, 0);
+      return result;
+    },
+    pushChanges: async ({ changes }) => {
+      pushedCount = Object.values(changes).reduce((sum, table) => {
+        return sum + (table?.created?.length ?? 0) + (table?.updated?.length ?? 0);
+      }, 0);
+      await this._pushToSupabase(changes);
+    },
+  });
+
+  const duration = Date.now() - startTime;
+
+  // Log to PostHog
+  posthog.capture('sync_completed', {
+    duration_ms: duration,
+    pulled_records: pulledCount,
+    pushed_records: pushedCount,
+    consecutive_failures: this.consecutiveFailures,
+  });
+
+  if (duration > 5000) {
+    // Slow sync alert — investigate if this becomes common
+    posthog.capture('sync_slow', { duration_ms: duration });
+  }
+}
+```
+
+Tracking `duration_ms` and record counts over time surfaces problems early: a sudden spike in `pulled_records` might indicate a data integrity issue; consistently high `duration_ms` might indicate a missing database index on the Supabase side.
+
+## Database Indexing: The Silent Performance Killer
+
+One thing that's easy to overlook when the data set is small but becomes painful at scale: **missing indexes in Supabase**.
+
+The sync query filters by `user_id` and sorts by `updated_at`. Without indexes on these columns, every sync does a full table scan — fine for hundreds of rows, slow for tens of thousands.
+
+```sql
+-- Add these indexes to Supabase
+CREATE INDEX idx_tasks_user_id ON tasks(user_id);
+CREATE INDEX idx_tasks_updated_at ON tasks(updated_at);
+CREATE INDEX idx_tasks_user_updated ON tasks(user_id, updated_at);  -- Composite index for sync query
+
+CREATE INDEX idx_projects_user_id ON projects(user_id);
+CREATE INDEX idx_projects_updated_at ON projects(updated_at);
+```
+
+The composite index `(user_id, updated_at)` matches the exact query pattern of the sync pull: `WHERE user_id = $1 AND updated_at > $2`. Supabase's query planner will use this index efficiently.
+
+Check your current index usage in Supabase by running this in the SQL editor after some sync activity:
+
+```sql
+SELECT
+  schemaname,
+  tablename,
+  indexname,
+  idx_scan,     -- How many times this index was used
+  idx_tup_read  -- How many rows were fetched via this index
+FROM pg_stat_user_indexes
+WHERE tablename IN ('tasks', 'projects')
+ORDER BY idx_scan DESC;
+```
+
+Indexes with `idx_scan = 0` are candidates for removal (they add write overhead with no read benefit).
+
+## Handling Auth Token Expiry During Long Offline Periods
+
+A subtle edge case: the user goes offline for several days, then comes back. Their Supabase JWT access token may have expired during that time. The sync engine needs to refresh the token before attempting to push.
+
+```typescript
+async _performSync(): Promise<void> {
+  const { data: { session }, error } = await supabase.auth.getSession();
+
+  if (error || \!session) {
+    // User is logged out — don't sync, surface a re-auth prompt
+    this.onAuthExpired?.();
+    return;
+  }
+
+  // Check if token is about to expire (within 5 minutes)
+  const expiresAt = session.expires_at ?? 0;
+  const fiveMinutesFromNow = Math.floor(Date.now() / 1000) + 300;
+
+  if (expiresAt < fiveMinutesFromNow) {
+    const { error: refreshError } = await supabase.auth.refreshSession();
+    if (refreshError) {
+      this.onAuthExpired?.();
+      return;
+    }
+  }
+
+  // Token is valid — proceed with sync
+  await synchronize({ /* ... */ });
+}
+```
+
+Supabase's session tokens have a configurable expiry (default: 1 hour for the access token, 1 week for the refresh token). The refresh token can be used to get a new access token without requiring the user to log in again. The code above handles both cases: token close to expiry (refresh it) and refresh token expired (prompt re-login).
+
+## Structuring Your Rork Prompts for This Architecture
+
+One pattern that works well when building this in Rork: use a **layered prompt strategy** rather than a single large specification.
+
+**Layer 1 — Core model and schema:**
+```
+Create a WatermelonDB schema with a tasks table.
+Columns: title (string), is_completed (boolean), priority (number),
+user_id (string indexed), is_deleted (boolean), created_at, updated_at.
+Generate the Task model class with @action decorators for complete() and softDelete().
+```
+
+**Layer 2 — Database provider and initialization:**
+```
+Add SQLiteAdapter initialization with the schema from above.
+Wrap the app in DatabaseProvider. Use JSI mode for better performance.
+```
+
+**Layer 3 — Optimistic update hooks:**
+```
+Create a useTaskActions hook that writes to the local WatermelonDB database
+directly (no network calls). Operations: addTask, completeTask, deleteTask (soft delete).
+```
+
+**Layer 4 — Observable component:**
+```
+Create a TaskList component that uses withObservables to watch the tasks table
+and re-render automatically when records change.
+Filter out is_deleted=true records.
+```
+
+**Layer 5 — Sync engine:**
+```
+Add a SyncEngine class using WatermelonDB's synchronize() function.
+Pull from Supabase using updated_at as the cursor.
+Push local changes with upsert. Handle soft deletes.
+Prevent double-sync with a singleton promise.
+```
+
+Each layer builds on the previous one and can be tested independently. Rork handles this incremental style well — you're less likely to get a tangled initial generation that you have to manually untangle.
+
+## Why This Architecture Improves App Store Performance
+
+Beyond the technical benefits, offline-first architecture has a measurable impact on app store metrics:
+
+**Session length increases.** When the app works in any connectivity state, users don't get interrupted and leave. They continue the session, which signals engagement to app store algorithms.
+
+**Crash rate drops.** A significant fraction of crashes in connectivity-dependent apps are network error handling failures — an API call returns an unexpected error, the error isn't handled, and the app crashes. Offline-first eliminates most of these code paths because the UI never directly waits for a network response.
+
+**Review sentiment improves.** "Works offline" and "fast and reliable" are common positive review phrases for apps with good local-first design. "Stopped working on the bus" is a common negative phrase for apps without it.
+
+These are the kinds of secondary effects that compound over time and separate apps that retain users from apps that don't. Building this architecture is an investment in the app's long-term health, not just a technical nicety.
+
+The next step after offline sync is making the app observable in production — knowing when sync failures are happening across your user base before users file support requests. That's where PostHog's product analytics integration with WatermelonDB event tracking becomes valuable. The [Rork × PostHog guide](/articles/rork-dev/rork-posthog-product-analytics-guide) covers the instrumentation side.

@@ -1,0 +1,666 @@
+---
+title: "RorkアプリにオフラインファーストアーキテクチャをSupabase同期で実装する完全ガイド"
+slug: "rork-offline-first-watermelondb-supabase-sync-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-19T11:00"
+author: "Rork Lab"
+description: "WatermelonDB + Supabase Realtimeを使ってRorkアプリにオフラインファーストを実装する方法を解説します。ローカルキャッシュ・楽観的更新・コンフリクト解決まで本番設計を徹底的に解説します。"
+tags: ["Rork", "オフライン", "WatermelonDB", "Supabase", "同期", "アーキテクチャ", "React Native"]
+highlights:
+  - "オフライン時も操作が止まらないアプリを作りたいが、どこから手をつけていいか分からなかった人が、WatermelonDB + Supabase Realtimeの構成を今日から動かせるようになる"
+  - "楽観的更新とコンフリクト解決の設計パターンを理解し、複数デバイス間でデータが壊れないアプリを実装できるようになる"
+  - "Rorkのプロンプトでオフラインファースト設計のボイラープレートを生成する実践的なプロンプトパターンを習得できる"
+---
+
+アプリが「オフラインで使えない」ことが理由でレビューに低評価が入るのは、開発者にとってもっとも避けたいシナリオの一つです。モバイルアプリを使う環境は、地下鉄・山間部・通信が不安定なカフェなど、常にオンラインとは限りません。「ネット接続が切れたらアプリが止まる」という設計は、ユーザー体験を著しく損ないます。
+
+この記事では、RorkアプリにオフラインファーストアーキテクチャをWatermelonDB + Supabase Realtimeの組み合わせで実装する方法を、設計の考え方からコードの実装まで解説します。楽観的更新・コンフリクト解決・デバイス間同期という、オフラインファースト実装の三大難所についても、実践的なパターンを示します。
+
+## なぜWatermelonDBなのか
+
+React Nativeのオフラインストレージには複数の選択肢があります。AsyncStorage・MMKV・SQLite・WatermelonDBがよく名前の挙がる候補ですが、**本格的なデータ同期が必要なアプリにはWatermelonDBが最適解**と考えています。
+
+理由は設計思想にあります。WatermelonDBは「観察可能なデータベース」として作られています。テーブルのレコードが変化すると、そのレコードを参照しているReactコンポーネントが自動的に再レンダリングされます。SQLiteのような直接クエリを書くスタイルとは異なり、データの変化がUIに自動伝播する仕組みが組み込まれています。
+
+また、WatermelonDBはLazy Loadingで設計されており、大量のレコードがあっても画面に必要な分だけ読み込みます。数万件のタスクを持つプロジェクト管理アプリでも、UIのスクロールがスムーズに保たれます。
+
+Supabaseとの親和性も高く、後述するSync Protocolを使うと双方向同期の実装コストが大幅に下がります。
+
+## プロジェクトのセットアップ
+
+Rorkで新規プロジェクトを作成したら、まずWatermelonDBとSupabaseクライアントを導入します。
+
+```bash
+npx expo install @nozbe/watermelondb @supabase/supabase-js
+npx expo install @nozbe/watermelondb/native
+```
+
+WatermelonDBはネイティブモジュールを使用するため、Expoのdev buildが必要です。Rork ProまたはMaxであれば、EAS Buildでdev buildを作成できます。
+
+```bash
+eas build --profile development --platform ios
+```
+
+次に、`babel.config.js` にWatermelonDBのBabelプラグインを追加します：
+
+```javascript
+// babel.config.js
+module.exports = function (api) {
+  api.cache(true);
+  return {
+    presets: ['babel-preset-expo'],
+    plugins: [
+      ['@babel/plugin-proposal-decorators', { legacy: true }],
+      ['@babel/plugin-proposal-class-properties', { loose: true }],
+    ],
+  };
+};
+```
+
+## モデル定義：スキーマとモデルクラス
+
+WatermelonDBのデータ構造はSchemaとModelクラスで定義します。タスク管理アプリを例に取ります。
+
+```typescript
+// db/schema.ts
+import { appSchema, tableSchema } from '@nozbe/watermelondb';
+
+export const schema = appSchema({
+  version: 1,
+  tables: [
+    tableSchema({
+      name: 'tasks',
+      columns: [
+        { name: 'title', type: 'string' },
+        { name: 'body', type: 'string', isOptional: true },
+        { name: 'is_completed', type: 'boolean' },
+        { name: 'priority', type: 'number' },
+        { name: 'project_id', type: 'string', isIndexed: true },
+        { name: 'user_id', type: 'string', isIndexed: true },
+        // 同期のために重要なフィールド
+        { name: 'synced_at', type: 'number', isOptional: true },
+        { name: 'is_deleted', type: 'boolean' },  // ソフトデリート
+        { name: 'created_at', type: 'number' },
+        { name: 'updated_at', type: 'number' },
+      ],
+    }),
+    tableSchema({
+      name: 'projects',
+      columns: [
+        { name: 'name', type: 'string' },
+        { name: 'color', type: 'string' },
+        { name: 'user_id', type: 'string', isIndexed: true },
+        { name: 'synced_at', type: 'number', isOptional: true },
+        { name: 'is_deleted', type: 'boolean' },
+        { name: 'created_at', type: 'number' },
+        { name: 'updated_at', type: 'number' },
+      ],
+    }),
+  ],
+});
+```
+
+```typescript
+// models/Task.ts
+import { Model } from '@nozbe/watermelondb';
+import { field, date, text, relation, action, readonly } from '@nozbe/watermelondb/decorators';
+
+export class Task extends Model {
+  static table = 'tasks';
+  static associations = {
+    projects: { type: 'belongs_to' as const, key: 'project_id' },
+  };
+
+  @text('title') title\!: string;
+  @text('body') body\!: string;
+  @field('is_completed') isCompleted\!: boolean;
+  @field('priority') priority\!: number;
+  @field('project_id') projectId\!: string;
+  @field('user_id') userId\!: string;
+  @field('is_deleted') isDeleted\!: boolean;
+  @readonly @date('created_at') createdAt\!: Date;
+  @readonly @date('updated_at') updatedAt\!: Date;
+
+  @action async complete() {
+    await this.update(task => {
+      task.isCompleted = true;
+    });
+  }
+
+  @action async softDelete() {
+    await this.update(task => {
+      task.isDeleted = true;
+    });
+  }
+}
+```
+
+`is_deleted` フィールドはソフトデリートのためのものです。ハードデリート（DBからレコードを物理削除）するとオフライン中に削除した事実がサーバーに伝わらなくなります。ソフトデリートにしておくことで、「削除した」という変更も同期対象にできます。
+
+## データベースの初期化とProviderの設定
+
+```typescript
+// db/index.ts
+import { Database } from '@nozbe/watermelondb';
+import SQLiteAdapter from '@nozbe/watermelondb/adapters/sqlite';
+import { schema } from './schema';
+import { Task } from '../models/Task';
+import { Project } from '../models/Project';
+
+const adapter = new SQLiteAdapter({
+  schema,
+  dbName: 'taskapp',
+  jsi: true,  // JIT優化（React Native 0.71+）
+  onSetUpError: (error) => {
+    console.error('DB setup error:', error);
+  },
+});
+
+export const database = new Database({
+  adapter,
+  modelClasses: [Task, Project],
+});
+```
+
+```typescript
+// App.tsx
+import { DatabaseProvider } from '@nozbe/watermelondb/DatabaseProvider';
+import { database } from './db';
+
+export default function App() {
+  return (
+    <DatabaseProvider database={database}>
+      {/* アプリの残りのコンポーネント */}
+    </DatabaseProvider>
+  );
+}
+```
+
+## 楽観的更新：レスポンスを待たずにUIを更新する
+
+オフラインファースト設計の核心は**楽観的更新**です。ユーザーが操作したとき、サーバーへの同期を待たずにローカルDBを即座に更新し、UIに反映します。同期はバックグラウンドで非同期に行います。
+
+```typescript
+// hooks/useTasks.ts
+import { useDatabase } from '@nozbe/watermelondb/DatabaseProvider';
+import { withObservables } from '@nozbe/watermelondb';
+import { Q } from '@nozbe/watermelondb';
+
+// タスクの追加（楽観的更新）
+export function useTaskActions() {
+  const database = useDatabase();
+
+  const addTask = async (title: string, projectId: string, userId: string) => {
+    // サーバーを待たずにローカルDBに即座に書き込む
+    await database.write(async () => {
+      await database.get<Task>('tasks').create(task => {
+        task.title = title;
+        task.projectId = projectId;
+        task.userId = userId;
+        task.isCompleted = false;
+        task.priority = 0;
+        task.isDeleted = false;
+      });
+    });
+    // UIはこの時点で更新済み。同期はバックグラウンドで行われる
+  };
+
+  const completeTask = async (task: Task) => {
+    await database.write(async () => {
+      await task.update(t => {
+        t.isCompleted = true;
+      });
+    });
+  };
+
+  const deleteTask = async (task: Task) => {
+    await database.write(async () => {
+      await task.update(t => {
+        t.isDeleted = true;  // ソフトデリート
+      });
+    });
+  };
+
+  return { addTask, completeTask, deleteTask };
+}
+```
+
+コンポーネント側でWatermelonDBのObservableを使うと、DBの変化が自動でUIに伝播します：
+
+```typescript
+// components/TaskList.tsx
+import { withObservables } from '@nozbe/watermelondb';
+import { Q } from '@nozbe/watermelondb';
+
+interface Props {
+  projectId: string;
+  tasks: Task[];  // withObservablesが自動でセット
+}
+
+const TaskList = ({ tasks }: Props) => {
+  return (
+    <FlatList
+      data={tasks.filter(t => \!t.isDeleted)}
+      keyExtractor={item => item.id}
+      renderItem={({ item }) => <TaskItem task={item} />}
+    />
+  );
+};
+
+// WatermelonDBのObservableとReactを接続
+const enhance = withObservables(['projectId'], ({ projectId, database }) => ({
+  tasks: database.get<Task>('tasks').query(
+    Q.where('project_id', projectId),
+    Q.sortBy('created_at', Q.desc)
+  ).observe(),
+}));
+
+export default enhance(TaskList);
+```
+
+`observe()` を使うことで、`tasks` テーブルに変化があるたびにコンポーネントが自動再レンダリングされます。`useState` も `useEffect` も不要で、DBの状態がそのままUIに反映されます。
+
+## Supabase Realtimeとの双方向同期
+
+ローカルDBの変更をSupabaseに同期し、他のデバイスでの変更を受信する部分です。WatermelonDB公式のSync Protocolを使います。
+
+まず、Supabase側にテーブルを作成します：
+
+```sql
+-- Supabase SQL Editor
+CREATE TABLE tasks (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT,
+  is_completed BOOLEAN DEFAULT FALSE,
+  priority INTEGER DEFAULT 0,
+  project_id UUID REFERENCES projects(id),
+  user_id UUID REFERENCES auth.users(id),
+  is_deleted BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  -- WatermelonDB Sync用フィールド
+  _changed TEXT,  -- どのフィールドが変更されたかのカラム名リスト
+  _status TEXT    -- 'created' | 'updated' | 'deleted'
+);
+
+-- Row Level Security
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can only access their own tasks"
+  ON tasks FOR ALL
+  USING (auth.uid() = user_id);
+
+-- updated_atを自動更新するトリガー
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_tasks_updated_at
+  BEFORE UPDATE ON tasks
+  FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
+```
+
+次に、WatermelonDB Sync Protocolに準拠した同期関数を実装します：
+
+```typescript
+// sync/syncEngine.ts
+import { synchronize } from '@nozbe/watermelondb/sync';
+import { supabase } from '../lib/supabase';
+import { database } from '../db';
+
+interface SyncState {
+  isSyncing: boolean;
+  lastSyncedAt: number | null;
+  error: string | null;
+}
+
+class SyncEngine {
+  private syncPromise: Promise<void> | null = null;
+
+  async sync(): Promise<void> {
+    // 二重同期を防ぐ
+    if (this.syncPromise) {
+      return this.syncPromise;
+    }
+
+    this.syncPromise = this._performSync().finally(() => {
+      this.syncPromise = null;
+    });
+
+    return this.syncPromise;
+  }
+
+  private async _performSync(): Promise<void> {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (\!user) return;
+
+    await synchronize({
+      database,
+
+      // Pull: Supabaseからローカルへ
+      pullChanges: async ({ lastPulledAt }) => {
+        const timestamp = lastPulledAt ? new Date(lastPulledAt).toISOString() : '1970-01-01';
+
+        // ユーザーの全テーブルから変更を取得
+        const [tasksRes, projectsRes] = await Promise.all([
+          supabase
+            .from('tasks')
+            .select('*')
+            .eq('user_id', user.id)
+            .gt('updated_at', timestamp),
+          supabase
+            .from('projects')
+            .select('*')
+            .eq('user_id', user.id)
+            .gt('updated_at', timestamp),
+        ]);
+
+        if (tasksRes.error) throw tasksRes.error;
+        if (projectsRes.error) throw projectsRes.error;
+
+        // WatermelonDB Sync Protocol形式に変換
+        return {
+          changes: {
+            tasks: {
+              created: tasksRes.data.filter(r => r._status === 'created'),
+              updated: tasksRes.data.filter(r => r._status === 'updated'),
+              deleted: tasksRes.data
+                .filter(r => r.is_deleted)
+                .map(r => r.id),
+            },
+            projects: {
+              created: projectsRes.data.filter(r => r._status === 'created'),
+              updated: projectsRes.data.filter(r => r._status === 'updated'),
+              deleted: projectsRes.data
+                .filter(r => r.is_deleted)
+                .map(r => r.id),
+            },
+          },
+          timestamp: Date.now(),
+        };
+      },
+
+      // Push: ローカルからSupabaseへ
+      pushChanges: async ({ changes }) => {
+        const { tasks, projects } = changes;
+
+        // tasksの変更をupsert
+        if (tasks) {
+          const toUpsert = [
+            ...(tasks.created || []),
+            ...(tasks.updated || []),
+          ].map(task => ({ ...task, user_id: user.id }));
+
+          if (toUpsert.length > 0) {
+            const { error } = await supabase
+              .from('tasks')
+              .upsert(toUpsert, { onConflict: 'id' });
+            if (error) throw error;
+          }
+
+          // 削除されたレコードはソフトデリートに変換
+          for (const id of tasks.deleted || []) {
+            const { error } = await supabase
+              .from('tasks')
+              .update({ is_deleted: true })
+              .eq('id', id)
+              .eq('user_id', user.id);
+            if (error) throw error;
+          }
+        }
+
+        // projectsも同様
+        if (projects) {
+          const toUpsert = [
+            ...(projects.created || []),
+            ...(projects.updated || []),
+          ].map(proj => ({ ...proj, user_id: user.id }));
+
+          if (toUpsert.length > 0) {
+            const { error } = await supabase
+              .from('projects')
+              .upsert(toUpsert, { onConflict: 'id' });
+            if (error) throw error;
+          }
+        }
+      },
+    });
+  }
+}
+
+export const syncEngine = new SyncEngine();
+```
+
+## コンフリクト解決：同じデータが複数デバイスで変更されたとき
+
+オフラインファースト実装で最も注意が必要な点が**コンフリクト解決**です。デバイスAとデバイスBが同じタスクをそれぞれオフラインで編集し、その後同期した場合、どちらの変更を正とするかを決める必要があります。
+
+一般的なアプローチは3つあります。
+
+**Last Write Wins（最終書き込み優先）**：`updated_at` タイムスタンプが新しい方を正とします。実装が最もシンプルですが、短い時間間隔での変更や時計のずれで意図しない上書きが起きる可能性があります。
+
+**Server Wins（サーバー優先）**：プル時の変更を常にローカルに優先させます。サーバーに権威を置く設計で、共同編集でないアプリ（例：ノートアプリの個人利用）に向いています。
+
+**Merge（マージ）**：フィールドレベルで変更を検知し、競合するフィールドのみをマージ処理します。`_changed` フィールドにどのカラムが変更されたかを記録しておくことで、「タイトルと完了状態を別々のデバイスで同時変更した場合、両方を反映する」というマージが可能になります。
+
+```typescript
+// sync/conflictResolver.ts
+
+type ConflictStrategy = 'last-write-wins' | 'server-wins' | 'field-merge';
+
+interface ConflictRecord {
+  local: Record<string, unknown>;
+  remote: Record<string, unknown>;
+}
+
+export function resolveConflict(
+  conflict: ConflictRecord,
+  strategy: ConflictStrategy = 'field-merge'
+): Record<string, unknown> {
+  switch (strategy) {
+    case 'last-write-wins': {
+      const localUpdatedAt = new Date(conflict.local.updated_at as string).getTime();
+      const remoteUpdatedAt = new Date(conflict.remote.updated_at as string).getTime();
+      return localUpdatedAt > remoteUpdatedAt ? conflict.local : conflict.remote;
+    }
+
+    case 'server-wins':
+      return conflict.remote;
+
+    case 'field-merge': {
+      // _changedフィールドからローカルで変更されたフィールドを特定
+      const localChangedFields = ((conflict.local._changed as string) || '')
+        .split(',')
+        .filter(Boolean);
+
+      // ベースはリモート（サーバーの状態）
+      const merged = { ...conflict.remote };
+
+      // ローカルで明示的に変更されたフィールドのみ上書き
+      for (const field of localChangedFields) {
+        if (field in conflict.local) {
+          merged[field] = conflict.local[field];
+        }
+      }
+
+      // タイムスタンプは常に最新を使用
+      merged.updated_at = new Date().toISOString();
+
+      return merged;
+    }
+  }
+}
+```
+
+個人利用のメモアプリや習慣トラッカーであれば `last-write-wins` で十分です。複数デバイスで細かく操作するタスク管理・プロジェクト管理であれば `field-merge` が望ましいです。
+
+## Supabase Realtimeでのリアルタイム更新受信
+
+同期エンジンを定期実行するだけでなく、Supabase RealtimeのSubscriptionを使うと、他デバイスからの変更をプッシュで受け取れます：
+
+```typescript
+// hooks/useRealtimeSync.ts
+import { useEffect, useRef } from 'react';
+import { AppState } from 'react-native';
+import { supabase } from '../lib/supabase';
+import { syncEngine } from '../sync/syncEngine';
+
+export function useRealtimeSync(userId: string) {
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+
+  useEffect(() => {
+    // Supabase Realtimeチャンネルの設定
+    channelRef.current = supabase
+      .channel(`tasks:${userId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'tasks',
+          filter: `user_id=eq.${userId}`,
+        },
+        async (payload) => {
+          // サーバーで変更があったら同期を実行
+          await syncEngine.sync();
+        }
+      )
+      .subscribe();
+
+    // アプリがフォアグラウンドに戻ったときも同期
+    const subscription = AppState.addEventListener('change', async (state) => {
+      if (state === 'active') {
+        await syncEngine.sync();
+      }
+    });
+
+    return () => {
+      channelRef.current?.unsubscribe();
+      subscription.remove();
+    };
+  }, [userId]);
+}
+```
+
+## Rorkプロンプトでオフライン設計のボイラープレートを生成する
+
+Rorkでオフラインファーストのボイラープレートを生成するときに効果的なプロンプトパターンを紹介します。
+
+**初期セットアップのプロンプト例：**
+
+```
+WatermelonDBとSupabaseを使ったオフラインファーストなタスク管理アプリを作成してください。
+
+要件：
+- データはWatermelonDB（SQLite）にローカル保存
+- Supabase Realtimeと双方向同期（Last Write Wins）
+- ネットワーク非接続時も全機能が使用可能
+- タスクのCRUD操作はすべて楽観的更新
+
+テーブル：tasks（id, title, is_completed, user_id, updated_at, is_deleted）
+認証：Supabase Auth（メール/パスワード）
+```
+
+Rorkがスキーマ・モデル・基本的な同期コードを生成した後、個別の機能をプロンプトで追加していきます：
+
+```
+タスクを削除するときは物理削除ではなくis_deleted=trueに更新するソフトデリートにしてください。
+削除済みのタスクはUIに表示せず、同期時にサーバーにもis_deleted=trueを伝播させます。
+```
+
+Rorkはこのような段階的な指示に応じてコードを修正します。一度に全部指示するよりも、段階的に機能を追加していくほうがコードの整合性が保ちやすいです。
+
+## 同期状態のUI表示：ユーザーへの透明性
+
+オフラインファーストアプリはユーザーに「今オフラインか、同期済みか」を伝える責任があります。
+
+```typescript
+// components/SyncStatusBar.tsx
+import NetInfo from '@react-native-community/netinfo';
+
+export function SyncStatusBar() {
+  const [isOnline, setIsOnline] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
+
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      setIsOnline(state.isConnected ?? false);
+      if (state.isConnected) {
+        // オンラインに戻ったら同期を実行
+        setIsSyncing(true);
+        syncEngine.sync().then(() => {
+          setIsSyncing(false);
+          setLastSyncedAt(new Date());
+        });
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  if (\!isOnline) {
+    return (
+      <View style={styles.offlineBanner}>
+        <Text style={styles.offlineText}>
+          オフラインモード — 変更はオンライン復帰時に同期されます
+        </Text>
+      </View>
+    );
+  }
+
+  if (isSyncing) {
+    return (
+      <View style={styles.syncingBanner}>
+        <ActivityIndicator size="small" />
+        <Text style={styles.syncingText}>同期中...</Text>
+      </View>
+    );
+  }
+
+  return null;
+}
+```
+
+## パフォーマンスとデータ量のコントロール
+
+オフラインファースト設計では、ローカルDBのデータ量が積み重なっていきます。特に画像や添付ファイルを扱うアプリでは、ローカルストレージの管理が重要です。
+
+いくつかの設計原則を持っておくといいでしょう。テキストデータはすべてローカルに保持するが、画像・動画などのバイナリデータはURLのみをローカルに保存し、実体はSupabase StorageやCloudflare R2に置く。同期は直近30日間のデータのみを対象にし、古いデータはアーカイブ用のエンドポイントから必要時に取得する。削除済みレコード（`is_deleted=true`）は30日後にバックグラウンドで物理削除する。
+
+```typescript
+// sync/archiveOldRecords.ts
+
+// 30日以上前のソフトデリートされたレコードを定期的に物理削除
+export async function cleanupDeletedRecords() {
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+  await database.write(async () => {
+    const oldDeletedTasks = await database
+      .get<Task>('tasks')
+      .query(
+        Q.where('is_deleted', true),
+        Q.where('updated_at', Q.lt(thirtyDaysAgo))
+      )
+      .fetch();
+
+    for (const task of oldDeletedTasks) {
+      await task.destroyPermanently();
+    }
+  });
+}
+```
+
+## まとめ：オフラインファーストはアプリの品質への投資
+
+オフラインファースト設計は実装コストが高いですが、ユーザーの信頼に直結します。「ネットが切れてもデータが消えない」「オフラインでも普通に使える」という安心感は、App Storeのレビューに現れます。
+
+WatermelonDB + Supabase Realtimeの組み合わせは、このアーキテクチャを個人開発者が実現するための現実的なスタックです。完全にスクラッチで同期エンジンを書く必要がなく、Rorkのプロンプトを使って段階的に実装を積み上げられます。
+
+次のステップとして、このアーキテクチャにプッシュ通知を組み合わせると「他のデバイスで変更があったことをリアルタイム通知する」機能が作れます。実装の詳細は[Rork × Expo通知の実践ガイド](/articles/rork-dev/rork-push-notifications)で解説しています。
