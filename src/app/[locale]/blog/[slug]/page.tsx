@@ -74,7 +74,7 @@ export default async function BlogPostPage({ params }: Props) {
       {/* Meta */}
       <div style={{ marginBottom: 8 }}>
         <time
-          dateTime={post.meta.date}
+          dateTime={post.meta.date?.split("T")[0]}
           style={{
             fontFamily: "'DM Mono', monospace",
             fontSize: 12,
@@ -82,7 +82,7 @@ export default async function BlogPostPage({ params }: Props) {
             letterSpacing: "0.04em",
           }}
         >
-          {post.meta.date}
+          {post.meta.date?.split("T")[0]}
         </time>
       </div>
 

@@ -115,7 +115,7 @@ export default async function BlogPage({ params }: Props) {
                   </p>
                 </div>
                 <time
-                  dateTime={post.date}
+                  dateTime={post.date.split("T")[0]}
                   style={{
                     fontFamily: "'DM Mono', monospace",
                     fontSize: 12,
@@ -126,7 +126,7 @@ export default async function BlogPage({ params }: Props) {
                     paddingTop: 2,
                   }}
                 >
-                  {post.date}
+                  {post.date.split("T")[0]}
                 </time>
               </div>
               {post.tags.length > 0 && (
