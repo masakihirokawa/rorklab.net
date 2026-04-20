@@ -1,0 +1,573 @@
+---
+title: "Rork Maxアプリで実装するエラー耐性の高いAPI通信設計 — Circuit Breaker・Retry・Exponential Backoffの実践パターン"
+slug: "rork-max-resilient-api-circuit-breaker-retry-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-20T11:15"
+updated: "2026-04-20T11:15"
+author: "Rork Lab"
+description: "Rork Maxアプリで本番品質のAPI通信を実現するCircuit Breaker・Retry・Exponential Backoffパターンを完全解説。実装コード付きで障害耐性の高いモバイルアーキテクチャを構築します。"
+tags: ["Rork Max", "API通信", "Circuit Breaker", "Retry", "Exponential Backoff", "エラー処理", "本番設計", "React Native"]
+highlights:
+  - "APIエラーが連鎖して全体障害に拡大するのを防ぐCircuit Breakerを、Rork Maxアプリに今日実装できる"
+  - "ネットワーク不安定な本番環境でも落ちないリトライ戦略（Exponential Backoff + Jitter）の完全な実装コードを手に入れられる"
+  - "複数のAPIエラー耐性パターンをTanStack Queryと組み合わせ、ユーザーが気づかないうちに自動回復するシステムを構築できる"
+---
+
+あのとき、本番アプリのAPIエラー率が突然5%を超えました。
+
+原因を調べると、依存していた外部APIが不安定になっていて、タイムアウトしたリクエストが次々と積み重なっていました。アプリはエラーを吐き続け、ユーザーには「読み込み中」のスピナーが延々と表示される最悪の状態です。もしあのとき Circuit Breaker が実装されていれば、10分以内に自動回復できたはずでした。
+
+個人でアプリを開発していると、API通信のエラー処理は後回しにしがちです。「fetch でエラーが出たら try/catch でキャッチすればいい」という認識のまま本番リリースして、実際に障害が起きてから「もっとちゃんと設計すべきだった」と気づく——これは多くの開発者が経験する共通のパターンではないでしょうか。
+
+この記事では、Rork Max アプリに本番品質のAPI通信設計を実装する方法を、実際に動くコードで解説します。Circuit Breaker・Retry・Exponential Backoff という3つのパターンを組み合わせることで、依存APIが不安定になっても自動回復し、ユーザーに影響を与えないシステムを構築できます。
+
+## なぜシンプルなfetchだけでは本番で通用しないのか
+
+Rork で生成されるAPIリクエストは、デフォルトでは素直な fetch 呼び出しです。
+
+```typescript
+// Rorkが生成する典型的なAPI呼び出し
+const fetchUser = async (userId: string) => {
+  const response = await fetch(`https://api.example.com/users/${userId}`);
+  if (\!response.ok) throw new Error("Failed to fetch user");
+  return response.json();
+};
+```
+
+開発環境では問題なく動きます。でも本番環境は別物です。実際に遭遇する問題を整理すると、以下のようなパターンがあります。
+
+まず**一時的な障害**の問題です。モバイルアプリはWiFiと4Gを行き来し、トンネルに入り、エレベーターの中で使われます。一時的な接続断は日常茶飯事で、1回のリトライで解決することがほとんどです。
+
+次に**カスケード障害**の問題です。外部APIが遅くなると、タイムアウトを待つリクエストが積み重なり、アプリ全体が詰まります。Circuit Breaker がないと、すでに壊れているAPIへのリクエストを送り続けて状況を悪化させます。
+
+そして**無限待機**の問題です。デフォルトの fetch はタイムアウトがありません。APIが応答しないとき、ユーザーはスピナーを何秒、場合によっては何十秒も見続けることになります。
+
+これら3つの問題を解決するために、Circuit Breaker・Retry・Exponential Backoff の3パターンを順番に見ていきましょう。
+
+## Circuit Breakerパターン: 障害の連鎖を断ち切る
+
+Circuit Breaker（サーキットブレーカー）は、電気の回路遮断器から来ている概念です。APIエラーが一定数を超えたとき「回路を切断」してリクエストを止め、しばらくして自動的に回復を試みます。
+
+状態は3つあります。**Closed（通常）**: リクエストを通します。**Open（遮断）**: リクエストを即座に拒否してエラーを返します。**Half-Open（試行）**: 1件だけリクエストを通して回復を確認します。
+
+```typescript
+interface CircuitBreakerOptions {
+  failureThreshold: number;
+  recoveryTimeout: number;
+  successThreshold: number;
+}
+
+type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
+
+class CircuitBreaker {
+  private state: CircuitState = "CLOSED";
+  private failureCount = 0;
+  private successCount = 0;
+  private lastFailureTime?: Date;
+  private options: CircuitBreakerOptions;
+
+  constructor(options: CircuitBreakerOptions) {
+    this.options = options;
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "OPEN") {
+      const now = new Date();
+      const elapsed = this.lastFailureTime
+        ? (now.getTime() - this.lastFailureTime.getTime()) / 1000
+        : Infinity;
+
+      if (elapsed >= this.options.recoveryTimeout) {
+        this.state = "HALF_OPEN";
+        console.log("Circuit Breaker: OPEN -> HALF_OPEN");
+      } else {
+        throw new Error(
+          `Circuit is OPEN. Retry after ${
+            Math.ceil(this.options.recoveryTimeout - elapsed)
+          }s`
+        );
+      }
+    }
+
+    try {
+      const result = await fn();
+
+      if (this.state === "HALF_OPEN") {
+        this.successCount++;
+        if (this.successCount >= this.options.successThreshold) {
+          this.reset();
+          console.log("Circuit Breaker: HALF_OPEN -> CLOSED (recovered)");
+        }
+      } else {
+        this.failureCount = 0;
+      }
+
+      return result;
+    } catch (error) {
+      this.recordFailure();
+      throw error;
+    }
+  }
+
+  private recordFailure() {
+    this.failureCount++;
+    this.lastFailureTime = new Date();
+    if (this.failureCount >= this.options.failureThreshold) {
+      this.state = "OPEN";
+      console.log(`Circuit Breaker: CLOSED -> OPEN (${this.failureCount} failures)`);
+    }
+  }
+
+  private reset() {
+    this.state = "CLOSED";
+    this.failureCount = 0;
+    this.successCount = 0;
+  }
+
+  getState(): CircuitState {
+    return this.state;
+  }
+}
+
+// 使用例
+const userApiBreaker = new CircuitBreaker({
+  failureThreshold: 5,    // 5回失敗でOpen
+  recoveryTimeout: 30,    // 30秒後に回復試行
+  successThreshold: 2,    // 2回成功でClosed復帰
+});
+```
+
+Circuit Breaker を実装するときに最初に迷うのが、閾値の設定です。個人開発で試してきた経験では、**failureThreshold: 5、recoveryTimeout: 30秒** から始めて、実際のエラーログを見ながら調整するのが現実的です。閾値を厳しくしすぎると、一時的なネットワーク揺れで Circuit がすぐに開いてしまいます。
+
+## Retry with Exponential Backoff: 賢いリトライ戦略
+
+単純な即時リトライは逆効果になることがあります。APIサーバーが高負荷でダウンしているときに、全クライアントが一斉にリトライすると、サーバーへの負荷がさらに増大します。これを「サンダリングハード問題」と言います。
+
+Exponential Backoff（指数関数的バックオフ）は、リトライするたびに待機時間を指数関数的に増やす戦略です。さらに Jitter（ランダムなばらつき）を加えることで、複数クライアントのリクエストが同タイミングに集中するのを防ぎます。
+
+```typescript
+interface RetryOptions {
+  maxRetries: number;
+  baseDelay: number;
+  maxDelay: number;
+  jitterFactor: number;
+  retryableStatusCodes: number[];
+}
+
+const DEFAULT_RETRY_OPTIONS: RetryOptions = {
+  maxRetries: 3,
+  baseDelay: 1000,
+  maxDelay: 30000,
+  jitterFactor: 0.3,
+  retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+};
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    public statusCode: number,
+    public response?: unknown
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  options: Partial<RetryOptions> = {}
+): Promise<T> {
+  const opts = { ...DEFAULT_RETRY_OPTIONS, ...options };
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt <= opts.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error as Error;
+
+      if (error instanceof ApiError) {
+        if (\!opts.retryableStatusCodes.includes(error.statusCode)) {
+          throw error; // リトライ対象外のエラーは即座に投げる
+        }
+      }
+
+      if (attempt === opts.maxRetries) break;
+
+      // Exponential Backoff + Jitter
+      // delay = min(baseDelay * 2^attempt, maxDelay) * (1 +/- jitter)
+      const exponentialDelay = Math.min(
+        opts.baseDelay * Math.pow(2, attempt),
+        opts.maxDelay
+      );
+      const jitter =
+        exponentialDelay * opts.jitterFactor * (Math.random() * 2 - 1);
+      const delay = Math.max(0, exponentialDelay + jitter);
+
+      console.log(
+        `Retry attempt ${attempt + 1}/${opts.maxRetries} after ${Math.round(delay)}ms`
+      );
+      await sleep(delay);
+    }
+  }
+
+  throw lastError ?? new Error("Retry failed");
+}
+```
+
+リトライすべきでないエラーを明確に区別することが重要です。`400 Bad Request` や `401 Unauthorized` は何度リトライしても意味がありません。リトライが効果的なのは、`503 Service Unavailable`（一時的なサーバー過負荷）や `408 Request Timeout` のような一時的な障害です。
+
+## Timeout管理: APIが帰ってこない問題を解決する
+
+fetch には組み込みのタイムアウト機能がありません。`AbortController` を使って実装します。
+
+```typescript
+interface FetchWithTimeoutOptions extends RequestInit {
+  timeoutMs: number;
+}
+
+async function fetchWithTimeout(
+  url: string,
+  options: FetchWithTimeoutOptions
+): Promise<Response> {
+  const { timeoutMs, ...fetchOptions } = options;
+  const controller = new AbortController();
+
+  const timeoutId = setTimeout(() => {
+    controller.abort(`Request timed out after ${timeoutMs}ms`);
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (\!response.ok) {
+      throw new ApiError(
+        `HTTP ${response.status}: ${response.statusText}`,
+        response.status,
+        await response.json().catch(() => null)
+      );
+    }
+
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new ApiError(`Request timed out after ${timeoutMs}ms`, 408);
+    }
+
+    throw error;
+  }
+}
+```
+
+モバイルアプリにおいてタイムアウトの設定値は用途によって変えるべきです。一覧取得系APIは5〜8秒、詳細取得やユーザー操作系は8〜12秒、ファイルアップロードや大きなデータ処理は30〜60秒という基準が現実的です。タイムアウトが短すぎると、低速回線のユーザーに不必要なエラーを見せてしまいます。
+
+## 3つのパターンを統合する: 本番APIクライアント
+
+Circuit Breaker・Retry・Timeout の3つを組み合わせた、本番品質のAPIクライアントを作ります。
+
+```typescript
+interface ApiClientOptions {
+  baseUrl: string;
+  defaultTimeout: number;
+  circuitBreaker: CircuitBreakerOptions;
+  retry: Partial<RetryOptions>;
+}
+
+class ResilientApiClient {
+  private breakers: Map<string, CircuitBreaker> = new Map();
+  private options: ApiClientOptions;
+
+  constructor(options: ApiClientOptions) {
+    this.options = options;
+  }
+
+  private getBreaker(endpoint: string): CircuitBreaker {
+    // エンドポイントごとに独立したCircuit Breakerを持つ
+    if (\!this.breakers.has(endpoint)) {
+      this.breakers.set(
+        endpoint,
+        new CircuitBreaker(this.options.circuitBreaker)
+      );
+    }
+    return this.breakers.get(endpoint)\!;
+  }
+
+  async request<T>(
+    path: string,
+    options: Omit<FetchWithTimeoutOptions, "timeoutMs"> & {
+      timeoutMs?: number;
+    } = {}
+  ): Promise<T> {
+    const url = `${this.options.baseUrl}${path}`;
+    const timeoutMs = options.timeoutMs ?? this.options.defaultTimeout;
+    const breaker = this.getBreaker(path);
+
+    // Circuit Breaker -> Retry -> Timeout の順に適用
+    return breaker.execute(() =>
+      withRetry(
+        () =>
+          fetchWithTimeout(url, {
+            ...options,
+            timeoutMs,
+          }).then((res) => res.json() as Promise<T>),
+        this.options.retry
+      )
+    );
+  }
+
+  getBreakerStates(): Record<string, CircuitState> {
+    const states: Record<string, CircuitState> = {};
+    this.breakers.forEach((breaker, endpoint) => {
+      states[endpoint] = breaker.getState();
+    });
+    return states;
+  }
+}
+
+// アプリ全体で共有するAPIクライアント（シングルトン）
+export const apiClient = new ResilientApiClient({
+  baseUrl: "https://api.yourapp.com",
+  defaultTimeout: 8000,
+  circuitBreaker: {
+    failureThreshold: 5,
+    recoveryTimeout: 30,
+    successThreshold: 2,
+  },
+  retry: {
+    maxRetries: 3,
+    baseDelay: 1000,
+    maxDelay: 15000,
+  },
+});
+
+// 使用例（これだけでCircuit Breaker+Retry+Timeout対応）
+const user = await apiClient.request<User>("/users/me");
+const posts = await apiClient.request<Post[]>("/posts", {
+  timeoutMs: 5000, // このエンドポイントだけタイムアウトを短く
+});
+```
+
+エンドポイントごとに独立した Circuit Breaker を持つことがポイントです。ユーザー情報APIが不安定になっても、投稿一覧APIには影響しないように設計します。一つのサービス障害がアプリ全体に波及するのを防げます。
+
+## TanStack Queryとの組み合わせ
+
+Rork Max で生成されるアプリでは TanStack Query（React Query）を使っているケースが多いと思います。上記の resilient API クライアントと TanStack Query を組み合わせると、より宣言的なエラー処理が実現できます。
+
+```typescript
+import { useQuery } from "@tanstack/react-query";
+
+// TanStack Query x ResilientApiClient の組み合わせ
+export function useUser(userId: string) {
+  return useQuery({
+    queryKey: ["user", userId],
+    queryFn: () => apiClient.request<User>(`/users/${userId}`),
+    // TanStack Query自身のリトライ設定（APIクライアント側と重複しない設定）
+    retry: (failureCount, error) => {
+      // Circuit OpenのエラーはTanStack Queryでリトライしない
+      if (
+        error instanceof Error &&
+        error.message.startsWith("Circuit is OPEN")
+      ) {
+        return false;
+      }
+      return failureCount < 1; // 最大1回まで
+    },
+    staleTime: 5 * 60 * 1000,  // 5分間はキャッシュを使用
+    gcTime: 30 * 60 * 1000,    // 30分間メモリに保持
+  });
+}
+
+// Rorkアプリの画面コンポーネントでの使用例
+function UserProfileScreen({ userId }: { userId: string }) {
+  const { data: user, error, isLoading, isError, refetch } = useUser(userId);
+
+  if (isLoading) return <LoadingSpinner />;
+
+  if (isError) {
+    const isCircuitOpen =
+      error?.message?.startsWith("Circuit is OPEN");
+    return (
+      <ErrorView
+        message={
+          isCircuitOpen
+            ? "サーバーが混雑しています。しばらくしてから再試行してください。"
+            : "データの読み込みに失敗しました。"
+        }
+        // Circuit Open中はリトライボタンを非表示にする
+        onRetry={isCircuitOpen ? undefined : refetch}
+      />
+    );
+  }
+
+  return <UserProfile user={user\!} />;
+}
+```
+
+TanStack Query 側の retry 設定と ApiClient 側のリトライが二重にかかると、失敗時に最大9回（3x3）のリクエストが飛ぶことになります。ApiClient 側でリトライのロジックを持ち、TanStack Query 側は1回まで（または無効）にするとシンプルです。詳しいTanStack Queryの活用方法は[RorkアプリでTanStack Queryを使ったデータ取得を最適化する](/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide)をご覧ください。
+
+## よくある間違いと落とし穴
+
+実装で頻繁に見かけるミスを3つ紹介します。
+
+**落とし穴1: 全エラーをリトライしてしまう**
+
+最もよくある間違いは、HTTPステータスコードに関わらず全てのリクエスト失敗をリトライすることです。
+
+```typescript
+// 悪い例: 全エラーをリトライ
+async function badRetry<T>(fn: () => Promise<T>) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await fn();
+    } catch {
+      await sleep(1000);
+    }
+  }
+}
+
+// 正しい例: リトライすべきエラーだけを対象にする
+async function goodRetry<T>(fn: () => Promise<T>) {
+  return withRetry(fn, {
+    retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+    // 400, 401, 403, 404 はリトライしない
+  });
+}
+```
+
+`401 Unauthorized`（認証エラー）を3回リトライするのは無意味なだけでなく、ログインページへのリダイレクトが3秒遅れるという最悪なUXを生みます。
+
+**落とし穴2: Circuit Breakerの状態をコンポーネント内に持つ**
+
+Circuit Breaker はアプリ全体で共有するものです。コンポーネントごとに新しいインスタンスを作ると、「5回失敗したらOpen」というロジックが機能しません。
+
+```typescript
+// 悪い例: コンポーネント内でインスタンス化
+function MyComponent() {
+  // コンポーネントがアンマウントされるたびにリセットされてしまう
+  const breaker = new CircuitBreaker({ failureThreshold: 5 });
+  ...
+}
+
+// 正しい例: モジュールレベルのシングルトンを使う
+import { apiClient } from "./api-client"; // 一度だけ生成されたインスタンス
+function MyComponent() {
+  apiClient.request("/endpoint"); // 共有インスタンスを使用
+  ...
+}
+```
+
+**落とし穴3: タイムアウト後のリソース解放を忘れる**
+
+コンポーネントがアンマウントされたあとでも、進行中の fetch がタイムアウトを待ち続けることがあります。`useEffect` のクリーンアップで確実にキャンセルする必要があります。
+
+```typescript
+useEffect(() => {
+  const controller = new AbortController();
+
+  apiClient
+    .request("/data", { signal: controller.signal })
+    .then(setData)
+    .catch((err) => {
+      // AbortError はアンマウントによるキャンセルなので無視
+      if (err.name \!== "AbortError") setError(err);
+    });
+
+  return () => controller.abort(); // アンマウント時にキャンセル
+}, []);
+```
+
+## 本番環境での監視と状態の可視化
+
+エラー耐性の仕組みを実装したら、それが実際に機能しているかを確認する手段も必要です。Circuit Breaker の状態変化をログに残すことで、問題の傾向が見えてきます。
+
+```typescript
+// Circuit Breaker の状態変化を監視する拡張クラス
+class MonitoredCircuitBreaker extends CircuitBreaker {
+  private readonly name: string;
+  private onStateChange?: (from: CircuitState, to: CircuitState) => void;
+
+  constructor(
+    name: string,
+    options: CircuitBreakerOptions,
+    onStateChange?: (from: CircuitState, to: CircuitState) => void
+  ) {
+    super(options);
+    this.name = name;
+    this.onStateChange = onStateChange;
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const previousState = this.getState();
+    try {
+      const result = await super.execute(fn);
+      const currentState = this.getState();
+
+      if (previousState \!== currentState) {
+        console.log(
+          `[CB:${this.name}] ${previousState} -> ${currentState}`
+        );
+        this.onStateChange?.(previousState, currentState);
+      }
+
+      return result;
+    } catch (error) {
+      const currentState = this.getState();
+      if (previousState \!== currentState) {
+        console.warn(
+          `[CB:${this.name}] ${previousState} -> ${currentState} (failure detected)`
+        );
+        this.onStateChange?.(previousState, currentState);
+      }
+      throw error;
+    }
+  }
+}
+
+// Sentryなどのエラー監視と連携する例
+const userApiBreaker = new MonitoredCircuitBreaker(
+  "user-api",
+  { failureThreshold: 5, recoveryTimeout: 30, successThreshold: 2 },
+  (from, to) => {
+    if (to === "OPEN") {
+      // Sentryにサーキットオープンを記録
+      Sentry.captureMessage(`Circuit Breaker opened: user-api`, {
+        level: "warning",
+        extra: { from, to },
+      });
+    }
+  }
+);
+```
+
+バックエンド側のAPI設計については[Rork × Hono + Cloudflare Workers で型安全なREST APIを作る](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide)が参考になります。外部APIの基本的な接続設定については[Rork外部API連携入門](/articles/rork-dev/rork-external-api-integration-guide)もあわせてご確認ください。
+
+## 段階的に導入するためのロードマップ
+
+全てを一度に実装する必要はありません。優先度の高い順に段階的に導入することをおすすめします。
+
+**Step 1（今日できること）: Timeout の追加**
+
+全APIコールに8秒のタイムアウトをつけるだけで、「無限ローディング」問題の大部分が解決します。実装コストが最も低く、効果が即座に出ます。`fetchWithTimeout` を一つのAPIコールに試してみてください。
+
+**Step 2（今週中）: Retry + Exponential Backoff**
+
+一時的なネットワーク断に対するリトライを追加します。この時点でユーザー報告のエラーが体感で減るはずです。`withRetry` をタイムアウトの外側に追加するだけです。
+
+**Step 3（今月中）: Circuit Breaker の導入**
+
+外部依存サービスが不安定になったとき、アプリが自動回復できるようになります。`ResilientApiClient` をシングルトンとしてアプリに組み込み、既存の fetch を置き換えていきましょう。
+
+全部そろった時点で、アプリのAPI通信は本番品質に達しています。「ネットワークエラーが怖くてリリースを遅らせていた」という状況から解放されるはずです。
+
+まず今日、`fetchWithTimeout` を最も重要なAPIコール1つに適用してみてください。それだけで無限スピナー問題の大半が解決します。小さな一歩から始めて、着実に本番品質のアプリに育てていきましょう。
