@@ -34,9 +34,6 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
         "x-default": "https://rorklab.net/en/articles",
       },
     },
-    ...(page > 1 && {
-      robots: { index: false, follow: true },
-    }),
   };
 }
 

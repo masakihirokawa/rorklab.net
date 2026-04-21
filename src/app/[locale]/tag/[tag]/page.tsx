@@ -52,10 +52,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
     },
   };
 
-  if (currentPage > 1) {
-    metadata.robots = { index: false, follow: true };
-  }
-
+  // Pagination: rely on canonical (to page 1) instead of noindex for GSC compatibility
   return metadata;
 }
 
