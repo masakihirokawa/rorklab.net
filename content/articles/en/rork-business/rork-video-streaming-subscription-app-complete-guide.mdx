@@ -1,0 +1,448 @@
+---
+title: "Launching a Branded Video Streaming App with Rork as a Solo Developer — HLS Delivery, Stripe Subscriptions, Offline Playback, and Revoking Access on Cancellation"
+slug: "rork-video-streaming-subscription-app-complete-guide"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-04-22T11:30"
+updated: "2026-04-22T11:30"
+author: "Rork Lab"
+description: "A realistic blueprint for shipping a membership video app with Rork — how to pick an HLS backend, keep Stripe subscription state in sync with playback permission, handle offline viewing securely, and decide whether DRM is actually worth the cost."
+tags: ["Rork", "video streaming", "subscription", "Stripe", "HLS", "DRM", "offline playback"]
+highlights:
+  - "If you got stuck trying to figure out where to even start with DRM, HLS, and encryption, you can now walk away with a complete working pattern on Rork."
+  - "You'll learn how to evaluate Mux, Bunny, and Cloudflare Stream as a solo developer, with concrete cost scenarios that hold up under real traffic."
+  - "You can reuse a Stripe subscription flow that actually revokes playback the next day — 'cancelled users can't watch', 'unpaid users get the preview only' — the way it's supposed to work."
+---
+
+Building a membership video app as a one-person team — three years ago I would have talked you out of it. In 2026 it's a reasonable project. Video delivery has been commoditized into APIs, and once you wire Rork's generated code into subscription state, you can ship a branded video product without operating any delivery infrastructure yourself.
+
+That said, the moment you actually start building, a wall of questions hits at once: "How do I serve HLS?" "Can a solo developer actually get FairPlay DRM approved?" "How do I make sure a cancelled user stops being able to watch tomorrow?" "Can't I just store the MP4 locally for offline playback?" This article walks through a full implementation at the granularity a solo developer needs to make these decisions.
+
+## Why Build Your Own Video Streaming App Instead of Using YouTube or Vimeo OTT
+
+Hosting on YouTube Memberships or Vimeo OTT is easier, but there are three reasons to host it yourself.
+
+**Revenue split.** Large video platforms take roughly 30% of your revenue. Even after Apple's cut, shipping your own app tends to leave you with more money on the table once monthly revenue crosses about $3,000–$5,000. That gap widens the more you grow, because platform fees stay at the same percentage while your content library's marginal cost stays flat.
+
+**Brand control.** No pre-roll ads, no recommended videos pulling people away, and a home screen icon that's yours. You can't get that on YouTube. For fitness, education, cooking, or any content where "viewing flow matters more than discoverability" the branded-app model wins. Users who are already paying subscribers don't need discovery — they need a smooth library.
+
+**Data.** Which video people drop off on, which chapter gets rewatched, what the first video a new user picks is — when that data lives in your own store, content decisions get sharper. You can build retention features (continue-watching, new-since-last-visit highlights, "popular among subscribers this week") that platforms simply don't expose to tenants.
+
+The flip side is that everything around DRM, bandwidth, CDN, and security becomes your problem. Balancing this tradeoff is where this article starts.
+
+## The Architecture Solo Developers Can Actually Operate
+
+Video apps have three layers that regular mobile apps don't need.
+
+- **Storage and encoding** — turning your source videos into multi-bitrate HLS. Building this from scratch isn't realistic for solo devs, so you outsource to Mux, Cloudflare Stream, or Bunny Stream.
+- **Playback authorization** — deciding who can watch what. Stripe subscription state, a small KV/DB, and a signed URL each time playback starts.
+- **Player** — the screen Rork generates. expo-video handles HLS, AirPlay, Picture-in-Picture, and offline caching.
+
+When a user taps "Play", the sequence is: app → your backend (Cloudflare Workers or similar) → Stripe state check → signed URL from the video provider → player starts. How fast you can spin this whole loop up determines whether the app feels responsive. Aim for under 400ms between tap and first frame on a warm session — that's where "feels like Netflix" begins.
+
+A useful mental model: **the app talks to your backend, your backend talks to Stripe and to the video provider, and the video provider talks to the player**. Never let the app talk directly to Stripe or to the video provider. The moment you do, you lose your ability to revoke access on cancellation and you expose secrets you shouldn't.
+
+## Step 1: Picking a Video Delivery Provider — Mux vs. Cloudflare Stream vs. Bunny
+
+Three providers are realistically within reach for solo developers.
+
+- **Mux** — polished APIs, a React Native SDK, strong analytics, and pricing based on viewing minutes. Predictable early on. FairPlay DRM is supported on the Mux Plus plan. Mux is especially strong if you want QoE (quality of experience) analytics built in from day one.
+- **Cloudflare Stream** — starts at $5/month plus storage. Simple pricing that fits the bootstrap phase. Both HLS and DASH, and signed URLs are a few lines of code. DRM support is negotiated separately. Stream's pricing ties cleanly into other Cloudflare products you may already be running (Workers, R2).
+- **Bunny Stream** — cheapest bandwidth at scale, often half of alternatives at 10TB/month levels. DRM (MediaCage) add-on is relatively clearly priced. Bunny is where you land after a year of growth if cost is becoming the dominant factor.
+
+My recommendation for starting out is **Cloudflare Stream**. The pricing is predictable, the signed URL story is short, and it plays nicely with Rork-generated code. Once your monthly viewing hours grow significantly, you can migrate the catalog to Mux.
+
+The migration cost between providers is real but not catastrophic — it's essentially "re-upload sources to new provider, update `video.id` in your DB, flip a feature flag". Most solo devs operate on one provider for the first 12–18 months.
+
+### Getting a Video Ready to Play
+
+Uploading from inside the app tends to be unreliable for large files, so do uploads from a separate admin surface (either the provider's dashboard, or a small Remix/Next.js admin UI). The app focuses on playback.
+
+Each video has a `uid` you receive after upload. Build a master table to bind video IDs to the plan required to watch them.
+
+```sql
+-- videos table
+CREATE TABLE videos (
+  id TEXT PRIMARY KEY,            -- Cloudflare Stream uid
+  title TEXT NOT NULL,
+  description TEXT,
+  required_plan TEXT NOT NULL,    -- 'free' | 'pro' | 'premium'
+  duration_sec INTEGER,
+  thumbnail_url TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Track viewing sessions for retention analytics
+CREATE TABLE view_sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  video_id TEXT NOT NULL,
+  started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  watched_seconds INTEGER DEFAULT 0,
+  completed BOOLEAN DEFAULT FALSE,
+  FOREIGN KEY (video_id) REFERENCES videos(id)
+);
+```
+
+## Step 2: Implementing the HLS Player in Rork
+
+Prompt Rork with "use expo-video to build an HLS player with a scrub bar, playback speed switch, and Picture-in-Picture support" and you'll get a scaffold that mostly works. The things that tend to be missing are iOS background playback, audio focus handling, and AirPlay support. Use the code below as a baseline you reinforce.
+
+```tsx
+// app/components/StreamPlayer.tsx
+import { useEvent } from "expo";
+import { useVideoPlayer, VideoView } from "expo-video";
+import { useEffect, useState } from "react";
+import { View, StyleSheet, ActivityIndicator } from "react-native";
+
+type Props = {
+  videoId: string;
+  getSignedUrl: (videoId: string) => Promise<string>;
+};
+
+export function StreamPlayer({ videoId, getSignedUrl }: Props) {
+  const [sourceUrl, setSourceUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Authorize, then resolve the signed HLS URL
+  useEffect(() => {
+    let canceled = false;
+    (async () => {
+      try {
+        const url = await getSignedUrl(videoId);
+        if (!canceled) setSourceUrl(url);
+      } catch (e: any) {
+        // Make the cause visible — missing plan vs. not logged in
+        if (!canceled) setError(e.message ?? "Could not load the video");
+      }
+    })();
+    return () => { canceled = true; };
+  }, [videoId, getSignedUrl]);
+
+  const player = useVideoPlayer(sourceUrl ?? "", (p) => {
+    p.loop = false;
+    p.allowsExternalPlayback = true; // Allow AirPlay
+    p.timeUpdateEventInterval = 1.0; // Subscribe to playhead every second
+  });
+
+  // Enabling background audio requires justification at App Review
+  // ("audio learning app", etc.). Don't turn it on unless you have a real case.
+  // player.staysActiveInBackground = true;
+
+  useEvent(player, "statusChange", { status: player.status });
+
+  if (error) {
+    return <View style={styles.centered}><ErrorNotice message={error} /></View>;
+  }
+  if (!sourceUrl) {
+    return <View style={styles.centered}><ActivityIndicator size="large" /></View>;
+  }
+
+  return (
+    <VideoView
+      style={styles.video}
+      player={player}
+      allowsFullscreen
+      allowsPictureInPicture
+      contentFit="contain"
+      nativeControls
+    />
+  );
+}
+
+const styles = StyleSheet.create({
+  video: { width: "100%", aspectRatio: 16 / 9, backgroundColor: "#000" },
+  centered: { width: "100%", aspectRatio: 16 / 9, alignItems: "center", justifyContent: "center", backgroundColor: "#111" },
+});
+```
+
+The key design choice is that the signed URL is fetched **inside useEffect** rather than passed in as a prop. That way permission checks always happen first, and the URL never reaches the component if the user isn't authorized. "No URL, no playback" is a simple rule, and simple rules hold up better when you're running the app alone.
+
+One addition I recommend from day one: persist the current `watched_seconds` to your backend every 10–15 seconds. This powers continue-watching in the library and also reveals mid-video drop-off patterns that help you edit future content.
+
+## Step 3: Issuing Signed URLs and Enforcing Permissions
+
+Cloudflare Stream signed URLs can be issued from Cloudflare Workers in just a few lines. What matters here is binding the signing step to **Stripe subscription state**.
+
+```ts
+// workers/api/video-token/route.ts (Cloudflare Workers + Hono)
+import { Hono } from "hono";
+import { getCookie } from "hono/cookie";
+import { decode } from "./jwt";
+
+type Bindings = {
+  STREAM_CUSTOMER_SUBDOMAIN: string;
+  STREAM_KEY_ID: string;
+  STREAM_SIGNING_JWK: string;      // JWK for HS256
+  STRIPE_SECRET: string;
+  DB: D1Database;
+  KV: KVNamespace;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.post("/video-token/:videoId", async (c) => {
+  const videoId = c.req.param("videoId");
+  const session = getCookie(c, "session");
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+
+  // 1) Resolve userId from the session
+  const user = await decode(session, c.env);
+  if (!user) return c.json({ error: "invalid_session" }, 401);
+
+  // 2) Look up the required plan for this video
+  const video = await c.env.DB.prepare(
+    "SELECT required_plan FROM videos WHERE id = ?"
+  ).bind(videoId).first<{ required_plan: string }>();
+  if (!video) return c.json({ error: "not_found" }, 404);
+
+  // 3) Check the user's active plan (KV-cached to avoid hitting Stripe)
+  const plan = await getActivePlan(user.email, c.env);
+  if (!canView(plan, video.required_plan)) {
+    return c.json({
+      error: "upgrade_required",
+      currentPlan: plan,
+      requiredPlan: video.required_plan,
+    }, 403);
+  }
+
+  // 4) Issue a short-lived signed JWT (10 min)
+  const token = await signStreamToken(videoId, {
+    exp: Math.floor(Date.now() / 1000) + 600,
+    kid: c.env.STREAM_KEY_ID,
+    jwk: c.env.STREAM_SIGNING_JWK,
+  });
+
+  const hlsUrl = `https://${c.env.STREAM_CUSTOMER_SUBDOMAIN}/${token}/manifest/video.m3u8`;
+  return c.json({ url: hlsUrl, expiresIn: 600 });
+});
+
+function canView(active: string | null, required: string) {
+  if (required === "free") return true;
+  if (!active) return false;
+  const rank: Record<string, number> = { pro: 1, premium: 2 };
+  return (rank[active] ?? 0) >= (rank[required] ?? 0);
+}
+
+export default app;
+```
+
+What matters most: **keep the expiration short**. A Cloudflare Stream signed URL plays for anyone until it expires. If a user cancels and still has a URL saved somewhere, you don't want that URL to keep working for hours. Ten to thirty minutes is the realistic sweet spot, and the app should refresh tokens mid-playback.
+
+The refresh pattern: inside `useVideoPlayer`, watch `timeUpdateEventInterval`; when remaining TTL drops below two minutes, fetch a new token and call `player.replace(newUrl, currentPosition)` to swap the URL without interrupting playback.
+
+One nuance worth spelling out: **don't cache the signed URL on the client beyond its TTL**. If you do — e.g. by putting it into a React Query cache with a long `staleTime` — you'll ship bugs where stale URLs come back from cache and cause 403s. Scope the cache key to `videoId + userId + expiresAt` so cache entries expire with the URL.
+
+## Step 4: Keeping Stripe Subscription State in Sync with Playback Permission
+
+This is the heart of the article. Making sure "a user who cancelled today cannot watch tomorrow" comes down to a reliable **Stripe Webhook → KV/DB** pipeline.
+
+```ts
+// workers/api/stripe-webhook/route.ts
+import { Hono } from "hono";
+import Stripe from "stripe";
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.post("/stripe/webhook", async (c) => {
+  const sig = c.req.header("stripe-signature")!;
+  const body = await c.req.text();
+  const stripe = new Stripe(c.env.STRIPE_SECRET, { apiVersion: "2025-05-01" });
+
+  let event: Stripe.Event;
+  try {
+    event = await stripe.webhooks.constructEventAsync(
+      body, sig, c.env.STRIPE_WEBHOOK_SECRET,
+      undefined, Stripe.createSubtleCryptoProvider()
+    );
+  } catch (e) {
+    return c.json({ error: "signature_failed" }, 400);
+  }
+
+  switch (event.type) {
+    case "checkout.session.completed":
+    case "customer.subscription.updated": {
+      const sub = event.data.object as Stripe.Subscription | Stripe.Checkout.Session;
+      await upsertSubscription(sub, c.env);
+      break;
+    }
+    case "customer.subscription.deleted": {
+      // Cancellation — clear KV entry
+      const sub = event.data.object as Stripe.Subscription;
+      const email = await resolveEmail(sub, c.env);
+      await c.env.KV.delete(`plan:${email}`);
+      break;
+    }
+    case "invoice.payment_failed": {
+      // Payment failure — treat as cancelled if not resolved in 3 days
+      await markPaymentFailed(event, c.env);
+      break;
+    }
+  }
+  return c.json({ received: true });
+});
+```
+
+**Why we trust the webhook instead of hitting Stripe live.** Calling Stripe API on every playback check is slow and expensive. Webhooks write to KV, and KV becomes the authoritative source for permission checks. This pattern holds up.
+
+Two caveats that every operator learns the hard way:
+
+1. **Design for idempotency.** The same `event.id` will arrive twice. Use `INSERT OR REPLACE`, or upsert by a stable key.
+2. **Guard against stale events.** An older `customer.subscription.updated` sometimes arrives after a newer one. Compare `current_period_end` timestamps and ignore older data.
+
+Skip these two and within two weeks of going live you'll have either "they cancelled but can still watch" or "they paid but can't watch" — one of them, guaranteed.
+
+A third rule I've adopted: **always log every webhook event** in a small append-only table in D1. When a customer emails you saying "I was charged but can't play" you have the full history in 10 seconds, not 30 minutes of Stripe Dashboard spelunking.
+
+## Step 5: Offline Playback and Encryption
+
+Offline playback matters for subway commuters and flyers. But storing raw MP4 on device is a non-starter — files extracted through the iOS Files app can end up on someone else's device within minutes.
+
+You have three realistic options.
+
+- **Lightweight AES-128 HLS encryption.** Download HLS segments encrypted with AES-128, store them in an encrypted location in the app, and fetch the decryption key from your backend before playback. Good enough for most indie apps.
+- **FairPlay Streaming (FPS).** Apple's full DRM. Requires a partnership with a provider like Mux Plus and Apple's FPS Deployment Package. The approval process is painful.
+- **No offline mode at all.** Surprisingly often the right call for v1. You spend those weeks making better content instead.
+
+For solo developers I recommend **shipping without offline first**, watching subscription conversion, and then adding AES-128 when the business justifies it. Starting with FairPlay adds about three months to the initial release.
+
+A pragmatic AES-128 pattern looks like this.
+
+```tsx
+// app/lib/offline.ts
+import * as FileSystem from "expo-file-system";
+
+export async function downloadEncryptedVideo(
+  videoId: string,
+  getDownloadManifest: (id: string) => Promise<{ segments: string[]; key: string }>
+) {
+  const { segments, key } = await getDownloadManifest(videoId);
+  const dir = `${FileSystem.documentDirectory}offline/${videoId}/`;
+  await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+
+  // Save decryption key in iOS Keychain / Android Keystore (NOT AsyncStorage)
+  await saveKeyToSecureStore(`key:${videoId}`, key);
+
+  for (const [index, segmentUrl] of segments.entries()) {
+    const path = `${dir}seg_${String(index).padStart(5, "0")}.ts`;
+    await FileSystem.downloadAsync(segmentUrl, path);
+  }
+  return dir;
+}
+
+async function saveKeyToSecureStore(name: string, key: string) {
+  // Use expo-secure-store for the AES key
+  // Never AsyncStorage — it's readable from a rooted device
+}
+
+// Verify entitlement before playing an offline file
+export async function canPlayOffline(videoId: string, currentPlan: string): Promise<boolean> {
+  const video = await getLocalVideoMeta(videoId);
+  if (!video) return false;
+  const rank: Record<string, number> = { free: 0, pro: 1, premium: 2 };
+  return (rank[currentPlan] ?? 0) >= (rank[video.requiredPlan] ?? 0);
+}
+```
+
+**Where you store the decryption key is critical.** Not AsyncStorage. Always `expo-secure-store` (iOS Keychain / Android Keystore). When a user cancels and reopens the app, delete the key from SecureStore so the offline files become unplayable on their own.
+
+Also design for **grace-period semantics**. If a user's subscription lapses but they're on a plane, you usually want "downloaded before expiration stays playable until the current period ends". Record `entitlement_valid_until` alongside the download so the offline check considers that date before blocking playback.
+
+## Step 6: When DRM is Required and When You Can Skip It
+
+Two axes decide whether DRM is worth it.
+
+- **Streaming only, no offline.** Signed URLs plus short expirations are enough. No DRM needed.
+- **Offline included.** AES-128 lightweight or FairPlay — pick one.
+
+Start seriously considering FairPlay if any of these hold true.
+
+- Content creators require "protection comparable to other platforms" by contract.
+- Monthly revenue has crossed about $10,000 and content leakage would cause real business loss.
+- You're selling into regulated verticals (enterprise training, healthcare) where contracts mandate protected delivery.
+
+Conversely, if your catalog is self-produced fitness clips, recipe videos, or similar — content where a leak is embarrassing but not fatal — the engineering cost of DRM doesn't pay back.
+
+The middle ground I like: **visible watermarking**. Overlay the viewer's email address at reduced opacity in a corner of the video (baked in at render time if you own the encoder, or dynamically drawn by the player). This doesn't stop screen-recording, but it dramatically changes the incentive. Someone who knows their own email would be visible in any shared recording thinks twice before posting it.
+
+## Step 7: Three Pitfalls Most Solo Developers Hit on First Release
+
+A few gotchas that almost always land on the first launch.
+
+### Pitfall 1: Background Playback and App Review
+
+Adding `audio` to `UIBackgroundModes` in Info.plist keeps playback alive on the lock screen. App Review will ask for a specific reason. Audio-book apps, language-learning courses — these pass. Vague reasons get rejected. Ship v1 without background audio and add it later when the use case is obvious.
+
+If you do need background audio, prepare a short screen recording showing the feature in use and paste it into the review notes. Reviewers who see a concrete demo tend to approve faster than reviewers who have to infer intent.
+
+### Pitfall 2: Permission Bypass Through AirPlay/Chromecast
+
+When a user AirPlays a stream, the signed URL is forwarded to Apple TV and becomes visible there. After cancellation, Apple TV can keep serving from its cache. Mitigate with **short signed URL expirations** (under 10 minutes) and, for long-form content, a **server-side session tracker** that requires fresh tokens to continue playing.
+
+For Chromecast the risk profile is similar. If you plan to support casting, design the session tracker from day one rather than retrofitting it.
+
+### Pitfall 3: "Three Days After Cancellation They Can Still Watch"
+
+The most common failure mode is a silently-failing webhook. Monitor the Stripe Dashboard "Events → Failed" view before launch. Add a nightly Cloudflare Worker job that queries the Stripe Subscriptions API and reconciles with your KV state — even when webhooks fail, you catch the drift within a day.
+
+Keep this job running forever. Webhooks fail occasionally no matter how much you test them, and reconciliation is cheap insurance.
+
+## Operating Costs and Revenue — Concrete Numbers
+
+A monthly operating picture at 1,000 unique users and 20 minutes average watch time.
+
+- **Cloudflare Stream** — 20,000 minutes × $0.001/min ≈ $20 + $5 storage = **$25**
+- **Cloudflare Workers** — free tier (100k req/day) is plenty = **$0**
+- **Stripe fees** — 2.9% + $0.30/transaction, on $1,000/mo revenue ≈ **$30**
+- **Apple fee** — 15% under Small Business Program, on $1,000 ≈ **$150**
+
+Net around **$700–$800** per month at $1,000 GMV. Moving the catalog to Mux once usage grows improves unit economics further.
+
+At 10× that scale (10,000 users, 200,000 minutes/month) Cloudflare Stream bandwidth grows to about $200 while everything else stays roughly linear with revenue. The unit economics get better, not worse, as you grow — which is the opposite of many SaaS businesses. That's part of why video subscription is an attractive solo-developer niche.
+
+## Measuring the Business — What Retention Metrics Actually Matter
+
+Solo developers often over-index on monthly revenue and under-index on the metrics that predict next month's revenue. For a video subscription business, three retention numbers are worth building your dashboards around from week one.
+
+**Day-7 activation rate.** Of users who started a trial this week, what percentage watched at least one full video within 7 days? Below 40% and trial-to-paid conversion is usually weak. Above 60% and the product fundamentally works — you're growth-limited, not product-limited.
+
+**Minutes-per-paying-user per month.** The gold-standard retention indicator. A paying user who watches 45+ minutes/month is very unlikely to cancel in the next 90 days. A paying user who watches under 10 minutes is likely to cancel within 60 days. Build a weekly cohort view of this number.
+
+**Library breadth per user.** How many distinct videos did each paying user watch this month? Users who watch 1 video per month are price-sensitive and cancel on the first invoice bump. Users who watch 5+ videos are anchored to the library and forgive price increases up to about 40%.
+
+These three metrics matter more than MRR for a solo-dev video business, because they predict churn 60–90 days ahead. MRR tells you what happened; these numbers tell you what's going to happen.
+
+### Building the Dashboard
+
+You don't need a full analytics platform for this. A nightly Cloudflare Worker that aggregates `view_sessions` into a weekly summary table, and a simple internal page on your admin site, is enough for your first year of operation. When you outgrow it, PostHog or Mixpanel both have free tiers that handle the volume most solo operators will ever generate.
+
+## Content Operations — The Part Most Engineers Ignore
+
+The mechanical parts of this article (HLS, Stripe, DRM) are the 30% of the work. The other 70% is content operations — the repeating cycle of producing, uploading, titling, thumbnailing, and publishing videos. Underestimate this at your peril.
+
+Three operational decisions I recommend making before launch.
+
+**Publishing cadence.** Pick a rhythm you can sustain for 12 months without burning out. For solo producers, 1 new video per week is usually the sweet spot: fast enough to keep subscribers engaged, slow enough that you don't collapse into burnout by month three. 2–3 per week works for full-time creators but is dangerous for side projects.
+
+**Thumbnail and title workflow.** Every video needs a thumbnail. Build a Figma template, assign 30 minutes per video for thumbnail + title, and treat it as a hard requirement. Low-effort thumbnails reduce discovery dramatically even inside your own app.
+
+**Archive vs. remove.** Decide up front what happens to old videos. Keeping every video forever bloats storage costs and hurts library navigation. A rotating "featured" section plus a searchable archive works better than a flat chronological list once you cross 50 videos.
+
+## Testing Before Launch — What Solo Developers Should Actually Verify
+
+Shipping a paid video app means real money moves through it, and the cost of a broken entitlement flow is high (customer support volume, refund requests, trust loss). Before the App Store submission, walk through these tests manually — automated tests never catch all of them.
+
+1. **New subscriber starts playing immediately.** Sign up, pay via Stripe Test Mode, and verify the webhook lands, KV updates, and the next `/video-token` request succeeds — all within 10 seconds of payment. If there's a gap, your webhook is slow or KV isn't being written in the right order.
+2. **Cancellation revokes next-day access.** In Stripe Test Mode, cancel a subscription with `cancel_at_period_end=false` (immediate cancellation). Verify the next `/video-token` call returns 403. Then test `cancel_at_period_end=true` — playback should remain until `current_period_end`, then stop.
+3. **Payment failure locks access after grace period.** Use a test card that triggers `card_declined` on renewal. Verify the user keeps access for your defined grace period (3 days is common) and loses it after.
+4. **Downgrade removes premium-only videos.** User downgrades from Premium to Pro; videos marked `required_plan = "premium"` return 403 while Pro-tier videos still play.
+5. **Free trial expires cleanly.** Start a 7-day trial, verify access throughout, let it expire without payment, verify access is revoked.
+
+If all five pass, your entitlement core is solid. Everything else (UI bugs, analytics gaps) can be fixed post-launch without losing customer trust.
+
+## Wrapping Up — What to Do Next
+
+If you're now at the point where you can build this, the best next step is a **minimal launch**. Skip DRM and offline in v1. Ship signed URLs plus Stripe subscriptions as a beta, and let real users tell you where to invest. What's watched, where people cancel, which video converts — those patterns become visible in the first two weeks, and they decide what to build next.
+
+For the subscription side, [Rork × Stripe Subscription Monetization Guide](/articles/rork-business/rork-stripe-subscription-monetization-guide) covers the billing flow in detail. For video backup workflows, [Rork × Cloudflare R2 File Storage Guide](/articles/rork-dev/rork-cloudflare-r2-file-storage-guide) is a good companion read.
