@@ -1,0 +1,579 @@
+---
+title: "Rork × Notion API で CMS 駆動アプリを作る実装ガイド — 認証・ブロック描画・レート制限・画像URLの運用まで"
+slug: "rork-notion-api-cms-content-app-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-23T11:15"
+updated: "2026-04-23T11:15"
+author: "Rork Lab"
+description: "Rork で作るアプリの裏側を Notion にする。認証方式の選び方、ブロック構造の安全な描画、1時間で切れる画像URL問題、API レート制限への向き合い方まで、本番運用に耐える設計をひとつずつ組み立てます。"
+tags: ["Notion API", "Rork", "CMS", "コンテンツ管理", "OAuth", "React Native", "キャッシュ", "レート制限"]
+highlights:
+  - "Notion API で詰まっていた「画像 URL が1時間で切れる」問題に、署名付き URL の再発行と CDN キャッシュを組み合わせた運用パターンで決着をつけられる"
+  - "Internal Integration Token と Public OAuth の境界線を見極め、個人アプリから多ワークスペース対応アプリまで一本の設計思想で拡張できる"
+  - "ブロック構造を UI に落とし込むレンダラを型安全に実装し、Notion 側の小さな更新がアプリ全体を壊さない堅牢な記事配信基盤を手に入れられる"
+---
+
+Rork で作ったアプリに「記事」「レシピ」「学習コンテンツ」のような読み物を載せたくなったとき、最初に悩むのがバックエンドの置き場所ではないでしょうか。Firestore にゼロから作るのは重い、Supabase を立てるとサーバー管理が増える、Sanity や Contentful は使いこなすほどの分量が出ないかもしれない — そんな「ちょうどいい規模のアプリ」に、私はここ数年ずっと Notion を裏側に据えてきました。
+
+Notion の良さは明快です。編集画面が誰にでも使えるうえに、タイトル・本文・タグ・公開フラグといった「記事らしいフィールド」がそのまま自然に組み立てられます。執筆は Notion アプリ、表示は Rork で生成したモバイルアプリ — この分業は、個人開発者が「書く・直す・出す」サイクルを自分ひとりで回すうえで驚くほどストレスが少ないのです。
+
+ただし、Notion API には本番で使うときに気をつけたいクセが3つあります。**画像 URL が1時間で失効する、リクエストレートに上限がある、ページの中身が「ブロックの配列」という独特の形で返ってくる**、この3点です。これらを先回りして設計に組み込んでおかないと、リリース初日はうまく動いていたアプリが、数日後に読者から「画像が表示されません」と報告されて慌てる羽目になります。
+
+このガイドでは、Rork で生成した React Native アプリから Notion を CMS として活用する実装を、個人開発 5 本分の経験から得た運用知識ごと書き留めます。中途半端なサンプルではなく、本番で回り続ける形を目指しましょう。
+
+## Notion をアプリの裏側に置く前に決めておきたい3つのこと
+
+Notion を CMS に据える前に、自分のアプリの性質を次の3つの軸で整理しておくと、あとから設計が迷子になりません。
+
+**① 読み取り専用か、書き込みもあるか。** ブログ・ニュース・レシピなど「自分が書いて読者が読む」一方通行なら読み取りだけで十分です。一方、ユーザー投稿をためたい場合は Notion を選ぶべきではありません。Notion API は書き込みも可能ですが、ワークスペースに見知らぬユーザーの投稿が流れ込むのは運用上おすすめしません。そういう用途なら Supabase や Firestore のほうが素直です。
+
+**② 読者の言語が複数か。** 多言語対応する場合、Notion のデータベースに `locale` プロパティを持たせて記事ごとに分ける方法と、プロパティとして `title_ja` / `title_en` を並べる方法があります。私は前者（1記事 = 1言語）を推しています。翻訳の進捗管理がやりやすく、「英語版だけまだ公開しない」といった操作が素直にできるからです。
+
+**③ 画像が多いか少ないか。** 画像が多いアプリ（レシピ・旅行ガイド・作品ポートフォリオ）は、後述する「画像 URL 1時間問題」への備えを必ず入れてください。画像がほとんどなく文字中心のアプリなら、実装はずっと軽く済みます。
+
+この3つが決まれば、あとは迷わずに手を動かせます。
+
+## 認証は Internal Integration Token から始めて、必要になったら OAuth へ
+
+Notion API への認証方法は大きく2つです。
+
+- **Internal Integration Token（内部インテグレーション）**: 自分のワークスペースだけを読み書きする用途。トークンを発行して `Authorization: Bearer` で送るだけの最短ルートです。
+- **Public OAuth**: 他のユーザーのワークスペースにアプリとして接続する用途。多ワークスペース対応が必要な SaaS 型アプリで使います。
+
+個人開発者が「自分が書いた記事を自分のアプリに配信する」だけなら、**Internal Integration Token で始めるのが正解**です。最初から OAuth を組むと、コールバック URL の処理、トークンの暗号化保存、リフレッシュの扱いまで考えることが増えて、記事1本を表示するのに1週間溶けます。
+
+ただしここで重要なのが、**トークンをクライアント（アプリ側）に絶対に埋め込まないこと**です。Rork が生成するコードに `NOTION_TOKEN=secret_xxx` を `.env` で書いてしまうと、ビルドに含まれて流出リスクが発生します。トークンは必ずサーバー（Cloudflare Workers や自前の軽量 BFF）に置き、アプリからはそのサーバー経由で Notion を叩くのが鉄則です。
+
+バックエンドの軽量構成としては、既存記事の [Rork × Hono で作る Cloudflare Workers REST API 実装ガイド](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) で紹介している Hono ベースの構成が相性抜群です。エンドポイントは3つだけで足ります — 一覧取得、記事1件取得、画像プロキシ。
+
+## Notion データベースから記事一覧を取り出す最小実装
+
+まずは最低限動くコードから組み立てます。以下は Cloudflare Workers 上で Hono を使って記事一覧エンドポイントを作る例です。
+
+```ts
+// server/src/routes/articles.ts
+import { Hono } from "hono";
+import { cache } from "hono/cache";
+import { Client } from "@notionhq/client";
+
+type Bindings = {
+  NOTION_TOKEN: string;
+  NOTION_DATABASE_ID: string;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.get(
+  "/articles",
+  cache({
+    cacheName: "notion-articles",
+    cacheControl: "public, max-age=300", // 5分のエッジキャッシュ
+  }),
+  async (c) => {
+    const notion = new Client({ auth: c.env.NOTION_TOKEN });
+
+    try {
+      const res = await notion.databases.query({
+        database_id: c.env.NOTION_DATABASE_ID,
+        filter: {
+          and: [
+            { property: "Status", select: { equals: "Published" } },
+            { property: "Locale", select: { equals: "ja" } },
+          ],
+        },
+        sorts: [{ property: "PublishedAt", direction: "descending" }],
+        page_size: 50,
+      });
+
+      const articles = res.results.map((page: any) => ({
+        id: page.id,
+        slug: page.properties.Slug.rich_text[0]?.plain_text ?? "",
+        title: page.properties.Title.title[0]?.plain_text ?? "無題",
+        excerpt: page.properties.Excerpt.rich_text[0]?.plain_text ?? "",
+        publishedAt: page.properties.PublishedAt.date?.start ?? null,
+        cover: page.cover?.type === "external"
+          ? page.cover.external.url
+          : page.cover?.file?.url ?? null,
+      }));
+
+      return c.json({ articles });
+    } catch (err: any) {
+      // Notion が 5xx を返すときは短いリトライが効くことが多い
+      console.error("notion-query-failed", err.code, err.message);
+      return c.json({ error: "notion_unavailable" }, 503);
+    }
+  }
+);
+
+export default app;
+```
+
+期待する動作は、公開済み・日本語の記事を最大50件、新しい順に JSON で返すことです。`cache()` ミドルウェアを入れているので、1度叩いたレスポンスは5分間エッジで保持され、Notion API のレート制限を圧迫しません。
+
+**なぜ `page_size: 50` なのか**ですが、Notion API の1回のクエリ上限は100件です。ただし100件取るとレスポンスサイズが肥大化し、スマホ側のパース時間が伸びます。一覧画面で即座に見える分（30〜50件）にとどめて、以降はページネーションするのが実用的です。
+
+## ブロックを UI に落とし込む — 型で守りながら描画する
+
+記事一覧が取れたら、次は本文のレンダリングです。Notion の本文は「ブロックの配列」として返ってきます。段落・見出し・画像・コード・リスト・引用など、それぞれ種類（type）が違うオブジェクトが並ぶ形です。
+
+この構造は柔軟な反面、**クライアント側で知らない type が来たときに黙って表示が消える**という落とし穴を抱えています。Notion 側で誰か（あなた自身）が新しいブロックタイプを使った瞬間、アプリで本文が欠落するわけです。私は過去にこれで「記事の途中だけ読めない」という報告を受けて、原因特定に丸一日溶かしました。
+
+対策は**型定義と未知ブロックのフォールバック**です。次のような構造で描画します。
+
+```tsx
+// app/components/NotionRenderer.tsx
+import { View, Text, Image, StyleSheet } from "react-native";
+import { useMemo } from "react";
+
+type NotionBlock =
+  | { id: string; type: "paragraph"; paragraph: { rich_text: RichText[] } }
+  | { id: string; type: "heading_2"; heading_2: { rich_text: RichText[] } }
+  | { id: string; type: "heading_3"; heading_3: { rich_text: RichText[] } }
+  | { id: string; type: "bulleted_list_item"; bulleted_list_item: { rich_text: RichText[] } }
+  | { id: string; type: "code"; code: { rich_text: RichText[]; language: string } }
+  | { id: string; type: "image"; image: { type: "file" | "external"; file?: { url: string }; external?: { url: string } } }
+  | { id: string; type: string; [key: string]: unknown }; // 未知タイプ用フォールバック
+
+type RichText = { plain_text: string; annotations: { bold: boolean; italic: boolean; code: boolean } };
+
+export function NotionRenderer({ blocks }: { blocks: NotionBlock[] }) {
+  return (
+    <View>
+      {blocks.map((block) => (
+        <BlockView key={block.id} block={block} />
+      ))}
+    </View>
+  );
+}
+
+function BlockView({ block }: { block: NotionBlock }) {
+  switch (block.type) {
+    case "paragraph":
+      return <Paragraph text={block.paragraph.rich_text} />;
+    case "heading_2":
+      return <Heading level={2} text={block.heading_2.rich_text} />;
+    case "heading_3":
+      return <Heading level={3} text={block.heading_3.rich_text} />;
+    case "bulleted_list_item":
+      return <BulletItem text={block.bulleted_list_item.rich_text} />;
+    case "code":
+      return <CodeBlock text={block.code.rich_text} language={block.code.language} />;
+    case "image": {
+      const url = block.image.type === "file"
+        ? block.image.file?.url
+        : block.image.external?.url;
+      if (!url) return null;
+      return <NotionImage url={url} />;
+    }
+    default:
+      // 未知タイプは黙って消さず、開発中は視覚的に気づけるようにする
+      if (__DEV__) {
+        return (
+          <View style={styles.unknown}>
+            <Text style={styles.unknownText}>未対応のブロック: {block.type}</Text>
+          </View>
+        );
+      }
+      return null;
+  }
+}
+
+function renderRichText(rich: RichText[]) {
+  return rich.map((r, i) => {
+    const style = [
+      r.annotations.bold && styles.bold,
+      r.annotations.italic && styles.italic,
+      r.annotations.code && styles.inlineCode,
+    ].filter(Boolean);
+    return (
+      <Text key={i} style={style}>
+        {r.plain_text}
+      </Text>
+    );
+  });
+}
+
+function Paragraph({ text }: { text: RichText[] }) {
+  return <Text style={styles.paragraph}>{renderRichText(text)}</Text>;
+}
+
+function Heading({ level, text }: { level: 2 | 3; text: RichText[] }) {
+  const style = level === 2 ? styles.h2 : styles.h3;
+  return <Text style={style}>{renderRichText(text)}</Text>;
+}
+
+function BulletItem({ text }: { text: RichText[] }) {
+  return (
+    <View style={styles.bulletRow}>
+      <Text style={styles.bulletDot}>•</Text>
+      <Text style={styles.bulletText}>{renderRichText(text)}</Text>
+    </View>
+  );
+}
+
+function CodeBlock({ text, language }: { text: RichText[]; language: string }) {
+  const source = text.map((r) => r.plain_text).join("");
+  return (
+    <View style={styles.codeWrap}>
+      <Text style={styles.codeLang}>{language}</Text>
+      <Text style={styles.codeBody}>{source}</Text>
+    </View>
+  );
+}
+
+function NotionImage({ url }: { url: string }) {
+  // url は後述の画像プロキシを通す
+  return <Image source={{ uri: url }} style={styles.image} resizeMode="cover" />;
+}
+
+const styles = StyleSheet.create({
+  paragraph: { fontSize: 16, lineHeight: 26, marginVertical: 8, color: "#111" },
+  h2: { fontSize: 22, fontWeight: "700", marginTop: 24, marginBottom: 12 },
+  h3: { fontSize: 18, fontWeight: "700", marginTop: 16, marginBottom: 8 },
+  bold: { fontWeight: "700" },
+  italic: { fontStyle: "italic" },
+  inlineCode: { fontFamily: "Menlo", backgroundColor: "#f2f2f2" },
+  bulletRow: { flexDirection: "row", marginVertical: 4 },
+  bulletDot: { marginRight: 8, lineHeight: 26 },
+  bulletText: { flex: 1, fontSize: 16, lineHeight: 26 },
+  codeWrap: { backgroundColor: "#f6f8fa", padding: 12, borderRadius: 8, marginVertical: 12 },
+  codeLang: { fontSize: 11, color: "#888", marginBottom: 6 },
+  codeBody: { fontFamily: "Menlo", fontSize: 13, lineHeight: 20 },
+  image: { width: "100%", aspectRatio: 16 / 9, borderRadius: 8, marginVertical: 12 },
+  unknown: { padding: 8, backgroundColor: "#fff4e5", borderRadius: 4, marginVertical: 4 },
+  unknownText: { color: "#b16a00", fontSize: 12 },
+});
+```
+
+この実装のポイントは **`default:` 分岐で未知タイプを `null` に落とす**ところです。開発中は警告表示しつつ、本番では黙って消えるようにしておけば、Notion 側で新ブロックが追加されてもアプリがクラッシュすることはありません。代わりに「新ブロックが来たら追加実装する」という運用で、アプリとしての堅牢性と拡張性を両立できます。
+
+## 画像 URL が1時間で切れる問題にどう向き合うか
+
+Notion API で最も詰まりやすいのがこれです。**Notion にアップロードした画像の URL（`block.image.file.url`）は、取得から1時間で失効します**。つまり、ある時点で API を叩いて得た画像 URL をアプリのキャッシュや自前 DB に保存しておき、それを翌日表示しても画像は出てこないのです。
+
+この挙動は Notion の仕様であり、署名付き URL の有効期限を1時間にすることで無制限の画像配布を防ぐ仕組みになっています。対策は2択あります。
+
+**案 A: 毎回 Notion API を叩き直して最新の URL を取る。** 読者がアプリを開いた瞬間にサーバー経由で Notion を再クエリし、その時点の有効な URL を返す方法です。シンプルですが、レート制限の圧迫と応答時間の延びが懸念です。
+
+**案 B: 画像を自分のストレージ（R2 / S3 / Cloudflare Images）に定期的に吸い出し、そこから配信する。** Notion から1日1回など画像を同期してしまえば、失効問題は完全に消えます。運用コストは少し増えますが、CDN の恩恵を受けられて読み込みも速くなります。
+
+**個人アプリから小規模 SaaS までは案 A、本格的な読み物アプリになったら案 B** というのが私の経験則です。ここでは案 A をベースに、サーバー側で短時間キャッシュしながら安全に捌く実装を示します。
+
+```ts
+// server/src/routes/image-proxy.ts
+import { Hono } from "hono";
+import { Client } from "@notionhq/client";
+
+type Bindings = { NOTION_TOKEN: string };
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// クライアントは /image-proxy?pageId=xxx&blockId=yyy の形で叩く
+app.get("/image-proxy", async (c) => {
+  const pageId = c.req.query("pageId");
+  const blockId = c.req.query("blockId");
+
+  if (!pageId || !blockId) {
+    return c.json({ error: "missing_params" }, 400);
+  }
+
+  const notion = new Client({ auth: c.env.NOTION_TOKEN });
+
+  try {
+    // ブロックを取り直すと、その場で有効な URL が手に入る
+    const block: any = await notion.blocks.retrieve({ block_id: blockId });
+
+    if (block.type !== "image") {
+      return c.json({ error: "not_an_image" }, 400);
+    }
+
+    const url = block.image.type === "file"
+      ? block.image.file.url
+      : block.image.external.url;
+
+    if (!url) {
+      return c.json({ error: "no_url" }, 404);
+    }
+
+    // Notion の画像本体を取得してそのまま返す
+    // こうすることで、クライアントは Notion の URL を知らなくて良い
+    const imageRes = await fetch(url);
+    if (!imageRes.ok) {
+      return c.json({ error: "notion_image_fetch_failed" }, 502);
+    }
+
+    const body = await imageRes.arrayBuffer();
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "Content-Type": imageRes.headers.get("Content-Type") ?? "image/jpeg",
+        // エッジで10分キャッシュする
+        "Cache-Control": "public, max-age=600, s-maxage=600",
+        // 画像は変わらないので ETag を使って再取得を抑制
+        "ETag": imageRes.headers.get("ETag") ?? "",
+      },
+    });
+  } catch (err: any) {
+    console.error("image-proxy-failed", err.code, err.message);
+    return c.json({ error: "proxy_failed" }, 500);
+  }
+});
+
+export default app;
+```
+
+この実装の勘所は、**クライアントは Notion の URL を一切知らない**ことです。アプリが叩くのは `https://api.yourapp.com/image-proxy?pageId=xxx&blockId=yyy` のような自分のサーバー。内部で Notion を都度参照し、画像バイナリをそのまま返します。
+
+CDN（Cloudflare Workers なら自動で有効）の上で `Cache-Control: max-age=600` を付けているので、同じ画像へのアクセスは10分間エッジで配信され、Notion API への再照会は抑えられます。
+
+## レート制限との付き合い方 — 3 req/秒を前提にした設計
+
+Notion API は**平均3リクエスト/秒**という緩やかなレート制限を持っています。個人アプリなら普段は気にならない数字ですが、**新着記事がプッシュ通知で配信された直後に読者が一斉にアプリを開く瞬間**だけ、このラインを超えがちです。
+
+推奨される対策は2段構えです。
+
+第1に、**サーバー側でエッジキャッシュを積極的に使う**こと。先ほどの記事一覧 API には `hono/cache` を入れ、画像プロキシには `Cache-Control: max-age=600` を入れました。この2つだけで、同一記事への連続リクエストはほぼキャッシュから返せます。
+
+第2に、**429 応答を受けたときのバックオフ**を必ず仕込むこと。Notion は制限超過時に `429 Too Many Requests` を返すので、その場合は `Retry-After` ヘッダに従って待ち、指数バックオフで再試行します。
+
+```ts
+// server/src/lib/notion-with-retry.ts
+import { Client } from "@notionhq/client";
+
+export async function queryWithRetry<T>(
+  fn: () => Promise<T>,
+  options: { maxRetries?: number; baseDelayMs?: number } = {}
+): Promise<T> {
+  const maxRetries = options.maxRetries ?? 3;
+  const baseDelay = options.baseDelayMs ?? 500;
+
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+
+      // 429（レート制限）と 5xx のみリトライ対象にする
+      const code = err?.status ?? err?.code;
+      const isRetryable =
+        code === 429 ||
+        code === "rate_limited" ||
+        (typeof code === "number" && code >= 500 && code < 600);
+
+      if (!isRetryable || attempt === maxRetries) {
+        throw err;
+      }
+
+      // Retry-After があればそれに従い、なければ指数バックオフ
+      const retryAfter = Number(err?.headers?.["retry-after"]);
+      const delay = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : baseDelay * Math.pow(2, attempt) + Math.random() * 200;
+
+      console.warn(`notion-retry attempt=${attempt + 1} delay=${delay}ms code=${code}`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+
+  throw lastError;
+}
+```
+
+期待する動作は、429 と 5xx を最大3回までリトライし、4xx（認証エラー等）は即座に投げ返すこと。バックオフにランダム成分（ジッター）を入れているのは、**全クライアントが同じタイミングで再試行して再び制限にぶつかる「雷鳴の群れ」を避ける**ためです。地味ですが本番で効きます。
+
+## クライアントを TanStack Query で組む — レート制限にやさしい stale-while-revalidate
+
+あまり語られませんが、体感速度に一番効いてくるのはクライアント側のフェッチ層です。サーバーの短い TTL キャッシュと TanStack Query（React Query）を組み合わせると、「端末 → エッジ → Notion」の二段キャッシュが完成し、同じ記事への再訪問は端末上のメモリから瞬時に返り、Notion へのリクエストは数分に1回に抑えられます。
+
+```tsx
+// app/hooks/useArticles.ts
+import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
+
+const API_BASE = process.env.EXPO_PUBLIC_API_BASE!;
+
+type ArticleSummary = {
+  id: string;
+  slug: string;
+  title: string;
+  excerpt: string;
+  publishedAt: string | null;
+  cover: string | null;
+};
+
+async function fetchArticles(cursor?: string): Promise<{ articles: ArticleSummary[]; nextCursor?: string }> {
+  const url = new URL("/articles", API_BASE);
+  if (cursor) url.searchParams.set("cursor", cursor);
+
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    throw new Error(`articles_fetch_failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export function useArticleList() {
+  return useInfiniteQuery({
+    queryKey: ["articles"],
+    queryFn: ({ pageParam }) => fetchArticles(pageParam as string | undefined),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextCursor,
+    // サーバーのエッジキャッシュと合わせて5分間は新鮮扱い
+    staleTime: 1000 * 60 * 5,
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useArticle(slug: string) {
+  return useQuery({
+    queryKey: ["article", slug],
+    queryFn: async () => {
+      const res = await fetch(`${API_BASE}/articles/${slug}`);
+      if (!res.ok) throw new Error(`article_fetch_failed: ${res.status}`);
+      return res.json();
+    },
+    staleTime: 1000 * 60 * 5,
+    // サーバー側でリトライ済みなのでクライアントでは一度だけ
+    retry: 1,
+  });
+}
+```
+
+オフライン耐性のある `QueryClient` 設定も一緒に入れておきます。地下鉄で電波が途切れる瞬間でも、いったん読まれた記事は読み続けられます。
+
+```tsx
+// app/providers.tsx
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
+import { AppState, type AppStateStatus } from "react-native";
+import { useEffect } from "react";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnReconnect: "always",
+      gcTime: 1000 * 60 * 30,
+      networkMode: "offlineFirst",
+    },
+  },
+});
+
+export function AppProviders({ children }: { children: React.ReactNode }) {
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state: AppStateStatus) => {
+      focusManager.setFocused(state === "active");
+    });
+    return () => sub.remove();
+  }, []);
+
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+```
+
+なぜこれが効くのか。**サーバーのエッジキャッシュで5分間の安い読み出しが、端末のキャッシュでゼロ遅延のナビゲーションが**、それぞれ担保されます。記事を開いて一覧に戻り、別の記事を開く — この一連の動作がすべて端末内の即応答になるので、実使用での体感は大きく変わります。Notion から見れば、同じ記事はおおむね5分に1回しか問い合わされません。
+
+## 入れ子ブロック — 再帰取得を入れずにリリースしないこと
+
+先ほど触れた `has_children` の話を、もう少し実装として具体化します。トグル・コールアウト・引用はいずれも子ブロックを持ち得るため、最上位の配列だけを描画する素朴な実装では、入れ子の中身が丸ごと消えます。先ほどのレンダラに合う再帰取得を次のように用意します。
+
+```ts
+// server/src/lib/fetch-blocks.ts
+import { Client } from "@notionhq/client";
+
+type BlockNode = { id: string; type: string; has_children: boolean; children?: BlockNode[] } & Record<string, unknown>;
+
+export async function fetchBlockTree(notion: Client, blockId: string, depth = 0): Promise<BlockNode[]> {
+  // 病的に深いページ対策（Notion は深いネストを許容する）
+  if (depth > 6) {
+    console.warn("fetchBlockTree: max depth reached", { blockId });
+    return [];
+  }
+
+  const results: BlockNode[] = [];
+  let cursor: string | undefined = undefined;
+
+  do {
+    const res = await notion.blocks.children.list({
+      block_id: blockId,
+      start_cursor: cursor,
+      page_size: 100,
+    });
+
+    for (const raw of res.results as any[]) {
+      const node: BlockNode = { ...raw };
+      if (raw.has_children) {
+        node.children = await fetchBlockTree(notion, raw.id, depth + 1);
+      }
+      results.push(node);
+    }
+
+    cursor = res.next_cursor ?? undefined;
+  } while (cursor);
+
+  return results;
+}
+```
+
+押さえどころは3つ。**最上位の子ブロックをページネーションする**（1回のレスポンスは最大100件まで）、**深さを制限する**（想定外のネストでレート制限を使い切らないため）、**ツリーを保持する**（トグルをトグルとして描画するには階層構造が必要）。入れ子を失ったフラットな配列を返してしまうと、レンダラでグルーピングが復元できません。
+
+## 下書き・公開・非公開をステータスで管理する運用パターン
+
+Notion をアプリのバックエンドにする最大の気持ちよさは、**「書きかけを公開しない」「公開後に引っ込める」「ABテスト的に一部だけ見せる」といった運用がプロパティで完結する**ことです。
+
+私が使っている最小構成はこうです。
+
+- **Status（単一選択）**: `Draft` / `InReview` / `Published` / `Archived`
+- **PublishedAt（日付）**: 公開日時
+- **Locale（単一選択）**: `ja` / `en`
+- **Slug（テキスト）**: URL 用
+- **Tier（単一選択）**: `Free` / `Premium` — 有料アプリなら会員向け記事を分ける
+
+API 側では、`Status = Published` かつ `PublishedAt <= 現在時刻` という条件でフィルタします。これで、予約投稿（未来の日時を設定しておけば自動公開）も特別な仕組みなしに実現できます。
+
+```ts
+// server/src/lib/article-filter.ts
+export function buildPublishedFilter(locale: "ja" | "en", now = new Date()) {
+  return {
+    and: [
+      { property: "Status", select: { equals: "Published" } },
+      { property: "Locale", select: { equals: locale } },
+      {
+        property: "PublishedAt",
+        date: { on_or_before: now.toISOString() },
+      },
+    ],
+  };
+}
+```
+
+予約投稿を有効にするには、エッジキャッシュの `max-age` を長くしすぎないことが肝心です。5分程度であれば、予約時刻から最大5分のラグで公開される計算になり、多くのアプリで許容できる範囲です。
+
+## よくある落とし穴とその回避策
+
+本番に出してから頭を抱えたポイントを3つ、共有します。
+
+**落とし穴 1: トークンがアプリのバンドルに混入する。** Rork で生成されるコードで `.env` を参照する箇所に `NOTION_TOKEN` を書き、クライアント側で使おうとする実装をよく見ます。これは絶対に避けてください。Notion のトークンは**サーバー側の秘匿情報**であり、バンドルに含まれた瞬間に誰でも抽出できます。クライアントからは常に自分のバックエンド経由で Notion を叩く設計を徹底しましょう。
+
+**落とし穴 2: データベース ID をハードコードして、別ワークスペースに切り替えられない。** 開発用・本番用の Notion データベースを分けるとき、DB ID をコードに直書きしていると入れ替えが辛くなります。環境変数にする、またはサーバーのシークレットとして持つのが安全です。
+
+**落とし穴 3: ブロックの `has_children` を無視して子ブロックを取り損ねる。** Notion のブロックは入れ子になれます（例: トグル内のリスト、引用の中の段落）。最上位のブロック配列だけを描画する実装だと、入れ子要素が全部消えます。`has_children: true` のブロックは `notion.blocks.children.list` で子を取り、再帰的に描画する必要があります。画像中心のアプリなら見逃しがちなので、描画ロジックを書く前に「自分のコンテンツにトグルや引用はあるか？」を棚卸ししてください。
+
+## 本番運用で効いてくる3つの小技
+
+最後に、派手ではないけれど本番で効く工夫を3つ。
+
+**工夫 1: 記事のカバー画像だけはアプリにバンドルする。** プッシュ通知のたびに記事一覧を開く読者体験では、カバー画像が1秒遅れるだけで印象が悪くなります。最新 N 件だけは Expo のアセットに入れておくか、事前ダウンロードで端末に寄せておく — これでファーストビューの体感が大きく変わります。
+
+**工夫 2: Notion 編集時の更新をすぐアプリに反映したいなら、短い TTL + 手動パージを組み合わせる。** 記事を直してすぐ確認したい時のために、管理者だけが叩ける `?refresh=1` パラメータをサーバーに用意し、エッジキャッシュをスキップして最新を取るルートを作っておくと、執筆作業のストレスが激減します。
+
+**工夫 3: 監視は「404 になった画像 URL の件数」を見る。** 画像 URL の1時間失効が悪さをしていないか、本番で最も先に気づけるのがこの指標です。画像プロキシで 404 を検知したらログに記録し、日次で集計して閾値を超えたらアラートを出す運用が実用的です。
+
+## 次の一歩 — まずは1記事を通しで動かしてみる
+
+Notion と Rork を組み合わせる楽しさは、「書いた記事が数秒後にアプリで読める」という即時性にあります。本格的な運用を目指すなら、今日は **1記事を1画面に描画するところまで**作り切ってみてください。
+
+一覧エンドポイント・詳細エンドポイント・画像プロキシの3つが揃えば、あとは画面側の UI に肉付けするだけで読み物アプリの骨格が完成します。ペイウォール実装や課金連携に進みたくなったら、[Rork × Cloudflare D1 バックエンド構築ガイド](/articles/rork-dev/rork-cloudflare-d1-sqlite-backend-guide) で紹介しているキャッシュ層との合わせ技が効いてきます。また、サーバー側のデータ取得と整合させたクライアントキャッシュを組みたい場合は [Rork × TanStack Query キャッシュ設計ガイド](/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide) の構成とそのまま統合できます。
+
+Notion の設計をより深く学びたい方には、[Notion API 公式ドキュメントに基づく実装書としても参照できる『Web API: The Good Parts』（水野貴明）](https://www.amazon.co.jp/dp/4873116864/?tag=pinocchio-22) が、REST API 全般の作法を押さえる意味で今でも役に立ちます。Notion API 固有の話ではありませんが、「どこにキャッシュを置き、どこでリトライし、どこでエラーを握りつぶさないか」という判断軸がきれいに身につく一冊です。

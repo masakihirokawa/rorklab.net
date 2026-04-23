@@ -1,0 +1,572 @@
+---
+title: "Using Notion as a CMS Backend for Rork Apps — Auth, Block Rendering, Rate Limits, and the 1-Hour Image URL Problem"
+slug: "rork-notion-api-cms-content-app-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-23T11:15"
+updated: "2026-04-23T11:15"
+author: "Rork Lab"
+description: "Put Notion behind your Rork app. Pick the right auth model, render Notion blocks safely, survive the 1-hour image URL expiry, and stay under the API rate limit — a production-grade walkthrough."
+tags: ["Notion API", "Rork", "CMS", "OAuth", "React Native", "Caching", "Rate Limiting"]
+highlights:
+  - "You'll settle the infamous '1-hour image URL expiry' with a proxy pattern that pairs short-TTL edge caching and signed URL refresh — no more broken images the day after launch"
+  - "You'll learn where Internal Integration Tokens end and public OAuth begins, so you can start personal and scale to multi-workspace without rewriting your auth layer"
+  - "You'll build a type-safe block renderer that survives Notion adding new block types tomorrow, turning your CMS into a reliable content pipeline rather than a weekly fire drill"
+---
+
+When a Rork-built app starts to feel like it needs actual articles, recipes, or lessons behind it, the backend question shows up uninvited. Firestore feels heavy to wire up from scratch. Supabase adds infrastructure you now have to think about. Sanity or Contentful are wonderful, but they might outclass a small project in ways you can feel in your wallet. I have spent the last few years quietly using Notion as the backend for exactly these "right-sized" apps — and it holds up better than you might expect.
+
+Notion's appeal is almost embarrassingly practical. Writers can edit in a tool they already know. Titles, bodies, tags, and publish flags fall out of a database without you designing anything. Write in Notion, read in Rork — that split cuts friction out of the "write, fix, ship" loop that indie developers live and die by.
+
+That said, Notion's API has three quirks you absolutely want to know before shipping. **Image URLs expire after one hour, the API has a rate limit you will notice eventually, and page content comes back as a peculiar array of blocks.** Miss any of those and the version of your app that launched just fine on Monday will greet you on Friday with "the images are gone" reports from confused readers.
+
+This guide walks through using Notion as the CMS for a Rork-generated React Native app, including the operational lessons I earned the hard way across five indie projects. We're aiming for something that keeps working — not a cute sample that falls apart in week two.
+
+## Three questions to settle before you put Notion behind your app
+
+Before wiring anything, clarify three things about your app. It saves design regret later.
+
+**1. Read-only, or read-write?** Blogs, news, recipes — anywhere "I write, readers read" — are a clean fit. If you need user-submitted content, Notion is the wrong tool. The API supports writes, but funneling strangers' content into your own workspace is an operational mess. Supabase or Firestore are much saner there.
+
+**2. One language, or many?** For multilingual apps you have two shapes: one row per language (with a `locale` property), or one row with `title_ja`, `title_en` columns side by side. I prefer the former. Translation progress is easier to track, and "publish Japanese today, hold the English until next week" just works.
+
+**3. Image-heavy, or text-heavy?** Image-heavy apps (recipes, travel guides, portfolios) must plan for the 1-hour expiry before writing a single line of frontend code. Text-heavy apps can ship a much simpler version.
+
+Once those three are settled, the rest of the work flows straight.
+
+## Start with an Internal Integration Token; reach for OAuth only when you must
+
+Notion gives you two auth paths.
+
+- **Internal Integration Token** — read and write your own workspace. Mint a token, send it as `Authorization: Bearer`, and you're online.
+- **Public OAuth** — let other users connect their workspaces. Needed for multi-workspace SaaS-style products.
+
+If you're a solo developer shipping your own writing to your own app, **start with an Internal Integration Token**. Building OAuth first — callback handling, encrypted token storage, refresh flows — quietly eats a week before you render a single paragraph.
+
+There is one rule, though, that you cannot bend: **never put the token in the client bundle**. Dropping `NOTION_TOKEN=secret_xxx` into a Rork-generated `.env` that ships with the app is a leak waiting to happen. The token belongs on a server (Cloudflare Workers, a tiny Hono BFF, whatever you have) and the app always talks to Notion through that server.
+
+A minimal backend needs exactly three endpoints: list articles, get one article, and proxy images. The Hono setup from [Rork × Hono Cloudflare Workers REST API Implementation Guide](/en/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) pairs cleanly with Notion and is what I'm using in the examples below.
+
+## Minimum viable article list from a Notion database
+
+Let's get the simplest working version on the table. Here's a Cloudflare Workers + Hono handler that returns a paginated list of published articles from a Notion database.
+
+```ts
+// server/src/routes/articles.ts
+import { Hono } from "hono";
+import { cache } from "hono/cache";
+import { Client } from "@notionhq/client";
+
+type Bindings = {
+  NOTION_TOKEN: string;
+  NOTION_DATABASE_ID: string;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.get(
+  "/articles",
+  cache({
+    cacheName: "notion-articles",
+    cacheControl: "public, max-age=300", // 5-minute edge cache
+  }),
+  async (c) => {
+    const notion = new Client({ auth: c.env.NOTION_TOKEN });
+
+    try {
+      const res = await notion.databases.query({
+        database_id: c.env.NOTION_DATABASE_ID,
+        filter: {
+          and: [
+            { property: "Status", select: { equals: "Published" } },
+            { property: "Locale", select: { equals: "en" } },
+          ],
+        },
+        sorts: [{ property: "PublishedAt", direction: "descending" }],
+        page_size: 50,
+      });
+
+      const articles = res.results.map((page: any) => ({
+        id: page.id,
+        slug: page.properties.Slug.rich_text[0]?.plain_text ?? "",
+        title: page.properties.Title.title[0]?.plain_text ?? "Untitled",
+        excerpt: page.properties.Excerpt.rich_text[0]?.plain_text ?? "",
+        publishedAt: page.properties.PublishedAt.date?.start ?? null,
+        cover: page.cover?.type === "external"
+          ? page.cover.external.url
+          : page.cover?.file?.url ?? null,
+      }));
+
+      return c.json({ articles });
+    } catch (err: any) {
+      // Notion often returns transient 5xx — short retries tend to resolve them
+      console.error("notion-query-failed", err.code, err.message);
+      return c.json({ error: "notion_unavailable" }, 503);
+    }
+  }
+);
+
+export default app;
+```
+
+Expected behavior: returns up to 50 published, English-language articles in descending publish order. The `cache()` middleware keeps the response at the edge for five minutes, which alone is enough to keep the Notion API breathing during a traffic spike.
+
+**Why `page_size: 50`?** Notion allows up to 100 per query, but 100 inflates the payload and slows first paint on the phone. Thirty to fifty items is what a list screen actually needs for the first scroll, and pagination picks up from there.
+
+## Render blocks into UI — type-safe, with graceful unknown-type handling
+
+Once the list works, the body is next. Notion bodies come back as **an array of blocks** — paragraph, heading, image, code, list, quote, each its own type. Flexible, but dangerous: **if your client doesn't know a block type, it silently disappears from the rendered body**. The day someone (you, probably) uses a new block in Notion, readers see articles with missing middles. I spent a full day tracking one of these down before learning my lesson.
+
+The fix is two-sided: **type the blocks you care about**, and **have a visible fallback for unknown types**.
+
+```tsx
+// app/components/NotionRenderer.tsx
+import { View, Text, Image, StyleSheet } from "react-native";
+
+type NotionBlock =
+  | { id: string; type: "paragraph"; paragraph: { rich_text: RichText[] } }
+  | { id: string; type: "heading_2"; heading_2: { rich_text: RichText[] } }
+  | { id: string; type: "heading_3"; heading_3: { rich_text: RichText[] } }
+  | { id: string; type: "bulleted_list_item"; bulleted_list_item: { rich_text: RichText[] } }
+  | { id: string; type: "code"; code: { rich_text: RichText[]; language: string } }
+  | { id: string; type: "image"; image: { type: "file" | "external"; file?: { url: string }; external?: { url: string } } }
+  | { id: string; type: string; [key: string]: unknown }; // fallback for unknown types
+
+type RichText = { plain_text: string; annotations: { bold: boolean; italic: boolean; code: boolean } };
+
+export function NotionRenderer({ blocks }: { blocks: NotionBlock[] }) {
+  return (
+    <View>
+      {blocks.map((block) => (
+        <BlockView key={block.id} block={block} />
+      ))}
+    </View>
+  );
+}
+
+function BlockView({ block }: { block: NotionBlock }) {
+  switch (block.type) {
+    case "paragraph":
+      return <Paragraph text={block.paragraph.rich_text} />;
+    case "heading_2":
+      return <Heading level={2} text={block.heading_2.rich_text} />;
+    case "heading_3":
+      return <Heading level={3} text={block.heading_3.rich_text} />;
+    case "bulleted_list_item":
+      return <BulletItem text={block.bulleted_list_item.rich_text} />;
+    case "code":
+      return <CodeBlock text={block.code.rich_text} language={block.code.language} />;
+    case "image": {
+      const url = block.image.type === "file"
+        ? block.image.file?.url
+        : block.image.external?.url;
+      if (!url) return null;
+      return <NotionImage url={url} />;
+    }
+    default:
+      // Never swallow silently — surface in dev, fall back cleanly in prod
+      if (__DEV__) {
+        return (
+          <View style={styles.unknown}>
+            <Text style={styles.unknownText}>Unsupported block: {block.type}</Text>
+          </View>
+        );
+      }
+      return null;
+  }
+}
+
+function renderRichText(rich: RichText[]) {
+  return rich.map((r, i) => {
+    const style = [
+      r.annotations.bold && styles.bold,
+      r.annotations.italic && styles.italic,
+      r.annotations.code && styles.inlineCode,
+    ].filter(Boolean);
+    return (
+      <Text key={i} style={style}>
+        {r.plain_text}
+      </Text>
+    );
+  });
+}
+
+function Paragraph({ text }: { text: RichText[] }) {
+  return <Text style={styles.paragraph}>{renderRichText(text)}</Text>;
+}
+
+function Heading({ level, text }: { level: 2 | 3; text: RichText[] }) {
+  const style = level === 2 ? styles.h2 : styles.h3;
+  return <Text style={style}>{renderRichText(text)}</Text>;
+}
+
+function BulletItem({ text }: { text: RichText[] }) {
+  return (
+    <View style={styles.bulletRow}>
+      <Text style={styles.bulletDot}>•</Text>
+      <Text style={styles.bulletText}>{renderRichText(text)}</Text>
+    </View>
+  );
+}
+
+function CodeBlock({ text, language }: { text: RichText[]; language: string }) {
+  const source = text.map((r) => r.plain_text).join("");
+  return (
+    <View style={styles.codeWrap}>
+      <Text style={styles.codeLang}>{language}</Text>
+      <Text style={styles.codeBody}>{source}</Text>
+    </View>
+  );
+}
+
+function NotionImage({ url }: { url: string }) {
+  // url is routed through the image proxy defined later
+  return <Image source={{ uri: url }} style={styles.image} resizeMode="cover" />;
+}
+
+const styles = StyleSheet.create({
+  paragraph: { fontSize: 16, lineHeight: 26, marginVertical: 8, color: "#111" },
+  h2: { fontSize: 22, fontWeight: "700", marginTop: 24, marginBottom: 12 },
+  h3: { fontSize: 18, fontWeight: "700", marginTop: 16, marginBottom: 8 },
+  bold: { fontWeight: "700" },
+  italic: { fontStyle: "italic" },
+  inlineCode: { fontFamily: "Menlo", backgroundColor: "#f2f2f2" },
+  bulletRow: { flexDirection: "row", marginVertical: 4 },
+  bulletDot: { marginRight: 8, lineHeight: 26 },
+  bulletText: { flex: 1, fontSize: 16, lineHeight: 26 },
+  codeWrap: { backgroundColor: "#f6f8fa", padding: 12, borderRadius: 8, marginVertical: 12 },
+  codeLang: { fontSize: 11, color: "#888", marginBottom: 6 },
+  codeBody: { fontFamily: "Menlo", fontSize: 13, lineHeight: 20 },
+  image: { width: "100%", aspectRatio: 16 / 9, borderRadius: 8, marginVertical: 12 },
+  unknown: { padding: 8, backgroundColor: "#fff4e5", borderRadius: 4, marginVertical: 4 },
+  unknownText: { color: "#b16a00", fontSize: 12 },
+});
+```
+
+The important move here is the `default:` branch. It renders to `null` in production so the app never crashes when Notion introduces a new block type, and it surfaces a visible warning in dev so you know exactly what to add next. Robust now, extendable later.
+
+## The 1-hour image URL expiry, and how to stop it from hurting you
+
+This is the biggest surprise in the Notion API. **Image URLs from `block.image.file.url` are signed with a one-hour TTL.** You cannot cache them in your database, you cannot serve them tomorrow from yesterday's response, and if you try, readers see broken images.
+
+The expiry is intentional — it's how Notion prevents unlimited redistribution of your uploaded assets. You have two viable responses.
+
+**Option A: Ask Notion for a fresh URL every time a reader opens a page.** Simple, stays in sync, but puts load on the API and adds latency to every image.
+
+**Option B: Pull images to your own storage (R2, S3, Cloudflare Images) on a schedule, and serve from there.** Expiry stops being your problem, and CDN delivery makes images noticeably faster. The tradeoff is a little more operational surface area.
+
+My rule of thumb: **stay on Option A while the app is small; graduate to Option B once you're shipping to thousands of readers.** The pattern below is Option A, done safely — you refresh URLs on demand but cache them briefly at the edge.
+
+```ts
+// server/src/routes/image-proxy.ts
+import { Hono } from "hono";
+import { Client } from "@notionhq/client";
+
+type Bindings = { NOTION_TOKEN: string };
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// Clients call /image-proxy?pageId=xxx&blockId=yyy
+app.get("/image-proxy", async (c) => {
+  const pageId = c.req.query("pageId");
+  const blockId = c.req.query("blockId");
+
+  if (!pageId || !blockId) {
+    return c.json({ error: "missing_params" }, 400);
+  }
+
+  const notion = new Client({ auth: c.env.NOTION_TOKEN });
+
+  try {
+    // Re-fetching the block gives us a URL that is valid right now
+    const block: any = await notion.blocks.retrieve({ block_id: blockId });
+
+    if (block.type !== "image") {
+      return c.json({ error: "not_an_image" }, 400);
+    }
+
+    const url = block.image.type === "file"
+      ? block.image.file.url
+      : block.image.external.url;
+
+    if (!url) {
+      return c.json({ error: "no_url" }, 404);
+    }
+
+    // Fetch the image bytes and proxy them — clients never see the Notion URL
+    const imageRes = await fetch(url);
+    if (!imageRes.ok) {
+      return c.json({ error: "notion_image_fetch_failed" }, 502);
+    }
+
+    const body = await imageRes.arrayBuffer();
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "Content-Type": imageRes.headers.get("Content-Type") ?? "image/jpeg",
+        // Ten-minute edge cache suppresses repeat Notion calls for the same image
+        "Cache-Control": "public, max-age=600, s-maxage=600",
+        "ETag": imageRes.headers.get("ETag") ?? "",
+      },
+    });
+  } catch (err: any) {
+    console.error("image-proxy-failed", err.code, err.message);
+    return c.json({ error: "proxy_failed" }, 500);
+  }
+});
+
+export default app;
+```
+
+The decisive move is that **the client never learns the Notion URL**. It calls something like `https://api.yourapp.com/image-proxy?pageId=xxx&blockId=yyy` and receives the image bytes. Cloudflare's edge, with a ten-minute `Cache-Control`, absorbs the repeated traffic that a single viral article would otherwise direct at Notion.
+
+## Rate limits — design for 3 requests per second, not unlimited
+
+Notion enforces roughly **three requests per second, averaged** per integration. Your app won't feel it on a normal day. It will feel it for about sixty seconds after a push notification goes out and every reader opens the app simultaneously.
+
+The defense is two-layered.
+
+First, **cache aggressively at the edge**. The list endpoint uses `hono/cache`. The image proxy sets `Cache-Control: max-age=600`. Together, those two knobs turn what looks like a burst into mostly cache hits.
+
+Second, **handle 429 responses with exponential backoff and jitter**. Notion returns `429 Too Many Requests` with a `Retry-After` header when you trip the limit. Respect it, and spread retries across a random window so every client doesn't collide again at the exact same millisecond.
+
+```ts
+// server/src/lib/notion-with-retry.ts
+export async function queryWithRetry<T>(
+  fn: () => Promise<T>,
+  options: { maxRetries?: number; baseDelayMs?: number } = {}
+): Promise<T> {
+  const maxRetries = options.maxRetries ?? 3;
+  const baseDelay = options.baseDelayMs ?? 500;
+
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+
+      // Retry only 429 and 5xx — 4xx usually means "you did the wrong thing"
+      const code = err?.status ?? err?.code;
+      const isRetryable =
+        code === 429 ||
+        code === "rate_limited" ||
+        (typeof code === "number" && code >= 500 && code < 600);
+
+      if (!isRetryable || attempt === maxRetries) {
+        throw err;
+      }
+
+      // Honor Retry-After when present, otherwise exponential backoff with jitter
+      const retryAfter = Number(err?.headers?.["retry-after"]);
+      const delay = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : baseDelay * Math.pow(2, attempt) + Math.random() * 200;
+
+      console.warn(`notion-retry attempt=${attempt + 1} delay=${delay}ms code=${code}`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+
+  throw lastError;
+}
+```
+
+Expected behavior: retry up to three times on 429/5xx, give up early on 4xx. The jitter component — the `+ Math.random() * 200` — is doing real work. It breaks thundering-herd collisions that would otherwise defeat the backoff.
+
+## Wire the client with TanStack Query — stale-while-revalidate that respects the rate limit
+
+The piece most people underinvest in is the client fetching layer. Doing it well is the difference between "app feels fast" and "app feels snappy even on slow networks". TanStack Query (React Query) pairs beautifully with the short edge cache on the server — together they produce a two-tier cache where the device never waits more than it has to, and Notion is rarely bothered twice for the same article within a few minutes.
+
+```tsx
+// app/hooks/useArticles.ts
+import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
+
+const API_BASE = process.env.EXPO_PUBLIC_API_BASE!;
+
+type ArticleSummary = {
+  id: string;
+  slug: string;
+  title: string;
+  excerpt: string;
+  publishedAt: string | null;
+  cover: string | null;
+};
+
+async function fetchArticles(cursor?: string): Promise<{ articles: ArticleSummary[]; nextCursor?: string }> {
+  const url = new URL("/articles", API_BASE);
+  if (cursor) url.searchParams.set("cursor", cursor);
+
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    throw new Error(`articles_fetch_failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export function useArticleList() {
+  return useInfiniteQuery({
+    queryKey: ["articles"],
+    queryFn: ({ pageParam }) => fetchArticles(pageParam as string | undefined),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextCursor,
+    // Match the server edge cache: data is fresh for 5 minutes
+    staleTime: 1000 * 60 * 5,
+    // Keep previous data while refetching on focus — no flash of empty list
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useArticle(slug: string) {
+  return useQuery({
+    queryKey: ["article", slug],
+    queryFn: async () => {
+      const res = await fetch(`${API_BASE}/articles/${slug}`);
+      if (!res.ok) throw new Error(`article_fetch_failed: ${res.status}`);
+      return res.json();
+    },
+    staleTime: 1000 * 60 * 5,
+    // The server handles retries for us; retry once on the client for transient network blips
+    retry: 1,
+  });
+}
+```
+
+Pair that with a `QueryClient` configured for offline resilience and you have a reading experience that keeps working when the subway eats the connection:
+
+```tsx
+// app/providers.tsx
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
+import { AppState, type AppStateStatus } from "react-native";
+import { useEffect } from "react";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // Avoid refetch storms when the user briefly backgrounds the app
+      refetchOnReconnect: "always",
+      gcTime: 1000 * 60 * 30,
+      networkMode: "offlineFirst",
+    },
+  },
+});
+
+export function AppProviders({ children }: { children: React.ReactNode }) {
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state: AppStateStatus) => {
+      focusManager.setFocused(state === "active");
+    });
+    return () => sub.remove();
+  }, []);
+
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+```
+
+Why this matters: **the server edge cache gives you five minutes of cheap reads, the client cache gives you zero-latency navigation**. A reader who taps into an article, returns to the list, and taps into another sees each screen instantly because both are already in memory. Meanwhile Notion is seeing maybe one request per five minutes per article, not one per reader per navigation.
+
+## Nested blocks — don't ship a renderer without recursive children
+
+I glossed over this earlier and want to make it concrete. Toggles, callouts, and quotes can all contain child blocks, and a naive renderer that only iterates the top-level array will silently lose content. Here is the recursive fetcher that pairs with the renderer from earlier.
+
+```ts
+// server/src/lib/fetch-blocks.ts
+import { Client } from "@notionhq/client";
+
+type BlockNode = { id: string; type: string; has_children: boolean; children?: BlockNode[] } & Record<string, unknown>;
+
+export async function fetchBlockTree(notion: Client, blockId: string, depth = 0): Promise<BlockNode[]> {
+  // Guard against pathologically deep pages — the Notion API allows deep nesting
+  if (depth > 6) {
+    console.warn("fetchBlockTree: max depth reached", { blockId });
+    return [];
+  }
+
+  const results: BlockNode[] = [];
+  let cursor: string | undefined = undefined;
+
+  do {
+    const res = await notion.blocks.children.list({
+      block_id: blockId,
+      start_cursor: cursor,
+      page_size: 100,
+    });
+
+    for (const raw of res.results as any[]) {
+      const node: BlockNode = { ...raw };
+      if (raw.has_children) {
+        node.children = await fetchBlockTree(notion, raw.id, depth + 1);
+      }
+      results.push(node);
+    }
+
+    cursor = res.next_cursor ?? undefined;
+  } while (cursor);
+
+  return results;
+}
+```
+
+The points worth highlighting: **paginate top-level children** (Notion returns at most 100 per call), **guard depth** (pages with extreme nesting exist and will hit your rate limit if you recurse forever), and **preserve the tree** so the renderer can walk it. A fully flat array of blocks loses the grouping you need to render a toggle correctly.
+
+## Draft, publish, and scheduled posts — all via Notion properties
+
+The reason Notion-as-CMS stays enjoyable is that **the editorial workflow lives entirely in properties**. "Don't publish yet", "pull this back", "show this to premium readers only" — none of it requires touching code.
+
+The minimum schema I recommend:
+
+- **Status** (single select): `Draft` / `InReview` / `Published` / `Archived`
+- **PublishedAt** (date): the scheduled publish time
+- **Locale** (single select): `ja` / `en` — one row per language
+- **Slug** (text): URL-safe identifier
+- **Tier** (single select): `Free` / `Premium` — gate premium-only content here
+
+On the server, filter for `Status = Published` AND `PublishedAt <= now`. That one filter gets you scheduled publishing for free — set a future date, and the article appears at that time without any cron job.
+
+```ts
+// server/src/lib/article-filter.ts
+export function buildPublishedFilter(locale: "ja" | "en", now = new Date()) {
+  return {
+    and: [
+      { property: "Status", select: { equals: "Published" } },
+      { property: "Locale", select: { equals: locale } },
+      {
+        property: "PublishedAt",
+        date: { on_or_before: now.toISOString() },
+      },
+    ],
+  };
+}
+```
+
+Just remember your edge cache `max-age`. If it's set to one hour, your scheduled article might be up to an hour late. Five minutes is the sweet spot for most apps — fresh enough that writers don't get frustrated, long enough to absorb traffic spikes.
+
+## Three pitfalls that caught me in production
+
+Trouble I learned about the hard way. Save yourself the detour.
+
+**Pitfall 1: The token leaks into the client bundle.** I've seen plenty of setups where someone puts `NOTION_TOKEN` into a Rork-generated `.env` and references it from the app. That token ships to every user's device, where anyone can extract it. Notion tokens are server-side secrets. Always. No exceptions. Keep the rule simple: if Notion sees it, only your server knows it.
+
+**Pitfall 2: Database IDs hardcoded in the repo.** When you split dev and production Notion databases, hardcoded IDs become a source of quiet deploys-to-wrong-place bugs. Put them in environment variables or server secrets, and you can rotate them without code changes.
+
+**Pitfall 3: Ignoring `has_children` in blocks.** Toggles, quotes, and callouts can contain children. A renderer that only iterates the top-level block array quietly drops all nested content. For any block where `has_children: true`, call `notion.blocks.children.list` and render recursively. If your content is image-heavy but text-light this is easy to miss — audit your actual Notion pages before writing the renderer.
+
+## Three small things that earn their keep in production
+
+None of these look impressive on a slide. All of them matter at 2am.
+
+**Bundle the latest cover images with the app.** Readers who tap a push notification notice every 100ms of image load. Ship the N most recent covers as Expo assets or pre-warm them on device. First paint improves dramatically for the people you most want back tomorrow.
+
+**Give yourself a "refresh now" escape hatch.** A `?refresh=1` query param that bypasses the edge cache — gated to your admin IP or a secret header — removes the "why isn't my edit showing up" frustration from the writing loop. It's five lines of code that you will use weekly.
+
+**Monitor 404s on the image proxy.** If image URLs start expiring in the wild, this is the signal that catches it first. Log proxy 404s, aggregate them daily, and alert when the count crosses a threshold. I've caught two multi-day image outages this way before a single reader reported it.
+
+## Ship one article first
+
+The moment Notion-backed content clicks for you is when something you just typed appears in your own app a few seconds later. Don't try to build the perfect pipeline up front. Get **one article rendering end-to-end** today — list endpoint, detail endpoint, image proxy — and iterate from there.
+
+For the caching layer that pairs with this setup, see [Rork × Cloudflare D1 SQLite Backend Guide](/en/articles/rork-dev/rork-cloudflare-d1-sqlite-backend-guide). For client-side cache design that plays well with the short-TTL edge cache above, see [Rork × TanStack Query Data Fetching & Cache Guide](/en/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide). The three fit together without translation layers.
+
+If you want to sharpen your instincts around API design more broadly — where to cache, when to retry, when to surface errors rather than swallow them — [Web API: The Good Parts by Takaaki Mizuno](https://www.amazon.co.jp/dp/4873116864/?tag=pinocchio-22) remains the book I hand to developers who want the decisions behind REST API choices to feel obvious rather than arbitrary. It's not Notion-specific, but the judgment it builds transfers directly to the work above.
