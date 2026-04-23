@@ -1,0 +1,166 @@
+---
+title: "Rork アプリで画像・動画をカメラロールに保存できない問題の完全解決ガイド"
+slug: "rork-save-media-to-device-library-fix"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-23T21:30"
+updated: "2026-04-23T21:30"
+author: "Rork Lab"
+description: "Rork で生成したアプリで画像・動画を iOS のカメラロール／Android のギャラリーに保存できない問題を、権限設定・expo-media-library の仕様・SDK 51+の変更点まで掘り下げて解決していきます。"
+tags: ["Rork", "expo-media-library", "トラブルシューティング", "iOS", "Android", "権限"]
+---
+
+「Rork で作った画像生成アプリを App Store にリリースしたのに、『保存ボタンが効きません』というレビューが並んでしまった」——こうしたご相談を、最近とくに耳にするようになりました。プレビュー段階では動いていたはずの処理が、実機配布後に動かなくなるのは、ほぼ例外なくメディアライブラリの権限と保存 API の扱い方が原因です。
+
+この記事では、Rork の生成コードそのままでは踏みがちな落とし穴と、私自身が 3 本のアプリで実際に踏み抜いてようやくたどり着いた修正パターンをまとめてお伝えします。Expo SDK 51 以降で仕様が変わった点も含めて、iOS と Android の両方で確実に動くコードに落とし込んでいきましょう。
+
+## なぜ保存できないのか — 「動くコード」が動かなくなる3つの分岐点
+
+まず症状を整理します。報告として多いのは次の3パターンです。
+
+- Simulator では保存できるのに、実機 TestFlight 配布後は無反応
+- iOS だけ動作し、Android では「Permission denied」例外が出る
+- Android 13 以降だけ失敗し、Android 12 以下なら動く
+
+いずれも権限モデルが OS のバージョンごとに少しずつ進化していることが根本原因です。Rork が生成するコードは現行バージョンのベストプラクティスを踏まえていますが、依存パッケージのバージョンや `app.json` の設定が噛み合っていないと、古い API を使った状態で固まってしまいます。
+
+## Step 1: 依存関係を正しい組み合わせに揃える
+
+`expo-media-library` は `expo-image-picker` や `expo-file-system` と連携して使うことが多く、それぞれのバージョン整合性が取れていないと実機でだけ失敗します。Rork で新規生成したプロジェクトであっても、既存アプリに機能追加した場合はここで詰まりがちです。
+
+```bash
+# Rork プロジェクトのルートで実行（Expo SDK 51+ 前提）
+npx expo install expo-media-library expo-file-system expo-image-picker
+# 期待する出力: "added 3 packages" または "up to date"。
+# ⚠️ npm install で入れると SDK と非互換のバージョンが入るため必ず expo install を使う。
+```
+
+`expo install` を使うのは、現行 SDK と互換性のあるバージョンを自動で選んでくれるからです。`npm install expo-media-library@latest` とすると、SDK の要求範囲外のバージョンが入り、起動時に `Invariant Violation: Native module RNCMediaLibrary cannot be null.` が出ることがあります。
+
+## Step 2: app.json の plugins セクションに権限文言を書く
+
+Expo Managed Workflow では、ネイティブの `Info.plist` や `AndroidManifest.xml` を直接触らず、`app.json` の `plugins` セクションで設定します。ここを書き忘れると、App Store / Play Store の審査で「用途未記載のまま権限要求をしている」としてリジェクトされます。
+
+```json
+{
+  "expo": {
+    "ios": {
+      "infoPlist": {
+        "NSPhotoLibraryAddUsageDescription": "作成した画像や動画を、お使いの写真ライブラリに保存するために利用します。",
+        "NSPhotoLibraryUsageDescription": "保存済みの画像を編集・共有するために写真ライブラリへのアクセスを求めます。"
+      }
+    },
+    "android": {
+      "permissions": [
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "作成した画像を写真ライブラリに保存します。",
+          "savePhotosPermission": "作成した画像を写真ライブラリに保存します。",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ]
+  }
+}
+```
+
+ここでポイントになるのが `NSPhotoLibraryAddUsageDescription`（追加のみ）と `NSPhotoLibraryUsageDescription`（読み取りも含む）の違いです。ダウンロードアプリのように書き込みしかしないのであれば前者だけで済みますが、既存アルバムから画像を読んで編集する機能があるなら後者も必要です。「書き込みだけなのに両方要求すると、審査でリジェクトされる」という逆パターンもあるので、アプリの実機能に合わせて最小限の権限に絞りましょう。
+
+## Step 3: 保存処理を iOS / Android で統一する
+
+実際の保存ロジックは、一度ローカルにダウンロードしてから `MediaLibrary.createAssetAsync` に渡す流れが最も安定します。HTTP の直 URL をそのまま渡すと Android で `ERR_UNEXPECTED` になることがあるため、必ずファイルシステムを経由させます。
+
+```typescript
+import * as MediaLibrary from 'expo-media-library';
+import * as FileSystem from 'expo-file-system';
+import { Alert, Platform } from 'react-native';
+
+/**
+ * リモート画像をカメラロール／ギャラリーに保存する。
+ * @param remoteUrl  保存したい画像の URL
+ * @param filename   保存時のファイル名（拡張子を必ず含める）
+ * @returns 成功時は true、ユーザーが権限を拒否した場合は false
+ */
+export async function saveRemoteImageToLibrary(
+  remoteUrl: string,
+  filename: string,
+): Promise<boolean> {
+  // 1) 権限リクエスト（iOS は書き込み専用権限で十分）
+  const { status } = await MediaLibrary.requestPermissionsAsync(
+    true,                  // writeOnly: true で iOS に軽い権限を要求
+    ['photo'],             // granularPermissions: 写真のみ
+  );
+  if (status !== 'granted') {
+    Alert.alert(
+      '権限が必要です',
+      '設定アプリから「写真」の追加権限を許可してください。',
+    );
+    return false;
+  }
+
+  // 2) キャッシュディレクトリに一旦ダウンロード
+  const localPath = `${FileSystem.cacheDirectory}${filename}`;
+  const downloaded = await FileSystem.downloadAsync(remoteUrl, localPath);
+  if (downloaded.status !== 200) {
+    throw new Error(`Download failed: HTTP ${downloaded.status}`);
+  }
+
+  // 3) MediaLibrary.createAssetAsync でライブラリへ登録
+  //    Android で直接 HTTPS URL を渡すと失敗するので必ずローカルパスを渡す
+  await MediaLibrary.createAssetAsync(downloaded.uri);
+
+  // 4) 一時ファイルを削除（古い端末の容量対策）
+  if (Platform.OS === 'ios') {
+    await FileSystem.deleteAsync(downloaded.uri, { idempotent: true });
+  }
+  return true;
+}
+```
+
+Android でキャッシュ削除をしていないのは、`createAssetAsync` が内部的に移動ではなくコピーを行うため、先に消してしまうとごく稀にアセット登録失敗時に元ファイルが戻せなくなるからです。iOS では常に実データがライブラリ側に複製されるので、元ファイルは安全に削除できます。
+
+## Step 4: Android 13 以降の Scoped Storage に対応する
+
+Android 13 から `READ_EXTERNAL_STORAGE` が廃止され、`READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` / `READ_MEDIA_AUDIO` の粒度別権限に置き換わりました。expo-media-library 15 系であれば SDK 側で自動対応していますが、古い app.json 設定だと権限ダイアログが表示されないまま「拒否された」扱いになるケースが起きます。
+
+- `permissions` 配列に `READ_MEDIA_IMAGES` と `READ_MEDIA_VIDEO` が**両方**含まれているか確認する
+- `READ_EXTERNAL_STORAGE` は残っていても害はないが、不要なら削除する
+- `targetSdkVersion` が 33 以上になっていることを `expo-build-properties` の設定で確認する
+- Android Emulator は API レベル 33 以上で検証する（API 30 以下だと古い権限で動いて問題が見えません）
+
+これらを満たしていないまま Google Play に提出すると、Pre-launch レポートで「Permission Usage が不十分」と警告され、リジェクトされる場合があります。事前に `npx expo prebuild --clean` を実行して生成される `AndroidManifest.xml` を確認しておくと安心です。
+
+## Step 5: 動作確認とデバッグのコツ
+
+ここまでの対応を入れてもうまく動かないときは、症状を切り分ける必要があります。私はいつもこの順番でチェックします。
+
+- `MediaLibrary.getPermissionsAsync()` で現在の権限状態をログ出力し、`granted` と `writeOnly` の値を確認する
+- Simulator ではなく実機で再現するか確かめる（Simulator のカメラロールは挙動が独特で、本番端末と一致しません）
+- 保存先ファイル名に日本語や絵文字が入っていないか（iOS では通りますが Android 側のファイルシステムで失敗することがあります）
+- `FileSystem.downloadAsync` が返す `uri` の拡張子が実ファイルと一致しているか（`.jpg` なのに中身が WebP だと Android で無視されます）
+- EAS Build でビルドした APK / IPA で確認する（開発ビルドと本番ビルドでネイティブモジュールの組み込み方が違います）
+
+特に EAS Build の本番ビルドでしか再現しないケースは、JS コードをいくら眺めても原因が見つかりません。ネイティブログの取得方法は [Rork アプリがデバイス上でクラッシュする原因と修正手順](/articles/rork-dev/rork-app-crashes-on-device-fix) で扱っていますので、あわせてご覧ください。
+
+## よくあるつまずきどころと対処
+
+最後に、この2年ほどで読者の方からいただいたご質問のうち、多かったものを3つだけご紹介します。
+
+- 「権限ダイアログが出ずにすぐ `denied` が返る」— 一度ユーザーが拒否すると、以降はダイアログが表示されません。`Linking.openSettings()` で設定画面に誘導するフォールバックを必ず入れましょう
+- 「保存はできたが写真アプリで見つからない」— iOS はデフォルトの「最近の項目」に入ります。Android は端末ごとにギャラリーアプリの挙動が違い、更新に数秒かかる機種があります
+- 「HEIC や WebP の画像が保存できない」— `createAssetAsync` はそのままでは受け付けません。`expo-image-manipulator` で JPEG/PNG に変換してから渡すのが確実です
+
+書き込み権限の取り扱いは、React Native 本体のアップデートや Expo SDK のリリースサイクルに合わせて年に一度は変わっている印象があります。体系的に整理したい方には、[『Reactネイティブ実践入門』（深谷 吉博、沼倉 正吾 著）](https://www.amazon.co.jp/dp/B0CH3DDM4R/?tag=pinocchio-22)が端末権限まわりの考え方を丁寧に追っているのでおすすめです。
+
+## まとめ
+
+保存機能が壊れるのは、たいていコードではなく設定とタイミングの問題です。今日できる一歩としては、お手元の `app.json` を開いて、`plugins` セクションに `expo-media-library` の設定があるか確認してみてください。もし空であれば、本記事のステップ2のスニペットをそのまま貼り付けるだけで、ほとんどの症例は改善するはずです。
+
+画像や動画に関するトラブル全般で悩まれている場合は、[Rork で生成したアプリの画像・メディア読み込みエラーの修正ガイド](/articles/rork-dev/rork-image-media-loading-error-fix) や [Rork アプリのパーミッション関連トラブル徹底攻略](/articles/rork-dev/rork-permissions-not-working-troubleshooting-fix) も参考にしていただけると嬉しいです。
