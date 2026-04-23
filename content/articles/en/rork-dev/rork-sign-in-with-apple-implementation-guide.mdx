@@ -1,0 +1,187 @@
+---
+title: "Adding Sign in with Apple to Your Rork App — What Review Actually Requires and Where People Get Stuck"
+slug: "rork-sign-in-with-apple-implementation-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-24T00:57"
+updated: "2026-04-24T00:57"
+author: "Rork Lab"
+description: "A practical walkthrough for adding Sign in with Apple to an existing Rork app. Covers the exact Guideline 4.8 requirements that reject Google/Facebook-only apps, the non-obvious parts of expo-apple-authentication, backend token verification with identityToken, and the account deletion requirement most tutorials skip."
+tags: ["Rork", "Sign in with Apple", "Authentication", "App Store Review", "Expo"]
+---
+
+You added Google Sign-In to your Rork app, shipped to App Store review, and came back to a Guideline 4.8 rejection. This happens constantly. Apple's rule is blunt: if you offer a third-party sign-in option (Google, Facebook, LINE, X, and so on), you must offer Sign in with Apple as an equivalent alternative.
+
+This article walks through retrofitting Sign in with Apple into a Rork project, following the actual steps that have passed review in real submissions. I'll flag the spots where the public docs tell you one thing but production behavior is different, and the quiet failure modes that don't reproduce in the iOS simulator.
+
+## Why Implement This Before You Need To
+
+Sign in with Apple tends to get added in a panic after the first rejection, which is the worst order. Retrofitting it late usually means rewriting your user table schema or reworking how your backend handles identity — because Apple's quirks (anonymized emails, names returned only on first sign-in) don't line up with how most auth providers work.
+
+I've shipped two apps where I made this mistake. Each time, the release slipped by a week. Since then, I implement Apple first on new projects, before adding any other social login. It's much easier to layer Apple in while the codebase is still small, which is exactly where most Rork projects sit.
+
+### When This Becomes Mandatory
+
+Sign in with Apple is effectively required if any of these apply:
+
+- You use one or more third-party auth options (Google, Facebook, X, LINE, Microsoft, etc.)
+- Email + password alone can sometimes qualify for exemption, but Apple users tend to dislike it
+- Passwordless email magic links can also qualify, but the UX trade-off is real
+
+Apps that don't authenticate at all (games, utilities, read-only content) are exempt by default.
+
+## What to Set Up in an Expo-Based Rork Project
+
+A typical Rork project uses Expo SDK with React Native. Sign in with Apple goes through `expo-apple-authentication`.
+
+```bash
+# In Rork's terminal, or locally
+npx expo install expo-apple-authentication
+```
+
+After installing, add iOS-only configuration to `app.json`. Rork generates `app.json` for you, but auth-related fields need to be added by hand.
+
+```json
+{
+  "expo": {
+    "ios": {
+      "bundleIdentifier": "com.yourcompany.yourapp",
+      "usesAppleSignIn": true
+    },
+    "plugins": ["expo-apple-authentication"]
+  }
+}
+```
+
+The subtle part: you need **both** `usesAppleSignIn: true` and `expo-apple-authentication` in `plugins`. If only one is present, EAS Build still succeeds, the app installs fine — and then crashes the moment a user taps the Apple button, because the Entitlement wasn't actually applied. This failure mode looks nothing like a missing setting, which is why people lose hours to it.
+
+### Apple Developer Portal Setup
+
+Go to Certificates, Identifiers & Profiles and open your App ID.
+
+- Enable the **Sign In with Apple** capability
+- Save, and then regenerate your provisioning profile (easy to forget)
+
+To sync the regenerated profile with EAS, run `eas build:configure` once, or let `eas credentials` refresh on the next build.
+
+## Minimal Implementation: Button and Handler
+
+Add this component to your Rork screen. Apple polices the look of the "Sign in with Apple" button tightly, so using their native component verbatim is the safest route.
+
+```tsx
+import * as AppleAuthentication from 'expo-apple-authentication';
+import { Platform, View, Alert } from 'react-native';
+import { useEffect, useState } from 'react';
+
+export function AppleSignInButton({ onSuccess }: { onSuccess: (user: AppleUser) => void }) {
+  const [available, setAvailable] = useState(false);
+
+  useEffect(() => {
+    // iOS 13+ only. Works in the simulator, but always confirm on a real device.
+    AppleAuthentication.isAvailableAsync().then(setAvailable);
+  }, []);
+
+  // Android / Web fall through to a different flow (see below)
+  if (Platform.OS !== 'ios' || !available) return null;
+
+  return (
+    <AppleAuthentication.AppleAuthenticationButton
+      buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+      buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+      cornerRadius={8}
+      style={{ width: '100%', height: 48 }}
+      onPress={async () => {
+        try {
+          const credential = await AppleAuthentication.signInAsync({
+            requestedScopes: [
+              AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+              AppleAuthentication.AppleAuthenticationScope.EMAIL,
+            ],
+          });
+          // Send identityToken to your backend for verification
+          onSuccess({
+            user: credential.user,
+            email: credential.email,       // first sign-in only
+            fullName: credential.fullName, // first sign-in only
+            identityToken: credential.identityToken!,
+          });
+        } catch (e: any) {
+          if (e.code === 'ERR_REQUEST_CANCELED') return;
+          Alert.alert('Sign-in failed', e.message);
+        }
+      }}
+    />
+  );
+}
+
+type AppleUser = {
+  user: string;
+  email: string | null;
+  fullName: AppleAuthentication.AppleAuthenticationFullName | null;
+  identityToken: string;
+};
+```
+
+The key thing to internalize is that `email` and `fullName` are **only returned on the user's very first sign-in**. On subsequent sign-ins they're `null`. You must persist whatever you get on the first attempt, or you'll have no way to display the user's name later. This is the single most common mismatch with how other social providers behave.
+
+### What You Get Back
+
+On a successful first sign-in, `credential.user` is something like `001234.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.xxxx` — a per-app, stable ID that persists even if the user uninstalls and reinstalls your app. Use this as the lookup key in your backend.
+
+## Backend Verification: Don't Skip the identityToken
+
+A frequent implementation mistake: trusting `credential.user` from the client without verifying the identityToken. This lets a malicious client forge any user ID they want. The right approach is to verify the `identityToken` JWT against Apple's public keys on your server.
+
+```ts
+// Works in Node.js and Cloudflare Workers
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const JWKS = createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
+
+export async function verifyAppleIdentityToken(identityToken: string, audience: string) {
+  const { payload } = await jwtVerify(identityToken, JWKS, {
+    issuer: 'https://appleid.apple.com',
+    audience, // your app's Bundle ID, or Services ID for web
+  });
+  return {
+    sub: payload.sub as string,     // = credential.user
+    email: payload.email as string | undefined,
+    emailVerified: payload.email_verified === 'true',
+  };
+}
+```
+
+For `audience`, pass your Bundle ID (e.g. `com.yourcompany.yourapp`). If you're handling the web flow, pass the Services ID instead. Get this wrong and you'll hit a `JWTClaimValidationFailed` that only shows up on the server, which can be genuinely hard to track down.
+
+## Handling Android and Web Users
+
+Sign in with Apple as a native UI is iOS-only, but Apple requires you to offer an equivalent sign-in option on other platforms too. If you ship Android or web builds from your Rork project, you'll need to route through Apple's OAuth flow in a browser (using the Services ID).
+
+For Rork users targeting Android or the web, `expo-auth-session` against Apple's OAuth endpoints is the usual approach. That's beyond the scope of this post, but if you're setting up device testing flows, [the Rork Companion iOS real-device testing guide](/en/articles/rork-basics/rork-companion-ios-real-device-test-guide) and the [full App Store submission guide](/en/articles/rork-business/rork-app-store-submission-complete-guide) pair well with the Services ID preparation you'll need.
+
+## Three Things That Still Trip Up Review
+
+Even with a working implementation, reviewers commonly flag these three things.
+
+### 1. The Apple Button Sits Below Other Sign-In Buttons
+
+Apple's guidelines say Sign in with Apple must be placed **at or above** other auth options in visual prominence. If the Google button is visually heavier or positioned above Apple, expect a 4.8 rejection. Match button sizes and contrast levels.
+
+### 2. Private Email Relay Not Handled
+
+Apple lets users choose "Share My Email" or "Hide My Email." Hide delivers a `@privaterelay.appleid.com` anonymous address to your app. Mail you send to that address is forwarded to the user via Apple's relay. If your backend treats anonymous addresses as invalid and filters them out, you'll silently lose communication with those users. Test this before shipping.
+
+### 3. No Account Deletion Path
+
+Since June 2022, apps offering Sign in with Apple must also provide in-app account deletion. Apps with sign-in but no delete flow get rejected under 5.1.1(v), not 4.8. Add a "Delete account" button and, when invoked, call `AppleAuthentication.revokeAsync` so Apple-side tokens are invalidated too.
+
+## Pricing and Device Testing Context
+
+Sign in with Apple requires an Apple Developer Program membership ($99/year), separate from Rork's pricing. For sizing up the Rork side of your budget, I put together [an honest comparison of Rork's pricing plans for 2026](/en/articles/rork-basics/rork-pricing-plan-honest-comparison-2026) you might want to read alongside the Apple Developer fee.
+
+If you want to write your own identityToken verifier from scratch, [OAuth 2.0 in Action (Justin Richer et al.)](https://www.amazon.co.jp/dp/1617295272/?tag=pinocchio-22) covers the OAuth/OpenID Connect fundamentals clearly and will save you from misreading the JWT spec.
+
+## Next Steps
+
+The code in this post is a minimum viable implementation, but it's enough to clear iOS build → TestFlight → App Store review. The next thing I'd do is test on a real device rather than the simulator — the behavior of anonymous email and the "same Apple ID, reinstalled app" case tends to only surface on real hardware. When you're ready to pair Apple sign-in with paid subscriptions, [the Rork + Stripe subscription guide](/en/articles/rork-dev/rork-stripe-subscription-complete-guide) is a natural next read.
