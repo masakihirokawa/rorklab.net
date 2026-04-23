@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SEED15 — Rork が $15M シード調達、Left Lane Capital 主導・Peak XV／True Ventures／Goodwater／a16z Speedrun 参加（4/10）",
-    "HIRING — 資金使途は Rork Max モデル強化と複雑度の天井拡張、エンジニアチーム拡大で開発速度ボトルネックを解消（4月）",
-    "PAPERLINE — アプリビルダー Paperline を買収、エンジニアリング人材を取り込みネイティブモバイル対応を強化（4月）",
-    "VIRAL — Rork Max 発表から 2 週間で X 累計 800 万ビュー、年間収益ランレートが倍増（4月）",
-    "RORKMAX — Rork Max は Claude Code + Claude Opus 4.6 で駆動、Xcode 代替を狙う Web 初の Swift アプリビルダー（4月）",
-    "STACK — 出力は React Native + Expo プロジェクトと Swift ネイティブコード、App Store／Google Play にそのまま提出可能（4月）",
+    "SEED15 — Rork が $15M シード調達、Left Lane Capital 主導・Peak XV／True Ventures／Goodwater／a16z Speedrun 参加（4月）",
+    "RORKMAX — Rork Max が Web 初の Swift アプリビルダーとして登場、Xcode 代替を狙う（2 月）",
+    "APPLESTACK — AR／LiDAR・Metal 3D・Dynamic Island・HealthKit・HomeKit・Core ML などネイティブ Apple 機能をフル解放（4月）",
+    "PAPERLINE — Rork が Paperline 買収を完了、ネイティブ Swift チームを取り込み Rork Max 機能を強化（4月）",
+    "PLATFORMS — iPhone／iPad／Apple Watch／Apple TV／Vision Pro／iMessage の全 Apple プラットフォームに対応（4月）",
+    "RENAISSANCE — App Store 新規アプリが前年比 +84%、AI アプリビルダーが個人開発者の黄金時代を後押し（4月）",
   ],
   en: [
-    "SEED15 — Rork raises $15M seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater and a16z Speedrun (4/10)",
-    "HIRING — Funding focuses on Rork Max model upgrades and complexity-ceiling expansion, with engineering team growth to unblock velocity (Apr)",
-    "PAPERLINE — Rork acquires app builder Paperline to absorb its engineering team and deepen native-mobile capabilities (Apr)",
-    "VIRAL — Rork Max generates 8M+ X views and doubles annual revenue run-rate within two weeks of launch (Apr)",
-    "RORKMAX — Rork Max is powered by Claude Code + Opus 4.6, the first Swift app builder on the web aimed at replacing Xcode (Apr)",
-    "STACK — Outputs are real React Native + Expo projects plus native Swift code, ready to ship to App Store and Google Play (Apr)",
+    "SEED15 — Rork raises $15M seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater and a16z Speedrun (Apr)",
+    "RORKMAX — Rork Max launches as the first Swift app builder on the web, aiming to replace Xcode (Feb)",
+    "APPLESTACK — Unlocks native Apple features including AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, HomeKit and Core ML (Apr)",
+    "PAPERLINE — Rork completes Paperline acquisition, bringing its native-Swift team into Rork Max (Apr)",
+    "PLATFORMS — Ships to iPhone, iPad, Apple Watch, Apple TV, Vision Pro and iMessage from plain English prompts (Apr)",
+    "RENAISSANCE — App Store sees +84% YoY new-app growth as AI builders usher in an indie-developer renaissance (Apr)",
   ],
 };
 
