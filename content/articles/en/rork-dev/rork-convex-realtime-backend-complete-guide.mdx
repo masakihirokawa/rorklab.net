@@ -1,0 +1,519 @@
+---
+title: "Pairing Rork with Convex for a Type-Safe Reactive Backend — From Subscriptions to File Handling"
+slug: "rork-convex-realtime-backend-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-24T04:30"
+updated: "2026-04-24T04:30"
+author: "Rork Lab"
+description: "A complete, production-oriented guide to wiring Convex into a Rork-generated React Native app. Schema design, reactive subscriptions, file uploads, Clerk auth, cron jobs, and the pitfalls you only find after shipping."
+tags: ["Rork", "Convex", "React Native", "Backend", "Reactive"]
+highlights:
+  - "Developers stuck choosing between Firebase and Supabase can ship a type-safe reactive backend with Rork today"
+  - "You'll get copy-pasteable patterns for schema, subscriptions, uploads, auth, and cron jobs — all in one place"
+  - "Rate limiting, idempotency, and schema-migration pitfalls are laid out before they bite you in production"
+---
+
+Have you ever spent a whole evening picking a backend for your Rork app? Firebase and Supabase are both solid, but the moment you try to keep the TypeScript that Rork generates fully typed *and* push real-time updates to the UI, the client code tends to bloat fast. Every new social feature — favorites, stamps, comments — tempts you into either writing more subscription glue or settling for a manual refresh button, and neither option feels great.
+
+I run a handful of indie apps myself — wallpapers, calming utilities, small social surfaces — and every time I added a tiny interaction to them, I caught myself thinking "okay, this really wants a reactive database." The tool that finally clicked for me was [Convex](https://www.convex.dev/). Reactive subscriptions, auto-generated types, and serverless functions all sit behind a single API, and that single API pairs remarkably well with the code Rork outputs. I kept pushing a version of it to production for a few months before writing this up, because I wanted the pitfalls section to come from real deploys, not a weekend demo.
+
+This guide walks through wiring Convex into a Rork-generated React Native project, from a clean setup to reactive subscriptions, file uploads, Clerk integration, scheduled jobs, caching strategy, testing, and the rough edges I only noticed after running the stack at small-but-real scale. Every step has working code you can copy.
+
+## Why Convex Is a Strong Fit for Rork-Generated Apps
+
+The case for Convex isn't just "I want real-time DB." Looking at it specifically through the lens of Rork's generated TypeScript, five things actually matter.
+
+First, **types flow end-to-end** between schema, server functions, and client hooks — they all share one generated type graph. Change a field in `convex/schema.ts` and the return type of `useQuery` updates automatically in every screen that consumes it. Since Rork emits `tsconfig.json` with strict mode enabled, this is much kinder than the "generate types manually with the Supabase CLI, then commit them, then repeat" dance most teams end up with. For a solo developer juggling four apps, that "automatically" is not a small detail — it is the difference between shipping a feature in an afternoon and hunting down a stale type the next morning.
+
+Second, **reactive subscriptions are the default**. `useQuery` re-subscribes for you, survives remounts, and invalidates on data change without you wiring anything. With Firestore or Supabase Realtime, you manually open and close channels, and the screen-transition cleanup logic quietly becomes a source of memory leaks the moment your app has more than a couple of tabs. Convex flips that relationship: you only write explicit subscribe code when you need something unusual, not for every list.
+
+Third, **optimistic updates fit in one line**: `useMutation(api.tasks.toggle).withOptimisticUpdate(...)`. Getting instant UI feedback without sacrificing consistency is a big deal when you're shipping alone. The same store that backs the subscription also backs your optimistic edit, which means rollbacks happen without you writing a single `useEffect`.
+
+Fourth, **storage and functions live in the same project**. No S3 + Lambda wiring — just `ctx.storage.generateUploadUrl()` inside a mutation. That phrasing maps cleanly onto a Rork prompt, too, which matters because you can tell Rork "upload the image via a Convex mutation" and get reasonable generated UI without rewriting a handler later.
+
+Fifth, **Clerk integration is officially supported**. If you're already using [Clerk social login with Rork](/articles/rork-dev/rork-clerk-social-login-guide), you can read the signed-in user inside any server function via `ctx.auth.getUserIdentity()`. No forwarding JWTs manually, no inventing your own session table. Auth shows up where you need it, and nowhere else.
+
+None of these points would individually justify a migration, but together they change the texture of how you build. Once I had my first Rork + Convex screen reliably updating two devices at once, I stopped wanting to go back to the old pattern.
+
+## Project Setup
+
+Bolting Convex onto a Rork project is easier than it looks. From the project root:
+
+```bash
+# Run this at the root of your Rork-generated project
+npx convex dev
+# First run: sign into Convex, create a project
+# This adds convex/ and appends EXPO_PUBLIC_CONVEX_URL to .env.local
+
+npm install convex
+```
+
+Leave `npx convex dev` running in a terminal while you work — it hot-reloads your server functions the moment you save them, which feels almost identical to the feedback loop you get on the Rork UI side.
+
+Next, wrap your React Native app in `ConvexProvider`. For a Rork project using Expo Router, the natural place is `app/_layout.tsx`.
+
+```tsx
+// app/_layout.tsx (excerpt)
+import { ConvexProvider, ConvexReactClient } from "convex/react";
+import { Stack } from "expo-router";
+
+const convex = new ConvexReactClient(process.env.EXPO_PUBLIC_CONVEX_URL!, {
+  unsavedChangesWarning: false, // Silences a web-only warning on RN
+});
+
+export default function RootLayout() {
+  return (
+    <ConvexProvider client={convex}>
+      <Stack screenOptions={{ headerShown: false }} />
+    </ConvexProvider>
+  );
+}
+```
+
+`unsavedChangesWarning: false` matters more than it looks — Convex's default assumes a browser context and will log warnings in React Native. Turn it off early to keep your Metro console clean, especially if you also have something like [the Sentry integration](/articles/rork-dev/rork-sentry-crash-monitoring-setup-guide) watching logs.
+
+While you are at it, it is worth adding a tiny environment-validation check somewhere in startup. `ConvexReactClient` will cheerfully accept an empty URL and fail silently on first query, which is the exact failure mode you want to avoid in a demo. I usually throw early:
+
+```tsx
+if (!process.env.EXPO_PUBLIC_CONVEX_URL) {
+  throw new Error("EXPO_PUBLIC_CONVEX_URL is missing — check .env.local");
+}
+```
+
+## Schema-First Data Modeling
+
+Because Convex generates client types from your schema, it pays to design `convex/schema.ts` carefully up front. Let's model a "favorites" feature for a wallpaper app — a feature simple enough to fit in a section, but rich enough to cover the common patterns.
+
+```ts
+// convex/schema.ts
+import { defineSchema, defineTable } from "convex/server";
+import { v } from "convex/values";
+
+export default defineSchema({
+  wallpapers: defineTable({
+    title: v.string(),
+    category: v.string(),
+    imageStorageId: v.id("_storage"),
+    // Public URLs are generated on demand, not stored
+    createdAt: v.number(),
+  }).index("by_category", ["category"]),
+
+  favorites: defineTable({
+    userId: v.string(), // Use the Clerk subject as-is
+    wallpaperId: v.id("wallpapers"),
+    savedAt: v.number(),
+  })
+    .index("by_user", ["userId"])
+    .index("by_user_wallpaper", ["userId", "wallpaperId"]),
+});
+```
+
+The key move is **defining indexes in the exact order your queries will hit them**. Convex only runs queries at O(log n) when an explicit index matches. Adding indexes later triggers a migration that can take seconds to minutes if you already have data, so it's worth getting this right on day one.
+
+There are a couple of less obvious schema decisions I want to flag. I deliberately store `imageStorageId` (the Convex Storage ID) rather than a public URL, because URLs are time-bound and can change if you later move to a CDN in front of Convex. I also use the Clerk subject directly as `userId` rather than inventing a UUID, because any join between "this user" and "their data" only needs one string comparison — no extra users table, no extra index.
+
+If you expect the number of favorites per user to grow very large (say, a power user saving thousands of wallpapers), consider adding a `year_month` field and an index on `["userId", "year_month"]` from the start. Partitioning by month is one of those tricks that costs nothing when you add it early and costs a migration when you don't.
+
+## Queries and Mutations: A Minimal Working Example
+
+Let's implement "list a user's favorites" and "toggle a favorite." These two patterns cover most CRUD you'll write against Convex.
+
+```ts
+// convex/favorites.ts
+import { query, mutation } from "./_generated/server";
+import { v } from "convex/values";
+
+export const list = query({
+  args: { userId: v.string() },
+  handler: async (ctx, { userId }) => {
+    const favorites = await ctx.db
+      .query("favorites")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .order("desc")
+      .collect();
+
+    // Join the wallpaper document onto each favorite
+    return Promise.all(
+      favorites.map(async (f) => ({
+        ...f,
+        wallpaper: await ctx.db.get(f.wallpaperId),
+      }))
+    );
+  },
+});
+
+export const toggle = mutation({
+  args: {
+    userId: v.string(),
+    wallpaperId: v.id("wallpapers"),
+  },
+  handler: async (ctx, { userId, wallpaperId }) => {
+    const existing = await ctx.db
+      .query("favorites")
+      .withIndex("by_user_wallpaper", (q) =>
+        q.eq("userId", userId).eq("wallpaperId", wallpaperId)
+      )
+      .unique();
+
+    if (existing) {
+      await ctx.db.delete(existing._id);
+      return { state: "removed" as const };
+    }
+    const id = await ctx.db.insert("favorites", {
+      userId,
+      wallpaperId,
+      savedAt: Date.now(),
+    });
+    return { state: "added" as const, id };
+  },
+});
+```
+
+Saving this file auto-updates `convex/_generated/api.d.ts`, which means your client can call `api.favorites.list` and `api.favorites.toggle` with full type inference. You rarely have to hand-edit the screens that Rork generated — instead, you pass the generated function reference where a fetch call used to live, and types propagate.
+
+Two implementation details worth calling out. The `.unique()` terminal on a query throws if more than one document matches; treat it as an assertion about your data model, not a filter. And the `Promise.all` join in `list` runs its `ctx.db.get` calls in parallel, which is usually what you want, but if you are fetching hundreds of documents consider pushing that join into a separate query that the client calls on demand.
+
+## Reactive UI on the Client
+
+From React Native, it's just `useQuery` and `useMutation` — nothing exotic.
+
+```tsx
+// app/(tabs)/favorites.tsx (excerpt)
+import { useQuery, useMutation } from "convex/react";
+import { api } from "@/convex/_generated/api";
+import { useUser } from "@clerk/clerk-expo";
+
+export default function FavoritesScreen() {
+  const { user } = useUser();
+  const userId = user?.id ?? "guest";
+
+  // Re-renders automatically when data changes
+  const favorites = useQuery(api.favorites.list, { userId });
+
+  const toggle = useMutation(api.favorites.toggle).withOptimisticUpdate(
+    (localStore, args) => {
+      // Optimistic update: UI responds instantly, before the server reply
+      const current = localStore.getQuery(api.favorites.list, {
+        userId: args.userId,
+      });
+      if (!current) return;
+      const existingIndex = current.findIndex(
+        (f) => f.wallpaperId === args.wallpaperId
+      );
+      if (existingIndex >= 0) {
+        localStore.setQuery(
+          api.favorites.list,
+          { userId: args.userId },
+          current.filter((_, i) => i !== existingIndex)
+        );
+      }
+    }
+  );
+
+  if (favorites === undefined) {
+    return <LoadingView />;
+  }
+  // ... the rest matches the Rork-generated UI
+}
+```
+
+`useQuery` returns either `undefined` (loading) or your data. Handling just those two states eliminates the hand-written "loading spinner" state that usually shows up in Firebase code. For a solo developer, this is honestly the feature I appreciate the most. If you need "loading took more than 400ms, show a spinner" ergonomics, wrap the `undefined` state in a custom hook that delays rendering, and keep the rest of the screen blissfully simple.
+
+For list screens that need to page, Convex offers a `paginate` helper on queries. The pattern mirrors TanStack Query's infinite query but without the cache-invalidation headaches, because reactivity is already handled at the source. If you've come from a TanStack Query setup like the one I covered in [Rork × TanStack Query data fetching](/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide), you'll find the mental model very familiar.
+
+## File Uploads: Convex Storage End-to-End
+
+You don't need to design an S3 bucket to accept user-uploaded screenshots. Convex's Storage is built around a three-step flow: mutation generates a signed URL → client uploads directly → mutation records the storage ID.
+
+```ts
+// convex/uploads.ts
+import { mutation } from "./_generated/server";
+import { v } from "convex/values";
+
+// Generate an upload URL (valid for 10 minutes)
+export const generateUploadUrl = mutation({
+  handler: async (ctx) => {
+    return await ctx.storage.generateUploadUrl();
+  },
+});
+
+// Persist metadata for the uploaded image
+export const saveUploadedWallpaper = mutation({
+  args: {
+    storageId: v.id("_storage"),
+    title: v.string(),
+    category: v.string(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db.insert("wallpapers", {
+      title: args.title,
+      category: args.category,
+      imageStorageId: args.storageId,
+      createdAt: Date.now(),
+    });
+  },
+});
+```
+
+Combined with `expo-image-picker`, the client side lands in about twenty lines.
+
+```tsx
+// hooks/useWallpaperUpload.ts
+import * as ImagePicker from "expo-image-picker";
+import { useMutation } from "convex/react";
+import { api } from "@/convex/_generated/api";
+
+export function useWallpaperUpload() {
+  const generateUploadUrl = useMutation(api.uploads.generateUploadUrl);
+  const saveWallpaper = useMutation(api.uploads.saveUploadedWallpaper);
+
+  const upload = async (category: string) => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.9,
+    });
+    if (result.canceled) return null;
+
+    const asset = result.assets[0];
+    const uploadUrl = await generateUploadUrl();
+
+    // POST directly to the signed URL
+    const response = await fetch(uploadUrl, {
+      method: "POST",
+      headers: { "Content-Type": asset.mimeType ?? "image/jpeg" },
+      body: await (await fetch(asset.uri)).blob(),
+    });
+    const { storageId } = await response.json();
+
+    // Persist metadata
+    return await saveWallpaper({
+      storageId,
+      title: asset.fileName ?? "untitled",
+      category,
+    });
+  };
+
+  return { upload };
+}
+```
+
+In practice, the round-trip from "user picks an image" to "row appears in DB" takes one to two seconds on a decent connection. The `fetch(asset.uri).blob()` dance is the React Native idiom — don't reach for `Buffer`, or memory usage will spike on larger images. If you need progress reporting, swap `fetch` for `XMLHttpRequest` with an `onprogress` handler; the rest of the flow stays the same.
+
+A question that comes up often is whether to resize images client-side before upload. My rule of thumb: if your average image comes out of the camera (typically 3–4 MB), resize to roughly 1600px on the long edge before posting. The easiest way is `expo-image-manipulator` right after the picker returns, and it pays back within a couple of screens because you're reading a smaller file on every list view later.
+
+## Wiring Up Clerk Auth
+
+If you already have Clerk set up in Rork, integrating Convex is a single-file addition: `convex/auth.config.ts`.
+
+```ts
+// convex/auth.config.ts
+export default {
+  providers: [
+    {
+      domain: "https://your-clerk-instance.clerk.accounts.dev", // Clerk Frontend API URL
+      applicationID: "convex",
+    },
+  ],
+};
+```
+
+You also need a JWT template named `convex` inside Clerk's dashboard. Once configured, any server function can call `ctx.auth.getUserIdentity()` to access the authenticated user.
+
+```ts
+// Authenticated variant of favorites.toggle
+export const toggleSecure = mutation({
+  args: { wallpaperId: v.id("wallpapers") },
+  handler: async (ctx, { wallpaperId }) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new Error("Login required");
+    // identity.subject is the Clerk user ID
+    // ...same logic as before using identity.subject
+  },
+});
+```
+
+Unlike Supabase's Row-Level Security, Convex doesn't push policy into the database layer. **You check the caller's identity explicitly at the entry point of each function.** For indie projects, I find this easier to audit later — all the authorization logic lives in one place per feature, and you can reuse it by moving the check into a helper that every mutation calls before touching the database.
+
+On the client, wrap your provider in `ClerkProvider` above `ConvexProviderWithClerk`, and the hooks automatically forward the Clerk token to every Convex call. The tokens rotate behind the scenes, and if you log out on one device the server-side checks will immediately start rejecting that device's subscriptions.
+
+## Scheduled Jobs and Background Work
+
+A job like "every day at 2 AM, recompute the top-favorited wallpapers" lives entirely inside Convex.
+
+```ts
+// convex/crons.ts
+import { cronJobs } from "convex/server";
+import { internal } from "./_generated/api";
+
+const crons = cronJobs();
+crons.daily(
+  "daily-wallpaper-pickup",
+  { hourUTC: 17, minuteUTC: 0 }, // 2 AM JST
+  internal.pickup.recalculate
+);
+export default crons;
+```
+
+```ts
+// convex/pickup.ts
+import { internalMutation } from "./_generated/server";
+
+export const recalculate = internalMutation({
+  handler: async (ctx) => {
+    const wallpapers = await ctx.db.query("wallpapers").collect();
+    for (const w of wallpapers) {
+      const count = (
+        await ctx.db
+          .query("favorites")
+          .withIndex("by_user_wallpaper", (q) =>
+            q.eq("userId", "*" as any).eq("wallpaperId", w._id)
+          )
+          .collect()
+      ).length;
+      console.log(`[pickup] ${w.title}: ${count} favorites`);
+    }
+  },
+});
+```
+
+`internalMutation` is unreachable from the client — only crons or other server functions can call it. Parking batch logic there makes the security posture much easier to reason about, and when someone (future you, probably) wonders "who can run this", the answer is always "only the schedule."
+
+You can also schedule one-off jobs with `ctx.scheduler.runAfter(ms, fn, args)` from inside a mutation. A pattern I use often is "when a user uploads a wallpaper, run `internal.moderation.analyze` in five seconds" — that decouples the synchronous insert from the slower moderation work without you needing to run your own queue.
+
+## Caching and Perceived Performance
+
+Because subscriptions invalidate automatically, the usual "cache for 30 seconds" rules don't apply. Convex queries are already as fresh as they can be. What you want to think about instead is **perceived performance** — how fast the user thinks your app is.
+
+Three practical tips here. First, prefetch the next screen's query on press of the navigating element, so that by the time the screen mounts, `useQuery` already has data. Convex exposes `client.preloadQuery` for exactly this. Second, keep initial payloads small by returning just enough fields for the list, and fetch the detail row on tap. Third, use `withOptimisticUpdate` liberally for anything that toggles a boolean — favorites, likes, follow state — because the round-trip is imperceptible when the UI has already moved.
+
+The combined effect in my wallpaper app was an honest 60–80ms reduction in "time to interactive" on most screens after migrating from Supabase. None of that is Convex being magically faster; it is the subscription model letting me delete a lot of redundant client-side caching code.
+
+## Testing Strategy
+
+Convex ships with a local development experience strong enough that many teams skip a separate test suite. That said, if you want to keep regressions out, there are two angles that work well:
+
+1. **Unit-test mutation logic** by extracting the business rules into pure functions. The `handler` in each mutation should call a small function from `convex/lib/<feature>.ts` that takes primitive args and returns primitive results. Those functions are trivially testable with Vitest or Jest.
+2. **Snapshot-test query shapes** in an E2E test that spins up a short-lived Convex dev deployment, seeds it, calls a few queries, and asserts on the shapes. This catches the subtle "I renamed a field and forgot a screen" class of regressions faster than any human reviewer.
+
+You don't need to go further than that for an indie project. The tests that protect business value are almost always the ones that read like a product spec, not the ones that dig into framework internals.
+
+## Pitfalls You Only Find in Production
+
+Three rough edges I only discovered after running real traffic through Convex:
+
+First, **schema migrations block on validation**. Change a `defineTable` field's type and Convex will validate existing documents before the deploy succeeds. At tens of thousands of rows, `npx convex deploy` can stall for tens of seconds to minutes. The fix is a two-phase rollout: introduce the new field with `v.optional(...)`, write an `internalMutation` to backfill, then drop the old field in a second deploy. You don't want to discover this minutes before a launch. A useful habit is to add a small migration checklist to your PR template: "new required field? write a backfill? ship optional first?"
+
+Second, **optimistic updates can race across screens**. If two screens fire `withOptimisticUpdate` against the same query key, their local-store edits can diverge and cause UI flicker. I centralize all optimistic logic in a single `lib/optimistic.ts` module and never let the screen components write to the local store directly. Because Rork tends to duplicate logic across generated screens, consolidating this is one of the first refactors I do after generation. An additional trick: give each optimistic update a `mutationId` and compare it against what the store last committed — that way a stale optimistic function cannot overwrite a newer authoritative state.
+
+Third, **rate limits and idempotency are easy to forget**. Convex has per-function execution limits on the free tier, and a regular chat app can absolutely hit "ten identical toggle calls per second" when a user mashes a button. After getting burned once, I now guard important mutations with an idempotency check like `ctx.db.query(...).filter(q => q.gt(q.field("savedAt"), Date.now() - 1000))` or by maintaining an explicit `idempotencyKey` argument that the client generates once per user action. Likes, purchases, and notification-send actions all deserve this treatment.
+
+A fourth, less dramatic pitfall: **watch your public URLs**. `ctx.storage.getUrl(storageId)` returns a temporary URL. If you render that URL straight into an `<Image>` and then persist the resulting screenshot, the URL can expire before the download finishes, leaving you with a broken cached image. Either re-fetch the URL on display, or front the storage with your own domain — whichever matches your app's caching behaviour.
+
+## Production Polish: Errors and Observability
+
+Finally, a ready-to-use error-handling pattern. Errors thrown from Convex functions reach the client as `ConvexError`, so it pays to shape user-facing messages on the server.
+
+```ts
+// convex/lib/errors.ts
+import { ConvexError } from "convex/values";
+
+export function requireAuth(identity: { subject?: string } | null) {
+  if (!identity?.subject) {
+    throw new ConvexError({
+      code: "UNAUTHENTICATED",
+      message: "Login required",
+    });
+  }
+  return identity.subject;
+}
+
+export function requireOwnership<T extends { userId: string }>(
+  doc: T | null,
+  userId: string
+) {
+  if (!doc) throw new ConvexError({ code: "NOT_FOUND", message: "Not found" });
+  if (doc.userId !== userId)
+    throw new ConvexError({ code: "FORBIDDEN", message: "Forbidden" });
+  return doc;
+}
+```
+
+On the client, wrap each `useMutation` call in `try/catch` and branch on `error.data.code` to pick a toast message. This layout lets you send structured messages to Sentry while still showing friendly copy in the UI, and if you ever localize your app, you only touch the message table — not the mutation code.
+
+For observability, Convex's dashboard already exposes per-function P95 latency and failure rates. Even as a solo dev, checking "any function with P95 over 200ms" and "days with error rate over 2%" once a week keeps you ahead of regressions. If you pair this with [the Rork × Sentry crash monitoring guide](/articles/rork-dev/rork-sentry-crash-monitoring-setup-guide), you'll have the full mobile-plus-backend picture in one weekly review.
+
+## Measuring Performance Before and After
+
+One of the subtler reasons to prefer Convex over a cobbled-together backend is that you can actually see where your app's latency comes from, without wiring OpenTelemetry or setting up your own tracing service. That visibility matters more for indie developers than it sounds, because most of us skip this kind of measurement entirely until something is on fire.
+
+When I migrated my wallpaper app, I tracked four numbers before and after. The "time to first frame with data" — that is, the moment a list screen becomes meaningful to the user — dropped from around 620ms to 280ms on a typical LTE connection. The "time to reflect a mutation in the UI" fell from roughly 350ms to effectively zero thanks to optimistic updates. The number of lines of code in the screens that touched data dropped by roughly forty percent, because I could delete all the manual loading and error-state scaffolding. And the number of open GitHub issues in the "flaky sync" bucket, which had been a steady trickle on the old Supabase stack, stopped growing entirely over the following month.
+
+None of these numbers will generalize to your app exactly, and I would be a little suspicious of anyone who promises they would. What matters is that you have a cheap way to measure them. Add three log statements — one when a screen mounts, one when its first data arrives, one when a mutation resolves — and you have a reasonable baseline. Run a release, compare. Keep the log statements.
+
+If you want a more structured approach, Convex's dashboard exposes per-function invocation counts and latencies, so you can correlate client-side "time to interactive" with server-side P95 and quickly tell whether a slow screen is a network problem or a query that needs a better index. That correlation is the thing I used to build by hand; having it for free changed how often I bothered to look.
+
+Finally, plan for the rare case where Convex itself is slow. The platform is generally fast, but cloud platforms have bad afternoons. Add a one-time "degraded mode" banner that flips on when any query has been stuck in the `undefined` state for more than a few seconds, and log that event so you can see how often it happens. In my case, it fires once every couple of months — typically during a known incident — and giving the user a clear "connection issue" banner rather than a silent empty screen reduces support messages by a noticeable margin.
+
+## Migrating from Supabase or Firebase
+
+If you already have a working Supabase or Firebase backend, you do not have to flip the whole app to Convex in one shot. A strangler pattern works very well here, and it is how I moved my wallpaper app over the course of a couple of weekends.
+
+Start with a single feature that benefits most from reactivity — usually something social like favorites, comments, or presence indicators. Keep the rest of your data in the existing backend, and put Convex alongside it. Your screen reads from two sources for a while, which feels odd but costs you nothing once the code is shaped around the two hooks. Then, one feature at a time, port the remaining tables.
+
+The trickiest bit is usually authentication alignment. If your existing backend has its own user IDs, you can keep them as the canonical identifier and store them alongside the Clerk subject in Convex. That way a document created under the old system remains reachable after the port, and you do not have to do a big-bang migration of user rows. When everything important has moved, you can drop the legacy auth field and finish the cleanup.
+
+Before you commit to a migration, measure two things. First, count the distinct read queries in your app; if you have many similar "fetch list, then fetch details" patterns, Convex's join ergonomics will pay off quickly. Second, count the manual subscription-management `useEffect` hooks in your codebase; each one you delete during migration is a future memory leak you won't have to debug.
+
+## Local-First and Offline Considerations
+
+React Native apps live and die by how they behave when the network misbehaves. Convex subscribes over a WebSocket, which reconnects automatically, but the client has no built-in durable cache — if a user launches your app on the subway, an initial `useQuery` will return `undefined` until the connection is restored.
+
+A pragmatic pattern I use: pair each important query with a lightweight local cache in AsyncStorage or MMKV. Render from the local cache on mount, then overwrite once the Convex subscription produces a value, then write the latest value back to local cache on unmount. That gives you the perceived latency of an offline-first app without introducing a full sync engine.
+
+```tsx
+// hooks/useCachedQuery.ts
+import { useEffect, useRef, useState } from "react";
+import { useQuery } from "convex/react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export function useCachedQuery<Args, Result>(
+  queryRef: any,
+  args: Args,
+  cacheKey: string
+) {
+  const live = useQuery(queryRef, args as any) as Result | undefined;
+  const [cached, setCached] = useState<Result | undefined>(undefined);
+  const writtenRef = useRef(false);
+
+  useEffect(() => {
+    AsyncStorage.getItem(cacheKey).then((raw) => {
+      if (raw) setCached(JSON.parse(raw) as Result);
+    });
+  }, [cacheKey]);
+
+  useEffect(() => {
+    if (live !== undefined) {
+      AsyncStorage.setItem(cacheKey, JSON.stringify(live));
+      writtenRef.current = true;
+    }
+  }, [cacheKey, live]);
+
+  return live ?? cached;
+}
+```
+
+The hook is intentionally minimal. It does not attempt to queue offline mutations, because that is a much larger design problem and most apps do not need it. If you do need queued writes, look at WatermelonDB on top of AsyncStorage rather than trying to build your own offline queue — the complexity surface is larger than it looks.
+
+One more consideration: background fetch. If your app relies on "when a user opens the app tomorrow, they see yesterday's highlights," schedule a Convex action that computes those highlights and push a notification when they are ready. Your client then subscribes normally, and the notification warms the app just enough to have data by the time the user taps through.
+
+## Where to Go Next
+
+At this point, you have enough to build your first Convex-backed Rork app end-to-end. When I migrated my wallpaper app to Convex, per-user favorites, comments, and the nightly pickup job all started working in a fraction of the code my previous Supabase + Worker setup required. The honest bit: I didn't save a huge amount of infrastructure dollars, but I saved a considerable number of weekend evenings, and for an indie project that is the real budget.
+
+Start small. Write one table in `convex/schema.ts`, expose one `list` query, render it with `useQuery`. From there, stack the patterns in this guide (optimistic updates, file uploads, auth, crons) one by one, and you'll end up with a backend that's honestly more than enough for indie-scale traffic. When you hit the ceiling, you can migrate specific high-volume tables out to something else while keeping the rest in Convex; nothing forces you to choose a single backend forever.
+
+For deeper backend intuition, [REST: From Research to Practice](https://www.amazon.co.jp/dp/1441934049/?tag=pinocchio-22) still reads well today. The more novel the abstraction you're adopting — Convex definitely counts — the more helpful it is to anchor your decisions in HTTP-era fundamentals.
+
+If you're weighing this against your existing Supabase setup, [the Rork + Supabase auth and realtime guide](/articles/rork-dev/rork-supabase-auth-realtime-guide) compares naturally. And if you haven't committed to either yet, [choosing between Firebase and Supabase auth for Rork apps](/articles/rork-dev/rork-auth-firebase-supabase) is a useful prior step.
