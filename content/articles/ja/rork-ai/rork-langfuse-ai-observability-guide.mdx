@@ -1,0 +1,411 @@
+---
+title: "Rork + Langfuse で本番 AI アプリのトレース・コスト・品質を計測する運用ガイド"
+slug: "rork-langfuse-ai-observability-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-23T20:00"
+updated: "2026-04-23T20:00"
+author: "Rork Lab"
+description: "Rork で作った AI アプリを本番に出した後に必ず必要になる、トレース・コスト計測・品質評価（Evals）を Langfuse で構築する実践ガイドです。"
+tags: ["Rork", "Langfuse", "AI Observability", "LLM コスト", "Evals", "本番運用"]
+highlights:
+  - "AI アプリをリリースしたあとに「月額コストが読めない」「どのプロンプトで事故が起きたか追えない」と困っていた状況が、今日から計測可能になります"
+  - "Langfuse のトレース構造・スコアリング設計を Rork アプリに落とし込む具体的なコードを手に入れ、自前の Evals パイプラインを動かせるようになります"
+  - "リリース直後に赤字化しやすい AI アプリの運用を、ユーザー体験の質を落とさずに黒字化まで持っていく判断基準が身につきます"
+---
+
+Rork で AI を使ったアプリを作るところまでは、今はそれほど難しくありません。難しいのはリリースした翌週、サーバーログを眺めながら「先月の OpenAI の請求がなぜこんなに膨らんだのか」「どの会話でユーザーが離脱したのか」をひとりで追いかけはじめたときです。
+
+私自身、Rork でリリースした AI チャット系アプリを1ヶ月運用してみて、最初に学んだのは「AI アプリは出してからが本番」でした。推論コストは予測を裏切る形で膨らみ、ユーザーからの「返答がおかしかった」という報告は、どのリクエストのことを指しているのか再現もできない。ログの grep では間に合わず、可視化ツールが必要だとはっきり感じた瞬間でした。
+
+この記事では、Rork で作った本番 AI アプリに [Langfuse](https://langfuse.com) を組み込み、（1）リクエスト単位のトレース、（2）モデル別・ユーザー別のコスト計測、（3）プロンプトや出力の品質スコアリング（Evals）を一気通貫で回す運用基盤の作り方をまとめました。Rork で AI を使っているけれど、月次のコストと品質に確信が持てない方に向けた実装ガイドです。
+
+## なぜ AI アプリに Observability が「後から」では遅いのか
+
+先に結論から書きます。AI アプリの Observability は、リリースしてから追加するのは技術的には可能ですが、運用上の「判断」が致命的に遅れます。
+
+理由は3つあります。1つ目は、コストの異常が起きたときに原因を特定できないこと。2つ目は、品質問題が起きたときにどのプロンプト・どの入力・どのモデルバージョンだったかを再構成できないこと。3つ目は、改善サイクルが「ユーザー報告」頼みになり、A/B テストやプロンプトの差し替えを自信を持って判断する根拠が揃わないことです。
+
+ここでいう Observability とは、ただログを集めることではありません。リクエストが LLM プロバイダに届くまでの中間処理を全部つなげて1つの「トレース」として見られること、トレースごとにトークン数・コスト・モデル・ユーザー・バージョンが紐づくこと、そして後から人間がスコアを付けたり自動評価（Evals）が走って記録されることです。
+
+## Langfuse を選んだ理由（他の選択肢との比較）
+
+AI アプリの Observability には Langfuse のほかにも Helicone、LangSmith、Braintrust、PostHog LLM Analytics、Arize などの選択肢があります。私が Rork アプリで Langfuse を採用した理由は大きく3つあります。
+
+1つ目は、セルフホスト可能で、個人開発のデータを外部に持ち出したくないケースに対応できること。Rork で作った国内向けアプリの場合、ユーザーの会話ログを海外 SaaS に送ることに抵抗がある場面は珍しくありません。Langfuse は Docker で自分の VPS に立てられるため、プライバシー要件の厳しい案件にそのまま持っていけます。
+
+2つ目は、トレース・プロンプト管理・Evals・データセット・アノテーションキューが1つのツールに統合されていることです。他社は「トレースは強いが Evals が弱い」「プロンプト管理は別ツール」という分担になりがちで、運用するほど道具が増えてつらくなります。
+
+3つ目は、SDK の設計が「プロバイダ中立」であること。OpenAI、Anthropic、Google、あるいはオンデバイス推論まで、同じトレース形式で扱えます。Rork のアプリは AI プロバイダを後から乗り換えることがよくあるので、ロックインしない観測基盤は重要でした。
+
+もちろん、これは私の使い方ベースの選択です。フルマネージドだけで済ませたい、チームで大規模に使う予定があるなら LangSmith や Braintrust のほうが向く場面もあります。
+
+## アーキテクチャ全体像
+
+Rork アプリから Langfuse までの経路は、基本的に「アプリ → 自前の API Gateway → LLM プロバイダ」という構成にし、Gateway で Langfuse にトレースを飛ばします。アプリから直接 Langfuse の公開鍵を叩かないのがコツです。
+
+- **アプリ層**: Rork で生成した React Native/Expo コード。Langfuse のクライアント SDK は直接埋め込まず、バックエンドへのリクエスト1本にまとめます
+- **Gateway 層**: Cloudflare Workers あるいは Hono on Cloudflare。ここで Langfuse にトレースを送信し、LLM プロバイダに実際のリクエストを飛ばします
+- **Langfuse 層**: セルフホスト（Docker）または Langfuse Cloud。トレース・コスト・スコアをここに集約します
+- **評価（Evals）層**: スケジュール実行（Cloudflare Cron Triggers）で過去トレースを読み、自動スコアリングして Langfuse にスコアを書き戻します
+
+この構成にする最大の理由は、アプリに API キーを持たせないためです。App Store に出ている Rork アプリから Langfuse Secret Key が漏れたら、全トレースが外部から書き換えられる状態になります。App を配ったあとに認証をやり直すコストは大きいので、最初から Gateway を噛ませるのを強くおすすめします。
+
+## ステップ1: Langfuse のセットアップと最小トレース
+
+まずは最小構成のトレースを1本通すところから始めます。Langfuse Cloud を使う場合はサインアップしてプロジェクトを作り、Public/Secret Key を発行するだけです。セルフホストする場合は `docker compose up` で立ち上がります。
+
+Rork のバックエンド（Cloudflare Workers + Hono）に仕込むトレース送信コードです。
+
+```typescript
+// worker/src/routes/chat.ts
+// Rork アプリから呼ばれる /api/chat エンドポイント
+// ユーザー発話を受け取り → OpenAI に投げ → Langfuse にトレースを残す
+import { Hono } from "hono";
+import { Langfuse } from "langfuse";
+import OpenAI from "openai";
+
+type Env = {
+  OPENAI_API_KEY: string;
+  LANGFUSE_PUBLIC_KEY: string;
+  LANGFUSE_SECRET_KEY: string;
+  LANGFUSE_BASE_URL: string; // 例: https://cloud.langfuse.com
+};
+
+export const chatRoute = new Hono<{ Bindings: Env }>();
+
+chatRoute.post("/chat", async (c) => {
+  const { userId, message, sessionId } = await c.req.json<{
+    userId: string;
+    sessionId: string;
+    message: string;
+  }>();
+
+  const langfuse = new Langfuse({
+    publicKey: c.env.LANGFUSE_PUBLIC_KEY,
+    secretKey: c.env.LANGFUSE_SECRET_KEY,
+    baseUrl: c.env.LANGFUSE_BASE_URL,
+  });
+
+  // トレース単位 = 「1回のユーザー発話に対する応答サイクル」
+  const trace = langfuse.trace({
+    name: "chat-turn",
+    userId,
+    sessionId,
+    input: { message },
+    tags: ["production", "chat-v2"],
+  });
+
+  const openai = new OpenAI({ apiKey: c.env.OPENAI_API_KEY });
+
+  // 生成ステップを Langfuse の generation として記録
+  const generation = trace.generation({
+    name: "openai-chat",
+    model: "gpt-4.1-mini",
+    input: [{ role: "user", content: message }],
+  });
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: message }],
+    });
+
+    const output = response.choices[0].message.content ?? "";
+
+    generation.end({
+      output,
+      usage: {
+        promptTokens: response.usage?.prompt_tokens,
+        completionTokens: response.usage?.completion_tokens,
+        totalTokens: response.usage?.total_tokens,
+      },
+    });
+
+    trace.update({ output: { reply: output } });
+
+    // Workers は終了するとバックグラウンドタスクが切られるので flush 必須
+    await langfuse.flushAsync();
+
+    return c.json({ reply: output, traceId: trace.id });
+  } catch (error) {
+    // 失敗も記録する — 本番では失敗トレースこそ宝
+    generation.end({
+      level: "ERROR",
+      statusMessage: error instanceof Error ? error.message : "unknown",
+    });
+    await langfuse.flushAsync();
+    return c.json({ error: "Upstream LLM error" }, 502);
+  }
+});
+```
+
+ここでの重要なポイントは2つです。1つ目は `trace.id` をレスポンスに含めてアプリ側に返していること。これにより、あとからユーザーが「さっきの返信が変だった」と言ったときに、アプリ内から trace ID を使って該当トレースを即座に特定できます。2つ目は、Cloudflare Workers のような短命環境では `flushAsync()` を必ず呼ぶこと。呼ばないと、リクエストが完了した瞬間にプロセスが落ちてトレースが届きません。
+
+## ステップ2: コスト計測とモデル別集計
+
+Langfuse はデフォルトで `model` と `usage` から自動的にコストを計算します。ですが、自社独自のモデル（例: Cloudflare Workers AI、独自ファインチューンモデル）を使っている場合は、ダッシュボードの「Model Settings」から1トークンあたりの単価を入力してください。これを忘れると、月次レポートで一部モデルのコストがゼロ表示され、判断を誤ります。
+
+コスト集計で役立つ3つの視点は以下です。
+
+- **ユーザー別コスト**: `userId` に Rork アプリのユーザー ID を渡しておけば、Langfuse ダッシュボードの Users タブで1人あたりの累計コストが自動集計されます。Free プランのユーザーが想定以上に API を叩いている場合、ここで検知できます
+- **セッション別コスト**: 1会話（セッション）あたりの平均コストを見ることで、会話が長引きすぎていないかを判断できます。会話要約や過去履歴の圧縮が必要になるラインが可視化されます
+- **タグ別コスト**: トレースに `tags: ["plan:free", "feature:summarize"]` のように貼っておくと、機能単位・プラン単位のコスト内訳が取れます。赤字になっている機能を見つけて仕様を変更する判断の根拠になります
+
+本番運用では、Langfuse のダッシュボードに加えて「日次コスト閾値」の自動アラートを組むことを強くおすすめします。以下は Cloudflare Cron Triggers を使った実装例です。
+
+```typescript
+// worker/src/crons/cost-alert.ts
+// 毎日 9:00 JST に前日分の LLM コスト合計を計算し、
+// 閾値を超えていたら Slack と Rork アプリのプッシュ通知で管理者に通知
+import { Langfuse } from "langfuse";
+
+type Env = {
+  LANGFUSE_PUBLIC_KEY: string;
+  LANGFUSE_SECRET_KEY: string;
+  LANGFUSE_BASE_URL: string;
+  SLACK_WEBHOOK_URL: string;
+  DAILY_COST_THRESHOLD_USD: string; // 例: "50"
+};
+
+export async function runCostAlert(env: Env): Promise<void> {
+  const langfuse = new Langfuse({
+    publicKey: env.LANGFUSE_PUBLIC_KEY,
+    secretKey: env.LANGFUSE_SECRET_KEY,
+    baseUrl: env.LANGFUSE_BASE_URL,
+  });
+
+  const now = new Date();
+  const start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  try {
+    // Langfuse Public API: /api/public/metrics/daily
+    const res = await fetch(
+      `${env.LANGFUSE_BASE_URL}/api/public/metrics/daily?fromTimestamp=${start.toISOString()}&toTimestamp=${now.toISOString()}`,
+      {
+        headers: {
+          Authorization:
+            "Basic " +
+            btoa(`${env.LANGFUSE_PUBLIC_KEY}:${env.LANGFUSE_SECRET_KEY}`),
+        },
+      },
+    );
+
+    if (!res.ok) throw new Error(`Langfuse API ${res.status}`);
+    const json = (await res.json()) as {
+      data: { totalCost: number; totalTokens: number }[];
+    };
+
+    const totalCostUSD = json.data.reduce((s, d) => s + d.totalCost, 0);
+    const threshold = Number(env.DAILY_COST_THRESHOLD_USD);
+
+    if (totalCostUSD >= threshold) {
+      await fetch(env.SLACK_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: `⚠️ Rork AI cost alert — yesterday: $${totalCostUSD.toFixed(2)} (threshold $${threshold})`,
+        }),
+      });
+    }
+  } catch (err) {
+    // 通知側の失敗でクロン自体を止めない
+    console.error("cost-alert failed:", err);
+  } finally {
+    await langfuse.flushAsync();
+  }
+}
+```
+
+このアラートを入れてから、私の環境では「気づいたら請求書がきていた」状態がなくなりました。閾値は最初は低めに（想定日次コストの 120% くらい）設定し、誤報が多ければ広げていくのが実務的です。
+
+## ステップ3: Evals（品質評価パイプライン）を組む
+
+AI アプリで最も難しいのはコストではなく、品質の「再現可能な評価」です。人間が毎回全部チェックするのは無理なので、自動評価（Evals）が必要になります。Langfuse の Evals は「過去のトレースに対して、プログラムあるいは LLM-as-a-judge がスコアをつけて保存する」という形を取ります。
+
+評価の作り方は大きく3段階あります。（1）スコア対象のトレースを選ぶ、（2）評価基準を定義する、（3）自動実行する。
+
+以下は「直近24時間のチャットトレースをランダムに100件取り、『ユーザーの意図を正しく汲めていたか』をモデルで判定してスコアを書き戻す」サンプルです。
+
+```typescript
+// worker/src/crons/eval-chat-quality.ts
+// 毎日 2:00 JST に前日のチャットトレースを抽出し、
+// LLM-as-a-judge で「意図理解スコア」を付与する
+import { Langfuse } from "langfuse";
+import OpenAI from "openai";
+
+const JUDGE_PROMPT = `
+あなたはカスタマーサポート品質評価の専門家です。
+以下のユーザー発話とアシスタント応答を読み、次の2軸を 1〜5 で採点してください。
+- intent_understanding: ユーザーの意図を正しく捉えているか
+- actionability: ユーザーが次に何をすべきか明確か
+
+JSON 形式で必ず以下を返してください:
+{"intent_understanding": 1-5, "actionability": 1-5, "reason": "..."}
+`;
+
+export async function runQualityEval(env: {
+  LANGFUSE_PUBLIC_KEY: string;
+  LANGFUSE_SECRET_KEY: string;
+  LANGFUSE_BASE_URL: string;
+  OPENAI_API_KEY: string;
+}): Promise<void> {
+  const langfuse = new Langfuse({
+    publicKey: env.LANGFUSE_PUBLIC_KEY,
+    secretKey: env.LANGFUSE_SECRET_KEY,
+    baseUrl: env.LANGFUSE_BASE_URL,
+  });
+  const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  // Langfuse から対象トレースを取得（簡略化した fetch 例）
+  const res = await fetch(
+    `${env.LANGFUSE_BASE_URL}/api/public/traces?name=chat-turn&fromTimestamp=${since}&limit=100`,
+    {
+      headers: {
+        Authorization:
+          "Basic " +
+          btoa(`${env.LANGFUSE_PUBLIC_KEY}:${env.LANGFUSE_SECRET_KEY}`),
+      },
+    },
+  );
+  if (!res.ok) throw new Error(`list traces ${res.status}`);
+  const { data } = (await res.json()) as {
+    data: { id: string; input: { message?: string }; output: { reply?: string } }[];
+  };
+
+  for (const trace of data) {
+    const userMsg = trace.input?.message ?? "";
+    const reply = trace.output?.reply ?? "";
+    if (!userMsg || !reply) continue;
+
+    try {
+      const judge = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: JUDGE_PROMPT },
+          { role: "user", content: `USER: ${userMsg}\nASSISTANT: ${reply}` },
+        ],
+      });
+
+      const parsed = JSON.parse(judge.choices[0].message.content ?? "{}") as {
+        intent_understanding?: number;
+        actionability?: number;
+        reason?: string;
+      };
+
+      // スコアを該当トレースに書き戻す
+      if (typeof parsed.intent_understanding === "number") {
+        langfuse.score({
+          traceId: trace.id,
+          name: "intent_understanding",
+          value: parsed.intent_understanding,
+          comment: parsed.reason,
+        });
+      }
+      if (typeof parsed.actionability === "number") {
+        langfuse.score({
+          traceId: trace.id,
+          name: "actionability",
+          value: parsed.actionability,
+        });
+      }
+    } catch (err) {
+      // 1件の失敗で全体を止めない
+      console.error("judge failed for trace", trace.id, err);
+    }
+  }
+
+  await langfuse.flushAsync();
+}
+```
+
+この仕組みが回り始めると、プロンプトを差し替えた前後での「意図理解スコアの平均」がダッシュボードで比較できます。A/B テストの判断が「感覚」から「数値」に変わるので、プロンプト改善のスピードが明らかに上がります。ここが、私が AI アプリの運用で Langfuse を手放せない最大の理由です。
+
+## ステップ4: Rork アプリ側からのフィードバック送信
+
+自動評価に加えて、ユーザー自身の「👍/👎」や自由記述フィードバックを trace に紐づけることが、品質改善の最短ルートです。Rork の React Native コンポーネントからバックエンド経由で Langfuse Score に書き込む実装はシンプルです。
+
+```tsx
+// app/components/ChatFeedback.tsx
+// メッセージの下に表示する「役に立った？」ボタン
+import { useState } from "react";
+import { Pressable, Text, View, Alert } from "react-native";
+
+type Props = { traceId: string };
+
+export function ChatFeedback({ traceId }: Props) {
+  const [sent, setSent] = useState<"up" | "down" | null>(null);
+
+  async function send(value: 1 | -1) {
+    try {
+      const res = await fetch(`${process.env.EXPO_PUBLIC_API_BASE}/chat/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ traceId, value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSent(value === 1 ? "up" : "down");
+    } catch (err) {
+      Alert.alert("送信できませんでした", "通信状況を確認してもう一度お試しください。");
+    }
+  }
+
+  if (sent) {
+    return (
+      <View><Text>ご協力ありがとうございました</Text></View>
+    );
+  }
+
+  return (
+    <View style={{ flexDirection: "row", gap: 12 }}>
+      <Pressable onPress={() => send(1)} accessibilityLabel="役に立った">
+        <Text>👍</Text>
+      </Pressable>
+      <Pressable onPress={() => send(-1)} accessibilityLabel="役に立たなかった">
+        <Text>👎</Text>
+      </Pressable>
+    </View>
+  );
+}
+```
+
+バックエンド側 `/chat/feedback` は、受け取った `traceId` と値をそのまま Langfuse の `score` API に渡します。これを用意しておくだけで、ダッシュボードで「低評価が多いトレース」を抽出し、プロンプトや前処理の弱点を発見する導線が完成します。
+
+## よくある間違い・落とし穴
+
+本番投入してから直面した痛みをまとめます。ここを読むだけでも、半年分の遠回りが省けるはずです。
+
+**落とし穴1: アプリから直接 Langfuse を叩く**
+App Store に出したクライアントアプリに Langfuse Secret Key を埋め込むのは絶対に避けてください。`app.json` の extra や `EXPO_PUBLIC_` 系の環境変数に置いた時点で、バイナリを解析した第三者がスコアを自由に書ける状態になります。必ず Gateway を挟み、アプリはバックエンドの独自エンドポイントだけを叩くようにします。
+
+**落とし穴2: `flushAsync()` を忘れて Workers で欠損する**
+Cloudflare Workers や Lambda のような短命実行環境で SDK の `flushAsync()` を呼ばずにレスポンスを返すと、イベントループが打ち切られてイベントが消えます。症状は「ローカル開発では出るが本番では一部だけ見えない」。レスポンス返却前に必ず `await langfuse.flushAsync()` を入れるか、Workers なら `c.executionCtx.waitUntil(langfuse.flushAsync())` を使ってください。
+
+**落とし穴3: PII（個人情報）をトレースに垂れ流す**
+デフォルトで `input`/`output` にユーザー発話がそのまま入るため、医療・金融・子ども向けアプリでは法的リスクになります。Langfuse には [Data Masking](https://langfuse.com/docs/tracing-features/masking) の仕組みがあり、SDK 側でマスク関数を渡すことで、電話番号・メール・クレジットカード番号などを `[REDACTED]` に置き換えられます。最初から組み込むと、後で全トレースを削除する悲劇を避けられます。
+
+**落とし穴4: 閾値アラートを「平均」だけで組む**
+日次平均コストだけを見ると、特定ユーザーが一晩で大量消費するバグを見逃します。p95・p99 のユーザー別コストもあわせて監視し、1ユーザーが日次平均の10倍以上を消費したら即通知、という上限も組んでおくと安全です。
+
+**落とし穴5: Evals を最初から完璧にしようとする**
+LLM-as-a-judge のプロンプトを細かく作り込むより、まず「1〜5 の雑なスコアを毎日回す」を優先してください。運用しながら評価プロンプト自体を改良していくほうが、結果的に良い評価基盤に育ちます。動いていない100点より、動いている60点のほうが価値があります。
+
+## 実務応用: ユーザー体験とトレースを結びつける
+
+単に記録するだけでなく、トレースをユーザーサポートと連携させることで効果が飛躍的に上がります。
+
+私の運用では、Rork アプリのサポートフォームから送られる「このメッセージが変でした」報告に、自動的にそのメッセージの `traceId` を添付するようにしています。サポート担当者は Langfuse ダッシュボードに `traceId` を貼り付けるだけで、該当リクエストの全文・モデル・プロンプト・トークン数・前後のセッションが復元できます。これで「どのメッセージのことですか？」という問い返しが不要になり、初回返信までの時間が劇的に短縮されます。
+
+また、Rork アプリの設定画面に「最近のやり取りを匿名化して開発者に送る」ボタンを設け、同意の上で Langfuse に該当セッションの trace ID を送ってもらう仕組みも有効です。GDPR・APPI の観点からも、同意フローを明示的に通しておくことで、後々の問い合わせに堂々と対応できます。
+
+さらに深掘りしたい方は、関連記事の [Rork で AI API コストを最適化するモバイル開発者向け実践ガイド](/articles/rork-dev/rork-ai-api-cost-optimization-mobile-guide) や [Rork AI 機能の本番 QA とテストガイド](/articles/rork-ai/rork-ai-feature-qa-production-testing-guide-2026) も合わせて読むと、計測と改善サイクルの全体像が掴めます。書籍としては、LLM アプリの設計思想を体系的に学べる [LLM のプロダクト設計（機械学習エンジニアのための実践ガイド）](https://www.amazon.co.jp/dp/B0DJQN5M6T/?tag=pinocchio-22) が、この記事のテーマを補強してくれる1冊です。
+
+## まとめ: 今日から始められる最小の一歩
+
+完璧な Observability 基盤を一度に作ろうとする必要はありません。私が強くおすすめしたい最初のアクションは、「Rork アプリの主要 AI エンドポイント1つに、Langfuse のトレースを1行足して `traceId` をレスポンスに返す」ところまでを今日中に終わらせることです。
+
+ここまでできれば、ユーザーから不具合報告が来た瞬間に、どのトレースかを特定する武器が手に入ります。そこから先は、コストアラート → 自動 Evals → ユーザーフィードバック統合の順に、1〜2週間おきに積んでいけば十分です。運用が育つと、プロンプト変更に自信が持てるようになり、AI アプリの改善速度が別物に変わります。AI アプリを「出して終わり」にしないための最短ルートを、ぜひ今日から始めてみてください。

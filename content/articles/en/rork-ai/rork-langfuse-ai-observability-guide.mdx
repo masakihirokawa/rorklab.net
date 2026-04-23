@@ -1,0 +1,444 @@
+---
+title: "Production AI Observability for Rork Apps with Langfuse: Tracing, Cost, and Quality Evals"
+slug: "rork-langfuse-ai-observability-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-23T20:00"
+updated: "2026-04-23T20:00"
+author: "Rork Lab"
+description: "A practical guide to instrumenting Rork-built AI apps with Langfuse — end-to-end tracing, per-user cost accounting, and automated quality evals you can run in production."
+tags: ["Rork", "Langfuse", "AI Observability", "LLM Cost", "Evals", "Production"]
+highlights:
+  - "If you're running an AI app and your monthly LLM bill is unpredictable, you'll leave this guide with working Cloudflare Workers code that accounts cost per user, per feature, and per model"
+  - "You'll learn how to wire Langfuse traces, scores, and datasets into a Rork mobile app so that every user complaint can be resolved by pasting a single trace ID"
+  - "You'll get a repeatable evaluation loop (LLM-as-a-judge + user thumbs up/down) that lets you change prompts with data instead of gut feeling"
+---
+
+Shipping an AI app with Rork is no longer the hard part. The hard part shows up the week after launch, when you're staring at a server log trying to explain why last month's OpenAI bill jumped 3x — and you can't reproduce the conversation a user said "broke" on you.
+
+After running my own Rork-built AI chat app in production for a month, I learned the same lesson many indie devs learn: AI apps begin the day they ship, not the day they launch. Inference costs drift in ways you did not model. User reports like "the reply was weird" are impossible to reproduce from `grep` alone. Observability stops being a nice-to-have and becomes the tool that decides whether your app survives its second month.
+
+This guide shows how to wire [Langfuse](https://langfuse.com) into a Rork production AI app so that every request is traced, every token is priced, and every output can be scored — by automated evaluators and by your users. It is written for developers who already ship with Rork but who can't yet answer "where is my money going, and is my product actually getting better?"
+
+## Why observability cannot be an afterthought for AI apps
+
+Let me put the conclusion first: yes, you can bolt observability on later. But operationally, every week without it widens a gap you can never fully close. The reasons are three, and each one burned me the hard way.
+
+First, once a cost anomaly happens, you cannot retroactively attribute it to a feature, a prompt version, or a misbehaving user. Without per-request tracing, bills become a mystery. Second, when a quality incident happens — a bad response, a hallucination, an unsafe output — you cannot reconstruct the exact request, model version, system prompt, and tool call unless they were captured at the moment. Third, improvement becomes reactive to user complaints instead of driven by data, which is the slowest possible mode of product iteration.
+
+Observability for AI apps is not just logging. It means every call from your app, through your gateway, into the LLM provider, is captured as a single "trace." Each trace carries tokens, cost, model, user, session, and release. Later, humans and automated judges attach scores, and you can slice and roll up that data on any dimension.
+
+## Why Langfuse, and how it compares
+
+There are several tools in this space: Helicone, LangSmith, Braintrust, PostHog LLM Analytics, Arize. I picked Langfuse for a Rork-based app for three specific reasons.
+
+First, it can be self-hosted. For indie apps where I don't want to ship user conversations to a third-party SaaS in another region, running Langfuse on my own VPS with Docker solves the compliance conversation before it starts. Second, tracing, prompt management, evals, datasets, and human annotation queues live in a single tool — I don't end up gluing three products together every time I add a new evaluation. Third, its SDK is provider-neutral: OpenAI, Anthropic, Google, Workers AI, or an on-device model all land in the same trace schema. That matters because Rork apps swap LLM providers more often than most people expect.
+
+None of this means Langfuse wins for every team. A larger team with enterprise support requirements might prefer LangSmith or Braintrust. My recommendation is framed around solo developers and small teams shipping with Rork.
+
+## Deciding what NOT to capture first
+
+Before you design traces, decide what you are deliberately leaving out. Teams that try to capture everything end up with 12 MB traces and a storage bill that rivals their LLM bill. Teams that capture too little can't answer the questions they actually have when incidents happen.
+
+My heuristic on a Rork app is to capture these four fields and leave everything else to sampling. First, the system prompt version (a hash or explicit tag). Second, the full input and output, either raw or after masking. Third, per-call token counts, which Langfuse uses to compute cost. Fourth, every tool/function call the model decided to invoke, with arguments and results. These four are the difference between "I can answer why this happened" and "I have no idea."
+
+What I explicitly do NOT capture on every trace: full retrieval context for RAG pipelines (sampled at 1% instead), raw image bytes (I store a content hash and a thumbnail URL), and model-internal reasoning when using extended-thinking models (captured only for the 5% of traces flagged as slow or failed). These exclusions are a deliberate trade-off: they trade some debuggability for a manageable Langfuse storage footprint and a reasonable monthly price.
+
+The principle I follow: capture what you need to reproduce an incident, sample what you need for trends, and be ruthless about the rest.
+
+## The target architecture
+
+The layout I recommend, and the one I run in production, puts a thin gateway between your Rork app and the LLM providers. Langfuse hooks in at the gateway, never in the app bundle.
+
+- **App layer**: The React Native/Expo code Rork generates. It calls a single backend endpoint you control and never talks to Langfuse directly
+- **Gateway layer**: A Hono worker on Cloudflare Workers. It forwards to the LLM provider and emits Langfuse traces
+- **Langfuse layer**: Langfuse Cloud or a self-hosted Docker stack. Traces, costs, and scores aggregate here
+- **Evaluation layer**: Cloudflare Cron Triggers that pull recent traces, run LLM-as-a-judge, and write scores back
+
+The reason for this layout is security. If a Langfuse Secret Key ships inside an App Store binary, a determined user can rewrite your scores and observability data. Once an app is distributed, rotating leaked keys is painful. Putting a gateway in front from day one removes the problem.
+
+## Step 1: Minimal Langfuse setup and a working trace
+
+Start by proving you can get one trace to appear. On Langfuse Cloud, sign up, create a project, and generate public/secret keys. If you self-host, `docker compose up` from the Langfuse repo gets you running.
+
+Here is the minimal gateway route that answers a chat request, forwards to OpenAI, and emits a full trace — including failure cases.
+
+```typescript
+// worker/src/routes/chat.ts
+// Endpoint called by the Rork app — traces a single chat turn end-to-end.
+import { Hono } from "hono";
+import { Langfuse } from "langfuse";
+import OpenAI from "openai";
+
+type Env = {
+  OPENAI_API_KEY: string;
+  LANGFUSE_PUBLIC_KEY: string;
+  LANGFUSE_SECRET_KEY: string;
+  LANGFUSE_BASE_URL: string; // e.g. https://cloud.langfuse.com
+};
+
+export const chatRoute = new Hono<{ Bindings: Env }>();
+
+chatRoute.post("/chat", async (c) => {
+  const { userId, message, sessionId } = await c.req.json<{
+    userId: string;
+    sessionId: string;
+    message: string;
+  }>();
+
+  const langfuse = new Langfuse({
+    publicKey: c.env.LANGFUSE_PUBLIC_KEY,
+    secretKey: c.env.LANGFUSE_SECRET_KEY,
+    baseUrl: c.env.LANGFUSE_BASE_URL,
+  });
+
+  // One trace per user turn so the UI can link directly to it later.
+  const trace = langfuse.trace({
+    name: "chat-turn",
+    userId,
+    sessionId,
+    input: { message },
+    tags: ["production", "chat-v2"],
+  });
+
+  const openai = new OpenAI({ apiKey: c.env.OPENAI_API_KEY });
+
+  const generation = trace.generation({
+    name: "openai-chat",
+    model: "gpt-4.1-mini",
+    input: [{ role: "user", content: message }],
+  });
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: message }],
+    });
+
+    const output = response.choices[0].message.content ?? "";
+
+    generation.end({
+      output,
+      usage: {
+        promptTokens: response.usage?.prompt_tokens,
+        completionTokens: response.usage?.completion_tokens,
+        totalTokens: response.usage?.total_tokens,
+      },
+    });
+
+    trace.update({ output: { reply: output } });
+
+    // Workers terminates after the response returns — flush is not optional.
+    await langfuse.flushAsync();
+
+    return c.json({ reply: output, traceId: trace.id });
+  } catch (error) {
+    // Failed traces are the most valuable data you have — always record them.
+    generation.end({
+      level: "ERROR",
+      statusMessage: error instanceof Error ? error.message : "unknown",
+    });
+    await langfuse.flushAsync();
+    return c.json({ error: "Upstream LLM error" }, 502);
+  }
+});
+```
+
+Two details are worth calling out. First, the `traceId` is returned to the app in the response. Any support report later — "that reply was weird" — can now be attached to an exact trace. Second, `flushAsync` on Cloudflare Workers is mandatory. Without it, the request returns and the runtime tears down before the SDK has a chance to push events, and traces silently disappear.
+
+## Step 2: Cost accounting and model-level rollups
+
+Langfuse infers cost from the `model` and `usage` you record. When you use a custom or self-hosted model — Workers AI, an Ollama endpoint, a fine-tune — open **Model Settings** in the Langfuse UI and register the per-token price. If you skip this, some traces report zero cost and your monthly totals become misleading.
+
+Three views pay for themselves within a week of running them.
+
+- **Per-user cost**: Pass the Rork user's ID as `userId` and Langfuse's Users tab aggregates lifetime spend per account — useful for catching free-tier users who are generating power-user costs
+- **Per-session cost**: Average cost per session reveals when conversations are getting too long and need summarization or memory compression
+- **Per-tag cost**: Tags like `plan:free` or `feature:summarize` let you slice cost by plan and by feature — essential for deciding which features are underwater
+
+On top of the dashboard, a daily threshold alert catches bill spikes before your next invoice does. The Cloudflare Workers cron below reads yesterday's totals from Langfuse's metrics API and posts to Slack if they exceeded your limit.
+
+```typescript
+// worker/src/crons/cost-alert.ts
+// Runs daily at 00:00 UTC. Alerts if yesterday's LLM cost exceeds the limit.
+import { Langfuse } from "langfuse";
+
+type Env = {
+  LANGFUSE_PUBLIC_KEY: string;
+  LANGFUSE_SECRET_KEY: string;
+  LANGFUSE_BASE_URL: string;
+  SLACK_WEBHOOK_URL: string;
+  DAILY_COST_THRESHOLD_USD: string;
+};
+
+export async function runCostAlert(env: Env): Promise<void> {
+  const langfuse = new Langfuse({
+    publicKey: env.LANGFUSE_PUBLIC_KEY,
+    secretKey: env.LANGFUSE_SECRET_KEY,
+    baseUrl: env.LANGFUSE_BASE_URL,
+  });
+
+  const now = new Date();
+  const start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  try {
+    const res = await fetch(
+      `${env.LANGFUSE_BASE_URL}/api/public/metrics/daily?fromTimestamp=${start.toISOString()}&toTimestamp=${now.toISOString()}`,
+      {
+        headers: {
+          Authorization:
+            "Basic " +
+            btoa(`${env.LANGFUSE_PUBLIC_KEY}:${env.LANGFUSE_SECRET_KEY}`),
+        },
+      },
+    );
+
+    if (!res.ok) throw new Error(`Langfuse API ${res.status}`);
+    const json = (await res.json()) as {
+      data: { totalCost: number; totalTokens: number }[];
+    };
+
+    const totalCostUSD = json.data.reduce((s, d) => s + d.totalCost, 0);
+    const threshold = Number(env.DAILY_COST_THRESHOLD_USD);
+
+    if (totalCostUSD >= threshold) {
+      await fetch(env.SLACK_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: `Rork AI cost alert — yesterday: $${totalCostUSD.toFixed(2)} (threshold $${threshold})`,
+        }),
+      });
+    }
+  } catch (err) {
+    // Never let alert delivery kill the cron itself.
+    console.error("cost-alert failed:", err);
+  } finally {
+    await langfuse.flushAsync();
+  }
+}
+```
+
+Set the threshold at about 120% of your expected daily cost at first. You will get a few false positives early — widen as you learn the baseline. What you want to avoid is the classic surprise: a bill that arrived before anyone noticed the spike.
+
+## Step 3: Automated quality evals
+
+Cost is easy once you have traces. Quality is harder, because humans can't review everything. The answer is automated evaluation — a second LLM that grades the first one — combined with a small, honest rubric.
+
+A good eval loop has three parts. Select traces. Define criteria. Run it on a schedule. The worker below pulls yesterday's chat traces and scores each one on two axes: whether the assistant understood the user's intent, and whether the reply was actionable.
+
+```typescript
+// worker/src/crons/eval-chat-quality.ts
+// Runs daily. Grades yesterday's chat traces with an LLM-as-a-judge.
+import { Langfuse } from "langfuse";
+import OpenAI from "openai";
+
+const JUDGE_PROMPT = `
+You are a customer-support quality auditor.
+Read the user message and the assistant reply.
+Score two axes from 1 to 5:
+- intent_understanding: did the assistant correctly read what the user wants?
+- actionability: is it obvious what the user should do next?
+
+Return strictly JSON:
+{"intent_understanding": 1-5, "actionability": 1-5, "reason": "..."}
+`;
+
+export async function runQualityEval(env: {
+  LANGFUSE_PUBLIC_KEY: string;
+  LANGFUSE_SECRET_KEY: string;
+  LANGFUSE_BASE_URL: string;
+  OPENAI_API_KEY: string;
+}): Promise<void> {
+  const langfuse = new Langfuse({
+    publicKey: env.LANGFUSE_PUBLIC_KEY,
+    secretKey: env.LANGFUSE_SECRET_KEY,
+    baseUrl: env.LANGFUSE_BASE_URL,
+  });
+  const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const res = await fetch(
+    `${env.LANGFUSE_BASE_URL}/api/public/traces?name=chat-turn&fromTimestamp=${since}&limit=100`,
+    {
+      headers: {
+        Authorization:
+          "Basic " +
+          btoa(`${env.LANGFUSE_PUBLIC_KEY}:${env.LANGFUSE_SECRET_KEY}`),
+      },
+    },
+  );
+  if (!res.ok) throw new Error(`list traces ${res.status}`);
+  const { data } = (await res.json()) as {
+    data: { id: string; input: { message?: string }; output: { reply?: string } }[];
+  };
+
+  for (const trace of data) {
+    const userMsg = trace.input?.message ?? "";
+    const reply = trace.output?.reply ?? "";
+    if (!userMsg || !reply) continue;
+
+    try {
+      const judge = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: JUDGE_PROMPT },
+          { role: "user", content: `USER: ${userMsg}\nASSISTANT: ${reply}` },
+        ],
+      });
+
+      const parsed = JSON.parse(judge.choices[0].message.content ?? "{}") as {
+        intent_understanding?: number;
+        actionability?: number;
+        reason?: string;
+      };
+
+      if (typeof parsed.intent_understanding === "number") {
+        langfuse.score({
+          traceId: trace.id,
+          name: "intent_understanding",
+          value: parsed.intent_understanding,
+          comment: parsed.reason,
+        });
+      }
+      if (typeof parsed.actionability === "number") {
+        langfuse.score({
+          traceId: trace.id,
+          name: "actionability",
+          value: parsed.actionability,
+        });
+      }
+    } catch (err) {
+      // One bad grade should not kill the batch.
+      console.error("judge failed for trace", trace.id, err);
+    }
+  }
+
+  await langfuse.flushAsync();
+}
+```
+
+Once this is running, every prompt change becomes a measurable event. Before/after average scores tell you whether your new system prompt actually improved anything, instead of forcing you to guess from user complaints. That shift — from gut feeling to numbers — is, honestly, the single biggest reason I will never ship another production AI feature without Langfuse wired in.
+
+## Step 4: Capturing user feedback from the Rork app
+
+Automated judges are fast but shallow. Pairing them with real user thumbs-up/thumbs-down gives you a grounded signal. Here is a lightweight feedback component that attaches a score to a specific trace.
+
+```tsx
+// app/components/ChatFeedback.tsx
+// Shown below each assistant message.
+import { useState } from "react";
+import { Pressable, Text, View, Alert } from "react-native";
+
+type Props = { traceId: string };
+
+export function ChatFeedback({ traceId }: Props) {
+  const [sent, setSent] = useState<"up" | "down" | null>(null);
+
+  async function send(value: 1 | -1) {
+    try {
+      const res = await fetch(`${process.env.EXPO_PUBLIC_API_BASE}/chat/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ traceId, value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSent(value === 1 ? "up" : "down");
+    } catch (err) {
+      Alert.alert("Could not send", "Please check your connection and try again.");
+    }
+  }
+
+  if (sent) {
+    return (
+      <View><Text>Thanks for the feedback.</Text></View>
+    );
+  }
+
+  return (
+    <View style={{ flexDirection: "row", gap: 12 }}>
+      <Pressable onPress={() => send(1)} accessibilityLabel="Helpful">
+        <Text>Helpful</Text>
+      </Pressable>
+      <Pressable onPress={() => send(-1)} accessibilityLabel="Not helpful">
+        <Text>Not helpful</Text>
+      </Pressable>
+    </View>
+  );
+}
+```
+
+The gateway endpoint just calls `langfuse.score({ traceId, name: "user_feedback", value })`. After a week of data you can filter Langfuse for low-rated traces and inspect them together with the model output and token usage. Usually a pattern emerges quickly — a specific class of prompt, or a tool call that frequently misfires.
+
+## Prompt versioning without a separate tool
+
+One of the quieter wins from Langfuse in production is prompt management. If your Rork app changes prompts frequently, storing them as source code means every prompt change is a new deploy, which slows iteration and couples product work to engineering release cycles.
+
+Langfuse's Prompts feature lets you treat prompts as versioned resources pulled at runtime. The gateway fetches the current production prompt, serves it to the LLM call, and records which prompt version was used on the trace. The gain is twofold. First, non-engineers (a designer, a support lead, a product manager) can propose prompt edits without a pull request. Second, every prompt change is attached to the traces and scores that came after it, which makes the effect of any change trivially measurable.
+
+The pattern I use on a Rork backend looks like this: the gateway reads a prompt with `langfuse.getPrompt("chat-system", { cacheTtlSeconds: 60 })`, compiles it with variables, and passes the resulting string to the LLM. The Langfuse SDK caches prompts with the TTL you set, so there is no per-request round-trip. When a new version is promoted, the next fetch picks it up automatically — no redeploy required.
+
+There is one caveat worth knowing upfront. If your prompt edits can introduce catastrophic regressions (safety issues, broken tool-calling formats), gate prompt promotion behind the same eval suite you use for model changes. Langfuse supports running an eval dataset against a candidate prompt version before promotion; treat this as the equivalent of a unit-test run and do not skip it.
+
+## How much does Langfuse actually cost to run
+
+A fair question I get often: what does the observability itself cost? For a self-hosted Langfuse on a small VPS (2 vCPU, 4 GB RAM, Postgres + ClickHouse), my Rork-backed apps push roughly 300k traces and 1M events per month and the infrastructure runs about $25-40 per month. Langfuse Cloud scales with trace volume and starts free for hobby use. Either way, the marginal cost per observed request is small enough that it rarely shows up as a line item worth discussing.
+
+What does show up is the *time* cost. Expect to spend half a day setting up tracing properly, another day wiring cost alerts and a first eval, and ongoing maintenance of maybe an hour a week to look at the data and tune thresholds. That time is the real investment, and the payback is measured in weeks, not months.
+
+## Session-level design: the unit of truth for AI apps
+
+Individual traces are debugging primitives. The unit you actually care about as a product owner is the *session* — what happened across a whole conversation, or across a multi-step agent workflow. Langfuse's session view aggregates all traces sharing the same `sessionId`, and this is where most of the product-level learning happens.
+
+For a Rork chat app, a session corresponds to an open conversation in the UI. For a multi-step agent (say, a research agent that reads PDFs and produces a report), a session corresponds to one user goal — even though internally there may be dozens of LLM calls. The rule of thumb: a session is whatever the user would describe as "one thing I asked the app to do."
+
+Structuring sessions well requires discipline in two places. First, the `sessionId` must be stable across retries, regenerations, and continuations — tie it to a durable identifier in your app (a conversation row in your database), not to a short-lived UI state. Second, inside a session you can use spans to group related calls: an "agent run" span containing a "retrieval" span and multiple "generation" spans. This hierarchy is what lets you later answer questions like "what did this agent actually do to solve this task?"
+
+The payoff compounds. Once sessions are structured well, three questions you could never answer cheaply before become a UI filter away: average cost per completed task, which task types fail most often, and whether users who rate a session highly behave differently in follow-up sessions.
+
+## Common pitfalls I wish I'd known
+
+These are the ones that hurt most in my own production rollout. Reading this section carefully will save you about six months of pain.
+
+**Pitfall 1: Calling Langfuse directly from the app**
+Never ship a Langfuse Secret Key in an `app.json` extra or an `EXPO_PUBLIC_` variable. As soon as the binary is distributed, anyone with a plist inspector can read the key and push fraudulent scores. Always route through your own backend.
+
+**Pitfall 2: Forgetting `flushAsync()` in Workers or Lambda**
+Short-lived runtimes terminate aggressively. Without a final `await langfuse.flushAsync()` before returning, events queue and get discarded. The symptom is infuriating: "it works locally, but production loses random traces." On Cloudflare specifically, `c.executionCtx.waitUntil(langfuse.flushAsync())` is also acceptable.
+
+**Pitfall 3: Leaking PII into traces**
+By default `input` and `output` carry the user's raw message. For healthcare, finance, or anything aimed at minors that is a legal liability. Langfuse supports [Data Masking](https://langfuse.com/docs/tracing-features/masking) in the SDK: pass a mask function and it replaces phone numbers, emails, card numbers with `[REDACTED]` before sending. Doing this on day one is far cheaper than bulk-deleting traces later.
+
+**Pitfall 4: Monitoring only average cost**
+A daily average hides one user overnight torching your balance. Track p95 and p99 cost per user as well, and alert whenever any single user crosses 10x the daily median. Abuse and runaway loops look invisible in averages.
+
+**Pitfall 5: Over-engineering your first eval**
+Resist the urge to write the perfect judge prompt before shipping. A crude 1–5 score that runs every day beats a flawless rubric that never ships. Iterate on the judge while it is already running.
+
+## Tying traces to real customer support
+
+Recording data is half the value. Linking it to the rest of your product multiplies it.
+
+In my setup, the Rork app's "report a bad reply" flow auto-attaches the offending `traceId`. Support staff paste the ID into Langfuse and immediately see the full exchange, model, prompt, token count, and adjacent messages. The "which message do you mean?" email loop — the slowest part of support for AI products — is gone.
+
+For sensitive conversations, a toggle in the app's settings screen labeled "share recent conversations anonymously with the developer" lets users consent explicitly before their `traceId`s are forwarded. This is the honest way to get real failure examples without legal exposure under GDPR or regional equivalents.
+
+### An incident walkthrough
+
+Here is the kind of incident that justifies all this setup. One Saturday morning, my Rork app's Slack channel lit up with three user reports saying replies had gone "weirdly aggressive" overnight. Without Langfuse, this would have been a multi-hour investigation involving log greps, prompt archaeology, and uncomfortable guesses.
+
+With Langfuse, the sequence was: open the Users tab, filter to the three reporting users' `userId`s, sort sessions by time, and within four minutes I could see that all three sessions had triggered the same branch of a function-calling flow — a newly-added tool that reformatted responses more assertively. I opened the session view, saw the tool call sequence, and confirmed that the tool's system prompt contained a phrase I'd tested on a different model family that responded less rigidly. The fix was a two-line edit to the tool's system prompt, shipped behind a feature flag, verified by checking the post-deploy evals for the same `tool_name` tag.
+
+Total time from alert to fix: about 25 minutes. Before observability, the same incident took me the better part of a day and included one partially incorrect conclusion I shipped to production before catching it. The ROI of observability is not abstract — it pays for itself the first time something goes wrong.
+
+
+If you want to go deeper, pair this article with [Rork AI API Cost Optimization for Mobile Developers](/articles/rork-dev/rork-ai-api-cost-optimization-mobile-guide) and [Rork AI Feature QA and Production Testing Guide](/articles/rork-ai/rork-ai-feature-qa-production-testing-guide-2026). For a broader view on designing observable LLM products, [AI Engineering: Building Applications with Foundation Models by Chip Huyen](https://www.amazon.co.jp/dp/1098166302/?tag=pinocchio-22) is the single best book I've read on the topic.
+
+## The smallest first step you can take today
+
+Do not try to build the perfect observability stack in one sprint. The action I recommend most strongly is simpler: add Langfuse tracing to exactly one production endpoint of your Rork app, return the `traceId` to the client, and ship it.
+
+From there you have a handle. Every future user complaint can be attached to a real trace. In the following week, add cost alerting. In the week after that, schedule your first eval. In a month, you will have something most AI products still don't: a feedback loop between what your app is doing, what it costs, and how well it's doing it. That loop is what turns a Rork-built AI feature from a launch moment into a product you can iterate on with confidence.
