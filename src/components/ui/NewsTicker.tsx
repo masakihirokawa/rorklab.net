@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SEED15 — Rork が $15M シード調達、Left Lane Capital 主導・Peak XV／True Ventures／Goodwater／a16z Speedrun 参加（4月）",
-    "RORKMAX — Rork Max が Web 初の Swift アプリビルダーとして登場、Xcode 代替を狙う（2 月）",
-    "APPLESTACK — AR／LiDAR・Metal 3D・Dynamic Island・HealthKit・HomeKit・Core ML などネイティブ Apple 機能をフル解放（4月）",
-    "PAPERLINE — Rork が Paperline 買収を完了、ネイティブ Swift チームを取り込み Rork Max 機能を強化（4月）",
-    "PLATFORMS — iPhone／iPad／Apple Watch／Apple TV／Vision Pro／iMessage の全 Apple プラットフォームに対応（4月）",
-    "RENAISSANCE — App Store 新規アプリが前年比 +84%、AI アプリビルダーが個人開発者の黄金時代を後押し（4月）",
+    "SEED15M — Rork が Left Lane Capital 主導で 1,500万ドルのシードラウンドを調達（4/9）",
+    "RORKMAX — Rork Max 登場: Webで動作する初の Swift アプリビルダー、Xcodeを置き換える存在へ",
+    "PAPERLINE — Rork が macOS AI アプリビルダー Paperline を買収、ネイティブ Swift 能力を強化",
+    "REVENUE — Rork Max 発表後2週間で年間収益が2倍に、X上での閲覧数800万超を記録",
+    "APPSTORE — App Store新規アプリが前年比84%増、AIビルダーがアプリルネサンスを牽引（4月）",
+    "TRAFFIC — 1年未満でRorkが世界最大のモバイルAIビルダープラットフォームにWebトラフィックで到達",
   ],
   en: [
-    "SEED15 — Rork raises $15M seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater and a16z Speedrun (Apr)",
-    "RORKMAX — Rork Max launches as the first Swift app builder on the web, aiming to replace Xcode (Feb)",
-    "APPLESTACK — Unlocks native Apple features including AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, HomeKit and Core ML (Apr)",
-    "PAPERLINE — Rork completes Paperline acquisition, bringing its native-Swift team into Rork Max (Apr)",
-    "PLATFORMS — Ships to iPhone, iPad, Apple Watch, Apple TV, Vision Pro and iMessage from plain English prompts (Apr)",
-    "RENAISSANCE — App Store sees +84% YoY new-app growth as AI builders usher in an indie-developer renaissance (Apr)",
+    "SEED15M — Rork raises \$15M Seed led by Left Lane Capital with Peak XV, True Ventures & a16z Speedrun (4/9)",
+    "RORKMAX — Rork Max: the first web-based Swift app builder to replace Xcode — English to App Store",
+    "PAPERLINE — Rork acquires Paperline macOS AI app builder to strengthen native Swift capabilities",
+    "REVENUE — Rork Max announcement generated 8M+ views on X and doubled annual revenue in two weeks",
+    "APPSTORE — App Store new app submissions up 84% YoY — AI builders like Rork Max driving the renaissance",
+    "TRAFFIC — In under a year, Rork became the world's largest AI mobile app builder by web traffic",
   ],
 };
 
@@ -58,9 +58,13 @@ export function NewsTicker() {
               fontSize: 11,
               color: "var(--text-muted)",
               fontFamily: "'DM Mono', monospace",
-              letterSpacing: "0.02em",
+              letterSpacing: "0.03em",
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
             }}
           >
+            <span style={{ color: "var(--accent-coral)", fontSize: 8 }}>●</span>
             {text}
           </span>
         ))}
