@@ -1,0 +1,350 @@
+---
+title: "Outgrowing RevenueCat: A Self-Hosted Guide to App Store Server Notifications V2 for Rork Apps"
+slug: "rork-app-store-server-notifications-v2-self-hosted-subscription"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-25T20:30"
+updated: "2026-04-25T20:30"
+author: "Rork Lab"
+description: "A complete implementation guide for receiving App Store Server Notifications V2 in Cloudflare Workers without RevenueCat — covering JWS verification, idempotent state updates, user binding, and production testing for Rork apps."
+tags: ["StoreKit 2", "App Store Server API", "Cloudflare Workers", "Subscriptions", "JWS"]
+highlights:
+  - "Indie developers who feel RevenueCat's monthly fee is starting to weigh on their margins can now move to a self-hosted Cloudflare Workers receiver for App Store Server Notifications V2"
+  - "You'll learn how to verify JWS signatures, handle replay-safe status transitions, and update subscription state idempotently — with working code that runs in a Rork project"
+  - "By switching to a self-hosted setup you can drive fixed costs close to zero and keep full control over the verification logic that powers your subscription business"
+---
+
+If you've been running RevenueCat for a year or so, there's a good chance you've quietly started wondering whether the monthly fee will become a problem as MRR keeps climbing. I had the exact same feeling once revenue from three Rork-built apps started to compound. RevenueCat is genuinely a great service and I'd recommend it for the first subscription app you ship. But once the business has matured, it's also natural — perhaps inevitable — to want the verification logic living inside your own codebase.
+
+This guide walks you through that "graduation" at the implementation level. Specifically, we'll build a minimal but production-ready setup: a Rork iOS app that completes purchases through StoreKit 2, a Cloudflare Workers endpoint that receives **App Store Server Notifications V2** (ASSN V2 from here on), JWS verification of those payloads, and idempotent state writes to Cloudflare KV. Everything below is based on a configuration I'm running in production right now, including the missteps I made along the way.
+
+## Why Go Self-Hosted — This Isn't an Anti-RevenueCat Pitch
+
+Before we dive in, let me say this clearly: I'm not trying to talk anyone off RevenueCat. For your very first subscription app, I'd actively recommend it. Building an in-house verification flow takes one or two weeks at minimum, and testing server-to-server notifications is much messier than it looks on paper. Burning that time before you've validated the product is almost always the wrong trade.
+
+That said, the moment a few of these conditions hold, self-hosting starts being worth a serious look:
+
+- Monthly Tracked Revenue has crossed a threshold where RevenueCat's pricing tier visibly affects your margins
+- You want fine-grained billing logic per user — region-specific pricing, internal coupons, one-off offers — that doesn't quite map to what RevenueCat exposes through its dashboard
+- Audit or privacy requirements have started limiting where payment-related state can live, and "anywhere outside your servers" is no longer comfortable
+- You've started writing custom analytics on top of RevenueCat's webhooks and find yourself fighting their data model more than using it
+
+If any of those resonate, self-hosting is genuinely worth the engineering investment. On the other hand, if MRR hasn't really lifted off yet and the only motivator is "the cost feels uncomfortable," I'd hold off. A single verification bug can stop a day of revenue, and that lost day will almost always cost more than a year of RevenueCat fees. The way I've come to think about it: leave RevenueCat the moment its abstraction stops compressing your work, and not a moment earlier.
+
+## The Big Picture: StoreKit 2 → ASSN V2 → Cloudflare Workers → KV
+
+Before any code, let's pin down the data flow:
+
+1. The user purchases a subscription inside the Rork app — StoreKit 2 handles the transaction
+2. After completion, Apple's servers send a **JWS-signed notification** (ASSN V2) to a URL you've registered
+3. Cloudflare Workers receives the notification and verifies the JWS against Apple's root certificate chain
+4. From the verified payload we extract `originalTransactionId` and `notificationType`, then write idempotently to Cloudflare KV
+5. On app launch, the client asks the server for its current entitlement instead of relying purely on local state
+
+The key idea is that the source of truth lives along the Apple → Workers → KV path. Trusting `Transaction.currentEntitlements` on the client alone leaves you exposed to clock manipulation and receipt tampering, and — just as importantly — your server has no idea who currently has an active subscription, which kills any downstream operation like targeted email or churn-prediction work.
+
+There's also a more subtle benefit to this layout. Because the client's role shrinks to "trigger the purchase, then ask the server what's true," you stop accumulating fragile state on devices. Lost devices, restored backups, switched Apple IDs — all of these become server-side reconciliation problems instead of client-side bugs. That alignment with the server is, to me, the single biggest reason this architecture pays off in the long run. It also turns out to be how you sleep well at night: when something does go wrong, you can answer it from inside your own code, with logs you wrote and data you control, instead of refreshing someone else's status page and hoping their team is awake.
+
+## App Store Connect Setup: Server URL and Signing Keys
+
+Assuming your subscription products are already configured, here's what you need to enable on the ASSN V2 side:
+
+- In App Store Connect, open **App Information → App Store Server Notifications**
+- Set both **Production Server URL** and **Sandbox Server URL** to your Cloudflare Workers endpoint (for example, `https://api.example.com/apple/notifications`)
+- Set **Notifications Version** to **Version 2**
+- Set the **Subscription Status URL** to the same endpoint
+
+You'll also want an **App Store Connect API key** so you can call App Store Server API endpoints from your server. Generate one under **Users and Access → Keys**, and store the Issuer ID, Key ID, and the p8 private key as Cloudflare Workers secrets. Even though we won't use the API for the basic notification path, having it ready means you can later add features like fetching the current subscription status on-demand, refunding a charge programmatically, or mass-extending grace periods during an outage — all without revisiting the Apple Developer console.
+
+There's one trap here that has burned more than a few indie developers: Sandbox notifications go to a **different URL** than Production. Make sure both are filled in. If only one is set, you'll see the maddening pattern of TestFlight working perfectly while production silently drops notifications (or vice versa), and tracking it down is no fun. I've also seen developers accidentally point production at their dev Worker. Use distinct subdomains for dev vs. prod and you'll avoid the worst of these mix-ups.
+
+## Client Side: Calling StoreKit 2 from Rork / Expo
+
+Here's the minimum client code that triggers a purchase from a Rork-generated Expo project, using `react-native-iap`. The deliberate design choice is that the React Native side is purely a trigger — the source of truth comes back through ASSN V2, not from the client.
+
+```ts
+// hooks/useSubscriptionPurchase.ts
+import {
+  initConnection,
+  endConnection,
+  requestSubscription,
+  getSubscriptions,
+  finishTransaction,
+  type SubscriptionPurchase,
+} from "react-native-iap";
+
+const PRODUCT_IDS = ["com.example.app.pro_monthly"];
+
+export async function purchasePro(userId: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await initConnection();
+    const products = await getSubscriptions({ skus: PRODUCT_IDS });
+    if (products.length === 0) {
+      return { ok: false, error: "PRODUCT_NOT_FOUND" };
+    }
+    // Embed userId in appAccountToken — ASSN V2 will surface it on the server
+    const purchase = (await requestSubscription({
+      sku: PRODUCT_IDS[0],
+      appAccountToken: userId,
+    })) as SubscriptionPurchase | null;
+
+    if (!purchase) {
+      return { ok: false, error: "PURCHASE_CANCELLED" };
+    }
+    // Intentionally do NOT grant entitlement on the client.
+    // The truth is determined once ASSN V2 reaches the server.
+    await finishTransaction({ purchase, isConsumable: false });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  } finally {
+    await endConnection();
+  }
+}
+```
+
+The crucial line is `appAccountToken: userId`. The ASSN V2 payload includes this token verbatim, which means your server can reliably tie "this Apple transaction" to "this user in our database." Skip it, and you'll later find yourself unable to map Apple IDs to your in-app users — making churn analysis and targeted messaging effectively impossible. I lost three months of this mapping in my first implementation by forgetting to set it. The data is gone for good once the purchase is finalized, so please attach it from day one.
+
+After the purchase resolves, the client should make one quick request to its own backend asking "what entitlement do I have now?" — and that's it. The server will eventually receive the ASSN V2 notification (usually within seconds, sometimes a little longer), and from then on the entitlement is reliably available. While the first response is still pending you can show a friendly "activating your subscription…" state instead of unlocking the UI optimistically. Optimistic unlocks are tempting because they feel snappy, but they create a window where a failed verification produces a worse experience than just waiting a few seconds.
+
+## Receiving V2 Notifications in Cloudflare Workers — Inside the JWS Verification
+
+This is the heart of the guide. The body Apple sends for ASSN V2 has a single key: `signedPayload`. Its content is a **JWS (JSON Web Signature)** whose header contains an `x5c` chain — a list of X.509 certificates that traces back to Apple's root CA. You're expected to verify the signature using that chain.
+
+Here's a minimal verification function that runs on Cloudflare Workers (the only dependency is `jose`):
+
+```ts
+// src/notifications/verify.ts
+import { decodeProtectedHeader, importX509, jwtVerify } from "jose";
+
+const APPLE_ROOT_CA_G3 = `-----BEGIN CERTIFICATE-----
+MIIBgDCCASagAwIBAgIQ.... (paste Apple Root CA - G3 here)
+-----END CERTIFICATE-----`;
+
+export async function verifyAppleJws(signedPayload: string): Promise<{
+  notificationType: string;
+  notificationUUID: string;
+  data: { signedTransactionInfo?: string; signedRenewalInfo?: string; appAppleId?: number };
+}> {
+  // 1. Pull the x5c chain out of the protected header
+  const header = decodeProtectedHeader(signedPayload) as { x5c?: string[] };
+  if (!header.x5c || header.x5c.length === 0) {
+    throw new Error("INVALID_X5C_CHAIN");
+  }
+
+  // 2. Import the leaf certificate's public key
+  const leafPem = `-----BEGIN CERTIFICATE-----\n${header.x5c[0]}\n-----END CERTIFICATE-----`;
+  const publicKey = await importX509(leafPem, "ES256");
+
+  // 3. Verify the chain back to Apple's root (omitted for brevity — see "Common Mistakes")
+  //    In production, walk leaf → intermediate → root and confirm the root
+  //    matches Apple Root CA G3.
+
+  // 4. Verify the JWS payload itself
+  const { payload } = await jwtVerify(signedPayload, publicKey, {
+    algorithms: ["ES256"],
+  });
+
+  return payload as {
+    notificationType: string;
+    notificationUUID: string;
+    data: { signedTransactionInfo?: string; signedRenewalInfo?: string; appAppleId?: number };
+  };
+}
+```
+
+After you've decoded `signedPayload`, you'll typically pass `signedTransactionInfo` (a nested JWS) through the same function to extract the transaction ID, expiration date, and so on. The "JWS inside a JWS" structure is one of the parts that genuinely confuses newcomers — once you've seen it, it stops being mysterious.
+
+A typical decoded payload looks like this:
+
+```json
+{
+  "notificationType": "DID_RENEW",
+  "subtype": "BILLING_RECOVERY",
+  "notificationUUID": "5e2cdf42-1e43-4ab7-b6d3-1e3d4c0a9c80",
+  "data": {
+    "appAppleId": 1234567890,
+    "bundleId": "com.example.app",
+    "environment": "Production",
+    "signedTransactionInfo": "eyJhbGciOiJFUzI1NiIsIng1Yy...",
+    "signedRenewalInfo": "eyJhbGciOiJFUzI1NiIsIng1Yy..."
+  }
+}
+```
+
+A small note on `notificationType`. Apple's catalog includes around twenty values now — `SUBSCRIBED`, `DID_RENEW`, `EXPIRED`, `DID_FAIL_TO_RENEW`, `REFUND`, `GRACE_PERIOD_EXPIRED`, `PRICE_INCREASE`, and so on. Don't try to handle all of them on day one. Start with `SUBSCRIBED`, `DID_RENEW`, and `EXPIRED`, log the rest, and only build branches for them once you actually see them in production. It's much easier to extend a small switch statement than to debug an over-engineered one.
+
+## Keeping Status Transitions Idempotent with notificationUUID
+
+Apple is explicit in the docs: **the same notification can arrive more than once**. Network retries are part of the design. If your handler doesn't dedupe, you'll see double-extended subscription expirations, doubled-up email sends, and KV state that drifts away from reality.
+
+Each notification carries a `notificationUUID` purpose-built for deduplication. Here's an idempotent handler in Cloudflare Workers:
+
+```ts
+// src/notifications/handler.ts
+import { verifyAppleJws } from "./verify";
+
+export async function handleAppleNotification(
+  signedPayload: string,
+  env: { SUBS_KV: KVNamespace }
+): Promise<{ ok: boolean; reason?: string }> {
+  const verified = await verifyAppleJws(signedPayload);
+  const dedupeKey = `notif:${verified.notificationUUID}`;
+
+  // 1. Drop already-processed notifications quietly
+  const seen = await env.SUBS_KV.get(dedupeKey);
+  if (seen) {
+    return { ok: true, reason: "ALREADY_PROCESSED" };
+  }
+
+  // 2. Update subscription state from the inner transaction info
+  const txInfo = verified.data.signedTransactionInfo;
+  if (txInfo) {
+    const tx = await verifyAppleJws(txInfo); // second-stage JWS verification
+    const txData = tx as unknown as {
+      originalTransactionId: string;
+      productId: string;
+      expiresDate: number;
+      appAccountToken?: string;
+    };
+    const userKey = `user:${txData.appAccountToken ?? "unknown"}`;
+    await env.SUBS_KV.put(
+      userKey,
+      JSON.stringify({
+        productId: txData.productId,
+        expiresAt: txData.expiresDate,
+        originalTransactionId: txData.originalTransactionId,
+        lastNotificationType: verified.notificationType,
+        updatedAt: Date.now(),
+      })
+    );
+  }
+
+  // 3. Mark the notification as processed (24h TTL is enough)
+  await env.SUBS_KV.put(dedupeKey, "1", { expirationTtl: 60 * 60 * 24 });
+  return { ok: true };
+}
+```
+
+Why a 24-hour TTL on the dedupe key? Apple's retry policy for any single notification almost always finishes inside that window. You can keep it longer, but at scale the KV cost-versus-benefit math made 24 hours the right balance for me.
+
+One more subtle thing about idempotency: the read-then-write sequence above is not strictly atomic in KV. If two retries arrive within milliseconds of each other, both can read "not seen" before either writes. Cloudflare Workers' KV is eventually consistent, so this corner case is rare but possible. If you process strictly monotonic side effects (extending an `expiresAt`, never decreasing it), the worst outcome is doing the same work twice — not corrupting state. If you ever introduce a side effect that *can* corrupt state on duplicate, lift it to Durable Objects or a database with transactions. For most subscription bookkeeping, KV is enough.
+
+## Binding User IDs Reliably — Who Bought What
+
+Because we passed `appAccountToken` from the client, the same value is delivered by ASSN V2 on the server. There's one wrinkle: `appAccountToken` is required to be a **UUID-formatted string**. If your in-app user ID isn't already a UUID, derive a deterministic UUID v5 instead:
+
+```ts
+import { v5 as uuidv5 } from "uuid";
+
+const NAMESPACE = "f47ac10b-58cc-4372-a567-0e02b2c3d479"; // any fixed UUID
+export function userIdToAppAccountToken(userId: string): string {
+  return uuidv5(userId, NAMESPACE);
+}
+```
+
+This gives you a one-to-one mapping between in-app user IDs and the tokens delivered to Apple. To make reverse lookups trivial later, also persist a `token2user:{appAccountToken} → {userId}` entry in KV at first purchase time.
+
+There's a related design question worth deciding early: what happens if the same Apple ID buys the subscription on two of your apps' user accounts? In practice this is rare, but it does happen — friends sharing devices, account migrations, and so on. The cleanest answer I've found is to treat the most recent `appAccountToken` as canonical. When a new purchase arrives carrying a different token for the same `originalTransactionId`, write a small "reassignment" record alongside the user entry. You almost never need to look at it, but on the day support has to ask "wait, why does this user think they're paying twice?", that record is the difference between a five-minute reply and a two-day investigation.
+
+## Testing: Bridging the Sandbox / Production Gap
+
+ASSN V2 fires in Sandbox too — purchases made via TestFlight or Xcode generate notifications with essentially the same schema. The `data.environment` field reads `"Sandbox"` or `"Production"`, so you can branch on that.
+
+A solid test loop looks like this:
+
+- Deploy a separate **dev environment** of your Cloudflare Workers project on its own subdomain, and point App Store Connect's "Sandbox Server URL" at it
+- Subscribe through TestFlight with a Sandbox account and confirm you see `notificationType: SUBSCRIBED` in the Workers logs
+- Wait one cycle — in Sandbox, 5 minutes equals one month — and confirm `DID_RENEW` arrives
+- Cancel through TestFlight and confirm `EXPIRED` is handled correctly
+
+That single loop covers purchase, renewal, and cancellation — the full subscription lifecycle — before you go to production.
+
+A practical note on Sandbox renewals: out of the box, Apple renews a subscription up to six times in a 24-hour Sandbox session before treating it as canceled. That's enough to exercise `DID_RENEW` and the eventual `EXPIRED`, but not enough to simulate the long tail of a yearly subscription. If you need to verify behavior across longer cycles, lean on App Store Server API's `Get All Subscription Statuses` endpoint and feed synthetic timestamps into your handler in unit tests instead of trying to coax Sandbox into doing it for you.
+
+## Defense in Depth: Adding App Store Server API as a Fallback
+
+ASSN V2 is the primary channel, but it shouldn't be the only one. Notifications can be delayed by minutes during Apple's busy hours, and on rare occasions they don't arrive at all (typically due to misconfigured URLs or a brief outage on either side). A small App Store Server API fallback path closes the gap.
+
+The pattern I rely on is this: when a client opens the app and asks the server for its entitlement, if the server's KV record is missing or stale (older than, say, two hours after the expected renewal time), the server calls App Store Server API's `Get All Subscription Statuses` for that `originalTransactionId` and reconciles. The cost is a single signed JWT request to Apple, and the benefit is that you stop seeing edge-case "I paid but the app says I'm not subscribed" support tickets.
+
+```ts
+// src/notifications/fallback.ts
+import { SignJWT, importPKCS8 } from "jose";
+
+interface AppStoreApiKey {
+  issuerId: string;
+  keyId: string;
+  privateKeyPem: string; // p8 in PKCS#8 form
+  bundleId: string;
+}
+
+export async function fetchSubscriptionStatuses(
+  originalTransactionId: string,
+  key: AppStoreApiKey,
+  env: "Sandbox" | "Production"
+): Promise<unknown> {
+  const pkcs8 = await importPKCS8(key.privateKeyPem, "ES256");
+  const token = await new SignJWT({ bid: key.bundleId })
+    .setProtectedHeader({ alg: "ES256", kid: key.keyId, typ: "JWT" })
+    .setIssuer(key.issuerId)
+    .setIssuedAt()
+    .setExpirationTime("20m")
+    .setAudience("appstoreconnect-v1")
+    .sign(pkcs8);
+
+  const host = env === "Production"
+    ? "https://api.storekit.itunes.apple.com"
+    : "https://api.storekit-sandbox.itunes.apple.com";
+
+  const res = await fetch(
+    `${host}/inApps/v1/subscriptions/${originalTransactionId}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) {
+    throw new Error(`APPLE_API_${res.status}`);
+  }
+  return await res.json();
+}
+```
+
+The signed JWT here is short-lived by design — Apple rejects tokens older than 60 minutes, and 20 minutes gives plenty of headroom while limiting the blast radius if a token ever leaks. Keep the p8 private key out of code: store it as a Cloudflare Workers secret and import it on cold start only.
+
+One important constraint: App Store Server API has rate limits per key. Don't call it on every entitlement check — reserve it for reconciliation paths. A reasonable rule of thumb is "only when KV says nothing, or KV's `expiresAt` has been in the past for more than two hours and we haven't received a `DID_RENEW`." That keeps you well under Apple's limits even with thousands of active subscribers.
+
+## Observability: Knowing the Pipeline Is Healthy Before Users Tell You
+
+When RevenueCat handled this for you, you also got their dashboard for free — a graphical view of what's happening to subscriptions across your app. After moving to a self-hosted setup, you give that up unless you build something equivalent. You don't need much, but you do need *something*, because a silently broken notification path is the worst possible failure mode: it doesn't crash, it doesn't error, it just slowly poisons your KV state.
+
+The cheapest setup that's actually useful is three numbers, plotted over time:
+
+- **Notifications received per hour**, broken down by `notificationType`. A flat zero overnight is normal; a flat zero at noon is an alarm.
+- **JWS verification failures per hour**. This should be effectively zero. Any non-zero value means either Apple rotated certificates without you noticing, or someone is sending you forged payloads.
+- **Time-since-last-`DID_RENEW`** per active user, exposed as a histogram. Apple usually fires renewals within seconds of the calendar boundary; if a chunk of users sit in the "two-plus-hours-late" bucket, your fallback path needs to step in.
+
+On Cloudflare, the simplest way to expose these is to write incrementing keys to KV (or push to Workers Analytics Engine) inside the handler, then have a small dashboard endpoint that aggregates them. You can ship a basic version in a single afternoon, and once you have it, you stop being surprised by the "I paid yesterday and it's still not active" support email.
+
+A second discipline that pays off: log the full decoded payload (not the raw JWS, because that's huge) to a separate KV namespace with a 30-day TTL. When a user reports something weird, "let me look up what Apple actually told us" goes from speculation to a one-second lookup. Be careful with PII here — `appAccountToken` is fine, but if you've also bound an email address or device ID to a user, you might prefer to log a hash. Cloudflare Workers' free tier easily covers this kind of bounded write volume, so cost is rarely the constraint.
+
+## Common Mistakes: Five Pitfalls When You Self-Host
+
+Things I or fellow indie developers have gotten wrong, in roughly the order of how often they bite:
+
+- **Skipping x5c chain validation**: It's tempting to assume that once `jwtVerify` accepts the signature you're done, but if you don't walk the chain back to Apple's root CA, an attacker who signs with a leaf certificate of their own choosing could pass through. Implement the full chain check before going to production.
+- **Forgetting `notificationUUID` deduping**: Everything looks fine until the day a network retry doubles a renewal or processes `EXPIRED` twice. By then the KV state is wrong and you have to reconcile manually.
+- **Missing the Sandbox URL in App Store Connect**: Easy to forget, painful to debug — TestFlight works but production drops everything (or the reverse). Always fill in both.
+- **Not setting `appAccountToken`**: This is the one I personally got wrong, and it cost me three months of unrecoverable user-to-Apple mapping. There is no retroactive fix. Set it on every purchase from day one.
+- **Treating `Transaction.currentEntitlements` as truth**: Clock manipulation and receipt tampering can fool the client. Treat the server's KV record as the source of truth, and have the client merely render what the server reports.
+
+For broader server-side hardening, the [Rork × App Attest / Play Integrity Server-Side Validation Guide](/articles/rork-dev/rork-app-attest-play-integrity-server-validation-guide) is a useful complement. If you want to firm up StoreKit 2 fundamentals first, the [Rork Max StoreKit 2 In-App Purchase Guide](/articles/rork-dev/rork-max-storekit-2-in-app-purchase) is a good starting point.
+
+## Wrap-Up: The First Thing to Try Tomorrow
+
+You don't have to ship the whole thing at once. The single most useful first step is to spin up a Cloudflare Workers endpoint that **receives ASSN V2, verifies the JWS, and logs the result** — nothing more. Once that exists, register the URL in App Store Connect's Sandbox slot, run a TestFlight purchase, and watch a real notification show up in your logs. The mental model clicks into place very quickly after that.
+
+From there, layer on the KV writes, the idempotency check, and the user binding incrementally. By the time those three pieces are in, you have a production-grade subscription receiver that's truly yours — and the framing shifts from "leaving RevenueCat" to "designing the subscription infrastructure that fits this specific business." That's the version that tends to age well.
+
+Apple's payment documentation is genuinely large, and reading it cold is rough. Keeping a copy of [iOS App Architecture Patterns (rich-flexible-tech)](https://www.amazon.co.jp/dp/4844398474/?tag=pinocchio-22) within reach will help you stay confident when separating client from server responsibilities while StoreKit 2 sits in the middle. The separation-of-concerns chapters apply almost verbatim to the client/server split this guide pushes you toward.
+
+One last thought from running this in practice. The first time you watch a real ASSN V2 notification land in your own logs — the JWS bytes resolving into a clean JSON payload, the user's `appAccountToken` matching the one your client just sent — there's a small but real shift in how the subscription business feels. It stops being someone else's abstraction and starts being part of your code. That feeling is actually the strongest signal that self-hosting was worth doing. Not the cost savings, not the dashboard control — the simple fact that the entire revenue path now fits in your head.
