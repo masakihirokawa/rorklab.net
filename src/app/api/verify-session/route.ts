@@ -52,7 +52,8 @@ export async function GET(request: NextRequest) {
     if (planType === "article") {
       const articleSlug = session.metadata?.article_slug;
       const returnUrl = session.metadata?.return_url;
-      const email = session.customer_details?.email;
+      const rawEmail = session.customer_details?.email;
+      const email = rawEmail ? rawEmail.trim().toLowerCase() : null;
 
       if (articleSlug && email) {
         const ARTICLE_TTL = 10 * 365 * 24 * 3600; // 10 years
@@ -123,11 +124,12 @@ export async function GET(request: NextRequest) {
     }
 
     // ── Membership purchase (pro / premium) ──────────────────────
-    const email = session.customer_details?.email;
-    if (!email) {
+    const rawEmail = session.customer_details?.email;
+    if (!rawEmail) {
       const prefix = locale === "en" ? "/en" : "";
       return NextResponse.redirect(new URL(`${prefix}/support?error=email`, request.url));
     }
+    const email = rawEmail.trim().toLowerCase();
 
     const type = session.mode === "subscription" ? "pro" : "premium";
     const ttlSeconds = type === "premium" ? 10 * 365 * 24 * 3600 : 31 * 24 * 3600;
