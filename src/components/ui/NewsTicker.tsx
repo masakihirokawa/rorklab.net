@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SEED15M — Rork が Left Lane Capital 主導で 1,500万ドルのシードラウンドを調達（4/9）",
-    "RORKMAX — Rork Max 登場: Webで動作する初の Swift アプリビルダー、Xcodeを置き換える存在へ",
-    "PAPERLINE — Rork が macOS AI アプリビルダー Paperline を買収、ネイティブ Swift 能力を強化",
-    "REVENUE — Rork Max 発表後2週間で年間収益が2倍に、X上での閲覧数800万超を記録",
-    "APPBOOM — App Store新規アプリが前年比104%増（iOS 89%増）、AIビルダーがアプリルネサンスを牽引（4月）",
-    "LOWCODE — ローコード市場は2032年に2,644億ドル規模へ（CAGR 32.2%）、個人開発者にとって最大のチャンス",
+    "SEED15M — Rorkが1,500万ドルのSeed調達、Left Lane Capitalがリード（4/9）",
+    "RORKMAX — Rork Max登場、Claude Code＋Opus 4.6搭載で初のWebベースSwift IDE（4月）",
+    "PAPERLINE — アプリビルダーPaperlineを買収、エンジニアリング人材を強化（4月）",
+    "8MVIEWS — Rork Max発表のX投稿が800万view超え、年間収益が2週間で2倍に（4月）",
+    "FUNDERS — Peak XV / True Ventures / Goodwater / a16z Speedrunが投資ラウンドに参加（4/9）",
+    "LARGEST — Rorkが1年未満で世界最大のモバイルAIアプリ構築プラットフォームに（4月）",
   ],
   en: [
-    "SEED15M — Rork raises \$15M Seed led by Left Lane Capital with Peak XV, True Ventures & a16z Speedrun (4/9)",
-    "RORKMAX — Rork Max: the first web-based Swift app builder to replace Xcode — English to App Store",
-    "PAPERLINE — Rork acquires Paperline macOS AI app builder to strengthen native Swift capabilities",
-    "REVENUE — Rork Max announcement generated 8M+ views on X and doubled annual revenue in two weeks",
-    "APPBOOM — App Store new app submissions up 104% YoY in April (iOS: +89%) — AI builders driving the renaissance",
-    "LOWCODE — Low-code market to reach \$264.4B by 2032 (CAGR 32.2%) — the golden age for indie developers",
+    "SEED15M — Rork raises $15M Seed funding led by Left Lane Capital (4/9)",
+    "RORKMAX — Rork Max launches as first web-based Swift IDE powered by Claude Code & Opus 4.6 (Apr)",
+    "PAPERLINE — Rork acquires app builder Paperline to bring in engineering talent (Apr)",
+    "8MVIEWS — Rork Max launch X post tops 8M views, doubling annual revenue in two weeks (Apr)",
+    "FUNDERS — Peak XV, True Ventures, Goodwater & a16z Speedrun join the seed round (4/9)",
+    "LARGEST — Rork becomes the world's largest mobile AI app-building platform in under a year (Apr)",
   ],
 };
 
