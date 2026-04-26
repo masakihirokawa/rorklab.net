@@ -1,0 +1,541 @@
+---
+title: "Usage-Based Billing for Rork AI Apps with Stripe Meter — Charge by API Calls and Tokens, Not Flat Rates"
+slug: "rork-stripe-meter-billing-usage-based-pricing-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-26T11:15"
+updated: "2026-04-26T11:15"
+author: "Rork Lab"
+description: "A complete guide to implementing Stripe Meter Billing in your Rork AI app. Covers meter setup, Cloudflare Workers usage reporting, subscription design with free tiers, and error handling — all with working, production-ready code."
+tags: ["Stripe", "Meter Billing", "Usage-Based Pricing", "Cloudflare Workers", "AI Monetization", "Subscription", "Indie Dev"]
+highlights:
+  - "Developers losing money on heavy AI users can implement a fair usage-based billing system that makes costs sustainable without raising prices for light users"
+  - "Walk through every step from creating a Stripe Meter to reporting usage from Cloudflare Workers and integrating with your Rork app — complete code with error handling included"
+  - "Combine a flat base fee with metered overage charges to stabilize monthly revenue while fairly monetizing power users — with a spend cap to prevent bill shock"
+---
+
+The month one of my users sent over 3,000 messages to my AI chat app, I learned a hard lesson about flat-rate subscriptions. The AI API bill for that single user exceeded their monthly subscription fee — and I still had 29 days left in the billing cycle. I wasn't losing a lot of money, but I could see the trend line, and it was pointing in the wrong direction.
+
+Flat subscriptions work well for software with predictable server costs, but for AI-powered apps where heavy users can consume 100× more than light users, they create a structural imbalance. The users generating the most value (and the most likely to stick around and recommend your app) are also the ones costing you the most to serve. At some point, that math stops working.
+
+The answer is **usage-based billing** — charging users based on what they actually consume. Stripe's Meter Billing, generally available since late 2024, is now the cleanest server-side way to implement this. This guide walks through the complete implementation: creating a Stripe Meter, reporting events from Cloudflare Workers, integrating with a Rork app, designing a hybrid pricing model, and handling the edge cases that will trip you up before your first billing cycle is over.
+
+## Why Flat Pricing Breaks Down for AI Apps
+
+Before getting into the implementation, it's worth being precise about the problem, because the solution should match the actual failure mode.
+
+The issue with flat pricing for AI features isn't just about cost — it's about **misalignment between perceived value and price**. A user who sends 20 messages a month and a user who sends 2,000 messages pay the same amount. The light user might feel the price is expensive relative to their usage. The heavy user is getting enormous value and wouldn't blink at paying more.
+
+With a flat subscription, you're essentially forcing light users to subsidize heavy users. That might sound like a reasonable trade-off, but in practice it leads to:
+
+**Higher churn among light users.** They feel like they're paying for something they barely use and eventually cancel. These are often your word-of-mouth advocates — casual users who'd happily recommend your app if they didn't feel the price was hard to justify.
+
+**Hesitation to acquire power features.** If you want to add a more expensive AI capability (like video analysis or long-context reasoning), you either have to raise prices for everyone or eat the cost for heavy users. Neither is great.
+
+**No natural upsell path.** With flat pricing, getting users to pay more requires convincing them to switch plans. With usage-based billing, users who use more automatically pay more — no conversation required.
+
+Usage-based billing aligns your revenue with the value you deliver. When it works well, it feels fair to users ("I pay for what I use"), sustainable for you ("my margin is consistent"), and creates a natural relationship between product success and revenue growth.
+
+After switching one of my apps to a hybrid model — base fee plus metered overage — churn among light users dropped. They no longer felt trapped by a flat fee for something they used occasionally. And when power users' bills went up, they didn't cancel; they told me they were happy to pay for a tool they relied on daily.
+
+## Understanding Stripe Meter Architecture
+
+Stripe Meter is a server-side billing primitive that counts events you report and uses the accumulated count to calculate charges at the end of a billing period. There are three components you need to understand before writing any code.
+
+**Meter** defines what you're counting. You create a meter in the Stripe dashboard (or via API) and give it an event name — a string like `ai_api_call` that you'll use when reporting usage. The meter also defines how values are aggregated: by default, each event counts as 1, but you can configure it to use a numeric value from the event payload (useful for token-based billing where different operations have different weights).
+
+**Meter Event** is a server-side API call you make every time the countable action occurs. You send `stripe.billing.meterEvents.create()` with the customer's Stripe ID and the event name. Stripe accumulates these throughout the billing period.
+
+**Metered Price** is a price object attached to a subscription that references your meter. At the end of the billing period, Stripe queries the meter for the customer's accumulated usage and charges accordingly.
+
+The complete request flow:
+
+```
+User triggers AI feature in Rork app
+    ↓
+App calls Cloudflare Workers backend (/api/meter-event)
+    ↓
+Workers validates request and calls stripe.billing.meterEvents.create()
+    ↓
+Stripe accumulates events throughout the month
+    ↓
+At billing period end, Stripe calculates charges from meter data
+    ↓
+Customer's saved payment method is charged automatically
+```
+
+One rule you absolutely must not break: **meter events must be reported from your server, never from the client app.** Calling the Stripe Meter Event API directly from the Rork app would require your Stripe Secret Key to be present in the app bundle — which means anyone who reverse-engineers the app can find it and submit fraudulent events or access your Stripe account. Always proxy through a backend like Cloudflare Workers.
+
+## Step 1: Create a Meter in the Stripe Dashboard
+
+Open the Stripe dashboard and navigate to **Billing → Meters**. Click "Create meter" and fill in the following:
+
+- **Display name**: `AI API Calls` (shown in the dashboard — make it human-readable)
+- **Event name**: `ai_api_call` (this exact string goes in your code — use snake_case)
+- **Value settings**: Default (each event counts as 1) — or "Custom event payload value" if you want to report weighted values like token counts
+
+Once created, you'll get a meter ID in the format `mtr_xxxxxxxxxxxxxxxx`. Copy this — you'll need it when querying usage summaries to show users their current consumption.
+
+Next, create a Price linked to this meter. From your Product in the Stripe dashboard, add a new Price:
+
+- **Billing period**: Monthly
+- **Pricing model**: Usage-based
+- **Meter**: Select the meter you just created
+- **Unit amount**: Your per-unit price (e.g., $0.01 per API call)
+
+You can also choose **Graduated Pricing** to implement free allowances — I'll cover that configuration in Step 4 since it's where most of the pricing design happens.
+
+A note on test vs. production: Stripe creates separate meter objects in test and live modes. The `mtr_` IDs are different between environments. Store both in your environment variables and use the correct one based on your deployment context.
+
+## Step 2: Report Meter Events from Cloudflare Workers
+
+This is the backend handler that receives usage from your Rork app and forwards it to Stripe:
+
+```typescript
+// cloudflare-workers/src/handlers/meter.ts
+import Stripe from 'stripe';
+
+interface Env {
+  STRIPE_SECRET_KEY: string;
+  INTERNAL_API_KEY: string; // for authenticating calls from your Rork app
+}
+
+interface MeterEventBody {
+  customerId: string;
+  eventName: string;
+  value?: number;   // optional weighted value (e.g., token count)
+  sessionId: string; // client-generated ID for idempotency
+}
+
+export async function handleMeterEvent(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  // Authenticate the request from your Rork app
+  const authHeader = request.headers.get('Authorization');
+  if (authHeader !== `Bearer ${env.INTERNAL_API_KEY}`) {
+    return new Response(
+      JSON.stringify({ error: 'Unauthorized' }),
+      { status: 401, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  // Parse and validate the request body
+  let body: MeterEventBody;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: 'Invalid JSON body' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  if (!body.customerId || !body.eventName || !body.sessionId) {
+    return new Response(
+      JSON.stringify({ error: 'customerId, eventName, and sessionId are required' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
+    apiVersion: '2024-11-20.acacia',
+  });
+
+  // Build idempotency key to prevent duplicate events on retry
+  const idempotencyKey = `meter_${body.customerId}_${body.sessionId}`;
+
+  try {
+    const meterEvent = await stripe.billing.meterEvents.create(
+      {
+        event_name: body.eventName, // e.g., 'ai_api_call'
+        payload: {
+          stripe_customer_id: body.customerId,
+          // Only include value if explicitly provided
+          ...(body.value !== undefined && { value: String(body.value) }),
+        },
+      },
+      { idempotencyKey }
+    );
+
+    return new Response(
+      JSON.stringify({ success: true, identifier: meterEvent.identifier }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    // Handle Stripe-specific errors separately from general errors
+    if (error instanceof Stripe.errors.StripeInvalidRequestError) {
+      // 400 signals to the client that retrying the same request won't help
+      return new Response(
+        JSON.stringify({ error: 'Invalid Stripe request', detail: error.message }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (error instanceof Stripe.errors.StripeConnectionError ||
+        error instanceof Stripe.errors.StripeAPIError) {
+      // 503 signals to the client that a retry may succeed
+      return new Response(
+        JSON.stringify({ error: 'Stripe service unavailable, please retry' }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.error('Unexpected meter event error:', error);
+    return new Response(
+      JSON.stringify({ error: 'Internal server error' }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+}
+```
+
+Several things are worth explaining here.
+
+The internal API key check prevents anyone other than your Rork app from submitting meter events to your Workers endpoint. Generate a long random string, store it as a Cloudflare Worker secret (`wrangler secret put INTERNAL_API_KEY`), and put the same value in your app's environment variables.
+
+The `idempotencyKey` built from `customerId + sessionId` ensures that if the same event is sent twice (network retry, double-tap on a button), Stripe only records it once. The key is valid for 24 hours, so short-lived session IDs are safe to use.
+
+The error response codes are intentional: a 400 tells the client "this request is broken, don't retry with the same data," while a 503 tells it "the upstream service is unavailable, retry later." Your client-side retry logic should respect these distinctions.
+
+## Step 3: Integrate Usage Reporting in the Rork App
+
+In your Rork app, you'll call the Workers endpoint after each successful AI operation. The timing matters: **report usage only after the AI call succeeds**, so you never charge for failed operations.
+
+```typescript
+// rork-app/src/services/aiService.ts
+import * as Crypto from 'expo-crypto'; // for generating session IDs
+
+interface ChatResult {
+  message: string;
+  tokensUsed: number;
+}
+
+export async function sendChatMessage(
+  userMessage: string,
+  stripeCustomerId: string
+): Promise<ChatResult> {
+  // Generate a unique ID for this interaction — used for idempotency
+  const sessionId = Crypto.randomUUID();
+
+  // Step 1: Call the AI API
+  // If this fails, an exception is thrown — no usage is reported
+  const aiResult = await callGeminiAPI(userMessage);
+
+  // Step 2: Report usage after confirmed success
+  // Failure here must NOT block the user from receiving their response
+  try {
+    await reportUsage({
+      customerId: stripeCustomerId,
+      eventName: 'ai_api_call',
+      value: aiResult.tokensUsed,
+      sessionId,
+    });
+  } catch (reportError) {
+    // Log the failure and add to a retry queue
+    // The user gets their response regardless
+    console.warn('Usage reporting failed, queuing retry:', { sessionId, reportError });
+    await enqueueUsageRetry({
+      customerId: stripeCustomerId,
+      tokensUsed: aiResult.tokensUsed,
+      sessionId,
+      failedAt: Date.now(),
+    });
+  }
+
+  return aiResult;
+}
+
+async function reportUsage(params: {
+  customerId: string;
+  eventName: string;
+  value?: number;
+  sessionId: string;
+}): Promise<void> {
+  const backendUrl = process.env.EXPO_PUBLIC_API_URL;
+  const apiKey = process.env.EXPO_PUBLIC_INTERNAL_API_KEY;
+
+  const response = await fetch(`${backendUrl}/api/meter-event`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(params),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+    // Preserve the status code — callers may want to distinguish 400 vs 503
+    const err = new Error(`Usage report failed: ${error.error}`);
+    (err as any).status = response.status;
+    throw err;
+  }
+}
+```
+
+The retry queue (`enqueueUsageRetry`) is worth implementing even if you start with something simple like `AsyncStorage`. A missed usage report means you provided a service you didn't get paid for. For production apps, process the retry queue in a background task that runs when the app comes back to the foreground, or sync it to your backend for server-side retry.
+
+## Step 4: Hybrid Pricing — Base Fee Plus Metered Overage
+
+Pure pay-per-use can feel unpredictable to users who don't want to think about every action they take. A hybrid model — fixed base fee plus metered overage — gives users a predictable minimum cost while still aligning revenue with heavy usage.
+
+In Stripe, you create this by attaching multiple prices to a single subscription:
+
+```typescript
+// Backend: Create a hybrid subscription for a new subscriber
+async function createHybridSubscription(
+  stripe: Stripe,
+  customerId: string,
+  basePriceId: string,    // fixed monthly fee
+  meteredPriceId: string  // metered overage price
+): Promise<Stripe.Subscription> {
+  const subscription = await stripe.subscriptions.create({
+    customer: customerId,
+    items: [
+      { price: basePriceId },    // e.g., $3/month base fee
+      { price: meteredPriceId }, // e.g., $0.01/call after free tier
+    ],
+    payment_behavior: 'default_incomplete',
+    payment_settings: {
+      save_default_payment_method: 'on_subscription',
+    },
+    expand: ['latest_invoice.payment_intent'],
+  });
+
+  return subscription;
+}
+```
+
+For the metered price, use **Graduated Pricing** in the Stripe dashboard to set up tiered rates with a free allowance:
+
+```
+Tier 1:  0 – 100 calls  →  $0.000 each  (free monthly allowance)
+Tier 2:  101 – 500 calls →  $0.010 each
+Tier 3:  501+ calls      →  $0.007 each  (volume discount for heavy users)
+```
+
+With this structure:
+- Light users (under 100 calls) pay only the base fee — no per-call charges
+- Medium users pay a reasonable per-call rate
+- Heavy users get a discount that keeps them from shopping for alternatives
+
+A practical example for an AI chat app: Base fee $3/month + 100 free messages + $0.02 per message beyond that. For a user who sends 200 messages, their total bill is $3 + (100 × $0.02) = $5. For someone who sends 20 messages, it's just $3. That's a much more defensible pricing structure than $8/month flat.
+
+## Step 5: Spend Caps — Protecting Users from Bill Shock
+
+Variable billing makes some users nervous, especially when they can't predict their usage. Stripe's **Billing Controls** lets you set a maximum amount a customer can be charged in a period, regardless of their usage.
+
+Configure this in the Stripe dashboard under a customer's Billing Controls, or programmatically when creating the subscription:
+
+```typescript
+async function createSubscriptionWithCap(
+  stripe: Stripe,
+  customerId: string,
+  basePriceId: string,
+  meteredPriceId: string,
+  maxMonthlyChargeUSD: number // e.g., 20 for a $20 cap
+): Promise<Stripe.Subscription> {
+  return await stripe.subscriptions.create({
+    customer: customerId,
+    items: [
+      { price: basePriceId },
+      { price: meteredPriceId },
+    ],
+    billing_thresholds: {
+      // Optional: issue invoice when amount reaches threshold (before period end)
+      amount_gte: maxMonthlyChargeUSD * 100, // in cents
+    },
+    payment_behavior: 'default_incomplete',
+    expand: ['latest_invoice.payment_intent'],
+  });
+}
+```
+
+Communicate the spend cap clearly during onboarding: "You'll never be charged more than $20 in a single month, no matter how much you use the app." That single sentence removes a lot of hesitation. In my experience, users who see a spend cap are more likely to try premium features freely — and more likely to upgrade when they consistently hit the cap.
+
+## Step 6: Showing Real-Time Usage to Users
+
+Displaying current-month usage directly in the app is one of the highest-ROI features you can add to a metered billing system. Users who can see "47 / 100 messages used this month" are less likely to be surprised at billing time and more likely to upgrade when they see they're approaching their limit.
+
+```typescript
+// Backend: Get a customer's current month usage
+async function getCurrentMonthUsage(
+  stripe: Stripe,
+  customerId: string,
+  meterId: string
+): Promise<{ used: number; freeAllowance: number }> {
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  const summaries = await stripe.billing.meters.listEventSummaries(meterId, {
+    customer: customerId,
+    start_time: Math.floor(startOfMonth.getTime() / 1000),
+    end_time: Math.floor(now.getTime() / 1000),
+    value_grouping_window: 'month',
+  });
+
+  const totalUsed = summaries.data.reduce(
+    (sum, summary) => sum + summary.aggregated_value,
+    0
+  );
+
+  return {
+    used: totalUsed,
+    freeAllowance: 100, // match your pricing configuration
+  };
+}
+```
+
+Cache this response for a few minutes on the client side — you don't need real-time precision, and Stripe's API has rate limits. Refreshing usage data every 5 minutes when the app is in the foreground is more than sufficient.
+
+## Three Pitfalls That Will Catch You Off Guard
+
+### Pitfall 1: Duplicate Meter Events from Retries
+
+Network failures, app backgrounding, and double-taps all cause clients to retry requests. Without deduplication, the same usage gets reported multiple times and your customer gets overcharged — which is a trust-destroying experience.
+
+The fix is Stripe's Idempotency Key, which you saw in Step 2. The key insight is that the idempotency key needs to be generated **before** the retry-able operation, not after. In practice, this means generating the `sessionId` at the start of the user action and threading it through all the way to the Stripe API call:
+
+```typescript
+// Generate at the start of the user action — before any network calls
+const sessionId = Crypto.randomUUID();
+
+// Use the same sessionId whether this is the first attempt or a retry
+await reportUsage({ customerId, eventName: 'ai_api_call', sessionId });
+```
+
+If you generate a new `sessionId` on each retry, you lose the deduplication benefit. Generate it once per user action and persist it in state across retry attempts.
+
+### Pitfall 2: Meter Summary Lag in Test Mode
+
+After sending a Meter Event in Stripe test mode, usage summaries take 5–10 minutes to update. If you call `listEventSummaries` immediately after creating an event in a test environment, you'll see 0 — and may waste significant debugging time assuming something is broken.
+
+The right way to verify events are arriving is to check **Developers → Events** in the Stripe dashboard. The event should appear there within seconds of being created. Once you've confirmed the event is arriving, wait 5–10 minutes and then check the usage summary.
+
+In production, the lag is similar. Your usage display UI should include a note like "Usage data is updated every few minutes" to set correct expectations.
+
+### Pitfall 3: Customer ID Mapping Goes Missing
+
+Your app's internal `userId` and Stripe's `customerId` are different identifiers. If you don't persist the mapping between them at signup, you'll eventually hit a situation — usually during a major refactor or database migration — where you can't determine which Stripe Customer a Meter Event should be attributed to.
+
+```typescript
+// At signup: create Stripe Customer and persist the mapping immediately
+async function onUserSignUp(
+  userId: string,
+  email: string,
+  db: Database
+): Promise<string> {
+  const stripe = new Stripe(env.STRIPE_SECRET_KEY);
+
+  // Create Stripe Customer with app userId in metadata for reverse lookup
+  const customer = await stripe.customers.create({
+    email,
+    metadata: { app_user_id: userId },
+  });
+
+  // Persist synchronously — don't fire-and-forget this
+  await db.users.update({
+    where: { id: userId },
+    data: { stripe_customer_id: customer.id },
+  });
+
+  return customer.id;
+}
+```
+
+Store the `stripe_customer_id` in a column on your users table with a unique constraint. Index it. You'll be querying by it frequently. The `metadata.app_user_id` on the Stripe Customer object also lets you look up your user from the Stripe side, which is useful when handling webhooks.
+
+If you're adding metered billing to an existing app that doesn't have Stripe Customer IDs for all users, build the migration script before you launch. It's much easier to run a one-time migration on a Sunday than to retroactively patch six months of missing usage data.
+
+## Application Patterns for Different App Types
+
+**AI chat app**: Charge per message. Show "X / 100 messages this month" in the UI. Use "messages" rather than "tokens" as the unit — it's more intuitive for consumer apps, and you can adjust the internal token-to-message ratio as AI models change without confusing users.
+
+**Image generation app**: Weight the meter value by generation complexity:
+
+```typescript
+// Different AI operations have different cost profiles
+const OPERATION_WEIGHTS = {
+  text_generation: 1,
+  image_generation: 5,      // image gen costs ~5x text gen
+  video_generation: 20,     // video gen costs ~20x text gen
+  audio_transcription: 2,   // per minute of audio
+} as const;
+
+type OperationType = keyof typeof OPERATION_WEIGHTS;
+
+async function reportWeightedUsage(
+  customerId: string,
+  operation: OperationType,
+  sessionId: string
+): Promise<void> {
+  const weight = OPERATION_WEIGHTS[operation];
+  await reportUsage({
+    customerId,
+    eventName: 'ai_api_call',
+    value: weight,
+    sessionId,
+  });
+}
+```
+
+This lets you use a single Meter across all AI operations while pricing them proportionally to their actual cost. As underlying model pricing changes, you only need to update the `OPERATION_WEIGHTS` constants.
+
+**Document processing app**: Set `value` to the number of pages or words processed. "Per page processed" is a unit that enterprise customers especially find easy to reason about when forecasting their costs.
+
+**Code generation app**: Charge per code generation request. For developer-focused apps, sophisticated users often appreciate the transparency of seeing their exact usage data — consider exposing a usage API that they can query programmatically.
+
+## Pre-Launch Checklist
+
+Before going live with metered billing, verify these items:
+
+**Stripe Billing Alerts are configured.** Set alerts at 50% and 90% of your expected monthly volume. If one user is consuming 10× the average, you want to know before the invoice is generated.
+
+**Your pricing page explains the model clearly.** "First 100 messages free, then $0.02 each — capped at $20/month" is clear. "Usage-based billing applies" is not. Show worked examples for light, medium, and heavy users.
+
+**App store compliance is confirmed.** For iOS App Store distribution, Apple requires In-App Purchase for digital goods and services consumed within the app. Stripe Meter Billing is suitable for B2B apps, web apps accessed through a WebView, physical goods, and services consumed outside the app. Confirm your use case against [App Store Review Guidelines 3.1.1](https://developer.apple.com/app-store/review/guidelines/#in-app-purchase) before your next app review.
+
+**Webhook handling is in place.** Specifically, handle `invoice.payment_failed` to notify users of failed charges and `customer.subscription.deleted` to revoke access when subscriptions lapse.
+
+For more on setting up Cloudflare Workers as a Rork app backend, see [Building REST APIs with Hono and Cloudflare Workers](/en/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide). For Stripe subscription fundamentals, [Stripe Subscription Monetization Guide](/en/articles/rork-dev/rork-stripe-subscription-complete-guide) covers the basics in depth.
+
+## Monitoring Usage in Production
+
+Once your metered billing is live, three operational metrics matter most.
+
+**Per-user cost versus revenue.** Query your Stripe meter summaries weekly and compare each user's accumulated usage against their subscription plan. Users consistently hitting the overage tiers are your upgrade candidates — consider triggering an in-app message when someone reaches 80% of their free allowance: "You've used 80 out of 100 free messages this month. Upgrade to remove limits."
+
+**Anomaly detection.** A single user with 10× average usage can be a genuine power user or a bot abusing your service. Set a Stripe Billing Alert at 3× your average monthly per-user spend. When it fires, check whether the usage pattern looks organic — consistent usage throughout the day, or all concentrated in a 10-minute window.
+
+**API cost ratio.** Track your actual AI API costs (from OpenAI, Gemini, or Anthropic dashboards) against the usage-based revenue you're collecting. This ratio should stay below 0.4 (40 cents of AI cost per dollar of revenue). If it drifts above that, your per-unit pricing is too low or your free tier is too generous.
+
+```typescript
+// Example: calculate cost ratio for the current month
+async function calculateCostRatio(
+  aiApiCostUSD: number,
+  meteredRevenue: number
+): Promise<{ ratio: number; status: 'healthy' | 'warning' | 'critical' }> {
+  const ratio = aiApiCostUSD / meteredRevenue;
+  return {
+    ratio,
+    status: ratio < 0.4 ? 'healthy' : ratio < 0.6 ? 'warning' : 'critical',
+  };
+}
+```
+
+When the cost ratio enters warning territory, the usual culprits are one or two heavy users on a plan that's priced too low for their usage pattern. Reach out to those users directly — in my experience, they're often happy to upgrade to a custom plan, because they're already getting significant value.
+
+## Getting Started: The Minimum Viable Implementation
+
+If you want to validate the concept before building the full system, here's the minimum path to a working implementation:
+
+1. Create one Meter in the Stripe test dashboard (5 minutes)
+2. Add a single Workers function that calls `stripe.billing.meterEvents.create()` (1 hour)
+3. Call that function after your most important AI operation (30 minutes)
+4. Create a Stripe test subscription with a metered price and verify that events accumulate (15 minutes)
+
+That's it for the first iteration. You don't need the retry queue, the spend caps, or the usage display UI to start. Build those progressively as you learn how your users actually use the app.
+
+Usage-based billing is worth the engineering investment for any app where AI is a core feature and your per-user costs vary significantly. The fair pricing model it enables is good for users, and the sustainable unit economics it creates are good for you. Start with one meter, one event type, and one integration — and build from there.
