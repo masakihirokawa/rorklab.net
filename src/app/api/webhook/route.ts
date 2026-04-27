@@ -51,7 +51,7 @@ export async function POST(request: NextRequest) {
       switch (event.type) {
         case "checkout.session.completed": {
           const session = event.data.object as Stripe.Checkout.Session;
-          const email = session.customer_details?.email;
+          const email = session.customer_details?.email?.trim().toLowerCase();
           if (email) {
             const kvKey = `site:rorklab:email:${email}`;
             const now = new Date();
@@ -84,7 +84,7 @@ export async function POST(request: NextRequest) {
         }
         case "customer.subscription.updated": {
           const sub = event.data.object as Stripe.Subscription;
-          const email = (sub as unknown as { customer_email?: string }).customer_email;
+          const email = (sub as unknown as { customer_email?: string }).customer_email?.trim().toLowerCase();
           if (email) {
             const kvKey = `site:rorklab:email:${email}`;
             const existing = await kv.get(kvKey);
@@ -98,7 +98,7 @@ export async function POST(request: NextRequest) {
         }
         case "customer.subscription.deleted": {
           const sub = event.data.object as Stripe.Subscription;
-          const email = (sub as unknown as { customer_email?: string }).customer_email;
+          const email = (sub as unknown as { customer_email?: string }).customer_email?.trim().toLowerCase();
           if (email) {
             await kv.delete(`site:rorklab:email:${email}`);
           }

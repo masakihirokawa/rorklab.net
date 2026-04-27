@@ -15,8 +15,9 @@ export async function getPremiumAccess(): Promise<PremiumType> {
 
   try {
     const decoded = atob(token);
-    const [email] = decoded.split(":");
-    if (!email) return null;
+    const [rawEmail] = decoded.split(":");
+    if (!rawEmail) return null;
+    const email = rawEmail.trim().toLowerCase();
 
     // Try Cloudflare KV lookup
     try {
