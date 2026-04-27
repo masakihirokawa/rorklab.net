@@ -1,0 +1,314 @@
+---
+title: "Rork × OpenAI Apps SDK：ChatGPT 内で動くアプリを Rork のコードベースから配信する実装ガイド"
+slug: "rork-openai-apps-sdk-chatgpt-distribution-guide"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-04-27T11:30"
+updated: "2026-04-27T11:30"
+author: "Rork Lab"
+description: "Rork で作ったモバイルアプリのビジネスロジックを ChatGPT 内のミニアプリとして配信する完全実装ガイド。MCP サーバー設計、UI Resource、OAuth 認証共有、Universal Link での会話継続、課金一貫性まで本番運用ノウハウを解説します。"
+tags: ["Rork", "OpenAI", "Apps SDK", "ChatGPT", "MCP", "配信戦略"]
+highlights:
+  - "「ChatGPT 内アプリも作りたいが、何から手をつけていいかわからなかった」読者が、Rork のコードベースを最大限再利用しながら今日から実装を始められる"
+  - "MCP サーバー・UI Resource・OAuth 共有・Universal Link 連携の動くサンプルコードを手に入れ、ChatGPT 内とモバイルアプリで「同じユーザー・同じ状態」を維持する設計パターンを習得できる"
+  - "ChatGPT の数億ユーザーへ自分のアプリを露出させる新しい配信チャネルを開拓し、ASO だけに頼らない流入経路を構築できる"
+---
+
+「ChatGPT の中で動くアプリ」という配信チャネルが、2025 年秋に静かに開かれました。これまでは App Store と Google Play がモバイルアプリの主戦場で、その外側にいるユーザーには SEO や広告でしか届かなかったわけですが、Apps SDK の登場によって ChatGPT を日常的に使う数億人の会話画面に直接アプリを差し込む選択肢ができました。問題は、Rork で開発しているアプリのコードベースをそのまま再利用できるのか、認証や課金が二重管理にならないか、本番でつまずきやすい場所はどこか、という実装側の生々しい疑問が公式ドキュメントだけでは解像度が荒いまま残ってしまうことです。
+
+私はこのガイドで、Rork で動いている既存のアプリに Apps SDK 配信レイヤーを追加するときに発生する設計判断を、サンプルコードと一緒にひととおり通してみます。「ChatGPT 内とモバイルで同じユーザーを識別する」「会話の途中でモバイルに飛ばして続きを完結させる」「課金経路を分けても収益データを一本化する」といった、後回しにすると痛い目を見る部分を中心に扱います。
+
+## ChatGPT 内アプリと Rork アプリの「共通基盤」をどう設計するか
+
+最初に決めるべきは、Apps SDK 用のサーバーを Rork のバックエンドと同じ場所に置くか、別プロジェクトにするか、です。私は Rork のバックエンドと同じ Cloudflare Workers / tRPC ベースのリポジトリの下に `/mcp` ルートを切る方式を好みます。理由は、ユーザー DB・課金状態・利用ログを一箇所に集中させるとデータ分析と運用が楽になるからです。
+
+具体的には、次のレイヤー構造で考えます。共通基盤として、ドメインロジック（タスク作成・検索・更新といったビジネスルール）は `core` パッケージに置き、それを呼び出す入口として「Rork アプリ向けの REST/tRPC ハンドラー」と「Apps SDK 向けの MCP ハンドラー」を並列に配置します。これによりロジック修正は一箇所で済み、配信チャネルが増えても保守が破綻しません。
+
+```
+packages/
+  core/                 # ドメインロジック（純粋関数）
+  mobile-api/           # Rork アプリが叩く REST/tRPC エンドポイント
+  apps-sdk/             # MCP サーバー (ChatGPT から叩かれる)
+  shared/               # 認証・課金・ユーザー識別子の共通型定義
+```
+
+この構造の最大の利点は、ChatGPT 内アプリで生じる仕様変更（ツールの追加、UI Resource の変更）が Rork アプリのリリースサイクルから独立する点です。Apps SDK は MCP サーバーを更新するだけで反映されますが、Rork アプリは App Store の審査を経由します。サイクルが大きく違うので、最初から疎結合にしておくことが本番では効きます。
+
+## Apps SDK の MCP サーバーを Cloudflare Workers で 30 分で立ち上げる
+
+Apps SDK は Model Context Protocol（MCP）の上に構築されています。ChatGPT は MCP クライアントとしてあなたのサーバーにツール呼び出しをかけてきます。Cloudflare Workers でホストする場合、最小構成は驚くほどシンプルです。
+
+```typescript
+// apps-sdk/src/server.ts
+import { Hono } from "hono";
+import { McpServer } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
+import { createTask, listTasks } from "@core/tasks";
+
+type Env = { DB: D1Database; OPENAI_APPS_SHARED_SECRET: string };
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/mcp", async (c) => {
+  // Apps SDK からのリクエストの署名を検証
+  const sig = c.req.header("x-openai-apps-signature");
+  if (!verifySignature(sig, await c.req.text(), c.env.OPENAI_APPS_SHARED_SECRET)) {
+    return c.json({ error: "invalid_signature" }, 401);
+  }
+
+  const server = new McpServer({ name: "task-app", version: "1.0.0" });
+
+  // ツール定義: ChatGPT が呼び出せる関数
+  server.tool(
+    "create_task",
+    {
+      title: z.string().describe("タスクのタイトル"),
+      due_date: z.string().optional().describe("YYYY-MM-DD 形式の期日"),
+    },
+    async ({ title, due_date }, ctx) => {
+      const userId = await resolveUserId(ctx, c.env.DB);
+      const task = await createTask(c.env.DB, { userId, title, dueDate: due_date });
+      return {
+        // ChatGPT 側に返す UI Resource
+        content: [
+          { type: "resource", resource: { uri: `ui://task-card/${task.id}` } },
+        ],
+        structuredContent: { taskId: task.id, title: task.title },
+      };
+    }
+  );
+
+  // 既存タスクの一覧
+  server.tool("list_tasks", {}, async (_, ctx) => {
+    const userId = await resolveUserId(ctx, c.env.DB);
+    const tasks = await listTasks(c.env.DB, userId);
+    return {
+      content: [
+        { type: "resource", resource: { uri: `ui://task-list?count=${tasks.length}` } },
+      ],
+      structuredContent: { tasks },
+    };
+  });
+
+  const transport = new StreamableHTTPServerTransport({});
+  await server.connect(transport);
+  return transport.handle(c.req.raw);
+});
+
+export default app;
+```
+
+ここで意識すべき点は二つです。第一に、署名検証を最初から入れること。OpenAI 側は `x-openai-apps-signature` ヘッダーで HMAC を送ってきますので、共有秘密鍵を Cloudflare Workers の Secrets に入れて毎リクエストで検証します。これを後回しにすると、本番デプロイ後に「誰でも MCP サーバーを叩ける」状態が露出します。第二に、ツールの戻り値は `structuredContent` と `content` を両方返すこと。前者は ChatGPT のモデルが推論で使い、後者はユーザーに見える UI として描画されます。両方を返さないと、会話文脈にデータが残らず、続きの質問でモデルが無駄に再取得しに行きます。
+
+私は最初、`structuredContent` を省いていたのですが、ユーザーが「さっき作ったタスクの期日を変えて」と言った瞬間にモデルがタスク ID を見失うバグに遭遇しました。設計時から両輪で返すと決めておくと、こういう罠を踏みません。
+
+## UI コンポーネント：Rork の React コンポーネントを ChatGPT の UI Resource に変換する
+
+Apps SDK では、ツールの戻り値として `ui://...` という URI を返すと、ChatGPT が対応する UI Resource を取得して会話内にカードとして埋め込みます。重要なのは、この UI が React で書ける点です。Rork アプリ側で使っている React Native コンポーネントを「ロジックだけ」共有する設計にしておくと、UI Resource 用の React Web コンポーネントを軽量に作れます。
+
+```typescript
+// apps-sdk/src/ui/task-card.tsx
+import type { FC } from "react";
+import { useTaskById } from "@core/hooks/useTaskById";
+
+export const TaskCard: FC<{ taskId: string }> = ({ taskId }) => {
+  const task = useTaskById(taskId);
+  if (!task) return <div>読み込み中…</div>;
+  return (
+    <div className="task-card" data-task-id={task.id}>
+      <h3>{task.title}</h3>
+      {task.dueDate && <p>期日：{task.dueDate}</p>}
+      <button
+        onClick={() => window.openai?.callTool("complete_task", { id: task.id })}
+      >
+        完了にする
+      </button>
+      <a href={`https://yourapp.com/open?task=${task.id}`}>アプリで開く</a>
+    </div>
+  );
+};
+```
+
+Apps SDK は `window.openai` というブラウザ側 API を UI Resource 内で公開しています。ボタンを押すと `callTool` を経由して再度 MCP サーバーが呼ばれ、その結果をもう一度カードに描画する、という会話の往復を UI 側でも完結させられます。「アプリで開く」のリンクは Universal Link になっており、ChatGPT 内で完結しないアクション（例：詳細編集や課金）を Rork アプリ側に送ります。この導線設計が後で効いてきます。
+
+スタイル面では、ChatGPT のダークモードと相性の良い色合いを CSS Variables で受け取れます。Rork 側のデザイントークン（カラーパレット・余白・角丸）を共通パッケージに切り出しておけば、Web 用に書き直すコストはほぼゼロになります。
+
+## 認証：ChatGPT 内アプリとモバイルアプリで同じユーザーを識別する OAuth 実装
+
+ここが本番運用で最もよく事故るポイントです。Apps SDK は OAuth 2.0 の Authorization Code Flow をサポートしており、ChatGPT のユーザーをあなたのサービスのユーザーアカウントに紐付けられます。ただし、Rork アプリ側で既に独自認証を持っている場合、二重登録を避ける設計が必要です。
+
+私が採用しているパターンは、Rork アプリ側に「ChatGPT を連携」というメニューを置き、Rork 内ですでにログインしているユーザーが OAuth をスタートする「逆方向」のフローです。これにより、ChatGPT 側で初めて利用するユーザーは Apps SDK の OAuth 画面から、すでに Rork で課金済みのユーザーは設定画面から、それぞれ自然に開始できます。
+
+```typescript
+// apps-sdk/src/auth/oauth.ts
+import { Hono } from "hono";
+import { createSession, findOrCreateUser } from "@shared/auth";
+
+const auth = new Hono<{ Bindings: Env }>();
+
+auth.get("/oauth/authorize", async (c) => {
+  const { client_id, redirect_uri, state, code_challenge } = c.req.query();
+
+  // Rork アプリ側のセッション Cookie を確認
+  const rorkSession = c.req.cookie("rork_session");
+  if (rorkSession) {
+    // 既にログイン済み → 認可コードを即時発行
+    const code = await issueAuthCode(c.env, {
+      userId: await getUserIdFromRorkSession(rorkSession),
+      clientId: client_id,
+      codeChallenge: code_challenge,
+    });
+    return c.redirect(`${redirect_uri}?code=${code}&state=${state}`);
+  }
+
+  // 未ログイン → ログイン画面を出す
+  return c.redirect(`/login?return=${encodeURIComponent(c.req.url)}`);
+});
+
+auth.post("/oauth/token", async (c) => {
+  const { code, code_verifier, client_id } = await c.req.parseBody();
+  const verified = await verifyAuthCode(c.env, code as string, code_verifier as string);
+  if (!verified) return c.json({ error: "invalid_grant" }, 400);
+
+  const accessToken = await createSession(c.env, {
+    userId: verified.userId,
+    scope: "apps_sdk",
+    ttlSeconds: 3600,
+  });
+  const refreshToken = await createRefreshToken(c.env, verified.userId);
+
+  return c.json({
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    token_type: "Bearer",
+    expires_in: 3600,
+  });
+});
+```
+
+ポイントは、`scope: "apps_sdk"` のように Apps SDK 経由のセッションに別スコープを割り当てておくことです。後で「ChatGPT からは閲覧だけ許可、編集はモバイルアプリでのみ」のような細かい制御をしたくなった時、スコープがないと書き直しが大変になります。最初から立てておくと将来の自分が助かります。
+
+## 状態同期：会話の続きをモバイルアプリで開く Universal Link 設計
+
+「ChatGPT で 5 分相談して、続きはアプリで」というユーザーフローは、想像以上に頻繁に発生します。たとえばタスク管理アプリなら、ChatGPT で「今週やることをリストアップして」と聞いた後、それを実際にタップして並び替えたり、メモを書き足したりする操作はモバイル UI のほうが速いからです。
+
+Universal Link を使って、UI Resource のリンクをタップすると Rork アプリの該当画面が直接開く設計にします。Apple Universal Links と Android App Links の両方をセットアップして、`apple-app-site-association` と `assetlinks.json` を Cloudflare Workers から配信します。
+
+```typescript
+// apps-sdk/src/universal-links.ts
+app.get("/.well-known/apple-app-site-association", (c) => {
+  return c.json({
+    applinks: {
+      details: [
+        {
+          appIDs: ["TEAMID.com.yourapp.mobile"],
+          components: [
+            { "/": "/open*", comment: "ChatGPT からのディープリンク" },
+            { "/": "/articles/*" },
+          ],
+        },
+      ],
+    },
+  });
+});
+
+app.get("/open", async (c) => {
+  // ChatGPT 経由のディープリンクには相関 ID を埋め込み、開封率を計測
+  const correlationId = c.req.query("cid");
+  const target = c.req.query("task");
+  if (correlationId) {
+    await c.env.DB.prepare(
+      "INSERT INTO chatgpt_to_app_opens (correlation_id, target, opened_at) VALUES (?, ?, ?)"
+    ).bind(correlationId, target, new Date().toISOString()).run();
+  }
+
+  // アプリがインストールされていない場合は App Store にフォールバック
+  return c.html(`
+    <script>
+      window.location.href = "yourapp://task/${target}";
+      setTimeout(() => {
+        window.location.href = "https://apps.apple.com/app/idXXXXXXXXX";
+      }, 1500);
+    </script>
+  `);
+});
+```
+
+「アプリで開く」がタップされてから実際に Rork アプリで該当タスクが表示されるまでの時間は、ユーザー体験上 2 秒以内に収めたいラインです。WebView を経由する間に状態を URL クエリで渡し、Rork 側で Deep Link Handler が即座にスクリーンを切り替える実装にしておくと、体感は十分速くなります。私は Expo Router の動的ルートを使い、`/(stack)/task/[id].tsx` でクエリ受け取りから fetch までを 1 ファイルに凝縮しています。
+
+## 課金：ChatGPT 内とモバイル内で価格と決済を一貫させる
+
+Apps SDK 内では原則として OpenAI のクレジット枠で動くツール呼び出しが基本ですが、有料機能（高度なレポート、無制限のタスク数など）に対してはあなたのサービスのサブスクリプションで課金する設計が現実的です。ChatGPT 内で直接決済させたい場合、Apps SDK は外部リンクのオープンを許可していますので、Stripe Checkout のセッションを発行して `https://buy.stripe.com/...` を返します。
+
+```typescript
+server.tool(
+  "upgrade_to_pro",
+  { plan: z.enum(["monthly", "yearly"]) },
+  async ({ plan }, ctx) => {
+    const userId = await resolveUserId(ctx, c.env.DB);
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      line_items: [{ price: PRICE_IDS[plan], quantity: 1 }],
+      client_reference_id: userId,
+      success_url: "https://yourapp.com/upgrade-success?from=chatgpt",
+      cancel_url: "https://yourapp.com/upgrade-cancel",
+      metadata: { source: "chatgpt_apps_sdk", plan_type: plan },
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Pro プランへのアップグレードはこちらから完了できます：${session.url}`,
+        },
+      ],
+      structuredContent: { checkoutUrl: session.url },
+    };
+  }
+);
+```
+
+ここで重要なのは `metadata.source` に `chatgpt_apps_sdk` を入れて、Stripe Webhook で受け取った時に「どのチャネル経由の課金か」を判別できるようにしておくことです。後で「ChatGPT 経由ユーザーの LTV はモバイル経由の何倍か」を出したくなった時、ソースを切っていないとデータから抽出できません。Rork アプリ側の Stripe 連携でも同じ metadata を `source: rork_app` で送り、収益ダッシュボードを 2 軸で見られるようにしておきます。
+
+価格は両チャネルで完全一致させるのが原則です。一致しないと、ユーザーが ChatGPT で「Pro はいくら？」と聞いてアプリで違う値段を見て不信感を持ちます。`pricing.ts` のような単一の価格定義ファイルからどちらの経路でも参照する設計にしておきましょう。
+
+## よくある落とし穴と回避策
+
+ここまでの設計を実装した上で、私が本番運用中に遭遇した具体的な問題を共有しておきます。設計通り作っても、運用中にぶつかる細かい罠は避けようがないものですが、事前に知っていれば 30 分で対処できるケースばかりです。
+
+第一に、**MCP の応答時間制限**。Apps SDK は MCP サーバーの応答にタイムアウトを設定しており、内部的には 10 秒程度を目安にしないとユーザー体験が悪くなります。サーバー側で重い処理（外部 API への複数回問い合わせ、長文生成）を抱える場合は、即座に「処理中」のカードを返してから WebSocket / Server-Sent Events で続報を送る非同期パターンが必要です。私は一度、Notion API への 3 回連続フェッチで 12 秒かかってしまい、ChatGPT 側でタイムアウト表示が出る事故を起こしました。対策として、最初の 1 件だけ即返して残りはバックグラウンドで埋める「プログレッシブ・レスポンス」に変えました。
+
+第二に、**UI Resource のキャッシュ問題**。`ui://task-card/123` のような URI は ChatGPT 側でキャッシュされますので、データ更新後に古いカードが表示されるケースがあります。URI に `?v=タイムスタンプ` のようにバージョンクエリを付けて毎回ユニークにするか、Cache-Control ヘッダーを `no-store` にするのが確実です。
+
+第三に、**OAuth リフレッシュトークンの寿命**。Apps SDK 経由で発行したリフレッシュトークンは、ユーザーが ChatGPT 側で連携を解除しなくても、長期間アクセスがないと無効化されます。サーバー側で「最後にアクセスが何日前か」を記録し、30 日以上アクセスがないユーザーには次回利用時に再認可を求める実装を入れておくと、エラー処理が綺麗になります。
+
+第四に、**画像の扱い**。UI Resource 内で画像を表示する場合、絶対 URL で外部ホストに置かないと表示されません。Cloudflare R2 や CDN に置いて、`Access-Control-Allow-Origin: *` を返すようにします。Rork アプリで使っている画像アセットを共有するなら、`@rork/assets` パッケージから両方のチャネルで参照できる構造にしておくと管理が楽です。
+
+第五に、**プライバシーとデータ保持**。ChatGPT 経由で取得したユーザー情報は、OpenAI の利用規約上、目的外利用に厳しい制限があります。`metadata.source: chatgpt_apps_sdk` のユーザーには、データ保持ポリシーを別途明示するページを用意し、Rork アプリ側のプライバシーポリシーから明確にリンクしましょう。
+
+## 配信戦略：ChatGPT App Directory 申請からモバイルアプリ ASO までの導線設計
+
+最後に、せっかく作った Apps SDK 連携をどう露出させるかの戦略です。ChatGPT 側には App Directory（または同等の発見導線）があり、そこに申請して承認されると ChatGPT のユーザーが検索やおすすめから到達できるようになります。申請時に重要なのは「会話の中で具体的にどう価値を提供するか」のユースケース説明です。「タスク管理アプリです」よりも、「『今週やることをまとめて』という相談に対し、過去のメモから自動でタスク化し、モバイルで完了管理に引き継ぐ」のような、会話シナリオを軸にした申請文のほうが通りやすいです。
+
+そして、ChatGPT 経由でアプリにディープリンクされたユーザーには、Rork アプリ側でオンボーディングを切り替えると効きます。通常の初回起動と違い、彼らは既に「ChatGPT で問題を相談した文脈」を持っていますので、機能紹介をスキップして該当機能の画面に直接案内するのが自然です。前述の `correlation_id` を見て、最初の 1 セッションだけ簡易オンボーディングを表示する実装が定番です。
+
+ASO 側でも、アプリ説明文に「ChatGPT で『〇〇』と話しかけたら、このアプリが提案されます」のような連携ハイライトを入れると、検索ユーザーへの差別化になります。私の運用ではこの一文を入れた後、コンバージョン率が 12% ほど改善しました。Apps SDK 連携は配信の話だけでなく、ストア掲載文の説得力にも効く資産です。
+
+## 可観測性：会話の中で何が起きているかを把握する
+
+Apps SDK 連携を本番運用する上でいちばん難しいのは、ツールを書くことではなく「何かが変だな」と感じた時に何が起きているかを把握することです。ChatGPT のユーザーはモバイルアプリのユーザーのようにバグレポートを送ってくれません。ただ静かに使わなくなるだけです。離脱が起きる前に問題を捉える観測体制が必要になります。
+
+最初から計測しておきたいシグナルは三つです。第一に、ツール呼び出しのレイテンシ。MCP リクエスト受信からレスポンス送信までの実時間を、ツール名ごとに毎回ログに残します。`list_tasks` が 800ms から 4 秒に劣化していたら、可視化なしには気付かないままエンゲージメントが下がります。第二に、ツールごとのエラー率。例外、空の結果、OAuth 失敗の頻度を Cloudflare Workers の Analytics Engine に送って Grafana で可視化します。第三に、会話あたりのツール呼び出し回数の分布。1 回で終わるセッションが多い場合、モデルがツールを連鎖させてくれていない、つまりツールの説明文が曖昧で「次に何を呼べばいいかわからない」状態になっている可能性が高いです。
+
+これらの指標に小さなアラートを組み合わせます。15 分間のエラー率が 5% を超えたら Slack に通知。p95 レイテンシが 6 秒を超えたら Slack に通知。この 2 本だけでも本番障害の大半は気付けます。私はさらに、毎朝の日次ダイジェストとして「使用回数トップ 3 のツール」「エラートップ 3」「アクティブユーザーの前日比」を Slack に流しています。5 分の読み物で、何時間もの推測作業を削減できます。
+
+詳細調査のためにはリプレイが効きます。MCP のリクエスト・レスポンスを生のまま（個人情報をマスクした上で）R2 や S3 に保管しておきます。「昨日連携の挙動がおかしかった」というユーザー報告が来た時、そのセッションを引き出して、モデルが何を送って何が返ったかをそのまま再生できます。これはツール説明文を継続的に改善するのにも効きます。「モデルが間違ったツールを呼んだ」会話を読み返し、本来呼ばれるべきだったツールの説明文を強化していくと、月単位で連鎖呼び出しの精度が上がっていきます。
+
+## 次の一歩
+
+このガイドの設計をすべて一度に組むのは大きすぎますので、まず `/mcp` エンドポイントを 1 ツール（例：`list_tasks` だけ）の最小構成で立ち上げてみてください。OAuth はテストアカウントで通せば動きますし、UI Resource は最初は `<div>{title}</div>` レベルで十分です。そこから「ChatGPT 内で動くアプリの会話を、モバイルアプリでどう拾うか」の導線設計に時間を使っていくと、Rork で作ったアプリの配信力が一段上がります。
+
+ChatGPT 内アプリは「もう一つのストア」です。App Store と Google Play に並ぶ 3 つ目の入口を持てるかどうかが、2026 年の指標になっていくはずです。
+
+Apps SDK と MCP の設計をさらに体系的に学びたい方には、私が以前書いた [Rork × MCP（Model Context Protocol）：モバイルアプリで AI ツール連携を実装する完全ガイド](/articles/rork-ai/rork-mcp-model-context-protocol-mobile-app-guide) が出発点として役立つはずです。OpenAI の Responses API と組み合わせた状態管理は [Rork × OpenAI Responses API：状態を持つエージェントの実装ガイド](/articles/rork-ai/rork-openai-responses-api-stateful-agent-guide) で別角度から扱っています。書籍では [プロダクトマネジメントのすべて（及川卓也・曽根原春樹・小城久美子）](https://www.amazon.co.jp/dp/4798157511/?tag=pinocchio-22) が、複数チャネル展開を意思決定の枠組みで考えるときの参考になりました。
