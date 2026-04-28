@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "APPSTORE — App Store 新規アプリリリース60%増、AIノーコードビルダーで開発の民主化が加速（Q1 2026）",
+    "LOVABLE — Lovable がモバイルアプリを iOS / Android で公開、AI ノーコード App ビルダー競争激化（4/27）",
+    "ANYTHING — Anything が AI App Builder ランキング1位、自然言語からネイティブ iOS/Android を生成（4/28）",
     "MAX — Rork Max がローンチ後3日で $1.5M ARR 達成、ネイティブ Swift 生成への需要が爆発（2026年）",
-    "ECOSYSTEM — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage まで Apple 全プラットフォームに対応",
-    "INTEGRATION — Widgets・ARKit・HealthKit を統合、Apple ネイティブ機能をフル活用したアプリを生成可能",
+    "ECOSYSTEM — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage まで Apple 全プラットフォーム対応",
     "CLOUDMAC — Cloud Mac Fleet でビルド、Xcode 不要・Mac 不要で2クリック App Store 公開を実現",
-    "BUBBLE — Bubble がネイティブモバイル機能をローンチ、Web・iOS・Android を単一エディタで構築可能に",
-    "CURSOR3 — Cursor 3 が Agents Window 搭載、ローカル・worktree・SSH・クラウドで複数AIエージェント並列実行（4/2）",
   ],
   en: [
+    "APPSTORE — Worldwide app launches up 60% YoY in Q1 2026 as AI no-code builders democratize mobile dev",
+    "LOVABLE — Lovable launches its AI app builder on iOS and Android, mobile no-code race heats up (4/27)",
+    "ANYTHING — Anything ranked #1 AI app builder, generates native iOS, Android, and web from natural language (4/28)",
     "MAX — Rork Max hits $1.5M ARR within 3 days of launch, demand for native Swift generation is surging (2026)",
     "ECOSYSTEM — Build for the entire Apple lineup: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "INTEGRATION — Native Widgets, ARKit, and HealthKit integration unlocks the full Apple platform feature set",
     "CLOUDMAC — Cloud Mac fleet builds your apps, no Xcode and no Mac required, with two-click App Store submission",
-    "BUBBLE — Bubble ships native mobile, build web, iOS, and Android from a single no-code editor",
-    "CURSOR3 — Cursor 3 launches Agents Window, run multiple AI agents in parallel across local, worktrees, SSH, and cloud (4/2)",
   ],
 };
 
