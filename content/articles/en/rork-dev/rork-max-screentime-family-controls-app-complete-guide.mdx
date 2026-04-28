@@ -1,0 +1,390 @@
+---
+title: "Building a Screen Time Control App with Rork Max — Family Controls, DeviceActivity, and ManagedSettings"
+slug: "rork-max-screentime-family-controls-app-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-28T20:00"
+updated: "2026-04-28T20:00"
+author: "Rork Lab"
+description: "A complete walkthrough for shipping a Screen Time-style app with Rork Max — covering Family Controls authorization, DeviceActivity scheduling, and ManagedSettings shielding via custom native modules and a DeviceActivityMonitor extension."
+tags: ["Rork Max", "ScreenTime API", "Family Controls", "DeviceActivity", "ManagedSettings", "iOS Development", "Native Modules"]
+highlights:
+  - "Anyone stuck on why Rork Max alone cannot ship a Screen Time app will walk away with a working three-framework integration — Family Controls, DeviceActivity, ManagedSettings — embedded as a custom Expo module."
+  - "You'll have copy-pasteable Swift modules for FamilyActivityPicker presentation, DeviceActivityCenter scheduling, and a dedicated DeviceActivityMonitor extension with App Group data sharing — no more guessing about entitlements or extension targets."
+  - "You'll know how to dodge the five most common shipping pitfalls (FamilyActivitySelection privacy boundaries, App Group misnaming, jetsam crashes in extensions, child-mode simulator failures, App Review rejections) and submit a build that actually clears review."
+---
+
+Screen Time-style apps — focus timers, parental controls, social-media detox tools — are one of the few iOS categories where new winners launch on the App Store almost every month. While building a "lock specific apps during focus hours" feature for one of my own Rork projects, I hit a wall that almost every Rork developer hits in this space: the default Rork Max template cannot reach Apple's three Screen Time frameworks (Family Controls, DeviceActivity, ManagedSettings) at all.
+
+The reason is simple. All three frameworks require the special **Family Controls entitlement**, which Apple grants only after a manual review request, and they only work in concert with an App Extension that runs in the background. Rork Max is essentially a polished React Native + Expo runtime, so anything outside of the prebuilt Expo modules requires you to write a custom native module yourself.
+
+This guide walks through the full path I followed to ship a focus-time app on Rork Max — entitlement request, native module bridge, extension target, App Group plumbing, App Store review tactics — based on what actually worked, not what the documentation implies should work.
+
+## Why Rork Defaults Cannot Ship a Screen Time App
+
+Out of the box, Rork Max bundles the standard Expo SDK modules: camera, notifications, location, secure storage, and so on. None of the three Screen Time frameworks ride on that train. Specifically:
+
+- The `FamilyControls` framework refuses to even compile without the `com.apple.developer.family-controls` entitlement on your provisioning profile
+- The `DeviceActivity` framework's "fire a callback when this time window starts" mechanism is delivered as an App Extension target — not in your main app — because the OS calls it when your app is not running
+- `ManagedSettings`, which actually applies the shield, depends on shared state between the main app and the extension via an App Group container
+
+For a typical "swipe through screens" app, Rork's Vibe Coding loop covers 95% of what you need. Screen Time work, however, crosses three boundaries at once: OS-level permissions, extension targets, and shared data. Trying to fake any of these layers is the fastest way to lose a weekend. **The pragmatic move is to set up the right architecture from day one — Rork main app, Swift native module, Extension target, App Group — and never look back.**
+
+## Architecture: The Three Frameworks at a Glance
+
+Before we start writing code, let's pin down what each framework actually does. Confusing them is the most common source of "why won't this work" sessions later.
+
+- **FamilyControls** is the consent and selection layer. It owns the prompt that asks the user to grant Screen Time access, and it owns `FamilyActivityPicker`, the SwiftUI component that lets the user pick which apps and categories to govern. The user's choice comes back as a `FamilyActivitySelection` — a privacy-preserving opaque token, not a list of bundle IDs
+- **DeviceActivity** is the scheduling layer. It says "when this time window opens, wake up an extension" or "when this app has been used for 30 minutes today, notify me." The extension runs even when your main app is terminated
+- **ManagedSettings** is the enforcement layer. Hand a `FamilyActivitySelection` to a `ManagedSettingsStore`, and the OS immediately blocks those apps with a system shield UI
+
+So the architecture is a three-stage rocket: pick targets (FamilyControls) → register schedule (DeviceActivity) → block on cue (ManagedSettings).
+
+### How This Maps to a Rork Project
+
+Here's the layout I settled on, which I'd recommend as a starting point:
+
+- **Main app (Rork Max build)**: React Native UI, calls into Swift via the custom Expo module
+- **Native Module (Swift)**: bridges authorization requests, picker presentation, schedule registration, and shield management to JS
+- **DeviceActivityMonitor Extension (Swift)**: a separate target. The OS wakes it up at schedule boundaries; it pulls the saved selection from shared storage and applies the shield
+- **App Group**: `group.{your-bundle-id}.shield` added to both targets, used as the single source of truth for the user's blocklist via `UserDefaults(suiteName:)`
+
+## Step 1: Entitlement Request and Xcode Configuration
+
+The Family Controls entitlement is gated by a manual Apple review. You request it through "Special Capabilities" in your developer portal. In my experience this took three to five business days. Once approved, the "Family Controls (Distribution)" checkbox appears on your App ID's edit screen.
+
+You can develop locally before approval by attaching the entitlement to a Debug provisioning profile, but **you absolutely need the Distribution version of the entitlement to upload to App Store Connect, so file the request as early as possible**. Don't wait until you're ready to ship.
+
+In Xcode, both the main app target and the extension target need these entries in their `.entitlements`:
+
+```xml
+<!-- ScreenTimeControl.entitlements -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.developer.family-controls</key>
+  <true/>
+  <key>com.apple.security.application-groups</key>
+  <array>
+    <string>group.com.example.screentimecontrol.shield</string>
+  </array>
+</dict>
+</plist>
+```
+
+Expected outcome: the build no longer fails with "Provisioning profile doesn't include the com.apple.developer.family-controls entitlement." If it does, your request hasn't been approved yet, or you need to regenerate the profile after approval.
+
+## Step 2: A Custom Native Module in Rork Max
+
+There are several ways to add a native module to a Rork Max project, but my preferred path is the Expo Modules API. A `config-plugin` integrates the module into the Xcode project automatically, so `eas build` doesn't need manual reconfiguration each time.
+
+```bash
+# Run from the project root
+npx create-expo-module@latest --local modules/screen-time-control
+```
+
+This scaffolds `modules/screen-time-control/`. Replace `ios/ScreenTimeControlModule.swift` with the following bridge:
+
+```swift
+// modules/screen-time-control/ios/ScreenTimeControlModule.swift
+import ExpoModulesCore
+import FamilyControls
+import ManagedSettings
+import DeviceActivity
+
+public class ScreenTimeControlModule: Module {
+  // Shared between main app and extension via App Group
+  private let appGroup = "group.com.example.screentimecontrol.shield"
+  private let store = ManagedSettingsStore()
+
+  public func definition() -> ModuleDefinition {
+    Name("ScreenTimeControl")
+
+    // Ask for Family Controls authorization (call once on first launch)
+    AsyncFunction("requestAuthorization") { (promise: Promise) in
+      Task {
+        do {
+          try await AuthorizationCenter.shared.requestAuthorization(for: .individual)
+          promise.resolve(true)
+        } catch {
+          promise.reject("AUTH_FAILED", "Family Controls authorization failed: \(error.localizedDescription)")
+        }
+      }
+    }
+
+    Function("authorizationStatus") { () -> String in
+      switch AuthorizationCenter.shared.authorizationStatus {
+        case .approved: return "approved"
+        case .denied: return "denied"
+        case .notDetermined: return "notDetermined"
+        @unknown default: return "unknown"
+      }
+    }
+
+    // Schedule a recurring shield window (e.g. 22:00 -> 07:00)
+    AsyncFunction("scheduleNightShield") { (startHour: Int, endHour: Int, promise: Promise) in
+      let intervalStart = DateComponents(hour: startHour)
+      let intervalEnd = DateComponents(hour: endHour)
+      let schedule = DeviceActivitySchedule(
+        intervalStart: intervalStart,
+        intervalEnd: intervalEnd,
+        repeats: true
+      )
+      let center = DeviceActivityCenter()
+      do {
+        try center.startMonitoring(.nightShield, during: schedule)
+        promise.resolve(true)
+      } catch {
+        promise.reject("SCHEDULE_FAILED", error.localizedDescription)
+      }
+    }
+
+    AsyncFunction("stopShield") { () -> Bool in
+      DeviceActivityCenter().stopMonitoring([.nightShield])
+      let store = ManagedSettingsStore()
+      store.shield.applications = nil
+      store.shield.applicationCategories = nil
+      return true
+    }
+  }
+}
+
+extension DeviceActivityName {
+  static let nightShield = Self("nightShield")
+}
+```
+
+The detail worth explaining: this module **only registers the schedule**. It does not actually apply the shield. That work happens later, inside the extension, when the schedule's start callback fires. The reason is that your main app is most likely not running at 22:00 sharp, so the shield must be applied from a process the OS can wake up on its own — namely the extension.
+
+## Step 3: Calling FamilyActivityPicker from JS
+
+The "let the user pick which apps to block" UI must use Apple's first-party `FamilyActivityPicker`. Trying to reproduce this picker in React Native is a dead end — the tokenization model breaks the moment you cross the bridge.
+
+```swift
+// PickerView.swift - SwiftUI wrapper
+import SwiftUI
+import FamilyControls
+
+struct AppPickerView: View {
+  @State private var selection = FamilyActivitySelection()
+  @Environment(\.dismiss) var dismiss
+  let onComplete: (FamilyActivitySelection) -> Void
+
+  var body: some View {
+    NavigationView {
+      FamilyActivityPicker(selection: $selection)
+        .navigationBarItems(
+          leading: Button("Cancel") { dismiss() },
+          trailing: Button("Done") {
+            onComplete(selection)
+            dismiss()
+          }
+        )
+    }
+  }
+}
+```
+
+Add a method to the native module to present this view:
+
+```swift
+// Append to ScreenTimeControlModule.swift
+AsyncFunction("presentAppPicker") { (promise: Promise) in
+  DispatchQueue.main.async {
+    guard let rootVC = UIApplication.shared.connectedScenes
+      .compactMap({ ($0 as? UIWindowScene)?.keyWindow?.rootViewController })
+      .first else {
+      promise.reject("NO_VC", "No root view controller")
+      return
+    }
+    let picker = AppPickerView { selection in
+      // Encode and persist to the App Group container
+      let encoder = PropertyListEncoder()
+      if let data = try? encoder.encode(selection),
+         let defaults = UserDefaults(suiteName: self.appGroup) {
+        defaults.set(data, forKey: "blockedApps")
+        promise.resolve([
+          "applicationCount": selection.applicationTokens.count,
+          "categoryCount": selection.categoryTokens.count
+        ])
+      } else {
+        promise.reject("ENCODE_FAILED", "Could not encode selection")
+      }
+    }
+    let host = UIHostingController(rootView: picker)
+    rootVC.present(host, animated: true)
+  }
+}
+```
+
+Expected behavior: from React Native, `await ScreenTimeControl.presentAppPicker()` opens Apple's native app picker. Once the user taps "Done," the JS call resolves with the count of selected apps and categories. The actual token data — for privacy reasons — never crosses the JS bridge; it lives in the App Group and is consumed by the extension.
+
+## Step 4: Implementing the DeviceActivityMonitor Extension
+
+This is the linchpin. The OS calls into this extension at the moment your schedule window opens.
+
+In Xcode, choose `File > New > Target > DeviceActivityMonitor Extension`. Replace the generated `DeviceActivityMonitorExtension.swift` with:
+
+```swift
+// DeviceActivityMonitorExtension.swift
+import DeviceActivity
+import ManagedSettings
+import Foundation
+
+class DeviceActivityMonitorExtension: DeviceActivityMonitor {
+  let store = ManagedSettingsStore()
+  let appGroup = "group.com.example.screentimecontrol.shield"
+
+  override func intervalDidStart(for activity: DeviceActivityName) {
+    super.intervalDidStart(for: activity)
+
+    // Pull the FamilyActivitySelection out of the App Group
+    guard let defaults = UserDefaults(suiteName: appGroup),
+          let data = defaults.data(forKey: "blockedApps") else {
+      return
+    }
+    let decoder = PropertyListDecoder()
+    guard let selection = try? decoder.decode(FamilyActivitySelection.self, from: data) else {
+      return
+    }
+    // Apply the shield
+    store.shield.applications = selection.applicationTokens.isEmpty
+      ? nil : selection.applicationTokens
+    store.shield.applicationCategories = selection.categoryTokens.isEmpty
+      ? nil : .specific(selection.categoryTokens)
+  }
+
+  override func intervalDidEnd(for activity: DeviceActivityName) {
+    super.intervalDidEnd(for: activity)
+    store.shield.applications = nil
+    store.shield.applicationCategories = nil
+  }
+}
+```
+
+The OS launches this extension in the background. Its execution budget is tight — measured in seconds — so network calls or expensive work are simply not viable here. **Treat this extension as "load the saved selection, apply or remove the shield, exit."** Anything more belongs in the main app.
+
+## Step 5: The React Native Surface
+
+With the native side in place, the JS side stays small:
+
+```typescript
+// app/screens/ScheduleScreen.tsx
+import { useEffect, useState } from "react";
+import { View, Text, Button, Alert } from "react-native";
+import ScreenTimeControl from "@/modules/screen-time-control";
+
+export default function ScheduleScreen() {
+  const [authStatus, setAuthStatus] = useState<string>("notDetermined");
+  const [pickedCount, setPickedCount] = useState(0);
+
+  useEffect(() => {
+    setAuthStatus(ScreenTimeControl.authorizationStatus());
+  }, []);
+
+  const handleAuthorize = async () => {
+    try {
+      await ScreenTimeControl.requestAuthorization();
+      setAuthStatus(ScreenTimeControl.authorizationStatus());
+    } catch (e) {
+      Alert.alert(
+        "Permission required",
+        "Open Settings > Screen Time and approve this app."
+      );
+    }
+  };
+
+  const handlePick = async () => {
+    const result = await ScreenTimeControl.presentAppPicker();
+    setPickedCount(result.applicationCount + result.categoryCount);
+  };
+
+  const handleSchedule = async () => {
+    await ScreenTimeControl.scheduleNightShield(22, 7);
+    Alert.alert("Night shield enabled (22:00 - 07:00)");
+  };
+
+  return (
+    <View style={{ padding: 16, gap: 12 }}>
+      <Text>Authorization: {authStatus}</Text>
+      {authStatus !== "approved" ? (
+        <Button title="Authorize Screen Time" onPress={handleAuthorize} />
+      ) : (
+        <>
+          <Button title="Pick apps to block" onPress={handlePick} />
+          <Text>Selected: {pickedCount} items</Text>
+          <Button title="Enable 22:00 - 07:00 shield" onPress={handleSchedule} />
+          <Button
+            title="Disable shield"
+            onPress={() => ScreenTimeControl.stopShield()}
+          />
+        </>
+      )}
+    </View>
+  );
+}
+```
+
+Expected flow on first run: tapping Authorize triggers the OS Screen Time dialog. After approval, the user picks apps via the system picker, then enables the schedule. At 22:00 sharp, the OS wakes the extension, applies the shield, and the user sees the system-level block screen on every selected app — exactly as in Apple's first-party Screen Time UI.
+
+## Common Pitfalls and How to Avoid Them
+
+These are the five places I (and most developers I've talked to in this space) have personally lost time. Apple's docs cover none of them in one place.
+
+### 1. "I'm trying to send the FamilyActivitySelection over to JS and it's empty"
+
+The contents of `FamilyActivitySelection` (the application tokens) are intentionally **only readable from the main app's process**. There is no design path to expose bundle IDs or human-readable names of selected apps to JavaScript. I burned an evening on this before realizing the design was the constraint, not a bug. **The correct pattern is to return only the count to JS, persist the selection to the App Group, and let the extension consume it.**
+
+### 2. "The shield never fires when the schedule opens"
+
+Ninety-nine percent of the time, this is a Bundle ID or entitlement misconfiguration on the extension target. Run through this checklist:
+
+- Is the extension's Bundle ID a child of the main app, e.g. `{main-app-id}.deviceactivitymonitor`?
+- Does the extension's `.entitlements` include both `com.apple.developer.family-controls = true` and the App Group?
+- Is the App Group string identical between the two targets?
+- Does the extension's Info.plist set `NSExtensionPrincipalClass` to `$(PRODUCT_MODULE_NAME).DeviceActivityMonitorExtension`?
+
+### 3. "UserDefaults(suiteName:) reads come back nil from the extension"
+
+If the App Group string differs by a single character, `UserDefaults` silently returns `nil` — no warning, no log. I once spent half a day chasing a typo between `group.com.example.screentimecontrol.shield` and `group.com.example.screentime.shield`. **Open the Capabilities pane on both targets in Xcode and copy-paste the App Group string between them; do not type it twice.**
+
+### 4. "Release builds crash where Debug builds were fine"
+
+DeviceActivity extensions live with a memory cap around 6 MB. Code that sails through Debug can tip over in Release with a `crashed - jetsam` log. The mitigation is to keep the extension's body razor-thin: load the selection, apply the shield, exit. I had Sentry initialized in the extension on my first attempt, and that single dependency was enough to push the extension past its budget.
+
+### 5. ".child authorization fails on the simulator"
+
+`requestAuthorization(for: .child)` always errors on the simulator. You must test on a real device. Furthermore, `.child` requires a real Family Sharing setup, and Apple's Sandbox testers cannot model parent-child relationships. Plan for a real Apple ID test family before you start a parental-control product, because building the test environment itself is a non-trivial task.
+
+## Getting Past App Review
+
+Screen Time apps are scrutinized more aggressively than most categories. After several rejections of my own, here's what I've learned actually moves the needle.
+
+The single most important step is making it dead obvious to the reviewer **what the app controls, on whose device, and how the user consents**. Put these three sentences in the App Review Notes verbatim:
+
+- The purpose of the app (e.g. "personal focus support" or "parental controls for minors")
+- The exact authorization screen the user sees on first launch
+- That `FamilyActivitySelection` data stays on-device and is never transmitted to a server
+
+Make sure `NSFamilyControlsUsageDescription` is set in `Info.plist`. An empty value is an automatic rejection:
+
+```xml
+<key>NSFamilyControlsUsageDescription</key>
+<string>We use Screen Time to limit access to apps you choose. The selection stays on this device.</string>
+```
+
+My first rejection was for "the user-visible behavior does not match what the user authorized." The cause: the wording on the authorization dialog implied a narrower scope than what the shield actually covered. **Treat the authorization copy and the shield behavior as a single contract and align them word-for-word.**
+
+## Wrapping Up — Ship the Smallest Possible Version First
+
+A Screen Time app is one of the most architecturally complex things you can ship on iOS today: framework, entitlement, extension, and shared container all have to line up. With Rork Max, the UI and most of the business logic stay in React Native, but the Apple-side integration must be Swift. That single boundary is where most projects stall.
+
+The smallest useful first step is to **submit the Family Controls entitlement request and add the DeviceActivityMonitor Extension target today**. The entitlement may take days; while it's pending, wire up the code from this guide so that the day it's approved, you're already buildable. Half a day of focused work is enough to get a basic schedule firing the shield. From there, it's pure iteration: more schedules, web-domain blocking via `store.webDomains`, usage statistics via `DeviceActivityReport`, and a polished onboarding — all of which build on top of the same plumbing.
+
+Screen Time apps carry real responsibility because they intervene in user behavior. That same weight is what makes them durable products. Pairing Rork Max's iteration speed for UI and business logic with carefully-written native code only at the OS boundary is, in my view, one of the strongest workflows available to a solo developer right now.
+
+For deeper background on the iOS-side concepts — memory model, protocol-oriented design, and how Swift maps to extension execution constraints — I keep [iOS Programming: The Big Nerd Ranch Guide](https://www.amazon.co.jp/dp/0135264022/?tag=pinocchio-22) on my desk as a reference. It pays off well beyond Screen Time work.
+
+If you want adjacent context for shipping this kind of app from Rork, see [Rork Max Background Processing with BGTask](/en/articles/rork-dev/rork-max-background-processing-bgtask) and [Setting Up Sentry Crash Monitoring on Rork](/en/articles/rork-dev/rork-sentry-crash-monitoring-setup-guide). Together they cover the operational reality of running extension-heavy apps in production.
