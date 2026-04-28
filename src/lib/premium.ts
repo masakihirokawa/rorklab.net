@@ -52,3 +52,45 @@ export async function getPremiumAccess(): Promise<PremiumType> {
     return null;
   }
 }
+
+// ── Single Article Access ────────────────────────────────────────
+
+export async function getArticleAccess(slug: string): Promise<boolean> {
+  const cookieStore = await cookies();
+  const token = cookieStore.get("article_purchases")?.value;
+  if (!token) return false;
+
+  try {
+    const decoded = atob(token);
+    let email: string | null = null;
+    let slugsInCookie: string[] = [];
+
+    if (decoded.startsWith("{")) {
+      const parsed = JSON.parse(decoded);
+      email = parsed.email || null;
+      slugsInCookie = Array.isArray(parsed.slugs) ? parsed.slugs : [];
+    } else {
+      const [e] = decoded.split(":");
+      email = e || null;
+    }
+
+    if (!email) return false;
+
+    try {
+      const kv = (() => { try { const { env } = getCloudflareContext(); return (env as Record<string, unknown>).PREMIUM_ACCESS as KVNamespace; } catch { return null; } })();
+      if (kv) {
+        const kvKey = `site:rorklab:article:${email}:${slug}`;
+        const data = await kv.get(kvKey);
+        if (!data) return false;
+        const record = JSON.parse(data);
+        return new Date(record.expires_at) > new Date();
+      }
+    } catch {
+      // KV not available
+    }
+
+    return slugsInCookie.includes(slug);
+  } catch {
+    return false;
+  }
+}
