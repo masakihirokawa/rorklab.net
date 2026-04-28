@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
 interface KVNamespace {
@@ -34,9 +35,11 @@ export async function GET(request: NextRequest) {
       return NextResponse.redirect(new URL(`${prefix}/support?error=payment`, request.url));
     }
 
+    // Check plan_type from metadata to distinguish tip from membership
     const planType = session.metadata?.plan_type;
 
-    // ── Tip payment: just say thanks ─────────────────────────────
+    // Tip payments: just say thanks, no premium access granted
+    // If return_url is set (e.g. from article page), redirect back to the article
     if (planType === "tip") {
       const returnUrl = session.metadata?.return_url;
       if (returnUrl) {
@@ -48,82 +51,6 @@ export async function GET(request: NextRequest) {
       return NextResponse.redirect(new URL(`${prefix}/support?thanks=tip`, request.url));
     }
 
-    // ── Article purchase: grant access to the specific article ───
-    if (planType === "article") {
-      const articleSlug = session.metadata?.article_slug;
-      const returnUrl = session.metadata?.return_url;
-      const rawEmail = session.customer_details?.email;
-      const email = rawEmail ? rawEmail.trim().toLowerCase() : null;
-
-      if (articleSlug && email) {
-        const ARTICLE_TTL = 10 * 365 * 24 * 3600; // 10 years
-        try {
-          const kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
-          if (kv) {
-            const kvKey = `site:rorklab:article:${email}:${articleSlug}`;
-            const kvValue = JSON.stringify({
-              type: "article",
-              slug: articleSlug,
-              stripe_session_id: sessionId,
-              purchased_at: new Date().toISOString(),
-              expires_at: new Date(Date.now() + ARTICLE_TTL * 1000).toISOString(),
-            });
-            await kv.put(kvKey, kvValue, { expirationTtl: ARTICLE_TTL });
-          }
-        } catch {
-          // KV not available — cookie-only fallback
-        }
-
-        // Build article_purchases cookie with slug list
-        // Format: btoa(JSON.stringify({ email, slugs: ["slug1", "slug2", ...] }))
-        // Read existing cookie to accumulate purchased slugs
-        let existingSlugs: string[] = [];
-        const existingToken = request.cookies.get("article_purchases")?.value;
-        if (existingToken) {
-          try {
-            const decoded = atob(existingToken);
-            // Handle new JSON format
-            if (decoded.startsWith("{")) {
-              const parsed = JSON.parse(decoded);
-              existingSlugs = Array.isArray(parsed.slugs) ? parsed.slugs : [];
-            }
-            // Old format "email:article" — no slugs to carry over
-          } catch {
-            // Malformed cookie — start fresh
-          }
-        }
-
-        // Add new slug if not already present
-        if (!existingSlugs.includes(articleSlug)) {
-          existingSlugs.push(articleSlug);
-        }
-
-        const articleToken = btoa(JSON.stringify({ email, slugs: existingSlugs }));
-        const dest = returnUrl
-          ? new URL(returnUrl)
-          : new URL(`${locale === "en" ? "/en" : ""}/support`, request.url);
-
-        if (returnUrl) {
-          dest.searchParams.set("thanks", "article");
-        }
-
-        const response = NextResponse.redirect(dest.toString());
-        response.cookies.set("article_purchases", articleToken, {
-          httpOnly: true,
-          secure: true,
-          sameSite: "lax",
-          maxAge: ARTICLE_TTL,
-          path: "/",
-        });
-        return response;
-      }
-
-      // Fallback if slug/email missing
-      const prefix = locale === "en" ? "/en" : "";
-      return NextResponse.redirect(new URL(`${prefix}/support?thanks=article`, request.url));
-    }
-
-    // ── Membership purchase (pro / premium) ──────────────────────
     const rawEmail = session.customer_details?.email;
     if (!rawEmail) {
       const prefix = locale === "en" ? "/en" : "";
@@ -135,9 +62,8 @@ export async function GET(request: NextRequest) {
     const ttlSeconds = type === "premium" ? 10 * 365 * 24 * 3600 : 31 * 24 * 3600;
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
 
-    // Save to Cloudflare KV
     try {
-      const kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
+      const kv = (() => { try { const { env } = getCloudflareContext(); return (env as Record<string, unknown>).PREMIUM_ACCESS as KVNamespace; } catch { return null; } })();
       if (kv) {
         const kvKey = `site:rorklab:email:${email}`;
         const kvValue = JSON.stringify({
@@ -151,10 +77,9 @@ export async function GET(request: NextRequest) {
         await kv.put(kvKey, kvValue, { expirationTtl: ttlSeconds });
       }
     } catch {
-      // KV not available yet — continue with cookie-only auth
+      // KV not available yet
     }
 
-    // Issue cookie
     const token = btoa(`${email}:${sessionId}`);
     const prefix = locale === "en" ? "/en" : "";
     const response = NextResponse.redirect(new URL(`${prefix}/support?thanks=true`, request.url));

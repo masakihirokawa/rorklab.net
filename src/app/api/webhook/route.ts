@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
 interface KVNamespace {
@@ -38,7 +39,7 @@ export async function POST(request: NextRequest) {
 
     let kv: KVNamespace | null = null;
     try {
-      kv = (process.env as unknown as { PREMIUM_ACCESS: KVNamespace }).PREMIUM_ACCESS;
+      kv = (() => { try { const { env } = getCloudflareContext(); return (env as Record<string, unknown>).PREMIUM_ACCESS as KVNamespace; } catch { return null; } })();
     } catch {
       // KV not available
     }
@@ -50,41 +51,47 @@ export async function POST(request: NextRequest) {
     try {
       switch (event.type) {
         case "checkout.session.completed": {
-          const session = event.data.object as Stripe.Checkout.Session;
-          const email = session.customer_details?.email?.trim().toLowerCase();
-          if (email) {
-            const kvKey = `site:rorklab:email:${email}`;
-            const now = new Date();
-            let plan: string;
-            let ttlSeconds: number;
+          const checkoutSession = event.data.object as Stripe.Checkout.Session;
+          const rawEmail = checkoutSession.customer_details?.email;
+          if (!rawEmail) break;
+          const email = rawEmail.trim().toLowerCase();
 
-            if (session.mode === "subscription") {
-              // Pro monthly plan
-              plan = "pro";
-              ttlSeconds = 31 * 24 * 3600;
-            } else if ((session.amount_total ?? 0) >= 500) {
-              // Premium lifetime
-              plan = "premium";
-              ttlSeconds = 10 * 365 * 24 * 3600; // 10 years
-            } else {
-              // Tip / supporter
-              plan = "supporter";
-              ttlSeconds = 365 * 24 * 3600; // 1 year
-            }
+          // Skip tip purchases — check against tip price IDs
+          const tipPriceIds = [
+            "price_1TCQyPEGB5g6A54ofaB9e5to", // JA tip
+            "price_1TGTQMEGB5g6A54o6VMWCFNr", // EN tip
+          ];
+          const isPurchasedTip = checkoutSession.line_items?.data.some((item) =>
+            tipPriceIds.includes(item.price?.id || "")
+          );
+          if (isPurchasedTip) break;
 
-            const record = {
-              plan,
-              granted_at: now.toISOString(),
-              expires_at: new Date(now.getTime() + ttlSeconds * 1000).toISOString(),
-              source: "checkout",
-            };
-            await kv.put(kvKey, JSON.stringify(record), { expirationTtl: ttlSeconds });
-          }
+          // Only write KV if no existing record (backup for verify-session)
+          const kvKey = `site:rorklab:email:${email}`;
+          const existing = await kv.get(kvKey);
+          if (existing) break;
+
+          // Determine plan type and TTL based on mode
+          const type = checkoutSession.mode === "subscription" ? "pro" : "premium";
+          const ttlSeconds = type === "premium" ? 10 * 365 * 24 * 3600 : 31 * 24 * 3600;
+          const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+
+          const kvValue = JSON.stringify({
+            type,
+            mode: checkoutSession.mode,
+            stripe_customer_id: checkoutSession.customer,
+            stripe_session_id: checkoutSession.id,
+            created_at: new Date().toISOString(),
+            expires_at: expiresAt.toISOString(),
+          });
+          await kv.put(kvKey, kvValue, { expirationTtl: ttlSeconds });
           break;
         }
         case "customer.subscription.updated": {
           const sub = event.data.object as Stripe.Subscription;
-          const email = (sub as unknown as { customer_email?: string }).customer_email?.trim().toLowerCase();
+          const rawEmail = (sub as unknown as { customer_email?: string }).customer_email;
+          if (!rawEmail) break;
+          const email = rawEmail.trim().toLowerCase();
           if (email) {
             const kvKey = `site:rorklab:email:${email}`;
             const existing = await kv.get(kvKey);
@@ -98,7 +105,9 @@ export async function POST(request: NextRequest) {
         }
         case "customer.subscription.deleted": {
           const sub = event.data.object as Stripe.Subscription;
-          const email = (sub as unknown as { customer_email?: string }).customer_email?.trim().toLowerCase();
+          const rawEmail = (sub as unknown as { customer_email?: string }).customer_email;
+          if (!rawEmail) break;
+          const email = rawEmail.trim().toLowerCase();
           if (email) {
             await kv.delete(`site:rorklab:email:${email}`);
           }
