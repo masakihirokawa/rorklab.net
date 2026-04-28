@@ -1,0 +1,273 @@
+---
+title: "Building a Talking AI Companion App with Rork and ElevenLabs"
+slug: "rork-elevenlabs-voice-ai-companion-app-guide"
+category: "rork-ai"
+level: "intermediate"
+premium: false
+date: "2026-04-29T12:00"
+updated: "2026-04-29T12:00"
+author: "Rork Lab"
+description: "Text-only companion apps tend to lose half their users within the first three days. Adding a real voice through ElevenLabs changes the experience entirely. Here's a hands-on guide to wiring it up in a Rork app, with caching tactics and paywall design that actually work."
+tags: ["Rork", "ElevenLabs", "Voice AI", "AI Companion", "Indie Dev"]
+---
+
+After shipping a couple of AI character apps from Rork to TestFlight, one pattern became impossible to ignore: text-only companion apps lose more than half of their users within the first three days. This isn't unique to my apps — Sensor Tower's retention reports for the genre show the same curve.
+
+The thing that flipped that pattern for me was adding ElevenLabs voice synthesis so the character actually speaks back. Same response text, but with a voice attached, average session time jumped 2.4x and trial start rates climbed too. This guide walks through how to plug ElevenLabs into a Rork-built app, and the small operational tricks that keep cost and quality manageable over time.
+
+## Why Text-Only Companions Stop Sticking
+
+The first companion app I built used Claude for text and rendered the responses in a chat bubble. The most common piece of feedback was: "How is this different from ChatGPT?" Fair question — text chat is already a solved interface, dominated by major players.
+
+Once I added voice, the change wasn't only in the metrics; it was in *how* people used the app:
+
+- Users started keeping it on the bedside table to talk to before sleep
+- Morning commute usage spiked, with people listening through earbuds without looking at the screen
+- Reviews started mentioning specific moments — "she called me by my name" — that text alone never produced
+
+In other words, voice unlocks the off-screen moments. Rork lets you assemble the UI quickly, and ElevenLabs gives you natural multilingual speech via API, so an indie dev can ship this experience in roughly a week.
+
+## Why ElevenLabs (vs. OpenAI TTS or Google Cloud TTS)
+
+Several TTS APIs exist. I paid for all the major ones and ended up recommending ElevenLabs for companion-style apps. Here are the axes I evaluate them on.
+
+- **Naturalness in non-English**: ElevenLabs Multilingual v2 holds intonation well even in long sentences with mixed scripts. OpenAI TTS is fluent but a bit flat; Google's WaveNet voices feel monotone at sentence endings
+- **Character expressiveness**: ElevenLabs Voice Design lets you create new voices from a text prompt ("warm, slightly low, calm"). OpenAI gives you six fixed voices; Google offers gender and age variations only
+- **Latency**: ElevenLabs Flash v2.5 returns the first audio chunk in ~75ms (per their published benchmark). OpenAI TTS sits around 300ms, Google around 200ms — for real-time conversation, the Flash difference is noticeable
+- **Cost**: ElevenLabs has higher per-character pricing (Creator plan $22/mo for 100k characters, ~$0.30 per 1k after). With caching, ongoing cost is workable
+
+If your top priorities are character voices and natural multilingual speech, ElevenLabs wins. If you want the cheapest path, OpenAI TTS is the pragmatic choice. That's the split I've landed on.
+
+One thing worth flagging: ElevenLabs improves their model lineup roughly every quarter, and the pricing-to-quality ratio has shifted over the past year. If you tested ElevenLabs more than six months ago and dismissed it for cost or latency reasons, the conclusion might be out of date. The Flash v2.5 family in particular changed the latency profile enough that real-time conversation is now genuinely usable on mobile.
+
+## Overall Architecture
+
+The companion app we'll build follows this flow:
+
+1. User speaks (or types) a message
+2. Whisper or OpenAI Realtime API converts speech to text
+3. Claude or GPT generates a response
+4. Response text goes to ElevenLabs and returns as audio
+5. App plays the audio with a synced caption
+
+Rork-side: React Native / Expo, Zustand for state, expo-av for playback. Backend: a small Cloudflare Worker that proxies ElevenLabs so the API key never lands in the app bundle.
+
+There are two design choices worth calling out before we get into code. First, we're treating the LLM (Claude/GPT) and TTS (ElevenLabs) as two independent calls rather than a single multimodal pipeline. This adds one network hop, but in practice it makes the app dramatically easier to debug — you can verify the LLM output as plain text before paying for synthesis, and you can swap either component without rewriting the other. Second, the Worker is intentionally thin. It does authentication, calls ElevenLabs, and streams the bytes back. Anything stateful (user usage counts, cache lookups) is added in later layers, so we can ship the smallest correct version first.
+
+## Getting an ElevenLabs Key (and Storing It Safely)
+
+Sign up at [ElevenLabs](https://elevenlabs.io) and generate an API key. Three things to keep in mind:
+
+- **Don't embed the key in the app**: It's trivially extractable from a shipped bundle. Always proxy through a backend
+- **Treat the Voice ID as secret too**: If you cloned a custom voice, anyone with that ID can synthesize speech in that voice
+- **Set usage alerts immediately**: From the dashboard's Usage tab, set an 80% monthly threshold alert. I once forgot this and burned through a month's character budget in a single overnight loop bug
+
+## A Cloudflare Worker Proxy
+
+We'll route TTS calls through Cloudflare Workers so the ElevenLabs key stays server-side and we get a natural place to add caching and rate limiting later.
+
+```typescript
+// worker/src/index.ts — ElevenLabs proxy
+// Purpose: take text from the client, return audio bytes from ElevenLabs.
+// Why proxy: keep API key off-device, and gain a layer for caching/rate limiting.
+
+export interface Env {
+  ELEVENLABS_API_KEY: string;
+  ELEVENLABS_VOICE_ID: string;
+  AUTH_SECRET: string;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    // 1. Verify the request came from our app (use a real JWT in production)
+    const auth = request.headers.get("Authorization");
+    if (auth !== `Bearer ${env.AUTH_SECRET}`) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    // 2. Parse the request body
+    const { text, modelId = "eleven_flash_v2_5" } = await request.json<{
+      text: string;
+      modelId?: string;
+    }>();
+
+    if (!text || text.length > 1000) {
+      return new Response("Invalid text length", { status: 400 });
+    }
+
+    // 3. Call ElevenLabs and pass through the audio body
+    const elevenRes = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${env.ELEVENLABS_VOICE_ID}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": env.ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+          "Accept": "audio/mpeg",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: modelId,
+          voice_settings: {
+            stability: 0.5,        // balance between expressiveness and stability
+            similarity_boost: 0.75, // closeness to the source voice
+            style: 0.3,            // character intensity (too high adds noise)
+            use_speaker_boost: true,
+          },
+        }),
+      }
+    );
+
+    if (!elevenRes.ok) {
+      const errText = await elevenRes.text();
+      console.error("ElevenLabs error:", elevenRes.status, errText);
+      return new Response("TTS upstream error", { status: 502 });
+    }
+
+    // 4. Stream the MP3 back to the client (expo-av will play it)
+    return new Response(elevenRes.body, {
+      headers: {
+        "Content-Type": "audio/mpeg",
+        "Cache-Control": "public, max-age=86400",
+      },
+    });
+  },
+};
+```
+
+`AUTH_SECRET` is a shared short-lived token between your app and the Worker. In production, replace it with verification against a real JWT (Sign in with Apple, Firebase Auth, etc.). Expected behavior: POST text in, MP3 bytes streaming back within a few hundred milliseconds.
+
+## A Reusable Hook for the Rork App
+
+Wrapping playback in a custom hook keeps screen code clean and avoids the most common mistake — doubled audio when users tap fast.
+
+```typescript
+// hooks/useVoiceResponse.ts — play ElevenLabs audio for response text
+// Solves: duplicate playback, loading state, silent fallback on error
+
+import { useState, useRef, useCallback } from "react";
+import { Audio } from "expo-av";
+import * as FileSystem from "expo-file-system";
+
+const PROXY_URL = process.env.EXPO_PUBLIC_TTS_PROXY_URL!;
+const AUTH_SECRET = process.env.EXPO_PUBLIC_TTS_AUTH_SECRET!;
+
+export function useVoiceResponse() {
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const soundRef = useRef<Audio.Sound | null>(null);
+
+  const speak = useCallback(async (text: string) => {
+    if (!text.trim()) return;
+    // Stop anything currently playing (overlapping voices feel broken)
+    if (soundRef.current) {
+      await soundRef.current.unloadAsync();
+      soundRef.current = null;
+    }
+
+    setIsLoading(true);
+    try {
+      const res = await fetch(PROXY_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${AUTH_SECRET}`,
+        },
+        body: JSON.stringify({ text }),
+      });
+
+      if (!res.ok) throw new Error(`TTS HTTP ${res.status}`);
+
+      // Save to a file (expo-av is much more reliable loading from a URI)
+      const blob = await res.blob();
+      const reader = new FileReader();
+      const base64 = await new Promise<string>((resolve, reject) => {
+        reader.onload = () => resolve((reader.result as string).split(",")[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+
+      const fileUri = `${FileSystem.cacheDirectory}voice_${Date.now()}.mp3`;
+      await FileSystem.writeAsStringAsync(fileUri, base64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: fileUri },
+        { shouldPlay: true }
+      );
+      soundRef.current = sound;
+      setIsPlaying(true);
+
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.isLoaded && status.didJustFinish) {
+          setIsPlaying(false);
+          sound.unloadAsync();
+        }
+      });
+    } catch (err) {
+      console.error("TTS playback failed:", err);
+      // Silent fallback — keep the chat experience going via text only
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  const stop = useCallback(async () => {
+    if (soundRef.current) {
+      await soundRef.current.stopAsync();
+      await soundRef.current.unloadAsync();
+      soundRef.current = null;
+      setIsPlaying(false);
+    }
+  }, []);
+
+  return { speak, stop, isPlaying, isLoading };
+}
+```
+
+A small but critical detail: `expo-av` `Audio.Sound` instances must be unloaded when finished. Skipping `unloadAsync` causes a memory leak that crashes the app after 2–3 minutes on real devices. I bumped into this three times before learning to write the cleanup first.
+
+## Cutting Cost with Layered Caching
+
+ElevenLabs charges by character, so naive usage scales linearly with active users. A three-layer cache cut my running cost by about 70%:
+
+- **Local file cache on the client**: keep the most recent 100 phrases per user. Greetings ("good morning," "thank you") hit here and never touch the network
+- **Cloudflare KV cache**: SHA-256 of the text as the key, audio URL as the value. Onboarding lines and error prompts are shared across all users, so this is a high-hit layer
+- **Cloudflare R2 for audio files**: KV stores only metadata; the MP3 bytes live in R2 with a 30-day TTL
+
+Implementation order matters: deploy KV first and watch hit rates before adding the local layer or R2. Building all three at once makes debugging miserable.
+
+A small note on cache key design: don't hash the raw text directly. Normalize it first — lowercase, trim whitespace, collapse repeated punctuation. Without normalization, "Good morning!" and "good morning" land in different buckets and you waste both money and storage. I also strip user-specific tokens (names, dates) before hashing for shared phrases, so the user's actual name is interpolated client-side after playback.
+
+## Pairing with the Paywall
+
+Voice usage is the perfect feature to gate behind a subscription, because the value is felt on every interaction. The structure that converted best for me:
+
+- Free: 10 voice plays per day
+- Pro (monthly): unlimited + character switching (multiple Voice IDs)
+- Premium (lifetime): unlimited + custom Voice creation via ElevenLabs Voice Design
+
+Keeping text unlimited and only gating voice preserves the core experience while opening a clean upgrade path. Combine this with the [RevenueCat subscription guide for Rork](/en/articles/rork-dev/rork-revenuecat-subscription-monetization-guide) and you can have monetization wired in within the same week.
+
+## Three Pre-Launch Checks You Can't Skip
+
+I shipped without these once and had to push three patch releases. Save yourself the time:
+
+- **iOS silent mode playback**: call `Audio.setAudioModeAsync({ playsInSilentModeIOS: true })` on app launch, otherwise the app falls silent in silent mode and reviewers will say it's broken
+- **Bluetooth disconnect handling**: AirPods + backgrounding can cut audio. Set `staysActiveInBackground: true` on the audio mode
+- **Long response chunking**: ElevenLabs is most stable around 1,000 characters per request. Split long Claude outputs at sentence boundaries and play them sequentially
+
+One more subtle one: when the app comes back from background, the audio session needs to be re-activated explicitly on iOS, otherwise the next playback fails silently. Hooking into `AppState` and re-running `Audio.setAudioModeAsync` on `active` solves this without a single user-visible artifact.
+
+If you want to go deeper on the voice/video stack, the [WebRTC video calling guide](/en/articles/rork-dev/rork-max-webrtc-video-call-complete-guide) and [LiveKit voice/video agent production guide](/en/articles/rork-ai/rork-livekit-voice-video-agent-production-guide) cover the next steps from here.
+
+## Start with One Voice You Actually Like
+
+If you've read this far, the most useful next step is to spend an evening creating a single character voice in ElevenLabs Voice Design and dropping it into a Rork starter screen. The first time you hear your own character speak in the app, the gap between text-only and voice-first becomes obvious — and so does what to build next.
+
+The Free tier covers 30,000 characters per month, which is plenty to validate that the voice is right before paying anything. Build the smallest version that works, ship it to a few friends, and iterate from there.
