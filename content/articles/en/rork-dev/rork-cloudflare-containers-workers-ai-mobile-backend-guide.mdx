@@ -1,0 +1,188 @@
+---
+title: "Building AI Backends for Rork Mobile Apps: When to Use Cloudflare Containers vs Workers AI"
+slug: "rork-cloudflare-containers-workers-ai-mobile-backend-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-28T13:00"
+updated: "2026-04-28T13:00"
+author: "Rork Lab"
+description: "A practical guide to choosing between Cloudflare Containers and Workers AI when building AI features for Rork-generated mobile apps, with cost numbers and code examples."
+tags: ["Cloudflare Containers", "Workers AI", "Rork", "AI Backend", "Mobile App", "GPU Inference", "Edge AI"]
+---
+
+When you build something with Rork and decide you want a real AI feature — image recognition, custom inference, on-the-fly summarization — you quickly hit the wall of choosing where the inference actually runs. Workers AI is convenient but limited to a curated catalog. Spinning up a GPU instance on AWS or GCP is overkill for a solo developer. For a long time, the middle ground was missing. Cloudflare Containers, which hit GA in 2025, finally fills it.
+
+This article walks through how I decide between Cloudflare Containers and Workers AI when shipping an AI backend behind a Rork-generated React Native app. I'll share the actual architecture and cost numbers from one of my production apps.
+
+## Always Try Workers AI First
+
+Before reaching for Containers, ask whether Workers AI can do the job. If a model in the Workers AI catalog covers your use case, it's almost always cheaper, faster to ship, and easier to operate.
+
+The catalog covers the common ground:
+
+- Conversational and summarization models (Llama, Mistral, Qwen families)
+- Image generation (Flux, Stable Diffusion XL Lightning)
+- Embeddings (BGE, E5)
+- Speech-to-text (small Whisper variants)
+
+For example, if your app summarizes a user's diary entry into three lines, or classifies the sentiment of a product review, there's no reason to involve Containers. Just hit Workers AI:
+
+```typescript
+// app/api/summarize+api.ts (Expo Router API route — what Rork generates)
+export async function POST(request: Request) {
+  const { text } = await request.json();
+
+  const ai = (request as any).env.AI; // Workers binding
+  const result = await ai.run("@cf/meta/llama-3.1-8b-instruct", {
+    messages: [
+      { role: "system", content: "Summarize the following text in three lines." },
+      { role: "user", content: text },
+    ],
+  });
+
+  return Response.json({ summary: result.response });
+}
+```
+
+This is a single fetch from the mobile side. Cold starts are negligible, the free tier is generous, and for most Rork-driven apps it's all you need.
+
+So when does Containers actually earn its place?
+
+## Three Situations Where Containers Wins
+
+Across my own builds, I've reached for Containers in exactly three situations.
+
+The first is custom or fine-tuned models. If you've fine-tuned a YOLOv8 for product detection, or converted a CoreML model to ONNX for cross-platform use, Workers AI simply can't host it. Containers is the only option without leaving the Cloudflare stack.
+
+The second is heavy pre- or post-processing. Image resizing and normalization, table extraction from PDFs, multi-image compositing — these can blow past Workers' CPU time limits (10ms on the free plan, 30 seconds on paid) under realistic loads. Containers gives you full Linux behavior with proper limits.
+
+The third is long-running jobs. Transcribing a 10-minute video, parsing a 100-page PDF, batch-loading vectors into a database — anything in the tens-of-seconds-to-minutes range belongs in Containers, ideally fronted by Cloudflare Queues for retry behavior.
+
+If your workload doesn't match one of these, skip Containers. Adopting it "because it sounds powerful" leaves you with cold starts and minimum spend that don't earn their keep.
+
+## Minimal Architecture: Rork App → Worker → Container
+
+Here's the shape I use whenever a Rork app needs to call into a Container:
+
+```
+[Rork App] → [Cloudflare Worker (auth, billing, queue)] → [Container (inference)]
+```
+
+Three reasons the Worker sits in front. First, auth token verification. Second, billing/quota checks (Stripe subscription status, free-tier limits). Third, the option to make the job asynchronous via Queues. Mobile clients can technically hit Containers directly, but in production you'll want this proxy layer for abuse prevention.
+
+Here's a typical `wrangler.toml`:
+
+```toml
+name = "rork-ai-backend"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+
+[[containers]]
+name = "yolo-detector"
+image = "./containers/yolo/Dockerfile"
+instance_type = "standard-2" # 2 vCPU / 4GB
+max_instances = 5
+
+[[ai]]
+binding = "AI"
+
+[[queues.producers]]
+binding = "DETECT_QUEUE"
+queue = "yolo-detect"
+```
+
+The biggest decision here is `instance_type`. GPU types (`gpu-*`) jump the per-second price several-fold, so I strongly recommend trying CPU types first. In my case, converting the model to ONNX Runtime made CPU instances fast enough for production traffic.
+
+The Worker entrypoint looks like this:
+
+```typescript
+// src/index.ts
+import { Container } from "@cloudflare/containers";
+
+export class YoloDetector extends Container {
+  defaultPort = 8080;
+  sleepAfter = "30s"; // scale to zero after idle
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/api/detect" && request.method === "POST") {
+      const userId = await verifyAuth(request, env);
+      if (!userId) return new Response("Unauthorized", { status: 401 });
+
+      const allowed = await checkQuota(userId, env);
+      if (!allowed) return new Response("Quota exceeded", { status: 402 });
+
+      const id = env.YOLO_DETECTOR.idFromName("singleton");
+      const container = env.YOLO_DETECTOR.get(id);
+      return container.fetch(request);
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+};
+```
+
+`sleepAfter = "30s"` is the cost-control lever. Thirty seconds after the last request, the container shuts down and billing stops. The next request triggers a cold start — about 2–3 seconds in my deployments. If your feature requires consistent latency, set `sleepAfter` higher or send periodic warm-up pings.
+
+## Calling It from the Rork-Generated Code
+
+Rork emits React Native + Expo. The fetch call carries the auth token and surfaces the quota state cleanly:
+
+```typescript
+// app/(tabs)/detect.tsx
+async function detectObjects(imageUri: string, token: string) {
+  const formData = new FormData();
+  formData.append("image", {
+    uri: imageUri,
+    name: "photo.jpg",
+    type: "image/jpeg",
+  } as any);
+
+  const res = await fetch("https://rork-ai-backend.example.workers.dev/api/detect", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+
+  if (res.status === 402) throw new Error("PLAN_REQUIRED");
+  if (!res.ok) throw new Error(`Detection failed: ${res.status}`);
+  return res.json() as Promise<{ objects: Array<{ label: string; score: number }> }>;
+}
+```
+
+I throw `PLAN_REQUIRED` as its own error so the UI can route quota-exceeded events to a paywall modal instead of a generic error toast. That handoff plugs into the subscription flow I describe in the [complete monetization guide for Rork apps](/articles/rork-business/rork-app-monetization-complete-guide).
+
+## What This Actually Costs
+
+Real numbers from one of my production apps (≈200 DAU, ≈15K inferences per month):
+
+- Workers requests: within the free tier
+- Containers compute: ~$4.20 (standard-2, only running during peak hours)
+- R2 storage (input/output images): ~$0.30
+- **Total: under $5/month**
+
+That's with no GPU — the model was converted to ONNX and runs on CPU. GPU instances will roughly multiply your container cost by 5–10x, so verify CPU isn't enough before reaching for them.
+
+For comparison, running the same workload on an always-on AWS `g4dn.xlarge` would cost over $300/month. The scale-to-zero behavior of Containers is a decisive advantage for solo developers. If you want to go deeper on the backend layer itself, the [Hono + Cloudflare Workers REST API guide](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) covers the surrounding architecture.
+
+## Three Operational Pitfalls I Hit
+
+Three lessons from running this in production:
+
+First, requests that arrive during a cold start. The container boot blocks the response, and if your Worker timeout is shorter than the mobile client's fetch timeout (often ~60 seconds in the popular libraries), the user sees an error while inference actually completes successfully on the backend. Set a Worker-side timeout that's tighter than the client's, and surface a clean retry path in the UI.
+
+Second, log aggregation. Container logs are separate from `console.log` in your Worker by default. I added [Sentry](/articles/rork-dev/rork-sentry-crash-monitoring-setup-guide) inside the container app so Worker errors and Container errors land in the same dashboard.
+
+Third, deploy atomicity. Updating the Worker and pushing a new container image are separate operations, which means a brief window where the new Worker talks to the old container image. I version the API path (`/api/v2/detect`) so the old and new schemas can coexist during deploys.
+
+## Closing Thoughts
+
+Cloudflare Containers fits squarely into the gap that solo developers have struggled with for years: too much for Workers AI alone, too expensive to justify a dedicated GPU box. For Rork-generated apps, the most cost-efficient approach I've found is to start everything on Workers AI, then peel off only the features that hit a real wall and move them to Containers.
+
+Don't migrate everything at once. Try one feature — image classification is a good first candidate — and run `wrangler containers deploy`. The moment your Rork app starts behaving like a real AI-backed service, you'll feel the shift in what's possible.
+
+For broader context on the Cloudflare stack, [Cloudflare Workers徹底解説 (Daisuke Sato)](https://www.amazon.co.jp/dp/4297139502/?tag=pinocchio-22) is a solid Japanese reference if you read the language; understanding Workers' execution model makes the boundary between Worker and Container far easier to design.
