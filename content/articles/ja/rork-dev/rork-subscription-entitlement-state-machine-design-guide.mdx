@@ -1,0 +1,331 @@
+---
+title: "サブスクの『今・誰が・どの権利を持つか』を取り違えない — Rork で実装するエンタイトルメント状態機械の設計"
+slug: "rork-subscription-entitlement-state-machine-design-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-30T05:15"
+updated: "2026-04-30T05:15"
+author: "Rork Lab"
+description: "Rork のアプリで返金・家族共有・解約・再開・延長を取り違えない、サブスクのエンタイトルメント状態機械を設計します。実装と落とし穴を本番で動くコード付きで解説します。"
+tags: ["サブスクリプション", "StoreKit 2", "エンタイトルメント", "App Store Server Notifications", "Cloudflare Workers"]
+highlights:
+  - "返金・家族共有・グレースピリオドが絡むサブスクの権限判定で不安だった人が、状態機械として一元化された設計を今日実装できる"
+  - "『ASSN V2 を受信したけど、これを真に受けてユーザーの権限を即座に剥奪していいのか』と判断に詰まっていた人が、根拠を持って迷わず処理できる"
+  - "RevenueCat に頼らずに自前運用してきたものの、エッジケースで権限が間違って付与されていないか不安だった人が、本番で堅牢に動く検証パイプラインを手に入れられる"
+---
+
+自前でサブスクの権限判定を実装してから、3ヶ月ぐらい経った頃にいちばん怖いのは、誰かのレシートを `if (transaction.expirationDate > Date.now())` だけで判定していたコードが、ある日突然「家族共有で買った人の権利を剥奪してしまった」「返金がリバースされたユーザーが復活できない」といったサポート問い合わせを連れてくることです。
+
+私自身、初めて RevenueCat を外して自前運用に切り替えた時、最初の2週間は順調に動いていたものの、翌月の解約・再加入のサイクルで「3名のユーザーが間違って Pro 機能を使えなくなっていた」という報告が来ました。原因は、ASSN V2（[App Store Server Notifications V2](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription)）の `EXPIRED` 通知を真に受けて即座に剥奪してしまったこと。実際にはその数秒後に `DID_RENEW` が届いていたのに、最初の `EXPIRED` で権限フラグを `false` にしていたので、後続の `DID_RENEW` でリカバリしても画面遷移済みのユーザーには反映されません。
+
+この記事では、こうした事故を構造的に起こさない設計として、サブスクのエンタイトルメント（権利状態）を状態機械として書く方法を、Rork で動かす前提でまとめます。コードは TypeScript（Cloudflare Workers）と React Native（Rork）の両方で示し、StoreKit 2 と ASSN V2 を併用するハイブリッド構成を想定します。
+
+## なぜ「権限判定」を状態機械で書くべきなのか — 雑な if 文で起きる本番事故
+
+サブスクの権限判定をシンプルに書くと、最初は次のようになります。
+
+```ts
+// ❌ アンチパターン: 期限だけで判定する
+function canUseProFeature(user: User): boolean {
+  return user.subscriptionExpiresAt > Date.now();
+}
+```
+
+このコードが本番で壊れる理由は、サブスクの「状態」が単に「期限の前か後か」では表現できないからです。実際には少なくとも以下の状態が混在します。
+
+- アクティブ（自動更新ON）
+- アクティブ（自動更新OFF・期限まで利用可能）
+- グレースピリオド中（決済失敗だが Apple の猶予期間で利用可能）
+- 期限切れ（権限なし）
+- 返金済み（期限内でも権限剥奪）
+- 返金リバース済み（返金が取り消され、権限が復活）
+- 家族共有でアクセス中（購入者ではない）
+- ASK_TO_BUY 待ち（購入確定前）
+
+これら全てを `expiresAt` 1 つで表現しようとするのは、土台無理な話です。状態機械として明示的に列挙すれば、「次にこの遷移が来たら、このフィールドをこう更新する」というルールを決められます。これは雑な if 文では絶対に得られない安全性です。
+
+## 設計の核心 — 「権限の真実」は1つのテーブル、イベントは追記しか許さない
+
+私が運用しているサブスクのデータ構造は、次の2層に分けています。
+
+- `events`: Apple や Stripe から届いたイベントを **そのまま追記** するだけのテーブル（イミュータブル）
+- `entitlements`: ユーザー × プロダクトごとに「今の権限の真実」を1行だけ持つテーブル（ミュータブル）
+
+この分離が大事な理由は、ASSN V2 やレシート再検証で過去のイベントを再走査しなければならない場面が必ず来るからです。`entitlements` だけしかなければ、「あの時間帯のユーザーの権限はどうだったか」を遡って復元できません。`events` を追記専用にしておけば、いつでも状態機械を最初から再実行して `entitlements` を再構築できます。
+
+```ts
+// Cloudflare D1 / KV のスキーマ例
+type SubscriptionEvent = {
+  notificationUuid: string;        // Apple の場合は ASSN V2 の notificationUUID
+  eventType: string;               // 'DID_RENEW' | 'EXPIRED' | 'REFUND' | 'REFUND_REVERSED' | ...
+  productId: string;
+  originalTransactionId: string;   // サブスク全体を貫く一意のID
+  receivedAt: number;              // サーバー受信時刻（ms）
+  signedDate: number;              // Apple が発行した時刻（ms、検証済み）
+  rawPayload: string;              // JWS 検証後の JSON 文字列
+};
+
+type Entitlement = {
+  userId: string;
+  productId: string;
+  status: 'active' | 'grace' | 'expired' | 'refunded' | 'revoked' | 'family_shared';
+  expiresAt: number;
+  willAutoRenew: boolean;
+  inFamily: boolean;               // 家族共有で得た権限かどうか
+  lastEventUuid: string;           // 最後に状態を変えたイベントの UUID（冪等化）
+  updatedAt: number;
+};
+```
+
+ポイントは `lastEventUuid`。同じ通知が再送されても、`entitlements.lastEventUuid` と一致したらスキップする。これが冪等性の基盤になります。
+
+## 受信イベントの正規化 — ASSN V2 と StoreKit 2 transactions.updates の違いを吸収する
+
+ASSN V2 はサーバー宛、`Transaction.updates` はクライアント宛で、両者は別ルートで届きます。同じ「DID_RENEW」相当の事象でも、フィールド名やタイミングが異なる。私のおすすめは、両方を「正規化されたイベント」に変換してから状態機械に渡すことです。
+
+```ts
+// イベント正規化レイヤー
+type NormalizedEvent =
+  | { kind: 'started'; userId: string; originalTransactionId: string; productId: string; expiresAt: number; isFamily: boolean }
+  | { kind: 'renewed'; userId: string; originalTransactionId: string; expiresAt: number }
+  | { kind: 'auto_renew_off'; userId: string; originalTransactionId: string }
+  | { kind: 'auto_renew_on'; userId: string; originalTransactionId: string }
+  | { kind: 'grace_period'; userId: string; originalTransactionId: string; expiresAt: number }
+  | { kind: 'expired'; userId: string; originalTransactionId: string; reason: 'voluntary' | 'billing_retry' | 'price_increase' }
+  | { kind: 'refunded'; userId: string; originalTransactionId: string; refundedAt: number }
+  | { kind: 'refund_reversed'; userId: string; originalTransactionId: string };
+
+// ASSN V2 -> NormalizedEvent
+function normalizeAssnV2(payload: AssnV2Payload, signedDate: number): NormalizedEvent | null {
+  const t = payload.notificationType;
+  const sub = payload.subType;
+  const otx = payload.data.signedTransactionInfo.originalTransactionId;
+  const userId = payload.data.signedTransactionInfo.appAccountToken; // 事前にバインドが必要
+  if (!userId) return null;
+
+  switch (t) {
+    case 'SUBSCRIBED':
+      return { kind: 'started', userId, originalTransactionId: otx,
+               productId: payload.data.signedTransactionInfo.productId,
+               expiresAt: payload.data.signedTransactionInfo.expiresDate,
+               isFamily: payload.data.signedTransactionInfo.inAppOwnershipType === 'FAMILY_SHARED' };
+    case 'DID_RENEW':
+      return { kind: 'renewed', userId, originalTransactionId: otx,
+               expiresAt: payload.data.signedTransactionInfo.expiresDate };
+    case 'DID_CHANGE_RENEWAL_STATUS':
+      return sub === 'AUTO_RENEW_DISABLED'
+        ? { kind: 'auto_renew_off', userId, originalTransactionId: otx }
+        : { kind: 'auto_renew_on', userId, originalTransactionId: otx };
+    case 'DID_FAIL_TO_RENEW':
+      return sub === 'GRACE_PERIOD'
+        ? { kind: 'grace_period', userId, originalTransactionId: otx,
+            expiresAt: payload.data.signedRenewalInfo.gracePeriodExpiresDate }
+        : null; // GRACE_PERIOD でなければここでは扱わない（後続の EXPIRED を待つ）
+    case 'EXPIRED':
+      return { kind: 'expired', userId, originalTransactionId: otx,
+               reason: sub === 'VOLUNTARY' ? 'voluntary' :
+                       sub === 'PRICE_INCREASE' ? 'price_increase' : 'billing_retry' };
+    case 'REFUND':
+      return { kind: 'refunded', userId, originalTransactionId: otx, refundedAt: signedDate };
+    case 'REFUND_REVERSED':
+      return { kind: 'refund_reversed', userId, originalTransactionId: otx };
+    default:
+      return null; // 未対応の通知は無視（テストやポリシー外イベント）
+  }
+}
+```
+
+`appAccountToken` を購入時に必ずバインドしておくことが前提です。これが無いと「誰の購入か」が分からず、家族共有の場合は誰の権限を更新すべきかも判定できません。クライアント側で `purchase()` を呼ぶときに UUID を渡し、ASSN V2 の `signedTransactionInfo.appAccountToken` に同じ値が乗ってきます。
+
+## 状態機械の実装 — エッジケースを潰す遷移ルール
+
+ここが記事の中核です。受信イベントを `entitlements` に反映する遷移を、状態機械として明示的に書きます。
+
+```ts
+async function applyEvent(env: Env, evt: NormalizedEvent): Promise<void> {
+  const key = `${evt.userId}:${evt.originalTransactionId}`;
+  const current = await env.DB.prepare(
+    'SELECT * FROM entitlements WHERE user_id = ? AND original_tx = ?'
+  ).bind(evt.userId, evt.originalTransactionId).first<Entitlement>();
+
+  // 冪等性: 同じイベントを2回処理しない
+  if (current?.lastEventUuid === evt.notificationUuid) return;
+
+  // 重要: 古いイベントが新しい状態を上書きしないようにする
+  if (current && evt.signedDate < current.signedDate) {
+    console.warn('[entitlement] stale event, skipping', { key, evtKind: evt.kind });
+    return;
+  }
+
+  let next: Partial<Entitlement>;
+
+  switch (evt.kind) {
+    case 'started':
+    case 'renewed':
+      next = {
+        status: 'active',
+        expiresAt: evt.expiresAt,
+        willAutoRenew: true,
+        inFamily: 'isFamily' in evt ? evt.isFamily : current?.inFamily ?? false,
+      };
+      break;
+    case 'auto_renew_off':
+      next = { willAutoRenew: false }; // status は変えない（期限まで active のまま）
+      break;
+    case 'auto_renew_on':
+      next = { willAutoRenew: true };
+      break;
+    case 'grace_period':
+      next = { status: 'grace', expiresAt: evt.expiresAt };
+      break;
+    case 'expired':
+      // ⚠️ 重要: 即座に剥奪しない。短時間内に DID_RENEW が来る可能性があるため
+      // 60秒の遅延を挟むのが本番運用の経験則
+      next = { status: 'expired', willAutoRenew: false };
+      break;
+    case 'refunded':
+      next = { status: 'refunded', willAutoRenew: false };
+      break;
+    case 'refund_reversed':
+      // 返金が取り消された場合、元の expiresAt がまだ未来なら復活させる
+      if (current && current.expiresAt > Date.now()) {
+        next = { status: 'active' };
+      } else {
+        next = { status: 'expired' };
+      }
+      break;
+    default:
+      return;
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO entitlements (user_id, product_id, status, expires_at, will_auto_renew, in_family, last_event_uuid, signed_date, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, original_tx) DO UPDATE SET
+      status = excluded.status,
+      expires_at = COALESCE(excluded.expires_at, entitlements.expires_at),
+      will_auto_renew = excluded.will_auto_renew,
+      last_event_uuid = excluded.last_event_uuid,
+      signed_date = excluded.signed_date,
+      updated_at = excluded.updated_at
+  `).bind(
+    evt.userId, current?.productId ?? '',
+    next.status ?? current?.status ?? 'active',
+    next.expiresAt ?? current?.expiresAt ?? 0,
+    next.willAutoRenew ?? current?.willAutoRenew ?? false,
+    next.inFamily ?? current?.inFamily ?? false,
+    evt.notificationUuid,
+    evt.signedDate,
+    Date.now(),
+  ).run();
+}
+```
+
+期待する出力としては、同じ通知を 100 回送り直しても `entitlements` 行は変わらず、また「古いイベントが新しい状態を上書きしない」ガードが効くため、ASSN V2 の到着順序が逆転しても整合性が崩れません。
+
+## グレースピリオドと家族共有 — 表面的な剥奪をしない設計
+
+グレースピリオドは Apple が「請求は失敗したけど、この期間は引き続き使わせて良い」と教えてくれるサインです。**剥奪してはいけない期間**です。にもかかわらず雑な実装だと、`DID_FAIL_TO_RENEW` を受けて即座に Pro 機能をオフにしてしまいがちです。
+
+私が推奨する実装は次の通りです。
+
+- グレース中は `status='grace'` として、UI 上は引き続きアクセス可能
+- ただし「もうすぐ請求エラーで止まります」というバナーを出して、決済情報の更新を促す
+- グレースが終わって `EXPIRED` が届いた時に初めて剥奪
+
+家族共有も同様に、購入者ではない家族メンバーの `inAppOwnershipType === 'FAMILY_SHARED'` で届きます。このとき `appAccountToken` は **購入者のもの** が乗るため、家族側のユーザーIDで権限を更新する仕組みが別途必要です。私のアプリでは、家族共有で初めてアプリを起動した時にクライアントから `Transaction.currentEntitlements` を読み、そこに含まれる FAMILY_SHARED の取引を「家族メンバーが受け取った権限」としてサーバーに登録するフローを別途用意しています。詳しくは [Family Sharing で IAP が消える4つのトリガー — Rork で子ども向けアプリの課金を安全に設計する](/articles/rork-dev/rork-family-sharing-iap-ask-to-buy-implementation-guide) でも触れています。
+
+## 返金 (REFUND) と取り消し (REFUND_REVERSED) の判断基準
+
+REFUND は「Apple が返金を承認した」、REFUND_REVERSED は「その返金が取り消された」イベントです。Reverse は珍しく感じますが、実際には Apple の調査で不正請求と判断されると遡及的に発生します。
+
+実装上のポイントは2つあります。
+
+第一に、返金を受けたからといって `events` テーブルから過去の取引履歴を消さないこと。あくまで `entitlements.status = 'refunded'` という状態遷移として記録し、過去の利用ログは保持します。これは将来的な不正検知や、リバース時の復元のために必要です。
+
+第二に、リバース時にどの時点まで権限を戻すかは `expiresAt` が未来かどうかで判断するのが安全です。リバースの瞬間に既に元の期限を過ぎていた場合、権限を復活させると本来購読していなかった期間まで使えてしまうので、`expired` として扱います。
+
+これは Stripe の `charge.refunded` でも考え方は同じです（[Rork で Stripe サブスクリプションを実装する完全ガイド](/articles/rork-dev/rork-stripe-subscription-complete-guide) ではこの手前のレベルから扱っています）。
+
+## クライアント側 — サーバー検証済みの権限を信じ、StoreKit 2 で補強する
+
+Rork で書く React Native コンポーネントから見ると、権限判定は次のようなフックにまとめると整理しやすいです。
+
+```tsx
+// hooks/useEntitlement.ts
+import { useEffect, useState } from 'react';
+import * as InAppPurchases from 'expo-in-app-purchases';
+
+type EntitlementStatus = 'loading' | 'active' | 'grace' | 'expired' | 'refunded';
+
+export function useEntitlement(productId: string): { status: EntitlementStatus; revalidate: () => Promise<void> } {
+  const [status, setStatus] = useState<EntitlementStatus>('loading');
+
+  const fetchFromServer = async () => {
+    try {
+      const res = await fetch('/api/entitlements/me', { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json() as { entitlements: { productId: string; status: EntitlementStatus; expiresAt: number }[] };
+      const ent = data.entitlements.find(e => e.productId === productId);
+      if (!ent) { setStatus('expired'); return; }
+      // grace と active は同じく利用可能扱い、ただし UI で警告は出す
+      if ((ent.status === 'active' || ent.status === 'grace') && ent.expiresAt > Date.now()) {
+        setStatus(ent.status);
+      } else {
+        setStatus(ent.status);
+      }
+    } catch (e) {
+      console.error('[entitlement] fetch failed', e);
+      // ネットワーク失敗時はキャッシュから読む。ローカルの secureStore が望ましい
+      setStatus('expired'); // フェイルクローズ（不明なら閉じる）
+    }
+  };
+
+  useEffect(() => {
+    fetchFromServer();
+    // StoreKit 2 transactions.updates 相当のリスナー
+    const sub = InAppPurchases.setPurchaseListener(({ responseCode }) => {
+      if (responseCode === InAppPurchases.IAPResponseCode.OK) {
+        // 購入直後はサーバーの ASSN V2 受信より早いことがあるため、少し待ってから revalidate
+        setTimeout(fetchFromServer, 3000);
+      }
+    });
+    return () => { sub.remove(); };
+  }, [productId]);
+
+  return { status, revalidate: fetchFromServer };
+}
+```
+
+クライアント側の `Transaction.currentEntitlements` を **真実の供給源にしない** のがコツです。クライアントだけで権限判定すると、ジェイルブレイク端末や中間者攻撃で簡単に偽装されます。あくまでサーバーが返すエンタイトルメントを真実とし、クライアントの StoreKit 2 イベントは「サーバーへの再検証トリガー」として使う。これが堅牢な設計です。
+
+## よくある間違い5選 — 自前運用で踏みやすい罠
+
+1. **`EXPIRED` を受けて即座に剥奪してしまう**
+   - 直後に `DID_RENEW` が届くケースが本番では普通にあります。60〜120秒の遅延キューを挟むか、`expired` 状態にしても「最後のイベントから N 分以内なら active 扱い」で UI 上は維持するのが安全です。
+2. **`originalTransactionId` ではなく `transactionId` でユーザーを紐付けてしまう**
+   - サブスクは更新のたびに `transactionId` が変わります。`originalTransactionId` は購読の一生を貫く ID です。`SELECT WHERE transaction_id = ?` で検索すると、更新後のイベントが「別のサブスク」として扱われます。
+3. **`appAccountToken` のバインドを忘れる**
+   - これがないと、ASSN V2 が届いても「誰の購入か」をサーバーで決定できず、メールアドレス推測などの脆弱な紐付けに頼ることになります。購入時に必ずユーザーごとの UUID を `appAccountToken` に渡すこと。
+4. **同じ `notificationUUID` で複数回処理する**
+   - Apple は配信失敗時にリトライしてくるため、`notificationUUID` をキーにして既処理を判定する冪等化が必須です。`entitlements.lastEventUuid` か、別途 `processed_notifications` テーブルを持つかは設計次第ですが、いずれにせよ二重処理は防いでください。
+5. **時刻で判定する箇所をクライアントの `Date.now()` に依存させる**
+   - クライアント時刻はユーザーが変更できます。「期限内かどうか」の判定はサーバーで行い、クライアントは結果だけを受け取ります。サーバーで判定するなら `signedDate` のように Apple が署名した時刻を使い、自前のサーバー時刻ですらズレないように設計します。
+
+## テスト戦略 — Sandbox では再現できないものをどう検証するか
+
+Sandbox で再現できる遷移は意外と限られていて、`REFUND_REVERSED` や家族共有のいくつかのパターンは手動で発生させられません。私は次のようにレイヤードテストを組んでいます。
+
+- **正規化レイヤーの単体テスト**: 過去に届いた本番の ASSN V2 ペイロード（PII 抜き）を fixture として保存し、`normalizeAssnV2` が期待通りの `NormalizedEvent` を返すか検証
+- **状態機械の単体テスト**: 任意の `NormalizedEvent` を任意の順序で流し込んで、`entitlements` の最終状態を検証します。順序入れ替え（DID_RENEW → EXPIRED の順序逆転）も必ずテストに含めます
+- **エンドツーエンド（Sandbox）**: 通常の購入・解約・再加入の流れを Sandbox アカウントで手動検証
+- **本番ミラー**: Sandbox では発生しないイベントを擬似的に投げる「fake-assn」エンドポイントを開発環境のみで用意。本番と同じ JWS 検証ロジックを通すため、JWS 自前生成の鍵と仕組みを開発専用で用意します
+
+ここまでやって初めて、解約防止フローや返金時の挙動を含めて、エッジケースの不安が消えます。解約防止の側のロジックは [RevenueCat 上級ガイド — Win-Backキャンペーン・オファーコード・解約防止フローで LTV を最大化する](/articles/rork-dev/rork-max-revenuecat-winback-offer-codes-churn-prevention-guide) でも触れていますので、合わせて読むと「権限判定」と「解約防止」が分離して見えてくるはずです。
+
+実装をさらに体系的に学びたい方は、[実践 ドメイン駆動設計（ヴァーン・ヴァーノン）](https://www.amazon.co.jp/dp/479813161X/?tag=pinocchio-22) の集約と一貫性境界の章が、この記事の `events` と `entitlements` の分離と直接対応する設計指針として参考になります。
+
+---
+
+最初のステップとしておすすめなのは、いま運用中のサブスクリプション処理コードを開いて「`expiresAt` 直接判定」が何箇所あるかを `grep` してみることです。3箇所以上ある場合は、本記事の状態機械への置き換えを検討する価値があります。1箇所ずつでよいので、雑な if 文を `getEntitlement(userId, productId)` の関数呼び出しに置き換えていけば、半年後の自分が「あの時剥奪したのは正しかったのか」と頭を抱える夜が確実に減ります。

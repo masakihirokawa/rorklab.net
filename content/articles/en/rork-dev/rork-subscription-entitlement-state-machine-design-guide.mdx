@@ -1,0 +1,385 @@
+---
+title: "Designing a Subscription Entitlement State Machine in Rork — Never Misidentify Who Has Access Right Now"
+slug: "rork-subscription-entitlement-state-machine-design-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-30T05:15"
+updated: "2026-04-30T05:15"
+author: "Rork Lab"
+description: "Design a subscription entitlement state machine in Rork that never confuses refunds, family sharing, cancel, resubscribe, or grace periods. Production-ready code and pitfalls included."
+tags: ["subscription", "StoreKit 2", "entitlement", "App Store Server Notifications", "Cloudflare Workers"]
+highlights:
+  - "You can implement, today, a unified state machine for subscription entitlement that you'll trust around refunds, family sharing, and grace periods"
+  - "You'll be able to act decisively when an ASSN V2 event arrives — knowing exactly when to revoke access and when to wait"
+  - "If you've been running self-hosted IAP without RevenueCat but worrying about edge-case correctness, you'll have a production-grade verification pipeline you can audit"
+---
+
+About three months after rolling your own subscription entitlement logic, the scariest moment is when a `if (transaction.expirationDate > Date.now())` line that seemed innocent on day one quietly turns into a support ticket: "I bought the subscription on my dad's account, why did your app revoke my access?" or "Apple reversed my refund yesterday, why am I still locked out?"
+
+When I first removed RevenueCat from one of my Rork apps and went self-hosted, the first two weeks looked clean. Then the next billing cycle hit and three users reported being locked out of Pro. The cause was an `EXPIRED` notification from [App Store Server Notifications V2](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription) that I trusted blindly. A few seconds later `DID_RENEW` arrived. The user had auto-renewed successfully, but my code had already set the entitlement flag to `false`, and any user already on a paywall screen never saw the recovery.
+
+This article walks through how to avoid those incidents structurally — by writing subscription entitlement as an explicit state machine. Code is shown in TypeScript (Cloudflare Workers) and React Native (Rork), assuming a hybrid setup that uses StoreKit 2 on the client and ASSN V2 on the server.
+
+The angle I want to push is that "is this user paid right now?" is a far harder question than it looks, and writing the answer as a finite state machine — with explicit transitions and an append-only event log — is how serious shops have been answering it for years. Doing it yourself is not glamorous. But once it's in place, you can sleep through Apple's announcement that some new notification subtype just shipped, knowing the worst case is that one event lands in the "ignore unrecognized" branch instead of corrupting state.
+
+## Why entitlement decisions belong in a state machine, not an `if` statement
+
+The naive version of an entitlement check looks like this:
+
+```ts
+// ❌ Anti-pattern: judging by expiration alone
+function canUseProFeature(user: User): boolean {
+  return user.subscriptionExpiresAt > Date.now();
+}
+```
+
+The reason this breaks in production is that "subscription state" cannot be expressed by "before or after the expiration." In reality the following states co-exist:
+
+- Active (auto-renew on)
+- Active (auto-renew off, valid until expiration)
+- Grace period (billing failed, but Apple's retry window is still open)
+- Expired (no access)
+- Refunded (still within the original window, but access revoked)
+- Refund reversed (a refund was undone, access restored)
+- Family-shared (this user is not the purchaser)
+- Ask-to-buy pending (not yet confirmed)
+
+Trying to compress all of those into a single `expiresAt` value is a losing battle. Once you enumerate the states explicitly, you can write transition rules that say "when this event arrives in this state, update these fields." That precision is impossible to get from ad-hoc conditionals.
+
+Here's a concrete failure mode I've seen ship: a developer's "premium check" was scattered across thirteen call sites in the codebase. Each one read `user.subscriptionExpiresAt` directly and applied a slightly different rule (some added a 24-hour grace, some did not, some checked a separate `isPro` flag). When Apple started shipping `DID_FAIL_TO_RENEW` with `subType=GRACE_PERIOD`, only three of the thirteen call sites correctly extended access. The other ten silently revoked, and the team spent three weeks debugging "why does our churn metric look catastrophic this month?" The fix wasn't to change Apple's behavior. The fix was to centralize the entitlement decision into a single function backed by a single source of truth.
+
+## The core design — one row of "current truth," and an append-only event log
+
+The data model I run looks like two layers:
+
+- `events`: an immutable, append-only table of every event that arrived from Apple or Stripe
+- `entitlements`: a mutable table holding exactly one row per (user, product) — the "current truth" of who has access
+
+The reason this separation matters is that you will, sooner or later, need to replay history. ASSN V2 occasionally delivers events out of order, and Apple does retry deliveries. With only `entitlements`, you cannot reconstruct what state the user was in at any past point. With `events` kept append-only, you can re-run the state machine from scratch and rebuild `entitlements` deterministically.
+
+```ts
+// Cloudflare D1 / KV schema
+type SubscriptionEvent = {
+  notificationUuid: string;        // ASSN V2 notificationUUID
+  eventType: string;               // 'DID_RENEW' | 'EXPIRED' | 'REFUND' | 'REFUND_REVERSED' | ...
+  productId: string;
+  originalTransactionId: string;   // stable across the whole subscription lifetime
+  receivedAt: number;              // server received timestamp (ms)
+  signedDate: number;              // Apple-issued timestamp (ms, JWS-verified)
+  rawPayload: string;              // verified JSON payload
+};
+
+type Entitlement = {
+  userId: string;
+  productId: string;
+  status: 'active' | 'grace' | 'expired' | 'refunded' | 'revoked' | 'family_shared';
+  expiresAt: number;
+  willAutoRenew: boolean;
+  inFamily: boolean;               // entitlement granted via Family Sharing
+  lastEventUuid: string;           // last event that mutated this row (idempotency anchor)
+  updatedAt: number;
+};
+```
+
+The `lastEventUuid` field is what makes the system idempotent. If the same notification is redelivered, you compare against `entitlements.lastEventUuid` and skip if it matches.
+
+A few schema decisions worth calling out:
+
+The primary key on `entitlements` is `(userId, originalTransactionId)`, not `(userId, productId)`. The reason is that a single user can have multiple subscriptions to the same product over time — they cancel, the row goes to `expired`, then they resubscribe months later, and a new `originalTransactionId` is issued. Keying by both lets you keep the historical row visible for reporting while the new row carries current state. If you key by `(userId, productId)` and overwrite, you lose the lineage and your churn analytics get noisy.
+
+On `events`, the index that matters in production is `(userId, signedDate DESC)`. You'll query "give me the last N events for this user" constantly — for support tickets, for replay, for audit. Without that index, support investigations turn into table scans on D1.
+
+If you're migrating from RevenueCat or another vendor, do **not** try to backfill historical events. RevenueCat's webhook history isn't shaped like ASSN V2 and translating it back is more pain than it's worth. Instead, snapshot the current entitlement state for every active user into the `entitlements` table on cutover day, and start the `events` log from zero. You'll lose the ability to replay pre-cutover history, but you avoid an entire class of "translation bugs" that would otherwise haunt you for months.
+
+## Normalize incoming events before they reach the state machine
+
+ASSN V2 is delivered server-to-server; `Transaction.updates` is delivered client-to-client. Both can fire for the same logical event ("renewed"), but field shapes and arrival timing differ. The maintainable approach is to convert both into a normalized event type before letting the state machine touch them.
+
+```ts
+// Normalization layer
+type NormalizedEvent =
+  | { kind: 'started'; userId: string; originalTransactionId: string; productId: string; expiresAt: number; isFamily: boolean }
+  | { kind: 'renewed'; userId: string; originalTransactionId: string; expiresAt: number }
+  | { kind: 'auto_renew_off'; userId: string; originalTransactionId: string }
+  | { kind: 'auto_renew_on'; userId: string; originalTransactionId: string }
+  | { kind: 'grace_period'; userId: string; originalTransactionId: string; expiresAt: number }
+  | { kind: 'expired'; userId: string; originalTransactionId: string; reason: 'voluntary' | 'billing_retry' | 'price_increase' }
+  | { kind: 'refunded'; userId: string; originalTransactionId: string; refundedAt: number }
+  | { kind: 'refund_reversed'; userId: string; originalTransactionId: string };
+
+// ASSN V2 -> NormalizedEvent
+function normalizeAssnV2(payload: AssnV2Payload, signedDate: number): NormalizedEvent | null {
+  const t = payload.notificationType;
+  const sub = payload.subType;
+  const otx = payload.data.signedTransactionInfo.originalTransactionId;
+  const userId = payload.data.signedTransactionInfo.appAccountToken; // requires prior binding
+  if (!userId) return null;
+
+  switch (t) {
+    case 'SUBSCRIBED':
+      return { kind: 'started', userId, originalTransactionId: otx,
+               productId: payload.data.signedTransactionInfo.productId,
+               expiresAt: payload.data.signedTransactionInfo.expiresDate,
+               isFamily: payload.data.signedTransactionInfo.inAppOwnershipType === 'FAMILY_SHARED' };
+    case 'DID_RENEW':
+      return { kind: 'renewed', userId, originalTransactionId: otx,
+               expiresAt: payload.data.signedTransactionInfo.expiresDate };
+    case 'DID_CHANGE_RENEWAL_STATUS':
+      return sub === 'AUTO_RENEW_DISABLED'
+        ? { kind: 'auto_renew_off', userId, originalTransactionId: otx }
+        : { kind: 'auto_renew_on', userId, originalTransactionId: otx };
+    case 'DID_FAIL_TO_RENEW':
+      return sub === 'GRACE_PERIOD'
+        ? { kind: 'grace_period', userId, originalTransactionId: otx,
+            expiresAt: payload.data.signedRenewalInfo.gracePeriodExpiresDate }
+        : null; // wait for the eventual EXPIRED if grace period is not active
+    case 'EXPIRED':
+      return { kind: 'expired', userId, originalTransactionId: otx,
+               reason: sub === 'VOLUNTARY' ? 'voluntary' :
+                       sub === 'PRICE_INCREASE' ? 'price_increase' : 'billing_retry' };
+    case 'REFUND':
+      return { kind: 'refunded', userId, originalTransactionId: otx, refundedAt: signedDate };
+    case 'REFUND_REVERSED':
+      return { kind: 'refund_reversed', userId, originalTransactionId: otx };
+    default:
+      return null; // ignore tests and out-of-policy notifications
+  }
+}
+```
+
+The hard prerequisite is that you must bind `appAccountToken` at purchase time. Without it, the server has no reliable way to know which of your users this transaction belongs to — and for Family Sharing, no way to figure out which family member's entitlement to update. Pass a per-user UUID into the StoreKit purchase call, and you'll see the same value in `signedTransactionInfo.appAccountToken` on the server.
+
+## The state machine — transition rules that close the edge cases
+
+Here is the heart of the article. The reducer that consumes normalized events and updates `entitlements`:
+
+```ts
+async function applyEvent(env: Env, evt: NormalizedEvent): Promise<void> {
+  const current = await env.DB.prepare(
+    'SELECT * FROM entitlements WHERE user_id = ? AND original_tx = ?'
+  ).bind(evt.userId, evt.originalTransactionId).first<Entitlement>();
+
+  // Idempotency: never apply the same event twice
+  if (current?.lastEventUuid === evt.notificationUuid) return;
+
+  // Critical: never let a stale event overwrite a newer state
+  if (current && evt.signedDate < current.signedDate) {
+    console.warn('[entitlement] stale event skipped', { evtKind: evt.kind });
+    return;
+  }
+
+  let next: Partial<Entitlement>;
+
+  switch (evt.kind) {
+    case 'started':
+    case 'renewed':
+      next = {
+        status: 'active',
+        expiresAt: evt.expiresAt,
+        willAutoRenew: true,
+        inFamily: 'isFamily' in evt ? evt.isFamily : current?.inFamily ?? false,
+      };
+      break;
+    case 'auto_renew_off':
+      next = { willAutoRenew: false }; // status stays active until the period ends
+      break;
+    case 'auto_renew_on':
+      next = { willAutoRenew: true };
+      break;
+    case 'grace_period':
+      next = { status: 'grace', expiresAt: evt.expiresAt };
+      break;
+    case 'expired':
+      // ⚠️ Do NOT revoke immediately — DID_RENEW often arrives within seconds
+      // A 60s delayed worker is the practical pattern in production
+      next = { status: 'expired', willAutoRenew: false };
+      break;
+    case 'refunded':
+      next = { status: 'refunded', willAutoRenew: false };
+      break;
+    case 'refund_reversed':
+      // If the original expiration is still in the future, restore access
+      if (current && current.expiresAt > Date.now()) {
+        next = { status: 'active' };
+      } else {
+        next = { status: 'expired' };
+      }
+      break;
+    default:
+      return;
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO entitlements (user_id, product_id, status, expires_at, will_auto_renew, in_family, last_event_uuid, signed_date, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, original_tx) DO UPDATE SET
+      status = excluded.status,
+      expires_at = COALESCE(excluded.expires_at, entitlements.expires_at),
+      will_auto_renew = excluded.will_auto_renew,
+      last_event_uuid = excluded.last_event_uuid,
+      signed_date = excluded.signed_date,
+      updated_at = excluded.updated_at
+  `).bind(
+    evt.userId, current?.productId ?? '',
+    next.status ?? current?.status ?? 'active',
+    next.expiresAt ?? current?.expiresAt ?? 0,
+    next.willAutoRenew ?? current?.willAutoRenew ?? false,
+    next.inFamily ?? current?.inFamily ?? false,
+    evt.notificationUuid,
+    evt.signedDate,
+    Date.now(),
+  ).run();
+}
+```
+
+The expected behavior: replaying the same notification 100 times leaves the row unchanged, and the stale-event guard means out-of-order ASSN V2 deliveries can't corrupt state.
+
+## Grace period and family sharing — never revoke prematurely
+
+Grace period is Apple's way of telling you "billing failed, but please keep this user happy a bit longer." It's the **wrong moment to revoke**. Many naive implementations treat `DID_FAIL_TO_RENEW` as a signal to flip Pro off — that's the bug.
+
+The pattern I recommend:
+
+- During grace period, set `status='grace'` and keep the UI fully accessible
+- Show a banner that says "Your billing will stop soon — please update your payment method"
+- Only revoke when `EXPIRED` arrives after grace ends
+
+Family Sharing arrives with `inAppOwnershipType === 'FAMILY_SHARED'`, but the `appAccountToken` carried in the JWS is the **purchaser's** UUID, not the family member's. That means you need a separate flow to register family members' entitlements. In my apps, the first time a family member opens the app, the client reads `Transaction.currentEntitlements`, finds the `FAMILY_SHARED` transactions, and registers them server-side under the family member's user ID. I write more about this in [The four triggers that make Family Sharing IAP disappear — designing safe in-app purchases for kids' apps in Rork](/articles/rork-dev/rork-family-sharing-iap-ask-to-buy-implementation-guide).
+
+## A walked-through example — one user's six months of state transitions
+
+To make the design concrete, here's a single user's actual sequence of events from one of my apps, over roughly six months. Names and IDs are scrubbed; the shape is real.
+
+Day 0: The user purchases a monthly subscription. The client calls StoreKit's purchase API with `appAccountToken = "u_38a9f1"`. The transaction completes locally. ASSN V2 fires `SUBSCRIBED` to the server within a few seconds. `normalizeAssnV2` produces `{ kind: 'started', userId: 'u_38a9f1', expiresAt: <Day 30> }`. The state machine inserts a row: `status='active'`, `expiresAt=<Day 30>`, `willAutoRenew=true`. Total time from tap to entitlement: about eight seconds.
+
+Day 30: Apple attempts the renewal. It succeeds. `DID_RENEW` arrives. `expiresAt` is updated to `<Day 60>`. No other fields change. The user notices nothing, which is the point.
+
+Day 41: The user's credit card expires. They don't update it. Day 60 arrives. Apple attempts the renewal — fails. `DID_FAIL_TO_RENEW` arrives with `subType='GRACE_PERIOD'`. The state machine sets `status='grace'` and `expiresAt=<Day 76>` (Apple's grace window). The app starts showing a yellow banner: "Your billing failed — please update your payment method." The user keeps full Pro access.
+
+Day 76: Grace period ends. Apple has retried billing and given up. `EXPIRED` arrives with `subType='BILLING_RETRY'`. The state machine queues a deferred mutation. 90 seconds later, no `DID_RENEW` has arrived, so the deferred handler fires and writes `status='expired'`. The app's UI flips to non-Pro. The user, now actually inconvenienced, finally updates their payment method.
+
+Day 78: The user opens the App Store, taps "renew," and resubscribes. A new `originalTransactionId` is issued. ASSN V2 fires `SUBSCRIBED` again. The state machine inserts a *new* row keyed by the new `originalTransactionId`. The old row stays at `status='expired'`, providing historical context. The read-path query (`SELECT * WHERE userId=? AND status IN ('active','grace') ORDER BY expires_at DESC LIMIT 1`) picks up the new row.
+
+Day 145: The user files a refund request through Apple's support channel. Apple investigates and approves it. `REFUND` fires. The state machine sets `status='refunded'` on the affected row. The app immediately revokes Pro.
+
+Day 152: Apple's fraud team flags the refund as suspicious during their post-approval audit. `REFUND_REVERSED` fires. The state machine checks `current.expiresAt > Date.now()`. It is — the refunded period has not yet ended. The state goes back to `status='active'`. The user opens the app the next morning and finds Pro features restored.
+
+That's six events over six months for one user, and every transition was driven by a normalized event flowing through the same reducer. No manual intervention. No support ticket. No "did we just revoke a paying user?" scramble. This is what the design buys you.
+
+## Out-of-order deliveries and the race conditions you'll see in production
+
+The single property of ASSN V2 that surprises most developers the first time they hit it is that delivery order is not guaranteed. Apple's distributed delivery system can hand off `DID_RENEW` to your endpoint before the corresponding `EXPIRED` for the previous billing cycle, even though `EXPIRED` happened earlier in real time. Two things make this manageable.
+
+The first is the `signedDate` field on every JWS-signed event. This is the moment Apple's system created the notification, not the moment your server received it. Your stale-event guard (`evt.signedDate < current.signedDate`) anchors the state machine to Apple's clock instead of your wall clock. The state machine never goes backwards in time, even if your reverse proxy holds a request for thirty seconds and lets a fresher one in first.
+
+The second is that you should treat `expiresAt` as monotonically increasing on `started`/`renewed` events. If a `renewed` event arrives with an `expiresAt` lower than the current row's `expiresAt`, that event is stale by definition and should be dropped. This protects you from the case where a duplicate `DID_RENEW` from a previous cycle re-runs through your queue.
+
+In practice you'll also want a small "soak time" on `EXPIRED` before flipping the UI. The pattern that has worked for me is to write the event into the log immediately, but defer the actual entitlement mutation by 90 seconds via a Cloudflare Workers scheduled handler. If a matching `DID_RENEW` arrives in that window, the deferred mutation is canceled. The user never sees a flicker. Latency cost: 90 seconds of "they may have access during the gap" — which is exactly the user-friendly choice.
+
+## REFUND vs REFUND_REVERSED — the rules of judgment
+
+A `REFUND` event means Apple has approved a refund. `REFUND_REVERSED` means that refund was later undone. Reversal feels rare but happens whenever Apple's investigation flags the refund as fraudulent or otherwise invalid.
+
+Two implementation rules:
+
+First, do **not** delete the original transaction from your `events` log. Record the refund as a state transition on `entitlements` (`status = 'refunded'`) and keep the historical event row. You'll need it later for fraud detection or to cleanly restore on reversal.
+
+Second, when a reversal arrives, judge whether to restore access by checking whether the original `expiresAt` is still in the future. If the original window has already passed at the moment of reversal, restoring access would unfairly grant a period the user did not pay for — keep `status='expired'` in that case.
+
+The same rules apply to Stripe `charge.refunded` (covered at a friendlier level in [The complete guide to implementing Stripe subscriptions in Rork](/articles/rork-dev/rork-stripe-subscription-complete-guide)).
+
+## On the client — trust the server, augment with StoreKit 2
+
+A clean React Native hook for entitlement looks like this:
+
+```tsx
+// hooks/useEntitlement.ts
+import { useEffect, useState } from 'react';
+import * as InAppPurchases from 'expo-in-app-purchases';
+
+type EntitlementStatus = 'loading' | 'active' | 'grace' | 'expired' | 'refunded';
+
+export function useEntitlement(productId: string): { status: EntitlementStatus; revalidate: () => Promise<void> } {
+  const [status, setStatus] = useState<EntitlementStatus>('loading');
+
+  const fetchFromServer = async () => {
+    try {
+      const res = await fetch('/api/entitlements/me', { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json() as { entitlements: { productId: string; status: EntitlementStatus; expiresAt: number }[] };
+      const ent = data.entitlements.find(e => e.productId === productId);
+      if (!ent) { setStatus('expired'); return; }
+      setStatus(ent.status); // grace and active are both "accessible," distinguished in UI
+    } catch (e) {
+      console.error('[entitlement] fetch failed', e);
+      // Network failure: fail-closed (deny by default if we can't verify)
+      setStatus('expired');
+    }
+  };
+
+  useEffect(() => {
+    fetchFromServer();
+    // Mirror StoreKit 2's transactions.updates listener
+    const sub = InAppPurchases.setPurchaseListener(({ responseCode }) => {
+      if (responseCode === InAppPurchases.IAPResponseCode.OK) {
+        // ASSN V2 may arrive on the server slightly after the client purchase event
+        setTimeout(fetchFromServer, 3000);
+      }
+    });
+    return () => { sub.remove(); };
+  }, [productId]);
+
+  return { status, revalidate: fetchFromServer };
+}
+```
+
+The discipline that matters: do **not** treat `Transaction.currentEntitlements` on the client as the source of truth. A jailbroken device can spoof it. The server's entitlement decision is the truth; client-side StoreKit events are revalidation triggers.
+
+## Observability — catch a broken pipeline before users do
+
+Self-hosted entitlement is only as reliable as your monitoring. The two metrics that have caught real incidents for me:
+
+The first is the **entitlement-event lag**. For every `DID_RENEW` event that lands, measure `now() - signedDate`. Plot the p99. If lag spikes past five minutes, either Apple is having a delivery hiccup or your endpoint is queuing under load. A small alert here costs nothing and catches outages early.
+
+The second is the **active-entitlement count drift**. Once a day, count the number of rows in `entitlements` with `status='active'` and `expires_at > now()`. Compare against yesterday. A drop greater than your typical churn rate is a signal that something in the state machine is incorrectly downgrading users. The cause is usually a recent code change that introduced a stale-event guard regression or a miscategorized notification.
+
+Both of these run on a Cloudflare Workers cron trigger writing to your analytics sink. Neither requires any third-party service. The point is to make "we silently broke entitlement" structurally impossible to miss.
+
+## Five pitfalls you'll hit if you're not careful
+
+The pitfalls below are the ones I have personally either shipped to production or watched another developer ship. They are not theoretical. Each one has a concrete code change you can make today.
+
+1. **Revoking on `EXPIRED` immediately**
+   - `DID_RENEW` often arrives within seconds, sometimes within milliseconds. The Apple billing system fires `EXPIRED` when the prior period ends, then `DID_RENEW` when the new period is confirmed — these are two separate notifications and they are not guaranteed to arrive in order. Either delay revocation in a 60–120 second worker, or keep the UI in "active" for a few more minutes after `EXPIRED`. Snapping the flag to `false` synchronously is the fastest way to lose three users in one cycle. The fix is a soft-revoke: write `status='expired'` to the database, but have the read path also accept `status='expired' AND updated_at > now() - 120s` as "still active for the user-facing experience."
+2. **Keying entitlements by `transactionId` instead of `originalTransactionId`**
+   - `transactionId` changes on every renewal. `originalTransactionId` is stable across the entire subscription lifetime. If your `WHERE` clause uses `transactionId`, every renewal will look like a brand new subscription, and your "active subscriber" count will diverge from reality after a single billing cycle. The fix is straightforward in code; the painful part is data migration if you've been running the wrong key for months. Plan a brief maintenance window, deduplicate by `originalTransactionId`, and move on.
+3. **Forgetting to bind `appAccountToken`**
+   - Without it, the server cannot reliably tell whose purchase this is. You'll end up matching by email — which is fragile, unsafe, and breaks entirely for users who change their Apple ID email. Worse, when Family Sharing arrives, the email on the receipt is the purchaser's, not the family member's, so your matching falls apart silently. Bind a per-user UUID at purchase time, and treat any incoming notification without an `appAccountToken` as a developer error rather than data.
+4. **Processing the same `notificationUUID` twice**
+   - Apple retries on delivery failure. The retry can land on a different worker instance than the original. Make `lastEventUuid` (or a separate `processed_notifications` table) the idempotency anchor. Without it, you can flip a user from `active` to `expired` and back, racing the same event. The pathological case: a redelivery of an old `EXPIRED` notification arrives after the user has already renewed. If you don't check the UUID, you re-revoke a paying user. With the UUID check (and the stale-`signedDate` guard), the redelivery is a no-op.
+5. **Trusting the client clock for time-based decisions**
+   - Users can change their device clock. All "is the period still valid?" decisions belong on the server, against `signedDate` from the JWS — not your server's wall clock either, since that can drift. A common variant of this bug: showing "Subscription expires in 3 days" using `expiresAt - Date.now()` on the client. If the user's clock is wrong, the warning fires at the wrong time, and they call support. Compute the remaining time on the server and pass the formatted string down. The client does presentation only.
+
+## Testing strategy — what Sandbox can and cannot give you
+
+Sandbox can replay routine flows, but it cannot easily produce `REFUND_REVERSED` or some Family Sharing edge cases. The layered test strategy that has worked for me:
+
+- **Unit tests on the normalization layer**: store anonymized real-world ASSN V2 payloads as fixtures; assert `normalizeAssnV2` returns the expected `NormalizedEvent`.
+- **Unit tests on the state machine**: feed arbitrary `NormalizedEvent` sequences in arbitrary orders and assert the final `entitlements` row. Always include reversed orderings (DID_RENEW arriving before its triggering EXPIRED).
+- **End-to-end against Sandbox**: standard purchase, cancel, and resubscribe flows verified manually.
+- **Production mirror (dev only)**: a `fake-assn` endpoint that lets you forge JWS-signed payloads with a development-only key pair and run them through the same verification stack as production. This is how you exercise REFUND_REVERSED before shipping.
+
+The thing nobody tells you about Sandbox is that some flows simply do not exist there. `REFUND_REVERSED` cannot be triggered. `CONSUMPTION_REQUEST` (Apple asking your server "did this user actually consume the content?") cannot be issued. Family Sharing across two real Sandbox accounts is theoretically possible but, in practice, painfully flaky. The `fake-assn` endpoint pattern — which lets you mint test JWS payloads against a development-only key pair and feed them through the production verification path — is what closes the gap. The only discipline you need is to make sure that endpoint is gated behind an `if (env.ENVIRONMENT !== 'production')` check, and that the key pair lives only in your dev environment's secret store.
+
+A second testing tactic worth mentioning: keep a `fixture.ndjson` of every novel ASSN V2 payload you've seen in production (with personal data scrubbed). Every time a payload arrives that doesn't match an existing fixture, append it. Replay the file in CI as a regression suite. After six months you'll have several hundred fixtures covering almost every realistic shape Apple ships, and your normalization layer becomes nearly impossible to break unintentionally.
+
+Once that scaffolding is in place, your anxiety about edge cases drops to nearly zero. For the cancel-prevention side of the picture (a separate concern from entitlement decisions), see [RevenueCat advanced — Win-Back campaigns, offer codes, and cancellation prevention to maximize LTV](/articles/rork-dev/rork-max-revenuecat-winback-offer-codes-churn-prevention-guide). Reading both should make the boundary between "who has access?" and "how do we keep them subscribed?" feel cleaner.
+
+If you want a deeper architectural foundation, [Implementing Domain-Driven Design (Vaughn Vernon)](https://www.amazon.co.jp/dp/479813161X/?tag=pinocchio-22) — the chapters on aggregates and consistency boundaries map almost one-to-one onto the `events` / `entitlements` separation in this article.
+
+---
+
+A concrete first step: open the codebase that's currently running your subscription logic and `grep` for direct comparisons against `expiresAt`. If you find more than three, the state-machine refactor in this article is worth doing. Replace those checks one at a time with calls to `getEntitlement(userId, productId)`, and the late-night question — *was that revocation actually correct?* — becomes a lot rarer.
+
+The honest tradeoff: this design is more code than the naive `expiresAt` check, and the first time you ship it the wins are not visible. The first paying user who silently regains access during a Apple delivery hiccup will never email you to thank you. The first refund-reversal that auto-restores entitlement won't appear on any dashboard. But the support tickets that don't get filed, the angry tweets that don't get posted, and the churn caused by misidentified state — those start accumulating in the negative space of your week. After three months on this design, the question stops being "did we get this user's access right?" and becomes "what new feature should we ship next?" — which is the actual reason you're building the app.
