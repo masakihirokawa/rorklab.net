@@ -1,0 +1,203 @@
+---
+title: "Fixing Date/Timezone Bugs in Rork Apps: When Times Are 9 Hours Off"
+slug: "rork-date-timezone-jst-display-fix"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-29T09:45"
+updated: "2026-04-29T09:45"
+author: "Rork Lab"
+description: "When dates appear shifted by 9 hours, when an entry made at 11pm shows up on the wrong day, or when production data drifts—here are the patterns that catch Rork developers and how to fix them safely."
+tags: ["Rork", "Date", "Timezone", "JST", "Troubleshooting", "React Native", "date-fns"]
+---
+
+You build a budget-tracking app, log an expense for "yesterday," and the list shows it as today. You write a journal entry at 11pm, and tomorrow morning it's filed under the wrong date. I have hit this exact wall in several Rork projects, and the fix is rarely where you first look.
+
+The root cause almost always boils down to two things. First, a UTC string from the server like `2026-04-29T00:00:00Z` gets passed to `new Date()` and silently re-interpreted in the device's local timezone. Second, you build a `Date` object on the client and `JSON.stringify` quietly converts it back to UTC, so the value you send doesn't match what you saw on screen.
+
+Rork's AI tends to generate code that *looks* correct in light testing, which makes this class of bug easy to ship. Let's go through the patterns one by one.
+
+## First, isolate where the drift is happening
+
+Before changing any code, find out what's actually drifting. Skip this and you'll patch the wrong layer and break something else.
+
+Start by printing every step side by side:
+
+```typescript
+// Drop this in temporarily to inspect each stage
+const raw = '2026-04-29T00:00:00Z';        // Value from the server
+const parsed = new Date(raw);
+console.log('Raw string:', raw);
+console.log('Date object:', parsed);
+console.log('Local string:', parsed.toString());
+console.log('toISOString():', parsed.toISOString());
+console.log('toLocaleString JP:', parsed.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }));
+console.log('getTimezoneOffset:', parsed.getTimezoneOffset());
+// Expected on a JST device:
+//   Local string  → "Wed Apr 29 2026 09:00:00 GMT+0900"
+//   getTimezoneOffset → -540 (JST is 9 hours ahead, so the offset is negative)
+```
+
+Run this in both the iOS simulator and on a real device. Simulators inherit your Mac's timezone, so a difference between the two often reveals a phone whose timezone is set to `Asia/Shanghai` or unset entirely.
+
+## Pattern 1: Treating a UTC string as if it were local
+
+This is by far the most common one. The server returns `2026-04-29T00:00:00Z` (the trailing `Z` means UTC), but the client immediately calls `getDate()` or `getHours()`. Those return values *after* the conversion to local time, so on a JST device the values are 9 hours ahead, and around midnight you get the date wrong.
+
+```typescript
+// ❌ Off by a day at the boundaries
+const record = { createdAt: '2026-04-29T00:00:00Z' };  // 2026/04/29 00:00 UTC
+const d = new Date(record.createdAt);
+const dayLabel = `${d.getMonth() + 1}/${d.getDate()}`;  // We want "4/29"
+// On JST this becomes 2026/04/29 09:00 → "4/29" (looks fine here)
+// But if the server sends 2026/04/28T15:00:00Z, JST shows 2026/04/29 00:00
+// → Client renders "4/29", database row is "4/28" — silent drift
+```
+
+If your server has any concept of "the day this happened" (daily totals, a one-entry-per-day journal, streaks), this drift is fatal.
+
+The fix is to **separate the meaning of "date" from the moment in time** and pick the right tool for each.
+
+```typescript
+import { format, parseISO } from 'date-fns';
+import { toZonedTime } from 'date-fns-tz';
+
+// ✅ For display: always convert to JST, then format
+function formatJstDate(isoString: string): string {
+  const utc = parseISO(isoString);                    // Parse as UTC correctly
+  const jst = toZonedTime(utc, 'Asia/Tokyo');         // Explicit conversion
+  return format(jst, 'yyyy/MM/dd HH:mm');
+}
+
+const label = formatJstDate('2026-04-29T00:00:00Z');
+console.log(label);  // → "2026/04/29 09:00"
+```
+
+`toZonedTime` from `date-fns-tz` returns a `Date` whose internal UTC instant is unchanged but whose display fields read correctly in JST. Combined with `format`, the rendered string is independent of the device's timezone setting.
+
+## Pattern 2: Sending local times to the server as if they were absolute
+
+The reverse mistake is just as common. The user picks "April 29, 2026" in a date picker, and `JSON.stringify` calls `toISOString()` under the hood, which converts back to UTC. If the server takes the first ten characters as the date, you've now misfiled the record by a day.
+
+```typescript
+// ❌ Common bug
+const selectedDate = new Date(2026, 3, 29);  // 2026/04/29 00:00:00 local (JST)
+const payload = { date: selectedDate };
+fetch('/api/diary', { method: 'POST', body: JSON.stringify(payload) });
+// What actually goes over the wire:
+// { "date": "2026-04-28T15:00:00.000Z" }  ← rolled back a day in UTC
+```
+
+The fix is to be explicit. Send a date as a plain `YYYY-MM-DD` string when you mean "a date," and include the timezone offset when you mean "this exact moment."
+
+```typescript
+import { format, formatISO } from 'date-fns';
+
+// ✅ Sending a calendar date
+const selectedDate = new Date(2026, 3, 29);
+const payload = {
+  date: format(selectedDate, 'yyyy-MM-dd'),  // → "2026-04-29"
+};
+fetch('/api/diary', { method: 'POST', body: JSON.stringify(payload) });
+
+// ✅ Sending a moment in time
+const now = new Date();
+const payloadWithTime = {
+  createdAt: formatISO(now),  // → "2026-04-29T09:30:15+09:00" (offset preserved)
+};
+```
+
+Always preserve the offset on absolute timestamps. With `+09:00` in the string, both the server and any other client can reconstruct the exact instant unambiguously.
+
+## Pattern 3: Dates becoming strings after AsyncStorage round-trips
+
+Local persistence has its own gotcha. `AsyncStorage` only stores strings, so a `Date` survives the round trip as text. Calling `getHours()` on the restored value blows up at runtime, but only sometimes—because in many flows you re-create the Date from a fresh API call before reading the saved one.
+
+```typescript
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// Save
+const lastOpened = new Date();
+await AsyncStorage.setItem('lastOpened', JSON.stringify(lastOpened));
+// JSON.stringify invokes toISOString → "2026-04-29T00:30:15.000Z" lands in storage
+
+// Read — ❌ This stays a string
+const raw = await AsyncStorage.getItem('lastOpened');
+const value = raw ? JSON.parse(raw) : null;
+console.log(value.getHours());  // TypeError: value.getHours is not a function
+
+// ✅ Rehydrate properly
+const restored = raw ? new Date(JSON.parse(raw)) : null;
+console.log(restored?.getHours());  // works
+```
+
+For more storage-related landmines around AsyncStorage and persistence in general, see [Why your Rork app data disappears or fails to save](/articles/rork-dev/rork-app-data-not-saved-disappears-fix).
+
+## Pattern 4: Works in dev, drifts in production
+
+Everything looked fine during development, then users start reporting wrong dates after launch. The usual suspects:
+
+- You only tested on a JST device, and overseas users hit edge cases you never saw
+- The iOS simulator was at its default UTC and you didn't notice
+- Daylight Saving Time crossings produced data your code didn't anticipate
+
+The cure is to test in multiple timezones from day one. On macOS you can boot the simulator under a different timezone with a single env var:
+
+```bash
+# Run the simulator in Honolulu time
+TZ='Pacific/Honolulu' npx expo run:ios
+
+# Reset (or just restart your terminal)
+unset TZ
+```
+
+I make a habit of running through three timezones (JST, UTC, PDT) before any release, with seed data that crosses the day boundary, and verify the UI doesn't shift.
+
+## Pattern 5: `new Date('2026-04-29')` behaves differently across platforms
+
+A subtle one: passing a hyphen-separated string to `new Date()` doesn't parse identically on every JavaScript engine. Hermes on iOS and Hermes on Android have shipped slightly different behaviors over time, and slash-separated strings (`'2026/04/29'`) sometimes return `Invalid Date` on iOS.
+
+The simple rule: **never trust the `Date` constructor for parsing**. Always go through a parser you control.
+
+```typescript
+// ❌ Behavior depends on the engine
+const d1 = new Date('2026-04-29');     // Differs by environment
+const d2 = new Date('2026/04/29');     // Returns Invalid Date on some iOS builds
+
+// ✅ Use date-fns parsers
+import { parse, parseISO } from 'date-fns';
+const d3 = parseISO('2026-04-29');                          // ISO 8601 only
+const d4 = parse('2026/04/29', 'yyyy/MM/dd', new Date());   // Explicit format
+```
+
+`parseISO` is strict and predictable. `parse` lets you spell out the format. Either is safer than letting `new Date()` guess.
+
+## A word on library choice
+
+I've moved away from `moment.js` entirely and settled on `date-fns` plus `date-fns-tz`. Three reasons:
+
+- Function-based imports keep the bundle small
+- Immutability means I never accidentally mutate someone else's `Date`
+- TypeScript support is excellent
+
+`dayjs` is a popular lightweight alternative, but I find the timezone plugin awkward to import everywhere, and `date-fns` reads more cleanly in my codebases. If you ask Rork's AI to "write the date handling," it sometimes reaches for `moment`—either correct it explicitly in the prompt or replace the import after generation.
+
+## What to do today
+
+If you only have time for one thing, **drop a thin wrapper into your project and route every display through it**:
+
+```typescript
+// utils/datetime.ts
+import { format, parseISO } from 'date-fns';
+import { toZonedTime } from 'date-fns-tz';
+
+export function formatJstDate(input: string | Date, pattern = 'yyyy/MM/dd HH:mm'): string {
+  const utc = typeof input === 'string' ? parseISO(input) : input;
+  const jst = toZonedTime(utc, 'Asia/Tokyo');
+  return format(jst, pattern);
+}
+```
+
+With this in place, you stop second-guessing yourself every time you build a new screen, and Rork's AI starts calling the helper instead of writing one-off `toLocaleString` calls.
+
+If your symptoms also include UI not updating after a state change, [State updates not triggering re-renders in Rork](/articles/rork-dev/rork-state-not-updating-rerender-fix) often pairs with this one—date bugs sometimes hide behind stale renders, and chasing both at once shortens the debugging loop.
