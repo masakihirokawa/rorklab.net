@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "APPSTORE — App Store 新規アプリリリース60%増、AIノーコードビルダーで開発の民主化が加速（Q1 2026）",
-    "LOVABLE — Lovable がモバイルアプリを iOS / Android で公開、AI ノーコード App ビルダー競争激化（4/27）",
-    "ANYTHING — Anything が AI App Builder ランキング1位、自然言語からネイティブ iOS/Android を生成（4/28）",
-    "MAX — Rork Max がローンチ後3日で $1.5M ARR 達成、ネイティブ Swift 生成への需要が爆発（2026年）",
-    "ECOSYSTEM — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage まで Apple 全プラットフォーム対応",
+    "ANYTHING — Anything が AI App Builder ランキング1位を獲得、Rork Max の最大競合として急浮上（4/28）",
+    "LOVABLE — Lovable がモバイルアプリを iOS / Android で公開、ノーコード競争はモバイル戦線へ突入（4/27）",
+    "APPSTORE — App Store 新規アプリリリース60%増、4月単月では前年比104%増と AI ツール普及で開発民主化が加速",
+    "RORK15M — Rork が $15M シードラウンドを完了、Paperline 買収で Native Swift 生成を強化（4/9）",
+    "MAX — Rork Max が iPhone・iPad・Watch・TV・Vision Pro・iMessage まで Apple 全プラットフォーム対応",
     "CLOUDMAC — Cloud Mac Fleet でビルド、Xcode 不要・Mac 不要で2クリック App Store 公開を実現",
   ],
   en: [
-    "APPSTORE — Worldwide app launches up 60% YoY in Q1 2026 as AI no-code builders democratize mobile dev",
-    "LOVABLE — Lovable launches its AI app builder on iOS and Android, mobile no-code race heats up (4/27)",
-    "ANYTHING — Anything ranked #1 AI app builder, generates native iOS, Android, and web from natural language (4/28)",
-    "MAX — Rork Max hits $1.5M ARR within 3 days of launch, demand for native Swift generation is surging (2026)",
-    "ECOSYSTEM — Build for the entire Apple lineup: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "CLOUDMAC — Cloud Mac fleet builds your apps, no Xcode and no Mac required, with two-click App Store submission",
+    "ANYTHING — Anything ranks #1 in the Top 8 AI App Builders, emerging as Rork Max's biggest rival (4/28)",
+    "LOVABLE — Lovable launches its AI app builder on iOS and Android, the no-code race shifts to mobile (4/27)",
+    "APPSTORE — App Store launches up 60% YoY in Q1 2026, with April alone +104% as AI tools democratize app dev",
+    "RORK15M — Rork closes a $15M seed round and acquires Paperline to strengthen native Swift generation (4/9)",
+    "MAX — Rork Max covers the full Apple lineup: iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
+    "CLOUDMAC — Cloud Mac fleet handles builds, no Xcode and no Mac required, with two-click App Store submission",
   ],
 };
 
