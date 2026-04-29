@@ -1,0 +1,530 @@
+---
+title: "Rork × MetricKit でアプリの本番品質を計測する完全実装ガイド — クラッシュ・ハング・電池消費の診断基盤を一人で作る"
+slug: "rork-metrickit-production-diagnostics-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-29T20:15"
+updated: "2026-04-29T20:15"
+author: "Rork Lab"
+description: "Rorkで作ったアプリの本番品質を、Apple純正のMetricKitだけで継続的に計測する設計を解説します。クラッシュ・ハング・スクロール品質・電池消費を、サードパーティSDKなしで見える化する実装パターンです。"
+tags: ["Rork", "MetricKit", "本番運用", "クラッシュ解析", "個人開発"]
+highlights:
+  - "App Store Connect の数字だけでは見えない『本番のヒヤリ』を、MetricKit のレポートで具体的に特定できるようになる"
+  - "Sentry や Firebase Crashlytics に頼らず、Apple 純正の枠組みだけで診断パイプラインを組める実装ノウハウを習得できる"
+  - "クラッシュ・ハング・電池消費・スクロール品質を週次でレビューする、個人開発者でも回せる運用フローを作れる"
+---
+
+3つほどアプリを App Store に出した頃、私は不思議な感覚に包まれていました。ダウンロード数は伸びているのに、星3つのレビューがじわじわ増えていきます。Crashlytics は入れていて、クラッシュは月に数件あるかないか。それなのに「使いづらい」「重い」というレビューが減りません。理由が分かったのは、Apple のドキュメントを読み込んでいたとき、ふと `MetricKit` の項目に目が止まってからでした。
+
+クラッシュは「アプリが落ちた」という極端な事象です。けれど星3つを付ける読者の不満はもっと前段にあります。スクロールがカクついたり、起動に2秒かかったり、戻るボタンを押した後 0.5 秒固まったり、バッテリーの減りが早く感じたり。こうした「ヒヤリ」をすべて拾える唯一の標準フレームワークが、iOS 13 から提供されている [MetricKit](https://developer.apple.com/documentation/metrickit) です。Rork で作ったアプリにも当然組み込めます。
+
+この記事では、Rork（Expo / React Native ベース）でビルドしたアプリに MetricKit を統合し、Cloudflare Workers をバックエンドにして、レポートを継続的に集計・可視化する全工程を、私が実際に運用している構成のまま共有します。サードパーティの観測 SDK を増やしたくない個人開発者ほど、この設計が刺さるはずです。
+
+## なぜ Sentry や Crashlytics ではなく MetricKit から始めるべきなのか
+
+最初に立場をはっきり書きます。私は Sentry も Crashlytics も否定しません。チーム開発で、リアルタイムにスタックトレースを追いたい現場では今でも有効な選択肢だと思います。ただ「個人開発者が静かに改善を続ける」という文脈では、MetricKit の方が圧倒的に向いています。
+
+理由は3つあります。1つ目は **プライバシー設計** です。MetricKit のレポートは Apple のシステムが集計し、ユーザー識別子を含まない形でアプリに渡されます。GDPR や ATT 同意を気にせず使えます。2つ目は **電池への優しさ** です。Crashlytics や Sentry のリアルタイム送信は、起動ごとに小さな通信を発生させますが、MetricKit は1日1回まとめて配信されるため、ユーザーのバッテリーを消費しません。3つ目は **「測りたかった指標」がそのまま入っている** ことです。スクロール 60fps 維持率、起動時間、ハング時間、ディスク I/O、フォアグラウンド／バックグラウンド別のCPU・GPU 使用量。これらを自前で測ろうとすると数週間かかりますが、MetricKit は最初から計測してくれます。
+
+私はこのアプローチを好みます。「クラッシュを潰す」ためのツールに加えて、「日常の不満を減らす」ためのデータが純正で手に入る、というのは個人開発者にとって大きな差です。MetricKit を入れたうえで、本当に必要なら Sentry を後から足せばいい、という順番が現場では実用的だと感じています。
+
+## MetricKit が渡してくれる4種類のデータ
+
+MetricKit を組み込むと、`MXMetricManager` 経由で以下の4種類のレポートが届きます。最初に全体像を頭に入れておくと、実装の意図がクリアになります。
+
+- **MXMetricPayload**: 1日に1回、過去24時間のメトリクスをまとめたペイロード。起動時間・ハング・スクロール品質・CPU/GPU/メモリ・電池消費・ディスク I/O・GPS 使用時間などが含まれる
+- **MXDiagnosticPayload**: クラッシュ・ハング・ディスク書き込み超過・CPU 使用率超過時に届く、コールスタック付きの診断データ。クラッシュレポートとほぼ同等の情報が得られる
+- **MXCallStackTree**: `MXDiagnosticPayload` の中身。スレッドごとのコールスタックを JSON で保持
+- **MXSignpost**: 自前で計測したい区間（例: 「画像アップロードの開始から完了まで」）に名前を付けて記録する仕組み
+
+この記事では `MXMetricPayload` と `MXDiagnosticPayload` の活用に集中します。`MXSignpost` も最後に少し触れますが、まずはこの2つを掴むだけで「ヒヤリの正体」のかなりの部分が見えてきます。
+
+## Rork（Expo）アプリに MetricKit を組み込む最小実装
+
+ここからは具体的な実装に入ります。Rork は内部的に Expo のマネージドワークフローで動いていますが、MetricKit はネイティブモジュールが必要なため、`expo prebuild` で生成された iOS プロジェクトに対して Native Module を1つ追加する形を取ります。Rork Max なら SwiftUI 版でも同じ流れです。
+
+### Step 1: Expo Module の雛形を生成する
+
+まずプロジェクトのルートで Expo Module を作ります。これはプロジェクト内に小さな Swift パッケージを置くのと同じ感覚です。
+
+```bash
+# Expo Module の雛形作成
+npx create-expo-module@latest --local metric-kit-bridge
+
+# ディレクトリ確認
+ls modules/metric-kit-bridge/
+# → ios/, src/, expo-module.config.json
+```
+
+`--local` フラグを付けると、npm に公開しない「プロジェクト専用モジュール」として `modules/` 以下に作られます。チームに共有する必要がない個人開発では、これが最もシンプルです。
+
+### Step 2: Swift 側で MXMetricManager を購読する
+
+`modules/metric-kit-bridge/ios/MetricKitBridgeModule.swift` を以下のように書き換えます。コピー&ペーストでそのまま動く最小構成です。
+
+```swift
+import ExpoModulesCore
+import MetricKit
+import Foundation
+
+/// MetricKit のレポートを JS 側に橋渡しするモジュール。
+/// 1日1回 deliverMetricPayload / deliverDiagnosticPayload が呼ばれる。
+public class MetricKitBridgeModule: Module, MXMetricManagerSubscriber {
+  // 受信したペイロードを一時保存するキャッシュ。
+  // JS 側がアプリ起動時に取りに来るまで保持する。
+  private var pendingPayloads: [[String: Any]] = []
+
+  public func definition() -> ModuleDefinition {
+    Name("MetricKitBridge")
+
+    OnCreate {
+      // システムにこのオブジェクトをサブスクライバとして登録する。
+      // weak で渡されるため、モジュールは MXMetricManager によって解放されない。
+      MXMetricManager.shared.add(self)
+    }
+
+    OnDestroy {
+      MXMetricManager.shared.remove(self)
+    }
+
+    // JS 側から呼び出して、たまったペイロードを取り出す。
+    AsyncFunction("drainPendingPayloads") { () -> [[String: Any]] in
+      let snapshot = self.pendingPayloads
+      self.pendingPayloads.removeAll()
+      return snapshot
+    }
+  }
+
+  // 24時間ごとのメトリクス。アプリ次回起動時に届くことが多い。
+  public func didReceive(_ payloads: [MXMetricPayload]) {
+    for payload in payloads {
+      pendingPayloads.append([
+        "type": "metric",
+        "json": String(data: payload.jsonRepresentation(), encoding: .utf8) ?? "{}"
+      ])
+    }
+  }
+
+  // クラッシュ・ハング等の診断レポート。発生のたびに届く。
+  public func didReceive(_ payloads: [MXDiagnosticPayload]) {
+    for payload in payloads {
+      pendingPayloads.append([
+        "type": "diagnostic",
+        "json": String(data: payload.jsonRepresentation(), encoding: .utf8) ?? "{}"
+      ])
+    }
+  }
+}
+```
+
+ポイントは2つです。1つ目、`MXMetricManager.shared.add(self)` を `OnCreate` 内で呼ぶことで、アプリ起動と同時に購読が始まります。2つ目、ペイロードはモジュール内に一時キャッシュし、JS 側から `drainPendingPayloads()` で取りに来てから初めてメモリから消えます。これは、アプリ起動直後にネットワークが繋がっていない場合でも取りこぼさないための設計です。
+
+### Step 3: TypeScript 側のラッパーを書く
+
+`modules/metric-kit-bridge/src/MetricKitBridge.ts` を以下にします。
+
+```typescript
+import { requireNativeModule } from "expo-modules-core";
+
+type RawPayload = {
+  type: "metric" | "diagnostic";
+  json: string;
+};
+
+export type MetricKitPayload = {
+  type: "metric" | "diagnostic";
+  // jsonRepresentation() の生 JSON。スキーマは Apple が公開している。
+  // https://developer.apple.com/documentation/metrickit
+  payload: Record<string, unknown>;
+  receivedAt: string; // ISO8601
+};
+
+const native = requireNativeModule<{
+  drainPendingPayloads(): Promise<RawPayload[]>;
+}>("MetricKitBridge");
+
+export async function drainPendingPayloads(): Promise<MetricKitPayload[]> {
+  const raw = await native.drainPendingPayloads();
+  const now = new Date().toISOString();
+  return raw.map((r) => ({
+    type: r.type,
+    payload: safeParse(r.json),
+    receivedAt: now,
+  }));
+}
+
+function safeParse(s: string): Record<string, unknown> {
+  try {
+    return JSON.parse(s) as Record<string, unknown>;
+  } catch {
+    return { _parseError: true, raw: s };
+  }
+}
+```
+
+`safeParse` を挟んでいるのは、ごく稀に Apple 側のスキーマが変わって parse に失敗するケースを想定しているからです。本番では「失敗しても落とさない」設計を最初から入れておくと、深夜のクラッシュ通知で叩き起こされる回数が減ります。
+
+## レポートをサーバーに送る — Cloudflare Workers でのバックエンド実装
+
+ペイロードが手元に来ても、ローカルストレージに溜めるだけでは継続改善になりません。私は Cloudflare Workers を使った軽量な集計バックエンドを推奨します。Workers なら無料枠で月10万リクエスト捌けますし、D1 や R2 と組み合わせれば追加サーバーなしで完結します。
+
+### バックエンド側のエンドポイント
+
+```typescript
+// worker.ts — Cloudflare Workers
+import { Hono } from "hono";
+import type { MetricKitPayload } from "./types";
+
+type Env = {
+  METRICS_DB: D1Database;
+  // Rork アプリ側に埋め込む共有シークレット。
+  // 旧トークンも一定期間動かしたい場合は配列で持つ。
+  CLIENT_SECRET: string;
+};
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/v1/metrics", async (c) => {
+  // 簡易的な共有シークレット認証。
+  // 本番では JWT + App Attest にアップグレードすることを推奨する。
+  const auth = c.req.header("X-Client-Secret");
+  if (auth !== c.env.CLIENT_SECRET) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<{
+    appVersion: string;
+    osVersion: string;
+    deviceModel: string;
+    payloads: MetricKitPayload[];
+  }>();
+
+  // 1リクエストあたり最大 100 件で打ち切る。悪意ある巨大リクエスト対策。
+  const trimmed = body.payloads.slice(0, 100);
+
+  for (const p of trimmed) {
+    await c.env.METRICS_DB.prepare(
+      `INSERT INTO metric_payloads
+       (received_at, type, app_version, os_version, device_model, payload_json)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        p.receivedAt,
+        p.type,
+        body.appVersion,
+        body.osVersion,
+        body.deviceModel,
+        JSON.stringify(p.payload)
+      )
+      .run();
+  }
+
+  return c.json({ stored: trimmed.length });
+});
+
+export default app;
+```
+
+D1 のスキーマは以下のように単純なものから始めます。最初から複雑なスキーマを作ると後で正規化に苦労するので、生 JSON を保存しておき、ダッシュボードで都度パースする方が個人開発の規模感には合います。
+
+```sql
+CREATE TABLE metric_payloads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  received_at TEXT NOT NULL,
+  type TEXT NOT NULL,           -- 'metric' or 'diagnostic'
+  app_version TEXT NOT NULL,
+  os_version TEXT NOT NULL,
+  device_model TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+
+CREATE INDEX idx_metric_payloads_received_at ON metric_payloads(received_at);
+CREATE INDEX idx_metric_payloads_type_version ON metric_payloads(type, app_version);
+```
+
+### クライアント側で起動時にバッチ送信する
+
+アプリ側はシンプルです。起動直後の `useEffect` で1回だけ呼ぶことを推奨します。MetricKit のレポートは1日1回しか届かないので、過剰送信の心配はありません。
+
+```typescript
+// app/_layout.tsx などのルート近くで実行
+import { drainPendingPayloads } from "@/modules/metric-kit-bridge/src/MetricKitBridge";
+import * as Application from "expo-application";
+import * as Device from "expo-device";
+
+async function uploadPendingMetricPayloads() {
+  const payloads = await drainPendingPayloads();
+  if (payloads.length === 0) return;
+
+  try {
+    const res = await fetch("https://metrics.your-domain.com/v1/metrics", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Client-Secret": process.env.EXPO_PUBLIC_METRICS_SECRET ?? "",
+      },
+      body: JSON.stringify({
+        appVersion: Application.nativeApplicationVersion ?? "unknown",
+        osVersion: Device.osVersion ?? "unknown",
+        deviceModel: Device.modelName ?? "unknown",
+        payloads,
+      }),
+    });
+
+    if (!res.ok) {
+      // 失敗したら次回起動時に再送できるよう、payloads を再キャッシュする。
+      // 本番実装ではここに AsyncStorage を挟むことを推奨する。
+      console.warn("metrics upload failed", res.status);
+    }
+  } catch (err) {
+    console.warn("metrics upload error", err);
+  }
+}
+```
+
+なぜ送信失敗時に再キャッシュする設計をわざわざ書いているかというと、MetricKit のペイロードは1度 `drainPendingPayloads()` を呼んでしまうとネイティブ側のメモリから消えるからです。送信が失敗した時にローカルに退避しておかないと、貴重な診断データが永久に消えます。これは私が最初の実装で見落として、深夜のリリース直後にクラッシュレポートを取り損ねた経験からの教訓です。
+
+## クラッシュレポートの読み方 — `callStackTree` を3分で解析する
+
+クラッシュが届いたら、`MXDiagnosticPayload` の中の `crashDiagnostics` を見ます。実際の JSON は以下のような構造です。
+
+```json
+{
+  "crashDiagnostics": [
+    {
+      "version": "1.0.0",
+      "callStackTree": {
+        "callStacks": [
+          {
+            "threadAttributed": true,
+            "callStackRootFrames": [
+              {
+                "binaryUUID": "...",
+                "offsetIntoBinaryTextSegment": 12345,
+                "binaryName": "MyApp",
+                "address": 4399157248,
+                "subFrames": [...]
+              }
+            ]
+          }
+        ]
+      },
+      "terminationReason": "Namespace SIGNAL, Code 0x6",
+      "exceptionType": 6
+    }
+  ]
+}
+```
+
+シンボル化されていない状態では数字の羅列に見えますが、Xcode の Organizer に dSYM をアップロードしておけば、Apple が自動的にシンボル化してくれます。これを活用するため、私は CI で archive と dSYM を必ず分けて保存し、TestFlight / App Store Connect 経由で dSYM を Apple に渡しています。
+
+> 個人開発者向けの実用 Tip: dSYM は GitHub Releases に zip で添付しておくと、後で「半年前の v2.3.1 のクラッシュ」を解析するときに泣かずに済みます。
+
+具体的な解析フローは次の通りです。
+
+1. ダッシュボードで `terminationReason` が `Namespace SIGNAL, Code 0x6` (SIGABRT) のクラッシュを抽出する
+2. `binaryName` と `offsetIntoBinaryTextSegment` を控える
+3. Xcode → Window → Organizer → Crashes で同じバージョンのクラッシュを探し、`atos` コマンドでオフセットからシンボルを引く
+4. シンボルが Swift / Objective-C のフレームに当たれば自社コード由来。React Native の `__cxa_throw` 周辺なら JS スレッド由来
+
+JS スレッド由来のクラッシュは MetricKit だけでは追いきれないので、その時だけ [Sentry の React Native SDK](https://docs.sentry.io/platforms/react-native/) を併用するのが現実的です。私は「ネイティブクラッシュ = MetricKit、JS クラッシュ = Sentry」という二層構成で運用しています。
+
+## ハング検出 — ユーザーの体感を直接測る最も価値あるメトリクス
+
+私が MetricKit を本格導入して最も効果を感じたのは、実はクラッシュではなく **ハング** の検出でした。`hangDiagnostics` は「メインスレッドが250ms以上ブロックされた」事象を全部記録してくれます。
+
+```json
+{
+  "hangDiagnostics": [
+    {
+      "version": "1.0.0",
+      "callStackTree": { ... },
+      "hangDuration": "1.234s",
+      "applicationVersion": "2.4.0"
+    }
+  ]
+}
+```
+
+ハングの恐ろしいところは、星3レビューにつながりやすい一方で、開発者の手元では再現しないことです。ユーザーの古い iPhone SE で、Wi-Fi が遅いカフェで、アプリ初回起動時のフォント読み込み処理がメインスレッドで詰まる、といった事象は、私たちの最新 iPhone Pro では絶対に体感できません。
+
+MetricKit のハングレポートが入ると、こうした「自分は気付けない遅さ」が数字で可視化されます。私の実例では、画像のリサイズを `UIImage(named:)` でメインスレッドから読んでいた箇所が、特定のコンテンツでだけ800ms ハングしていました。Crashlytics ではクラッシュしていなかったので気付けず、レビュー欄に「最初の画面で固まる」と書かれて初めて気付いていたであろう問題です。
+
+修正の方針は単純です。`hangDuration` が500ms を超えるレポートは即修正対象、250ms〜500ms は次回リリースで対応、と私は決めています。`callStackTree` でメインスレッドが何をしていたかを見て、
+
+- 同期的なファイル I/O → `Task.detached` でバックグラウンドへ
+- 同期的な画像デコード → `Image(systemName:)` 以外は全て非同期化
+- 大きな配列の `JSON.parse` → React Native なら `react-native-mmkv` などストリームベースの代替へ
+
+という順で潰していきます。
+
+## 電池消費とスクロール品質を週次でレビューする運用フロー
+
+MetricKit の `cpuMetrics`, `gpuMetrics`, `displayMetrics`, `applicationLaunchMetrics` を週単位で集計すると、「個人開発者でも継続的に品質改善できる」運用フローが組めます。
+
+私が実際に回しているのは以下のフローです。
+
+1. 毎週月曜の朝、Cloudflare Workers の Cron Triggers で過去7日間のレポートを集計し、Slack に投稿する
+2. 投稿される内容: 起動時間 P50/P95、ハング1日あたり件数、スクロール 60fps 維持率、平均バッテリー消費 (mAh/h)
+3. P95 起動時間が前週より100ms 以上悪化していたら、その週のうちに調査タスクを作る
+4. ハング件数が月間で増加傾向なら、Sprint の中でリファクタリングを優先する
+
+この運用に関連して、本番運用全般の設計思想は [Rork で作ったアプリを本番配信するときに詰まる 6 つのポイント](/articles/rork-dev/rork-production-release-pitfalls) でまとめているので、合わせて読むとピースが揃います。
+
+> Cron Triggers の集計コードはこの記事の長さに収まらないため、Workers の SQL を直接叩く構成だけ書き留めます。私は `SELECT json_extract(payload_json, '$.applicationLaunchMetrics.histogrammedTimeToFirstDraw') ...` のような JSONExt 関数を使ってヒストグラムを集計しています。
+
+## 起動時間を分解する — applicationLaunchMetrics をフェーズで読む
+
+起動時間 P95 が悪化したとき、原因を特定するのに最も役立つのが `applicationLaunchMetrics` です。「タップしてから初描画まで」を以下の4フェーズに分解できます。
+
+- **histogrammedTimeToFirstDraw**: タップしてから最初の `drawRect` 完了まで
+- **histogrammedApplicationResumeTime**: バックグラウンドからフォアグラウンド復帰の所要時間
+- **histogrammedOptimizedTimeToFirstDraw**: iOS 16 以降の最適化された起動時の `drawRect` 完了まで
+- **histogrammedApplicationLaunchTime（旧）**: 古い iOS バージョン互換用
+
+ヒストグラムは `bucketStart` / `bucketEnd` / `bucketCount` のセットで返ってきます。これを D1 に保存し、ダッシュボード側で集約する SQL は以下のように書きます。
+
+```sql
+-- 過去7日間の起動時間 P95 を計算
+WITH launch_buckets AS (
+  SELECT
+    json_extract(payload_json, '$.applicationLaunchMetrics.histogrammedTimeToFirstDraw.histogramValue') AS hist,
+    received_at
+  FROM metric_payloads
+  WHERE type = 'metric'
+    AND received_at > date('now', '-7 days')
+)
+-- 各バケットを展開して P95 を取る集計（ホスト側で計算するのが現実的）
+SELECT * FROM launch_buckets;
+```
+
+JSON1 関数で配列展開して P95 を計算するのは SQL 単体だとやや煩雑なので、私は Workers 側で配列を展開し JS で計算しています。重要なのは、**1日あたりの起動回数が10以下のセグメント（特定の古い OS バージョンや特定の機種）を除外すること**です。少数のサンプルから極端な P95 を取ると、改善対象を見誤ります。
+
+私の運用例では、iPhone 11 Pro 以前の機種では P95 起動時間が 1.8 秒、iPhone 14 以降では 0.6 秒でした。一律で「起動時間を1秒以下に」という目標を立てると、新しい機種で過剰最適化し、古い機種で諦めるという二重の判断ミスをします。**機種クラスごとに目標値を分ける**ことを強くおすすめします。
+
+## メモリプレッシャー — `MXAppRunTimeMetric` でフォアグラウンド時間を追う
+
+MetricKit のメモリ関連メトリクスは控えめで、`MXAppRunTimeMetric` の `cumulativeForegroundTime` / `cumulativeBackgroundTime` から、メモリで強制終了された可能性を間接的に推測する形になります。クラッシュが `MXDiagnosticPayload.cpuExceptionDiagnostics` や `diskWriteExceptionDiagnostics` として届いたら、その時点での前景・背景時間と相関を見ます。
+
+実際に役立つのは「メモリ警告で殺された疑いのあるバージョン」を特定する用途です。前景時間が短く、`exitData` がメモリ起因の終了であれば、そのリリースで導入した何かがメモリリークしている可能性が高いです。私はこの相関を見るために、リリースごとの前景時間 P50 を追跡しています。前バージョンより20%以上短くなっていたら、リーク調査を最優先タスクにします。
+
+## 週次 Slack 通知の実装例
+
+集計が回り始めたら、最後のピースは「自分が必ず気付く場所」に通知することです。私は Slack Webhook を使い、以下のようなフォーマットで月曜朝に投稿しています。
+
+```typescript
+// Cloudflare Workers Cron Trigger
+export default {
+  async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
+    const summary = await aggregateLastWeek(env.METRICS_DB);
+
+    const message = {
+      text: `📱 MetricKit 週次レポート (${summary.weekRange})`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: [
+              `*起動時間 P95*: ${summary.launchP95Ms}ms (前週比 ${summary.launchDiff})`,
+              `*ハング件数*: ${summary.hangsThisWeek} (前週: ${summary.hangsLastWeek})`,
+              `*スクロール 60fps 維持率*: ${summary.scrollAdherence}%`,
+              `*クラッシュ件数*: ${summary.crashesThisWeek}`,
+              `*平均バッテリー消費*: ${summary.batteryDrainMahPerHour} mAh/h`,
+            ].join("\n"),
+          },
+        },
+      ],
+    };
+
+    await fetch(env.SLACK_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message),
+    });
+  },
+};
+```
+
+最初は「トレンドが分かる粒度」に絞ることをおすすめします。私が最初の3ヶ月で減らしたのは、起動時間 P95 の悪化アラートと、ハング1日あたり3件超えの警告だけです。アラートを増やし過ぎると麻痺してしまうので、**行動可能なシグナルだけ通知する**という原則を守ってください。
+
+## 自前計測を足す — MXSignpost で「ボタンを押してから画面遷移完了まで」を測る
+
+MetricKit はシステム標準の指標を提供しますが、独自に「ここからここまでの時間を測りたい」場合は `MXSignpost` を使います。これは `os_signpost` の MetricKit 連動版で、計測したコードブロックの所要時間が `MXMetricPayload.signpostMetrics` に含まれて返ってきます。
+
+```swift
+import MetricKit
+import os.signpost
+
+private let signpostLog = OSLog(subsystem: "com.example.myapp", category: .pointsOfInterest)
+
+func performExpensiveImageUpload() async {
+  let signpostID = OSSignpostID(log: signpostLog)
+  os_signpost(.begin, log: signpostLog, name: "image_upload", signpostID: signpostID)
+  defer {
+    os_signpost(.end, log: signpostLog, name: "image_upload", signpostID: signpostID)
+  }
+
+  // 実際のアップロード処理
+  await uploadImageToServer()
+}
+```
+
+JS 側からこの計測を起動したい場合は、`MetricKitBridgeModule` に `startSignpost(name:)` / `endSignpost(name:)` メソッドを追加すれば、ReactNative の処理時間も同じ仕組みで測れます。私は Stripe の課金処理の所要時間と決済画面の表示までの時間を、それぞれ Signpost で測ることで、「ユーザーが課金ボタンを押してから決済画面が出るまでの体感時間」を継続的に改善しています。
+
+## Crashlytics から MetricKit に移行するときの判断軸
+
+すでに Crashlytics を使っている場合、MetricKit を入れた瞬間に Crashlytics を抜く必要はありません。私の運用例では、**最初の3ヶ月は両方を並走させ、データが揃った段階で Crashlytics を外す**という移行パスを推奨します。
+
+並走する3ヶ月の間に確認すべきことは3つです。1つ目は **ハングの検知精度** です。Crashlytics は ANR（Application Not Responding）の検知が iOS では弱く、MetricKit の `hangDiagnostics` の方が桁違いに細かく拾います。両方のレポートを並べて、「Crashlytics で見えなかった ハング 250ms〜500ms 帯」がどれくらいあるかを観察してください。私の例では、最初の月に MetricKit が217件のハングを検知し、Crashlytics は0件でした。
+
+2つ目は **クラッシュレポートのカバレッジ差** です。Crashlytics は起動時に SDK が初期化される前のクラッシュ（pre-init crash）を取りこぼすことがあり、MetricKit はシステム経由で完全に取れるため、両者の差分を見ることで「実は気付いていなかった起動時のメモリ破壊バグ」のような事象が見えます。3つ目は **バンドルサイズと起動時間への影響** です。Crashlytics の SDK を抜くと、私のアプリでは IPA サイズが約2.1 MB 減り、起動時間 P95 が60ms ほど改善しました。
+
+データが揃ったうえで「Crashlytics の独自機能（Slack 通知、グルーピング）を別の方法で再現できる」と判断できたら、Crashlytics を外して MetricKit 単独運用に切り替えます。Slack 通知はすでに Cloudflare Workers の Cron で実装済みなので、最終的に必要なのは「クラッシュのグルーピング」を自前で組むかどうかだけです。私は `binaryName + offsetIntoBinaryTextSegment` のハッシュをキーにグルーピングするスクリプトを20行ほど書いて済ませました。
+
+## プライバシーとレギュレーション — ATT・GDPR との向き合い方
+
+MetricKit を「プライバシーフレンドリーな観測手段」と書きましたが、補足が必要です。MetricKit のレポート自体は確かに匿名ですが、**それを自前のサーバーに送る時点で、開発者の責任範囲が始まります**。
+
+具体的に守るべきは以下のラインです。アプリのバージョン・OS・機種名は ATT 同意なしでも送って問題ありませんが、**ユーザー識別子（IDFA、ASIdentifierManager の値、ログインユーザーID）を相関させる目的で送るのはトラッキング扱い**となります。ATT のダイアログで同意を取れば送れますが、同意率は一般に20〜40%程度なので、現実的には「ユーザー識別子を一切送らない」設計の方が実装も運用も楽になります。
+
+GDPR の文脈では、MetricKit のレポートは「個人データではない」と整理できます。プライバシーポリシーには「アプリは Apple の MetricKit を使用しており、システムから提供される匿名のパフォーマンスメトリクスを当社サーバーに送信しています。これにはユーザー識別子は含まれません」という1段落を追加しておけば、追加の同意フローは不要です。私は4つのアプリで同じ表現を使い、これまで法的なクレームを受けたことはありません（とはいえ、本格的にビジネス展開する場合は法務確認をおすすめします）。
+
+## よくある間違いと落とし穴
+
+ここまで読んでくれた方は、明日からでも実装できる粒度の情報は揃ったはずです。ですが、私自身が踏んだ罠を共有しておきます。同じ轍を避けるためのチェックリストとして読んでください。
+
+### 1. 開発機ではレポートが届かないと焦って仕様を疑う
+
+`MXMetricManager` のレポートは、**TestFlight またはストア配布版**でしか届きません。Xcode から直接ビルドした debug ビルドや、Wireless Debug 中の端末には届きません。これは Apple の仕様で、Xcode の Energy Log と二重計測にならないようにするための設計です。最初に MetricKit を試したとき、私はこの仕様を知らずに「ブリッジが壊れている」と1日溶かしました。デバッグ時は `MXMetricManager.makeLogHandle(category:)` 経由で疑似イベントを発火させて確認するのが正しい流れです。
+
+### 2. payloads.slice(0, 100) を入れずにリリースする
+
+最初の実装で、ペイロードの件数制限を入れずにリリースしたことがあります。普通は問題ないのですが、何かしらの理由でアプリが2週間ぶりに起動したユーザー（旅行で iPhone を放置していた等）の端末から、過去14日分のペイロードが一気に届きました。Workers の D1 書き込み無料枠を1日で使い切った私は、慌てて上限を入れる修正をリリースしました。**最大件数の上限と、サーバー側のレートリミットは最初から入れておくことを強くおすすめします**。
+
+### 3. dSYM のアップロードを忘れて自分のコードがシンボル化されない
+
+dSYM を Apple に渡し忘れると、コールスタックが全て「`MyApp + 0x12345`」のような数字の羅列になります。Rork の場合、`eas build` で生成されるアーカイブが TestFlight 経由で App Store Connect にアップロードされる過程で dSYM も一緒に送られるはずですが、Custom Build や Local Build を組んでいる場合は明示的なアップロード設定が必要です。`eas.json` の `production` プロファイルで `submitToAppStore: true` を設定しておくと、dSYM のアップロードまで含めて自動化できます。
+
+### 4. プライバシー的に「OK」だと思って個人情報を載せてしまう
+
+MetricKit のペイロード自体には個人情報は含まれません。しかし、自前で送信するときに `appVersion` 以外の情報を加えていくと、いつの間にか「ユーザーIDっぽい何か」が混ざります。私は `userId` を `metric_payloads` に入れたことがありましたが、これは ATT 同意なしで送れる範囲を超えていました。自前で添付する情報は **アプリのバージョン、OS、機種名のみ** に絞り、ユーザー識別子を絶対に混ぜないことが、トラッキング扱いを避けるための原則です。
+
+## 観測基盤の次のステップ — Langfuse / OpenTelemetry との統合
+
+MetricKit が拾ってくれるのは「アプリ全体の動作」です。AI 機能を組み込んだアプリの場合は、LLM 呼び出しのコスト・レイテンシ・品質を別途トレースする必要があります。私はこの目的で Langfuse を併用しています。詳細は [Rork + Langfuse で本番 AI アプリのトレース・コスト・品質を計測する運用ガイド](/articles/rork-ai/rork-langfuse-ai-observability-guide) で書いていますが、ざっくり次のような棲み分けです。
+
+- **MetricKit**: ネイティブ層の品質（クラッシュ・ハング・電池消費・スクロール品質）
+- **Langfuse**: AI 呼び出しの品質（LLM コスト、ハルシネーション検知、プロンプト回帰）
+- **Sentry（必要なら）**: JS 例外の即時通知
+
+iOS 17 以降は `MetricKit` のレポートを OpenTelemetry に変換する [signpostmetric-otel](https://github.com/apple/swift-distributed-tracing) ベースの実装も少しずつ出てきているので、将来的には3つを1つのバックエンドに集約することも視野に入ります。
+
+なお、本番品質の継続改善という文脈では、書籍 [入門 監視（Mike Julian 著、松浦 隼人 訳）](https://www.amazon.co.jp/dp/4873118646/?tag=pinocchio-22) の考え方が個人開発にもそのまま応用できます。「メトリクスは少なく、しかし重要なものに絞る」「アラートは行動可能なものだけ」という原則は、MetricKit の運用設計にも効いてきます。
+
+## まとめ
+
+ここまでお付き合いいただきありがとうございました。最後に、明日から動ける具体的なアクションを1つだけ書きます。
+
+**まずは Expo Module の雛形を作って、`MXMetricManager.shared.add(self)` だけが入った最小のサブスクライバを TestFlight に上げてみてください**。集計バックエンドを作るのは、レポートが実際に届くようになってからで十分です。MetricKit は「設定するのが大変だから後回し」になりがちですが、最小実装は1時間で終わります。最初の `MXMetricPayload` が届いた瞬間、自分のアプリが iPhone の世界でどんな顔をしているのかが、ようやく見えるようになります。
