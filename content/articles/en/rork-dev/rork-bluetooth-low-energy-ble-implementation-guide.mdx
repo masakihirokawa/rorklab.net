@@ -1,0 +1,171 @@
+---
+title: "Bluetooth Low Energy in Rork Apps — A Practical BLE Guide with react-native-ble-plx"
+slug: "rork-bluetooth-low-energy-ble-implementation-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-04-30T12:00"
+author: "Rork Lab"
+description: "A hands-on guide to talking to BLE peripherals — heart-rate monitors, smart locks, custom IoT boards — from a Rork-built app. Covers permissions, scanning, connection, read/write, and disconnect handling with real code."
+tags: ["Rork", "Bluetooth Low Energy", "BLE", "IoT", "React Native"]
+---
+
+Whenever someone asks me how to read values from a heart-rate monitor or send commands to a homemade M5Stack board from a Rork app, the first wall they hit is permissions and scanning — not the BLE protocol itself. Most BLE write-ups online assume you're working in native iOS or Android code, and it's surprisingly hard to find guidance that maps cleanly onto the Expo + React Native + Rork stack. The result is a lot of half-broken examples on Stack Overflow and a fair amount of frustration before the first byte ever flows.
+
+This article walks through the shortest realistic path to getting a Rork-built app talking to a BLE peripheral using `react-native-ble-plx`. It's based on what I learned wiring a small distance-sensor app to a custom board, so the focus is on the parts that actually trip people up — not the parts the official docs already cover well.
+
+## Is react-native-ble-plx Really the Only Choice?
+
+In practice, your two real options inside the React Native + Expo ecosystem are:
+
+- `react-native-ble-plx`: actively maintained, plays nicely with Expo prebuild, and exposes a single API that covers both iOS and Android. The TypeScript typings are accurate enough that your editor catches most mistakes before you run the app
+- `react-native-ble-manager`: long-lived but sometimes lags behind on Expo SDK upgrades, and its event-emitter style API tends to encourage scattered state across components
+
+Unless you have a specific reason to choose otherwise, going with `react-native-ble-plx` lowers the chance you'll be stuck the next time Expo bumps its major version. It also fits Rork's build pipeline (which is Expo prebuild based) without forcing you to drop into native code, which means you can stay inside the Rork workflow for the vast majority of changes. The one situation where I'd reconsider is if your peripheral requires a vendor SDK that ships only as a native iOS framework — but that's the exception, not the rule.
+
+## The Permissions Trap — Android 12 Changed Everything
+
+The biggest pitfall is that iOS and Android need very different permissions, and Android changed its model in version 12.
+
+- iOS requires `NSBluetoothAlwaysUsageDescription` in your Info.plist. Forget it and the app crashes at launch with a console message that's easy to miss until you read it twice
+- Android 12 (API 31) and later promote `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT` to runtime permissions. You may also still need `ACCESS_FINE_LOCATION` depending on what you do with scan results
+- Android 11 and earlier require `ACCESS_FINE_LOCATION` for any BLE scan, with no exceptions
+
+So on Android, you need code that branches on the SDK version. `Platform.Version` is the simplest hook for that, and the branch ends up being only a few lines.
+
+```typescript
+import { PermissionsAndroid, Platform } from "react-native";
+
+// Permissions diverge between Android 12+ and earlier versions
+async function requestBlePermissions(): Promise<boolean> {
+  if (Platform.OS !== "android") return true;
+
+  const apiLevel = Platform.Version as number;
+  const perms =
+    apiLevel >= 31
+      ? [
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]
+      : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+
+  const results = await PermissionsAndroid.requestMultiple(perms);
+  return Object.values(results).every(
+    (r) => r === PermissionsAndroid.RESULTS.GRANTED,
+  );
+}
+// Returns true only when every requested permission is granted; false on any denial.
+```
+
+You may worry that asking for `ACCESS_FINE_LOCATION` will get you flagged in Google Play review. In practice, Play accepts location permission for BLE-only purposes as long as your store listing makes the use case explicit and you don't actually log location coordinates. I've shipped multiple apps with this exact pattern, and the data-safety form has a dedicated "BLE only" answer that Play accepts cleanly. The only time I had a review pushback was when I forgot to mention BLE in the privacy policy URL.
+
+## Scanning and Connecting — A Single Hook is Enough
+
+I find that wrapping the scan-connect-cleanup lifecycle in a single hook keeps UI code clean and predictable. The cleanup path matters more than people expect: if you let `BleManager` instances leak across screens, you eventually run into "Scan in progress" errors that are extremely confusing to debug.
+
+```typescript
+import { useEffect, useRef, useState } from "react";
+import { BleManager, Device } from "react-native-ble-plx";
+
+export function useBleScanner(targetName: string) {
+  const managerRef = useRef<BleManager | null>(null);
+  const [device, setDevice] = useState<Device | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const manager = new BleManager();
+    managerRef.current = manager;
+
+    const start = async () => {
+      const ok = await requestBlePermissions();
+      if (!ok) {
+        setError("Bluetooth/Location permissions were not granted");
+        return;
+      }
+
+      manager.startDeviceScan(null, null, (err, scanned) => {
+        if (err) {
+          setError(err.message);
+          return;
+        }
+        if (scanned?.name === targetName) {
+          manager.stopDeviceScan();
+          scanned
+            .connect()
+            .then((d) => d.discoverAllServicesAndCharacteristics())
+            .then(setDevice)
+            .catch((e) => setError(String(e)));
+        }
+      });
+    };
+
+    start();
+
+    return () => {
+      manager.stopDeviceScan();
+      manager.destroy();
+    };
+  }, [targetName]);
+
+  return { device, error };
+}
+// When a device whose advertised name matches targetName is found, the hook connects and stores it in state.
+```
+
+The single most important call here is `discoverAllServicesAndCharacteristics()`. Skip it and the next call to `readCharacteristicForDevice` throws `Service not found` — a confusing error that cost me two hours the first time I hit it. The reason is subtle: at the BLE layer, an open connection doesn't mean you've negotiated which services exist. That negotiation has to happen explicitly. It's the kind of detail you only learn the hard way, which is exactly why I keep mentioning it.
+
+## Bytes and Base64 — Reading and Writing Characteristics
+
+`react-native-ble-plx` exchanges Characteristic values as base64-encoded strings, not raw byte arrays. You'll need to encode and decode on your side. JavaScript's standard library doesn't ship a great Buffer-style API by default in React Native, so I import the `buffer` polyfill, which is small and well-tested.
+
+```typescript
+import { Buffer } from "buffer";
+
+// Read: base64 → byte array
+const value = await device.readCharacteristicForService(
+  serviceUUID,
+  characteristicUUID,
+);
+const bytes = Buffer.from(value.value ?? "", "base64");
+console.log("Heart rate:", bytes[1]); // e.g. byte index 1 in the HRP profile
+
+// Write: byte array → base64
+const payload = Buffer.from([0x01, 0x02, 0x03]).toString("base64");
+await device.writeCharacteristicWithResponseForService(
+  serviceUUID,
+  characteristicUUID,
+  payload,
+);
+// On success the read logs the heart-rate value; the write resolves once the peripheral acknowledges.
+```
+
+Before you write a single byte, confirm with the firmware spec which byte holds what, and whether the device uses little- or big-endian encoding. In my experience, around seventy percent of BLE bugs come from misreading this layout — far more than from the BLE stack itself. If the spec is ambiguous, write a quick scratch script that reads every byte and logs it as both decimal and hex; comparing that against expected values usually reveals the encoding within a few minutes.
+
+There is one extra detail worth knowing about MTU. By default, BLE caps a single packet at around 23 bytes of usable payload. If your device exchanges larger structured data, request a higher MTU early in the connection with `device.requestMTU(247)`. Skipping this leads to silent truncation on Android, which is one of the meanest BLE bugs to track down — the read succeeds, the value just looks corrupted.
+
+For notifications (where the peripheral pushes values rather than waiting to be read), use `monitorCharacteristicForService`. The shape is the same — a base64 string in, a `Buffer.from(...)` to decode. The lifecycle is just longer, so make sure you `remove()` the subscription on unmount.
+
+## Designing for Disconnects and Reconnects
+
+BLE is far less stable than Wi-Fi. If you don't design for "we lost the connection the moment the user stepped onto a train", the user experience falls apart fast.
+
+- Subscribe to `device.onDisconnected()` and reflect the connection state in your UI immediately. Users who can see what's happening tolerate disconnects far better than users left guessing
+- If you need to keep the connection alive while the app is backgrounded on iOS, enable the `bluetooth-central` Background Mode in your Info.plist. Without it, iOS suspends BLE callbacks within seconds of backgrounding
+- For automatic reconnection, use exponential backoff and cap the retry window at around 30 seconds before giving up. Aggressive infinite retries drain the battery and rarely help — most users would rather hit a "Reconnect" button than have the radio stay hot indefinitely
+
+The general approach to "things that fail unpredictably" is the same one I covered in [the Rork error-handling and crash-prevention guide](/articles/rork-dev/rork-error-handling-crash-prevention-basics) — treating BLE as something that *will* fail at some point produces much more stable apps than trying to engineer the failure modes away. The mental shift from "make it always succeed" to "make it recover gracefully" is the single highest-leverage change I've seen people make in BLE-heavy apps.
+
+## Verification — Simulators Won't Help You Here
+
+BLE doesn't work in the iOS Simulator or the Android Emulator. Real-device testing is non-negotiable. This means your TestFlight and internal-testing pipelines need to be in place before BLE work begins, otherwise you'll lose half a day every time a build breaks.
+
+- If a scan takes more than ten seconds, narrow it with a Service UUID filter — it speeds things up and saves battery, and on iOS it dramatically improves background scan reliability
+- When pairing flows include a form (Wi-Fi credentials, device nickname, etc.), combine the input layer with the patterns from [the Rork form-validation guide](/articles/rork-dev/rork-form-validation-react-hook-form-zod) so you reject malformed input before you hit the device. Hardware errors are expensive; rejecting bad input early is cheap
+- If you see disconnects on screen rotation, walk through [the Rork orientation-handling article](/articles/rork-dev/rork-app-orientation-rotation-not-working-fix) and verify your reconnect logic survives Configuration changes. Activity recreation on Android is a common silent killer of BLE sessions
+
+When you debug hardware, get into the habit of separating the "app side / firmware side / Bluetooth stack" layers. Knowing which one is at fault more than doubles your debugging speed, because each layer has its own diagnostic tools (your app logs, a serial console on the firmware, and platform tools like nRF Connect or LightBlue for the Bluetooth stack itself). If you want to deepen your React Native foundations alongside this kind of integration work, "[React Native実践入門](https://www.amazon.co.jp/dp/4297141922/?tag=pinocchio-22)" by Nozomu Sawada is a solid systematic resource that maps well onto Rork's Expo-prebuild model.
+
+## Wrap-up — Start with Just a Single Read
+
+BLE has so many stages — permissions, scan, connect, read/write, disconnect — that trying to wire everything end-to-end on day one is a fast way to give up. The smallest meaningful step you can take today is to grab a heart-rate monitor or step counter, plug in `device.readCharacteristicForService`, and get a single value to print to the console. Once that one read works, writes and notifications are just additive on top of the same scaffolding you already trust. From there, the rest of the BLE protocol becomes much less intimidating, because you've already proven that the hard part — the platform plumbing — is in place. The pattern I keep returning to is: prove one thing works on a real device, then commit it before moving on. BLE punishes ambitious refactors, and rewards small, verified increments.
