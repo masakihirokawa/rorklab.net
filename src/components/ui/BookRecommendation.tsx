@@ -107,11 +107,11 @@ const BOOKS: Record<string, Book[]> = {
       topics: ["dev", "infra", "cloudflare"],
     },
     {
-      title: "GitHub Actions実践入門",
-      author: "宮田淳平",
-      url: "https://www.amazon.co.jp/dp/4844378716/?tag=pinocchio-22",
-      tag: "CI/CD",
-      topics: ["dev", "infra", "cicd"],
+      title: "この1冊でしっかりわかる Geminiの教科書",
+      author: "佐倉井理冴",
+      url: "https://www.amazon.co.jp/dp/4815637660/?tag=pinocchio-22",
+      tag: "Gemini",
+      topics: ["ai", "llm", "beginner", "google"],
     },
     {
       title: "GitHub CI/CD実践ガイド",
@@ -210,11 +210,11 @@ const BOOKS: Record<string, Book[]> = {
       topics: ["ai", "agent", "llm", "data"],
     },
     {
-      title: "Web Development with Node and Express (2nd ed.)",
-      author: "Ethan Brown",
-      url: "https://www.amazon.co.jp/dp/1492053511/?tag=pinocchio-22",
-      tag: "Node.js",
-      topics: ["dev", "backend", "frontend"],
+      title: "Google Antigravity and Gemini 3.1 Pro",
+      author: "Chris Sullivan",
+      url: "https://www.amazon.co.jp/dp/B0GNDKQPHQ/?tag=pinocchio-22",
+      tag: "Antigravity",
+      topics: ["ai", "agent", "dev", "google"],
     },
     // ── Architecture / System Design ──
     {
