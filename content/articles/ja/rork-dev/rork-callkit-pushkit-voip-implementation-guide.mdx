@@ -1,0 +1,375 @@
+---
+title: "Rork × CallKit + PushKit で VoIP 通話アプリを実装する完全ガイド — Native 着信 UI と専用 Push の本番運用"
+slug: "rork-callkit-pushkit-voip-implementation-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-01T11:30"
+updated: "2026-05-01T11:30"
+author: "Rork Lab"
+description: "Rork で作った通話アプリに CallKit + PushKit を組み込み、ネイティブ着信 UI と VoIP 専用 Push を本番運用する手順を、トークン管理・audio session・審査リスクまで含めて解説します。"
+tags: ["Rork", "CallKit", "PushKit", "VoIP", "Push通知", "WebRTC", "iOS", "React Native", "通話アプリ"]
+highlights:
+  - "VoIP 通話アプリでロック画面の着信 UI が出ない／鳴らない問題で詰まっていた人が、PushKit + CallKit を正しく繋ぎ込んで本番で動く実装を手に入れられる"
+  - "PushKit トークンの取得・更新・サーバ送信、audio session の切り替え、CallKit からの WebRTC 接続まで、本番運用に必要な全レイヤーのコードを習得できる"
+  - "App Store 審査で VoIP 用途として認められるためのガイドライン適合と、リジェクトされた場合の修正方針を、自分のアプリに当てはめて判断できる"
+---
+
+「Rork で通話アプリを作っているのですが、画面が消えている状態で着信が鳴りません」というご相談を、最近とても多くいただきます。多くの場合、原因は通常の Push 通知（FCM/APNs）に頼っていることです。iOS の VoIP 通話で「ロック画面に全画面の着信 UI を出す」「相手の声を即座に再生する」を成立させるには、**CallKit と PushKit という、通常の通知系とは別系統の API を組み合わせる必要があります**。
+
+私自身、過去に WebRTC を使った通話アプリを Rork で書き始めて、最初の数日は「なぜ実機で着信が鳴らないのか」をひたすら追いかけていた時期がありました。CallKit のドキュメントは断片的で、Rork（React Native）からネイティブモジュール経由で扱う情報はさらに少ない領域です。本記事では、私が本番運用にたどり着くまでに整理した知見を、Rork で開発している方が同じ落とし穴を避けられる形でまとめました。
+
+この記事は **Rork（React Native）** と **Rork Max（SwiftUI ネイティブ）** の両方の開発フローを念頭に置いています。前者では `react-native-callkeep` + `react-native-voip-push-notification` をベースに、後者では PushKit / CallKit のネイティブ実装を直接扱います。
+
+## なぜ通常の Push では VoIP 通話が成立しないのか
+
+最初に、なぜわざわざ別の API が必要なのかという「設計の理由」から整理させてください。これを納得しておくと、後の実装で迷ったときに正しい判断ができるようになります。
+
+通常の APNs 通知（`alert` / `sound` / `badge`）は、ユーザーが通知センターを開いてアプリをタップして初めてアプリが起動します。つまり「相手が今すぐ電話に出られる状態」を作るには遅すぎるのです。一方 PushKit を使うと、`pushType: voip` の Push が届いた瞬間に **iOS がアプリのプロセスをバックグラウンドで起こし**、CallKit の `reportNewIncomingCall` を呼ぶチャンスを与えてくれます。
+
+ただし iOS 13 以降は、PushKit を受け取ったら **「30 秒以内に CallKit に着信を報告しなければアプリを kill する」** という厳しい制約が課されています。これを満たさないアプリは、繰り返し違反するとそのデバイスでの VoIP Push を受け取れなくなります。CallKit に必ず通すという設計は守らなければいけません。
+
+ここで併せて理解しておきたいのが「VoIP Push を別のことに使えないか？」という誘惑です。たとえばチャットの新着メッセージや、AI のレスポンス完了通知をバックグラウンドで処理したくなる場面があります。しかし Apple は VoIP Push を実際の通話用途以外で使うアプリをリジェクトしており、過去に多くの大手アプリが書き換えを迫られています。VoIP Push はあくまで「鳴らす電話」のために使うと割り切ってください。
+
+## アーキテクチャ全体像 — どのレイヤーが何を担当するか
+
+本番で動く VoIP 通話アプリは、おおよそ次のようなレイヤーで構成されます。Rork で開発する場合、JavaScript レイヤーから iOS のネイティブ機能に橋渡しする「ブリッジ」の存在を意識することが重要です。
+
+- **シグナリングサーバ**: 誰が誰に電話をかけたかを伝えるサーバ（Cloudflare Workers + Durable Objects、Supabase Realtime、自前 WebSocket など）
+- **VoIP Push サーバ**: APNs に対して `apns-push-type: voip` を投げるバックエンド
+- **PushKit レイヤー（iOS ネイティブ）**: VoIP Push を受信し CallKit に転送
+- **CallKit レイヤー（iOS ネイティブ）**: 着信 UI の表示、通話状態の管理、audio session の制御
+- **WebRTC レイヤー（共通）**: 実際の音声・映像のメディア接続
+- **JS レイヤー（Rork）**: 通話履歴、UI、ビジネスロジック
+
+Rork（React Native）の場合、CallKit と PushKit は OSS の `react-native-callkeep` と `react-native-voip-push-notification` がブリッジを提供してくれます。Rork Max（SwiftUI ネイティブ）の場合は、`PushRegistry` と `CXProvider` を直接扱います。本記事では両方のサンプルコードを示します。
+
+## VoIP Push 証明書と APNs バックエンドの準備
+
+着信音が鳴らない原因の半分は、サーバ側の APNs 設定ミスです。先にここを確実にしておきましょう。
+
+Apple Developer サイトの Identifiers から App ID を選び、**Push Notifications** と **Voice over IP** の両方の Capability を有効化します。証明書は **VoIP Services Certificate** を別途生成する必要があります（普通の Push 用証明書とは別物です）。生成した `.p12` をサーバ側に配置し、以下のような Cloudflare Workers 実装で APNs に送信します。
+
+```typescript
+// src/voip-push.ts — Cloudflare Workers での VoIP Push 送信
+// 期待動作: APNs が voip-push を受け取ると、対象端末の PushKit が
+// すぐに着信ペイロードを受信する。レスポンスが 200 でなければ詳細をログに残す。
+
+interface VoipPayload {
+  callId: string;        // CallKit の UUID（全端末で一意）
+  callerName: string;    // ロック画面に表示する発信者名
+  callerHandle: string;  // 連絡先解決のための識別子（電話番号やメール）
+  hasVideo: boolean;     // ビデオ通話かどうか
+}
+
+export async function sendVoipPush(
+  apnsToken: string,
+  payload: VoipPayload,
+  env: { APNS_KEY: string; APNS_KEY_ID: string; APNS_TEAM_ID: string; APNS_TOPIC: string }
+) {
+  // JWT を作る部分は別関数に切り出している前提
+  const jwt = await buildApnsJwt(env);
+
+  const url = `https://api.push.apple.com/3/device/${apnsToken}`;
+  const body = JSON.stringify({
+    aps: { 'content-available': 1 },
+    ...payload,
+  });
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      authorization: `bearer ${jwt}`,
+      'apns-topic': `${env.APNS_TOPIC}.voip`, // ⚠️ topic は bundle-id + ".voip"
+      'apns-push-type': 'voip',
+      'apns-priority': '10',
+      'apns-expiration': '0',                  // 即時配信、保留しない
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    // 410 はトークン失効、400 系はペイロード不正の可能性が高い
+    const detail = await res.text();
+    console.error('[voip-push] failed', res.status, detail);
+    throw new Error(`APNs ${res.status}: ${detail}`);
+  }
+  return { status: res.status };
+}
+```
+
+期待される出力は HTTP 200 で空ボディです。**410 が返ってきた場合は、PushKit トークンが失効している**ので、サーバ側の DB から該当トークンを削除する処理を入れてください。失効トークンに送り続けると、Apple のレートリミットでサイレントに弾かれることがあります。
+
+`apns-topic` を `bundle-id + ".voip"` にし忘れる失敗が多いので、ここはコードレビュー時の必須チェック項目にしておくと安全です。
+
+## iOS ネイティブ側 — PushKit トークン取得と CallKit 着信報告
+
+ここが VoIP 実装で最もデリケートな部分です。Rork（React Native）でも Rork Max（SwiftUI）でも、最終的にこの 2 つを直列に呼ぶ必要があります。
+
+```swift
+// ios/AppDelegate.swift — PushKit と CallKit を最短経路で繋ぐ
+// 期待動作: アプリが kill されている状態でも VoIP Push 受信時に
+// 全画面の着信 UI が表示され、応答ボタンで delegate コールバックが届く。
+
+import PushKit
+import CallKit
+import UIKit
+
+final class VoipManager: NSObject, PKPushRegistryDelegate, CXProviderDelegate {
+  static let shared = VoipManager()
+  private let registry = PKPushRegistry(queue: .main)
+  let provider: CXProvider
+
+  override init() {
+    let config = CXProviderConfiguration(localizedName: "Rork Talk")
+    config.supportsVideo = true
+    config.maximumCallsPerCallGroup = 1
+    config.supportedHandleTypes = [.generic]
+    self.provider = CXProvider(configuration: config)
+    super.init()
+    self.provider.setDelegate(self, queue: .main)
+    registry.delegate = self
+    registry.desiredPushTypes = [.voIP]
+  }
+
+  // 1. トークン取得 — サーバへ送る
+  func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
+    guard type == .voIP else { return }
+    let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
+    print("[PushKit] token=\(token)")
+    Task { try? await ApiClient.shared.registerVoipToken(token) }
+  }
+
+  // 2. トークン失効 — サーバ側でも消す
+  func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
+    Task { try? await ApiClient.shared.invalidateVoipToken() }
+  }
+
+  // 3. Push 受信 — 30 秒以内に必ず reportNewIncomingCall する
+  func pushRegistry(
+    _ registry: PKPushRegistry,
+    didReceiveIncomingPushWith payload: PKPushPayload,
+    for type: PKPushType,
+    completion: @escaping () -> Void
+  ) {
+    let dict = payload.dictionaryPayload
+    guard
+      let callIdString = dict["callId"] as? String,
+      let callId = UUID(uuidString: callIdString),
+      let name = dict["callerName"] as? String
+    else {
+      // payload 異常時もダミー着信を出さないと iOS に kill される
+      let fallbackId = UUID()
+      let update = CXCallUpdate()
+      update.localizedCallerName = "通話"
+      provider.reportNewIncomingCall(with: fallbackId, update: update) { _ in completion() }
+      return
+    }
+
+    let update = CXCallUpdate()
+    update.remoteHandle = CXHandle(type: .generic, value: dict["callerHandle"] as? String ?? "unknown")
+    update.localizedCallerName = name
+    update.hasVideo = (dict["hasVideo"] as? Bool) ?? false
+
+    provider.reportNewIncomingCall(with: callId, update: update) { error in
+      if let error = error {
+        print("[CallKit] reportNewIncomingCall failed: \(error.localizedDescription)")
+      } else {
+        // ここでシグナリングと WebRTC を準備する
+        WebRtcController.shared.prepareIncoming(callId: callId)
+      }
+      completion() // ⚠️ どんな分岐でも必ず完了する
+    }
+  }
+
+  // 4. 応答ボタン押下
+  func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    WebRtcController.shared.answer(callId: action.callUUID) { success in
+      success ? action.fulfill() : action.fail()
+    }
+  }
+
+  // 5. 終了ボタン押下
+  func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    WebRtcController.shared.hangUp(callId: action.callUUID)
+    action.fulfill()
+  }
+
+  func providerDidReset(_ provider: CXProvider) {
+    WebRtcController.shared.tearDownAll()
+  }
+}
+```
+
+このコードのポイントは「**どんな payload が来ても必ず `reportNewIncomingCall` を呼ぶ**」ことです。たとえ payload が不正で本来ダミー着信を出すべきでないケースでも、呼ばないと iOS にアプリを kill されます。kill が繰り返されるとそのデバイスでは PushKit が無効化されてしまうので、ここの条件分岐は徹底的にレビューしてください。
+
+なお、Rork で生成された React Native アプリでは、上記コードを Native Module として `ios/` に追加し、JS レイヤーからは `react-native-callkeep` の API（`RNCallKeep.displayIncomingCall(...)`）を使うのが楽な経路です。CallKeep は内部で同等の `CXProvider.reportNewIncomingCall` を呼んでくれます。
+
+## React Native（Rork）側 — CallKeep と Voip Push の統合
+
+ここからは、Rork で出力された React Native プロジェクトに導入する具体的な JS 実装に入ります。私の好みとしては、ネイティブの薄いラッパーである `react-native-callkeep` をそのまま使い、状態管理は Zustand など普段のスタックに任せるのが運用しやすかったです。
+
+```typescript
+// app/voip/voipBootstrap.ts — Rork（RN）から CallKit/PushKit を起動する
+// 期待動作: アプリ起動時に setup を一度だけ呼ぶ。Push 受信から 1 秒以内に
+// displayIncomingCall が走り、ロック画面着信 UI が表示される。
+
+import RNCallKeep from 'react-native-callkeep';
+import VoipPushNotification from 'react-native-voip-push-notification';
+import { Platform } from 'react-native';
+import { useCallStore } from './callStore';
+
+export async function setupVoip() {
+  if (Platform.OS !== 'ios') return; // Android 側は ConnectionService で別実装
+
+  await RNCallKeep.setup({
+    ios: {
+      appName: 'Rork Talk',
+      supportsVideo: true,
+      maximumCallGroups: '1',
+      maximumCallsPerCallGroup: '1',
+      includesCallsInRecents: false, // 履歴に残したくない場合は false
+    },
+    android: { alertTitle: '', alertDescription: '', cancelButton: '', okButton: '' },
+  });
+
+  // 1. PushKit トークン取得
+  VoipPushNotification.addEventListener('register', async (token: string) => {
+    try {
+      await fetch('https://api.example.com/voip/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+    } catch (e) {
+      console.error('[VoIP] failed to register token', e);
+    }
+  });
+
+  // 2. VoIP Push 受信時 → CallKit に着信を渡す
+  VoipPushNotification.addEventListener('notification', (notification: any) => {
+    const callId: string = notification.callId ?? generateUuid();
+    const callerName: string = notification.callerName ?? '通話';
+    const hasVideo: boolean = !!notification.hasVideo;
+
+    RNCallKeep.displayIncomingCall(callId, callerName, callerName, 'generic', hasVideo);
+
+    // ストアに着信状態を保持しておくと、応答後の UI 遷移が書きやすい
+    useCallStore.getState().setIncoming({ callId, callerName, hasVideo });
+
+    // 必須: complete を呼ぶ
+    VoipPushNotification.onVoipNotificationCompleted(callId);
+  });
+
+  // 3. 応答・終了の延長線
+  RNCallKeep.addEventListener('answerCall', async ({ callUUID }: { callUUID: string }) => {
+    try {
+      await connectWebRtc(callUUID);
+    } catch (e) {
+      console.error('[VoIP] answer failed', e);
+      RNCallKeep.endCall(callUUID);
+    }
+  });
+  RNCallKeep.addEventListener('endCall', ({ callUUID }: { callUUID: string }) => {
+    teardownWebRtc(callUUID);
+    useCallStore.getState().clear();
+  });
+
+  // 4. 起動時に既存トークンを取得
+  VoipPushNotification.registerVoipToken();
+}
+
+function generateUuid(): string {
+  // crypto.randomUUID は React Native 0.74+ で利用可能
+  return (globalThis.crypto?.randomUUID?.() ?? 'fallback-' + Date.now().toString(36)).toUpperCase();
+}
+```
+
+期待動作としては、初回起動時に `register` イベントで PushKit トークンが届き、サーバに保存されます。以後、相手から発信があると 1 秒以内に着信 UI が表示され、応答ボタンで `answerCall` ハンドラが走り、WebRTC の P2P 接続が開始されます。
+
+`onVoipNotificationCompleted(callId)` の呼び忘れは、私自身も最初にハマった落とし穴です。これを呼ばないと iOS は「処理が終わっていない」と判断して以後の VoIP Push を抑制し始めます。**全分岐で必ず呼ぶ**ことを徹底してください。
+
+## Audio Session の切り替え — CallKit と WebRTC を協調させる
+
+CallKit を使う場合、audio session の制御は **CallKit が行います**。WebRTC（特に `react-native-webrtc`）が独自に `AVAudioSession` を触るとハウリングや無音になることがあるため、CallKit から「いつ audio をスタートしてよいか」を教わる設計に揃えます。
+
+```swift
+// ios/WebRtcController.swift — CallKit と audio session の協調
+// 期待動作: provider(_:didActivate:) のタイミングで初めて peerConnection の audio を有効化する。
+import CallKit
+import WebRTC
+
+final class WebRtcController: NSObject, CXProviderDelegate {
+  static let shared = WebRtcController()
+  private let factory = RTCPeerConnectionFactory()
+  private var pendingActivation: (() -> Void)?
+
+  func prepareIncoming(callId: UUID) {
+    // この時点ではまだ audio を流さない（CallKit が活性化通知を出すまで待つ）
+    pendingActivation = { [weak self] in self?.startAudio(for: callId) }
+  }
+
+  func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+    do {
+      try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .duckOthers])
+      try audioSession.setActive(true, options: [])
+      pendingActivation?()
+      pendingActivation = nil
+    } catch {
+      print("[Audio] activate failed: \(error)")
+    }
+  }
+
+  func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+    // 通話終了時の停止処理は CallKit に任せる
+  }
+
+  private func startAudio(for callId: UUID) {
+    // peerConnection.add(localAudioTrack, ...) など
+  }
+}
+```
+
+ここで `category` を `.playAndRecord` に、`mode` を `.voiceChat` にする組み合わせが、現時点では最も問題が少ない構成です。`.videoChat` は反響キャンセラの挙動が異なり、ヘッドセット使用時に違和感が出るケースがありました。私はビデオ通話アプリでも `.voiceChat` を使い、video のフレーム処理を別レイヤーで管理する方針を採っています。
+
+## よくある間違いと落とし穴
+
+ここまでの内容を実装すると一通り動きますが、私が実プロダクトで踏んだ「気づきにくいバグ」を 3 つほど共有させてください。
+
+**1. 着信時にアプリを foreground に持ってきていない**: CallKit は `reportNewIncomingCall` を呼んだだけではアプリを foreground にしません。応答後にアプリ画面を開きたい場合は、`UNUserNotificationCenter` ではなく、CallKit の応答ハンドラで `RNCallKeep.backToForeground()`（RN）または `UIApplication.shared.open(URL(string: "myapp://call/...")!)` を呼ぶ実装が必要です。これを忘れると、応答してもユーザーには「無音の通話画面」のように見えます。
+
+**2. 通話履歴が iOS の電話アプリに残ってしまう**: `includesCallsInRecents: true`（デフォルト）にしていると、ユーザーの「最近使った項目」に通話履歴が混ざります。プライバシーや審査の観点で外したいことが多いので、用途に応じて `false` を選んでください。私のアプリではユーザーから「会社の電話履歴に表示されて困る」というフィードバックが届き、リリース後に修正しました。
+
+**3. iOS 13 以降の 30 秒ルール違反**: payload を待たずに先に DB を読みに行ったり、`reportNewIncomingCall` の前に重い同期 I/O をかますと簡単に違反します。**Push 受信ハンドラの先頭で、必要最小限の payload から CallKit の着信報告を完了させ、シグナリングや WebRTC の準備はその後で行う**ことを徹底してください。順序を守るだけで、原因不明の VoIP 停止のほとんどは消えます。
+
+## 本番運用で押さえるべきオブザーバビリティ
+
+通話アプリは「鳴らないこと」が最大のクレーム要因なので、運用に入る前に最低限のメトリクスを仕込んでおくと安心です。私は次の 4 つを必ず計装するようにしています。
+
+- VoIP Push の APNs 送信成功率（status コード別）
+- PushKit 受信から `reportNewIncomingCall` 完了までの所要時間
+- `answerCall` 押下から audio activation までの所要時間
+- 通話終了時の `endCall` 理由（remoteEnded / declined / unanswered など）
+
+Cloudflare Workers + Logpush + R2 を使っている場合は、APNs レスポンスをそのまま JSON で吐いて R2 に貯めるだけでも、初期のトラブルシュートはかなり楽になります。アプリ側のメトリクスは Sentry の breadcrumb として送るか、自前バックエンドに JSON で POST する程度で十分です。
+
+## App Store 審査で詰まらないために
+
+最後に、審査面で気をつけたい点を共有します。Apple は `pushType: voip` を **「ユーザー間のリアルタイム音声・映像通信」以外で使うことを禁止**しています。次の用途はリジェクト対象になります。
+
+- メッセージの新着通知（→ 通常の APNs alert を使うこと）
+- AI レスポンスの完了通知
+- バックグラウンドでのデータ同期
+- ジオフェンスに基づくサイレント起動
+
+私が経験したケースでは、「VoIP Push を使ってバックグラウンドで AI の長時間ジョブを完了させる」設計でリジェクトされ、`silent push` + `BGTaskScheduler` の組み合わせに書き換えて再提出することで通りました。Rork で「裏で動かしたい」処理が出てきた場合は、まず BGTaskScheduler やバックグラウンド配信付き silent push が使えないかを検討してから、最後の手段として VoIP Push を選んでください。
+
+CallKit の利用自体は、中国大陸（CN リージョン）のアプリでは制限があります。多言語展開する場合、`PrivacyInfo.xcprivacy` の declared API と合わせて、リージョン別ビルド戦略を検討する必要があります。私の場合は `CallKit` を使う構成と使わない構成（フルカスタム着信 UI）を 2 つビルドターゲットとして用意し、配信先で出し分けています。
+
+## 次の一歩 — 自分のアプリに組み込む
+
+ここまでお読みいただき、ありがとうございます。次に取るべき具体的なアクションは 1 つです。**現在の Rork プロジェクトのバックエンド側で、VoIP 用 APNs 証明書を発行し、`apns-topic` に `.voip` を付けたテストリクエストを 1 本通してみる**ことです。サーバから 200 が返り、実機の PushKit が `register` を発火するところまで確認できれば、本記事のクライアント側コードはそのまま乗せられます。
+
+通話品質や接続成功率の話は WebRTC のフレームワーク選択（Daily / LiveKit / Twilio Video / 自前 SFU）でほぼ決まります。Rork での WebRTC 実装ノウハウは [Rork Max × WebRTC ビデオ通話完全ガイド](/articles/rork-dev/rork-max-webrtc-video-call-complete-guide) で扱っているので、メディア層の設計と合わせて読んでいただくと、エンドツーエンドの全体像が掴めるはずです。Push 通知側の運用ノウハウは [Rork × Expo Push Notifications バックエンド完全ガイド](/articles/rork-dev/rork-push-notification-expo-backend-complete-guide) も参考になります。
+
+VoIP の設計判断や iOS の細かい挙動を体系的に整理しておきたい方には、[詳解 iOS プログラミング（Apple Developer 向け実践書）](https://www.amazon.co.jp/dp/4798147303/?tag=pinocchio-22) のような Apple フレームワーク全般を扱う書籍が補助線として役立ちます。CallKit と PushKit は単独の章として扱われていることは少ないですが、`UIBackgroundModes` や `AVAudioSession` の前提知識を一冊で押さえておくと、本記事の内容がより腹落ちすると思います。

@@ -1,0 +1,398 @@
+---
+title: "Implementing CallKit + PushKit in Rork: A Production Guide to Native Call UI and VoIP Push for Voice & Video Apps"
+slug: "rork-callkit-pushkit-voip-implementation-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-01T11:30"
+updated: "2026-05-01T11:30"
+author: "Rork Lab"
+description: "A practical, production-grade walkthrough for wiring CallKit and PushKit into a Rork-built voice or video calling app — covering token lifecycle, audio sessions, App Store review risks, and the WebRTC handoff."
+tags: ["Rork", "CallKit", "PushKit", "VoIP", "Push Notifications", "WebRTC", "iOS", "React Native", "Calling Apps"]
+highlights:
+  - "If you've been stuck because your VoIP app doesn't show a full-screen incoming call UI on the lock screen, you'll walk away with a working PushKit + CallKit pipeline you can ship today"
+  - "You'll learn the entire production stack — VoIP token registration and revocation, audio session coordination with WebRTC, and answer/hangup flow on both React Native and SwiftUI"
+  - "You'll be able to judge whether your app's use of VoIP push is App Store compliant, and what to swap to if Apple pushes back during review"
+---
+
+"My Rork-built calling app doesn't ring when the screen is locked." I get this question often, and almost every time the root cause is the same: the app is relying on a regular APNs alert. To make a real iOS VoIP call land — full-screen incoming UI on the lock screen, audio playing the moment the user taps Answer — you need **a different, parallel API surface: CallKit plus PushKit**.
+
+I've shipped this stack myself in a Rork-based WebRTC calling app, and the first few days were entirely spent figuring out why incoming calls wouldn't ring on a real device. Apple's docs are scattered, and there's even less material when you're bridging from React Native. This article is the survival guide I wish I'd had — laid out so that you can avoid the same pitfalls I hit on the way to production.
+
+The patterns below cover both **Rork (React Native)** and **Rork Max (native SwiftUI)**. For React Native, we'll use `react-native-callkeep` plus `react-native-voip-push-notification` as the bridge. For Rork Max, we'll touch `PushKit` and `CallKit` directly through `PushRegistry` and `CXProvider`. Most of the underlying behaviors are identical — what changes is how much glue code you write yourself.
+
+## Why a Regular Push Just Won't Cut It
+
+Before we touch any code, it's worth slowing down to understand *why* Apple gave us a separate API at all. Internalizing this saves you a lot of debugging later, because most of the strange constraints you'll bump into are downstream consequences of this design choice.
+
+A standard APNs alert delivers a banner that the user has to tap before your app comes alive. Even with `content-available: 1` background pushes, iOS prioritizes battery life and may delay or coalesce delivery for tens of minutes. By the time your app finally executes, the caller has already given up. PushKit, by contrast, ships a payload with `apns-push-type: voip`, and the moment iOS receives it, **it wakes your process from a cold start in the background** and gives you a chance to call CallKit's `reportNewIncomingCall`. CallKit then displays the lock-screen-full-bleed system UI that users associate with "real" phone calls.
+
+There's a strict catch from iOS 13 onward: **if you receive a VoIP push and don't report an incoming call to CallKit within 30 seconds, iOS will kill your app**. Repeated violations make the OS quietly stop delivering VoIP pushes to that device entirely. The penalty is brutal precisely because Apple wants to disincentivize developers using VoIP push as a generic background-execution loophole. So the rule isn't optional — every PushKit handler must end at CallKit, no exceptions, on every code path including error branches.
+
+This naturally brings up a tempting question: can you reuse VoIP push for other "must run in background" tasks, like clearing a chat queue or finishing an LLM response? Apple has been firm: VoIP push is for real-time human-to-human voice and video, period. Several large apps — including some you've heard of — have been told to refactor in review, and at least one had a temporary App Store removal as part of the negotiation. Use BGTaskScheduler or silent push for anything else, and reserve VoIP push for actual ringing phones. I'll come back to this in the App Store review section, because it's the single most common reason a Rork-based calling app gets rejected.
+
+A useful mental model: think of VoIP push as a privilege Apple grants on the implicit promise that you'll use it for human-to-human calls only. The OS gates it heavily because it's the most expensive privilege in the entire push system in terms of battery life and background CPU. If your design starts to drift from that promise, that's a signal to pick a different mechanism.
+
+## The Layers You're Wiring Together
+
+A production VoIP app ends up looking like this. When you build it on Rork, what makes it tricky is that you're hopping between JavaScript and native iOS code — and you need a clear mental model of which layer owns which job. Confusing the layers (e.g. trying to do CallKit reporting from JavaScript) is the most common architectural mistake I see in code reviews.
+
+- **Signaling server**: tells "user A wants to call user B" (Cloudflare Workers + Durable Objects, Supabase Realtime, custom WebSocket — your choice). It's also where you'd implement features like ringing-state expiration and auto-cancel.
+- **VoIP push backend**: hits APNs with `apns-push-type: voip`. Often the same service as your signaling server, but logically distinct.
+- **PushKit (native iOS)**: receives the VoIP push and is responsible for handing the payload to CallKit within Apple's deadline.
+- **CallKit (native iOS)**: shows the system call UI, manages call state, owns the audio session lifecycle.
+- **WebRTC (shared)**: actual audio/video media transport, usually via `react-native-webrtc` or a vendor SDK like Daily / LiveKit / Twilio.
+- **JS layer (Rork)**: history, in-app UI screens, business logic, analytics.
+
+For React Native, OSS handles the bridge: `react-native-callkeep` wraps `CXProvider`, and `react-native-voip-push-notification` wraps `PKPushRegistry`. Both libraries are mature and used in production by some of the largest RN-based calling apps. For Rork Max, you'll be in Swift the whole way, which gives you finer control and avoids one extra JS bridge round trip per event. I'll show both flavors below so you can pick whichever matches your project.
+
+A subtle point worth calling out: **CallKit operations are blocking from iOS's perspective**. When you call `reportNewIncomingCall`, iOS expects the rest of your handler to be lightweight. Heavy work — DB reads, contact lookups, network calls — should happen *after* CallKit has accepted the report. Mixing this up causes intermittent "the call rang but I can't answer it" bugs that are nearly impossible to reproduce in the simulator.
+
+## Setting Up the VoIP Certificate and APNs Backend
+
+Half of all "calls don't ring" tickets I've seen come from a misconfigured server side. Get this nailed down first, before you write a single line of client code.
+
+In the Apple Developer site, open your App ID and enable both **Push Notifications** and **Voice over IP** capabilities. Then generate a separate **VoIP Services Certificate** — this is *not* the same artifact as your normal push certificate, and you can't reuse it. As of mid-2025, Apple still supports certificate-based VoIP push (some teams expected deprecation, but it's still alive). Token-based authentication via `.p8` keys also works for VoIP if you'd rather use a unified APNs key. Drop the resulting `.p12` (or token-based key) onto your backend, and send pushes like this from a Cloudflare Workers handler.
+
+```typescript
+// src/voip-push.ts — sending a VoIP push from Cloudflare Workers
+// Expected behavior: APNs accepts the push and the target device's PushKit
+// handler fires within a second. Anything other than 200 should be logged.
+
+interface VoipPayload {
+  callId: string;        // CallKit UUID, unique across all devices
+  callerName: string;    // shown on the lock screen incoming UI
+  callerHandle: string;  // identifier used by the call directory (phone, email…)
+  hasVideo: boolean;     // controls the video badge on the call UI
+}
+
+export async function sendVoipPush(
+  apnsToken: string,
+  payload: VoipPayload,
+  env: { APNS_KEY: string; APNS_KEY_ID: string; APNS_TEAM_ID: string; APNS_TOPIC: string }
+) {
+  const jwt = await buildApnsJwt(env);
+
+  const url = `https://api.push.apple.com/3/device/${apnsToken}`;
+  const body = JSON.stringify({
+    aps: { 'content-available': 1 },
+    ...payload,
+  });
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      authorization: `bearer ${jwt}`,
+      'apns-topic': `${env.APNS_TOPIC}.voip`, // ⚠️ must be bundle-id + ".voip"
+      'apns-push-type': 'voip',
+      'apns-priority': '10',
+      'apns-expiration': '0',                  // deliver now, do not store-and-forward
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    // 410 = invalidated token; 400-class is usually a payload problem
+    const detail = await res.text();
+    console.error('[voip-push] failed', res.status, detail);
+    throw new Error(`APNs ${res.status}: ${detail}`);
+  }
+  return { status: res.status };
+}
+```
+
+A successful call returns HTTP 200 with an empty body. **A 410 means the device's PushKit token has been invalidated** — handle it by deleting the token from your database immediately. If you keep pushing dead tokens, Apple will start silently rate-limiting your traffic, and worse, the throttle can extend across all of your tokens for hours. I recommend periodically pruning tokens older than 30 days as well, since some users let their devices sit idle long enough that PushKit silently invalidates without your backend ever hearing about it.
+
+The single most common bug in this snippet is forgetting that `apns-topic` is `bundle-id + ".voip"`, not just the bundle id. Make this part of your code review checklist. The other one is forgetting `apns-priority: 10` (immediate delivery) — without it, Apple may delay your push for power-saving reasons, which destroys the user experience even when everything else is correct.
+
+If you're on a non-Cloudflare backend (Node + Express, Cloudflare doesn't fit your latency or compliance requirements, etc.), the equivalent code translates one-for-one using libraries like `node-apn` or `apns2`. The headers are what matter; the underlying transport is HTTP/2 either way.
+
+## Native iOS — Token Registration and Reporting an Incoming Call
+
+This is the most delicate piece of the whole stack. Whether you're on Rork (RN) or Rork Max (SwiftUI), eventually two calls have to happen back-to-back: receive the VoIP payload, hand it to CallKit. Everything else is supporting infrastructure for those two API calls.
+
+```swift
+// ios/AppDelegate.swift — wiring PushKit and CallKit on the shortest possible path
+// Expected behavior: even when the app has been killed, a VoIP push wakes the
+// process and a full-screen incoming UI appears. Tapping Answer triggers the
+// CXAnswerCallAction delegate.
+
+import PushKit
+import CallKit
+import UIKit
+
+final class VoipManager: NSObject, PKPushRegistryDelegate, CXProviderDelegate {
+  static let shared = VoipManager()
+  private let registry = PKPushRegistry(queue: .main)
+  let provider: CXProvider
+
+  override init() {
+    let config = CXProviderConfiguration(localizedName: "Rork Talk")
+    config.supportsVideo = true
+    config.maximumCallsPerCallGroup = 1
+    config.supportedHandleTypes = [.generic]
+    self.provider = CXProvider(configuration: config)
+    super.init()
+    self.provider.setDelegate(self, queue: .main)
+    registry.delegate = self
+    registry.desiredPushTypes = [.voIP]
+  }
+
+  // 1. Got a token — ship it to the server
+  func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
+    guard type == .voIP else { return }
+    let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
+    print("[PushKit] token=\(token)")
+    Task { try? await ApiClient.shared.registerVoipToken(token) }
+  }
+
+  // 2. Token revoked — drop it server-side too
+  func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
+    Task { try? await ApiClient.shared.invalidateVoipToken() }
+  }
+
+  // 3. Push received — must reportNewIncomingCall within 30 seconds
+  func pushRegistry(
+    _ registry: PKPushRegistry,
+    didReceiveIncomingPushWith payload: PKPushPayload,
+    for type: PKPushType,
+    completion: @escaping () -> Void
+  ) {
+    let dict = payload.dictionaryPayload
+    guard
+      let callIdString = dict["callId"] as? String,
+      let callId = UUID(uuidString: callIdString),
+      let name = dict["callerName"] as? String
+    else {
+      // Even on bad payloads, you MUST report a call — otherwise iOS kills the app
+      let fallbackId = UUID()
+      let update = CXCallUpdate()
+      update.localizedCallerName = "Call"
+      provider.reportNewIncomingCall(with: fallbackId, update: update) { _ in completion() }
+      return
+    }
+
+    let update = CXCallUpdate()
+    update.remoteHandle = CXHandle(type: .generic, value: dict["callerHandle"] as? String ?? "unknown")
+    update.localizedCallerName = name
+    update.hasVideo = (dict["hasVideo"] as? Bool) ?? false
+
+    provider.reportNewIncomingCall(with: callId, update: update) { error in
+      if let error = error {
+        print("[CallKit] reportNewIncomingCall failed: \(error.localizedDescription)")
+      } else {
+        // Only after CallKit has accepted, prep signaling and WebRTC
+        WebRtcController.shared.prepareIncoming(callId: callId)
+      }
+      completion() // ⚠️ ALWAYS call completion, in every branch
+    }
+  }
+
+  // 4. User tapped Answer
+  func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    WebRtcController.shared.answer(callId: action.callUUID) { success in
+      success ? action.fulfill() : action.fail()
+    }
+  }
+
+  // 5. User tapped End
+  func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    WebRtcController.shared.hangUp(callId: action.callUUID)
+    action.fulfill()
+  }
+
+  func providerDidReset(_ provider: CXProvider) {
+    WebRtcController.shared.tearDownAll()
+  }
+}
+```
+
+The non-negotiable rule in this code: **every code path must end at `reportNewIncomingCall`**. Even when the payload is junk and you'd rather not pretend an incoming call exists, you still have to put one up — otherwise iOS terminates your process. Repeated terminations cause iOS to disable VoIP push on that device. Treat the branches in this handler as a single block of "must execute in any case." The fallback `CallUpdate` with a generic name is a defensive measure: if something went wrong upstream and your payload arrives malformed, at least the user sees *something* and you don't get blacklisted.
+
+A few details that aren't obvious from Apple's docs:
+
+- `reportNewIncomingCall` runs asynchronously, but its completion handler arrives quickly (typically within 50–200ms). You can rely on it firing inside the 30-second window, but only if you don't block the call site.
+- The `CXCallUpdate` is what shows up on the lock screen UI. You can update it later via `provider.reportCall(with:updated:)` to enrich the caller name (useful when you do an async contact lookup after the call has already been reported).
+- `CXProviderConfiguration.iconTemplateImageData` lets you brand the call screen with your app icon. Use a 40x40 monochrome PNG; Apple is strict about template sizing.
+
+For a Rork-generated React Native app, you'll add this as a Native Module under `ios/` and let `react-native-callkeep` (`RNCallKeep.displayIncomingCall(...)`) call into the same `CXProvider.reportNewIncomingCall` underneath. That's the easiest path to keep maintenance simple, and it means you can write most of your call logic in TypeScript while only touching Swift for the bridge.
+
+## React Native (Rork) — Wiring CallKeep and VoIP Push Together
+
+Now the JavaScript side. My preference here is to keep `react-native-callkeep` as a thin native wrapper and let the rest of the app (state, UI, history) be ordinary React Native code. That keeps the boundary clear and easy to debug. The temptation is to put more logic on the JS side because TypeScript tooling is so much better than Xcode's, but every additional bridge call adds latency and a failure mode.
+
+```typescript
+// app/voip/voipBootstrap.ts — boot the VoIP stack from a Rork RN app
+// Expected behavior: setup runs once at app launch. A VoIP push fires
+// displayIncomingCall within ~1s and the system call UI appears.
+
+import RNCallKeep from 'react-native-callkeep';
+import VoipPushNotification from 'react-native-voip-push-notification';
+import { Platform } from 'react-native';
+import { useCallStore } from './callStore';
+
+export async function setupVoip() {
+  if (Platform.OS !== 'ios') return; // Android uses ConnectionService — different path
+
+  await RNCallKeep.setup({
+    ios: {
+      appName: 'Rork Talk',
+      supportsVideo: true,
+      maximumCallGroups: '1',
+      maximumCallsPerCallGroup: '1',
+      includesCallsInRecents: false, // false to keep calls out of the system Recents list
+    },
+    android: { alertTitle: '', alertDescription: '', cancelButton: '', okButton: '' },
+  });
+
+  // 1. PushKit token registration
+  VoipPushNotification.addEventListener('register', async (token: string) => {
+    try {
+      await fetch('https://api.example.com/voip/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+    } catch (e) {
+      console.error('[VoIP] failed to register token', e);
+    }
+  });
+
+  // 2. VoIP push received → hand off to CallKit immediately
+  VoipPushNotification.addEventListener('notification', (notification: any) => {
+    const callId: string = notification.callId ?? generateUuid();
+    const callerName: string = notification.callerName ?? 'Call';
+    const hasVideo: boolean = !!notification.hasVideo;
+
+    RNCallKeep.displayIncomingCall(callId, callerName, callerName, 'generic', hasVideo);
+
+    // Stash incoming-call info in the store for post-answer routing
+    useCallStore.getState().setIncoming({ callId, callerName, hasVideo });
+
+    // Required: tell iOS we're done
+    VoipPushNotification.onVoipNotificationCompleted(callId);
+  });
+
+  // 3. Answer / end propagation
+  RNCallKeep.addEventListener('answerCall', async ({ callUUID }: { callUUID: string }) => {
+    try {
+      await connectWebRtc(callUUID);
+    } catch (e) {
+      console.error('[VoIP] answer failed', e);
+      RNCallKeep.endCall(callUUID);
+    }
+  });
+  RNCallKeep.addEventListener('endCall', ({ callUUID }: { callUUID: string }) => {
+    teardownWebRtc(callUUID);
+    useCallStore.getState().clear();
+  });
+
+  // 4. Pull any cached token at boot
+  VoipPushNotification.registerVoipToken();
+}
+
+function generateUuid(): string {
+  return (globalThis.crypto?.randomUUID?.() ?? 'fallback-' + Date.now().toString(36)).toUpperCase();
+}
+```
+
+The expected flow: on first launch, the `register` event arrives with a fresh PushKit token, you POST it to your API. From then on, an inbound call shows the system UI within roughly a second, the user taps Answer, and `connectWebRtc` does the SDP exchange. The store update (`useCallStore.getState().setIncoming`) is a small but important piece — it gives your in-app UI enough state to render the call screen seamlessly when the user opens the app from the CallKit interface.
+
+Forgetting `onVoipNotificationCompleted(callId)` was my own first stumble. iOS interprets a missing completion as "this app didn't finish processing the push" and starts throttling subsequent VoIP pushes. **Call it in every branch**, including error paths. If you wrap your push handler in a `try/catch`, make sure the completion call lives in a `finally` block. Another related trap: don't call it twice for the same `callId` — that won't blow up, but it can confuse the runtime in subtle ways.
+
+Two more notes from production experience. First, the `displayIncomingCall` API is forgiving: you can call it from the JS thread at any time. You can also use it for *outgoing* calls' user-facing UI by combining it with `RNCallKeep.startCall`, which is convenient if you want unified styling. Second, if your app crashes shortly after `displayIncomingCall` (before the user taps Answer), iOS keeps the system UI on screen briefly, which can surprise users. Make sure your incoming flow has minimal allocation pressure to avoid this.
+
+## Audio Session — Letting CallKit Drive
+
+When CallKit is in the picture, **CallKit owns the audio session lifecycle**. If WebRTC (via `react-native-webrtc`) decides to activate `AVAudioSession` independently, you'll see howling, dead silence, or incoming audio that arrives only after a few seconds. The fix is to let CallKit tell you when it's safe to wire up audio. This is one of those rules that's easy to read and very easy to violate when you're integrating a third-party SDK that doesn't know CallKit exists.
+
+```swift
+// ios/WebRtcController.swift — coordinating CallKit and the audio session
+// Expected behavior: peerConnection audio is only enabled inside
+// provider(_:didActivate:). Anything earlier risks broken first seconds of audio.
+import CallKit
+import WebRTC
+
+final class WebRtcController: NSObject, CXProviderDelegate {
+  static let shared = WebRtcController()
+  private let factory = RTCPeerConnectionFactory()
+  private var pendingActivation: (() -> Void)?
+
+  func prepareIncoming(callId: UUID) {
+    // Don't push audio yet. Wait for CallKit's activation callback.
+    pendingActivation = { [weak self] in self?.startAudio(for: callId) }
+  }
+
+  func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+    do {
+      try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .duckOthers])
+      try audioSession.setActive(true, options: [])
+      pendingActivation?()
+      pendingActivation = nil
+    } catch {
+      print("[Audio] activate failed: \(error)")
+    }
+  }
+
+  func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+    // Tear-down on call end is handled by CallKit; we don't need to do it here.
+  }
+
+  private func startAudio(for callId: UUID) {
+    // peerConnection.add(localAudioTrack, ...) and friends
+  }
+}
+```
+
+`.playAndRecord` plus `mode: .voiceChat` is the combination I've seen behave best across iPhone hardware generations. `.videoChat` changes the echo canceler behavior in subtle ways and produced odd headset experiences for me. Even on a video calling app, I prefer `.voiceChat` and manage the video frames separately. Bluetooth headphones — both AirPods and third-party — are particularly sensitive to mode choice; use a real device with real headphones during testing rather than relying on the simulator.
+
+If you're integrating with a vendor SDK like Daily or LiveKit, consult their docs for "CallKit integration" — most of them have specific hooks (e.g., `audioOutputDevice` selection) that need to be deferred until CallKit has activated the session. Their default behavior often assumes an in-app call screen with no system audio handoff, which doesn't compose with CallKit out of the box.
+
+## Things That Will Bite You in Production
+
+The code above will get you a working call. Now let me share three bugs I shipped and only caught in the field — they're easy to miss without a lot of device hours and real users.
+
+**1. Your app stays in the background after answering.** `reportNewIncomingCall` does *not* bring your app to the foreground. If you want your in-app call screen visible after the user taps Answer, call `RNCallKeep.backToForeground()` (RN) or open a deep link via `UIApplication.shared.open(URL(string: "myapp://call/...")!)` from the Swift answer handler. Without this, users will think "the call is silent" because they're staring at their home screen, when in reality the audio is playing fine and they just need to open the app to see the in-call controls.
+
+**2. Your app's calls show up in the iOS Phone app's Recents.** With `includesCallsInRecents: true` (the default), every CallKit call gets logged to the user's system call history. That's often a privacy and review concern, especially for work-related calling apps. After a user wrote in to me about colleagues' calls leaking into their personal Recents, I shipped a hotfix to flip this to `false`. If you do want to retain history, write to your own backend instead — that gives you control over retention and visibility without surfacing private call metadata to other apps on the device.
+
+**3. Hidden 30-second-rule violations.** Even reading from your local DB or making a network round-trip *before* `reportNewIncomingCall` is enough to trip iOS's deadline on a slow device or a poor network. **In your push handler, parse the bare minimum from the payload, hand it to CallKit, and only then start signaling and WebRTC setup.** Following this ordering eliminates the majority of the "VoIP just stops working on my phone" reports. Apple has tightened this enforcement over the years — what worked in iOS 14 may be too lax in iOS 18 — so err on the side of doing less in the push handler.
+
+A bonus fourth one I'll throw in because it's specific to React Native: **your JS bundle takes time to load on cold start**. When iOS wakes your app from a kill, the bridge has to spin up before any JS-side handlers run. That's why the most reliable pattern is to do the CallKit reporting from native code (or via `react-native-callkeep`'s native path) and then let the JS layer catch up afterward. If you try to do CallKit reporting *only* from JS, you'll lose calls on slower devices.
+
+## Observability You Want Before Going Live
+
+A calling app's worst failure mode is "my phone didn't ring," and that's silent on the client side — there's no error to log, because nothing happened. Before you ship, instrument these four metrics on the server and the client. They've saved me from countless support escalations.
+
+- APNs push success rate, broken down by HTTP status (200, 410, 400-class, 500-class)
+- Time from PushKit receipt to `reportNewIncomingCall` completion (target: under 1 second)
+- Time from `answerCall` tap to audio session activation (target: under 500ms)
+- Reason for call termination (`remoteEnded` / `declined` / `unanswered` / network drop / app crashed)
+
+If you're already on Cloudflare Workers, piping APNs responses straight to Logpush + R2 gives you a queryable trail with almost zero engineering work. Client-side, Sentry breadcrumbs are usually enough — or a tiny `POST /metrics` endpoint to your own backend if you'd rather keep the data first-party. I also recommend a synthetic monitoring job that places a test call to a sentinel device every five minutes; without that, you can go a long time before noticing your APNs cert has expired.
+
+The four metrics above let you slice problems by device model, OS version, and network condition. If "ring rate" drops on a specific iOS build, you'll know to look at the OS release notes; if it drops on a specific carrier, you'll know it's network-shaped. Without this telemetry you'll be debugging by user reports, which lag the actual problem by days.
+
+## Surviving App Store Review
+
+Apple polices VoIP push aggressively. The rule is: **`pushType: voip` is for real-time voice or video between users, full stop**. Any of the following will get you rejected:
+
+- Sending message-arrived notifications via VoIP push (use a regular APNs alert instead)
+- Telling the user "your AI response is ready" via VoIP
+- Background data sync triggered by VoIP push
+- Geofence-triggered silent wakeups
+- Any "schedule a thing in the future" pattern that uses VoIP push to wake the app
+
+I had an app rejected once for using VoIP push to finish long-running AI jobs in the background; the fix was to switch to a `silent push` + `BGTaskScheduler` combo, and the resubmission went through. If you find yourself reaching for VoIP push for anything other than ringing a phone, stop and check whether BGTaskScheduler or silent push solves the problem first. Both have their own constraints (silent push throttling, BGTaskScheduler's "may run tomorrow" promise), but neither will get you rejected.
+
+There's also a regional caveat: CallKit is restricted in mainland China (CN region). If you're shipping internationally, plan for two build variants — one with CallKit and one with a fully custom in-app call UI — and select per region. I now treat this as a planning concern up-front rather than something to retrofit. The custom UI variant is a non-trivial engineering effort because you lose the lock-screen integration entirely; many teams compromise by showing local notifications with high-priority sound and an in-app full-screen ring-back screen.
+
+One more review tip: when you submit, add a clear note explaining your VoIP use case in the App Review Information field. "This app uses VoIP push to deliver incoming voice/video calls between users via WebRTC. The push triggers CallKit's `reportNewIncomingCall` within 1 second." That single sentence has gotten my apps through review faster than any amount of polished marketing copy.
+
+## What to Do Next
+
+Thanks for reading this far. The single most useful next step is small and concrete: **on your existing Rork backend, mint a VoIP APNs certificate, fire one test push with the `.voip` topic, and confirm a 200 response plus a `register` event on a real device**. Once that loop closes, every piece of client code in this article drops in cleanly. You don't need to build the full CallKit UI yet — just prove the network round trip works. Everything else is incremental.
+
+How well your calls actually *sound* and *connect* depends largely on your WebRTC choice (Daily, LiveKit, Twilio Video, or your own SFU). I covered the WebRTC side of a Rork app in [Rork Max × WebRTC Video Calling Complete Guide](/articles/rork-dev/rork-max-webrtc-video-call-complete-guide), and it pairs naturally with this PushKit/CallKit foundation. For the broader push-notification operations playbook, [Rork × Expo Push Notifications Backend Complete Guide](/articles/rork-dev/rork-push-notification-expo-backend-complete-guide) is a useful companion.
+
+If you want a structured reference for the underlying iOS frameworks — `UIBackgroundModes`, `AVAudioSession`, the lifecycle around extensions — a comprehensive Apple-frameworks book like [iOS Programming: A Practical Reference for Apple Developers](https://www.amazon.co.jp/dp/4798147303/?tag=pinocchio-22) is a pragmatic shelf companion. CallKit and PushKit rarely get standalone chapters, but the surrounding context is invaluable when you're debugging a call that won't ring. Good luck with your build — once the first test call rings on a real device, the rest of the work is mostly polishing and edge cases.
