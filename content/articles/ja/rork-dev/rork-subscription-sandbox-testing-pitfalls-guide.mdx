@@ -1,0 +1,130 @@
+---
+title: "Rork のサブスクリプションを Sandbox でテストする実践 — Apple／Google で詰まる箇所と検証手順"
+slug: "rork-subscription-sandbox-testing-pitfalls-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-02T06:00"
+updated: "2026-05-02T06:00"
+author: "Rork Lab"
+description: "Rork で実装したサブスクリプションを Sandbox 環境でテストする際の落とし穴を、Apple／Google の両側から実装コード付きでまとめました。本番ビルド前に必ず潰しておきたい検証ポイントを順序立てて確認できます。"
+tags: ["Rork", "サブスクリプション", "Sandbox", "StoreKit 2", "Google Play Billing", "テスト"]
+---
+
+サブスクリプション機能を Rork で実装して「さあテストしよう」と TestFlight にビルドを上げた直後、購入ボタンを押してもダイアログが出ない、出ても価格が表示されない、購入は通ったのにエンタイトルメントが反映されない — このあたりで丸一日溶ける、というのは多くの個人開発者が一度は経験する場面ではないでしょうか。
+
+私自身、これまで Rork で生成したアプリを App Store に出す中で、Sandbox テストの段階で何度も足をすくわれました。原因はだいたい決まっていて、Apple と Google それぞれに「Sandbox 特有の罠」があり、しかも両者は罠の種類がまったく違います。本記事では、Rork で生成したサブスクリプションコードを Sandbox で正しく検証するための具体的な手順を、よく詰まる箇所と一緒にまとめます。
+
+## Sandbox で必ず確認すべき4つのシナリオ
+
+リリース前のテストでカバーすべきシナリオは、突き詰めると次の4つに集約されます。これを「全部試した」と言える状態を目標にしてください。
+
+- **新規購入の成功**: 何も持っていないユーザーが初回購入する
+- **トライアル開始 → 自動課金移行**: 無料体験から有料移行する瞬間
+- **ユーザーによるキャンセル**: 途中解約後にエンタイトルメントが消えるか
+- **更新失敗（決済エラー）**: カード期限切れなどで猶予期間に入る挙動
+
+特に最後の「更新失敗」は本番でしか起きないように見えますが、Sandbox でも `Billing Retry` 状態を再現できます。実装漏れがそのまま課金トラブルに直結する箇所なので、絶対に飛ばさないでください。
+
+サブスク全体の設計が固まっていない場合は、先に [サブスクリプションのエンタイトルメント状態管理ガイド](/articles/rork-dev/rork-subscription-entitlement-state-machine-design-guide) で全体像を整理してから Sandbox に進むと迷いが減ります。
+
+## Apple Sandbox の準備で見落としがちな3つのポイント
+
+App Store Connect で Sandbox テスターを作るところまではドキュメント通りに進められるのですが、その後でつまずく箇所が3つあります。
+
+第一に、**Sandbox テスターのメールアドレスは実在のものを使えません**。本物のアドレスを入れると Apple ID として通知メールが届かず、検証用パスワードも受け取れません。私はいつも `sandbox-rork-001@example.com` のような架空アドレスを使い、`Notes` 欄にパスワードと用途を書いています。
+
+第二に、**実機の「設定 → App Store → Sandbox アカウント」に必ず Sandbox テスターでログインしておく**こと。本番 Apple ID のままアプリを起動すると、購入ダイアログ自体が出なかったり、価格が「読み込み中」のまま固まります。Rork で生成された `react-native-iap` ベースのコードでは、価格取得失敗時のハンドリングを入れていないテンプレートがあるので、ここで沈黙してしまうのです。
+
+第三に、**StoreKit Configuration ファイル（`.storekit`）を Xcode の Scheme で有効にしている場合、Sandbox 課金が走りません**。これはローカル StoreKit テスト専用の設定で、TestFlight ビルドには関係しないのですが、開発時の Xcode 設定が残ったまま `eas build` してしまうと挙動が混乱します。EAS Build に渡る前にスキームの `Run` の StoreKit Configuration を `None` に戻すのを習慣化してください。
+
+## StoreKit 2 で Sandbox を判別する実装例
+
+「いま実機で走っているのは Sandbox なのか本番なのか」を、コード側から確実に判定したい場面があります。エンタイトルメント反映やログ送信先を切り替えるためです。StoreKit 2 では `Transaction.environment` が用意されているので、これを使うのが最もシンプルです。
+
+```swift
+import StoreKit
+
+@MainActor
+func resolveActiveSubscription() async -> SubscriptionState {
+    for await result in Transaction.currentEntitlements {
+        guard case .verified(let transaction) = result else { continue }
+
+        // Sandbox / Production / Xcode のいずれかを返す
+        let env = transaction.environment
+
+        if env == .sandbox {
+            // ログを開発用 Logflare 等に分離して送る
+            Analytics.send("sandbox_entitlement_active", productId: transaction.productID)
+        }
+
+        return SubscriptionState(
+            productId: transaction.productID,
+            isSandbox: env == .sandbox,
+            expiresAt: transaction.expirationDate ?? .distantPast
+        )
+    }
+
+    return .none
+}
+```
+
+期待する出力は、Sandbox テスターでログインした実機で実行した場合 `isSandbox = true` が返ること、本番ビルド（実購入）では `false` になることです。Sandbox 専用ログを本番のメトリクスに混ぜないために、私は早い段階でこの分岐を入れるようにしています。
+
+なぜ `transaction.environment` を使うかというと、`UIApplication.shared` のレシート URL を見て判断する古い手法（`StoreKit 1` 時代）はサーバー検証なしには信頼できず、また Xcode テスト時の判別もできないからです。StoreKit 2 を採用しているなら、迷わず `environment` を使ってください。StoreKit 2 全般の実装は [Rork Max で StoreKit 2 によるアプリ内購入を実装する手順](/articles/rork-dev/rork-max-storekit-2-in-app-purchase) を参照すると、Sandbox 検証と本実装の関係が見通しやすくなります。
+
+## Google Play Billing の Sandbox テスト — ライセンステスター登録の盲点
+
+Android 側は仕組みが Apple と大きく異なります。Google Play Console の「ライセンステスト → テストアカウント」にメールアドレスを追加し、そのアカウントでログインしている端末で内部テストトラックの APK / AAB を起動すると、購入が「テスト購入」として扱われます。実カードで決済しても課金が発生しません。
+
+ここで最も詰まりやすいのが、**「内部テスト」「クローズドテスト」「製品版」のうち、ライセンステスターが効くのは内部テストとクローズドテストのみ**だという点です。製品版に直接 AAB をアップロードして審査を通してしまうと、ライセンステスターでも実際に課金が走り、後から払い戻し申請が必要になります。Rork で生成したアプリを最初に Google Play に出すときは、必ずまず「内部テスト」トラックで Sandbox 確認を済ませてください。
+
+加えて、サブスクリプションは Apple と違って **Google Play では更新間隔が短縮されており、月額プランなら約5分で1回更新される** という挙動になります。これは「キャンセル → 自動更新失敗」の検証を高速で回すには便利な反面、5分間 BGTask を待たないと再現できないため、テスト中にアプリを閉じて放置する時間を確保しておくとスムーズです。
+
+決済まわりの全体像を把握しておきたい場合は、[Google Play Billing で Android サブスクリプションを実装するガイド](/articles/rork-dev/rork-google-play-billing-android-subscription-guide) もあわせて読んでおくと、Sandbox で見ている挙動がどの仕様に対応しているかがわかります。
+
+## RevenueCat 経由でテストする時に見えなくなる「内部の動き」
+
+RevenueCat を使っていると、ストア側の細かい挙動が抽象化されて見えなくなります。これは便利な反面、「Sandbox で何が起きているか」を把握しにくくする副作用もあります。
+
+私が実践している対処は2つです。
+
+ひとつは、**RevenueCat ダッシュボードの「Sandbox サンドボックスデータを表示」をオンにし、Customer ページで Sandbox トランザクションを直接眺める**こと。エンタイトルメントの付与・剥奪が「いつ・なぜ」起きたかが時系列でわかります。
+
+もうひとつは、**`Purchases.logHandler` で Verbose ログを開発ビルドだけ有効にする**こと。Rork で生成された SDK 初期化コードに次の一行を足しておけば、Sandbox テスト中の通信を全部 Console で追えます。
+
+```typescript
+import Purchases, { LOG_LEVEL } from 'react-native-purchases';
+
+if (__DEV__) {
+  // 期待する出力: [Purchases] - DEBUG: ... が大量に流れる
+  Purchases.setLogLevel(LOG_LEVEL.VERBOSE);
+}
+
+Purchases.configure({
+  apiKey: process.env.EXPO_PUBLIC_REVENUECAT_KEY!,
+});
+```
+
+なぜ `__DEV__` で囲むかというと、Verbose ログは個人情報に近い情報（購読者ID等）も含むため、本番ビルドに混ぜたくないからです。Sandbox テストが終わってリリースする前に、このログを Production で意図せず流していないか必ず確認してください。
+
+エンタイトルメントが反映されない／購入後に課金状態がアプリ側で同期されない場合は、[RevenueCat で購入状態が同期されない問題の修正手順](/articles/rork-dev/rork-purchase-status-sync-revenuecat-fix) に典型的な原因がまとまっています。
+
+## 本番リリース前の最終チェックリスト
+
+ここまでの内容を、リリース前に「機械的に潰せるリスト」として整理しておきます。
+
+- 新規購入・トライアル → 自動課金・キャンセル・更新失敗、4シナリオすべて Sandbox で再現済み
+- Apple／Google 双方でサーバー側 Webhook（App Store Server Notifications V2 / Real-time developer notifications）を受け取れているか確認済み
+- StoreKit Configuration ファイル無効化、`.storekit` を読まない構成で TestFlight に出している
+- Google Play は内部テストトラックで `LICENSED` の挙動と `BILLING_UNAVAILABLE` の両方を確認した
+- RevenueCat の Sandbox トランザクションがダッシュボードに記録されている
+- Verbose ログが本番ビルドで無効化されている
+
+サーバー側通知の受け方は [App Store Server Notifications V2 を自前バックエンドで処理する実装](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription) に詳しくまとめてありますので、Webhook が未実装ならここを早めに固めてください。
+
+サブスクリプション全体のマネタイズ設計を学び直したい時には、[個人開発で稼ぐ！スマホアプリ・マネタイズの教科書（谷口有近 著）](https://www.amazon.co.jp/dp/4798067849/?tag=pinocchio-22) が、課金フローの組み方とユーザー心理の両面から具体的に整理されていて参考になります。
+
+## まとめ — 次にやる1ステップ
+
+Sandbox テストは「やったかどうか」より「どこまで再現したか」の差で本番事故率が大きく変わります。今日この記事を読み終えたら、まず **「更新失敗（猶予期間突入）」シナリオを Sandbox テスターで1回だけ通してみる** ことをおすすめします。新規購入の成功は誰でも確認しますが、更新失敗パスは見落とされがちで、しかも本番で最も顧客サポートに繋がりやすいポイントだからです。ここを1度自分の手で再現しておくと、リリース後の不具合報告に対する初動が大きく変わってきます。
