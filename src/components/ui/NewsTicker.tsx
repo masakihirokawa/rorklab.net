@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "GLOBAL-#1 — Rork がローンチ 1 年未満で web トラフィック世界一のモバイルアプリビルダーへ、英語でアプリを記述するパラダイムを牽引",
     "RORK15M — Rork が $15M シードラウンドを Left Lane Capital リードで調達、X 上で 800 万 view・2 週間で年間収益 2 倍（4/9）",
-    "PAPERLINE — Rork が Paperline を買収、ネイティブ Swift 生成能力が大幅強化、創業者の Mozharovskii / Konstantinov が参画",
-    "RORKMAX — Rork Max が Web ベースの Xcode 代替として確立、Claude Code + Opus 4.6 を基盤に Swift をクラウド Mac で直接コンパイル",
-    "APPLEFULL — Rork Max が iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage に対応、AR/LiDAR・Metal・Dynamic Island まで活用可能",
-    "COMPANION — Rork Companion アプリで Apple Developer 有償契約なしに実機 iPhone テストが可能、個人開発者の参入障壁が大幅低下",
-    "TRENDS2026 — Gartner 予測で 2026 年までに低コード開発が新規アプリの 75% を占める、Rork / Lovable / Anything の 3 強体制が定着",
+    "RORKMAX — Rork Max が Web ベース Xcode 代替として確立、Claude Code + Opus 4.6 基盤でローンチ 3 日で $1.5M ARR を達成",
+    "PAPERLINE — Rork が Paperline を買収、ネイティブ Swift 生成能力が大幅強化、創業エンジニア 2 名が参画",
+    "APP-BOOM — 4 月の iOS アプリリリース 80%+ 増、両 OS 合計 104% 増、AI 起因の新規開発ブームの主役に",
+    "AGENT365 — Microsoft Agent 365（5/1 ローンチ）はエンタープライズ統制プレーン、個人開発者向け Rork とは別市場で住み分け",
   ],
   en: [
+    "GLOBAL-#1 — In under a year Rork becomes the world's #1 mobile app builder by web traffic, leading the English-to-app paradigm",
     "RORK15M — Rork closes a $15M seed round led by Left Lane Capital, with 8M+ X views and revenue doubling in two weeks (4/9)",
-    "PAPERLINE — Rork acquires Paperline, strengthening native Swift generation as founders Mozharovskii and Konstantinov join the team",
-    "RORKMAX — Rork Max emerges as a web-based Xcode alternative, powered by Claude Code + Opus 4.6 with cloud-Mac Swift compilation",
-    "APPLEFULL — Rork Max covers iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage with AR/LiDAR, Metal, and Dynamic Island",
-    "COMPANION — Rork Companion lets you test on real iPhones without a paid Apple Developer account, lowering the bar for solo devs",
-    "TRENDS2026 — Gartner forecasts low-code tools to drive 75% of new app development in 2026, with Rork, Lovable, and Anything as the top 3",
+    "RORKMAX — Rork Max emerges as a web-based Xcode alternative, hitting $1.5M ARR within three days on Claude Code + Opus 4.6",
+    "PAPERLINE — Rork acquires Paperline, strengthening native Swift generation as the founders join the team",
+    "APP-BOOM — April iOS app releases jumped 80%+, with combined OS releases up 104%, putting Rork at the heart of the AI-driven app boom",
+    "AGENT365 — Microsoft Agent 365 launches May 1 as the enterprise control plane, leaving Rork to dominate the solo-developer market",
   ],
 };
 
