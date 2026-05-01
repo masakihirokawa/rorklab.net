@@ -1,0 +1,239 @@
+---
+title: "Catch Silent Deprecations Before the Next OS Update Breaks Your Rork App"
+slug: "rork-os-update-deprecation-api-early-detection"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-01T15:00"
+author: "Rork Lab"
+description: "Apple and Google deprecate APIs every year, and your app breaks the morning after. Build the watchdog: a four-layer monitoring setup with concrete CI scripts that catches Required Reason APIs, missing Privacy Manifests, targetSdkVersion shifts, and Expo SDK signals before submission fails."
+tags: ["rork", "ios", "android", "deprecation", "maintenance"]
+highlights:
+  - "How silent deprecations differ from crashes — they ship through Apple/Google notification emails, and the four layers where they hide"
+  - "Working CI scripts for Required Reason APIs, third-party Privacy Manifests, Android targetSdkVersion, and Expo SDK warning triage"
+  - "An annual operating calendar that turns the WWDC-to-Play-Store deadline cycle from emergency mode into a routine quarterly task"
+---
+
+The first app I shipped is now over a decade old. Even an app that has run for ten years can stop running tomorrow if the OS underneath it changes. One morning I opened my email to an Apple notice: "Your app uses a Required Reason API that is not declared in PrivacyInfo." The submission was rejected. When I dug into the cause, the offending API was being called by a small library deep in my dependency tree — `UserDefaults` was used inside an Expo update plugin, and `systemUptime` was being read by an analytics SDK I had not even thought about for a year.
+
+The danger of OS updates is the **silent deprecation**: an API that does not warn you while it works, then suddenly cannot be used anymore. This article walks through the operational design I run on my Rork apps to catch silent deprecations before they reach an Apple rejection email — including the CI scripts, layered by where the deprecation actually hides.
+
+## Why silent deprecations are uniquely painful
+
+A normal bug surfaces as a crash report. Deprecations move differently:
+
+- **Apple rejection emails** arrive only at submission time
+- **iOS Privacy Manifest requirements** add APIs quietly and become enforced three months later
+- **Android targetSdkVersion** is raised every August; if you miss it, no further updates can be shipped
+- **Expo SDK** breaks dependent native modules across major version bumps
+
+The thing they share: **your code still runs**. Because it runs, no crash report shows up. But submissions get rejected, or the listing gets pulled a year from now, when the silent grace period quietly ends.
+
+My checklist exists to remove that "silent period." Find them while they still work. Without this, every June through September — from WWDC to the iOS release — used to be a write-off for me.
+
+## Four layers to monitor
+
+Deprecations do not collect at one place. They scatter across at least four layers, and each requires its own detection mechanism.
+
+1. **Required Reason API (iOS)** — Apple's list of ~100 APIs (`UserDefaults`, `fileTimestamps`, `systemUptime`, etc.) that must be declared in `PrivacyInfo.xcprivacy`
+2. **Privacy Manifest (third-party SDKs)** — Whether each dependency ships its own `PrivacyInfo.xcprivacy`
+3. **targetSdkVersion (Android)** — Google Play's annual minimum SDK floor
+4. **Expo SDK and dependency deprecation warnings** — Peer dep complaints from `npm ls`, Xcode build warnings
+
+I tried to handle all four with one script. It collapsed. Now each layer has its own check, and that is what kept the system maintainable.
+
+## Layer 1: detecting Required Reason API usage automatically
+
+Required Reason APIs must be declared with a reason in `PrivacyInfo.xcprivacy`. Apple expands the list a few times a year, so the script has to accept that **the list itself is a moving target**.
+
+I keep the list in `scripts/required-reason-apis.json` and grep symbols from the built ipa.
+
+```typescript
+// scripts/check-required-reason-apis.ts
+import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+interface ApiEntry {
+  symbol: string;
+  category: string;  // "UserDefaults" / "FileTimestamp" etc.
+  reasonRequired: boolean;
+}
+
+const apiList: ApiEntry[] = JSON.parse(
+  readFileSync("scripts/required-reason-apis.json", "utf8"),
+);
+
+const ipa = process.argv[2];
+const symbols = execSync(
+  `unzip -p "${ipa}" "Payload/*.app/*" | nm - 2>/dev/null || true`,
+).toString();
+
+const declared = new Set<string>(
+  JSON.parse(
+    execSync(
+      `plutil -convert json -o - $(unzip -p "${ipa}" "Payload/*.app/PrivacyInfo.xcprivacy" > /tmp/p.xcprivacy && echo /tmp/p.xcprivacy)`,
+    ).toString(),
+  ).NSPrivacyAccessedAPITypes?.map((x: any) => x.NSPrivacyAccessedAPIType) ?? [],
+);
+
+const undeclared = apiList.filter(
+  (api) => api.reasonRequired && symbols.includes(api.symbol) && !declared.has(api.category),
+);
+
+if (undeclared.length > 0) {
+  console.error("❌ Undeclared Required Reason APIs:");
+  for (const api of undeclared) {
+    console.error(`  - ${api.symbol} (${api.category})`);
+  }
+  process.exit(1);
+}
+console.log("✅ All Required Reason APIs are declared");
+```
+
+I plug this into the post-build step of GitHub Actions on Xcode builds. Adding a new dependency or upgrading the Expo SDK will fail the CI if it brought in a Required Reason API silently. The most important property: **CI fails before Apple does**. Reading a rejection email at midnight does not get easier with practice.
+
+## Layer 2: auditing third-party Privacy Manifests
+
+Third-party SDKs need to ship their own `PrivacyInfo.xcprivacy`. Apple is particularly strict on the "commonly used third-party SDKs" list.
+
+```bash
+#!/usr/bin/env bash
+# scripts/check-third-party-privacy-manifest.sh
+set -euo pipefail
+
+REQUIRED=$(cat scripts/sdks-requiring-privacy-manifest.txt)
+MISSING=()
+
+while read -r sdk; do
+  PATH_GUESS=$(find ios/Pods -path "*${sdk}*PrivacyInfo.xcprivacy" 2>/dev/null | head -1)
+  if [ -z "$PATH_GUESS" ]; then
+    MISSING+=("$sdk")
+  fi
+done <<< "$REQUIRED"
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+  echo "❌ SDKs missing PrivacyInfo.xcprivacy:"
+  printf '  - %s\n' "${MISSING[@]}"
+  echo ""
+  echo "Action: update these pods to a version that includes the manifest,"
+  echo "or replace with a maintained alternative."
+  exit 1
+fi
+echo "✅ All required SDKs include PrivacyInfo.xcprivacy"
+```
+
+This runs after every `pod install`. Holding onto an old SDK version eventually triggers a rejection — pre-detecting it in CI is the practical defense.
+
+## Layer 3: ongoing Android targetSdkVersion monitoring
+
+Google Play raises requirements every August. The first warning arrives around April: "Please move to targetSdkVersion 36 by August 2026." Miss it and you can no longer submit updates.
+
+```yaml
+# .github/workflows/sdk-version-check.yml
+name: Check Android targetSdk
+on:
+  schedule:
+    - cron: "0 9 1 * *"   # 1st of every month
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read targetSdkVersion
+        id: read
+        run: |
+          TARGET=$(grep -E "targetSdkVersion\s*=" android/build.gradle | sed -E 's/.*=\s*([0-9]+).*/\1/' | head -1)
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+      - name: Compare with Google Play minimum
+        run: |
+          REQUIRED=36
+          if [ "${{ steps.read.outputs.target }}" -lt "$REQUIRED" ]; then
+            echo "❌ targetSdkVersion ${{ steps.read.outputs.target }} is below required $REQUIRED"
+            exit 1
+          fi
+          echo "✅ targetSdk OK (${{ steps.read.outputs.target }} >= $REQUIRED)"
+```
+
+Once a month is enough. Google Play's policy changes are announced at least six months out, so a monthly run gives plenty of runway.
+
+## Layer 4: triage Expo SDK warnings — do not let them drown each other
+
+Major Expo SDK upgrades produce dozens of `npm ls` and `expo-doctor` warnings. I lost a lot of weekends trying to **treat all warnings the same**. Some are genuinely critical, others are noise — but if you put them in one list, nobody reads it.
+
+The triage script that finally stuck splits them by severity:
+
+```typescript
+// scripts/triage-deprecation-warnings.ts
+import { execSync } from "node:child_process";
+
+interface Warning {
+  pkg: string;
+  message: string;
+}
+
+const raw = execSync("npx expo-doctor --no-color 2>&1 || true").toString();
+const warnings: Warning[] = parseExpoDoctorOutput(raw);
+
+const SEVERITY: Record<string, "block" | "warn" | "note"> = {
+  // Tied to Apple/Google enforcement
+  "react-native-firebase": "block",
+  "expo-notifications": "block",
+  "expo-tracking-transparency": "block",
+  // Behavior-coupled with other SDKs
+  "react-native-async-storage": "warn",
+  "react-native-mmkv": "warn",
+  // Pure feature warnings
+  "default": "note",
+};
+
+const triaged = warnings.map((w) => ({
+  ...w,
+  severity: SEVERITY[w.pkg] ?? SEVERITY.default,
+}));
+
+const blocks = triaged.filter((w) => w.severity === "block");
+if (blocks.length > 0) {
+  console.error("❌ BLOCK warnings — must address before next release:");
+  for (const w of blocks) console.error(`  - [${w.pkg}] ${w.message}`);
+  process.exit(1);
+}
+const warns = triaged.filter((w) => w.severity === "warn");
+console.log(`⚠ ${warns.length} WARN warnings (non-blocking)`);
+```
+
+An "everything is red" list never gets read. A list that says **what must be fixed right now in one line** drives action. Same operational principle I follow with Claude Code release gates: the way you go red has to be designed.
+
+## Turning notification emails into actionable tasks
+
+Apple and Google notifications often state the symptom abstractly. I forward each one into a Notion database with a fixed template:
+
+```
+Subject: Submission Failure - PrivacyInfo Missing API Reason
+Symptom: NSPrivacyAccessedAPICategoryUserDefaults not declared
+Layer: Layer 1 (Required Reason API)
+Deadline: Next submission
+Owner: me
+First step: run scripts/check-required-reason-apis.ts
+```
+
+The only field I refuse to leave blank is **First step**. If I read this email at midnight, the cognitive load between "knowing the problem" and "doing something about it" is small enough that I can act. Notifications without a clear first step erode you when you read them late at night.
+
+## An annual calendar — fix it before it breaks
+
+Finally, the rhythm in my head. OS-related changes follow an annual cadence; aligning preparation to it removes almost all surprise emergencies.
+
+- **June (right after WWDC)** — Read the new iOS Required Reason API additions and Privacy Manifest changes
+- **July–August** — Run Required Reason API checks against the new iOS beta; flag rejection candidates
+- **September** — Submit the compatible build at iOS release
+- **April** — Google Play sends the next year's targetSdk announcement; plan summer work
+- **August** — Hit the Google Play deadline before enforcement kicks in
+
+Putting these five recurring events into Google Calendar removed about 80 percent of my "surprise rejections." The remaining 20 percent are unexpected library shifts, which Layer 2 and Layer 4 mostly catch.
+
+## If you can do only one thing this week
+
+For readers short on time: the highest-leverage one is **Layer 1 — wire Required Reason API checks into CI**. The script is half a day's work. Apple publishes the API list; turn it into JSON, grep it against your build symbols, fail CI on undeclared usage.
+
+When I added this for the first time, it caught five cases of `systemUptime` being called from small libraries I had forgotten about. Two of them would have caused the next rejection if I had submitted as-is. As a first step into "catching silent deprecations early," nothing has paid off as well as this one check.

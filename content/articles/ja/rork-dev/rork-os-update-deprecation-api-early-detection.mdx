@@ -1,0 +1,241 @@
+---
+title: "Rork のアプリが OS アップデートで突然壊れる前に — 沈黙する非推奨 API を先回りで掴む運用設計"
+slug: "rork-os-update-deprecation-api-early-detection"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-01T15:00"
+author: "Rork Lab"
+description: "Apple や Google の年次アップデートで動かなくなる前に、非推奨 API・必要な PrivacyInfo・Required Reason API を継続的に監視する運用設計。Rork で長く動かすための実践パターンと自動チェックを紹介します。"
+tags: ["rork", "ios", "android", "deprecation", "maintenance"]
+highlights:
+  - "iOS / Android 双方の年次アップデートサイクルで「沈黙して壊れる」非推奨 API を、自動で検出する仕組みの設計"
+  - "PrivacyInfo.xcprivacy / Required Reason API / Privacy Manifest を継続的に監査する CI スクリプトの実装パターン"
+  - "Expo SDK・ネイティブモジュール・Apple Reject 通知メールを「対応可能なタスク」に変換する運用フローと、急ぎではない警告との切り分け"
+---
+
+私が個人開発で公開しているアプリは、いま 2014 年の最初の一本から数えて 10 年を超えました。10 年動いたアプリも、明日 OS が変われば動かなくなる可能性が常にあります。実際、ある朝メールを開いたら Apple から「あなたのアプリは PrivacyInfo に未申告の Required Reason API を使っています」という通知が届いていて、提出物がリジェクトされたことが何度もありました。「使っていないはず」と思って調べると、依存している小さなライブラリが内部で `UserDefaults` を呼んでいたり、Expo の Update プラグインが `systemUptime` を取得していたりするのです。
+
+OS アップデートの怖さは、エラーで気づかせてくれない **「沈黙する非推奨」** にあります。動いているうちは何も言わない API が、ある朝のメールでいきなり「使えなくなります」と言われる。本記事では、私が Rork で運用しているアプリ群で実装している「沈黙する非推奨を先回りで掴む」運用設計を、CI スクリプトのレベルまで踏み込んで共有します。
+
+## なぜ「沈黙する非推奨」がこれほど厄介なのか
+
+通常のバグであればクラッシュレポートが上がってきます。しかし非推奨化は別の動き方をします。
+
+- **Apple Reject 通知メール** は、submit のたびにしか届かない
+- **iOS Privacy Manifest 要件** は、新規 API 追加が静かに行われ、3 か月後に強制になる
+- **Android targetSdkVersion** は、毎年 8 月頃に基準が引き上がり、対応しないと新規アップデートを受け付けない
+- **Expo SDK** は、メジャーバージョンを跨ぐと依存ネイティブモジュールが互換切れする
+
+これらの共通項は **「あなたのコードはまだ動いている」** ことです。動いているからクラッシュレポートに出ない。けれど来月のリリースで突然 reject される、あるいは 1 年後にストアから消える、という形で結末がやってきます。
+
+私のチェックリスト運用は、この「沈黙の期間」をなくすことを目的にしています。動いているうちに、それでも見つける仕組み。これがないと、毎年夏の Apple WWDC から秋の iOS リリースまでの 2 か月間、私は仕事ができなくなります（実話です）。
+
+## 監視すべき 4 つのレイヤー
+
+非推奨は 1 か所では起きません。少なくとも次の 4 か所を継続的に観察する必要があります。
+
+1. **Required Reason API（iOS）** — Apple が指定する 100 弱の API リスト。`UserDefaults`、`fileTimestamps`、`systemUptime` など。`PrivacyInfo.xcprivacy` での宣言が必須
+2. **Privacy Manifest（依存ライブラリ）** — サードパーティ SDK がプライバシーマニフェストを同梱しているか
+3. **targetSdkVersion（Android）** — Google Play の毎年の最低要件
+4. **依存パッケージの非推奨警告** — `npm ls --silent` で出る peer dep 警告、Xcode のビルド警告
+
+それぞれ別のメカニズムで検出する必要があります。1 つのスクリプトで全部見ようとして失敗した経験があるので、いまは観点ごとに別々のチェックを走らせています。
+
+## レイヤー 1：Required Reason API の自動検出
+
+Required Reason API は、iOS の `PrivacyInfo.xcprivacy` で「なぜそれを使うのか」を宣言する必要のある API です。Apple のリストは年に数回拡張されるため、**チェックスクリプトもリストを更新する**必要があります。
+
+私の運用では、Apple のドキュメントから抽出した API シンボルリストを `scripts/required-reason-apis.json` として保持し、ipa ビルド成果物の中をシンボル検索しています。
+
+```typescript
+// scripts/check-required-reason-apis.ts
+import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+interface ApiEntry {
+  symbol: string;
+  category: string;  // "UserDefaults" / "FileTimestamp" など
+  reasonRequired: boolean;
+}
+
+const apiList: ApiEntry[] = JSON.parse(
+  readFileSync("scripts/required-reason-apis.json", "utf8"),
+);
+
+const ipa = process.argv[2];
+const symbols = execSync(
+  `unzip -p "${ipa}" "Payload/*.app/*" | nm - 2>/dev/null || true`,
+).toString();
+
+const declared = new Set<string>(
+  // PrivacyInfo.xcprivacy の解析結果から取り出す（plutil で plist→json 化）
+  JSON.parse(
+    execSync(
+      `plutil -convert json -o - $(unzip -p "${ipa}" "Payload/*.app/PrivacyInfo.xcprivacy" > /tmp/p.xcprivacy && echo /tmp/p.xcprivacy)`,
+    ).toString(),
+  ).NSPrivacyAccessedAPITypes?.map((x: any) => x.NSPrivacyAccessedAPIType) ?? [],
+);
+
+const undeclared = apiList.filter(
+  (api) => api.reasonRequired && symbols.includes(api.symbol) && !declared.has(api.category),
+);
+
+if (undeclared.length > 0) {
+  console.error("❌ Undeclared Required Reason APIs:");
+  for (const api of undeclared) {
+    console.error(`  - ${api.symbol} (${api.category})`);
+  }
+  process.exit(1);
+}
+console.log("✅ All Required Reason APIs are declared");
+```
+
+このスクリプトを CI（GitHub Actions の Xcode ビルド後ステップ）に組み込みます。新しい依存ライブラリを追加したり、Expo SDK を上げた直後に Required Reason API が増えても、ビルド失敗で検出できます。何より重要なのは、**reject される前に CI で止まる** こと。Apple の reject メールを夜中に読むのは、人生で何度経験しても慣れません。
+
+## レイヤー 2：依存ライブラリの Privacy Manifest 監査
+
+サードパーティ SDK は自分自身の `PrivacyInfo.xcprivacy` を同梱する必要があります。Apple のガイドラインで「commonly used third-party SDKs」リストに入っているライブラリは特に厳しくチェックされます。
+
+```bash
+#!/usr/bin/env bash
+# scripts/check-third-party-privacy-manifest.sh
+set -euo pipefail
+
+REQUIRED=$(cat scripts/sdks-requiring-privacy-manifest.txt)
+MISSING=()
+
+while read -r sdk; do
+  PATH_GUESS=$(find ios/Pods -path "*${sdk}*PrivacyInfo.xcprivacy" 2>/dev/null | head -1)
+  if [ -z "$PATH_GUESS" ]; then
+    MISSING+=("$sdk")
+  fi
+done <<< "$REQUIRED"
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+  echo "❌ SDKs missing PrivacyInfo.xcprivacy:"
+  printf '  - %s\n' "${MISSING[@]}"
+  echo ""
+  echo "Action: update these pods to a version that includes the manifest,"
+  echo "or replace with a maintained alternative."
+  exit 1
+fi
+echo "✅ All required SDKs include PrivacyInfo.xcprivacy"
+```
+
+このチェックは、`pod install` のたびに走らせます。古いバージョンの SDK を維持していると、ある日突然 Apple から reject 通知が来ます。CI で先に検出するのが現実的な防衛策です。
+
+## レイヤー 3：Android targetSdkVersion の継続監視
+
+Android の Google Play 要件は毎年 8 月に上がります。「2026 年 8 月までに targetSdkVersion 36 にしてください」というメールは、その年の 4 月くらいに最初の警告として届きます。これを取り逃すと、新規アップデートが配信できなくなります。
+
+```yaml
+# .github/workflows/sdk-version-check.yml
+name: Check Android targetSdk
+on:
+  schedule:
+    - cron: "0 9 1 * *"   # 毎月 1 日に走らせる
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read targetSdkVersion
+        id: read
+        run: |
+          TARGET=$(grep -E "targetSdkVersion\s*=" android/build.gradle | sed -E 's/.*=\s*([0-9]+).*/\1/' | head -1)
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+      - name: Compare with Google Play minimum
+        run: |
+          # Google Play の最新の最低 targetSdk（自プロジェクトで毎年更新）
+          REQUIRED=36
+          if [ "${{ steps.read.outputs.target }}" -lt "$REQUIRED" ]; then
+            echo "❌ targetSdkVersion ${{ steps.read.outputs.target }} is below required $REQUIRED"
+            exit 1
+          fi
+          echo "✅ targetSdk OK (${{ steps.read.outputs.target }} >= $REQUIRED)"
+```
+
+毎月 1 回しか走らせていませんが、それで十分です。Google Play の要件改定は半年以上の予告期間があるため、月次チェックで余裕を持って対応できます。
+
+## レイヤー 4：Expo SDK と依存パッケージの非推奨警告を「ノイズ」にしない
+
+Expo SDK のメジャーバージョンを上げると、`npm ls` や `expo-doctor` が大量の peer dependency 警告を出します。私が長らく失敗していたのは、**全ての警告を同列に扱おうとした**ことでした。本気で対応すべき警告と、無視してよい警告が混在しているのに。
+
+そこで定着した運用は、警告を 3 段階に分類するスクリプトです。
+
+```typescript
+// scripts/triage-deprecation-warnings.ts
+import { execSync } from "node:child_process";
+
+interface Warning {
+  pkg: string;
+  message: string;
+}
+
+const raw = execSync("npx expo-doctor --no-color 2>&1 || true").toString();
+const warnings: Warning[] = parseExpoDoctorOutput(raw); // 自前のパーサ
+
+const SEVERITY: Record<string, "block" | "warn" | "note"> = {
+  // Apple/Google の強制要件に関わるもの
+  "react-native-firebase": "block",
+  "expo-notifications": "block",
+  "expo-tracking-transparency": "block",
+  // 他の SDK と挙動が連動するもの
+  "react-native-async-storage": "warn",
+  "react-native-mmkv": "warn",
+  // 純粋な機能的警告
+  "default": "note",
+};
+
+const triaged = warnings.map((w) => ({
+  ...w,
+  severity: SEVERITY[w.pkg] ?? SEVERITY.default,
+}));
+
+const blocks = triaged.filter((w) => w.severity === "block");
+if (blocks.length > 0) {
+  console.error("❌ BLOCK warnings — must address before next release:");
+  for (const w of blocks) console.error(`  - [${w.pkg}] ${w.message}`);
+  process.exit(1);
+}
+const warns = triaged.filter((w) => w.severity === "warn");
+console.log(`⚠ ${warns.length} WARN warnings (non-blocking)`);
+```
+
+「全部赤」のリストは誰も読まなくなります。**何を今すぐ直すべきか** が一行で分かるリストの方が、結果として対応が進む。これは前回の記事（Claude Code のリリースゲート設計）でも書いた、警告疲れに対する同じ思想です。
+
+## 通知メールを「タスク」に変換する小さな仕組み
+
+Apple や Google から届く通知メールは、内容が抽象的で対応箇所が分かりづらいことがあります。私の運用では、こうしたメールを Notion の DB に転送し、「症状 / 関係するレイヤー / 対応期限 / 担当者」を必ず埋めるテンプレートを使っています。
+
+```
+件名（メール原文）: Submission Failure - PrivacyInfo Missing API Reason
+症状: NSPrivacyAccessedAPICategoryUserDefaults が未申告
+関係するレイヤー: Layer 1 (Required Reason API)
+対応期限: 次回 submit まで
+担当者: 自分
+最初の一手: scripts/check-required-reason-apis.ts を走らせる
+```
+
+最初の一手 を必ず書く、というのが私の中での唯一のルールです。これがあるかないかで、夜中に通知を読んだときの心理的負荷が大きく違います。何をすればいいか分からない通知は、夜中に読むと精神を削るのです。
+
+## 「壊れる前に直す」ための年次カレンダー
+
+最後に、私が頭に置いているカレンダーを共有します。OS 周辺の動きには年次のリズムがあるので、そのリズムに合わせて準備するだけで、突発対応がほぼなくなりました。
+
+- **6 月（WWDC 直後）** — iOS 新版の Required Reason API リスト追加を確認、Privacy Manifest 要件の変更を読み込む
+- **7〜8 月** — 新 iOS のベータで Required Reason API スクリプトを実行、reject 候補を洗う
+- **9 月** — iOS 新版リリース時に対応版を submit
+- **4 月** — Google Play の targetSdk 改定通知が来る時期、夏までに対応スケジュールを引く
+- **8 月** — Google Play の targetSdk 強制移行に間に合わせる
+
+この 5 つのチェックポイントを Google Calendar に毎年繰り返しで入れておくだけで、突発リジェクトの 8 割は消えました。残り 2 割は依存ライブラリの予期しない変更ですが、これは Layer 2 と Layer 4 のチェックでだいぶ救えます。
+
+## いまから一つだけやるなら
+
+時間がない方のために、いますぐ着手するなら何が効くかを一つだけ。**Layer 1 の Required Reason API チェックを CI に組み込む**ことです。スクリプト本体は半日あれば書けます。Apple の Required Reason API のリストは公開されているので、それを JSON にして symbols を grep するだけ。
+
+私の場合、これを最初に入れた瞬間に、「依存している小さなライブラリが `systemUptime` を呼んでいた」のを 5 件発見しました。そのうち 2 件は、申告しないまま submit していたら次の reject につながっていたものです。「沈黙する非推奨」を先回りで掴む第一歩としては、これが最も投資対効果の高い一手だと感じています。
