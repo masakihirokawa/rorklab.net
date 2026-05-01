@@ -1,0 +1,341 @@
+---
+title: "Rork × Notification Service Extension 本番実装ガイド — 画像付き通知・暗号化ペイロード・通知の動的書き換えで開封率を底上げする"
+slug: "rork-notification-service-extension-rich-push-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-01T20:15"
+updated: "2026-05-01T20:15"
+author: "Rork Lab"
+description: "Rork で作ったアプリに Notification Service Extension を組み込み、画像付き通知・E2E暗号化ペイロードの復号・APNs ペイロードの動的書き換えを本番品質で実装する設計と落とし穴を、動作する Swift コードとともに解説します。"
+tags: ["Rork", "Notification Service Extension", "Rich Push", "APNs", "Swift", "iOS", "プッシュ通知", "暗号化"]
+highlights:
+  - "プッシュ通知に画像が出ない・開封率が伸びないと悩んでいた人が、本番で動く Rich Push 実装を今日手に入れられます"
+  - "APNs ペイロードを暗号化して送信し、デバイス側で復号してから通知に表示する E2E 暗号化通知の設計と Swift コードを習得できます"
+  - "30秒の処理時間制限と50MBのメモリ制限の中で、画像ダウンロード・ローカライズ・パーソナライズまでを安定して捌くNSEの本番品質パターンを身につけられます"
+---
+
+「同じプッシュ通知でも、画像付きとテキストだけでは開封率が2倍以上違う」— App Store の主要アプリを観察していると、画像通知を使いこなしているチームとそうでないチームの差が、リテンションと収益にそのまま響いていることが見えてきます。それなのに、Rork で作ったアプリに後から画像通知を組み込もうとして、「`mutable-content: 1` を付けても画像が出ない」「Notification Service Extension（NSE）を作ったが30秒で落ちる」「テスト環境では出るのに本番だと出ない」と詰まっている方を、最近よく見かけます。
+
+私自身、最初に NSE を実装したときは、Xcode のターゲット追加から App Group の設定、APNs ペイロードの仕様まで、断片的な情報を10個以上のドキュメントから拾い集める必要がありました。本記事では、その回り道を一掃するために、**画像通知の最低限実装から、E2E 暗号化ペイロードの復号、APNs ペイロードの動的書き換え、本番品質を保つための監視設計まで**、Rork で作ったアプリに後付けで組み込むことを前提として、動作する Swift コードと一緒に解説していきます。Rork Max でネイティブターゲットを生成済みのプロジェクトを想定していますが、Expo Bare ワークフローや React Native からの移行ケースでも応用できる構成にしています。
+
+## なぜ Notification Service Extension が必要なのか
+
+iOS のプッシュ通知は、APNs（Apple Push Notification service）から送られたペイロードをそのまま画面に表示するのが基本動作です。しかしこの仕組みには、本番アプリで遭遇する3つの大きな制約があります。
+
+ひとつ目は、**画像・動画・音声などの添付ファイルは APNs のペイロードに直接乗せられない**こと。ペイロード上限は 4096 バイト（HTTP/2 経由なら 4KB）しかなく、Retina 用の画像 1 枚すら入りません。代わりに、ペイロードに画像 URL を入れて、デバイス側でダウンロードしてから通知に貼り付ける必要があります。この「デバイス側で通知を加工する」処理を担うのが Notification Service Extension です。
+
+ふたつ目は、**APNs を経由するペイロードは Apple のサーバーに届く以上、平文では機密情報を載せられない**こと。チャットアプリの本文や金融アプリの取引明細など、E2E 暗号化が前提の通知では、サーバー側で暗号化したペイロードを送り、デバイス側で復号してから表示する設計が必要になります。これも NSE で実装します。
+
+みっつ目は、**ユーザーごと・タイムゾーンごとの動的書き換え**です。たとえば「あと3時間で締切」という通知を多言語で送る場合、サーバー側で全ユーザー分の文字列を生成するより、デバイス側のロケールに応じて NSE で書き換える方が、配信パフォーマンスもリージョン拡張性も高まります。
+
+これら3つは、いずれも「APNs を信頼境界にしない」「デバイス側で最終加工する」という発想が共通しています。NSE はそのための公式に提供された唯一の手段であり、Rork で作ったアプリでも、ネイティブターゲットを開いて NSE を追加するだけで利用できます。
+
+## NSE が動く仕組み — 通知パイプライン全体像
+
+実装に入る前に、NSE がどのタイミングで起動し、何ができて何ができないのかを整理しておきます。これを理解しておかないと、後で「30秒の制限」や「メモリ50MB」に詰まったときに、なぜ落ちているのか分からなくなります。
+
+通常のプッシュ通知では、APNs から届いたペイロードがそのままシステム UI に渡され、通知センターやロック画面に表示されます。一方、ペイロードに `mutable-content: 1` が含まれている場合、システムは通知をユーザーに見せる前に、アプリの NSE を起動し、`UNNotificationServiceExtension` のサブクラスに通知を渡します。
+
+NSE 側では、`didReceive(_:withContentHandler:)` というメソッドが呼ばれ、ここで通知の内容を書き換えたり、画像をダウンロードして添付したり、暗号化されたペイロードを復号したりできます。処理が終わったら `contentHandler` を呼び出して、システムに加工後の通知を返します。
+
+ここで重要なのが、**処理に与えられる時間は最大30秒、メモリは約50MB まで**という制約です。30秒を超えた場合、システムは `serviceExtensionTimeWillExpire()` を呼び出して「あと少しで強制終了するから、できる範囲の結果を返せ」と通知します。これに応答せずに30秒を超えると、加工前のペイロードがそのまま表示されます。メモリ50MB は意外と厳しく、4K 画像をフルロードしただけでクラッシュすることもあるため、画像はダウンサンプルしながら扱うのが鉄則です。
+
+また、NSE は本体アプリと同じプロセスでは動きません。**別プロセス・別バンドル ID** で動作するため、Keychain や UserDefaults を共有するには App Group の設定が必要です。本体側で保存した認証トークンを NSE から読みたい場合は、Keychain Access Group を共有する設計にしておきます。
+
+## 環境構築 — Rork のネイティブターゲットに NSE を追加する
+
+Rork Max でネイティブ iOS ターゲットを生成済みであることを前提に進めます。Rork のプロジェクトを Xcode で開き、ターゲット一覧の `+` ボタンから `Notification Service Extension` を追加します。命名規則として、本体のバンドル ID が `com.example.myapp` なら、NSE は `com.example.myapp.NotificationService` のように suffix を付けるのが慣例です。
+
+ターゲットを追加すると、`NotificationService.swift` というファイルが自動生成されます。このファイルが NSE のエントリーポイントです。最初は次のような雛形になっています。
+
+```swift
+import UserNotifications
+
+class NotificationService: UNNotificationServiceExtension {
+    var contentHandler: ((UNNotificationContent) -> Void)?
+    var bestAttemptContent: UNMutableNotificationContent?
+
+    override func didReceive(
+        _ request: UNNotificationRequest,
+        withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
+    ) {
+        self.contentHandler = contentHandler
+        bestAttemptContent = (request.content.mutableCopy() as? UNMutableNotificationContent)
+
+        if let bestAttemptContent = bestAttemptContent {
+            // ここで通知を加工する
+            bestAttemptContent.title = "\(bestAttemptContent.title) [modified]"
+            contentHandler(bestAttemptContent)
+        }
+    }
+
+    override func serviceExtensionTimeWillExpire() {
+        // 30秒制限が近い場合の救済処理
+        if let contentHandler = contentHandler, let bestAttemptContent = bestAttemptContent {
+            contentHandler(bestAttemptContent)
+        }
+    }
+}
+```
+
+このまま動かすと、通知のタイトル末尾に `[modified]` が付きます。これを実装の出発点として、画像添付や暗号化復号を組み込んでいきます。
+
+App Group を有効化する手順も忘れずに行います。Project → Signing & Capabilities で本体ターゲットと NSE ターゲットの両方に同じ App Group（例: `group.com.example.myapp`）を追加し、Xcode が自動生成する entitlements ファイルに反映されていることを確認してください。これにより、本体と NSE で UserDefaults や File System を共有できるようになります。
+
+## 画像通知の最低限実装
+
+NSE が動く土台ができたら、最初に実装するのは画像添付です。サーバー側のペイロードに次のような構造を含めて送信する設計を前提とします。
+
+```json
+{
+  "aps": {
+    "alert": {
+      "title": "新しい記事が公開されました",
+      "body": "Rork × Notification Service Extension の本番実装ガイド"
+    },
+    "mutable-content": 1,
+    "sound": "default"
+  },
+  "image_url": "https://cdn.example.com/notifications/article-cover-12345.jpg"
+}
+```
+
+`mutable-content: 1` がないと NSE が起動しません。これは本番投入前に必ず確認するポイントで、サーバー側のテンプレートでこのフラグが落ちている事故を私は3回見ています。
+
+NSE 側では、`image_url` を取り出してダウンロードし、テンポラリディレクトリに保存してから通知の attachment として添付します。
+
+```swift
+override func didReceive(
+    _ request: UNNotificationRequest,
+    withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
+) {
+    self.contentHandler = contentHandler
+    bestAttemptContent = (request.content.mutableCopy() as? UNMutableNotificationContent)
+
+    guard let bestAttemptContent = bestAttemptContent,
+          let imageURLString = request.content.userInfo["image_url"] as? String,
+          let imageURL = URL(string: imageURLString) else {
+        contentHandler(self.bestAttemptContent ?? request.content)
+        return
+    }
+
+    // 画像をダウンロード（30秒制限の中で完了する必要がある）
+    let task = URLSession.shared.downloadTask(with: imageURL) { [weak self] localURL, response, error in
+        guard let self = self,
+              let localURL = localURL,
+              error == nil else {
+            // 画像取得失敗時は本文だけで通知を出す（無音失敗より優先）
+            contentHandler(bestAttemptContent)
+            return
+        }
+
+        // 一時ディレクトリにユニークな名前で保存（拡張子は重要）
+        let tmpDir = FileManager.default.temporaryDirectory
+        let ext = imageURL.pathExtension.isEmpty ? "jpg" : imageURL.pathExtension
+        let savedURL = tmpDir.appendingPathComponent(UUID().uuidString + "." + ext)
+
+        do {
+            try FileManager.default.moveItem(at: localURL, to: savedURL)
+            let attachment = try UNNotificationAttachment(
+                identifier: "image",
+                url: savedURL,
+                options: nil
+            )
+            bestAttemptContent.attachments = [attachment]
+            contentHandler(bestAttemptContent)
+        } catch {
+            // 添付失敗時もテキスト通知は出す
+            contentHandler(bestAttemptContent)
+        }
+    }
+    task.resume()
+}
+```
+
+このコードで意識しているのは、**失敗時に必ず `contentHandler` を呼び出すこと**です。NSE は `contentHandler` が呼ばれないとシステムが通知を表示できず、ユーザーから見ると「通知が来たはずなのに何も出ていない」状態になります。例外パスを含めて、すべての分岐で `contentHandler` を呼ぶ設計にしてください。
+
+拡張子がない URL（CDN 経由でクエリパラメータ付き等）には特に注意が必要です。`UNNotificationAttachment` は拡張子で MIME タイプを推定するため、`.jpg` などを明示しないと無視されることがあります。私は最初これに気づかず、`Cache-Control` の設定不備かと2時間ほど無駄にしました。
+
+## E2E 暗号化ペイロードの復号
+
+機密性の高いアプリでは、APNs に渡るペイロードに本文を平文で書きません。代わりに、サーバー側で暗号化したペイロードを送り、デバイス側で復号してから表示します。設計の骨格は次の通りです。
+
+サーバー側では、デバイスごとに事前に発行した共有鍵（または ECDH で派生した鍵）を使って、本文を AES-GCM で暗号化します。送信ペイロードには、暗号化された本文・nonce（IV）・認証タグだけを載せ、平文のタイトルや本文は「メッセージが届きました」のような汎用文字列にしておきます。
+
+デバイス側の NSE では、本体アプリが Keychain に保存した鍵を App Group 経由で読み取り、ペイロードを復号して通知のタイトル・本文を上書きします。鍵の管理は Keychain Access Group を共有することで実現します。
+
+```swift
+import CryptoKit
+import Security
+
+private func loadSymmetricKey() -> SymmetricKey? {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "com.example.myapp.notification.key",
+        kSecAttrAccessGroup as String: "group.com.example.myapp",
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne
+    ]
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    guard status == errSecSuccess, let data = item as? Data else { return nil }
+    return SymmetricKey(data: data)
+}
+
+private func decryptPayload(
+    cipherBase64: String,
+    nonceBase64: String,
+    tagBase64: String,
+    key: SymmetricKey
+) -> String? {
+    guard let cipher = Data(base64Encoded: cipherBase64),
+          let nonceData = Data(base64Encoded: nonceBase64),
+          let tag = Data(base64Encoded: tagBase64),
+          let nonce = try? AES.GCM.Nonce(data: nonceData) else {
+        return nil
+    }
+    let sealedBox = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: cipher, tag: tag)
+    guard let box = sealedBox,
+          let plaintext = try? AES.GCM.open(box, using: key) else {
+        return nil
+    }
+    return String(data: plaintext, encoding: .utf8)
+}
+```
+
+この `loadSymmetricKey()` と `decryptPayload(...)` を `didReceive` から呼び出して、復号した本文をタイトルや body に上書きします。鍵の取得や復号に失敗した場合は、汎用文字列のまま通知を出すフォールバックを必ず用意してください。エラー時に通知が消える設計にすると、ユーザーは「来ていない」と認識してリテンションが下がります。
+
+ここで最も重要なのは、**鍵の保存場所**です。Keychain にアクセスグループを設定する際は、本体ターゲットと NSE ターゲットの両方の entitlements で同じ Access Group を指定し、Xcode の Capabilities で Keychain Sharing を有効にしてください。Keychain そのものの保存設計を体系的に押さえたい場合は、[Rork Max × Keychain 完全実装ガイド](/articles/rork-dev/rork-max-security-keychain-guide) も参考になります。これを忘れると、NSE 側で `errSecItemNotFound` が返って復号できません。
+
+「鍵そのものをデバイスに置いて大丈夫か」という疑問は当然出ます。これは Apple の Secure Enclave / Keychain の保護モデルに依存する設計で、「Keychain に保存した鍵は、そのデバイスを物理的に手に入れて、なおかつ Face ID / パスコードを突破しないと取り出せない」前提です。サーバー側に鍵を置くより、攻撃面は確実に小さくなります。さらに堅牢にしたい場合は、`kSecAttrAccessibleWhenUnlockedThisDeviceOnly` を指定して、デバイスがロック解除中にしか鍵を読み出せないようにします。
+
+## ペイロードの動的書き換え — ローカライズとパーソナライズ
+
+NSE のもうひとつの強力な使い道が、デバイス側の状態を反映した動的書き換えです。たとえば、サーバー側ではメッセージのキー（`new_message_from`）と差し込み変数（`{name: "山田"}`）だけを送り、デバイス側で現在のロケールに応じた文字列に組み立てる設計です。
+
+この設計のメリットは3つあります。サーバー側のテンプレート管理が単純化される（言語ごとのコピーを持たなくていい）、A/B テストでコピーを差し替えるときに APNs を介さず本体アプリのリリースで完結する、ユーザーの設定（ニックネームなど）をデバイス側だけで合成できる、という点です。
+
+実装は次のようになります。
+
+```swift
+private func renderLocalized(
+    key: String,
+    args: [String: String],
+    locale: Locale
+) -> String {
+    // App Group 内に保存された言語ファイル（JSON）を読み込む
+    let containerURL = FileManager.default
+        .containerURL(forSecurityApplicationGroupIdentifier: "group.com.example.myapp")
+    let langCode = locale.identifier.prefix(2) // "ja", "en" など
+    let url = containerURL?
+        .appendingPathComponent("notifications-\(langCode).json")
+
+    guard let url = url,
+          let data = try? Data(contentsOf: url),
+          let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+          let template = dict[key] else {
+        return key // フォールバックとしてキーをそのまま返す
+    }
+
+    var result = template
+    for (placeholder, value) in args {
+        result = result.replacingOccurrences(of: "{\(placeholder)}", with: value)
+    }
+    return result
+}
+```
+
+本体アプリは初回起動時とアップデート時に、最新のメッセージ JSON を App Group のディレクトリに書き出しておきます。これにより、NSE はネットワーク通信なしでロケール対応された本文を生成できます。NSE での通信はバッテリー消費と30秒制限を圧迫するため、可能な限り「事前にデバイスに置いてある情報」で完結させるのが本番品質の鉄則です。
+
+## 30秒・50MB の制約と向き合う
+
+NSE の最大の落とし穴は、リソース制約です。実装した直後はテスト環境で動いていても、本番で「画像が大きい・回線が遅い・複数の画像を並列ダウンロードしている」といった条件が重なると、30秒を超えて打ち切られたり、メモリ不足でクラッシュしたりします。
+
+時間制約に対しては、`serviceExtensionTimeWillExpire()` で必ず救済処理を行います。「30秒近づいたら、画像なしでもいいから本文は出す」という設計が原則です。
+
+```swift
+override func serviceExtensionTimeWillExpire() {
+    // ダウンロード中だった画像は諦め、テキストだけで通知を出す
+    if let contentHandler = contentHandler, let bestAttemptContent = bestAttemptContent {
+        contentHandler(bestAttemptContent)
+    }
+}
+```
+
+メモリ制約に対しては、画像のダウンサンプルが鉄則です。`UIImage(data:)` で画像を全画素ロードするのは避け、`CGImageSourceCreateThumbnailAtIndex` を使って通知に必要なサイズまで縮小してから添付します。
+
+```swift
+import ImageIO
+
+private func downsample(imageAt url: URL, to maxPixelSize: CGFloat) -> URL? {
+    let options: [CFString: Any] = [
+        kCGImageSourceShouldCache: false
+    ]
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary) else {
+        return nil
+    }
+    let thumbnailOptions: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+    ]
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbnailOptions as CFDictionary) else {
+        return nil
+    }
+    let outputURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString + ".jpg")
+    guard let dst = CGImageDestinationCreateWithURL(outputURL as CFURL, "public.jpeg" as CFString, 1, nil) else {
+        return nil
+    }
+    CGImageDestinationAddImage(dst, cgImage, nil)
+    guard CGImageDestinationFinalize(dst) else { return nil }
+    return outputURL
+}
+```
+
+通知に表示される画像はせいぜい 800〜1024 px もあれば十分です。CDN から 4K 原寸を渡してくる場合は、サーバー側でリサイズ済みのバリアントを返す方が確実です。NSE 側でリサイズを行うのは、サーバーを変更できない場合の最終手段と考えてください。
+
+## 監視・デバッグ・本番運用
+
+NSE は本体アプリと別プロセスで動くため、デバッグも独特の癖があります。Xcode で NSE のスキームを選択してから「Run」すると、シミュレーターまたは実機にアタッチした状態で通知を待ち受けられます。Console.app で `subsystem:com.apple.Pushkit` や自社のサブシステムを絞り込んで観察すると、本番環境のログ追跡もしやすくなります。
+
+本番運用では、通知の到達率と画像表示成功率の2指標を分けて追うのがおすすめです。サーバー側の APNs レスポンスだけでは「画像が出たか」までは分かりません。NSE 内で `os_log` や `Logger` を使って、画像取得の成否・復号の成否を出力しておき、Sentry や Crashlytics などのクラッシュレポーティングツールに送信する設計にすると、本番障害の検知が早くなります。通知の到達率や A/B テストの設計をより精緻に行いたい場合は、[Rork のプッシュ通知を高度にセグメンテーションする実装ガイド](/articles/rork-dev/rork-push-notification-advanced-segmentation-automation) で配信設計の手前を整理しておくと、画像通知の効果計測が大幅に楽になります。Crashlytics はサブプロセスでの初期化に対応しているため、NSE のターゲットにも組み込めます。
+
+iOS や Apple のセキュリティ実装の前提を体系的に押さえたい方には、[iOS 17プログラミング徹底解説（金田 浩明）](https://www.amazon.co.jp/dp/4798179396/?tag=pinocchio-22) が、UserNotifications フレームワーク・App Group・Keychain などの周辺知識を一冊で確認できる定番書として参考になります。
+
+## よくある間違いと対処
+
+NSE を実装するときに、私自身が踏み抜いた、または現場でよく見る落とし穴を3つに絞ってまとめます。
+
+ひとつ目は、**`mutable-content: 1` の設定漏れ**です。サーバー側のテンプレートで一部のキャンペーンだけこのフラグが落ちていて、画像が出ないことがあります。配信ログに `mutable-content` の値を記録して、配信前にバリデーションする運用にしてください。
+
+ふたつ目は、**HTTP の URL を渡してしまう問題**です。App Transport Security の設定上、HTTP 画像はダウンロード自体ができません。CDN に `https://` で配信させ、`Info.plist` の例外設定に頼らない構成にします。
+
+みっつ目は、**`contentHandler` の二重呼び出し**です。エラー時のフォールバックを書く際に、`return` を忘れて成功パスにも到達してしまうと、`contentHandler` が2回呼ばれてシステムが警告を出します。各分岐で必ず `return` するか、`defer` を使ってクリーンアップを集約してください。
+
+## 本番品質チェックリスト
+
+NSE をリリース前に確認したい項目を、私が実際に使っているチェックリストとして共有します。
+
+- 画像 URL は HTTPS 必須にしている（HTTP は ATS でブロックされる）
+- 画像のダウンサンプルを実装し、メモリピークが20MB を超えないことを Xcode の Memory Gauge で確認している
+- `serviceExtensionTimeWillExpire()` でテキスト通知が必ず出るフォールバックを書いている
+- App Group が本体ターゲットと NSE 両方に設定されている
+- Keychain Access Group が両ターゲットで一致している
+- `mutable-content: 1` がサーバーのテンプレートにハードコードされ、配信ログでも検証している
+- ロック画面通知でも画像が表示されることを実機で確認している（プレビューと表示で挙動が違うことがある）
+- 機内モード時に通知本文だけ出ることを確認している
+- 暗号化通知のフォールバック（鍵がない場合）が、汎用文字列で通知を出す設計になっている
+- TestFlight ビルドでも NSE が動作することを、本番 APNs 環境で確認している（Development と Production で APNs 接続先が異なるため、忘れがち）
+
+このチェックリストを通過してからリリースすれば、「画像が出ない」「通知が来ない」というユーザーからの問い合わせを9割削減できるはずです。
+
+## 次のアクション
+
+ここまで読んでいただいた方が今日できる具体的な一歩は、**現在のアプリのプッシュ通知ペイロードに `mutable-content: 1` が含まれているかをサーバー側のログで確認すること**です。もし含まれていなければ、まずそこを追加する。それだけで、後から NSE を投入したときに「画像が出ない原因の半分」が解消されます。
+
+NSE を実装した後は、A/B テストで「画像あり / なし」の開封率を比較してみてください。多くのアプリで、画像付き通知の開封率は 1.5〜2倍に伸びます。リテンションの底上げ施策として、新規機能開発よりもコストパフォーマンスが高いことが多いはずです。
+
+Rork で作ったアプリのネイティブ拡張は、慣れるまでは情報が散らかっていて遠回りに感じるかもしれません。それでも、Apple のフレームワークを直接呼び出せる構造を持っているからこそ、Rork のようなツールは「ノーコードでも本番品質まで持っていける」価値を発揮します。次の記事では、NSE の兄弟である [Notification Content Extension](/articles/rork-dev/rork-callkit-pushkit-voip-implementation-guide) を題材に、通知のカスタム UI をどこまで作り込めるかを掘り下げる予定です。

@@ -1,0 +1,396 @@
+---
+title: "Rork × Notification Service Extension Production Guide — Rich Push, Encrypted Payloads, and Dynamic Rewriting to Lift Open Rates"
+slug: "rork-notification-service-extension-rich-push-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-01T20:15"
+updated: "2026-05-01T20:15"
+author: "Rork Lab"
+description: "A practical guide to wiring a Notification Service Extension into a Rork-built iOS app — image attachments, end-to-end encrypted payloads, and dynamic APNs payload rewriting — with working Swift code and the production pitfalls that bit me along the way."
+tags: ["Rork", "Notification Service Extension", "Rich Push", "APNs", "Swift", "iOS", "Push Notifications", "Encryption"]
+highlights:
+  - "If your push notifications never seem to show images and your open rates aren't moving, you'll walk away with a working Rich Push implementation today"
+  - "You'll learn how to encrypt APNs payloads on the server and decrypt them on-device inside the extension, including the Swift code and the Keychain access group setup that usually trips people up"
+  - "You'll get a battle-tested pattern for staying inside the 30-second runtime and 50 MB memory budget while still doing image downloads, localization, and personalization"
+---
+
+"The same notification, with and without an image, drives more than 2x the open rate" — when you watch the top App Store apps closely, the teams that have figured out Rich Push are the ones whose retention and revenue charts look very different from the teams that haven't. So it's frustrating when you ship an app with Rork, try to add image notifications, and run straight into "the image doesn't show up even with `mutable-content: 1`," "my Notification Service Extension keeps timing out at 30 seconds," or "this works in the simulator but not in production."
+
+I've walked that road. The first time I built a Notification Service Extension (NSE), I had to stitch together fragments from ten different Apple docs, Stack Overflow threads, and forum posts before anything actually rendered. This article is the guide I wish I'd had: a Rork-friendly walkthrough that takes you from a bare app to a production-quality NSE that handles image attachments, end-to-end encrypted payloads, dynamic APNs payload rewriting, and the monitoring you'll actually want once it ships. The code assumes you've generated native iOS targets with Rork Max, but the same patterns apply if you're coming from an Expo bare workflow or a React Native project.
+
+## Why a Notification Service Extension Is Worth the Effort
+
+iOS push notifications, by default, just show whatever APNs hands them. That works for plain text, but production apps run into three hard limits.
+
+First, **APNs payloads can't carry attachments**. The hard cap is 4096 bytes over HTTP/2 — not even one Retina image fits. Instead, your payload includes an image URL, and the device has to download and attach it before showing the notification. The "modify the notification on-device" job is exactly what a Notification Service Extension is for.
+
+Second, **anything you put in an APNs payload passes through Apple's servers**. For chat apps, finance apps, or any product where end-to-end encryption is non-negotiable, you can't ship the message body in plaintext. The server sends an encrypted payload, the device decrypts it inside the extension, and only then does the user see the actual content. This too is an NSE job.
+
+Third, **per-user, per-locale, per-timezone rewriting**. If you want to send "3 hours until your deadline" to users across many languages, generating the localized strings on the server scales poorly. Rendering them on-device, where the locale and the user's nickname already live, is far cleaner — and again, NSE is where that code runs.
+
+The thread tying all three together: APNs is not a trusted boundary. The device is. NSE is the only sanctioned way to do final-mile work on a notification, and Rork apps can use it freely once you open the native target and add the extension.
+
+## The Notification Pipeline, End to End
+
+Before any code, it's worth being clear about when an NSE actually runs and what it can and can't do. Without this mental model, the 30-second deadline and the 50 MB memory ceiling will feel like random gotchas.
+
+For a normal push, APNs hands the payload to the system, which renders it in Notification Center or the lock screen. When the payload contains `mutable-content: 1`, the system instead launches your app's NSE first and hands the notification to your `UNNotificationServiceExtension` subclass.
+
+Inside the extension, `didReceive(_:withContentHandler:)` is called. You can rewrite the title, attach an image you just downloaded, decrypt a sealed payload, swap in a localized template — and when you're done, you call `contentHandler` with the modified content. The system then displays whatever you returned.
+
+The hard constraints: **30 seconds of wall-clock time, ~50 MB of memory**. If you're getting close to 30 seconds, the system calls `serviceExtensionTimeWillExpire()` so you can return your best-effort result before being killed. If you ignore it and overrun, the user sees the original payload — usually meaning no image and no decrypted body. The 50 MB limit bites harder than you'd expect; loading a 4K image with `UIImage(data:)` can blow it out by itself, so always downsample.
+
+One more thing that catches people: **the NSE runs in a different process from your main app**, with its own bundle identifier. Sharing tokens or settings via Keychain or UserDefaults requires explicit App Group and Keychain Access Group configuration. If you skip this, you'll spend an evening debugging `errSecItemNotFound`.
+
+## Adding an NSE to Your Rork Native Target
+
+The setup assumes you've already generated a native iOS target with Rork Max. Open the Xcode project, click the `+` in the targets list, and add a `Notification Service Extension`. The naming convention is to suffix your main bundle ID — if your app is `com.example.myapp`, the extension is `com.example.myapp.NotificationService`.
+
+Xcode generates a starter `NotificationService.swift` that looks like this:
+
+```swift
+import UserNotifications
+
+class NotificationService: UNNotificationServiceExtension {
+    var contentHandler: ((UNNotificationContent) -> Void)?
+    var bestAttemptContent: UNMutableNotificationContent?
+
+    override func didReceive(
+        _ request: UNNotificationRequest,
+        withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
+    ) {
+        self.contentHandler = contentHandler
+        bestAttemptContent = (request.content.mutableCopy() as? UNMutableNotificationContent)
+
+        if let bestAttemptContent = bestAttemptContent {
+            // Modify the notification here
+            bestAttemptContent.title = "\(bestAttemptContent.title) [modified]"
+            contentHandler(bestAttemptContent)
+        }
+    }
+
+    override func serviceExtensionTimeWillExpire() {
+        // Last chance before the system kills us
+        if let contentHandler = contentHandler, let bestAttemptContent = bestAttemptContent {
+            contentHandler(bestAttemptContent)
+        }
+    }
+}
+```
+
+Run it as-is and your notifications will get `[modified]` appended to the title. Use this scaffolding as the launch pad for image attachments and decryption.
+
+Don't forget the App Group. Under Project → Signing & Capabilities, add the same App Group (e.g. `group.com.example.myapp`) to both the main target and the NSE target, and verify the entitlements files Xcode generates reflect it. Without this, your main app and your NSE can't share UserDefaults, files, or — most critically — Keychain entries.
+
+## Minimum Viable Image Attachment
+
+With the extension wired up, the first feature to add is image support. Have your server send a payload like this:
+
+```json
+{
+  "aps": {
+    "alert": {
+      "title": "New article published",
+      "body": "Rork × Notification Service Extension Production Guide"
+    },
+    "mutable-content": 1,
+    "sound": "default"
+  },
+  "image_url": "https://cdn.example.com/notifications/article-cover-12345.jpg"
+}
+```
+
+Without `mutable-content: 1`, the NSE never runs. I've seen production teams ship a campaign with that flag missing in one template variant — it's worth validating in your delivery pipeline before every blast.
+
+Inside the extension, pull `image_url` out of the payload, download it to a temp directory, and attach it to the notification:
+
+```swift
+override func didReceive(
+    _ request: UNNotificationRequest,
+    withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
+) {
+    self.contentHandler = contentHandler
+    bestAttemptContent = (request.content.mutableCopy() as? UNMutableNotificationContent)
+
+    guard let bestAttemptContent = bestAttemptContent,
+          let imageURLString = request.content.userInfo["image_url"] as? String,
+          let imageURL = URL(string: imageURLString) else {
+        contentHandler(self.bestAttemptContent ?? request.content)
+        return
+    }
+
+    let task = URLSession.shared.downloadTask(with: imageURL) { [weak self] localURL, response, error in
+        guard let self = self,
+              let localURL = localURL,
+              error == nil else {
+            // If we can't fetch the image, still deliver the text — silent failure is worse
+            contentHandler(bestAttemptContent)
+            return
+        }
+
+        // Save with a unique filename — the extension matters for MIME detection
+        let tmpDir = FileManager.default.temporaryDirectory
+        let ext = imageURL.pathExtension.isEmpty ? "jpg" : imageURL.pathExtension
+        let savedURL = tmpDir.appendingPathComponent(UUID().uuidString + "." + ext)
+
+        do {
+            try FileManager.default.moveItem(at: localURL, to: savedURL)
+            let attachment = try UNNotificationAttachment(
+                identifier: "image",
+                url: savedURL,
+                options: nil
+            )
+            bestAttemptContent.attachments = [attachment]
+            contentHandler(bestAttemptContent)
+        } catch {
+            // Even if attaching fails, deliver the text body
+            contentHandler(bestAttemptContent)
+        }
+    }
+    task.resume()
+}
+```
+
+The non-obvious rule: **always call `contentHandler`, even on failure**. If you forget on any branch, the system can't render the notification at all and the user just sees nothing. Wire `contentHandler` into every error path.
+
+URLs without a clean extension (CDN URLs with query strings, signed URLs) are particularly nasty. `UNNotificationAttachment` infers MIME type from the file extension, so if you save the file as `imagefile` with no `.jpg`, the system silently drops the attachment. I lost two hours to this once before realizing the cache headers had nothing to do with it.
+
+## Decrypting End-to-End Encrypted Payloads
+
+For apps where confidentiality matters, you don't put plaintext into APNs. Instead, the server sends an encrypted blob, and the device decrypts it inside the NSE. The shape of the design:
+
+The server uses a per-device shared secret — either provisioned out of band or derived via ECDH — to encrypt the body with AES-GCM. The APNs payload carries the ciphertext, the nonce (IV), and the auth tag, plus a generic placeholder body like "You have a new message" for users who haven't unlocked yet.
+
+In the NSE, the main app's stored Keychain key is read via the shared Keychain Access Group, and the payload is decrypted before the title/body are rewritten. Sharing the key works because the Keychain Access Group ties both targets to the same protected storage.
+
+```swift
+import CryptoKit
+import Security
+
+private func loadSymmetricKey() -> SymmetricKey? {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "com.example.myapp.notification.key",
+        kSecAttrAccessGroup as String: "group.com.example.myapp",
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne
+    ]
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    guard status == errSecSuccess, let data = item as? Data else { return nil }
+    return SymmetricKey(data: data)
+}
+
+private func decryptPayload(
+    cipherBase64: String,
+    nonceBase64: String,
+    tagBase64: String,
+    key: SymmetricKey
+) -> String? {
+    guard let cipher = Data(base64Encoded: cipherBase64),
+          let nonceData = Data(base64Encoded: nonceBase64),
+          let tag = Data(base64Encoded: tagBase64),
+          let nonce = try? AES.GCM.Nonce(data: nonceData) else {
+        return nil
+    }
+    let sealedBox = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: cipher, tag: tag)
+    guard let box = sealedBox,
+          let plaintext = try? AES.GCM.open(box, using: key) else {
+        return nil
+    }
+    return String(data: plaintext, encoding: .utf8)
+}
+```
+
+Call these from `didReceive` and overwrite the title/body with the decrypted text. If the key isn't available or decryption fails — design for this — fall back to the generic placeholder body. The temptation is to drop the notification entirely on failure; resist it. Users read "no notification" as "the message didn't arrive," and your retention takes the hit instead of your security review.
+
+The setup that bites people is **Keychain Access Group configuration**. Both targets need the same Access Group in entitlements and Keychain Sharing enabled in Capabilities. Skip a step and you'll get `errSecItemNotFound` in production with no log to explain why.
+
+"Is it really safe to keep the key on the device?" is the right question to ask. The answer leans on Apple's Secure Enclave / Keychain protection model: keys stored with the right accessibility class can only be retrieved by physically possessing the device and getting past Face ID or the passcode. That's a strictly smaller attack surface than letting a server read your messages. For maximum safety, set `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` so the key is only readable while the device is unlocked and never escapes that hardware.
+
+## Dynamic Rewriting — Localization and Personalization
+
+The other underrated NSE feature is rewriting payloads using on-device state. Imagine sending only a key (`new_message_from`) and a variable bag (`{name: "Alex"}`) over APNs, and rendering the localized string on-device based on the user's current locale.
+
+Three concrete wins from this pattern: server templates stay simple (no per-language copy management), copy A/B tests can ship in app updates without touching APNs, and personalization (nickname, theme, etc.) stays on the device where it belongs.
+
+```swift
+private func renderLocalized(
+    key: String,
+    args: [String: String],
+    locale: Locale
+) -> String {
+    // Read a JSON file the main app wrote into the App Group container
+    let containerURL = FileManager.default
+        .containerURL(forSecurityApplicationGroupIdentifier: "group.com.example.myapp")
+    let langCode = locale.identifier.prefix(2) // "ja", "en", etc.
+    let url = containerURL?
+        .appendingPathComponent("notifications-\(langCode).json")
+
+    guard let url = url,
+          let data = try? Data(contentsOf: url),
+          let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+          let template = dict[key] else {
+        return key // Fall back to the raw key
+    }
+
+    var result = template
+    for (placeholder, value) in args {
+        result = result.replacingOccurrences(of: "{\(placeholder)}", with: value)
+    }
+    return result
+}
+```
+
+The main app is responsible for writing the latest message JSON to the App Group container on first launch and after updates. With that in place, the NSE never has to touch the network for localization — which matters because every network round-trip eats into the 30-second budget and the battery.
+
+## Living Inside 30 Seconds and 50 MB
+
+The biggest production trap with NSE is resource limits. Things work fine in the simulator, then hit production where images are larger, networks are slower, and parallel downloads are the norm — and suddenly extensions get killed mid-flight or crash on memory.
+
+For time, always implement `serviceExtensionTimeWillExpire()`. The principle: if we're nearly out of time, ship the text without the image rather than nothing.
+
+```swift
+override func serviceExtensionTimeWillExpire() {
+    // Image fetch didn't finish — deliver the text-only version
+    if let contentHandler = contentHandler, let bestAttemptContent = bestAttemptContent {
+        contentHandler(bestAttemptContent)
+    }
+}
+```
+
+For memory, downsample aggressively. Loading a full image with `UIImage(data:)` is the easy way to blow past 50 MB. Use `CGImageSourceCreateThumbnailAtIndex` to size the image down to what the notification UI actually needs:
+
+```swift
+import ImageIO
+
+private func downsample(imageAt url: URL, to maxPixelSize: CGFloat) -> URL? {
+    let options: [CFString: Any] = [
+        kCGImageSourceShouldCache: false
+    ]
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary) else {
+        return nil
+    }
+    let thumbnailOptions: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+    ]
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbnailOptions as CFDictionary) else {
+        return nil
+    }
+    let outputURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString + ".jpg")
+    guard let dst = CGImageDestinationCreateWithURL(outputURL as CFURL, "public.jpeg" as CFString, 1, nil) else {
+        return nil
+    }
+    CGImageDestinationAddImage(dst, cgImage, nil)
+    guard CGImageDestinationFinalize(dst) else { return nil }
+    return outputURL
+}
+```
+
+Notification UI rarely needs more than 800–1024 px. If your CDN keeps handing you 4K originals, a server-side resized variant is the better fix. Doing it in the NSE is a fallback when you can't change the server.
+
+## Monitoring, Debugging, and Production Operations
+
+Because the NSE runs in a separate process, debugging has its own quirks. In Xcode, select the NSE scheme and hit Run; it'll attach to the simulator or device and wait for a notification. In Console.app, filter by `subsystem:com.apple.Pushkit` (or your own subsystem if you've set one up) to follow what's happening on real devices in the field.
+
+In production, separate two metrics: delivery rate and image render rate. The APNs response only confirms delivery to the device — it doesn't tell you whether the image rendered. Use `os_log` or the `Logger` API inside the extension to record image-fetch and decryption outcomes, then forward them to Sentry or Crashlytics. If you want a more sophisticated baseline before adding visuals, the [advanced segmentation guide for Rork push notifications](/articles/rork-dev/rork-push-notification-advanced-segmentation-automation) is a useful starting point — once your delivery rules are right, image impact becomes measurable. Crashlytics supports subprocess initialization, so the NSE target can carry its own client.
+
+For a deeper look at the iOS frameworks underneath — UserNotifications, App Group, Keychain — Apple's official [User Notifications documentation](https://developer.apple.com/documentation/usernotifications) is the canonical reference; pair it with [Sending notification requests to APNs](https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns) once you've got the device-side working. If you'd like to lock down the Keychain side first, the [Rork Max Keychain implementation guide](/articles/rork-dev/rork-max-security-keychain-guide) covers the storage model end to end.
+
+## Common Mistakes and How to Fix Them
+
+Three pitfalls I see most often when teams ship their first NSE.
+
+**Forgetting `mutable-content: 1`.** A single template variant missing the flag will silently drop image rendering for that campaign. Validate the flag in your server-side delivery logs and gate the send pipeline on it.
+
+**Shipping HTTP image URLs.** App Transport Security blocks plain HTTP downloads from extensions. Use HTTPS on the CDN and avoid `Info.plist` exceptions — they'll bite you again at App Review.
+
+**Calling `contentHandler` twice.** It's easy to write a fallback and forget the `return` on the success path, leading to duplicate calls and a runtime warning. Use `defer` or careful `return` placement to guarantee a single call per invocation.
+
+
+## Testing Strategy — Beyond "It Works on My Simulator"
+
+The simulator is a poor proxy for what actually happens with notifications in the wild. A test strategy that catches the production-only failures looks like this.
+
+**Layer 1 — Local payload simulator.** During development, you don't want to wait for real APNs traffic to test extension changes. Drop a JSON file into your project (e.g. `test-payload.apns`) and use Xcode's "Simulate Notification" feature: drag the file onto the running simulator while the NSE scheme is active. The system invokes your extension just as it would for a real push. This is the fastest feedback loop and where 80% of NSE bugs should be caught.
+
+**Layer 2 — Real APNs against TestFlight builds.** Some bugs only show up against the real APNs gateway — particularly anything related to delivery thresholds, throttling, or production certificate vs sandbox certificate behavior. Have a staging endpoint that pushes to TestFlight builds and run the same payload variants you'd send in production. The "production APNs vs development APNs" gotcha is real: a build signed with the App Store distribution profile won't receive notifications sent to the development APNs gateway, and vice versa.
+
+**Layer 3 — Field telemetry.** Once shipped, instrument the NSE to report what actually happened. The minimum I'd track:
+
+- Notification received (the extension fired)
+- Image fetch attempted, succeeded, failed (with reason — DNS, timeout, HTTP status)
+- Decryption attempted, succeeded, failed (without logging plaintext)
+- Time elapsed before `contentHandler` was called
+- Whether `serviceExtensionTimeWillExpire` was hit
+
+Send these as breadcrumbs to your APM tool. The first time you see a real-world distribution of "time to contentHandler" — usually a long tail with some 25-second outliers — you'll understand why the timeout exists and where your bottlenecks are.
+
+## Cross-Platform Parity — What Android Users See
+
+If your app ships on both iOS and Android, the equivalent of NSE on the Android side is a combination of FCM message handling in a `FirebaseMessagingService`, NotificationCompat for rich notifications, and `BigPictureStyle` for image attachments. The constraints are different — Android's foreground service has more headroom — but the shape of the work is similar: the device modifies the payload before display.
+
+The catch for cross-platform teams: **payload structure should be the same on both platforms.** Don't ship one schema for iOS and another for Android. Use a single canonical envelope (e.g. `{type, body, image_url, encrypted_payload}`) and have each platform's handler consume it. This makes server-side delivery code testable and keeps your campaign tooling sane. I've seen teams maintain two divergent schemas and watch their A/B test infrastructure quietly produce inconsistent results for a year.
+
+The notification sound is another place where iOS and Android diverge silently. iOS picks up `aps.sound`; Android wants a notification channel registered up front. If parity matters, document the registration on both sides as part of your push setup runbook.
+
+## When NSE Isn't Enough — Notification Content Extensions
+
+NSE handles modifying the notification's data, but the visual UI you see in Notification Center is still the system's standard layout. If you want a custom view — interactive forms, video previews, branded chrome — you'll add a Notification Content Extension on top of NSE.
+
+Content extensions render a SwiftUI or UIKit view when the user expands the notification (3D Touch, long press, or pull). They're useful for chat previews with multiple message bubbles, RSVP-style interactions, live event scoreboards, and similar use cases where the standard layout falls short. The trade-off is more code and more state to manage; a content extension that looks beautiful in the design comp but is buggy in production hurts the user experience more than no custom UI at all.
+
+A reasonable rule of thumb: ship NSE first, get image and decryption working, watch a month of metrics, and only consider a content extension if you have a clear product hypothesis — usually "a richer preview will reduce taps required to get the answer the notification implies."
+
+## A Worked Example — Chat App Notification Pipeline
+
+To make all the pieces concrete, here's how the components combine for a privacy-respecting chat app.
+
+The server has a per-conversation symmetric key, shared with the receiving device at conversation creation time. When a message is sent, the server:
+
+1. Encrypts the message body with AES-GCM using the conversation key
+2. Sends an APNs payload with a placeholder body ("New message"), the encrypted ciphertext, the nonce, the auth tag, and `mutable-content: 1`
+3. Optionally includes a sender avatar URL for the image attachment
+
+The device, on receiving the push:
+
+1. The system invokes the NSE because of `mutable-content: 1`
+2. The NSE reads the conversation key from the shared Keychain Access Group
+3. The NSE decrypts the ciphertext and rewrites the title (sender name) and body (message text)
+4. The NSE downloads the avatar image, downsamples it, and attaches it as a `UNNotificationAttachment`
+5. The NSE calls `contentHandler` with the modified content
+6. The system shows the notification with the actual sender name, decrypted body, and avatar
+
+What the user sees: a notification that looks just like any iMessage or WhatsApp push — sender name, message body, sender avatar — except the server never had access to any of that information in plaintext. That's the design payoff for building this pipeline correctly.
+
+The pieces I'd ship in order if I were building this from scratch today: image attachment first (lowest risk, biggest visual win), then localization rewriting (cleaner server templates), then encrypted payloads (most complex, only worth it if confidentiality is a product requirement).
+
+## Production Readiness Checklist
+
+The list I run through before shipping any NSE change:
+
+- All image URLs are HTTPS (HTTP is silently blocked by ATS in extensions)
+- Image downsampling is in place; memory peak stays under 20 MB in Xcode's Memory Gauge
+- `serviceExtensionTimeWillExpire()` always returns a text-only fallback
+- App Group is enabled on both the main target and the NSE target
+- Keychain Access Groups match across both targets
+- `mutable-content: 1` is hard-coded in server templates and checked in delivery logs
+- Image rendering is verified on the lock screen, not just in Notification Center previews
+- Airplane-mode tests confirm text-only delivery works
+- Encrypted notifications fall back to generic copy when the key is missing
+- The NSE was tested via TestFlight against the production APNs environment (development and production APNs differ — easy to forget)
+
+If you can clear this list before release, you should see "I'm not getting notifications" support tickets drop by roughly 90%.
+
+## The One Thing to Do Today
+
+If you've read this far, the one thing worth doing today is **checking your server-side push pipeline to confirm `mutable-content: 1` is actually present in the payloads**. If it isn't, add it. That single change unblocks half of the "the image isn't showing up" complaints you'll hear once you eventually ship an NSE.
+
+Once you have the NSE in place, A/B test "with image" versus "text only" and watch the open rate. Most apps see image notifications open at 1.5–2x the rate of plain text. As a retention lever, that beats a lot of new-feature work on cost-per-result.
+
+Building native extensions on top of a Rork app is unfamiliar territory at first, but it's also where Rork stops feeling like a no-code tool and starts feeling like a real iOS development environment — one where you can call into any Apple framework you need. In the next piece, I'll dig into the NSE's sibling, the [Notification Content Extension](/articles/rork-dev/rork-callkit-pushkit-voip-implementation-guide), and how far you can push custom UI inside the notification itself.
