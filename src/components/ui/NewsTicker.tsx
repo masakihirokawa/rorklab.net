@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GLOBAL-#1 — Rork がローンチ 1 年未満で web トラフィック世界一のモバイルアプリビルダーへ、英語でアプリを記述するパラダイムを牽引",
-    "RORK15M — Rork が $15M シードラウンドを Left Lane Capital リードで調達、X 上で 800 万 view・2 週間で年間収益 2 倍（4/9）",
-    "RORKMAX — Rork Max が Web ベース Xcode 代替として確立、Claude Code + Opus 4.6 基盤でローンチ 3 日で $1.5M ARR を達成",
-    "PAPERLINE — Rork が Paperline を買収、ネイティブ Swift 生成能力が大幅強化、創業エンジニア 2 名が参画",
-    "APP-BOOM — 4 月の iOS アプリリリース 80%+ 増、両 OS 合計 104% 増、AI 起因の新規開発ブームの主役に",
-    "AGENT365 — Microsoft Agent 365（5/1 ローンチ）はエンタープライズ統制プレーン、個人開発者向け Rork とは別市場で住み分け",
+    "LOVABLE_RIVAL — Lovable が iOS / Android モバイルアプリで vibe-coding 市場に参入、Rork の主要競合に（4/28）",
+    "APP_STORE_BOOM — Q1 の新規アプリが前年比60%増、4月は104%増。AIアプリビルダーが個人開発を加速",
+    "RORK_MAX — Rork Max が Claude Opus 4.6 + Claude Code 基盤でネイティブ Swift アプリ生成、Web 版 Xcode の代替へ",
+    "SEED_15M — Rork、Left Lane Capital 主導で $15M シードラウンドを調達（4/9）— App Store 起業家を支援",
+    "APPLE_GUARD — Apple が動的コード実行系の vibe-coding ツールを審査強化。Rork Companion は引き続き安定運用",
+    "CLOUD_MAC — Cloud Mac fleet による2クリック App Store 公開、Mac / Xcode 不要の体制が個人開発者に好評",
   ],
   en: [
-    "GLOBAL-#1 — In under a year Rork becomes the world's #1 mobile app builder by web traffic, leading the English-to-app paradigm",
-    "RORK15M — Rork closes a $15M seed round led by Left Lane Capital, with 8M+ X views and revenue doubling in two weeks (4/9)",
-    "RORKMAX — Rork Max emerges as a web-based Xcode alternative, hitting $1.5M ARR within three days on Claude Code + Opus 4.6",
-    "PAPERLINE — Rork acquires Paperline, strengthening native Swift generation as the founders join the team",
-    "APP-BOOM — April iOS app releases jumped 80%+, with combined OS releases up 104%, putting Rork at the heart of the AI-driven app boom",
-    "AGENT365 — Microsoft Agent 365 launches May 1 as the enterprise control plane, leaving Rork to dominate the solo-developer market",
+    "LOVABLE_RIVAL — Lovable enters the mobile vibe-coding market with iOS and Android apps, becoming a direct Rork rival (4/28)",
+    "APP_STORE_BOOM — Q1 new app releases up 60% YoY and 104% in April, with AI app builders accelerating indie development",
+    "RORK_MAX — Rork Max generates native Swift apps on Claude Opus 4.6 + Claude Code, positioning as a web-based Xcode alternative",
+    "SEED_15M — Rork closes a $15M seed round led by Left Lane Capital (Apr 9) to back the next wave of App Store entrepreneurs",
+    "APPLE_GUARD — Apple tightens review on dynamic code execution tools while Rork Companion continues to ship reliably",
+    "CLOUD_MAC — Two-click App Store publishing via the cloud Mac fleet—no Mac or Xcode needed—keeps winning indie developers",
   ],
 };
 
