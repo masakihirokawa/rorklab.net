@@ -44,11 +44,20 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
     openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
     alternates: {
       canonical: locale === "ja" ? `${base}/tag/${encoded}` : `${base}/en/tag/${encoded}`,
-      languages: {
-        ja: `${base}/tag/${encoded}`,
-        en: `${base}/en/tag/${encoded}`,
-        "x-default": `${base}/en/tag/${encoded}`,
-      },
+      languages: (() => {
+        const otherLocale = locale === "ja" ? "en" : "ja";
+        const otherArticles = getArticles(otherLocale);
+        const tagExistsInOther = otherArticles.some((a) =>
+          (a.tags || []).some((t) => t.toLowerCase() === decoded.toLowerCase())
+        );
+        const langs: Record<string, string> = {};
+        langs[locale] = locale === "ja" ? `${base}/tag/${encoded}` : `${base}/en/tag/${encoded}`;
+        if (tagExistsInOther) {
+          langs[otherLocale] = otherLocale === "ja" ? `${base}/tag/${encoded}` : `${base}/en/tag/${encoded}`;
+          langs["x-default"] = `${base}/en/tag/${encoded}`;
+        }
+        return langs;
+      })(),
     },
   };
 
