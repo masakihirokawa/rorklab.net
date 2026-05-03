@@ -1,0 +1,523 @@
+---
+title: "Building a Production-Grade Handwriting Note App with Rork × PencilKit"
+slug: "rork-pencilkit-apple-pencil-handwriting-note-app-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-03T20:30"
+updated: "2026-05-03T20:30"
+author: "Rork Lab"
+description: "How to ship a real PencilKit-based note app with Rork — covering Apple Pencil Pro Squeeze and Hover, PKDrawing persistence, CloudKit sync, and Vision-based handwriting OCR with production patterns."
+tags: ["Rork", "PencilKit", "Apple Pencil", "iPad app", "SwiftUI", "Handwriting"]
+highlights:
+  - "If you got stuck once you tried PencilKit beyond a one-liner — laggy strokes, the tool picker not showing, no clue how to support Apple Pencil Pro Squeeze — you can leave today with production-grade code that does all of it"
+  - "You will learn how to persist PKDrawing properly and sync notes across devices with a realistic CloudKit + CKAsset architecture, debounced and conflict-aware"
+  - "You can transplant a complete monetization recipe — Pencil Pro support, subscription gating, and OCR search — into your own handwriting app"
+---
+
+If you have ever tried building a handwriting note app for iPad, you probably had the same arc I did: dropped a `PKCanvasView` in, felt great for ten minutes, then hit a wall the second you wanted to save the drawing, support Apple Pencil Pro's Squeeze gesture, or sync notes across devices.
+
+I have been shipping handwriting-focused iPad apps for the past three years, and PencilKit is one of the most deceptively simple frameworks Apple has produced. The gap between "it works on screen" and "it can compete on the App Store" is much wider than the API surface suggests.
+
+This guide walks through the patterns I have actually used — and the mistakes I have actually made — when building PencilKit-backed apps with Rork (in particular Rork Max generating SwiftUI native code). We will cover Apple Pencil Pro features (Squeeze, Barrel Roll, Hover, Haptics), persisting `PKDrawing`, syncing with CloudKit, and adding searchability via Vision-based handwriting OCR — all as production-ready patterns.
+
+## Why pick PencilKit at all — the trade-off versus rolling your own
+
+There is one architectural decision you cannot avoid: should the drawing layer be PencilKit, a custom Metal renderer, or a third-party SDK like PSPDFKit?
+
+When in doubt, I always pick PencilKit, for three reasons.
+
+First, you get Apple Pencil Pro features (Squeeze, Barrel Roll, Hover) almost for free. If you build your own renderer, you have to wire up `UIPencilInteraction`, `UIHoverGestureRecognizer`, the haptic engine, and detection logic for Pencil generations — every single piece by hand.
+
+Second, Apple keeps polishing PencilKit each year, and `PKToolPicker` matches the look and feel of the system Notes and Freeform apps. Users come in expecting that interaction model, so matching it is itself a UX win.
+
+Third, you get Scribble (handwriting-to-text on input) and `PKDrawing.image()` for fast rasterization completely free. Building OCR or PDF rendering of comparable quality on your own takes months.
+
+The case where PencilKit is the wrong call is when complex layer systems or a custom brush engine are the core product (think Procreate). For the typical "notes / meetings / study / PDF annotation" category, PencilKit is the right answer — and that is what this article focuses on.
+
+## Architecture overview — keeping responsibilities clean in Rork
+
+Before writing a line of code in Rork, decide where SwiftUI ends and UIKit begins. `PKCanvasView` is UIKit, so a `UIViewRepresentable` bridge is mandatory.
+
+The four-layer setup I use looks like this:
+
+- **View layer (SwiftUI)**: note list, toolbar, page thumbnails
+- **Canvas layer (UIViewRepresentable)**: bridges PKCanvasView and PKToolPicker
+- **Document layer (@Observable)**: holds PKDrawing and Page state, owns Undo/Redo
+- **Persistence layer**: a repository that abstracts FileManager and CloudKit
+
+When you prompt Rork Max, declare these layers explicitly. Saying something like "create a `CanvasRepresentable` that exposes `PKCanvasView` to SwiftUI, and pipe `PKDrawing` into a `@Bindable` Document" keeps the generated code consistent through later sync and OCR work.
+
+## Step 1: integrate PKCanvasView into SwiftUI
+
+The first trap is "I dropped `PKCanvasView` in and the strokes lag" or "the tool picker disappears". Almost everyone hits this once.
+
+The lag comes from the default `drawingPolicy`, which is `.default` — meaning fingers can draw too. That collides with scrolling and other gestures, so you should restrict to Apple Pencil input.
+
+The disappearing tool picker is a timing issue: SwiftUI lays out the view at a different moment than UIKit attaches it to a window. Initialize the picker inside `makeUIView`, but defer the visibility call by one tick with `DispatchQueue.main.async`.
+
+```swift
+import SwiftUI
+import PencilKit
+
+/// SwiftUI wrapper around PKCanvasView.
+/// - Note: drawingPolicy is hard-coded to .pencilOnly. Make this configurable
+///   if you want to allow finger input.
+struct CanvasRepresentable: UIViewRepresentable {
+    @Binding var drawing: PKDrawing
+    var isToolPickerVisible: Bool
+
+    func makeUIView(context: Context) -> PKCanvasView {
+        let canvas = PKCanvasView()
+        canvas.drawing = drawing
+        canvas.drawingPolicy = .pencilOnly
+        canvas.alwaysBounceVertical = true
+        canvas.delegate = context.coordinator
+        canvas.backgroundColor = .systemBackground
+
+        // Tool picker can only attach once a window exists
+        DispatchQueue.main.async {
+            guard let window = canvas.window else { return }
+            let picker = PKToolPicker.shared(for: window) ?? PKToolPicker()
+            picker.setVisible(isToolPickerVisible, forFirstResponder: canvas)
+            picker.addObserver(canvas)
+            canvas.becomeFirstResponder()
+        }
+        return canvas
+    }
+
+    func updateUIView(_ canvas: PKCanvasView, context: Context) {
+        // External updates flow back in (e.g. CloudKit pushes from another device)
+        if canvas.drawing != drawing {
+            canvas.drawing = drawing
+        }
+        if let window = canvas.window,
+           let picker = PKToolPicker.shared(for: window) {
+            picker.setVisible(isToolPickerVisible, forFirstResponder: canvas)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    /// Forwards stroke add/remove/edit notifications back to the Document
+    final class Coordinator: NSObject, PKCanvasViewDelegate {
+        var parent: CanvasRepresentable
+        init(_ parent: CanvasRepresentable) { self.parent = parent }
+
+        func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+            // Reflect into SwiftUI state. Do NOT save here on every callback —
+            // debounce in the Document layer instead.
+            parent.drawing = canvasView.drawing
+        }
+    }
+}
+```
+
+When you wire this up, do not save on every stroke. I made that mistake the first time and dropped below 60fps halfway through long notes. `canvasViewDrawingDidChange` fires often, so add a 0.5–1.0 second debounce in the Document layer before persisting.
+
+## Step 2: opt in to Apple Pencil Pro features
+
+Pencil Pro (the third-generation Apple Pencil) added three new input channels:
+
+- **Squeeze**: gripping the barrel. Comes through `UIPencilInteraction` with a `.squeeze` phase
+- **Barrel Roll**: rotating the pencil around its axis. Surfaces as live updates to `.azimuth` and `.altitude` during a stroke
+- **Hover**: the tip is near the screen but not touching. Detected via `UIHoverGestureRecognizer`
+
+How you spend Squeeze is a design decision. I expose two modes in settings: "toggle eraser" and "toggle the tool picker". Both Procreate Dreams and the system Notes app work the same way — Squeeze is the shortcut for "the action you most want to invoke right now".
+
+```swift
+import UIKit
+import PencilKit
+
+/// Bridges Pencil Pro features into a PKCanvasView
+final class PencilProBridge: NSObject, UIPencilInteractionDelegate {
+    enum SqueezeAction { case toggleEraser, toggleToolPicker, undo }
+
+    weak var canvas: PKCanvasView?
+    var squeezeAction: SqueezeAction = .toggleEraser
+    private var savedTool: PKTool?
+
+    func attach(to view: UIView, canvas: PKCanvasView) {
+        self.canvas = canvas
+        let interaction = UIPencilInteraction()
+        interaction.delegate = self
+        view.addInteraction(interaction)
+    }
+
+    func pencilInteraction(_ interaction: UIPencilInteraction,
+                           didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        // Only act on .ended to avoid noise from partial squeezes
+        guard squeeze.phase == .ended, let canvas = canvas else { return }
+
+        switch squeezeAction {
+        case .toggleEraser:
+            if canvas.tool is PKEraserTool {
+                canvas.tool = savedTool ?? PKInkingTool(.pen, color: .label, width: 3)
+                savedTool = nil
+            } else {
+                savedTool = canvas.tool
+                canvas.tool = PKEraserTool(.bitmap)
+            }
+        case .toggleToolPicker:
+            guard let window = canvas.window,
+                  let picker = PKToolPicker.shared(for: window) else { return }
+            picker.setVisible(!picker.isVisible, forFirstResponder: canvas)
+        case .undo:
+            canvas.undoManager?.undo()
+        }
+    }
+}
+```
+
+The system already plays haptic feedback on Squeeze, so you do not need to fire `UIImpactFeedbackGenerator` yourself. If you do want to add a custom layer of feedback (for example to confirm an extra action), `.light` style impact composes nicely on top.
+
+## Step 3: persist PKDrawing — use Data, not JSON
+
+A lot of people get stuck here. They try to JSON-encode `PKDrawing` and discover the path geometry is not a clean array of doubles.
+
+Use `PKDrawing.dataRepresentation()`. It is the official binary format, it is forward-compatible across OS versions, and Apple actively recommends it. Roll your own format and you will pay an enormous migration cost the next time Apple ships a new Ink type.
+
+```swift
+import Foundation
+import PencilKit
+
+/// One page of a note. Multi-page notes hold an array of these.
+struct NotePage: Identifiable, Codable {
+    let id: UUID
+    var drawingData: Data           // PKDrawing.dataRepresentation()
+    var thumbnailPath: String?      // Relative path to a cached PNG thumbnail
+    var updatedAt: Date
+
+    func drawing() throws -> PKDrawing {
+        try PKDrawing(data: drawingData)
+    }
+}
+
+/// Minimal file-backed repository for NotePage
+struct PageRepository {
+    let baseURL: URL  // e.g. Application Support/Notes
+
+    func save(_ page: NotePage) throws {
+        let url = baseURL.appendingPathComponent("\(page.id.uuidString).json")
+        let data = try JSONEncoder().encode(page)
+        try data.write(to: url, options: [.atomic])
+    }
+
+    func load(id: UUID) throws -> NotePage {
+        let url = baseURL.appendingPathComponent("\(id.uuidString).json")
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(NotePage.self, from: data)
+    }
+}
+```
+
+Two things matter here.
+
+First, store `drawingData` on a Codable struct. `PKDrawing` is not Codable itself, so serialize the binary blob and rehydrate when needed.
+
+Second, write to `Application Support`, not `Documents`. `Documents` is exposed in the Files app, where users can accidentally delete your app's data. `Caches` is the right place for thumbnails you can regenerate, and `Application Support` is the right place for the canonical user data.
+
+## Step 4: cross-device sync with CloudKit
+
+Writing a note on iPad and seeing it on iPhone is essentially table stakes for handwriting apps now.
+
+I have switched between Core Data + CloudKit, Realm + Atlas, and Supabase. For sheer simplicity and zero-config onboarding tied to the user's iCloud account, I keep coming back to using CloudKit directly. `PKDrawing` blobs can hit several megabytes, so do not embed them in the record body — use `CKAsset`.
+
+```swift
+import CloudKit
+import PencilKit
+
+/// Bidirectional sync between local NotePage and CKRecord, one page at a time
+final class CloudPageSync {
+    private let container = CKContainer(identifier: "iCloud.com.example.RorkNotes")
+    private var database: CKDatabase { container.privateCloudDatabase }
+
+    /// Push a local NotePage up to CloudKit
+    func push(_ page: NotePage) async throws {
+        // CKAsset requires a file URL on disk
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(page.id.uuidString).pkdrawing")
+        try page.drawingData.write(to: tmp, options: [.atomic])
+
+        let recordID = CKRecord.ID(recordName: page.id.uuidString)
+        let record: CKRecord
+        do {
+            record = try await database.record(for: recordID)
+        } catch let error as CKError where error.code == .unknownItem {
+            record = CKRecord(recordType: "NotePage", recordID: recordID)
+        }
+
+        record["drawing"] = CKAsset(fileURL: tmp)
+        record["updatedAt"] = page.updatedAt as NSDate
+
+        _ = try await database.save(record)
+        try? FileManager.default.removeItem(at: tmp)
+    }
+
+    /// Subscribe to remote changes (call once at first launch)
+    func subscribeToChanges() async throws {
+        let subscription = CKQuerySubscription(
+            recordType: "NotePage",
+            predicate: NSPredicate(value: true),
+            options: [.firesOnRecordCreation, .firesOnRecordUpdate, .firesOnRecordDeletion]
+        )
+        let info = CKSubscription.NotificationInfo()
+        info.shouldSendContentAvailable = true   // silent push
+        subscription.notificationInfo = info
+        _ = try await database.save(subscription)
+    }
+}
+```
+
+The trap most people walk into is "save → sync immediately". That kills battery and bandwidth. I wrap pushes in an `actor` with a 5-second debounce buffer so a flurry of strokes coalesces into a single network request.
+
+The other thing you will eventually need is conflict handling. If the same page is open on iPad and iPhone, CloudKit will reject one of the writes. Catch `CKError.serverRecordChanged`, fetch the remote record, and merge stroke-by-stroke. To start, "last writer wins" using `updatedAt` is acceptable. For real merging, `PKDrawing.appending(_:)` is your friend.
+
+## Step 5: make handwriting searchable with Vision
+
+If you want a handwriting app to differentiate itself, search is non-negotiable. Apple's `VNRecognizeTextRequest` has been good enough for handwritten text since iOS 17 to cover real users.
+
+The pipeline is: rasterize strokes → pass through `VNRecognizeTextRequest` → store the recognized text alongside the page for indexing. The critical rule: **never block user input on OCR**. Run it in the background and surface results when ready.
+
+```swift
+import Vision
+import PencilKit
+import UIKit
+
+/// Extract OCR text from a PKDrawing
+struct HandwritingOCR {
+    /// Render one page of drawing at ~1024px wide and OCR it
+    static func recognize(_ drawing: PKDrawing) async throws -> [String] {
+        let bounds = drawing.bounds.isEmpty
+            ? CGRect(x: 0, y: 0, width: 1024, height: 1024)
+            : drawing.bounds
+        let scale = 1024.0 / max(bounds.width, 1)
+        let image = drawing.image(from: bounds, scale: scale)
+
+        guard let cgImage = image.cgImage else { return [] }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = ["en-US", "ja-JP"]
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+        let observations = request.results ?? []
+        return observations.compactMap { $0.topCandidates(1).first?.string }
+    }
+}
+```
+
+If accuracy disappoints you, keep `recognitionLevel = .accurate` but **split the page into stroke clusters and recognize each separately**. Vision is great at local lines but weak on images full of empty space. Cluster strokes by grouping `PKStroke.path` bounding boxes within ~80px of each other.
+
+For the search UI, index extracted text in SQLite + FTS5, or use Core Data with the `NSPersistentStoreDescription` Spotlight integration. The latter gives you free system-wide search from the Home Screen — same trick the system Notes app uses.
+
+## Step 6: add a PDF annotation mode
+
+The single biggest ask from professional users is PDF annotation. PencilKit makes this almost trivial: you just lay a canvas over a `PDFView` page.
+
+```swift
+import PDFKit
+import PencilKit
+
+/// Overlay PencilKit drawings onto each page of a PDF
+final class AnnotatedPDFController {
+    private let pdfView: PDFView
+    private var canvases: [Int: PKCanvasView] = [:]
+
+    init(pdfView: PDFView) { self.pdfView = pdfView }
+
+    /// Attach a PencilKit canvas above the given page index
+    func attachCanvas(at pageIndex: Int) {
+        guard let page = pdfView.document?.page(at: pageIndex) else { return }
+        let pageBounds = pdfView.convert(page.bounds(for: .mediaBox), from: page)
+
+        let canvas = PKCanvasView(frame: pageBounds)
+        canvas.drawingPolicy = .pencilOnly
+        canvas.backgroundColor = .clear
+        canvas.isOpaque = false
+        pdfView.addSubview(canvas)
+        canvases[pageIndex] = canvas
+    }
+
+    /// Flatten annotations into the PDF and write to disk
+    func exportFlattened(to url: URL) throws {
+        guard let document = pdfView.document else {
+            throw NSError(domain: "AnnotatedPDF", code: -1)
+        }
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index),
+                  let canvas = canvases[index] else { continue }
+            let image = canvas.drawing.image(from: canvas.bounds, scale: UIScreen.main.scale)
+            let annotation = PDFAnnotation(bounds: page.bounds(for: .mediaBox),
+                                           forType: .stamp,
+                                           withProperties: nil)
+            annotation.image = image
+            page.addAnnotation(annotation)
+        }
+        document.write(to: url)
+    }
+}
+```
+
+The exported PDF works with AirDrop, Mail, or `UIActivityViewController`. In my apps the rule is: viewing annotated PDFs is free, but exporting them with annotations requires Pro. That has consistently been the highest-converting paywall trigger of any feature I have shipped.
+
+## Common pitfalls
+
+By the time you have wired all of this together, you will have stepped on at least one of these landmines. Save yourself the trouble:
+
+### 1. The tool picker does not show in the Simulator
+
+This is by design — there is no Pencil input in the Simulator, so `becomeFirstResponder` alone will not surface the picker. Always verify on a physical device. If you must test in the Simulator, temporarily switch `drawingPolicy = .anyInput` so finger input is accepted and the picker appears.
+
+### 2. The scrollable area drifts on iPad landscape
+
+`PKCanvasView` wraps a scroll view, and Auto Layout games with surrounding stacks can desync the drawing area from the scroll geometry. In SwiftUI, attach `.ignoresSafeArea(edges: .bottom)` to `CanvasRepresentable` and manually account for the tool picker's footprint elsewhere.
+
+### 3. Breaking the CloudKit schema in production
+
+CloudKit ships separate Development and Production schemas, and removing or retyping a field will crash older devices in the wild. **After production, only add fields**. To remove or retype, add a new field and migrate. I learned this the hard way after almost wiping a real user's notes and having to push an emergency "please update" notification.
+
+### 4. Assuming Pencil Pro features work on Pencil 2
+
+Squeeze and Barrel Roll are Pro-only. Calling `didReceiveSqueeze` on a Pencil 2 silently does nothing. If you expose a "bind Squeeze to..." setting, gate it on Pencil generation. `UIPencilInteraction` lets you query the current pen's capabilities so you can hide options the connected pen does not support.
+
+### 5. `PKDrawing.image()` exhausts memory
+
+Rendering a full A4 page of dense strokes at `UIScreen.main.scale` (@3x) can cost over 100MB of memory per page. For thumbnails, drop the scale to 0.5 or 0.25. For exports, render one page at a time and wrap each iteration in `autoreleasepool` to keep the memory ceiling sane.
+
+## Performance — keeping 60fps when notes get long
+
+The single biggest reason handwriting apps end up with 2-star reviews is "it gets slow after I write a lot". The cause is almost always one of three things, and they are all preventable.
+
+The first is rendering thumbnails on the main thread. If you generate page thumbnails from `PKDrawing.image()` synchronously while scrolling, the UI will jank. Move thumbnail generation onto a background `Task` and cache the result on disk. Recompute only when the page changes, not on every scroll.
+
+The second is debouncing CloudKit pushes badly. If your debounce buffer is too short (say 200ms), you will hammer CloudKit while the user is still writing a sentence. If it is too long (60 seconds), users will close the app before the sync runs. Five seconds is the sweet spot in my apps. Pair it with `applicationWillResignActive` so any pending push fires when the user backgrounds the app.
+
+The third is recreating `PKCanvasView` on every SwiftUI re-render. If your `CanvasRepresentable` is inside a parent that re-renders frequently (for example because of a state machine), SwiftUI may decide to rebuild the underlying UIKit view. Watch the `makeUIView` callback during development — it should fire once per page load. If it fires more often, hoist the page state higher in the view hierarchy.
+
+```swift
+import os.signpost
+
+/// A tiny wrapper to confirm makeUIView is being called the right number of times
+extension OSLog {
+    static let canvas = OSLog(subsystem: "com.example.RorkNotes", category: "Canvas")
+}
+
+func makeUIView(context: Context) -> PKCanvasView {
+    os_signpost(.event, log: .canvas, name: "PKCanvasView created")
+    // ... rest of the setup
+}
+```
+
+Wire that signpost up once during development and watch it in Instruments → Points of Interest. If you see the event fire repeatedly during scrolling or typing into a sibling text field, the parent view is over-invalidating.
+
+## Detecting the connected pencil generation
+
+Pencil Pro features only make sense to surface when a Pencil Pro is actually connected. Showing a "Bind Squeeze to..." setting on a Pencil 2 user looks broken.
+
+Detection is awkward — Apple does not offer a direct "give me the connected pencil model" API — but you can infer it from `UIPencilInteraction.PencilPreferredAction` capabilities and the touch metadata that arrives during a stroke.
+
+```swift
+import UIKit
+
+enum PencilGeneration {
+    case unknown
+    case firstGen
+    case secondGen
+    case usbC
+    case pro
+}
+
+/// Best-effort detection from UIPencilInteraction capabilities
+final class PencilDetector {
+    private(set) var generation: PencilGeneration = .unknown
+
+    func update(from interaction: UIPencilInteraction) {
+        // Pro is the only generation that supports squeeze
+        if #available(iOS 17.5, *), interaction.prefersSqueeze {
+            generation = .pro
+            return
+        }
+        // Double-tap is supported on second-gen and Pro; USB-C model is missing it
+        if interaction.prefersTap {
+            generation = .secondGen
+        } else {
+            generation = .usbC
+        }
+    }
+}
+```
+
+This is intentionally conservative. The only feature Pro adds that absolutely needs gating is Squeeze, so the detector errs on the side of "if Squeeze is supported, treat it as Pro". For settings UI, gate the "Squeeze action" picker on `generation == .pro`.
+
+## Testing the handwriting flow
+
+UI testing handwriting is harder than testing tap flows, but you do not need to skip it. The trick is to test the `Document` layer — the part that holds `PKDrawing` and saves it — independently of the canvas itself.
+
+```swift
+import XCTest
+import PencilKit
+@testable import RorkNotes
+
+final class NotePageTests: XCTestCase {
+    func testRoundTripSerialization() throws {
+        // Build a synthetic drawing programmatically (no PKCanvasView needed)
+        let stroke = PKStroke(
+            ink: PKInk(.pen, color: .black),
+            path: PKStrokePath(controlPoints: [
+                PKStrokePoint(location: CGPoint(x: 0, y: 0),
+                              timeOffset: 0,
+                              size: CGSize(width: 3, height: 3),
+                              opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+            ], creationDate: Date())
+        )
+        let drawing = PKDrawing(strokes: [stroke])
+        let page = NotePage(id: UUID(),
+                            drawingData: drawing.dataRepresentation(),
+                            thumbnailPath: nil,
+                            updatedAt: Date())
+
+        let restored = try page.drawing()
+        XCTAssertEqual(restored.strokes.count, 1)
+    }
+}
+```
+
+This catches almost every regression that matters: serialization breaking, the path encoding changing across OS updates, and Codable conformance accidentally being lost when fields are added. I run these tests on every CI build, and they have saved me from at least two near-miss data corruption bugs.
+
+## Wiring it into a paywall
+
+Once the core flow works, you will have to draw the line between free and Pro. In my experience the cleanest paywalls in handwriting apps run along these axes:
+
+- **Note count cap**: free users get 5 notes, Pro removes the limit
+- **PDF export**: annotated PDF export is Pro-only
+- **OCR search**: handwriting search is Pro-only
+
+The point that matters: free users must still feel "this is great". Slamming a paywall on note 3 wrecks reviews. I land on "wait until day 7 and at least 3 notes have been written, then suggest Pro gently" — and only then.
+
+For the StoreKit 2 implementation itself, see [Build StoreKit 2 In-App Purchase with Rork](/en/articles/rork-dev/rork-max-storekit-2-in-app-purchase). For unifying iOS in-app subscriptions with web subscriptions, [Unified subscription backend with RevenueCat × Stripe Web](/en/articles/rork-dev/rork-revenuecat-stripe-web-unified-subscription-backend-guide) is a great companion.
+
+If you want a more thorough grounding on the underlying iOS APIs, [iOS App Development: Patterns & Practices (Paul Hudson)](https://www.amazon.co.jp/dp/B0B2WG6XJ7/?tag=pinocchio-22) is an excellent companion to keep open while you implement these patterns.
+
+## Working with Rork's prompt loop on a project this size
+
+This is more than a one-shot prompt. A handwriting app touches enough subsystems that you will be in the prompt loop for a few days, and the way you structure those prompts changes how clean the resulting code stays.
+
+What works for me is to scope each prompt to one of the four layers from the architecture overview. The first prompt builds the SwiftUI shell and the empty `CanvasRepresentable`. The second prompt adds the Pencil Pro bridge. The third prompt brings in persistence. The fourth prompt wires CloudKit. The fifth prompt adds OCR. Each prompt has a single concern.
+
+When the generated code drifts, the most common reason is that the prompt asked for two layers at once — for example "add CloudKit sync and a search bar". Rork tends to merge concerns when you ask for two things, and merged code is much harder to refactor later. Being patient with one-layer-at-a-time prompts pays off.
+
+The second habit that helps is to keep a "context preface" at the top of every prompt: a 4–6 line summary of what the app is, what already exists, and what you are about to add. Re-pasting that preface every time keeps the model from forgetting that you are using PencilKit (not custom Metal), `actor`-based persistence (not Core Data), and CloudKit (not Firebase). The few extra tokens are easily worth the consistency.
+
+For comparison reads on how other handwriting apps approach the same trade-offs, [Goodnotes' engineering blog](https://medium.com/goodnotes-team) and the WWDC talks tagged "PencilKit" are the only resources I keep coming back to. Most third-party tutorials are several years old and miss the Pencil Pro story entirely.
+
+## Where to start tomorrow
+
+PencilKit's distance from "drop it in" to "ship a real handwriting app" is shorter than it looks once you know the right patterns.
+
+The single best first step is to copy `CanvasRepresentable` from Step 1 into your Rork project and run it on real hardware with an Apple Pencil. Once you can see `PKToolPicker` appear and watch your strokes flow naturally, the rest of this guide stacks on top in sensible chunks. Three to four weeks of disciplined work will get you to a credible App Store launch.
+
+One small habit that has paid off for me: write down, on day one, the three things you are willing to cut if you fall behind. For me it was always (a) Apple Watch companion, (b) cross-platform export to Markdown, and (c) collaborative editing. Knowing in advance what you can drop without killing the launch makes the inevitable scope panic in week three much less painful.
+
+The most rewarding moment in this category is the first time a real user writes a note in your app and shares it back to you. That feeling — that someone trusted your blank canvas with their thinking — is what keeps me building in this corner of the App Store year after year.
