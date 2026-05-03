@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "LOVABLE_RIVAL — Lovable が iOS / Android モバイルアプリで vibe-coding 市場に参入、Rork の主要競合に（4/28）",
-    "APP_STORE_BOOM — Q1 の新規アプリが前年比60%増、4月は104%増。AIアプリビルダーが個人開発を加速",
-    "RORK_MAX — Rork Max が Claude Opus 4.6 + Claude Code 基盤でネイティブ Swift アプリ生成、Web 版 Xcode の代替へ",
-    "SEED_15M — Rork、Left Lane Capital 主導で $15M シードラウンドを調達（4/9）— App Store 起業家を支援",
-    "APPLE_GUARD — Apple が動的コード実行系の vibe-coding ツールを審査強化。Rork Companion は引き続き安定運用",
-    "CLOUD_MAC — Cloud Mac fleet による2クリック App Store 公開、Mac / Xcode 不要の体制が個人開発者に好評",
+    "RORK15M — Rork が 1,500 万ドルのシード調達、Left Lane Capital・a16z Speedrun ら参加（4/9）",
+    "RORKMAX — Rork Max が Claude Code + Opus 4.6 搭載で公開、2週間で年間収益2倍を達成",
+    "PAPERLINE — Rork が App Builder の Paperline を買収、機能統合で開発体験を強化",
+    "SWIFT — Rork Max が Web 上初の Swift アプリビルダーに、Xcode なしで iOS アプリを生成",
+    "LOVABLE — Lovable も iOS/Android アプリをリリース、音声・テキストで vibe コーディング（4/28）",
+    "NOCODE75 — Gartner 予測：2026 年末までに新規アプリの 75% がローコード・ノーコードで開発",
   ],
   en: [
-    "LOVABLE_RIVAL — Lovable enters the mobile vibe-coding market with iOS and Android apps, becoming a direct Rork rival (4/28)",
-    "APP_STORE_BOOM — Q1 new app releases up 60% YoY and 104% in April, with AI app builders accelerating indie development",
-    "RORK_MAX — Rork Max generates native Swift apps on Claude Opus 4.6 + Claude Code, positioning as a web-based Xcode alternative",
-    "SEED_15M — Rork closes a $15M seed round led by Left Lane Capital (Apr 9) to back the next wave of App Store entrepreneurs",
-    "APPLE_GUARD — Apple tightens review on dynamic code execution tools while Rork Companion continues to ship reliably",
-    "CLOUD_MAC — Two-click App Store publishing via the cloud Mac fleet—no Mac or Xcode needed—keeps winning indie developers",
+    "RORK15M — Rork raises $15M seed from Left Lane Capital, a16z Speedrun & more (4/9)",
+    "RORKMAX — Rork Max powered by Claude Code + Opus 4.6 doubles annual revenue in 2 weeks",
+    "PAPERLINE — Rork acquires app builder Paperline to strengthen its development experience",
+    "SWIFT — Rork Max becomes the first web-based Swift app builder, generating iOS apps without Xcode",
+    "LOVABLE — Lovable launches iOS & Android vibe-coding app for mobile-first development (4/28)",
+    "NOCODE75 — Gartner: 75% of new apps built with low-code/no-code tools by end of 2026",
   ],
 };
 
