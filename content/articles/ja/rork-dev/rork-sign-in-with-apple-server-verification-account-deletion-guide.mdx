@@ -1,0 +1,499 @@
+---
+title: "Rork アプリの Sign in with Apple を、サーバー検証とアカウント削除まで本気で実装するガイド"
+slug: "rork-sign-in-with-apple-server-verification-account-deletion-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-03T11:30"
+updated: "2026-05-03T11:30"
+author: "Rork Lab"
+description: "Rork で作ったアプリに Sign in with Apple をクライアントだけで載せて満足してしまうと、審査で確実に詰まります。ID トークンの公開鍵検証から nonce の扱い、必須となったアカウント削除フロー、Apple への revoke 通知までを、現場で動かしている構成のまま全部書きます。"
+tags: ["Sign in with Apple", "認証", "JWT", "App Store審査", "Cloudflare Workers"]
+highlights:
+  - "「とりあえず Sign in with Apple ボタンを置いただけ」で審査リジェクトを繰り返していた人が、サーバー側の ID トークン検証まで含めた本番品質の実装を今日手に入れられる"
+  - "Apple の公開鍵を取得してきて JWT を検証する、nonce を hashed nonce として渡す、メールアドレスが初回しか取れない罠を回避する、といった実装の急所を動くコードで習得できる"
+  - "2022 年から App Store ガイドライン 5.1.1(v) で必須になったアカウント削除フローを、Apple への revoke_token 通知まで含めて完成形で実装し、リジェクトのリスクを根本から消せる"
+---
+
+「Sign in with Apple をボタンだけ置いてリリースしたら、Apple からのレビュー結果がリジェクトだった」— Rork で個人開発をしていると、この経験は意外なほど高頻度で発生します。私も最初の 1 本目はこれで 2 回連続リジェクトされ、3 回目でようやく通したクチです。レビュアーから返ってくるメッセージは妙に淡白で、何が足りないのか自分で全部組み立てて推測するしかありません。
+
+このガイドは、そのときに「最初からこれが分かっていれば良かった」と感じたことを、Rork のコード生成と相性の良い形で全部まとめ直したものです。具体的には、`expo-apple-authentication` でクライアント側を組み立てつつ、Cloudflare Workers で ID トークンの JWS 検証・nonce 検証・アカウント削除（revoke_token 通知込み）まで一気通貫で実装します。Sign in with Google や Sign in with Twitter など他の認証を入れている場合の「Apple ID も併設しないとリジェクトされる」というルールにも触れます。
+
+## なぜ「ボタンを置いただけ」では絶対に通らないのか
+
+Sign in with Apple は単なる OAuth プロバイダではありません。Apple は App Store ガイドラインの **4.8** と **5.1.1(v)** で、Sign in with Apple をどう実装するべきかをかなり細かく規定しています。私が痛い目を見たポイントを先に並べておきます。
+
+- ガイドライン 4.8: アプリで第三者の認証サービス（Google・Facebook・Twitter 等）を使っている場合、Sign in with Apple を「同等の選択肢として」必ず提供しなければなりません。「同等」には UI 上の見せ方も含まれます。Apple のボタンを下の方に小さく置く、はリジェクト対象です
+- ガイドライン 5.1.1(v): アカウント作成機能があるアプリは、ユーザーがアプリ内から自分のアカウントを削除できる導線を持たなければなりません。これは 2022 年 6 月から完全必須になりました。設定画面のどこかから 2〜3 タップで到達できる必要があります
+- Apple Developer Documentation の地味な脚注: ID トークン (`identityToken`) を取得したら、サーバー側で Apple の公開鍵を使って JWS 署名を検証することが「必須」と書かれています。クライアントが受け取った `email` を信用してそのまま DB に書き込む実装は、この時点で本番品質ではありません
+
+逆に言えば、この 3 点を満たして実装すれば、Sign in with Apple 起因のリジェクトはほぼゼロになります。本記事はその 3 点を全部「動くコード」で示します。
+
+## 全体像 — クライアント取得・サーバー検証・削除フローの 4 層
+
+実装に入る前に、各層が何を担当するかを揃えておきます。これが頭に入っていないと、後でデバッグするときに「どの層で何が壊れているのか分からない」という地獄が始まります。
+
+- **層 1: ユーザー操作層（Rork で生成した React Native 画面）**: Sign in with Apple ボタンを表示し、`AppleAuthentication.signInAsync()` を呼び、`identityToken` と `authorizationCode` を取得します
+- **層 2: クライアント側の前処理層**: nonce を生成して SHA-256 でハッシュし、`hashedNonce` をリクエストに含めます。ユーザーから受け取った情報をそのまま信用せず、必ずサーバー側に投げます
+- **層 3: サーバー検証層（Cloudflare Workers + Hono）**: Apple の JWKs エンドポイントから公開鍵を取得して JWT 署名を検証、`aud`・`iss`・`nonce`・有効期限・`sub` を確認した上で、自前のセッショントークンを発行します
+- **層 4: 削除フロー層**: ユーザーがアプリ内で「アカウント削除」を押したとき、ローカルの DB から該当ユーザーを消すだけでなく、Apple に対して `revoke_token` API を叩いて認証連携を解除します。これを忘れると、ユーザーは「設定 → Apple ID → サインインに使用中の App」に幽霊アカウントが残り続けます
+
+これら 4 層を順番に実装していきます。サーバー側は Cloudflare Workers を例にしますが、Vercel Edge Functions や AWS Lambda でも同じ考え方で組めます。
+
+## Step 1: Rork で Sign in with Apple ボタンを設置する
+
+Rork のチャット欄にこう投げると、ベースになる画面を作ってくれます。
+
+> 「ログイン画面に `expo-apple-authentication` を使った Sign in with Apple ボタンを追加してください。ボタンをタップしたら nonce を生成して SHA-256 ハッシュにし、`identityToken` と `authorizationCode` をサーバーの `/auth/apple` エンドポイントに POST してください。サーバーから返ってきたセッショントークンは `expo-secure-store` に保存してください。」
+
+生成されたコードは大体合っていますが、nonce の扱いとエラーハンドリングだけは手で整える必要があります。私の手元で動いているのはこの形です。
+
+```tsx
+// app/(auth)/sign-in-apple.tsx
+import * as AppleAuthentication from "expo-apple-authentication";
+import * as Crypto from "expo-crypto";
+import * as SecureStore from "expo-secure-store";
+import { Alert, Platform } from "react-native";
+import { useState } from "react";
+import { useRouter } from "expo-router";
+
+const API_BASE = process.env.EXPO_PUBLIC_API_BASE!;
+
+// Apple のドキュメントが推奨する nonce 生成方式: 32 バイト乱数の base64 → SHA-256
+async function generateNonce(): Promise<{ raw: string; hashed: string }> {
+  const bytes = await Crypto.getRandomBytesAsync(32);
+  const raw = btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const hashed = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    raw,
+    { encoding: Crypto.CryptoEncoding.HEX }
+  );
+  return { raw, hashed };
+}
+
+export function AppleSignInButton() {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+
+  const handlePress = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { raw, hashed } = await generateNonce();
+
+      const credential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+        ],
+        nonce: hashed, // 注: ここに渡すのは hashed の方
+      });
+
+      // サーバー側で raw nonce と ID トークンの nonce ハッシュを照合する
+      const res = await fetch(`${API_BASE}/auth/apple`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          identityToken: credential.identityToken,
+          authorizationCode: credential.authorizationCode,
+          rawNonce: raw,
+          // 初回ログイン時のみ取得できる氏名・メール（再ログイン時は null になる）
+          fullName: credential.fullName,
+          email: credential.email,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Server verification failed: ${err}`);
+      }
+
+      const { sessionToken } = (await res.json()) as { sessionToken: string };
+      await SecureStore.setItemAsync("session_token", sessionToken);
+      router.replace("/(app)/home");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      // ユーザーがキャンセルしたケースだけは無音で抜ける
+      if (!msg.includes("ERR_REQUEST_CANCELED")) {
+        Alert.alert("ログインに失敗しました", msg);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (Platform.OS !== "ios") return null;
+
+  return (
+    <AppleAuthentication.AppleAuthenticationButton
+      buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+      buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+      cornerRadius={8}
+      style={{ width: "100%", height: 50 }}
+      onPress={handlePress}
+    />
+  );
+}
+```
+
+ポイントは「**`nonce` 引数に渡すのは hashed の方、サーバーには raw を送る**」という非対称性です。Apple は `identityToken` の中に hashed を入れて返してくるので、サーバー側で raw を再ハッシュして照合します。raw のまま渡してしまうと「リプレイ攻撃を防ぐ意味のある検証」が成立しません。
+
+## Step 2: nonce が本当に必要な理由 — リプレイ攻撃の具体像
+
+「nonce ってなんとなく付けるもの」と思っていると、実装の細部で必ずミスします。具体的にどういう攻撃を防いでいるのかを 1 段だけ深掘りしておきます。
+
+ある攻撃者が、何らかの方法で別ユーザーの `identityToken` を 1 度だけ盗んだとします（例: HTTPS が中間者攻撃に晒されている、デバッグ用に書き出された JWT が漏洩した、等）。nonce 検証がない世界では、攻撃者はそのトークンをそのままサーバーの `/auth/apple` に投げ込めば、被害者として認証が通ってしまいます。
+
+nonce があると、サーバーは「自分が今回の認証セッションのために発行した raw nonce」と「ID トークン内の hashed nonce」が一致することを要求します。攻撃者は raw nonce を知らないので、トークンをそのまま使い回しても認証が通りません。これが「リプレイ攻撃を防ぐ」の中身です。
+
+ここで重要なのは、**nonce は「セッションごとに新しく」生成すること**、そして**サーバー側で 1 度照合したら使い捨てにすること**です。同じ nonce を 2 回使いまわせる実装にしてしまうと、せっかくの検証が無効化されます。Cloudflare KV や Redis に短い TTL（例: 5 分）で保存して、検証成功と同時に削除する、という運用が実用的です。
+
+## Step 3: サーバー側で ID トークンを「正しく」検証する
+
+ここが本記事の核です。Cloudflare Workers + [Hono](https://hono.dev/) + [`jose`](https://github.com/panva/jose) という組み合わせで書きます。Hono を選んでいる理由は、Workers との相性と、ミドルウェアの書きやすさです。
+
+```ts
+// src/auth/verify-apple.ts
+import { jwtVerify, createRemoteJWKSet } from "jose";
+
+const APPLE_ISSUER = "https://appleid.apple.com";
+const APPLE_JWKS = createRemoteJWKSet(
+  new URL("https://appleid.apple.com/auth/keys")
+);
+
+export type VerifiedAppleIdentity = {
+  sub: string; // Apple のユーザー一意 ID（このアプリ内では永続）
+  email?: string;
+  emailVerified?: boolean;
+  isPrivateEmail?: boolean;
+};
+
+export async function verifyAppleIdentityToken(params: {
+  identityToken: string;
+  expectedAudience: string; // Apple Developer の Service ID または Bundle ID
+  rawNonce: string;
+}): Promise<VerifiedAppleIdentity> {
+  const { identityToken, expectedAudience, rawNonce } = params;
+
+  // 1) JWS 署名検証 + iss / aud / exp の自動チェック
+  const { payload } = await jwtVerify(identityToken, APPLE_JWKS, {
+    issuer: APPLE_ISSUER,
+    audience: expectedAudience,
+  });
+
+  // 2) nonce 検証 — Apple が hashed nonce を返してくる
+  const expectedHashedNonce = await sha256Hex(rawNonce);
+  if (payload.nonce !== expectedHashedNonce) {
+    throw new Error("Nonce mismatch — possible replay attack");
+  }
+
+  // 3) sub を必ず確認
+  if (typeof payload.sub !== "string" || payload.sub.length === 0) {
+    throw new Error("Missing sub claim in Apple ID token");
+  }
+
+  return {
+    sub: payload.sub,
+    email: typeof payload.email === "string" ? payload.email : undefined,
+    emailVerified: payload.email_verified === true || payload.email_verified === "true",
+    isPrivateEmail:
+      payload.is_private_email === true || payload.is_private_email === "true",
+  };
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+```
+
+ここで意図的に省略していないのが、**`expectedAudience` の扱い**です。iOS ネイティブのアプリから直接 Sign in with Apple を呼んでいる場合、`aud` は「アプリの Bundle ID」が入ります（例: `com.dolice.myrorkapp`）。Web 側にも Sign in with Apple を載せている場合は、Service ID（例: `com.dolice.myrorkapp.web`）が `aud` に入るので、**両方を許容する実装**にする必要があります。
+
+```ts
+// 複数の audience を許容する場合
+const ACCEPTED_AUDIENCES = [
+  "com.dolice.myrorkapp",      // iOS app
+  "com.dolice.myrorkapp.web",  // Web (Service ID)
+];
+
+const { payload } = await jwtVerify(identityToken, APPLE_JWKS, {
+  issuer: APPLE_ISSUER,
+  audience: ACCEPTED_AUDIENCES,
+});
+```
+
+ここを Bundle ID 1 つだけハードコードしておくと、後で Web ログインを追加した瞬間に「Web からログインできない」というバグになります。最初から配列で持っておく方が安全です。
+
+## Step 4: ユーザー作成と「メールが 1 度しか取れない」問題
+
+Sign in with Apple のもっとも嫌な仕様は、**`email` と `fullName` が初回ログイン時にしか取得できない**ことです。2 回目以降のログインでは、Apple は `email`・`fullName` をすべて空で返してきます（これは仕様であり、Apple のサーバー側で「初回フラグ」が立っていると返ってこなくなります）。
+
+つまり、「初回ログイン時に email を保存し損ねたら、二度と取れない」が起こります。Rork で生成された素朴なコードだとここを取りこぼしがちです。サーバー側ではこんな順序で処理します。
+
+```ts
+// src/routes/auth-apple.ts
+import { Hono } from "hono";
+import { verifyAppleIdentityToken } from "../auth/verify-apple";
+import { issueSessionToken } from "../auth/session";
+
+const app = new Hono<{ Bindings: { DB: D1Database; KV: KVNamespace } }>();
+
+app.post("/auth/apple", async (c) => {
+  const body = await c.req.json<{
+    identityToken: string;
+    authorizationCode: string;
+    rawNonce: string;
+    fullName?: { givenName?: string | null; familyName?: string | null } | null;
+    email?: string | null;
+  }>();
+
+  // 1) nonce が「そのセッションのために発行されたものか」を KV で確認
+  const nonceKey = `apple:nonce:${body.rawNonce}`;
+  const issued = await c.env.KV.get(nonceKey);
+  if (!issued) {
+    return c.json({ error: "Nonce expired or unknown" }, 401);
+  }
+  await c.env.KV.delete(nonceKey); // 使い捨て
+
+  // 2) ID トークン検証
+  const identity = await verifyAppleIdentityToken({
+    identityToken: body.identityToken,
+    expectedAudience: "com.dolice.myrorkapp",
+    rawNonce: body.rawNonce,
+  });
+
+  // 3) 既存ユーザー検索
+  const existing = await c.env.DB.prepare(
+    "SELECT id, email FROM users WHERE apple_sub = ?1"
+  )
+    .bind(identity.sub)
+    .first<{ id: string; email: string | null }>();
+
+  let userId: string;
+
+  if (existing) {
+    userId = existing.id;
+    // 既存ユーザーで、初回時に取り損ねていた email が今回の body に入っていれば補完
+    if (!existing.email && body.email) {
+      await c.env.DB.prepare("UPDATE users SET email = ?1 WHERE id = ?2")
+        .bind(body.email, userId)
+        .run();
+    }
+  } else {
+    // 4) 新規ユーザー作成 — email がないケースを必ず許容する
+    userId = crypto.randomUUID();
+    const displayName = [
+      body.fullName?.givenName ?? "",
+      body.fullName?.familyName ?? "",
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    await c.env.DB.prepare(
+      `INSERT INTO users (id, apple_sub, email, display_name, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5)`
+    )
+      .bind(
+        userId,
+        identity.sub,
+        body.email ?? identity.email ?? null,
+        displayName || "Unnamed",
+        new Date().toISOString()
+      )
+      .run();
+  }
+
+  const sessionToken = await issueSessionToken(c.env, userId);
+  return c.json({ sessionToken });
+});
+
+export default app;
+```
+
+この実装の急所は、**`apple_sub` を一意キーにして、`email` を任意項目にすること**です。Apple のプライベートリレーメール（`@privaterelay.appleid.com` で終わるアドレス）も、ユーザーが Apple ID 設定からいつでも遮断できるので、メール経由で連絡する設計にしている場合は別途「自前で確認したメール」を持つカラムを足してください。
+
+## Step 5: アカウント削除を実装する — 5.1.1(v) リジェクト対策
+
+ここがリジェクト経験者の多くが「最初から知っておきたかった」と口を揃えるポイントです。ガイドライン 5.1.1(v) は次の 2 つを要求します。
+
+- アプリ内から「アカウントを削除する」導線がある（設定画面のどこかから 2〜3 タップで到達できること）
+- 削除実行後は、ユーザーのデータがサーバーから削除される（または匿名化される）こと
+
+そして、Sign in with Apple を使っている場合は、**Apple に対しても「このアプリとの連携を解除して良い」と通知する**必要があります。これが `revoke_token` API です。これを呼ばないと、ユーザーの Apple ID 設定画面に「このアプリでサインインに使用中」という幽霊エントリが残り続け、レビュアーから次のような指摘が飛んできます。
+
+> *Your app does not adequately revoke the user's authentication credential when the account is deleted.*
+
+私はこのメッセージを 2 回受け取りました。実装は次の通りです。Apple が要求するのは Apple Developer ポータルで作った Service ID 用の `client_secret`（自分で署名する JWT）です。
+
+```ts
+// src/auth/apple-revoke.ts
+import { SignJWT, importPKCS8 } from "jose";
+
+type AppleClientSecretParams = {
+  teamId: string;        // Apple Developer の Team ID（10桁）
+  clientId: string;      // Bundle ID または Service ID
+  keyId: string;         // Sign in with Apple 用に作った p8 鍵の Key ID
+  privateKeyPkcs8: string; // p8 鍵の中身（PEM 形式）
+};
+
+async function buildAppleClientSecret(p: AppleClientSecretParams) {
+  const now = Math.floor(Date.now() / 1000);
+  const key = await importPKCS8(p.privateKeyPkcs8, "ES256");
+
+  return await new SignJWT({})
+    .setProtectedHeader({ alg: "ES256", kid: p.keyId })
+    .setIssuer(p.teamId)
+    .setIssuedAt(now)
+    .setExpirationTime(now + 60 * 5) // 最大 6 ヶ月だが短め推奨
+    .setAudience("https://appleid.apple.com")
+    .setSubject(p.clientId)
+    .sign(key);
+}
+
+export async function revokeAppleToken(p: {
+  refreshToken: string; // Apple から受け取った refresh_token
+  clientId: string;
+  clientSecret: string; // 上の buildAppleClientSecret の戻り値
+}): Promise<void> {
+  const body = new URLSearchParams({
+    client_id: p.clientId,
+    client_secret: p.clientSecret,
+    token: p.refreshToken,
+    token_type_hint: "refresh_token",
+  });
+
+  const res = await fetch("https://appleid.apple.com/auth/revoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Apple revoke failed: ${res.status} ${err}`);
+  }
+}
+```
+
+ここで気付くのは、**`revoke_token` 呼び出しには `refresh_token` が必要だ**ということです。Sign in with Apple の `refresh_token` は、初回ログイン時に `authorizationCode` を Apple の `/auth/token` エンドポイントと交換することで取得できます。つまり、ログイン時に「将来削除する権利」を確保しておかないと、削除のときになって取れません。
+
+```ts
+// 初回ログイン時に refresh_token を取得して DB に保存
+async function exchangeAuthCodeForRefreshToken(
+  authorizationCode: string,
+  clientId: string,
+  clientSecret: string
+): Promise<{ refreshToken: string }> {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    code: authorizationCode,
+    grant_type: "authorization_code",
+  });
+
+  const res = await fetch("https://appleid.apple.com/auth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) throw new Error(`Token exchange failed: ${await res.text()}`);
+  const json = (await res.json()) as { refresh_token: string };
+  return { refreshToken: json.refresh_token };
+}
+```
+
+そして削除エンドポイントは次のようにまとめます。
+
+```ts
+app.post("/account/delete", async (c) => {
+  const userId = c.get("userId"); // セッション認証ミドルウェアで設定済み
+
+  const row = await c.env.DB.prepare(
+    "SELECT apple_refresh_token FROM users WHERE id = ?1"
+  )
+    .bind(userId)
+    .first<{ apple_refresh_token: string | null }>();
+
+  // 1) Apple との連携解除を先にやる（失敗したらユーザーデータは消さない）
+  if (row?.apple_refresh_token) {
+    const clientSecret = await buildAppleClientSecret({
+      teamId: c.env.APPLE_TEAM_ID,
+      clientId: "com.dolice.myrorkapp",
+      keyId: c.env.APPLE_KEY_ID,
+      privateKeyPkcs8: c.env.APPLE_PRIVATE_KEY_P8,
+    });
+    await revokeAppleToken({
+      refreshToken: row.apple_refresh_token,
+      clientId: "com.dolice.myrorkapp",
+      clientSecret,
+    });
+  }
+
+  // 2) ユーザーデータ削除（外部キーは ON DELETE CASCADE 推奨）
+  await c.env.DB.prepare("DELETE FROM users WHERE id = ?1").bind(userId).run();
+
+  return c.json({ ok: true });
+});
+```
+
+順序が重要で、**Apple への revoke を先にやってからローカル DB を消します**。逆順だと、revoke に失敗したときにユーザーデータだけが消えて、Apple 側の連携が残った「最悪の片寄り状態」になります。
+
+## Step 6: 通常ログイン経路と Apple ログインを共存させる
+
+Sign in with Apple だけしか提供していないアプリは、現実にはほぼありません。メールアドレス + パスワードや Sign in with Google も提供している場合、「同じユーザーが両方の経路でログインしてきた」ケースをどう扱うかが設計の分かれ目になります。
+
+私の好みは「同一メールアドレスを持つアカウントは自動マージしない」設計です。理由は、Apple のプライベートリレーメールが `@privaterelay.appleid.com` 形式の別アドレスを返してくるため、同じユーザーでもメールが違うことが構造的に起こるからです。マージするなら、ユーザー本人に「これは私のアカウントです」と明示的に承認させる UI を作る方が安全です。
+
+実装としては、`users` テーブルとは別に `auth_providers` テーブルを切る形が扱いやすいです。
+
+- `auth_providers (user_id, provider, provider_user_id, refresh_token, created_at)`
+- 1 ユーザーに複数 provider をぶら下げられる
+- `provider_user_id` には Apple の `sub` や Google の `sub` が入る
+
+この構造だと、後で「Apple ログインから Google ログインに移行したい」「Sign in with Apple を解除して Google だけ残したい」といった要望にも素直に対応できます。
+
+## Step 7: テスト戦略 — Sandbox では再現しない地雷
+
+Sign in with Apple は、IAP の Sandbox とは別の意味で「本番でしか出ないバグ」がいくつかあります。私が踏んだ順に並べます。
+
+- **TestFlight では `isPrivateEmail` が常に `false` になることがある**: 実機の本番ビルドではプライベートリレーが返ってくるので、両方のメールフォーマットを処理できる実装にしておきます
+- **Apple ID にメールが複数登録されているユーザーで、選択結果が初回と 2 回目で異なることがある**: メールでユーザーを一意化する実装は破綻します。必ず `sub` で一意化してください
+- **「Apple ID から Sign in with Apple を一括解除」されると、`refresh_token` が突然無効になる**: これに備えて、refresh_token を使う処理は失敗を許容し、ユーザーに「再度 Apple でログインしてください」と促すフォールバックを用意します
+- **iCloud キーチェーンが空のテスト用 Apple ID では、`fullName` が空で返ってくる**: 「初回でも `fullName` が取れない」ケースが本番で起こり得るので、必須にしないでください
+
+これらは全部、私が本番で実際に踏んだものです。ローカルとシミュレーターだけのテストで「動いた」と判断するのは早いです。
+
+## Step 8: ガイドライン 4.8 への対応 — UI レベルの「同等性」
+
+最後に、純粋に技術ではなく UI の話を 1 つだけ。Apple は「同等の選択肢として提供」を要求しているので、Sign in with Apple のボタンは他の認証ボタンと **同じ目立ち方**で並べる必要があります。具体的には、
+
+- 同じサイズの領域を確保する
+- 同じくらいの優先度に見える位置に置く（一番下に小さく置くのは NG）
+- ボタンのラベルとして「Apple でサインイン」を必須で含める（自前テキストにするとリジェクト対象）
+
+UI ガイドライン違反は審査でかなり多く検出されます。Rork で画面を生成するときも、「他の認証ボタンと並べてください」を明示プロンプトに入れておくと、生成結果が一発で通る確率が上がります。
+
+## よくある間違い・落とし穴
+
+実装中に「あれ、ここで詰まる人多いだろうな」と感じたものを 5 つにまとめます。
+
+- **クライアントから受け取った `email` をそのまま信用する**: 検証していない `email` は偽装可能です。必ず ID トークンの payload から取り出すか、サーバー検証後に DB に書き込みます
+- **`nonce` をハッシュせずに渡してしまう**: `signInAsync` の `nonce` 引数は **hashed の方**を渡します。raw を渡しても見た目は動きますが、リプレイ防止が無効化されます
+- **`refresh_token` を保存し忘れる**: 初回の `authorizationCode` を /auth/token で交換して `refresh_token` を取得し、DB に暗号化して保存しないと、後でアカウント削除フローが完成しません
+- **`apple_sub` ではなく `email` でユーザーを引く**: プライベートリレーが切り替わる、メールアドレスが Apple ID 側で変更されるなどの理由で、`email` は永続キーになり得ません
+- **アカウント削除後に Apple へ revoke を呼ばない**: ガイドライン 5.1.1(v) と Apple 公式ガイドの両方で求められています。revoke 失敗時はユーザーに通知し、削除自体はリトライ可能にしておくのが安全です
+
+## まとめ — 次にやる 1 つのこと
+
+ここまで実装すれば、Sign in with Apple 起因のリジェクトはほぼ消えます。長くなりましたが、もし「今日のうちに 1 つだけ進めるなら」を選ぶなら、**先に「アカウント削除エンドポイント + Apple revoke の動作確認」**から手を付けることをおすすめします。理由はシンプルで、ここが一番リジェクトされやすく、かつテストもしにくい部分だからです。設計を後回しにすると、リリース直前に焦って組むことになります。
+
+ID トークン検証の細かい仕様や、JWT の検証ライブラリ選定を体系的に深めたい場合は、[実用 Go 言語](https://www.amazon.co.jp/dp/4297133520/?tag=pinocchio-22) のような実装系の書籍を 1 冊持っておくと、サーバー側の設計判断のベースラインが安定します。React Native 周りの認証 UX 全般を学び直したい方には、[詳解 TypeScript 第 2 版](https://www.amazon.co.jp/dp/4798179647/?tag=pinocchio-22) が前段の型設計を整理するのに役立ちました。
+
+関連する記事として、[Rork で作るパスワードレス認証 — Passkeys 実装ガイド](/articles/rork-dev/rork-passkeys-passwordless-authentication-guide) も併せて読むと、認証手段全体の選定軸が見えやすくなります。

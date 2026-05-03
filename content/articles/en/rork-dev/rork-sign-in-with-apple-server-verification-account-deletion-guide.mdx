@@ -1,0 +1,545 @@
+---
+title: "Sign in with Apple in Rork: Server-Side Verification, Account Linking, and the Mandatory Deletion Flow"
+slug: "rork-sign-in-with-apple-server-verification-account-deletion-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-03T11:30"
+updated: "2026-05-03T11:30"
+author: "Rork Lab"
+description: "Dropping a Sign in with Apple button into your Rork app and shipping it is the fastest path to a rejection. This guide walks through the full picture: nonce hashing, server-side ID token verification with Apple's JWKs, the mandatory account deletion flow, and the often-forgotten revoke_token call back to Apple."
+tags: ["Sign in with Apple", "Authentication", "JWT", "App Store Review", "Cloudflare Workers"]
+highlights:
+  - "Indie developers who got rejected for 'just dropping in a Sign in with Apple button' will leave with a production-grade implementation, including server-side ID token verification, in a single sitting"
+  - "You'll learn the implementation pressure points: fetching Apple's public keys to verify the JWT, passing the nonce as a hashed value while keeping the raw on the server, and surviving the trap that email is only returned on the very first sign-in"
+  - "You'll have a complete account deletion flow that satisfies App Store Guideline 5.1.1(v) end-to-end, including the revoke_token call to Apple, eliminating an entire class of rejection risk from your release pipeline"
+---
+
+"I added a Sign in with Apple button and shipped it — and got rejected." If you build with Rork as a solo developer, this story shows up surprisingly often. My very first app went through two rejections before finally clearing review on the third attempt. The reviewer's note was terse, and I had to reverse-engineer what was actually missing.
+
+This guide is the document I wish I had on attempt one. We'll build the full implementation that pairs cleanly with Rork's code generation: `expo-apple-authentication` on the client, plus a Cloudflare Workers backend doing the JWS verification, nonce check, and the account deletion flow (with the `revoke_token` call to Apple). We'll also touch on Guideline 4.8 — the rule that forces you to offer Sign in with Apple alongside any third-party social login.
+
+## Why a "button-only" implementation will never pass
+
+Sign in with Apple isn't just another OAuth provider. Apple's App Store Guidelines spell out exactly how it must be implemented in **4.8** and **5.1.1(v)**. Here are the specific traps that bit me:
+
+- **Guideline 4.8**: If your app uses a third-party authentication service (Google, Facebook, Twitter, etc.), you must also offer Sign in with Apple "as an equivalent option." "Equivalent" includes UI presentation. Tucking the Apple button in a smaller box at the bottom of the screen is grounds for rejection
+- **Guideline 5.1.1(v)**: Apps that allow account creation must let users delete their account from inside the app. This became fully mandatory in June 2022. Users must be able to reach the delete flow within 2–3 taps from somewhere in your settings
+- **The understated footnote in Apple's docs**: Once you obtain the `identityToken`, you are required to verify the JWS signature on the server using Apple's public keys. Trusting the `email` field returned to the client and writing it straight into your database is not a production implementation
+
+If you nail those three points, Sign in with Apple rejections essentially disappear. The rest of this article shows working code for each of them.
+
+## The full picture: four layers, each with a clear job
+
+Before writing any code, get the layer model in your head. Without this mental map, debugging becomes "something is broken somewhere," which is the worst place to start.
+
+- **Layer 1 — User interaction (the React Native screen Rork generates for you)**: Renders the Sign in with Apple button, calls `AppleAuthentication.signInAsync()`, and receives back the `identityToken` and `authorizationCode`
+- **Layer 2 — Client preprocessing**: Generates a nonce, hashes it with SHA-256, and passes the **hashed** value into the sign-in call. Never trusts what the user-side claims; always forwards the data to the server for verification
+- **Layer 3 — Server verification (Cloudflare Workers + Hono)**: Pulls Apple's public keys from the JWKs endpoint, verifies the JWT signature, checks `aud`/`iss`/`nonce`/expiry/`sub`, and only then issues your own session token
+- **Layer 4 — Deletion flow**: When the user taps "Delete account" inside the app, you not only purge their data from your DB; you also call Apple's `revoke_token` endpoint to tear down the auth association. Skip this and a ghost entry sits forever under "Settings → Apple ID → Apps Using Your Apple ID"
+
+We'll implement these in order. The server examples use Cloudflare Workers, but the same shape works on Vercel Edge Functions or AWS Lambda.
+
+## Step 1: Add the Sign in with Apple button in Rork
+
+Drop this prompt into Rork's chat to get a working baseline:
+
+> "Add a Sign in with Apple button using `expo-apple-authentication` on the login screen. When tapped, generate a nonce, hash it with SHA-256, and POST the `identityToken`, `authorizationCode`, and the raw nonce to `/auth/apple` on the server. Save the session token returned by the server into `expo-secure-store`."
+
+The generated code is mostly correct, but you'll need to tighten the nonce handling and error states by hand. Here's what runs in production for me:
+
+```tsx
+// app/(auth)/sign-in-apple.tsx
+import * as AppleAuthentication from "expo-apple-authentication";
+import * as Crypto from "expo-crypto";
+import * as SecureStore from "expo-secure-store";
+import { Alert, Platform } from "react-native";
+import { useState } from "react";
+import { useRouter } from "expo-router";
+
+const API_BASE = process.env.EXPO_PUBLIC_API_BASE!;
+
+// Apple's recommended nonce flow: 32 random bytes → base64 → SHA-256
+async function generateNonce(): Promise<{ raw: string; hashed: string }> {
+  const bytes = await Crypto.getRandomBytesAsync(32);
+  const raw = btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const hashed = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    raw,
+    { encoding: Crypto.CryptoEncoding.HEX }
+  );
+  return { raw, hashed };
+}
+
+export function AppleSignInButton() {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+
+  const handlePress = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { raw, hashed } = await generateNonce();
+
+      const credential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+        ],
+        nonce: hashed, // Note: the HASHED value goes here
+      });
+
+      // The server will hash the raw nonce and compare it against the token's nonce
+      const res = await fetch(`${API_BASE}/auth/apple`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          identityToken: credential.identityToken,
+          authorizationCode: credential.authorizationCode,
+          rawNonce: raw,
+          // fullName/email are only populated on the very first sign-in
+          fullName: credential.fullName,
+          email: credential.email,
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Server verification failed: ${err}`);
+      }
+
+      const { sessionToken } = (await res.json()) as { sessionToken: string };
+      await SecureStore.setItemAsync("session_token", sessionToken);
+      router.replace("/(app)/home");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      // User-cancelled is a normal outcome; don't surface an alert
+      if (!msg.includes("ERR_REQUEST_CANCELED")) {
+        Alert.alert("Sign in failed", msg);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (Platform.OS !== "ios") return null;
+
+  return (
+    <AppleAuthentication.AppleAuthenticationButton
+      buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+      buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+      cornerRadius={8}
+      style={{ width: "100%", height: 50 }}
+      onPress={handlePress}
+    />
+  );
+}
+```
+
+The asymmetry to internalize: **the `nonce` argument receives the hashed value; the raw value is what you send to your server**. Apple embeds the hashed value inside `identityToken`, and your server re-hashes the raw to compare. If you pass the raw value into `signInAsync`, the replay protection collapses even though the flow appears to "work" in development.
+
+## Step 2: Why the nonce really matters — concretely
+
+If you treat nonce as "something you sprinkle in for security," you'll cut a corner somewhere and break the protection without realizing it. Let's walk through the attack the nonce defends against.
+
+Suppose an attacker manages to capture another user's `identityToken` once — maybe through a misconfigured proxy in their dev environment, or a JWT leaked in debug logs that got committed. In a world without nonce verification, the attacker simply replays that token to your `/auth/apple` endpoint and is authenticated as the victim.
+
+With a nonce, the server demands that the **raw nonce it issued for this specific session** matches the **hashed nonce baked into the ID token**. The attacker doesn't know the raw value, so the replay fails.
+
+Two implementation rules follow from this:
+
+- The nonce **must be freshly generated per session**
+- The nonce **must be single-use on the server** — once verified, throw it away
+
+Cloudflare KV or Redis with a short TTL (5 minutes) is the practical choice. Issue, verify, delete.
+
+## Step 3: Verify the ID token correctly on the server
+
+Here's the heart of the article. The stack: Cloudflare Workers + [Hono](https://hono.dev/) + [`jose`](https://github.com/panva/jose). Hono fits Workers nicely, and the middleware story is clean.
+
+```ts
+// src/auth/verify-apple.ts
+import { jwtVerify, createRemoteJWKSet } from "jose";
+
+const APPLE_ISSUER = "https://appleid.apple.com";
+const APPLE_JWKS = createRemoteJWKSet(
+  new URL("https://appleid.apple.com/auth/keys")
+);
+
+export type VerifiedAppleIdentity = {
+  sub: string; // Apple's stable per-app user ID
+  email?: string;
+  emailVerified?: boolean;
+  isPrivateEmail?: boolean;
+};
+
+export async function verifyAppleIdentityToken(params: {
+  identityToken: string;
+  expectedAudience: string; // Bundle ID or Service ID from Apple Developer
+  rawNonce: string;
+}): Promise<VerifiedAppleIdentity> {
+  const { identityToken, expectedAudience, rawNonce } = params;
+
+  // 1) JWS signature + iss / aud / exp checks
+  const { payload } = await jwtVerify(identityToken, APPLE_JWKS, {
+    issuer: APPLE_ISSUER,
+    audience: expectedAudience,
+  });
+
+  // 2) Nonce check — Apple returns the hashed nonce
+  const expectedHashedNonce = await sha256Hex(rawNonce);
+  if (payload.nonce !== expectedHashedNonce) {
+    throw new Error("Nonce mismatch — possible replay attack");
+  }
+
+  // 3) Sanity-check sub
+  if (typeof payload.sub !== "string" || payload.sub.length === 0) {
+    throw new Error("Missing sub claim in Apple ID token");
+  }
+
+  return {
+    sub: payload.sub,
+    email: typeof payload.email === "string" ? payload.email : undefined,
+    emailVerified: payload.email_verified === true || payload.email_verified === "true",
+    isPrivateEmail:
+      payload.is_private_email === true || payload.is_private_email === "true",
+  };
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+```
+
+Worth highlighting: **how to handle `expectedAudience`**. When Sign in with Apple is invoked from the iOS native app, `aud` contains your **Bundle ID** (e.g. `com.dolice.myrorkapp`). When it's invoked from a web flow, `aud` contains the **Service ID** (e.g. `com.dolice.myrorkapp.web`). If you ever plan to support web sign-in later, accept both up front:
+
+```ts
+const ACCEPTED_AUDIENCES = [
+  "com.dolice.myrorkapp",      // iOS app
+  "com.dolice.myrorkapp.web",  // Web (Service ID)
+];
+
+const { payload } = await jwtVerify(identityToken, APPLE_JWKS, {
+  issuer: APPLE_ISSUER,
+  audience: ACCEPTED_AUDIENCES,
+});
+```
+
+Hardcoding only the Bundle ID is a one-liner now and a multi-hour debugging session the day you add web sign-in.
+
+## Step 4: User creation and the "email shows up only once" trap
+
+The most painful quirk of Sign in with Apple: **`email` and `fullName` are only returned on the very first sign-in**. On subsequent sign-ins, Apple returns empty values for both — that's by design, because Apple's server flips an "already-shown" flag for that user/app pair.
+
+In other words: **if you fail to persist `email` on first sign-in, you will never see it again**. Rork's first-cut code tends to miss this. The server-side handling should look like this:
+
+```ts
+// src/routes/auth-apple.ts
+import { Hono } from "hono";
+import { verifyAppleIdentityToken } from "../auth/verify-apple";
+import { issueSessionToken } from "../auth/session";
+
+const app = new Hono<{ Bindings: { DB: D1Database; KV: KVNamespace } }>();
+
+app.post("/auth/apple", async (c) => {
+  const body = await c.req.json<{
+    identityToken: string;
+    authorizationCode: string;
+    rawNonce: string;
+    fullName?: { givenName?: string | null; familyName?: string | null } | null;
+    email?: string | null;
+  }>();
+
+  // 1) Confirm the nonce was actually issued for this session
+  const nonceKey = `apple:nonce:${body.rawNonce}`;
+  const issued = await c.env.KV.get(nonceKey);
+  if (!issued) {
+    return c.json({ error: "Nonce expired or unknown" }, 401);
+  }
+  await c.env.KV.delete(nonceKey); // Single-use
+
+  // 2) Verify the ID token
+  const identity = await verifyAppleIdentityToken({
+    identityToken: body.identityToken,
+    expectedAudience: "com.dolice.myrorkapp",
+    rawNonce: body.rawNonce,
+  });
+
+  // 3) Look up an existing user by Apple sub
+  const existing = await c.env.DB.prepare(
+    "SELECT id, email FROM users WHERE apple_sub = ?1"
+  )
+    .bind(identity.sub)
+    .first<{ id: string; email: string | null }>();
+
+  let userId: string;
+
+  if (existing) {
+    userId = existing.id;
+    // Backfill email if we missed it on first sign-in but it shows up now
+    if (!existing.email && body.email) {
+      await c.env.DB.prepare("UPDATE users SET email = ?1 WHERE id = ?2")
+        .bind(body.email, userId)
+        .run();
+    }
+  } else {
+    // 4) Create a new user — must tolerate missing email
+    userId = crypto.randomUUID();
+    const displayName = [
+      body.fullName?.givenName ?? "",
+      body.fullName?.familyName ?? "",
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    await c.env.DB.prepare(
+      `INSERT INTO users (id, apple_sub, email, display_name, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5)`
+    )
+      .bind(
+        userId,
+        identity.sub,
+        body.email ?? identity.email ?? null,
+        displayName || "Unnamed",
+        new Date().toISOString()
+      )
+      .run();
+  }
+
+  const sessionToken = await issueSessionToken(c.env, userId);
+  return c.json({ sessionToken });
+});
+
+export default app;
+```
+
+The key shape: **`apple_sub` is the unique identity key; `email` is optional**. Apple's private relay addresses (those ending in `@privaterelay.appleid.com`) can also be revoked by the user from Settings at any time, so if you rely on email for transactional communication, plan to collect a separately-verified email after sign-in.
+
+## Step 5: Implement account deletion — survive 5.1.1(v)
+
+This is the section where rejection survivors universally say "I wish I'd known earlier." Guideline 5.1.1(v) requires two things:
+
+- An in-app path to "Delete account," reachable in 2–3 taps from somewhere in your settings
+- After deletion, the user's data is removed from your servers (or anonymized)
+
+If you're using Sign in with Apple, you also have to **notify Apple to revoke the auth association**. That's the `revoke_token` API. Skip it and the user keeps a ghost entry under "Settings → Apple ID → Apps Using Your Apple ID," and the reviewer leaves you something like:
+
+> *Your app does not adequately revoke the user's authentication credential when the account is deleted.*
+
+I've received this exact note twice. Here's the implementation. Apple wants a `client_secret` JWT signed by the p8 key you generated for Sign in with Apple in the Apple Developer portal:
+
+```ts
+// src/auth/apple-revoke.ts
+import { SignJWT, importPKCS8 } from "jose";
+
+type AppleClientSecretParams = {
+  teamId: string;        // 10-digit Team ID from Apple Developer
+  clientId: string;      // Bundle ID or Service ID
+  keyId: string;         // Key ID for the p8 you minted for Sign in with Apple
+  privateKeyPkcs8: string; // The PEM contents of the p8 key
+};
+
+async function buildAppleClientSecret(p: AppleClientSecretParams) {
+  const now = Math.floor(Date.now() / 1000);
+  const key = await importPKCS8(p.privateKeyPkcs8, "ES256");
+
+  return await new SignJWT({})
+    .setProtectedHeader({ alg: "ES256", kid: p.keyId })
+    .setIssuer(p.teamId)
+    .setIssuedAt(now)
+    .setExpirationTime(now + 60 * 5) // Apple allows up to 6 months; keep it short
+    .setAudience("https://appleid.apple.com")
+    .setSubject(p.clientId)
+    .sign(key);
+}
+
+export async function revokeAppleToken(p: {
+  refreshToken: string; // The refresh_token you obtained from Apple
+  clientId: string;
+  clientSecret: string; // Result of buildAppleClientSecret
+}): Promise<void> {
+  const body = new URLSearchParams({
+    client_id: p.clientId,
+    client_secret: p.clientSecret,
+    token: p.refreshToken,
+    token_type_hint: "refresh_token",
+  });
+
+  const res = await fetch("https://appleid.apple.com/auth/revoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Apple revoke failed: ${res.status} ${err}`);
+  }
+}
+```
+
+Notice: **`revoke_token` requires a `refresh_token`**. Sign in with Apple gives you the refresh token only when you exchange the `authorizationCode` for tokens via Apple's `/auth/token` endpoint. That means if you don't grab and persist the refresh token at sign-in time, you literally cannot honor a delete request later.
+
+```ts
+// On first sign-in, exchange the auth code for a refresh_token and store it
+async function exchangeAuthCodeForRefreshToken(
+  authorizationCode: string,
+  clientId: string,
+  clientSecret: string
+): Promise<{ refreshToken: string }> {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    code: authorizationCode,
+    grant_type: "authorization_code",
+  });
+
+  const res = await fetch("https://appleid.apple.com/auth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) throw new Error(`Token exchange failed: ${await res.text()}`);
+  const json = (await res.json()) as { refresh_token: string };
+  return { refreshToken: json.refresh_token };
+}
+```
+
+The delete endpoint pulls it all together:
+
+```ts
+app.post("/account/delete", async (c) => {
+  const userId = c.get("userId"); // Set by your session middleware
+
+  const row = await c.env.DB.prepare(
+    "SELECT apple_refresh_token FROM users WHERE id = ?1"
+  )
+    .bind(userId)
+    .first<{ apple_refresh_token: string | null }>();
+
+  // 1) Revoke with Apple FIRST — if this fails, do not delete user data
+  if (row?.apple_refresh_token) {
+    const clientSecret = await buildAppleClientSecret({
+      teamId: c.env.APPLE_TEAM_ID,
+      clientId: "com.dolice.myrorkapp",
+      keyId: c.env.APPLE_KEY_ID,
+      privateKeyPkcs8: c.env.APPLE_PRIVATE_KEY_P8,
+    });
+    await revokeAppleToken({
+      refreshToken: row.apple_refresh_token,
+      clientId: "com.dolice.myrorkapp",
+      clientSecret,
+    });
+  }
+
+  // 2) Then delete user data (use ON DELETE CASCADE on related tables)
+  await c.env.DB.prepare("DELETE FROM users WHERE id = ?1").bind(userId).run();
+
+  return c.json({ ok: true });
+});
+```
+
+The order matters: **revoke first, delete second**. The reverse order leaves you in the worst possible inconsistent state — local data is gone, but Apple still thinks the association exists.
+
+## Step 6: Coexisting with email and other social logins
+
+Almost no app ships with Sign in with Apple as the only option. If you also have email/password or Sign in with Google, you'll need a clear policy for "the same person signed in through both paths." This is the design fork.
+
+My preferred policy: **don't auto-merge accounts by email**. Reason: Apple's private relay addresses can change, and the same person may legitimately have two different email values across providers. If you do want to merge, build an explicit "Yes, this is also my account" confirmation UI rather than silently joining records.
+
+Practically, separate the tables:
+
+- `auth_providers (user_id, provider, provider_user_id, refresh_token, created_at)`
+- One user can have many providers attached
+- `provider_user_id` stores Apple's `sub`, Google's `sub`, etc.
+
+This shape gracefully handles future requests like "let me detach Apple and use Google only" without schema gymnastics.
+
+## Step 6.5: Observability — what to log when sign-in fails in production
+
+Authentication flows are uniquely painful to debug after the fact. The user reports "I can't sign in," your logs say nothing, and you have no way to reproduce because Apple deduplicates session attempts. The fix is to add structured logging at three specific points before you ship.
+
+```ts
+// src/auth/observability.ts
+type AppleAuthEvent =
+  | { stage: "nonce_check"; outcome: "ok" | "expired" | "missing"; nonceHash: string }
+  | { stage: "jwt_verify"; outcome: "ok" | "bad_signature" | "wrong_audience" | "expired"; aud?: string }
+  | { stage: "user_resolve"; outcome: "existing" | "new" | "linked"; sub: string };
+
+export function logAppleAuth(event: AppleAuthEvent, env: { LOG_SINK: Queue }) {
+  // Avoid logging the raw nonce or full identity token; keep only the shape
+  env.LOG_SINK.send({
+    ts: new Date().toISOString(),
+    flow: "apple_auth",
+    ...event,
+  });
+}
+```
+
+The deliberate choices here: log only the **shape** of failures (which stage, which outcome), never the full identity token or raw nonce. That gives you enough signal to triage a "I can't sign in" report ("we see a `bad_signature` event from your device at 14:23") without putting credentials into your log retention. Pair this with an alert on `bad_signature` exceeding 1% of total verification attempts and you'll notice when Apple rotates a key but a stale JWKs cache lingers in your Worker.
+
+While you're at it, consider keeping a small ring buffer of the last N failures per `apple_sub` in KV. When a user pings support saying "I can't sign in," reading their last few failure stages directly is far faster than asking them to reproduce.
+
+## Step 7: Testing strategy — landmines that don't surface in Sandbox
+
+Sign in with Apple has a separate-but-similar set of "only happens in production" bugs from IAP. Here are the ones I've personally hit:
+
+- **`isPrivateEmail` may always be `false` in TestFlight builds** — but production builds can return a real private relay address. Build to handle both
+- **Users with multiple Apple ID emails can return different selections across sign-ins** — anchoring identity on email will silently break. Always anchor on `sub`
+- **A user revoking your app from Settings invalidates the `refresh_token` immediately** — design your flows to gracefully fail and prompt the user to sign in again
+- **Test Apple IDs with empty iCloud Keychains return empty `fullName`** — even on first sign-in. Don't make `fullName` a required field
+- **Apple's JWKs endpoint can return new keys at any time** — your `createRemoteJWKSet` call caches them, but if the cache TTL is too long, you'll see `bad_signature` errors after a key rotation until the cache expires. The default jose behavior is reasonable for most apps, but worth being aware of when you alert on signature failures
+- **The Apple Developer portal lets you generate a p8 key with two purposes** — make sure you select **Sign in with Apple** and not **APNs** when minting the key for revoke. Using the wrong key produces a confusing `invalid_client` error from `/auth/revoke`
+
+All of these came from production, not from local testing. "It worked in the simulator" is an early signal, not a finish line.
+
+A practical test plan I run before submitting any release that touches auth code:
+
+- Sign in fresh with a never-before-seen Apple ID (private relay enabled) → verify user is created with no email
+- Sign out of the app, sign back in with the same Apple ID → verify user is re-resolved by `sub`, no duplicate created
+- Trigger account deletion → confirm the user disappears from your DB, and from "Settings → Apple ID → Apps Using Your Apple ID" on the device
+- Sign back in after deletion with the same Apple ID → verify a fresh user record is created (Apple does not re-issue the previous `sub`)
+- Sign in once on iOS, then attempt to sign in on web (if you support web) → verify the multi-audience handling works
+
+These five scenarios cover roughly 95% of the edge cases that show up in real users.
+
+## Step 8: Guideline 4.8 — UI-level "equivalence"
+
+One non-technical note. Apple requires Sign in with Apple to be offered "as an equivalent option." In practice that means the button must be presented with **the same visual prominence as your other social buttons**:
+
+- Equal-sized container
+- Comparable position (not relegated to a small spot at the bottom)
+- The label must include "Sign in with Apple" — replacing it with custom text is a rejection trigger
+- The button must use the official `AppleAuthenticationButton` component (or its iOS-native equivalent) — rolling your own visual that mimics the official button has been flagged in past reviews
+
+UI guideline violations are a meaningful share of rejections. When you ask Rork to generate the screen, include "place it next to the other social login buttons, all with the same height" in your prompt — generated screens that follow the rule pass review on the first try far more often.
+
+A subtle case: if your app uses **only** email/password, Sign in with Apple is **not** required by Guideline 4.8. The trigger is the presence of a third-party social provider. So if you launch with Apple + email/password and add Google later, you'll need to revisit the login screen layout to keep all three on equal footing visually. It's the kind of thing that's easy to forget six months after launch.
+
+## Common mistakes and pitfalls
+
+The five most common patterns where I've watched implementations break:
+
+- **Trusting the client-side `email` directly** — unverified email is forgeable. Always extract it from the verified token payload, or write it to your DB only after server verification
+- **Passing the un-hashed nonce to `signInAsync`** — the `nonce` argument expects the **hashed** value. The flow appears to work with the raw value, but replay protection is silently disabled
+- **Forgetting to persist the `refresh_token`** — without it, the deletion flow can never call `revoke_token`. Encrypt and store it during the initial auth code exchange
+- **Looking up users by `email` instead of `apple_sub`** — private relay addresses can change, and Apple ID email itself can change. `email` is not a stable primary key
+- **Skipping the revoke call after deletion** — both Guideline 5.1.1(v) and Apple's documentation require it. If revoke fails, retry; do not silently drop the deletion
+
+## Wrap up — the one thing to do today
+
+Implement everything above and Sign in with Apple rejections largely disappear from your release pipeline. If you can only do one thing today, **start with the delete endpoint and the Apple revoke call**. Reasoning: it's the most rejected and the hardest to test, so it's the worst thing to leave for the night before submission. Build it once, write a regression test that hits the staging endpoint with a real refresh token, and you've eliminated a recurring source of stress for the lifetime of the app.
+
+A practical sequencing for the rest of the work: get the delete + revoke flow green first, then layer on the JWS verification, then finally polish the client-side UI. Counterintuitively, the client UI is the easiest to fix in a follow-up release; the server logic is the part that's hardest to retrofit safely after you have real users.
+
+For the deeper context on JWT verification and cryptographic library choices, a solid implementation-focused book on TypeScript or your server language (such as [TypeScript in 50 Lessons](https://www.amazon.co.jp/dp/3945749603/?tag=pinocchio-22)) helps stabilize the design baseline you bring to authentication code. If you want a broader treatment of mobile auth UX, [iOS App Distribution and Best Practices](https://www.amazon.co.jp/dp/1484292588/?tag=pinocchio-22) is a thoughtful companion that covers more than just the auth flow.
+
+For an adjacent topic — passwordless flows — see [Building Passwordless Auth in Rork with Passkeys](/articles/rork-dev/rork-passkeys-passwordless-authentication-guide) so you can compare both options before deciding which to ship first.
