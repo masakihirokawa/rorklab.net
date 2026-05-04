@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK15M — Rork が 1,500 万ドルのシード調達、Left Lane Capital・a16z Speedrun ら参加（4/9）",
-    "RORKMAX — Rork Max が Claude Code + Opus 4.6 搭載で公開、2週間で年間収益2倍を達成",
-    "PAPERLINE — Rork が App Builder の Paperline を買収、機能統合で開発体験を強化",
-    "SWIFT — Rork Max が Web 上初の Swift アプリビルダーに、Xcode なしで iOS アプリを生成",
-    "LOVABLE — Lovable も iOS/Android アプリをリリース、音声・テキストで vibe コーディング（4/28）",
-    "NOCODE75 — Gartner 予測：2026 年末までに新規アプリの 75% がローコード・ノーコードで開発",
+    "APPBOOM — 2026年4月のアプリリリース数が前年比104%増、AI アプリビルダーが市場拡大を牽引",
+    "APPLEREJECT — Apple が Replit・Vibecode 等をブロック、React Native 基盤の Rork は審査に適合",
+    "RORK15M — Rork が 1,500 万ドルのシード調達、月間 74 万訪問・成長率 85% で首位（4/9）",
+    "RORKMAX — Rork Max が Web 初の Swift アプリビルダー、2 週間で年間収益 2 倍を達成",
+    "PAPERLINE — Rork が App Builder の Paperline を買収、さらなる買収も積極的に検討中",
+    "WRESTLEAI — 18 歳の大学生が Rork で WrestleAI を構築、月収 3 万ドル超を達成",
   ],
   en: [
-    "RORK15M — Rork raises $15M seed from Left Lane Capital, a16z Speedrun & more (4/9)",
-    "RORKMAX — Rork Max powered by Claude Code + Opus 4.6 doubles annual revenue in 2 weeks",
-    "PAPERLINE — Rork acquires app builder Paperline to strengthen its development experience",
-    "SWIFT — Rork Max becomes the first web-based Swift app builder, generating iOS apps without Xcode",
-    "LOVABLE — Lovable launches iOS & Android vibe-coding app for mobile-first development (4/28)",
-    "NOCODE75 — Gartner: 75% of new apps built with low-code/no-code tools by end of 2026",
+    "APPBOOM — App releases up 104% YoY in April 2026 — AI builders like Rork are fueling the surge",
+    "APPLEREJECT — Apple blocks Replit & Vibecode; Rork's React Native base stays compliant with App Store rules",
+    "RORK15M — Rork raises $15M seed, hits 743K monthly visits with 85% growth rate (4/9)",
+    "RORKMAX — Rork Max: the web's first Swift app builder, doubling annual revenue in just 2 weeks",
+    "PAPERLINE — Rork acquires app builder Paperline and stays actively acquisitive for engineering talent",
+    "WRESTLEAI — An 18-year-old student built WrestleAI with Rork and earns over $30K/month",
   ],
 };
 
