@@ -1,0 +1,446 @@
+---
+title: "Complete Guide to Production Edge AI in Rork Apps — Ollama Streaming, Conversation History, and Cost Architecture"
+slug: "rork-offline-ai-app-complete-implementation-premium"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-06T10:45"
+author: "Rork Lab"
+description: "A complete production guide to integrating Ollama-powered local LLMs into Rork apps. Covers token streaming, SQLite conversation history, cloud fallback routing, and sustainable monetization for indie developers."
+tags: ["Rork", "Ollama", "Edge AI", "Local LLM", "React Native", "Gemma", "Offline AI", "Indie Dev"]
+highlights:
+  - "Indie developers struggling with API costs will gain a concrete architecture and working code to reduce monthly API bills to near zero using Ollama-powered edge inference"
+  - "Master three production-essential patterns — token streaming, SQLite conversation history with context management, and cloud fallback routing — with ready-to-run code"
+  - "Understand how to design a sustainable monetization model for AI-powered indie apps by converting variable API costs into predictable fixed infrastructure costs"
+---
+
+In the companion article, we covered the basics of connecting a Rork-generated React Native app to a local Ollama server over WiFi and running simple text generation. "It works — but is it production-ready?" That was exactly my feeling when I built the first prototype.
+
+This article bridges that gap. We'll cover streaming responses for fluid chat UX, managing conversation history in SQLite so the model retains context, routing between local and cloud APIs, and how these pieces combine to support a monetization model that actually scales for indie developers.
+
+## Why Local LLMs Matter for Indie App Developers
+
+Before diving into code, I want to share a bit of context that shaped my thinking here.
+
+I run three AI-powered apps as a solo developer. When I started with OpenAI's API, costs were fine at low usage. But when daily active users crossed 1,000, the monthly bill started climbing — and the trajectory was uncomfortable. Revenue wasn't keeping pace with cost growth. The fundamental problem: every extra user meant extra variable cost.
+
+Ollama + local models changes that equation. Running Gemma 4's 7B model on a small VPS costs around $5–10/month flat. OpenAI GPT-4o charges per million tokens. Once you have meaningful user volume, the difference is enormous.
+
+There are trade-offs, of course: no real-time knowledge cutoff, slower inference than cloud APIs, and smaller models have lower reasoning ceiling. But for typical indie app use cases — chat assistance, text summarization, creative prompts — Gemma 4's 7B model is genuinely good enough. The economics are simply too compelling to ignore.
+
+## Architecture Overview
+
+Here's the layered architecture we'll build:
+
+```
+[Rork App (React Native)]
+  ↓ HTTP streaming
+[EdgeAI Gateway (FastAPI)]
+  ├── Primary: Ollama (Gemma 4 7B) on VPS
+  └── Fallback: OpenAI / Gemini API
+  
+[Data Layer]
+  ├── SQLite: conversation history + context window management
+  └── AsyncStorage: user settings, model preferences
+```
+
+Build the local path first, add fallback later. Starting with both paths wired in from day one makes debugging needlessly complex.
+
+### Model Routing by Task
+
+```python
+# gateway: model routing by task type
+MODEL_ROUTING = {
+    "chat":     "gemma4:7b",   # general conversation — balanced
+    "summary":  "gemma4:4b",   # summarization — optimized for speed
+    "analysis": "gemma4:12b",  # detailed analysis — quality priority
+}
+
+def select_model(task_type: str, context_length: int) -> str:
+    base_model = MODEL_ROUTING.get(task_type, "gemma4:7b")
+    # Downgrade if context is long — prevents OOM on smaller VPS
+    if context_length > 4000 and base_model == "gemma4:12b":
+        return "gemma4:7b"
+    return base_model
+```
+
+## Token Streaming Implementation
+
+The introductory article used a simple POST to `/api/generate`. Real chat UIs require streaming — the response flowing in word by word as the model produces it. Ollama's `/api/chat` endpoint supports `stream: true`, and React Native's Fetch API handles it directly.
+
+```javascript
+// hooks/useOllamaStream.js
+import { useState, useCallback, useRef } from 'react';
+
+const OLLAMA_HOST = __DEV__
+  ? 'http://192.168.1.100:11434'        // dev: direct local IP
+  : 'https://your-ollama-gateway.com';  // prod: VPS gateway
+
+export function useOllamaStream() {
+  const [streamingText, setStreamingText] = useState('');
+  const [isStreaming, setIsStreaming] = useState(false);
+  const abortControllerRef = useRef(null);
+
+  const streamChat = useCallback(async (messages, onComplete) => {
+    abortControllerRef.current = new AbortController();
+    setIsStreaming(true);
+    setStreamingText('');
+
+    let fullText = '';
+
+    try {
+      const response = await fetch(`${OLLAMA_HOST}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gemma4:7b',
+          messages,
+          stream: true,
+          options: { temperature: 0.7, top_p: 0.9, num_predict: 1024 },
+        }),
+        signal: abortControllerRef.current.signal,
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      // Parse NDJSON (newline-delimited JSON) stream
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (parsed.message?.content) {
+              fullText += parsed.message.content;
+              setStreamingText(fullText);
+            }
+            if (parsed.done) { onComplete?.(fullText); return; }
+          } catch { /* ignore malformed JSON chunks */ }
+        }
+      }
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        onComplete?.(fullText); // user cancel — treat as normal completion
+      } else {
+        throw error;
+      }
+    } finally {
+      setIsStreaming(false);
+    }
+  }, []);
+
+  const cancelStream = useCallback(() => {
+    abortControllerRef.current?.abort();
+  }, []);
+
+  return { streamingText, isStreaming, streamChat, cancelStream };
+}
+```
+
+The `cancelStream` function lets you build a stop-generation button — a small UX detail that users strongly appreciate in long responses.
+
+## SQLite Conversation History Management
+
+Moving beyond single-turn Q&A requires persisting conversation history and feeding it back to the model as context. Expo SQLite gives us a local persistent store that works fully offline.
+
+```javascript
+// services/ConversationDB.js
+import * as SQLite from 'expo-sqlite';
+
+class ConversationDB {
+  async init() {
+    this.db = await SQLite.openDatabaseAsync('conversations.db');
+    await this.db.execAsync(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        model TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT,
+        role TEXT CHECK(role IN ('user', 'assistant', 'system')),
+        content TEXT,
+        token_count INTEGER DEFAULT 0,
+        created_at INTEGER,
+        FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_messages_conv
+        ON messages(conversation_id, created_at);
+    `);
+  }
+
+  async createConversation(model = 'gemma4:7b') {
+    const id = `conv_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const now = Date.now();
+    await this.db.runAsync(
+      'INSERT INTO conversations VALUES (?, ?, ?, ?, ?)',
+      [id, 'New conversation', model, now, now]
+    );
+    return id;
+  }
+
+  async addMessage(conversationId, role, content, tokenCount = 0) {
+    const id = `msg_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await this.db.runAsync(
+      'INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)',
+      [id, conversationId, role, content, tokenCount, Date.now()]
+    );
+
+    // Auto-generate conversation title from first user message
+    if (role === 'user') {
+      const { cnt } = await this.db.getFirstAsync(
+        'SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ? AND role = "user"',
+        [conversationId]
+      );
+      if (cnt === 1) {
+        const title = content.length > 40 ? content.slice(0, 40) + '…' : content;
+        await this.db.runAsync(
+          'UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?',
+          [title, Date.now(), conversationId]
+        );
+      }
+    }
+  }
+
+  /**
+   * Returns messages that fit within the context window.
+   * Trims oldest messages first when token budget is exceeded.
+   */
+  async getMessagesForContext(conversationId, maxTokens = 3000) {
+    const messages = await this.db.getAllAsync(
+      `SELECT role, content, token_count FROM messages
+       WHERE conversation_id = ?
+       ORDER BY created_at DESC LIMIT 50`,
+      [conversationId]
+    );
+
+    let totalTokens = 0;
+    const context = [];
+
+    for (const msg of messages) {
+      // Rough estimate: ~3.5 chars per token for English
+      const estimated = msg.token_count || Math.ceil(msg.content.length / 3.5);
+      if (totalTokens + estimated > maxTokens) break;
+      totalTokens += estimated;
+      context.unshift({ role: msg.role, content: msg.content });
+    }
+
+    return context;
+  }
+}
+
+export const conversationDB = new ConversationDB();
+```
+
+The `getMessagesForContext` method is the key piece here. Instead of blindly passing all messages and hoping the model handles overflow, it proactively trims old messages while staying under the token budget. This prevents garbled responses that occur when you push past the model's context window.
+
+## Cloud Fallback Routing
+
+Users will sometimes be away from WiFi, on cellular with port restrictions, or accessing the app from somewhere the local server isn't reachable. A graceful fallback to a cloud API keeps the experience intact — but we want to be deliberate about when it fires, because it costs money.
+
+```javascript
+// services/AIRouter.js
+const LOCAL_TIMEOUT_MS = 3000;
+
+async function checkLocalAvailability(host) {
+  try {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), LOCAL_TIMEOUT_MS);
+    const res = await fetch(`${host}/api/version`, {
+      signal: controller.signal,
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+export class AIRouter {
+  constructor({ localHost, cloudApiKey, onRouteChange }) {
+    this.localHost = localHost;
+    this.cloudApiKey = cloudApiKey;
+    this.onRouteChange = onRouteChange;
+    this.currentRoute = 'unknown';
+    this.lastChecked = 0;
+    this.CHECK_INTERVAL_MS = 30_000;
+  }
+
+  async resolveRoute() {
+    const now = Date.now();
+    // Cache the check result for 30 seconds to avoid hammering the server
+    if (now - this.lastChecked < this.CHECK_INTERVAL_MS) {
+      return this.currentRoute;
+    }
+    this.lastChecked = now;
+    const available = await checkLocalAvailability(this.localHost);
+    const route = available ? 'local' : 'cloud';
+    if (route !== this.currentRoute) {
+      this.currentRoute = route;
+      this.onRouteChange?.(route);
+    }
+    return route;
+  }
+
+  async chatCloud(messages) {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.cloudApiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini', // cheapest capable model for fallback
+        messages,
+        max_tokens: 1024,
+      }),
+    });
+    const data = await response.json();
+    return { text: data.choices[0].message.content, source: 'cloud' };
+  }
+}
+```
+
+Surface the current route in the UI — something as simple as "🏠 Local AI" vs "☁️ Cloud AI" in the header. Users appreciate knowing whether their data is leaving the device, and it builds trust.
+
+## Production Gateway (FastAPI)
+
+In development you connect directly to a local IP. For production, you'll want a simple gateway on your VPS that adds authentication and sits in front of Ollama.
+
+```python
+# gateway/main.py
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import httpx
+
+app = FastAPI()
+OLLAMA_BASE = "http://localhost:11434"
+
+class ChatRequest(BaseModel):
+    messages: list[dict]
+    model: str = "gemma4:7b"
+    stream: bool = True
+    max_tokens: int = 1024
+
+@app.post("/v1/chat")
+async def chat(req: ChatRequest, x_api_key: str = Header(None)):
+    if x_api_key != "your-secret-gateway-key":
+        raise HTTPException(status_code=401)
+
+    payload = {
+        "model": req.model,
+        "messages": req.messages,
+        "stream": req.stream,
+        "options": {"num_predict": req.max_tokens, "temperature": 0.7},
+    }
+
+    if req.stream:
+        async def generate():
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", f"{OLLAMA_BASE}/api/chat", json=payload) as r:
+                    async for line in r.aiter_lines():
+                        if line:
+                            yield line + "\n"
+        return StreamingResponse(generate(), media_type="application/x-ndjson")
+    else:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{OLLAMA_BASE}/api/chat", json=payload)
+            return r.json()
+
+@app.get("/health")
+async def health():
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{OLLAMA_BASE}/api/version")
+            return {"status": "ok", "ollama": r.json()}
+    except Exception as e:
+        return {"status": "degraded", "error": str(e)}
+```
+
+A €4/month Hetzner CX22 instance runs Gemma 4 4B comfortably. For 7B, bump to CX32 (~€9/month). Both are dramatically cheaper than equivalent cloud API usage at scale.
+
+## Cost Architecture and Monetization Design
+
+This is the part I most want to share with fellow indie developers.
+
+The core insight is: **convert variable API costs into fixed infrastructure costs**.
+
+```
+Traditional cloud API model:
+  Users × Usage × Per-token rate = Variable cost
+  → Cost scales linearly with growth. Bad for margins.
+
+Edge AI model:
+  VPS flat fee ($5–10/month) + minimal cloud fallback = Near-fixed cost
+  → Cost is nearly constant regardless of user count (within server capacity).
+```
+
+This unlocks a tier structure that simply isn't viable with cloud-only APIs:
+
+```javascript
+// config/tiers.js
+export const TIERS = {
+  free: {
+    name: 'Free',
+    dailyMessages: 20,
+    model: 'gemma4:4b',        // smaller model for free tier
+    maxContextMessages: 10,
+    cloudFallback: false,      // no fallback = no variable cost
+  },
+  premium: {
+    name: 'Premium',
+    dailyMessages: Infinity,   // unlimited — sustainable because cost is fixed
+    model: 'gemma4:7b',
+    maxContextMessages: 50,
+    cloudFallback: true,
+    price: { usd: 5, jpy: 580 },
+  },
+};
+```
+
+With cloud-only APIs, offering "unlimited" messages at $5/month is financially risky — a power user could cost you more than their subscription. With an edge AI backend, your marginal cost per extra message is essentially zero (CPU cycles on a server you're already paying for). The risk profile is completely different.
+
+## Common Implementation Pitfalls
+
+### Pitfall 1: Context Window Overflow
+
+As conversations grow long, naive context trimming breaks conversational coherence. Rather than simply dropping old messages, summarize them first:
+
+```javascript
+async function summarizeOldMessages(convId) {
+  const all = await conversationDB.getAllMessages(convId);
+  if (all.length < 30) return;
+
+  const toSummarize = all.slice(0, -20);
+  const summary = await router.chat([
+    { role: 'system', content: 'Summarize the following conversation in 3 sentences, preserving key facts and decisions.' },
+    { role: 'user', content: JSON.stringify(toSummarize) },
+  ]);
+  await conversationDB.setSystemPrompt(convId, `[Conversation summary]\n${summary.text}`);
+}
+```
+
+### Pitfall 2: Multibyte Character Corruption in Streaming
+
+When streaming text that contains multibyte characters (especially CJK scripts), chunk boundaries can split a character mid-byte. Always use `TextDecoder` with `{ stream: true }` — exactly as shown in the streaming hook above. Forgetting this option causes garbled characters at unpredictable intervals.
+
+### Pitfall 3: iOS Background Connection Interruption
+
+iOS aggressively drops TCP connections when an app moves to the background. If a user switches apps mid-stream, the response silently truncates. Detect this with the `AppState` API and either cancel-and-resume or switch to non-streaming mode when the app goes to background.
+
+## What to Build Next
+
+The patterns in this article give you the foundation for a production-grade AI chat feature in any Rork app. The immediate next step I'd recommend: spin up a small VPS, install Ollama, pull Gemma 4 4B, and run the FastAPI gateway. Get one real user testing the latency on mobile before committing to a larger model.
+
+The economic argument for edge AI only strengthens as your user base grows. The infrastructure investment you make early pays dividends at every subsequent scale point — which is exactly the kind of leverage that makes indie development sustainable over the long run.
