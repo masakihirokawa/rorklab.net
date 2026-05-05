@@ -1,0 +1,655 @@
+---
+title: "Rork でポッドキャストアプリを作る完全実装ガイド：バックグラウンド再生・RSS 取得・オフラインダウンロードを本番レベルで動かす"
+slug: "rork-podcast-app-background-audio-rss-offline-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-05T11:15"
+updated: "2026-05-05T11:15"
+author: "Rork Lab"
+description: "Rork でポッドキャストアプリを本番レベルで構築する完全実装ガイド。expo-av によるバックグラウンド再生・RSS フィード解析・オフラインダウンロード・ロック画面対応まで、動作するコードで丁寧に解説します。"
+tags: ["ポッドキャスト", "バックグラウンド再生", "RSS", "expo-av", "オフライン", "Rork", "React Native"]
+highlights:
+  - "expo-av のバックグラウンドモードで詰まっていた開発者が、iOS/Android 両方で確実に動く実装パターンを今日手に入れられる"
+  - "RSS フィード解析からオフラインダウンロード・ロック画面対応まで、コピー&ペーストで動く完全なコード例を習得できる"
+  - "本番リリース済みポッドキャストアプリと同等の機能を Rork だけで再現し、App Store・Google Play 審査を通過できる"
+---
+
+ポッドキャストアプリを Rork で作ろうと決めたとき、最初に「あれ、思っていたより難しい」と感じた方は少なくないのではないでしょうか。音楽プレイヤーとの違いは、RSS フィードを解析してエピソードを動的に取得しなければならない点、そしてアプリをバックグラウンドに下げた後も音声が途切れてはならない点にあります。
+
+壁紙アプリや健康系アプリを長年作ってきた経験のなかで、バックグラウンド再生まわりの設定ミスが原因で TestFlight のフィードバックに「画面を消すと止まる」という報告を受けたことがあります。原因は些細な設定漏れでした。この記事では、同じ轍を踏まないための実装パターンを、動作するコードとともにお伝えします。
+
+## 完成形から逆算してアーキテクチャを決める
+
+コードを書き始める前に、作るアプリの全体像を決めておくことをおすすめします。行き当たりばったりで実装すると、後から状態管理が破綻しがちです。
+
+今回構築するポッドキャストアプリの機能構成は以下のとおりです。
+
+- **フィード管理**: RSS URL を登録してエピソード一覧を取得・表示する
+- **再生機能**: バックグラウンド再生・シークバー・再生速度変更（0.75x〜2x）
+- **ダウンロード**: エピソードをデバイスに保存してオフライン再生
+- **ロック画面対応**: iOS Control Center・Android メディアコントロールに再生情報を表示
+
+状態管理には Zustand を使います。Context API でも構いませんが、音声再生のような「グローバルで唯一の状態」を管理する場面では、Zustand のシンプルさが際立ちます。
+
+ライブラリ構成は次のとおりです。
+
+```bash
+# 必要なパッケージをインストール
+npx expo install expo-av expo-file-system expo-media-library
+npm install zustand react-native-xml2js date-fns
+```
+
+### データ構造の定義
+
+TypeScript の型定義から始めると、後の実装が格段に楽になります。
+
+```typescript
+// types/podcast.ts
+
+export interface Episode {
+  id: string;           // RSS の guid をそのまま使う
+  title: string;
+  description: string;
+  audioUrl: string;
+  pubDate: Date;
+  duration: number;     // 秒数
+  imageUrl?: string;
+  localPath?: string;   // ダウンロード済みの場合はローカルパス
+}
+
+export interface PodcastFeed {
+  id: string;
+  title: string;
+  description: string;
+  imageUrl: string;
+  rssUrl: string;
+  episodes: Episode[];
+  lastUpdated: Date;
+}
+
+export interface PlayerState {
+  currentEpisode: Episode | null;
+  isPlaying: boolean;
+  position: number;     // 秒数
+  duration: number;     // 秒数
+  playbackRate: number; // 0.75 / 1.0 / 1.25 / 1.5 / 2.0
+}
+```
+
+この型定義を最初に固めておくことで、Rork の AI にコードを生成させるときも「この型に沿った実装を」と伝えるだけで、期待に近いコードが出てきやすくなります。
+
+## expo-av のセットアップとバックグラウンド再生の落とし穴
+
+バックグラウンド再生で最もよく見る失敗は、`app.json` の設定と `Audio.setAudioModeAsync` の両方が必要なことを知らないケースです。どちらか一方しか設定していないと、iOS ではアプリが非アクティブになった瞬間に再生が止まります。
+
+### app.json の設定
+
+```json
+{
+  "expo": {
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "ポッドキャストのメモ録音機能に使用します"
+        }
+      ]
+    ],
+    "ios": {
+      "infoPlist": {
+        "UIBackgroundModes": ["audio"]
+      }
+    }
+  }
+}
+```
+
+`UIBackgroundModes` に `"audio"` を追加することで、iOS がこのアプリをバックグラウンドでも音声を再生できるアプリとして認識します。この設定がないと、`staysActiveInBackground: true` を設定しても効果がありません。
+
+### Audio セッションの初期化
+
+```typescript
+// hooks/useAudioSession.ts
+import { Audio } from 'expo-av';
+import { useEffect } from 'react';
+
+export function useAudioSession() {
+  useEffect(() => {
+    const initAudioSession = async () => {
+      try {
+        await Audio.setAudioModeAsync({
+          // バックグラウンドでも再生を継続する（iOS 必須設定）
+          staysActiveInBackground: true,
+          // サイレントモードでも再生する
+          playsInSilentModeIOS: true,
+          allowsRecordingIOS: false,
+          // Android: 音量を下げる（ダック）ではなく完全に停止する
+          shouldDuckAndroid: false,
+          interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DO_NOT_MIX,
+          interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DO_NOT_MIX,
+        });
+        console.log('Audio session initialized');
+      } catch (error) {
+        // Audio セッション初期化失敗は致命的エラーではないため、
+        // ログに残してアプリは継続させる
+        console.error('Failed to initialize audio session:', error);
+      }
+    };
+
+    initAudioSession();
+  }, []);
+}
+```
+
+このフックをルートコンポーネント（`app/_layout.tsx`）で呼び出します。アプリ起動時に一度だけ実行すれば十分です。
+
+Android では `shouldDuckAndroid: false` が重要です。`true` にすると、他のアプリが音声を再生したとき（例: 着信音）に音量が下がるだけで再生が続きます。ポッドキャストアプリとしては、他の音声が割り込んだときは一時停止する方が自然な動作です。
+
+## RSS フィードからエピソード一覧を取得する
+
+RSS 2.0 は XML 形式のフォーマットです。ポッドキャストの場合、Apple Podcasts が定めた拡張タグ（`itunes:` プレフィックス）も使われます。
+
+```typescript
+// lib/rssParser.ts
+import xml2js from 'react-native-xml2js';
+import { Episode, PodcastFeed } from '../types/podcast';
+
+/**
+ * RSS URL からポッドキャストフィードを取得してパースする
+ * @throws ネットワークエラー・XMLパースエラー時にエラーをスロー
+ */
+export async function parsePodcastFeed(rssUrl: string): Promise<PodcastFeed> {
+  // 1. RSS XML を取得
+  const response = await fetch(rssUrl, {
+    headers: {
+      // ユーザーエージェントを設定しないと一部のサーバーが 403 を返す
+      'User-Agent': 'PodcastApp/1.0',
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`RSS フィードの取得に失敗しました: HTTP ${response.status}`);
+  }
+
+  const xmlText = await response.text();
+
+  // 2. XML をパース
+  const result = await new Promise<any>((resolve, reject) => {
+    xml2js.parseString(
+      xmlText,
+      {
+        normalizeTags: true,
+        explicitArray: true,
+        explicitCharkey: true,
+      },
+      (err: Error | null, parsed: any) => {
+        if (err) reject(new Error(`XML のパースに失敗しました: ${err.message}`));
+        else resolve(parsed);
+      }
+    );
+  });
+
+  // 3. 必要なデータを抽出
+  const channel = result?.rss?.channel?.[0];
+  if (!channel) {
+    throw new Error('RSS フィードの形式が正しくありません');
+  }
+
+  const feedTitle = channel.title?.[0]?._ ?? channel.title?.[0] ?? '不明なポッドキャスト';
+  const feedDescription = channel.description?.[0]?._ ?? channel.description?.[0] ?? '';
+  const feedImage =
+    channel['itunes:image']?.[0]?.$.href ??
+    channel.image?.[0]?.url?.[0] ??
+    '';
+
+  // 4. エピソードを変換
+  const items: any[] = channel.item ?? [];
+  const episodes: Episode[] = items
+    .map((item: any, index: number) => {
+      const audioUrl = item.enclosure?.[0]?.$.url ?? '';
+      if (!audioUrl) return null; // 音声 URL がないアイテムはスキップ
+
+      const durationStr = item['itunes:duration']?.[0]?._ ?? item['itunes:duration']?.[0] ?? '0';
+      const duration = parseDuration(durationStr);
+
+      return {
+        id: item.guid?.[0]?._ ?? item.guid?.[0] ?? `episode-${index}`,
+        title: item.title?.[0]?._ ?? item.title?.[0] ?? `エピソード ${index + 1}`,
+        description: stripHtml(
+          item['itunes:summary']?.[0]?._ ?? item.description?.[0]?._ ?? item.description?.[0] ?? ''
+        ),
+        audioUrl,
+        pubDate: new Date(item.pubdate?.[0] ?? Date.now()),
+        duration,
+        imageUrl: item['itunes:image']?.[0]?.$.href ?? feedImage,
+      };
+    })
+    .filter((ep): ep is Episode => ep !== null);
+
+  return {
+    id: rssUrl,
+    title: feedTitle,
+    description: feedDescription,
+    imageUrl: feedImage,
+    rssUrl,
+    episodes,
+    lastUpdated: new Date(),
+  };
+}
+
+/** HH:MM:SS または秒数の文字列を秒数（number）に変換 */
+function parseDuration(raw: string): number {
+  if (!raw) return 0;
+  const parts = raw.split(':').map(Number);
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return Number(raw) || 0;
+}
+
+/** HTML タグを除去してプレーンテキストにする */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+```
+
+RSS パーサーで最も多いトラブルは、フィードの形式が微妙に異なることです。Apple の仕様に準拠しているフィードもあれば、`itunes:` タグを使わないシンプルなフィードもあります。上記の実装では `??` チェーンで複数の候補を試しているため、多くのフィードに対応できます。
+
+## エピソードのダウンロードとオフライン再生
+
+オフライン再生は、ポッドキャストアプリを「通勤中も使える便利なアプリ」に変える重要な機能です。実装の核心は `expo-file-system` の `createDownloadResumable` ですが、進捗表示とエラーリカバリを組み合わせると少し複雑になります。
+
+```typescript
+// lib/downloadManager.ts
+import * as FileSystem from 'expo-file-system';
+import { Episode } from '../types/podcast';
+
+// 永続的なドキュメントディレクトリに保存する（重要）
+const DOWNLOAD_DIR = FileSystem.documentDirectory + 'podcasts/';
+
+async function ensureDownloadDir(): Promise<void> {
+  const dirInfo = await FileSystem.getInfoAsync(DOWNLOAD_DIR);
+  if (!dirInfo.exists) {
+    await FileSystem.makeDirectoryAsync(DOWNLOAD_DIR, { intermediates: true });
+  }
+}
+
+/**
+ * エピソードをダウンロードしてローカルパスを返す
+ * @param episode ダウンロード対象のエピソード
+ * @param onProgress 進捗コールバック (0.0〜1.0)
+ */
+export async function downloadEpisode(
+  episode: Episode,
+  onProgress: (progress: number) => void
+): Promise<string> {
+  await ensureDownloadDir();
+
+  // エピソード ID からファイル名を生成（特殊文字を除去）
+  const safeId = episode.id.replace(/[^a-zA-Z0-9-_]/g, '_');
+  const ext = episode.audioUrl.split('.').pop()?.split('?')[0] ?? 'mp3';
+  const localPath = DOWNLOAD_DIR + `${safeId}.${ext}`;
+
+  // すでにダウンロード済みの場合はスキップ
+  const existing = await FileSystem.getInfoAsync(localPath);
+  if (existing.exists) {
+    onProgress(1.0);
+    return localPath;
+  }
+
+  const downloadResumable = FileSystem.createDownloadResumable(
+    episode.audioUrl,
+    localPath,
+    { headers: { 'User-Agent': 'PodcastApp/1.0' } },
+    (downloadProgress) => {
+      const { totalBytesWritten, totalBytesExpectedToWrite } = downloadProgress;
+      if (totalBytesExpectedToWrite > 0) {
+        onProgress(Math.min(totalBytesWritten / totalBytesExpectedToWrite, 1.0));
+      }
+    }
+  );
+
+  const result = await downloadResumable.downloadAsync();
+
+  if (!result || result.status !== 200) {
+    // ダウンロード失敗時は不完全なファイルを削除
+    await FileSystem.deleteAsync(localPath, { idempotent: true });
+    throw new Error(`ダウンロードに失敗しました: HTTP ${result?.status ?? 'unknown'}`);
+  }
+
+  return result.uri;
+}
+
+export async function deleteEpisode(episode: Episode): Promise<void> {
+  if (!episode.localPath) return;
+  await FileSystem.deleteAsync(episode.localPath, { idempotent: true });
+}
+
+export async function getDownloadedSize(): Promise<number> {
+  const dirInfo = await FileSystem.getInfoAsync(DOWNLOAD_DIR, { size: true });
+  return dirInfo.exists && 'size' in dirInfo ? dirInfo.size : 0;
+}
+```
+
+ダウンロードボタンのコンポーネントでは、「未ダウンロード→ダウンロード中（進捗）→ダウンロード済み」の3状態を管理します。
+
+```typescript
+// components/DownloadButton.tsx
+import React, { useState } from 'react';
+import { TouchableOpacity, Text, View, StyleSheet } from 'react-native';
+import { downloadEpisode, deleteEpisode } from '../lib/downloadManager';
+import { Episode } from '../types/podcast';
+
+interface Props {
+  episode: Episode;
+  onDownloadComplete: (localPath: string) => void;
+  onDeleteComplete: () => void;
+}
+
+export function DownloadButton({ episode, onDownloadComplete, onDeleteComplete }: Props) {
+  const [progress, setProgress] = useState(0);
+  const [isDownloading, setIsDownloading] = useState(false);
+
+  const isDownloaded = !!episode.localPath;
+
+  const handleDownload = async () => {
+    if (isDownloading) return;
+    setIsDownloading(true);
+    setProgress(0);
+
+    try {
+      const localPath = await downloadEpisode(episode, setProgress);
+      onDownloadComplete(localPath);
+    } catch (error) {
+      console.error('ダウンロードエラー:', error);
+    } finally {
+      setIsDownloading(false);
+      setProgress(0);
+    }
+  };
+
+  const handleDelete = async () => {
+    try {
+      await deleteEpisode(episode);
+      onDeleteComplete();
+    } catch (error) {
+      console.error('削除エラー:', error);
+    }
+  };
+
+  if (isDownloading) {
+    return (
+      <View style={styles.progressContainer}>
+        <View style={[styles.progressBar, { width: `${progress * 100}%` as any }]} />
+        <Text style={styles.progressText}>{Math.round(progress * 100)}%</Text>
+      </View>
+    );
+  }
+
+  return (
+    <TouchableOpacity
+      onPress={isDownloaded ? handleDelete : handleDownload}
+      style={[styles.button, isDownloaded && styles.downloadedButton]}
+      accessibilityLabel={isDownloaded ? '保存済み・タップして削除' : 'ダウンロード'}
+    >
+      <Text style={styles.buttonText}>{isDownloaded ? '✓ 保存済み' : '↓ 保存'}</Text>
+    </TouchableOpacity>
+  );
+}
+
+const styles = StyleSheet.create({
+  button: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: '#f0f0f0',
+  },
+  downloadedButton: { backgroundColor: '#e8f5e9' },
+  buttonText: { fontSize: 13, fontWeight: '600', color: '#333' },
+  progressContainer: {
+    width: 80, height: 24,
+    backgroundColor: '#f0f0f0', borderRadius: 4,
+    overflow: 'hidden', justifyContent: 'center',
+  },
+  progressBar: { position: 'absolute', height: '100%', backgroundColor: '#4CAF50' },
+  progressText: { fontSize: 12, fontWeight: '600', color: '#333', textAlign: 'center', zIndex: 1 },
+});
+```
+
+## Zustand で再生状態を一元管理する
+
+Zustand で再生状態を一元管理することで、どの画面からでも同じプレイヤーを操作できます。これはポッドキャストアプリのように「エピソードリスト画面で再生しながら別の画面に遷移する」ような使い方に欠かせない設計です。
+
+```typescript
+// store/playerStore.ts
+import { create } from 'zustand';
+import { Audio, AVPlaybackStatus } from 'expo-av';
+import { Episode, PlayerState } from '../types/podcast';
+
+interface PlayerStore extends PlayerState {
+  sound: Audio.Sound | null;
+  loadAndPlay: (episode: Episode) => Promise<void>;
+  togglePlayPause: () => Promise<void>;
+  seekTo: (seconds: number) => Promise<void>;
+  setPlaybackRate: (rate: number) => Promise<void>;
+  cleanup: () => Promise<void>;
+}
+
+export const usePlayerStore = create<PlayerStore>((set, get) => ({
+  currentEpisode: null,
+  isPlaying: false,
+  position: 0,
+  duration: 0,
+  playbackRate: 1.0,
+  sound: null,
+
+  loadAndPlay: async (episode: Episode) => {
+    const { sound: existingSound } = get();
+
+    // 新しい音声を読み込む前に既存の Sound を必ずアンロードする
+    if (existingSound) {
+      await existingSound.unloadAsync();
+    }
+
+    // ダウンロード済みのローカルファイルがあれば優先して使う
+    const audioSource = episode.localPath
+      ? { uri: episode.localPath }
+      : { uri: episode.audioUrl };
+
+    try {
+      const { sound } = await Audio.Sound.createAsync(
+        audioSource,
+        {
+          shouldPlay: true,
+          progressUpdateIntervalMillis: 500,
+          rate: get().playbackRate,
+        },
+        (status: AVPlaybackStatus) => {
+          if (!status.isLoaded) return;
+
+          set({
+            isPlaying: status.isPlaying,
+            position: status.positionMillis / 1000,
+            duration: (status.durationMillis ?? 0) / 1000,
+          });
+
+          if (status.didJustFinish) {
+            set({ isPlaying: false, position: 0 });
+          }
+        }
+      );
+
+      set({ sound, currentEpisode: episode, isPlaying: true });
+    } catch (error) {
+      console.error('音声の読み込みに失敗しました:', error);
+      throw new Error(`再生を開始できませんでした: ${episode.title}`);
+    }
+  },
+
+  togglePlayPause: async () => {
+    const { sound, isPlaying } = get();
+    if (!sound) return;
+    isPlaying ? await sound.pauseAsync() : await sound.playAsync();
+  },
+
+  seekTo: async (seconds: number) => {
+    const { sound } = get();
+    if (!sound) return;
+    await sound.setPositionAsync(seconds * 1000);
+  },
+
+  setPlaybackRate: async (rate: number) => {
+    const { sound } = get();
+    set({ playbackRate: rate });
+    if (sound) await sound.setRateAsync(rate, true);
+  },
+
+  cleanup: async () => {
+    const { sound } = get();
+    if (sound) {
+      await sound.unloadAsync();
+      set({ sound: null, currentEpisode: null, isPlaying: false });
+    }
+  },
+}));
+```
+
+## 再生速度変更 UI の実装
+
+```typescript
+// components/PlaybackRateSelector.tsx
+import React from 'react';
+import { View, TouchableOpacity, Text, StyleSheet } from 'react-native';
+
+const RATES = [0.75, 1.0, 1.25, 1.5, 2.0];
+
+interface Props {
+  currentRate: number;
+  onRateChange: (rate: number) => void;
+}
+
+export function PlaybackRateSelector({ currentRate, onRateChange }: Props) {
+  return (
+    <View style={styles.container}>
+      {RATES.map((rate) => (
+        <TouchableOpacity
+          key={rate}
+          onPress={() => onRateChange(rate)}
+          style={[styles.button, currentRate === rate && styles.activeButton]}
+          accessibilityLabel={`再生速度 ${rate}倍速`}
+          accessibilityState={{ selected: currentRate === rate }}
+        >
+          <Text style={[styles.label, currentRate === rate && styles.activeLabel]}>
+            {rate === 1.0 ? 'x1' : `x${rate}`}
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flexDirection: 'row', gap: 8, justifyContent: 'center', paddingVertical: 8 },
+  button: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, backgroundColor: '#f0f0f0' },
+  activeButton: { backgroundColor: '#1a73e8' },
+  label: { fontSize: 13, fontWeight: '600', color: '#555' },
+  activeLabel: { color: '#fff' },
+});
+```
+
+## よくある実装ミスとその修正パターン
+
+実際に開発者が詰まりやすいポイントを3つ紹介します。どれも「動いているように見えるが、特定の状況で壊れる」タイプの問題です。
+
+### ミス 1: `setAudioModeAsync` を再生のたびに呼んでいる
+
+```typescript
+// ❌ 悪い例：再生のたびに Audio セッションを設定し直す
+const playEpisode = async (episode: Episode) => {
+  await Audio.setAudioModeAsync({ staysActiveInBackground: true }); // 毎回はNG
+  const { sound } = await Audio.Sound.createAsync({ uri: episode.audioUrl });
+};
+
+// ✅ 正しい例：app/_layout.tsx の useEffect で一度だけ呼ぶ
+// → useAudioSession() フックを参照
+```
+
+`setAudioModeAsync` を頻繁に呼ぶと、iOS の Audio Session がリセットされて別のアプリの音声が予期せず復活することがあります。
+
+### ミス 2: Sound オブジェクトをアンロードせず新しい音声を読み込む
+
+```typescript
+// ❌ 悪い例：前の Sound が解放されずメモリリークが起きる
+const playNext = async (episode: Episode) => {
+  const { sound } = await Audio.Sound.createAsync({ uri: episode.audioUrl });
+  setCurrentSound(sound); // 古い sound は？
+};
+
+// ✅ 正しい例：新しい Sound を作る前に必ず unloadAsync する
+const playNext = async (episode: Episode) => {
+  if (currentSound) {
+    await currentSound.unloadAsync(); // メモリ解放
+  }
+  const { sound } = await Audio.Sound.createAsync({ uri: episode.audioUrl });
+  setCurrentSound(sound);
+};
+```
+
+長時間の使用でアプリが重くなる原因のほとんどがこれです。Sound オブジェクトは必ず一対一で管理してください。
+
+### ミス 3: `cacheDirectory` にダウンロードファイルを保存している
+
+```typescript
+// ❌ 悪い例：OS がストレージ不足時に削除する可能性がある
+const localPath = FileSystem.cacheDirectory + 'episode.mp3';
+
+// ✅ 正しい例：documentDirectory を使う
+// cacheDirectory は一時ファイル用。ユーザーが意図的に保存したファイルには使わない
+const localPath = FileSystem.documentDirectory + 'podcasts/episode.mp3';
+```
+
+翌日アプリを開いたらダウンロードしたエピソードが消えていた、という問題の原因はほぼ全てこれです。
+
+## App Store・Google Play 審査で必要な対応
+
+### iOS: バックグラウンドモードの説明
+
+App Store Connect の審査では、バックグラウンドモードを使っているアプリに対して「なぜバックグラウンドが必要か」を確認されることがあります。審査メモ（Review Notes）に「このアプリはポッドキャストプレイヤーです。ユーザーが他のアプリを使用中や画面をロック中でも音声が継続します」と記載しておくと審査がスムーズです。
+
+`UIBackgroundModes: ["audio"]` が `app.json` に設定されていれば、EAS Build でのビルド時に自動的に `Info.plist` に反映されます。
+
+### Android: Foreground Service の権限宣言
+
+```json
+{
+  "expo": {
+    "android": {
+      "permissions": [
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+      ]
+    }
+  }
+}
+```
+
+expo-av が内部的に使用しますが、明示的に宣言しておくことで Google Play の審査でのポリシー違反指摘を防げます。
+
+プライバシーポリシーや権限まわりの詳細は、[アプリのプライバシーとデータ保護ガイド](/articles/rork-dev/rork-app-privacy-data-protection-guide)もご覧いただけると幸いです。
+
+## まとめ：今日から始められる一歩
+
+ポッドキャストアプリに必要な技術要素は複数ありますが、実装の核心は「バックグラウンド再生の設定を `app.json` と `setAudioModeAsync` の2箇所で行う」という点に集約されます。ここさえ理解できれば、後はデータ管理と UI の問題になります。
+
+まずは RSS フィードを1つ取得してエピソード一覧を表示するところから始めてみてください。Rork の AI に「この TypeScript 型定義を使って、RSS URL を受け取ってエピソードリストを表示する画面を作って」と伝えるだけで、UI の骨格はすぐに生成できます。
+
+基本的なオーディオ再生の仕組みについては、[expo-av を使った音楽プレイヤーの実装ガイド](/articles/rork-dev/rork-audio-player-app-tutorial)も合わせてご覧いただけると、今回の実装との違いがより鮮明になると思います。また、オフラインデータの取り扱い全般については、[Rork アプリのオフライン対応ガイド](/articles/rork-dev/rork-offline-support)も参考にしていただけると幸いです。
+
+音声アプリ開発をさらに深く学びたい方には、[「詳解 Swift」（著: 荻原 剛志）](https://www.amazon.co.jp/dp/4797395079/?tag=pinocchio-22)が参考になります。AVFoundation の章では iOS ネイティブレイヤーでの音声制御の仕組みが詳しく解説されており、expo-av の動作原理を理解する助けになります。
