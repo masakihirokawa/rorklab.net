@@ -4,16 +4,16 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "IO2026ANDROID — Google I/O 2026（5/19-20）で Android 17 と Gemini 深統合、アプリ開発エコシステムへの影響に注目",
     "APPBOOM — 2026年4月のアプリリリース数が前年比104%増、AI アプリビルダーが市場拡大を牽引",
-    "APPLEREJECT — Apple が Replit・Vibecode 等をブロック、React Native 基盤の Rork は審査に適合",
     "RORK15M — Rork が 1,500 万ドルのシード調達、月間 74 万訪問・成長率 85% で首位（4/9）",
     "RORKMAX — Rork Max が Web 初の Swift アプリビルダー、2 週間で年間収益 2 倍を達成",
     "PAPERLINE — Rork が App Builder の Paperline を買収、さらなる買収も積極的に検討中",
     "WRESTLEAI — 18 歳の大学生が Rork で WrestleAI を構築、月収 3 万ドル超を達成",
   ],
   en: [
+    "IO2026ANDROID — Google I/O 2026 (May 19-20): Android 17 + Gemini deep integration — big news for app devs",
     "APPBOOM — App releases up 104% YoY in April 2026 — AI builders like Rork are fueling the surge",
-    "APPLEREJECT — Apple blocks Replit & Vibecode; Rork's React Native base stays compliant with App Store rules",
     "RORK15M — Rork raises $15M seed, hits 743K monthly visits with 85% growth rate (4/9)",
     "RORKMAX — Rork Max: the web's first Swift app builder, doubling annual revenue in just 2 weeks",
     "PAPERLINE — Rork acquires app builder Paperline and stays actively acquisitive for engineering talent",
