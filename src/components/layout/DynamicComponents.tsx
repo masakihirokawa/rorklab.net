@@ -14,6 +14,10 @@ const CookieBanner = dynamic(
   () => import("@/components/layout/CookieBanner").then((m) => ({ default: m.CookieBanner })),
   { ssr: false }
 );
+const MembershipPromoModal = dynamic(
+  () => import("@/components/ui/MembershipPromoModal").then((m) => ({ default: m.MembershipPromoModal })),
+  { ssr: false }
+);
 
 export function DynamicNewsTicker() {
   return <NewsTicker />;
@@ -30,4 +34,8 @@ export function DynamicCookieBanner(props: {
   storageKey: string;
 }) {
   return <CookieBanner {...props} />;
+}
+
+export function DynamicMembershipPromoModal(props: { locale: string; siteName: string }) {
+  return <MembershipPromoModal {...props} />;
 }

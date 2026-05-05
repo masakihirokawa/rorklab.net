@@ -4,7 +4,7 @@ import { routing } from "@/i18n/routing";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
 import { Header } from "@/components/layout/Header";
 import { Footer } from "@/components/layout/Footer";
-import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner } from "@/components/layout/DynamicComponents";
+import { DynamicNewsTicker, DynamicScrollToTop, DynamicCookieBanner, DynamicMembershipPromoModal } from "@/components/layout/DynamicComponents";
 
 import type { Metadata } from "next";
 
@@ -92,6 +92,7 @@ export default async function LocaleLayout({
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <DynamicScrollToTop />
+            <DynamicMembershipPromoModal locale={locale} siteName="Rork Lab" />
             <DynamicCookieBanner
               gaId="G-H9JTCV49KJ"
               privacyHref={locale === "ja" ? "/privacy" : "/en/privacy"}
