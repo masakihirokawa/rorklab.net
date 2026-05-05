@@ -1,0 +1,504 @@
+---
+title: "Rork + Stripe で Web SaaS の決済基盤を完全構築する：Next.js × Cloudflare Workers × Supabase"
+slug: "rork-stripe-saas-web-app-payment-complete-build"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-05-06T12:00"
+author: "Rork Lab"
+description: "Rork Maxで生成したNext.jsアプリにStripeの月額サブスクリプション・単品購入・Webhookを完全実装するガイド。Cloudflare Workers + Supabase構成でSaaS課金基盤を一から構築する実践的な手順を解説します。"
+tags: ["rork", "stripe", "saas", "nextjs", "cloudflare-workers", "supabase", "subscription", "monetization"]
+highlights:
+  - "RorkでNext.jsアプリを生成し、Stripe月額サブスクリプション・単品購入・Webhookを完全実装する手順を習得できます"
+  - "Cloudflare Workers + Supabase + Stripe の3層構成で、スケーラブルなSaaS課金基盤を設計・実装できます"
+  - "Webhookによる支払いイベント処理、会員ステータス管理、キャンセル・ダウングレードフローを実際に動作するコードで理解できます"
+---
+
+Rorkを使ってWebアプリを作れるようになった。次のステップは「それを売る仕組みを作る」ことです。
+
+Stripeを使えばサブスクリプション・単品購入・Webhookによる自動処理を比較的シンプルに実装できますが、Next.js + Cloudflare Workers の環境では注意が必要な点もあります。RorkでSaaS課金基盤を構築するための完全なパターンを、実際に動くコードで解説します。
+
+## 構成の全体像
+
+```
+Rork Max（Next.js生成）
+    ├── フロントエンド
+    │   ├── /membership — 料金プランページ
+    │   ├── /api/checkout — Stripe Checkout セッション作成
+    │   ├── /api/webhook — Stripe Webhook 受信
+    │   └── /api/verify-session — 購入確認
+    │
+    ├── Supabase
+    │   ├── users テーブル（基本情報）
+    │   ├── subscriptions テーブル（サブスク状態）
+    │   └── purchases テーブル（単品購入）
+    │
+    └── Stripe
+        ├── Products + Prices（料金設定）
+        ├── Checkout Sessions（決済ページ）
+        └── Customer Portal（顧客自身による管理）
+```
+
+## Step 1: Stripe Products と Prices の設定
+
+まずStripe Dashboardで商品と価格を作成します。
+
+```bash
+# Stripe CLI で価格を作成（開発用）
+
+# 月額プラン（Pro）
+stripe prices create \
+  --currency=jpy \
+  --unit-amount=580 \
+  --recurring[interval]=month \
+  --product-data[name]="Pro Plan" \
+  --lookup-key=pro_monthly_jpy
+
+# 年額プラン（Pro） — 月額換算で20%オフ
+stripe prices create \
+  --currency=jpy \
+  --unit-amount=5568 \
+  --recurring[interval]=year \
+  --product-data[name]="Pro Plan" \
+  --lookup-key=pro_yearly_jpy
+
+# 単品購入（プレミアム記事）
+stripe prices create \
+  --currency=jpy \
+  --unit-amount=250 \
+  --product-data[name]="Premium Article" \
+  --lookup-key=article_single_jpy
+```
+
+本番環境では Stripe Dashboard から作成し、Price IDを環境変数に保存します。
+
+```typescript
+// src/config/pricing.ts
+export const STRIPE_PRICES = {
+  pro_monthly: process.env.STRIPE_PRICE_PRO_MONTHLY!,
+  pro_yearly: process.env.STRIPE_PRICE_PRO_YEARLY!,
+  article_single: process.env.STRIPE_PRICE_ARTICLE_SINGLE!,
+} as const;
+
+export const DISPLAY_PRICES = {
+  pro_monthly: { jpy: 580, usd: 5 },
+  pro_yearly:  { jpy: 5568, usd: 48 },
+  article:     { jpy: 250, usd: 1.75 },
+} as const;
+```
+
+## Step 2: Checkout セッション作成 API
+
+```typescript
+// app/api/checkout/route.ts
+import Stripe from "stripe";
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+import { STRIPE_PRICES } from "@/config/pricing";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-04-30",
+});
+
+export async function POST(request: NextRequest) {
+  const body = await request.json();
+  const { plan_type, locale, article_slug, user_email } = body;
+
+  // plan_type のバリデーション
+  const VALID_PLAN_TYPES = ["pro_monthly", "pro_yearly", "article"] as const;
+  type PlanType = typeof VALID_PLAN_TYPES[number];
+  
+  if (!VALID_PLAN_TYPES.includes(plan_type as PlanType)) {
+    return NextResponse.json({ error: "Invalid plan_type" }, { status: 400 });
+  }
+
+  // Stripe Customer を取得または作成
+  let customerId: string | undefined;
+  
+  if (user_email) {
+    const customers = await stripe.customers.list({ email: user_email, limit: 1 });
+    if (customers.data.length > 0) {
+      customerId = customers.data[0].id;
+    } else {
+      const customer = await stripe.customers.create({ email: user_email });
+      customerId = customer.id;
+    }
+  }
+
+  const baseUrl = process.env.NEXT_PUBLIC_SITE_URL!;
+  const isSubscription = plan_type === "pro_monthly" || plan_type === "pro_yearly";
+
+  // 商品の line_items 設定
+  const lineItems = isSubscription
+    ? [{
+        price: plan_type === "pro_monthly"
+          ? STRIPE_PRICES.pro_monthly
+          : STRIPE_PRICES.pro_yearly,
+        quantity: 1,
+      }]
+    : [{
+        price_data: {
+          currency: locale === "ja" ? "jpy" : "usd",
+          product_data: {
+            name: locale === "ja"
+              ? "プレミアム記事"
+              : "Premium Article",
+            description: locale === "ja"
+              ? "単記事の永久アクセス権"
+              : "Lifetime access to this premium article",
+            images: [`${baseUrl}/images/stripe-product.png`],
+          },
+          unit_amount: locale === "ja" ? 250 : 175,
+        },
+        quantity: 1,
+      }];
+
+  const session = await stripe.checkout.sessions.create({
+    customer: customerId,
+    mode: isSubscription ? "subscription" : "payment",
+    line_items: lineItems,
+    success_url: `${baseUrl}/${locale}/verify-session?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${baseUrl}/${locale}/membership`,
+    metadata: {
+      plan_type,
+      article_slug: article_slug ?? "",
+      locale,
+    },
+    // 日本円サブスク向け設定
+    ...(locale === "ja" && isSubscription ? {
+      payment_method_types: ["card"],
+    } : {}),
+  });
+
+  return NextResponse.json({ url: session.url });
+}
+```
+
+## Step 3: Webhook 処理
+
+Stripeからの支払い完了・解約イベントを受け取り、Supabaseのユーザーデータを更新します。
+
+```typescript
+// app/api/webhook/route.ts
+import Stripe from "stripe";
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-04-30",
+});
+
+// Cloudflare Workers 環境では next.config.ts で
+// export const runtime = "edge" を設定する
+export const runtime = "edge";
+
+export async function POST(request: NextRequest) {
+  const body = await request.text();
+  const sig = request.headers.get("stripe-signature");
+
+  if (!sig) {
+    return NextResponse.json({ error: "Missing signature" }, { status: 400 });
+  }
+
+  let event: Stripe.Event;
+  
+  try {
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET!,
+    );
+  } catch (err) {
+    console.error("Webhook signature verification failed:", err);
+    return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
+  }
+
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  );
+
+  switch (event.type) {
+    case "checkout.session.completed": {
+      const session = event.data.object as Stripe.CheckoutSession;
+      await handleCheckoutCompleted(session, supabase, stripe);
+      break;
+    }
+    
+    case "customer.subscription.updated": {
+      const subscription = event.data.object as Stripe.Subscription;
+      await handleSubscriptionUpdated(subscription, supabase);
+      break;
+    }
+    
+    case "customer.subscription.deleted": {
+      const subscription = event.data.object as Stripe.Subscription;
+      await handleSubscriptionDeleted(subscription, supabase);
+      break;
+    }
+    
+    case "invoice.payment_failed": {
+      const invoice = event.data.object as Stripe.Invoice;
+      await handlePaymentFailed(invoice, supabase);
+      break;
+    }
+  }
+
+  return NextResponse.json({ received: true });
+}
+
+async function handleCheckoutCompleted(
+  session: Stripe.CheckoutSession,
+  supabase: ReturnType<typeof createClient>,
+  stripe: Stripe,
+) {
+  const { plan_type, article_slug } = session.metadata ?? {};
+  const customerEmail = session.customer_email ?? session.customer_details?.email;
+  
+  if (!customerEmail) return;
+
+  if (plan_type === "pro_monthly" || plan_type === "pro_yearly") {
+    // サブスクリプション情報を取得
+    const subscription = await stripe.subscriptions.retrieve(
+      session.subscription as string,
+    );
+    
+    await supabase.from("subscriptions").upsert({
+      email: customerEmail,
+      stripe_customer_id: session.customer as string,
+      stripe_subscription_id: subscription.id,
+      plan_type,
+      status: subscription.status,
+      current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+      current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+      cancel_at_period_end: subscription.cancel_at_period_end,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "email" });
+
+  } else if (plan_type === "article" && article_slug) {
+    // 単品記事購入
+    await supabase.from("purchases").insert({
+      email: customerEmail,
+      article_slug,
+      stripe_session_id: session.id,
+      purchased_at: new Date().toISOString(),
+    });
+  }
+}
+
+async function handleSubscriptionUpdated(
+  subscription: Stripe.Subscription,
+  supabase: ReturnType<typeof createClient>,
+) {
+  const { data: existingSub } = await supabase
+    .from("subscriptions")
+    .select("email")
+    .eq("stripe_subscription_id", subscription.id)
+    .single();
+  
+  if (!existingSub) return;
+  
+  await supabase
+    .from("subscriptions")
+    .update({
+      status: subscription.status,
+      current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+      cancel_at_period_end: subscription.cancel_at_period_end,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("stripe_subscription_id", subscription.id);
+}
+
+async function handleSubscriptionDeleted(
+  subscription: Stripe.Subscription,
+  supabase: ReturnType<typeof createClient>,
+) {
+  await supabase
+    .from("subscriptions")
+    .update({
+      status: "canceled",
+      cancel_at_period_end: false,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("stripe_subscription_id", subscription.id);
+}
+
+async function handlePaymentFailed(
+  invoice: Stripe.Invoice,
+  supabase: ReturnType<typeof createClient>,
+) {
+  // 決済失敗の記録（メール通知等に活用）
+  const customerEmail = invoice.customer_email;
+  if (!customerEmail) return;
+  
+  await supabase.from("payment_failures").insert({
+    email: customerEmail,
+    stripe_invoice_id: invoice.id,
+    amount: invoice.amount_due,
+    failed_at: new Date().toISOString(),
+  });
+}
+```
+
+## Step 4: 会員ステータス確認
+
+```typescript
+// src/lib/subscription.ts
+import { createClient } from "@supabase/supabase-js";
+import { cookies } from "next/headers";
+
+export type SubscriptionStatus = {
+  is_pro: boolean;
+  plan_type: string | null;
+  expires_at: string | null;
+  cancel_at_period_end: boolean;
+};
+
+export async function getSubscriptionStatus(email: string): Promise<SubscriptionStatus> {
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  );
+  
+  const { data } = await supabase
+    .from("subscriptions")
+    .select("plan_type, status, current_period_end, cancel_at_period_end")
+    .eq("email", email)
+    .single();
+  
+  const isActive = data?.status === "active" || data?.status === "trialing";
+  const notExpired = data?.current_period_end
+    ? new Date(data.current_period_end) > new Date()
+    : false;
+  
+  return {
+    is_pro: isActive && notExpired,
+    plan_type: data?.plan_type ?? null,
+    expires_at: data?.current_period_end ?? null,
+    cancel_at_period_end: data?.cancel_at_period_end ?? false,
+  };
+}
+
+export async function getArticleAccess(email: string, slug: string): Promise<boolean> {
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  );
+  
+  const { data } = await supabase
+    .from("purchases")
+    .select("id")
+    .eq("email", email)
+    .eq("article_slug", slug)
+    .single();
+  
+  return data !== null;
+}
+```
+
+## Step 5: Stripe Customer Portal の設定
+
+ユーザー自身がプラン変更・解約・支払い情報更新を行えるポータルを設定します。
+
+```typescript
+// app/api/customer-portal/route.ts
+import Stripe from "stripe";
+import { NextRequest, NextResponse } from "next/server";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-04-30",
+});
+
+export async function POST(request: NextRequest) {
+  const { customer_id, locale } = await request.json();
+  
+  const session = await stripe.billingPortal.sessions.create({
+    customer: customer_id,
+    return_url: `${process.env.NEXT_PUBLIC_SITE_URL}/${locale}/membership`,
+  });
+  
+  return NextResponse.json({ url: session.url });
+}
+```
+
+Customer Portalを使うことで、解約・プラン変更の画面を自前で実装せずに済みます。Stripe側でUIが提供され、Webhookで変更がアプリに通知されます。
+
+## Supabase テーブル設計
+
+```sql
+-- subscriptions テーブル
+CREATE TABLE subscriptions (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  email text UNIQUE NOT NULL,
+  stripe_customer_id text,
+  stripe_subscription_id text UNIQUE,
+  plan_type text,                    -- 'pro_monthly' / 'pro_yearly'
+  status text,                       -- 'active' / 'trialing' / 'canceled' / 'past_due'
+  current_period_start timestamptz,
+  current_period_end timestamptz,
+  cancel_at_period_end boolean DEFAULT false,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+-- purchases テーブル（単品購入）
+CREATE TABLE purchases (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  email text NOT NULL,
+  article_slug text NOT NULL,
+  stripe_session_id text UNIQUE,
+  purchased_at timestamptz DEFAULT now(),
+  UNIQUE(email, article_slug)       -- 同一記事の重複購入を防ぐ
+);
+
+-- payment_failures テーブル
+CREATE TABLE payment_failures (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  email text,
+  stripe_invoice_id text,
+  amount integer,
+  failed_at timestamptz DEFAULT now()
+);
+
+-- Row Level Security（必須）
+ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE purchases ENABLE ROW LEVEL SECURITY;
+
+-- サービスロールのみフルアクセス可（アプリはサービスロールキーを使用）
+CREATE POLICY "Service role access" ON subscriptions
+  FOR ALL USING (auth.role() = 'service_role');
+```
+
+## Cloudflare Workers 環境での注意点
+
+Rork MaxのNext.jsアプリをCloudflare Workersにデプロイする場合、Webhookエンドポイントで `export const runtime = "edge"` を指定する必要があります。また、`stripe.webhooks.constructEvent()` ではなく非同期版の `stripe.webhooks.constructEventAsync()` を使用してください（Edge Runtime では同期版が動作しません）。
+
+```typescript
+// next.config.ts（Edge Runtime指定）
+// Webhook routeに必要
+// app/api/webhook/route.ts の冒頭に追記:
+export const runtime = "edge";
+```
+
+環境変数の設定:
+```bash
+# Cloudflare の wrangler.toml または Dashboard で設定
+STRIPE_SECRET_KEY=sk_live_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_PRICE_PRO_MONTHLY=price_...
+STRIPE_PRICE_PRO_YEARLY=price_...
+STRIPE_PRICE_ARTICLE_SINGLE=price_...
+SUPABASE_URL=https://xxxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
+NEXT_PUBLIC_SITE_URL=https://yoursite.com
+```
+
+## まとめ
+
+Rork + Stripe + Supabase + Cloudflare Workersの組み合わせは、スケーラブルなWeb SaaS課金基盤として十分機能します。
+
+実装の核心は4点です。Checkoutセッション作成でplan_typeを正しくmetadataに含めること、WebhookでCheckoutとSubscriptionの両イベントを適切に処理すること、Supabaseのsubscriptionsテーブルで会員状態を一元管理すること、そしてCustomer Portalで解約・変更フローを委譲することです。
+
+モバイルアプリのIAPと組み合わせる場合は、メールアドレスをキーにした共通の認証基盤を持つことで、Web課金とアプリ課金を統合した会員管理が実現できます。
+
+みなさまのプロダクトの成功を願っています。

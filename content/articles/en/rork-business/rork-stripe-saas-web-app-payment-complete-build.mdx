@@ -1,0 +1,442 @@
+---
+title: "Building a Complete Stripe SaaS Payment System with Rork: Next.js × Cloudflare Workers × Supabase"
+slug: "rork-stripe-saas-web-app-payment-complete-build"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-05-06T12:00"
+author: "Rork Lab"
+description: "A complete guide to implementing Stripe subscriptions, one-time purchases, and webhooks in a Rork-generated Next.js app. Build a production-grade SaaS billing stack with Cloudflare Workers and Supabase from scratch."
+tags: ["rork", "stripe", "saas", "nextjs", "cloudflare-workers", "supabase", "subscription", "monetization"]
+highlights:
+  - "Implement Stripe monthly subscriptions, one-time purchases, and webhooks in a Rork-generated Next.js app with complete working code"
+  - "Design a scalable SaaS billing stack using Cloudflare Workers, Supabase, and Stripe in a three-layer architecture"
+  - "Handle payment events via webhooks, manage subscription status, and implement cancellation and downgrade flows with production-ready patterns"
+---
+
+Building an app with Rork is one thing. Building the infrastructure to charge for it is another. Stripe makes billing manageable, but wiring it into a Next.js + Cloudflare Workers setup requires getting a few things right that aren't obvious from the docs.
+
+This is the complete implementation — Checkout sessions, Webhooks, Supabase state management, and Customer Portal — with production-ready code for each layer.
+
+## Architecture Overview
+
+```
+Rork Max (Next.js output)
+    ├── Frontend
+    │   ├── /membership — Pricing page
+    │   ├── /api/checkout — Create Stripe Checkout session
+    │   ├── /api/webhook — Receive Stripe Webhook events
+    │   └── /api/verify-session — Confirm purchase after redirect
+    │
+    ├── Supabase
+    │   ├── subscriptions — Active subscription state
+    │   ├── purchases — One-time article purchases
+    │   └── payment_failures — Failed payment log
+    │
+    └── Stripe
+        ├── Products + Prices
+        ├── Checkout Sessions
+        └── Customer Portal
+```
+
+## Step 1: Stripe Products and Prices
+
+Set up your products with the Stripe CLI during development:
+
+```bash
+# Monthly subscription (Pro)
+stripe prices create \
+  --currency=usd \
+  --unit-amount=500 \
+  --recurring[interval]=month \
+  --product-data[name]="Pro Plan" \
+  --lookup-key=pro_monthly_usd
+
+# Annual subscription (20% off monthly)
+stripe prices create \
+  --currency=usd \
+  --unit-amount=4800 \
+  --recurring[interval]=year \
+  --product-data[name]="Pro Plan" \
+  --lookup-key=pro_yearly_usd
+
+# One-time premium article purchase
+stripe prices create \
+  --currency=usd \
+  --unit-amount=175 \
+  --product-data[name]="Premium Article" \
+  --lookup-key=article_single_usd
+```
+
+Store the resulting Price IDs in environment variables:
+
+```typescript
+// src/config/pricing.ts
+export const STRIPE_PRICES = {
+  pro_monthly: process.env.STRIPE_PRICE_PRO_MONTHLY!,
+  pro_yearly:  process.env.STRIPE_PRICE_PRO_YEARLY!,
+} as const;
+
+export const DISPLAY_PRICES = {
+  pro_monthly: { jpy: 580,  usd: 5   },
+  pro_yearly:  { jpy: 5568, usd: 48  },
+  article:     { jpy: 250,  usd: 1.75 },
+} as const;
+```
+
+## Step 2: Checkout Session API
+
+```typescript
+// app/api/checkout/route.ts
+import Stripe from "stripe";
+import { NextRequest, NextResponse } from "next/server";
+import { STRIPE_PRICES } from "@/config/pricing";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-04-30",
+});
+
+export async function POST(request: NextRequest) {
+  const body = await request.json();
+  const { plan_type, locale, article_slug, user_email } = body;
+
+  const VALID_PLAN_TYPES = ["pro_monthly", "pro_yearly", "article"] as const;
+  type PlanType = typeof VALID_PLAN_TYPES[number];
+
+  if (!VALID_PLAN_TYPES.includes(plan_type as PlanType)) {
+    return NextResponse.json({ error: "Invalid plan_type" }, { status: 400 });
+  }
+
+  // Find or create Stripe Customer
+  let customerId: string | undefined;
+  if (user_email) {
+    const existing = await stripe.customers.list({ email: user_email, limit: 1 });
+    customerId = existing.data[0]?.id
+      ?? (await stripe.customers.create({ email: user_email })).id;
+  }
+
+  const baseUrl = process.env.NEXT_PUBLIC_SITE_URL!;
+  const isSubscription = plan_type === "pro_monthly" || plan_type === "pro_yearly";
+
+  const lineItems = isSubscription
+    ? [{ price: STRIPE_PRICES[plan_type as "pro_monthly" | "pro_yearly"], quantity: 1 }]
+    : [{
+        price_data: {
+          currency: locale === "ja" ? "jpy" : "usd",
+          product_data: {
+            name: locale === "ja" ? "プレミアム記事" : "Premium Article",
+            description: locale === "ja"
+              ? "単記事の永久アクセス権"
+              : "Lifetime access to this premium article",
+            images: [`${baseUrl}/images/stripe-product.png`],
+          },
+          unit_amount: locale === "ja" ? 250 : 175,
+        },
+        quantity: 1,
+      }];
+
+  const session = await stripe.checkout.sessions.create({
+    customer: customerId,
+    mode: isSubscription ? "subscription" : "payment",
+    line_items: lineItems,
+    success_url: `${baseUrl}/${locale}/verify-session?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${baseUrl}/${locale}/membership`,
+    metadata: {
+      plan_type,
+      article_slug: article_slug ?? "",
+      locale,
+    },
+  });
+
+  return NextResponse.json({ url: session.url });
+}
+```
+
+## Step 3: Webhook Handler
+
+This is where subscription state gets persisted to Supabase. The webhook must handle both the initial checkout completion and ongoing subscription lifecycle events:
+
+```typescript
+// app/api/webhook/route.ts
+import Stripe from "stripe";
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-04-30",
+});
+
+// Required for Cloudflare Workers / Edge Runtime
+export const runtime = "edge";
+
+export async function POST(request: NextRequest) {
+  const body = await request.text();
+  const sig = request.headers.get("stripe-signature");
+
+  if (!sig) return NextResponse.json({ error: "Missing signature" }, { status: 400 });
+
+  let event: Stripe.Event;
+  try {
+    // Use async version — synchronous constructEvent doesn't work in Edge Runtime
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET!,
+    );
+  } catch (err) {
+    console.error("Webhook verification failed:", err);
+    return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
+  }
+
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  );
+
+  switch (event.type) {
+    case "checkout.session.completed":
+      await handleCheckoutCompleted(event.data.object as Stripe.CheckoutSession, supabase, stripe);
+      break;
+    case "customer.subscription.updated":
+      await handleSubscriptionUpdated(event.data.object as Stripe.Subscription, supabase);
+      break;
+    case "customer.subscription.deleted":
+      await handleSubscriptionDeleted(event.data.object as Stripe.Subscription, supabase);
+      break;
+    case "invoice.payment_failed":
+      await handlePaymentFailed(event.data.object as Stripe.Invoice, supabase);
+      break;
+  }
+
+  return NextResponse.json({ received: true });
+}
+
+async function handleCheckoutCompleted(
+  session: Stripe.CheckoutSession,
+  supabase: ReturnType<typeof createClient>,
+  stripe: Stripe,
+) {
+  const { plan_type, article_slug } = session.metadata ?? {};
+  const email = session.customer_email ?? session.customer_details?.email;
+  if (!email) return;
+
+  if (plan_type === "pro_monthly" || plan_type === "pro_yearly") {
+    const sub = await stripe.subscriptions.retrieve(session.subscription as string);
+
+    await supabase.from("subscriptions").upsert({
+      email,
+      stripe_customer_id: session.customer as string,
+      stripe_subscription_id: sub.id,
+      plan_type,
+      status: sub.status,
+      current_period_start: new Date(sub.current_period_start * 1000).toISOString(),
+      current_period_end:   new Date(sub.current_period_end * 1000).toISOString(),
+      cancel_at_period_end: sub.cancel_at_period_end,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "email" });
+
+  } else if (plan_type === "article" && article_slug) {
+    await supabase.from("purchases").insert({
+      email,
+      article_slug,
+      stripe_session_id: session.id,
+      purchased_at: new Date().toISOString(),
+    });
+  }
+}
+
+async function handleSubscriptionUpdated(
+  sub: Stripe.Subscription,
+  supabase: ReturnType<typeof createClient>,
+) {
+  await supabase
+    .from("subscriptions")
+    .update({
+      status: sub.status,
+      current_period_end:   new Date(sub.current_period_end * 1000).toISOString(),
+      cancel_at_period_end: sub.cancel_at_period_end,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("stripe_subscription_id", sub.id);
+}
+
+async function handleSubscriptionDeleted(
+  sub: Stripe.Subscription,
+  supabase: ReturnType<typeof createClient>,
+) {
+  await supabase
+    .from("subscriptions")
+    .update({ status: "canceled", cancel_at_period_end: false, updated_at: new Date().toISOString() })
+    .eq("stripe_subscription_id", sub.id);
+}
+
+async function handlePaymentFailed(
+  invoice: Stripe.Invoice,
+  supabase: ReturnType<typeof createClient>,
+) {
+  if (!invoice.customer_email) return;
+  await supabase.from("payment_failures").insert({
+    email: invoice.customer_email,
+    stripe_invoice_id: invoice.id,
+    amount: invoice.amount_due,
+    failed_at: new Date().toISOString(),
+  });
+}
+```
+
+## Step 4: Subscription Status Checking
+
+```typescript
+// src/lib/subscription.ts
+import { createClient } from "@supabase/supabase-js";
+
+export type SubscriptionStatus = {
+  is_pro: boolean;
+  plan_type: string | null;
+  expires_at: string | null;
+  cancel_at_period_end: boolean;
+};
+
+export async function getSubscriptionStatus(email: string): Promise<SubscriptionStatus> {
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  );
+
+  const { data } = await supabase
+    .from("subscriptions")
+    .select("plan_type, status, current_period_end, cancel_at_period_end")
+    .eq("email", email)
+    .single();
+
+  const isActive = data?.status === "active" || data?.status === "trialing";
+  const notExpired = data?.current_period_end
+    ? new Date(data.current_period_end) > new Date()
+    : false;
+
+  return {
+    is_pro: isActive && notExpired,
+    plan_type: data?.plan_type ?? null,
+    expires_at: data?.current_period_end ?? null,
+    cancel_at_period_end: data?.cancel_at_period_end ?? false,
+  };
+}
+
+export async function getArticleAccess(email: string, slug: string): Promise<boolean> {
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  );
+
+  const { data } = await supabase
+    .from("purchases")
+    .select("id")
+    .eq("email", email)
+    .eq("article_slug", slug)
+    .single();
+
+  return data !== null;
+}
+```
+
+## Step 5: Customer Portal
+
+Let Stripe handle plan changes, cancellations, and payment method updates through their hosted portal:
+
+```typescript
+// app/api/customer-portal/route.ts
+import Stripe from "stripe";
+import { NextRequest, NextResponse } from "next/server";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2025-04-30",
+});
+
+export async function POST(request: NextRequest) {
+  const { customer_id, locale } = await request.json();
+
+  const session = await stripe.billingPortal.sessions.create({
+    customer: customer_id,
+    return_url: `${process.env.NEXT_PUBLIC_SITE_URL}/${locale}/membership`,
+  });
+
+  return NextResponse.json({ url: session.url });
+}
+```
+
+This eliminates the need to build cancellation and plan change UI yourself. Stripe's portal handles it, and your webhook catches the resulting events to update Supabase.
+
+## Supabase Schema
+
+```sql
+-- subscriptions
+CREATE TABLE subscriptions (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  email text UNIQUE NOT NULL,
+  stripe_customer_id text,
+  stripe_subscription_id text UNIQUE,
+  plan_type text,
+  status text,
+  current_period_start timestamptz,
+  current_period_end timestamptz,
+  cancel_at_period_end boolean DEFAULT false,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+-- purchases (one-time articles)
+CREATE TABLE purchases (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  email text NOT NULL,
+  article_slug text NOT NULL,
+  stripe_session_id text UNIQUE,
+  purchased_at timestamptz DEFAULT now(),
+  UNIQUE(email, article_slug)
+);
+
+-- payment_failures
+CREATE TABLE payment_failures (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  email text,
+  stripe_invoice_id text,
+  amount integer,
+  failed_at timestamptz DEFAULT now()
+);
+
+-- Enable RLS on all tables
+ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE purchases ENABLE ROW LEVEL SECURITY;
+
+-- Only service role has write access (app uses service role key server-side)
+CREATE POLICY "Service role only" ON subscriptions FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "Service role only" ON purchases FOR ALL USING (auth.role() = 'service_role');
+```
+
+## Cloudflare Workers: Key Differences from Node.js
+
+Two things that differ specifically in the Cloudflare Workers / Edge Runtime environment:
+
+**Use `constructEventAsync` for webhook verification.** The synchronous `stripe.webhooks.constructEvent()` relies on Node.js crypto APIs that aren't available in Edge Runtime. Always use the async version.
+
+**Set `export const runtime = "edge"` on the webhook route.** Without this, Next.js will try to run it in Node.js mode, which creates issues in the Workers environment.
+
+```bash
+# wrangler.toml or Cloudflare Dashboard — required variables
+STRIPE_SECRET_KEY=sk_live_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_PRICE_PRO_MONTHLY=price_...
+STRIPE_PRICE_PRO_YEARLY=price_...
+SUPABASE_URL=https://xxxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
+NEXT_PUBLIC_SITE_URL=https://yoursite.com
+```
+
+## Combining Web SaaS with Mobile IAP
+
+If you're running both a web app and a mobile app (common for Rork developers), use email address as the shared key between the two billing systems. A user who subscribes via the web should get access in the mobile app, and vice versa.
+
+The pattern: authenticate the user by email in both apps, then check both `subscriptions` (Stripe web) and RevenueCat (mobile IAP) for active access. Whichever is active, grant access. This unified check can live in a shared edge function or a Supabase RPC call.
+
+The implementation takes a weekend to build and handles everything from free trial through cancellation to win-back offers. It's the foundation that makes everything else — pricing experiments, churn analysis, revenue forecasting — possible to build on top of.
+
+I hope this gives you a solid starting point. Good luck shipping.
