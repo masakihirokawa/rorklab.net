@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "IO2026ANDROID — Google I/O 2026（5/19-20）で Android 17 と Gemini 深統合、アプリ開発エコシステムへの影響に注目",
-    "APPBOOM — 2026年4月のアプリリリース数が前年比104%増、AI アプリビルダーが市場拡大を牽引",
-    "RORK15M — Rork が 1,500 万ドルのシード調達、月間 74 万訪問・成長率 85% で首位（4/9）",
-    "RORKMAX — Rork Max が Web 初の Swift アプリビルダー、2 週間で年間収益 2 倍を達成",
-    "PAPERLINE — Rork が App Builder の Paperline を買収、さらなる買収も積極的に検討中",
-    "WRESTLEAI — 18 歳の大学生が Rork で WrestleAI を構築、月収 3 万ドル超を達成",
+    "RORKFUND — Rorkが$1500万シード資金調達、Left Lane Capital主導・Peak XV/a16z Speedrun参加（4月）",
+    "RORKMAX — Rork Max: Claude Code + Opus 4.7搭載でネイティブSwiftアプリを1プロンプトで生成",
+    "PAPERLINE — RorkがPaperlineを買収、エンジニアリング人材確保で複雑UI・バックエンド対応を加速",
+    "LOVABLE — LovableがバイブコーディングアプリをiOS/Androidでリリース、競争激化（4/28）",
+    "GOOGLEIO — Google I/O 2026が5月19日開幕、Flutter・Firebase・Android 新機能の発表に注目（5月）",
+    "GARTNER70 — Gartner予測: 2026年末までに新規ビジネスアプリの70%がローコード・ノーコード化",
   ],
   en: [
-    "IO2026ANDROID — Google I/O 2026 (May 19-20): Android 17 + Gemini deep integration — big news for app devs",
-    "APPBOOM — App releases up 104% YoY in April 2026 — AI builders like Rork are fueling the surge",
-    "RORK15M — Rork raises $15M seed, hits 743K monthly visits with 85% growth rate (4/9)",
-    "RORKMAX — Rork Max: the web's first Swift app builder, doubling annual revenue in just 2 weeks",
-    "PAPERLINE — Rork acquires app builder Paperline and stays actively acquisitive for engineering talent",
-    "WRESTLEAI — An 18-year-old student built WrestleAI with Rork and earns over $30K/month",
+    "RORKFUND — Rork raises $15M seed led by Left Lane Capital with Peak XV & a16z Speedrun (Apr)",
+    "RORKMAX — Rork Max: Claude Code + Opus 4.7 generates native SwiftUI apps from one prompt",
+    "PAPERLINE — Rork acquires Paperline to accelerate complex UI & backend API development",
+    "LOVABLE — Lovable launches vibe-coding iOS/Android app, intensifying no-code competition (4/28)",
+    "GOOGLEIO — Google I/O 2026 opens May 19 with Flutter, Firebase & Android announcements",
+    "GARTNER70 — Gartner: 70% of new business apps via low-code/no-code platforms by year-end 2026",
   ],
 };
 
