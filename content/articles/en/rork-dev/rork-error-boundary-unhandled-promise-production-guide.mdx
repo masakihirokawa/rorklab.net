@@ -1,0 +1,247 @@
+---
+title: "Killing the Silent Crash in Rork-Generated Apps — A Practical Error Boundary and Unhandled Promise Setup"
+slug: "rork-error-boundary-unhandled-promise-production-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-07T12:56"
+updated: "2026-05-07T12:56"
+author: "Rork Lab"
+description: "Rork-generated code tends to swallow errors with optional chaining and leave promise rejections uncaught. Here is the minimum production-grade setup to surface those crashes instead of letting users churn in silence."
+tags: ["Rork", "Error Boundary", "React Native", "Expo", "Sentry", "Production"]
+---
+
+The day after I shipped the first Rork-generated build to TestFlight, my Crashlytics dashboard quietly filled up with rows that all looked the same: `JavaScriptError: undefined is not an object`, stack trace `<anonymous>` all the way down. Dozens of users every day. No reproducible path. I burned three days trying to chase it.
+
+Once I dug in, I realized the problem was structural: the patterns Rork tends to generate clash with how React Native propagates errors. The code is meticulous about `?.` optional chaining, but the awaited async calls inside `useEffect` blocks are essentially fire-and-forget. Any exception they throw vanishes — the JS thread silently dies, the screen freezes, and the user uninstalls.
+
+This article distills the minimum Error Boundary + Unhandled Promise Rejection setup I now apply to every Rork app before it leaves my laptop. If you ship AI-generated code to real users, this is the safety net you want in place before the first 1-star review arrives.
+
+## Why Rork-generated code crashes silently more often than you'd expect
+
+Rork outputs React Native + Expo code, but its idioms have a few consistent biases:
+
+- It defends with `?.` and `??` rather than `try/catch` (the "swallow before it throws" school of thought)
+- It runs async work inside `useEffect` as fire-and-forget calls
+- Error UI tends to be inline `<Text>` swaps instead of dedicated fallback screens
+
+When the network is shaky on a real device, those biases combine into a specific failure mode: the screen renders successfully, then locks. Users tap, nothing happens. Crashlytics sees nothing useful. They quietly delete the app.
+
+The most common offender I see in Rork output is a pattern that looks defensible at a glance:
+
+```tsx
+useEffect(() => {
+  loadProfile();
+}, []);
+
+const loadProfile = async () => {
+  const data = await api.get('/profile');
+  setName(data?.user?.name ?? '');
+  setAvatar(data?.user?.avatar?.url ?? '');
+};
+```
+
+Two things go wrong. First, `loadProfile` is fire-and-forget — if `api.get` throws, the rejection is unhandled. Second, even when the response succeeds, `data` itself can be `undefined` on a 401, and the `?.` chain silently produces empty strings instead of telling the user they were signed out. The screen renders, the user is confused, and your error monitoring sees nothing.
+
+Across the apps I run — about 50 million combined downloads — this silent failure has been the single biggest driver of one-star reviews. The good news is that closing this gap visibly improves your store rating. The infrastructure to do it is small. If you want the foundation first, the companion piece [Error handling and crash prevention basics for Rork apps](/en/articles/rork-dev/rork-error-handling-crash-prevention-basics) covers the try/catch fundamentals this article builds on.
+
+## Error Boundary is your last line of defense — install it first
+
+React Native does not ship a built-in Error Boundary. You either write a class component that implements `componentDidCatch` yourself, or you reach for `react-error-boundary`. In 2026 the package is by far the easier option: function-component friendly, with a clean reset mechanism.
+
+```tsx
+// app/_layout.tsx — wrap the root once and forget it
+import { ErrorBoundary } from 'react-error-boundary';
+import { Stack } from 'expo-router';
+import { Text, View, Pressable, StyleSheet } from 'react-native';
+
+function FallbackScreen({ error, resetErrorBoundary }: {
+  error: Error;
+  resetErrorBoundary: () => void;
+}) {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Something went wrong</Text>
+      <Text style={styles.message}>{error.message}</Text>
+      <Pressable style={styles.button} onPress={resetErrorBoundary}>
+        <Text style={styles.buttonText}>Try again</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+export default function RootLayout() {
+  return (
+    <ErrorBoundary
+      FallbackComponent={FallbackScreen}
+      onError={(error, info) => {
+        // Forward to Sentry/Crashlytics from here
+        console.error('[ErrorBoundary]', error, info.componentStack);
+      }}
+    >
+      <Stack />
+    </ErrorBoundary>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  title: { fontSize: 18, fontWeight: '600', marginBottom: 12 },
+  message: { fontSize: 14, color: '#666', marginBottom: 24, textAlign: 'center' },
+  button: { backgroundColor: '#000', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
+  buttonText: { color: '#fff', fontWeight: '600' },
+});
+
+// Expected behavior: any render-time throw inside the Stack is caught.
+// The user sees "Try again" instead of a frozen screen.
+// Calling resetErrorBoundary remounts the subtree.
+```
+
+Wrap the entire `Stack` in a single boundary. It is tempting to scope boundaries per route in expo-router, but transitions themselves can throw, and a top-level boundary catches more in practice.
+
+Routing the failure through the `onError` callback also means you can swap Sentry in or out later without changing the call sites.
+
+### expo-router v3+ supports a per-route `ErrorBoundary` export
+
+Expo Router v3 added support for exporting an `ErrorBoundary` named export from any route file, scoping fallback UI to that subtree:
+
+```tsx
+// app/(tabs)/profile.tsx
+export { ErrorBoundary } from 'expo-router';
+// You can replace it with your own component when you need a tailored UI
+```
+
+In production I keep the global `react-error-boundary` at the root and add per-route boundaries only for screens where a quick reset is genuinely useful — typically heavy form screens like profile editors.
+
+## Error Boundary cannot catch unhandled promise rejections
+
+This is the part that bites Rork users specifically. **Error Boundary only catches exceptions thrown during render.** Anything that escapes a `useEffect`-spawned async call slips past it.
+
+```tsx
+// This will NOT be caught by ErrorBoundary
+useEffect(() => {
+  fetch('/api/me')
+    .then(r => r.json())
+    .then(data => setUser(data.user.profile.name)); // TypeError if user is null
+}, []);
+```
+
+In React Native, those rejections show up in `LogBox` during development, but `LogBox` is disabled in production. The user sees nothing. JS state silently corrupts.
+
+The fix is a global handler combined with the rejection tracker that React Native already ships internally:
+
+```tsx
+// utils/installGlobalErrorHandlers.ts
+import { Platform } from 'react-native';
+
+type ErrorReporter = (error: unknown, isFatal: boolean) => void;
+
+export function installGlobalErrorHandlers(report: ErrorReporter) {
+  // 1) Synchronous fatal JS errors
+  const defaultHandler = ErrorUtils.getGlobalHandler();
+  ErrorUtils.setGlobalHandler((error, isFatal) => {
+    report(error, !!isFatal);
+    defaultHandler(error, isFatal);
+  });
+
+  // 2) Unhandled promise rejections
+  const tracking = require('promise/setimmediate/rejection-tracking');
+  tracking.enable({
+    allRejections: true,
+    onUnhandled: (id: number, error: unknown) => {
+      report(error, false);
+    },
+    onHandled: () => {
+      // A rejection that was caught later — safe to ignore
+    },
+  });
+
+  if (__DEV__ && Platform.OS !== 'web') {
+    // Optional: surface the rejection in dev so you notice it
+  }
+}
+
+// Call once from the very top of app/_layout.tsx:
+// installGlobalErrorHandlers((err, fatal) => sendToSentry(err, { fatal }));
+```
+
+`ErrorUtils` is on the React Native global but lacks a TypeScript declaration; either add a global `.d.ts` or cast through `(global as any).ErrorUtils`. The `promise/setimmediate/rejection-tracking` module is bundled with React Native — no extra install required.
+
+The first week I shipped this handler, our Sentry inbound tripled. Errors that had been hiding finally surfaced. It is uncomfortable to look at, but it is the real number.
+
+## Sentry or Crashlytics for a Rork app?
+
+If you can run both, do. If you are a solo developer with limited time, install Sentry first. Sentry is simply better at structuring JavaScript-layer errors, and Rork apps are mostly JavaScript:
+
+```tsx
+// app/_layout.tsx
+import * as Sentry from '@sentry/react-native';
+
+Sentry.init({
+  dsn: 'https://YOUR_SENTRY_DSN@o0.ingest.sentry.io/0',
+  enableNative: true,
+  enableNativeCrashHandling: true,
+  tracesSampleRate: 0.1,
+  beforeSend(event) {
+    // Strip auth headers before they leave the device
+    if (event.request?.headers) delete event.request.headers['Authorization'];
+    return event;
+  },
+});
+
+const report = (error: unknown, isFatal: boolean) => {
+  Sentry.captureException(error, { tags: { isFatal: String(isFatal) } });
+};
+```
+
+Keep `enableNative: true` on. Rork ships its builds with Hermes by default, and Hermes can throw native crashes that the JS-only path will miss. Disabling native handling means losing roughly half of the silent crashes you came to fix.
+
+Crashlytics earns its place once your Android volume grows — its native crash aggregation is excellent. But I would not start with it. The Sentry setup itself is documented in [Setting up Sentry crash monitoring for Rork](/en/articles/rork-dev/rork-sentry-crash-monitoring-setup-guide) — refer to it when you are ready to wire up DSNs and source maps.
+
+## Three implementation traps worth knowing in advance
+
+A few details that only show up once the code is running:
+
+1. **`__DEV__` does not bypass `LogBox`.** Even with `react-error-boundary` and `onError` wired up, the development red-screen still appears in development. To verify the production behavior, run a release build through TestFlight or `eas build --profile preview`.
+2. **Throwing inside `onError` recurses.** If your Sentry call fails and you re-throw, the boundary itself errors out and the fallback UI never renders. Wrap the body of `onError` in a `try/catch` or rely on `captureException` swallowing transport failures.
+3. **`resetErrorBoundary` does not clear external state.** Error Boundary unmounts and remounts its subtree. Whatever you stored in Zustand or Jotai persists. If your error came from corrupt store data, you will loop straight back into the fallback. Reset the store inside the retry handler.
+
+I lost half a day to trap #3 — a corrupted user object kept hydrating the new mount, the boundary fired again, and the "Try again" button effectively did nothing.
+
+There is a subtler fourth trap worth mentioning if you use `expo-router` with a Tabs layout. The root `<Stack />` you wrap with the boundary lives outside the tab navigator state, so a render error inside one tab does not lose the user's place in the other tabs — but **only** if you keep the boundary above the tab navigator. Boundaries placed inside `(tabs)/_layout.tsx` will reset all tabs together, which usually surprises users. If you need per-tab recovery, place a per-route `ErrorBoundary` export on each tab leaf instead of wrapping the layout.
+
+
+## Verifying the safety net actually fires
+
+Before you ship, write the smallest possible test that proves each layer works. I keep a hidden developer route in every project that triggers each kind of failure, accessible only when an environment flag is set:
+
+```tsx
+// app/_dev/error-test.tsx — only registered when EXPO_PUBLIC_DEV_TOOLS=1
+import { Pressable, View, Text } from 'react-native';
+
+export default function ErrorTest() {
+  return (
+    <View>
+      <Pressable onPress={() => { throw new Error('render-time test'); }}>
+        <Text>Throw during render</Text>
+      </Pressable>
+      <Pressable onPress={async () => { await Promise.reject(new Error('async test')); }}>
+        <Text>Reject a promise</Text>
+      </Pressable>
+      <Pressable onPress={() => { setTimeout(() => { throw new Error('timer test'); }, 0); }}>
+        <Text>Throw inside setTimeout</Text>
+      </Pressable>
+    </View>
+  );
+}
+```
+
+When you tap each button on a release build, the boundary should catch the first one, your global rejection handler should report the second, and the global error handler should report the third. If any of them slips through silently, your wiring is incomplete. Spending fifteen minutes on this dev route once has saved me from shipping broken instrumentation more times than I want to admit.
+
+## Start with one wrapper in `_layout.tsx`
+
+You do not need to install the entire stack at once. The single highest-leverage change is wrapping `<Stack />` in `<ErrorBoundary>` and shipping that. From the first build, the "frozen white screen" experience your users hate the most goes away.
+
+A reasonable rollout order looks like this. Day one: install `react-error-boundary`, wrap the Stack, ship a minimal fallback screen. Day two: add the global rejection tracker and verify it surfaces something in development by deliberately throwing inside a `useEffect`. Day three: install Sentry, route both the boundary's `onError` and the global handler through `Sentry.captureException`, and upload your first source map via `eas build` so the stack traces are readable. From there it becomes maintenance work — reviewing real errors as they come in and tightening the loose `?.` chains that were hiding them.
+
+If your app is already locking on a white screen today, the diagnostic flow in [Debugging the white-screen crash in Rork apps](/en/articles/rork-dev/rork-app-crash-white-screen-debug-guide) is the fastest way to narrow down whether you are looking at a JS-side error, a native module mismatch, or a routing failure — read it alongside this guide. Add the global rejection handler and Sentry the following weekend. React Native error propagation has its quirks, but once these patterns live in your codebase, you will reuse them on every project that follows. Thanks for reading — I hope this saves you the three days I lost the first time.
