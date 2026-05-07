@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORKFUND — Rorkが$1500万シード資金調達、Left Lane Capital主導・Peak XV/a16z Speedrun参加（4月）",
-    "RORKMAX — Rork Max: Claude Code + Opus 4.7搭載でネイティブSwiftアプリを1プロンプトで生成",
-    "PAPERLINE — RorkがPaperlineを買収、エンジニアリング人材確保で複雑UI・バックエンド対応を加速",
-    "LOVABLE — LovableがバイブコーディングアプリをiOS/Androidでリリース、競争激化（4/28）",
-    "GOOGLEIO — Google I/O 2026が5月19日開幕、Flutter・Firebase・Android 新機能の発表に注目（5月）",
-    "GARTNER70 — Gartner予測: 2026年末までに新規ビジネスアプリの70%がローコード・ノーコード化",
+    "FUNDING — Rorkが$1500万シード調達、Left Lane Capital主導・Peak XV・True Ventures・a16z参加（2026）",
+    "RORKMAX — Rork Max登場、Claude Code + Opus 4.7でネイティブSwiftUIアプリを1プロンプトで生成（2月）",
+    "NATIVE — React NativeではなくSwiftで真のネイティブiOSアプリを生成、AR・3D・HealthKit等に対応（2月）",
+    "PAPERLINE — RorkがPaperlineを買収、エンジニアリング人材強化・複雑UI対応を加速（2026）",
+    "NOCODE75 — Gartner予測: 2026年末までに新規アプリの75%がローコード/ノーコードで開発される（2026）",
+    "GOOGLEIO — Google I/O 2026が5月19日開幕、Flutter・Firebase・Androidの大規模アップデートに注目（5月）",
   ],
   en: [
-    "RORKFUND — Rork raises $15M seed led by Left Lane Capital with Peak XV & a16z Speedrun (Apr)",
-    "RORKMAX — Rork Max: Claude Code + Opus 4.7 generates native SwiftUI apps from one prompt",
-    "PAPERLINE — Rork acquires Paperline to accelerate complex UI & backend API development",
-    "LOVABLE — Lovable launches vibe-coding iOS/Android app, intensifying no-code competition (4/28)",
-    "GOOGLEIO — Google I/O 2026 opens May 19 with Flutter, Firebase & Android announcements",
-    "GARTNER70 — Gartner: 70% of new business apps via low-code/no-code platforms by year-end 2026",
+    "FUNDING — Rork raises $15M seed led by Left Lane Capital with Peak XV, True Ventures & a16z (2026)",
+    "RORKMAX — Rork Max: build native SwiftUI apps in one prompt powered by Claude Code + Opus 4.7 (Feb)",
+    "NATIVE — True native Swift apps (not React Native): AR, 3D, HealthKit, Dynamic Island & more (Feb)",
+    "PAPERLINE — Rork acquires Paperline for engineering talent to accelerate complex UI & API support (2026)",
+    "NOCODE75 — Gartner: 75% of new apps will be built with low-code/no-code tools by end of 2026",
+    "GOOGLEIO — Google I/O 2026 opens May 19 with major Flutter, Firebase & Android updates expected",
   ],
 };
 
