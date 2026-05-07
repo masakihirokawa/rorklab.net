@@ -25,10 +25,8 @@ interface Props {
 }
 
 /* ── Metadata ── */
-export async function generateMetadata({ params, searchParams }: Props): Promise<Metadata> {
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale, tag } = await params;
-  const sp = await searchParams;
-  const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
   const decoded = decodeURIComponent(tag);
   const title = locale === "ja" ? `「${decoded}」の記事一覧` : `Articles tagged "${decoded}"`;
   const description =
@@ -36,33 +34,12 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
       ? `Rork Lab の「${decoded}」タグが付いた記事を一覧で閲覧できます。`
       : `Browse all Rork Lab articles tagged with "${decoded}".`;
 
-  const base = "https://rorklab.net";
-  const encoded = encodeURIComponent(decoded);
-  const metadata: Metadata = {
+  return {
     title,
     description,
     openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
-    alternates: {
-      canonical: locale === "ja" ? `${base}/tag/${encoded}` : `${base}/en/tag/${encoded}`,
-      languages: (() => {
-        const otherLocale = locale === "ja" ? "en" : "ja";
-        const otherArticles = getArticles(otherLocale);
-        const tagExistsInOther = otherArticles.some((a) =>
-          (a.tags || []).some((t) => t.toLowerCase() === decoded.toLowerCase())
-        );
-        const langs: Record<string, string> = {};
-        langs[locale] = locale === "ja" ? `${base}/tag/${encoded}` : `${base}/en/tag/${encoded}`;
-        if (tagExistsInOther) {
-          langs[otherLocale] = otherLocale === "ja" ? `${base}/tag/${encoded}` : `${base}/en/tag/${encoded}`;
-          langs["x-default"] = `${base}/en/tag/${encoded}`;
-        }
-        return langs;
-      })(),
-    },
+    robots: { index: false, follow: true },
   };
-
-  // Pagination: rely on canonical (to page 1) instead of noindex for GSC compatibility
-  return metadata;
 }
 
 /* ── Page ── */
