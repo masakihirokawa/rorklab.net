@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — Rorkが$1500万シード調達、Left Lane Capital主導・Peak XV・True Ventures・a16z参加（2026）",
-    "RORKMAX — Rork Max登場、Claude Code + Opus 4.7でネイティブSwiftUIアプリを1プロンプトで生成（2月）",
-    "NATIVE — React NativeではなくSwiftで真のネイティブiOSアプリを生成、AR・3D・HealthKit等に対応（2月）",
-    "PAPERLINE — RorkがPaperlineを買収、エンジニアリング人材強化・複雑UI対応を加速（2026）",
-    "NOCODE75 — Gartner予測: 2026年末までに新規アプリの75%がローコード/ノーコードで開発される（2026）",
-    "GOOGLEIO — Google I/O 2026が5月19日開幕、Flutter・Firebase・Androidの大規模アップデートに注目（5月）",
+    "RORK15M — Rork が $1500 万シードを調達、Left Lane Capital 主導・a16z Speedrun も参加（4/10）",
+    "RORKMAX — Rork Max が Claude Opus 4.6 ベースで Swift native アプリを量産、ARR 短期間で倍増（5月）",
+    "CLOUDCOMPILE — Rork Max Cloud Compile が Mac 不要に、クラウド Mac 上で署名・配布まで完結（4〜5月）",
+    "LOVABLEAPP — Lovable iOS/Android リリース、バイブコーディング競合がスマホ完結に（4/28）",
+    "STITCHFLOW — Stitch でデザイン → Antigravity で設計 → Rork Max でアプリ完成のフルパス確立（5月）",
+    "WWDC2026 — Apple WWDC 2026 が 6/8 開催、iOS 27 Siri に Claude・Gemini・ChatGPT が統合（6月）",
   ],
   en: [
-    "FUNDING — Rork raises $15M seed led by Left Lane Capital with Peak XV, True Ventures & a16z (2026)",
-    "RORKMAX — Rork Max: build native SwiftUI apps in one prompt powered by Claude Code + Opus 4.7 (Feb)",
-    "NATIVE — True native Swift apps (not React Native): AR, 3D, HealthKit, Dynamic Island & more (Feb)",
-    "PAPERLINE — Rork acquires Paperline for engineering talent to accelerate complex UI & API support (2026)",
-    "NOCODE75 — Gartner: 75% of new apps will be built with low-code/no-code tools by end of 2026",
-    "GOOGLEIO — Google I/O 2026 opens May 19 with major Flutter, Firebase & Android updates expected",
+    "RORK15M — Rork raises $15M seed led by Left Lane Capital with a16z Speedrun also joining (4/10)",
+    "RORKMAX — Rork Max ships native Swift apps powered by Claude Opus 4.6, ARR doubling quickly (May)",
+    "CLOUDCOMPILE — Rork Max Cloud Compile removes the Mac requirement, signs and ships from the cloud (Apr-May)",
+    "LOVABLEAPP — Lovable launches iOS/Android, bringing vibe coding fully onto the phone (4/28)",
+    "STITCHFLOW — Stitch → Antigravity → Rork Max becomes the canonical AI-native build pipeline (May)",
+    "WWDC2026 — Apple WWDC 2026 on June 8 brings iOS 27, integrating Claude, Gemini, and ChatGPT into Siri (Jun)",
   ],
 };
 
