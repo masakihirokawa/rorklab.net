@@ -14,6 +14,17 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/rork-dev/rork-push-notification-expo-backend-complete-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-max-storekit-2-in-app-purchase", to: "/articles/rork-dev" },
   { from: "/articles/rork-ai/rork-multiplatform-ios-android-complete-guide", to: "/articles/rork-ai" },
+  // 2026-05-09 Tax content removal (backed up to _backup/tax_content_2026-05-09/, migrated to note.com)
+  { from: "/blog/admob-export-exemption-family-loss-app-developer-testimony", to: "/blog" },
+  { from: "/blog/admob-export-tax-exemption-ai-defense", to: "/blog" },
+  { from: "/blog/ai-tax-filing-and-fighting-injustice", to: "/blog" },
+  { from: "/blog/japan-tax-injustice-complete-record", to: "/blog" },
+  { from: "/blog/tax-battle-complete-chronicle", to: "/blog" },
+  { from: "/blog/toyama-darkness-uozu-tax-office-kura-ai-reform", to: "/blog" },
+  { from: "/blog/toyama-tax-office-darkness-systemic-injustice", to: "/blog" },
+  { from: "/blog/toyama-tax-office-kura-recording-refusal-health-crisis", to: "/blog" },
+  { from: "/blog/uozu-tax-office-update-fighting-systemic-injustice", to: "/blog" },
+  { from: "/blog/why-ai-should-replace-tax-officials", to: "/blog" },
 ];
 
 const buildAuditRedirects = () => {
