@@ -1,0 +1,418 @@
+---
+title: "Building a Rork A/B Testing Platform with GrowthBook and PostHog from Scratch"
+slug: "rork-growthbook-posthog-ab-testing-platform"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-09T11:15"
+updated: "2026-05-09T11:15"
+author: "Rork Lab"
+description: "Drop Firebase and pair GrowthBook with PostHog to ship a production-grade A/B testing stack for your Rork apps. SDK wiring, edge evaluation on Cloudflare Workers, Bayesian statistics interpretation, and the operational pitfalls I learned the hard way."
+tags: ["GrowthBook", "PostHog", "A/B Testing", "Feature Flags", "Cloudflare Workers", "Rork", "Experimentation"]
+highlights:
+  - "Wire GrowthBook and PostHog into a Rork app today and run your first real experiment without depending on Firebase"
+  - "Cut feature-flag evaluation latency below 30ms by routing the GrowthBook Edge SDK through Cloudflare Workers"
+  - "Read GrowthBook's Bayesian metrics with confidence and stop calling experiments early just because Chance to Beat hit 95%"
+---
+
+Late 2025, I tried to run a small experiment on my wallpaper app — three different onboarding screens for a paid subscription — using Firebase A/B Testing. I gave up partway through. Three reasons. Reaching the sample size for adequate statistical power would have taken three weeks. Remote Config updates lag behind the rollout, smearing the cohorts. And Firebase's billing got tangled with other features I was already paying for, making it hard to scale up just the experimentation piece.
+
+After trying a few alternatives, the combination that fit my own indie-developer workflow best was **GrowthBook (the experiment engine) paired with PostHog (product analytics)**. Both are open source. Self-hosted, the running cost is the server bill alone. The official SDKs run cleanly on the React Native code Rork generates, and putting Cloudflare Workers in front of GrowthBook for edge evaluation gives more consistently low latency than Firebase Remote Config in my testing.
+
+This article walks through the entire setup I actually use in production: integrating both tools into a Rork app, getting the first experiment running, and the statistics-and-operations details that aren't obvious from the official docs.
+
+## Why GrowthBook + PostHog, Not Firebase
+
+Firebase Remote Config plus Firebase Analytics is the shortest path to your very first A/B test. But once experimentation becomes a regular practice, the limits show up.
+
+The first is the **opacity of the statistics engine**. Firebase A/B Testing uses an internal Bayesian engine whose assumptions you can't tune. Want to set custom priors? Adjust the significance threshold? Apply CUPED (Controlled-experiment Using Pre-Experiment Data) to reduce variance? You're stuck with Firebase's defaults.
+
+The second is the **separation between experiment design and analysis**. Remote Config delivers flags, Analytics collects events, and you bounce between two tools to interpret a running experiment. GrowthBook unifies definition, delivery, and analysis in one dashboard, and when you point it at PostHog as the data source, your existing PostHog events become experiment metrics directly.
+
+The third reason — the one that tipped me over the edge — is **avoiding vendor lock-in through self-hosting**. GrowthBook is MIT-licensed; PostHog's core is MIT/Apache 2.0. Both ship Docker images. GrowthBook Cloud has a free tier for up to 3 users, and PostHog Cloud is free up to 1M events per month. I ran on both clouds for the first six months, then moved GrowthBook alone onto Fly.io once the bill became visible.
+
+## Architecture Overview
+
+The platform has four moving parts.
+
+- **GrowthBook backend**: the admin UI, delivery rules, and statistics engine. Either GrowthBook Cloud or self-hosted on Fly.io / Railway / Hetzner.
+- **GrowthBook Edge SDK on Cloudflare Workers**: the edge layer that delivers feature flags to the Rork app at low latency.
+- **PostHog**: events, funnels, cohorts. Doubles as GrowthBook's metric source.
+- **Rork app (React Native / Expo)**: integrates `@growthbook/growthbook-react` and `posthog-react-native`; sends user identification and exposure logs.
+
+When a user launches the app, Cloudflare Workers serves the latest GrowthBook flag set; exposure events flow into PostHog. The GrowthBook backend then reads PostHog's `$pageview`, `subscription_started`, and similar events, runs Bayesian inference, and tells you which arm wins.
+
+## Step 1: Self-Host GrowthBook on Fly.io
+
+Skip this section if GrowthBook Cloud's free tier is enough. I made the move when PostHog integration started running daily and I wanted tighter control over the data plane. Fly.io's Hobby plan keeps me at $0–3 per month.
+
+```bash
+# Install Fly CLI and log in
+brew install flyctl
+fly auth login
+
+# Clone the official GrowthBook repo
+git clone https://github.com/growthbook/growthbook.git
+cd growthbook
+
+# Create fly.toml
+cat > fly.toml << 'EOF'
+app = "my-rork-growthbook"
+primary_region = "nrt"
+
+[build]
+  image = "growthbook/growthbook:latest"
+
+[env]
+  APP_ORIGIN = "https://my-rork-growthbook.fly.dev"
+  API_HOST = "https://my-rork-growthbook.fly.dev"
+  JWT_SECRET = "GENERATE_WITH_OPENSSL"
+  ENCRYPTION_KEY = "GENERATE_WITH_OPENSSL"
+  MONGODB_URI = "mongodb+srv://..."
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+EOF
+
+# Generate secrets
+openssl rand -base64 32  # JWT_SECRET
+openssl rand -base64 32  # ENCRYPTION_KEY
+
+# Deploy
+fly launch --copy-config --no-deploy
+fly secrets set JWT_SECRET="..." ENCRYPTION_KEY="..." MONGODB_URI="..."
+fly deploy
+```
+
+MongoDB Atlas's free tier (512MB) is plenty. Six months into running my wallpaper app's experimentation workspace, MongoDB usage is still around 80MB.
+
+## Step 2: Connect PostHog as the Experiment Data Source
+
+In the GrowthBook admin UI, go to `Settings > Data Sources` and add PostHog. Issue a "Personal API Key" from PostHog's settings, plug in the Project ID, and you're done.
+
+```typescript
+// Generate the PostHog Personal API Key from
+// Settings > Personal API Keys in the PostHog dashboard.
+// GrowthBook only needs the "query:read" scope, keeping
+// the integration on least-privilege.
+```
+
+Once connected, register PostHog event names as GrowthBook "Metrics". For my app, I use these three.
+
+- `subscription_started` — subscription start. The primary metric for Bayesian inference.
+- `onboarding_completed` — onboarding completion rate. A secondary metric.
+- `app_session_duration` — median session duration. A guardrail metric.
+
+A guardrail metric is the safety valve that says "even if it looks like we won, don't ship if this got worse." I once over-engineered an onboarding screen and saw subscriptions go up — but retention quietly cratered. Since then I always set at least one guardrail.
+
+## Step 3: Place an Edge Evaluation Layer on Cloudflare Workers
+
+GrowthBook's SDK can evaluate flags client-side, but fetching `features.json` from the GrowthBook backend on every cold start adds directly to launch latency — typically 200–400ms round-trip from Japan.
+
+Putting a Cloudflare Workers proxy in front knocks evaluation down to under 30ms. GrowthBook ships an official Edge SDK for Cloudflare, and the wiring is straightforward.
+
+```javascript
+// worker.js — Cloudflare Workers entry point.
+// Built on top of the GrowthBook Edge SDK reference, with
+// minimal additions for header-based origin validation and
+// KV caching.
+import { handleRequest } from "@growthbook/edge-cloudflare";
+
+export default {
+  async fetch(request, env, ctx) {
+    // Lightweight check that requests come from your app
+    const allowedOrigin = request.headers.get("X-App-Bundle-Id");
+    if (allowedOrigin !== env.EXPECTED_BUNDLE_ID) {
+      return new Response("Forbidden", { status: 403 });
+    }
+
+    const config = {
+      apiHost: env.GROWTHBOOK_API_HOST,
+      clientKey: env.GROWTHBOOK_CLIENT_KEY,
+      // Cache features in the KV namespace GROWTHBOOK_FEATURES_KV
+      // TTL set to 60 seconds (drop lower if instant rollout matters)
+      kvCacheTtl: 60,
+    };
+
+    return handleRequest(request, env, config);
+  },
+};
+```
+
+`wrangler.toml` declares the KV binding and environment variables.
+
+```toml
+name = "rork-growthbook-edge"
+main = "worker.js"
+compatibility_date = "2026-04-01"
+
+[[kv_namespaces]]
+binding = "GROWTHBOOK_FEATURES_KV"
+id = "your-kv-namespace-id"
+
+[vars]
+GROWTHBOOK_API_HOST = "https://my-rork-growthbook.fly.dev"
+EXPECTED_BUNDLE_ID = "design.dolice.wallpaper"
+
+# Set GROWTHBOOK_CLIENT_KEY and prod values via wrangler secret put
+```
+
+The KV TTL is a risk dial. I run 60 seconds in steady state and drop it to 10 seconds around launches of high-impact experiments. Going below 10 seconds bumps into Workers' subrequest limits — even on a CDN, there's a floor.
+
+## Step 4: Wire the SDKs into the Rork App
+
+Enable "Native Modules" in Rork's project settings, then install `@growthbook/growthbook-react` and `posthog-react-native`. Rork's React Native projects support Expo prebuild, so no special steps.
+
+```bash
+npx expo install @growthbook/growthbook-react posthog-react-native
+npx expo install react-native-async-storage/async-storage
+```
+
+Initialize both providers at the app root. The non-obvious requirement: **the user identifier (PostHog's `distinctId`) must match GrowthBook's `attributes.id` exactly**. If they drift, exposure logs and conversion events can't be joined, and GrowthBook will indefinitely show "not enough data."
+
+```typescript
+// src/providers/ExperimentProvider.tsx
+// Initializes GrowthBook and PostHog, ensuring both share the
+// same identifier so experiment data joins cleanly downstream.
+import { GrowthBook, GrowthBookProvider } from "@growthbook/growthbook-react";
+import PostHog from "posthog-react-native";
+import { useEffect, useMemo, useState } from "react";
+import { v4 as uuidv4 } from "uuid";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const EDGE_URL = "https://rork-growthbook-edge.workers.dev";
+const POSTHOG_HOST = "https://app.posthog.com";
+
+export const posthog = new PostHog(process.env.EXPO_PUBLIC_POSTHOG_KEY!, {
+  host: POSTHOG_HOST,
+  flushInterval: 30,
+});
+
+export function ExperimentProvider({ children }: { children: React.ReactNode }) {
+  const [userId, setUserId] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      let id = await AsyncStorage.getItem("anon_user_id");
+      if (!id) {
+        id = uuidv4();
+        await AsyncStorage.setItem("anon_user_id", id);
+      }
+      setUserId(id);
+      posthog.identify(id, { app: "rork-wallpaper" });
+    })();
+  }, []);
+
+  const gb = useMemo(() => {
+    if (!userId) return null;
+    return new GrowthBook({
+      apiHost: EDGE_URL,
+      clientKey: process.env.EXPO_PUBLIC_GROWTHBOOK_KEY,
+      attributes: { id: userId, country: "JP" },
+      // Always emit exposure logs into PostHog — the join key.
+      trackingCallback: (experiment, result) => {
+        posthog.capture("$feature_flag_called", {
+          $feature_flag: experiment.key,
+          $feature_flag_response: result.variationId,
+        });
+      },
+    });
+  }, [userId]);
+
+  if (!gb) return null;
+  return <GrowthBookProvider growthbook={gb}>{children}</GrowthBookProvider>;
+}
+```
+
+The `trackingCallback` that fires `$feature_flag_called` into PostHog is the mechanism that ties the two systems together. When you point GrowthBook at PostHog as a data source, this event becomes the exposure log GrowthBook uses to define the eligible population for Bayesian analysis.
+
+## Step 5: Define the First Experiment
+
+In `Experiments > Add Experiment`, create the experiment. Here's the first one I ran on my own app, as a worked example.
+
+- **Hypothesis**: "Adding a 'Try free for 7 days' button to the final onboarding screen will lift subscription start rate."
+- **Feature Flag Key**: `onboarding-cta-7day-trial`
+- **Variations**: `control` (existing) / `treatment` (7-day free CTA)
+- **Targeting**: Japan only (`attributes.country = JP`)
+- **Goal Metric**: `subscription_started` (PostHog event)
+- **Guardrail Metric**: `app_session_duration` (halt if median drops by 5% or more)
+
+In the Rork app, branch with the `useFeatureValue` hook.
+
+```typescript
+// src/screens/OnboardingFinalScreen.tsx
+// Branch with GrowthBook's useFeatureValue.
+// "control" is the default — the few hundred milliseconds before
+// flags load also return this default, so always make the
+// default value the safe path.
+import { useFeatureValue } from "@growthbook/growthbook-react";
+
+export function OnboardingFinalScreen() {
+  const variant = useFeatureValue("onboarding-cta-7day-trial", "control");
+
+  if (variant === "treatment") {
+    return <TrialCtaScreen days={7} />;
+  }
+  return <SubscribeScreen />;
+}
+```
+
+A pitfall I hit early on: `useFeatureValue`'s default value is what you get **before flags load, on network failures, and after the flag is deleted**. When you're rolling out a new feature, **the default must always be `control`**. Flip it the wrong way and a flag-server outage ships your unfinished feature to every user. I narrowly avoided shipping that in production myself.
+
+## Step 6: Reading GrowthBook's Bayesian Output
+
+Once the experiment is running, the dashboard fills with metrics like "Chance to Beat Control," "Risk," and "Probability of Improvement." If you've only seen Frequentist p-values before, this can feel disorienting.
+
+My working interpretation comes down to three rules.
+
+**Chance to Beat Control above 95% is not, by itself, a stop signal.** That number says "the probability treatment is better than control." It says nothing about *how much* better. Read it together with `Risk` — the upper bound of expected value lost if you ship the wrong arm.
+
+**Risk below 0.5% means it's worth considering shipping.** A small Risk number is the system telling you "even if you're wrong, the worst-case cost in your secondary metrics is acceptable."
+
+**Always check that sample size hit the recommended target.** GrowthBook's Bayesian setup supports early stopping in principle, but I still want at least one full week and 2,000 users per arm. The week is to wash out weekday-vs-weekend cohort differences in mobile apps.
+
+"Chance to Beat hit 99%, ship it" is genuinely dangerous. I run a personal rule that nothing ships before either 7 days or 2,000 users per arm, whichever comes first.
+
+## Step 7: Stopping and Cleaning Up Experiments
+
+When you decide to ship, set the flag to 100% rollout, mark the experiment Stopped, then remove the branch from code and promote the treatment to default. Leave the flag itself in the system for a few days. Cloudflare Workers' KV cache may still hold the old config, and there will be users on older app versions hitting the flag service for a while.
+
+```typescript
+// Refactoring after the experiment ships, Before/After
+
+// Before — branch is still live
+const variant = useFeatureValue("onboarding-cta-7day-trial", "control");
+if (variant === "treatment") {
+  return <TrialCtaScreen days={7} />;
+}
+return <SubscribeScreen />;
+
+// After — treatment promoted, flag removed
+return <TrialCtaScreen days={7} />;
+```
+
+GrowthBook's "Cleanup checklist" view lists flags overdue for removal. I review this list every release cycle (biweekly, in my case) and forcibly delete anything older than 3 months. Stale flags are the fastest way to tank the credibility of an experimentation system.
+
+## Designing Metrics That Don't Lie to You
+
+The single most common mistake I see (including in my own first experiments) is choosing the wrong primary metric. It looks like a small detail until your dashboard says you "won" but revenue is flat the next month.
+
+A useful test before locking a metric: **if this metric moves by 10%, does anything I care about — retention, revenue, support volume — also move?** If you can't answer that confidently, the metric is a proxy for a proxy.
+
+For my wallpaper app, the metrics I gradually settled on are:
+
+- `subscription_started`: a clean, immediate signal but vulnerable to "free trial farming" where users start trials and never convert. Always paired with the next metric.
+- `subscription_renewed_d7`: did the user actually keep the subscription past the first week? This is the metric that correlates with month-3 retention in my data.
+- `paid_user_dau`: weekly active users among paying users. The metric that, when it moves, my MRR moves with it.
+
+GrowthBook lets you mark metrics as primary, secondary, or guardrail. I treat the primary as a directional signal and the secondaries as the actual decision metric. A treatment that wins the primary but loses against `subscription_renewed_d7` is one I do not ship — I usually find that the onboarding got more aggressive in a way that pulled in users who didn't truly want the app.
+
+PostHog makes secondary metrics cheap to define. You write a SQL query in PostHog's "Insights" once, give it a name, and GrowthBook can pull it directly. I keep about 12 metrics defined; for any given experiment 4–6 of them are relevant.
+
+## Sample Size: A Worked Example
+
+Picking a sample size up front is the single highest-leverage decision in an experiment. Too small and you can't detect the effect even if it's real. Too large and you waste weeks on something a quick test would have answered.
+
+GrowthBook ships with a sample size calculator under `Settings > Statistics`. The inputs you need are:
+
+- Baseline conversion rate of the metric (from PostHog historicals)
+- Minimum detectable effect (MDE) — the smallest effect size you'd care about
+- Statistical power (typically 80%)
+- Number of variations
+
+For my wallpaper app, a typical experiment looks like:
+
+- Baseline `subscription_started` rate: 3.2% (from past 30 days)
+- MDE: 15% relative lift (so we want to detect 3.68% absolute or higher)
+- Power: 80%
+- Variations: 2 (control + 1 treatment)
+
+The calculator tells me I need approximately 11,000 users per arm. At my app's 800 daily active users with 50% in the experiment, that's 14 days minimum. This is the math I run before *every* experiment, and it's what stops me from chasing tiny effects with samples that can't possibly detect them.
+
+If you don't run this calculation, you'll fall into one of two traps. Either you stop too early and ship false positives, or you stop too late and waste calendar time on experiments that were never going to be conclusive.
+
+## Sample Ratio Mismatch: The Bug You Can't See Without Looking
+
+If your experiment is set to a 50/50 split, the actual exposure ratio observed in the data will rarely be exactly 50/50 — but it should be very close. When it's not (say, 53/47 with 10,000 users per arm), something is broken upstream. This is called Sample Ratio Mismatch (SRM), and it's the single most underrated diagnostic in experimentation.
+
+GrowthBook flags SRM automatically and stops trusting the result when detected. The common causes I've seen:
+
+- **Crashes correlated with one variation** — the treatment crashes for a subset of users, so they get re-bucketed when the app restarts.
+- **A bug in your `trackingCallback`** that double-fires for one variation.
+- **Caching layer holding stale flag assignments** for users who installed before the experiment started.
+
+When SRM fires, your move is not to debug the result — it's to debug the platform. I once spent two days analyzing why "treatment was significantly worse" before realizing I was triple-counting exposures from a `useEffect` cleanup function. The result wasn't real; the platform was lying.
+
+A good habit: review the SRM indicator on every experiment, not just the headline metric. If it's healthy, you can trust the rest. If it's not, no amount of "but the metric is positive" justifies shipping.
+
+## Cost Comparison at Scale
+
+For an indie developer, cost is rarely the main reason to choose this stack — control is. But if you're considering whether the migration is worth the effort, here's roughly what running this looked like for me at 30,000 monthly active users.
+
+- **GrowthBook Cloud (free tier)**: $0 — works up to 3 admin users.
+- **GrowthBook self-hosted on Fly.io**: ~$3/month for 256MB RAM machine + MongoDB Atlas free tier.
+- **PostHog Cloud**: $0 if under 1M events/month; my app was at ~600K/month, well within the free tier.
+- **Cloudflare Workers**: $5/month for the paid plan (free tier covers up to 100K requests/day, which mobile apps blow through quickly).
+
+Total: ~$8/month for the production setup. Compare to Firebase's Blaze plan where unpredictable Analytics + Crashlytics + Remote Config bills can spike to $40–100/month for the same workload, depending on event volume.
+
+The bigger savings, though, are non-financial: I can pull my raw data into a notebook for ad-hoc analysis whenever I want, the experiment definitions are stored in a database I own, and I'm not subject to a vendor decision to deprecate or re-price the service.
+
+## Three Operational Pitfalls Worth Knowing in Advance
+
+After a year of running experiments through this stack, three patterns hurt enough to call out.
+
+**Identifier drift.** When PostHog's `distinctId` is "promoted" from anonymous to authenticated user, GrowthBook's `attributes.id` needs to update at the same time. If they don't, exposures and conversions can't be joined. I wrap `posthog.alias()` in a hook that always calls `growthbook.setAttributes()` immediately after.
+
+**Cache mismatch on flaky networks.** A user opening the app in airplane mode or on a subway with patchy signal will fall back to the default value (`control`), so users who *should* have seen treatment get bucketed into control instead — adding noise to the analysis. I set `growthbook.loadFeatures({ timeout: 2000 })` with a 2-second timeout, falling back to the previous cached config rather than emitting a wrong assignment.
+
+**Reviewer assignments during App Store review.** Apple's reviewer ran my app, drew the treatment arm, and saw behavior different from what the review notes described — earning me a rejection. Fix this either by dropping treatment rollout to 0% during review, or by detecting "reviewer" attributes and forcing control. Either way, build the safeguard in before submission.
+
+## When This Stack Is the Wrong Choice
+
+It's worth being explicit: this stack isn't the right answer for every Rork project.
+
+If your app has fewer than 1,000 daily active users, the statistical power simply isn't there to learn anything from A/B testing in a reasonable timeframe. Spend that energy on user interviews and direct observation instead. I started using this stack on my wallpaper app only after it crossed 5,000 DAU.
+
+If your team is one person and your release cadence is monthly, the operational overhead of managing flags and experiments may eat into the time you need for actually building features. The break-even is around when you're shipping at least one user-facing change per week and want measurable signal on those changes.
+
+If your business depends on rapid response to App Store editorial features or seasonal events, real-time experimentation may not match how your decisions actually get made. Sometimes "ship and see" is the right answer, and an A/B test would slow you down for no real gain.
+
+The stack shines when you have a stable enough user base to detect effects, you're shipping changes regularly, and you've already got the obvious things right (good onboarding, clear pricing, working core flows). It is a magnifier of decisions, not a replacement for them.
+
+## Migration Path from Firebase
+
+If you already have Firebase A/B Testing running and want to move incrementally, here's the order I'd suggest, learned from doing it the wrong way first.
+
+**Run both stacks in parallel for two weeks.** Don't disable Firebase. Add GrowthBook + PostHog alongside it, fire identical events into both, and compare the dashboards. This builds confidence in the new stack and surfaces integration bugs while you still have the old data to fall back on.
+
+**Migrate metrics one at a time.** Don't try to recreate every Firebase Analytics event in PostHog at once. Start with the 3–5 metrics that matter most for experimentation, get those working end-to-end in GrowthBook, then expand.
+
+**Cut Firebase Remote Config last.** It's the piece most likely to be load-bearing in code you don't remember writing. Keep it as the fallback for non-experimental config (server URLs, kill switches) for at least a month after experiments have moved.
+
+I tried to do all three at once on my first migration and rolled back twice. Doing it in order took an extra week of calendar time and saved me a weekend of debugging.
+
+## A Note on Privacy and App Store Compliance
+
+One thing I underestimated: PostHog's default configuration captures more than App Store reviewers want to see. You'll need to declare event collection in Privacy Manifests (iOS 17+), and disclose third-party data sharing in your App Store Connect privacy questionnaire.
+
+The minimum cleanup I recommend before submission:
+
+- Disable PostHog's `autocapture` feature in production. It captures every screen tap by default; reviewers don't love this.
+- Configure PostHog to **not** send IDFA or any device identifier that App Tracking Transparency would gate.
+- Add explicit user consent for analytics in your onboarding flow (a clear "Help improve the app by sharing anonymous usage data" toggle).
+
+I had a submission rejected on these grounds and learned the privacy review checklist the hard way. Building consent in from the start saves a week of back-and-forth with Apple.
+
+## Summary and a Suggested Next Step
+
+That gets you a serious experimentation platform behind a Rork app. For your first experiment, pick something **low-cost to change with a clearly observable effect**. My own first one was comparing two phrasings of the paid plan's price label. The code change took an hour; the result took two weeks; CTR moved 18%, paying back the self-hosted infrastructure for the month. Nothing fancy, easy to interpret, immediately useful.
+
+The satisfaction of getting that first real experiment to land is genuine — it's the moment your app starts being shaped by "data-supported hypothesis testing" rather than gut feeling. The platform itself isn't the goal; it's the foundation that lets you keep delivering slightly better experiences to users every day. It's the kind of stack that earns its keep over a long time.
+
+If you want a more rigorous treatment of A/B test statistics, [*Trustworthy Online Controlled Experiments: A Practical Guide to A/B Testing* (Ron Kohavi et al.)](https://www.amazon.com/dp/1108724264/?tag=pinocchio-22) is the most useful companion to this article. Part II on the statistics of experimentation pairs well with GrowthBook's Bayesian decision rules, and the chapters on guardrail metrics and Sample Ratio Mismatch are ones I keep going back to.
+
+If you'd like context, [Visualizing User Behavior with Rork × PostHog: A Complete Product Analytics Setup Guide](/articles/rork-dev/rork-posthog-product-analytics-guide) covers the PostHog basics, and [Rork Max × Firebase Analytics for User Behavior and A/B Testing: Complete Guide](/articles/rork-dev/rork-max-firebase-analytics-ab-testing) shows the Firebase-based contrast.
+
+Thanks for reading all the way through. Hope this helps you ship your first real experiment.

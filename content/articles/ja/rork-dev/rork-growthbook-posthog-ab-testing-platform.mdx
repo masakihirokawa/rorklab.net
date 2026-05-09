@@ -1,0 +1,409 @@
+---
+title: "Rork の A/B テスト基盤を GrowthBook と PostHog でゼロから組む"
+slug: "rork-growthbook-posthog-ab-testing-platform"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-09T11:15"
+updated: "2026-05-09T11:15"
+author: "Rork Lab"
+description: "Firebase に頼らず、GrowthBook と PostHog をオープンソースで組み合わせて Rork アプリの A/B テスト基盤を構築する手順を、SDK 統合からベイズ統計の解釈、運用上の落とし穴までまとめました。"
+tags: ["GrowthBook", "PostHog", "A/Bテスト", "Feature Flags", "Cloudflare Workers", "Rork", "実験基盤"]
+highlights:
+  - "GrowthBook と PostHog の自己ホストを Rork アプリに繋ぎ込み、Firebase に依存しない A/B テスト基盤をその日のうちに動かせる"
+  - "Cloudflare Workers の Edge SDK を介して機能フラグの評価レイテンシを 30ms 以下に抑える具体的な実装パターンを習得できる"
+  - "ベイズ統計の指標を読み解いて『有意になったから勝ち』ではなく『どこで止めるか』を自分で判断できるようになる"
+---
+
+2025 年の終わり頃、自分の壁紙アプリで「定期購入のオンボーディング画面を 3 種類比較したい」という小さな実験を Firebase A/B Testing で回そうとして、結局やめてしまったことがありました。理由は単純で、必要な統計的検出力に届くサンプル数を集めるには 3 週間以上かかること、Remote Config の更新が端末に反映されるまでのタイムラグがコホートを濁すこと、そして Firebase の課金が他の機能と紐付いて切り離しにくいことの 3 点でした。
+
+それから、いくつかの代替を試した結果、私自身の運用に一番フィットしたのが **GrowthBook（実験エンジン）と PostHog（プロダクト分析）の組み合わせ**でした。両方ともオープンソースで、自己ホストすればコストはサーバー代だけ。Rork で書き出した React Native アプリには公式の SDK が動き、Cloudflare Workers をエッジ評価に使えば、フラグ取得のレイテンシは Firebase Remote Config よりも安定して短く抑えられます。
+
+この記事では、Rork で開発したアプリにこの 2 つを組み込み、最初の実験を回すまでの全工程を、自分が運用で使っているそのままの形で書きます。途中で詰まりがちな統計の話と、本番運用で痛い目を見ないための運用パターンも添えます。
+
+## なぜ Firebase ではなく GrowthBook + PostHog なのか
+
+Firebase Remote Config と Firebase Analytics の組み合わせは、最初の A/B テストを始めるなら確かに最短経路です。ただ実験を本格的に回し始めると、いくつかの不便さが見えてきます。
+
+ひとつは**統計エンジンの不透明さ**で、Firebase A/B Testing は内部のベイズ統計エンジンの仮定をユーザー側で調整できません。事前分布や有意水準を変更したいケース、CUPED（Controlled-experiment Using Pre-Experiment Data）で分散削減したいケースには手が届きません。
+
+もうひとつは**実験設計と分析の分離**です。Firebase Remote Config はフラグ配信、Firebase Analytics はイベント収集と機能が分かれており、実験の途中経過を一画面で追えません。GrowthBook は実験の定義・配信・解析を 1 つのダッシュボードで提供し、PostHog をデータソースに指定すれば PostHog のイベント定義をそのまま実験のメトリクスとして使えます。
+
+最後に、**自己ホストでベンダーロックインを避けられる**のも私が現在この構成を選んでいる理由です。GrowthBook は MIT ライセンス、PostHog はコア部分が MIT/Apache 2.0 ライセンスで、両方とも Docker コンテナで動きます。GrowthBook Cloud には 3 ユーザーまで使える無料枠があり、PostHog Cloud にも月 100 万イベントまでの無料枠があるので、いきなり自己ホストにせずクラウド版を入口にしてもよいでしょう。私自身は最初の半年は両方クラウド版で運用し、月の請求が見えてきた段階で GrowthBook だけ Fly.io に移しました。
+
+## 構成の全体像
+
+実験基盤は次の 4 つのコンポーネントで構成します。
+
+- **GrowthBook 管理画面**：実験の定義・配信ルール・統計解析を担う Web UI と API。GrowthBook Cloud か自己ホスト（Fly.io / Railway / Hetzner）。
+- **GrowthBook Edge SDK on Cloudflare Workers**：機能フラグを Rork アプリに低レイテンシで配信するエッジ評価レイヤー。
+- **PostHog**：イベント収集・ファネル分析・コホート定義のデータ基盤。GrowthBook の指標ソースとしても利用。
+- **Rork アプリ（React Native / Expo）**：`@growthbook/growthbook-react` と `posthog-react-native` を組み込み、ユーザー識別と暴露ログを送る。
+
+この構成では、ユーザーがアプリを起動した瞬間に Cloudflare Workers が GrowthBook の最新フラグセットを返し、暴露イベントは PostHog に流れます。GrowthBook 管理画面は PostHog の `$pageview` や `subscription_started` といった既存イベントを集計し、ベイズ統計で勝ち負けを判定します。
+
+## ステップ 1：GrowthBook を Fly.io に自己ホストする
+
+GrowthBook Cloud で十分という方は飛ばしてください。私の場合、PostHog 連携の頻度が高くなってきたタイミングで自己ホストに切り替えました。Fly.io なら Hobby プランで月 0〜3 ドル程度に収まります。
+
+```bash
+# Fly CLI のインストールとログイン
+brew install flyctl
+fly auth login
+
+# GrowthBook 公式リポジトリを clone
+git clone https://github.com/growthbook/growthbook.git
+cd growthbook
+
+# fly.toml を作成
+cat > fly.toml << 'EOF'
+app = "my-rork-growthbook"
+primary_region = "nrt"
+
+[build]
+  image = "growthbook/growthbook:latest"
+
+[env]
+  APP_ORIGIN = "https://my-rork-growthbook.fly.dev"
+  API_HOST = "https://my-rork-growthbook.fly.dev"
+  JWT_SECRET = "GENERATE_WITH_OPENSSL"
+  ENCRYPTION_KEY = "GENERATE_WITH_OPENSSL"
+  MONGODB_URI = "mongodb+srv://..."
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+EOF
+
+# シークレット生成
+openssl rand -base64 32  # JWT_SECRET 用
+openssl rand -base64 32  # ENCRYPTION_KEY 用
+
+# デプロイ
+fly launch --copy-config --no-deploy
+fly secrets set JWT_SECRET="..." ENCRYPTION_KEY="..." MONGODB_URI="..."
+fly deploy
+```
+
+MongoDB は MongoDB Atlas の無料枠（512MB）で十分動きます。私の壁紙アプリのワークスペースでは、半年運用しても 80MB 程度しか使っていません。
+
+## ステップ 2：PostHog を実験のデータソースとして繋ぐ
+
+GrowthBook 管理画面にログインしたら、`Settings > Data Sources` から PostHog を追加します。PostHog 側で「Personal API Key」を発行し、Project ID と一緒に登録するだけです。
+
+```typescript
+// PostHog の Personal API Key を発行する手順は PostHog ダッシュボードの
+// Settings > Personal API Keys から行います。
+// GrowthBook 側で必要な権限スコープは "query:read" のみで、最小権限の原則を守れます。
+```
+
+接続が終わったら、PostHog のイベント名を GrowthBook の「Metric」として登録します。たとえば私の場合は次の 3 つを登録しています。
+
+- `subscription_started`：購読開始イベント。ベイズ統計のメインメトリクス。
+- `onboarding_completed`：オンボーディング完遂率。サブメトリクス。
+- `app_session_duration`：セッション時間中央値。ガードレールメトリクス。
+
+ガードレールメトリクスは「勝ったように見えても、こちらが悪化していたら採用しない」という安全弁として機能します。私はオンボーディングを派手にしすぎて購読率は上がったが定着率が落ちた、という失敗をしたことがあり、それ以降は必ずガードレールを 1 つ以上設定しています。
+
+## ステップ 3：Cloudflare Workers にエッジ評価レイヤーを配置する
+
+GrowthBook の SDK はクライアント側でフラグを評価できますが、`features.json` を毎回 GrowthBook 本体から取得するとアプリ起動時のレイテンシに直接効きます。日本のユーザーが多いアプリなら 200ms から 400ms の往復が発生しがちです。
+
+Cloudflare Workers にプロキシキャッシュを置くと、評価の往復は 30ms 以下に抑えられます。GrowthBook 公式に Cloudflare Workers 用の Edge SDK が用意されていて、設定はシンプルです。
+
+```javascript
+// worker.js — Cloudflare Workers のエントリーポイント
+// このコードは GrowthBook Edge SDK のリファレンス実装をベースに、
+// 認証ヘッダー検証と KV キャッシュを追加した最小構成です。
+import { handleRequest } from "@growthbook/edge-cloudflare";
+
+export default {
+  async fetch(request, env, ctx) {
+    // 自分のアプリだけからアクセスを許可するための簡易検証
+    const allowedOrigin = request.headers.get("X-App-Bundle-Id");
+    if (allowedOrigin !== env.EXPECTED_BUNDLE_ID) {
+      return new Response("Forbidden", { status: 403 });
+    }
+
+    const config = {
+      apiHost: env.GROWTHBOOK_API_HOST,
+      clientKey: env.GROWTHBOOK_CLIENT_KEY,
+      // KV ネームスペース GROWTHBOOK_FEATURES_KV にキャッシュ
+      // TTL は 60 秒に設定（実験の即時反映が必要な場合は短く）
+      kvCacheTtl: 60,
+    };
+
+    return handleRequest(request, env, config);
+  },
+};
+```
+
+`wrangler.toml` には KV バインディングと環境変数を書きます。
+
+```toml
+name = "rork-growthbook-edge"
+main = "worker.js"
+compatibility_date = "2026-04-01"
+
+[[kv_namespaces]]
+binding = "GROWTHBOOK_FEATURES_KV"
+id = "your-kv-namespace-id"
+
+[vars]
+GROWTHBOOK_API_HOST = "https://my-rork-growthbook.fly.dev"
+EXPECTED_BUNDLE_ID = "design.dolice.wallpaper"
+
+# GROWTHBOOK_CLIENT_KEY と本番環境用の値は wrangler secret put で設定
+```
+
+KV キャッシュの TTL は実験のリスクで決めます。私は通常 60 秒に設定し、影響範囲が大きい実験を始める前後だけ 10 秒に下げています。10 秒以下にすると Workers の Subrequest 上限に近づくので、CDN 配信であっても限界はあります。
+
+## ステップ 4：Rork アプリに SDK を組み込む
+
+Rork の Project Settings から「Native Modules」を有効化し、`@growthbook/growthbook-react` と `posthog-react-native` をインストールします。Rork の React Native プロジェクトは Expo prebuild に対応しているので、特殊な手順は不要です。
+
+```bash
+npx expo install @growthbook/growthbook-react posthog-react-native
+npx expo install react-native-async-storage/async-storage
+```
+
+アプリのルートで両方のプロバイダーを初期化します。重要なのは「ユーザー識別子（PostHog の `distinctId`）と GrowthBook の `attributes.id` を必ず一致させること」です。これが揃っていないと、暴露ログとコンバージョンイベントが結合できず、GrowthBook が「データが足りません」と表示し続けます。
+
+```typescript
+// src/providers/ExperimentProvider.tsx
+// GrowthBook と PostHog を初期化し、両者の識別子を一致させる
+// ことで実験データの結合性を保証するプロバイダー。
+import { GrowthBook, GrowthBookProvider } from "@growthbook/growthbook-react";
+import PostHog from "posthog-react-native";
+import { useEffect, useMemo, useState } from "react";
+import { v4 as uuidv4 } from "uuid";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const EDGE_URL = "https://rork-growthbook-edge.workers.dev";
+const POSTHOG_HOST = "https://app.posthog.com";
+
+export const posthog = new PostHog(process.env.EXPO_PUBLIC_POSTHOG_KEY!, {
+  host: POSTHOG_HOST,
+  flushInterval: 30,
+});
+
+export function ExperimentProvider({ children }: { children: React.ReactNode }) {
+  const [userId, setUserId] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      let id = await AsyncStorage.getItem("anon_user_id");
+      if (!id) {
+        id = uuidv4();
+        await AsyncStorage.setItem("anon_user_id", id);
+      }
+      setUserId(id);
+      posthog.identify(id, { app: "rork-wallpaper" });
+    })();
+  }, []);
+
+  const gb = useMemo(() => {
+    if (!userId) return null;
+    return new GrowthBook({
+      apiHost: EDGE_URL,
+      clientKey: process.env.EXPO_PUBLIC_GROWTHBOOK_KEY,
+      attributes: { id: userId, country: "JP" },
+      // 暴露ログを必ず PostHog に送る — これが結合の要
+      trackingCallback: (experiment, result) => {
+        posthog.capture("$feature_flag_called", {
+          $feature_flag: experiment.key,
+          $feature_flag_response: result.variationId,
+        });
+      },
+    });
+  }, [userId]);
+
+  if (!gb) return null;
+  return <GrowthBookProvider growthbook={gb}>{children}</GrowthBookProvider>;
+}
+```
+
+`trackingCallback` で `$feature_flag_called` イベントを PostHog に送る部分が肝です。GrowthBook が PostHog をデータソースに指定すると、このイベントを「暴露ログ」として認識し、ベイズ統計の対象母集団を切り出します。
+
+## ステップ 5：最初の実験を定義する
+
+GrowthBook 管理画面の `Experiments > Add Experiment` で実験を作ります。私が最初に回した実験の例で説明します。
+
+- **Hypothesis（仮説）**：「オンボーディングの最後の画面に『無料で 7 日試す』ボタンを追加すると、購読開始率が上がる」
+- **Feature Flag Key**：`onboarding-cta-7day-trial`
+- **Variations**：`control`（既存）/ `treatment`（7日無料 CTA）
+- **Targeting**：日本のユーザーのみ（`attributes.country = JP`）
+- **Goal Metric**：`subscription_started`（PostHog イベント）
+- **Guardrail Metric**：`app_session_duration`（中央値が 5% 以上下がったら停止）
+
+Rork アプリ側では、`useFeatureValue` フックで分岐します。
+
+```typescript
+// src/screens/OnboardingFinalScreen.tsx
+// GrowthBook の useFeatureValue で分岐。
+// "control" がデフォルト値で、フラグがロードされる前の最初の数百ミリ秒も
+// この値が返るため、デフォルト挙動を必ず安全側に倒すこと。
+import { useFeatureValue } from "@growthbook/growthbook-react";
+
+export function OnboardingFinalScreen() {
+  const variant = useFeatureValue("onboarding-cta-7day-trial", "control");
+
+  if (variant === "treatment") {
+    return <TrialCtaScreen days={7} />;
+  }
+  return <SubscribeScreen />;
+}
+```
+
+ここで一度ハマったポイントを共有します。`useFeatureValue` のデフォルト値は「フラグがロードされる前」「ネットワーク失敗時」「フラグが削除された後」のすべてで返ります。**新機能を treatment として扱う場合、デフォルト値は必ず control を指定する**こと。逆にしてしまうと、フラグサーバーがダウンしたときに全ユーザーに新機能が出てしまいます。私は最初これで本番事故を起こしかけました。
+
+## ステップ 6：ベイズ統計の結果をどう読むか
+
+実験が始まると、GrowthBook 管理画面に「Chance to Beat Control」「Risk」「Probability of Improvement」といった指標が並びます。Frequentist（頻度論）的な p 値しか見たことがない方は最初戸惑うかもしれません。
+
+私が運用で使っている読み方は次の 3 つです。
+
+**Chance to Beat Control が 95% 以上**になっても、それだけで採用してはいけません。これは「treatment が control より良い確率」であって、「どの程度良いか」は別の話です。`Risk`（採用したときに失う可能性のある期待値）と組み合わせて読みます。
+
+**Risk が 0.5% 以下**になったら採用検討です。Risk は「採用判断が間違っていたとき、サブメトリクスでどれだけ損するか」の上限値で、これが十分小さければ「最悪のケースでも許容範囲」と判断できます。
+
+**サンプルサイズが推奨値に達しているか**も必ず確認します。GrowthBook はベイズ統計で早期停止できる設計ですが、それでも最低 1 週間・両腕 2,000 ユーザー以上は回したい。アプリの曜日効果（土日と平日でユーザー層が違う）を吸収するためです。
+
+「Chance to Beat Control が 99% になったから即停止」の判断は危険で、私は最低でも 7 日と 2,000 ユーザーのどちらかを満たすまでは止めない、という運用ルールを自分に課しています。
+
+## ステップ 7：実験の停止と片付け
+
+採用が決まったら、フラグを「100% rollout」にして実験を Stopped に変更し、コードからも分岐を削除して `treatment` をデフォルトに昇格します。フラグは数日残してから削除します。これは Cloudflare Workers の KV キャッシュが残っている可能性と、古いアプリバージョンのユーザーがまだ問い合わせてくる可能性に備えるためです。
+
+```typescript
+// 実験終了後のリファクタリング Before/After
+
+// Before — フラグ分岐あり
+const variant = useFeatureValue("onboarding-cta-7day-trial", "control");
+if (variant === "treatment") {
+  return <TrialCtaScreen days={7} />;
+}
+return <SubscribeScreen />;
+
+// After — treatment 採用、フラグ削除済み
+return <TrialCtaScreen days={7} />;
+```
+
+GrowthBook の管理画面には「Cleanup checklist」という機能があり、削除すべきフラグを一覧表示してくれます。私はリリースサイクルごと（私の場合は隔週）にこのリストをレビューして、3 ヶ月以上放置されたフラグは強制的に削除しています。フラグの墓場は実験基盤の品質を一気に下げます。
+
+## メトリクス設計を間違えると分析が嘘をつく
+
+最初に運用を始めて一番後悔したのが**プライマリメトリクスの選び方**でした。ダッシュボードでは「勝ち」と出ているのに、翌月の MRR は変わらない、というすれ違いが起きます。
+
+メトリクスを確定させる前に毎回自分に問うているチェックがあります。「このメトリクスが 10% 動いたら、自分が本当に気にしているもの（リテンション・収益・サポート問い合わせ件数）も連動して動くのか？」と。これに自信を持って答えられないなら、そのメトリクスは代理指標の代理指標になっています。
+
+私の壁紙アプリでは段々と次の組み合わせに落ち着きました。
+
+- `subscription_started`：購読開始のクリーンな即時シグナル。ただし「無料トライアルだけ取って解約」を拾ってしまうので、必ず次の指標とセットで見る。
+- `subscription_renewed_d7`：7 日後にまだ購読が継続しているか。私のデータでは 3 ヶ月後リテンションと最も相関する指標。
+- `paid_user_dau`：有料ユーザー内のアクティブ率。これが動くと MRR も動く、という関係がデータで見えています。
+
+GrowthBook ではメトリクスを Primary・Secondary・Guardrail に分けて登録します。私はプライマリは「方向のシグナル」、セカンダリは「採用判断の決め手」として使う運用です。プライマリで勝っても `subscription_renewed_d7` で負けたものは採用しません。たいてい「オンボーディングを攻めすぎて、本来定着しないユーザーまで巻き込んだ」結果になっています。
+
+## サンプルサイズの決め方を一度ちゃんと計算する
+
+実験の最初の一手で一番効くのが**事前のサンプルサイズ計算**です。少なすぎれば本物の効果も検出できないし、多すぎれば即終わるはずの実験に何週間もカレンダーを使うことになります。
+
+GrowthBook の `Settings > Statistics` にサンプルサイズ計算機があります。入力は次のとおり。
+
+- ベースライン変換率（PostHog の過去データから取得）
+- 最小検出効果（MDE）：「これより小さい効果なら、検出できなくて構わない」というしきい値
+- 統計的検出力（通常 80%）
+- バリエーション数
+
+私のアプリの典型値で計算すると、
+
+- ベースライン `subscription_started` 率：3.2%（直近 30 日）
+- MDE：相対 15%（つまり 3.68% 以上の絶対値変化を検出したい）
+- 検出力：80%
+- バリエーション数：2（control + treatment）
+
+→ 計算機は「片腕あたり約 11,000 ユーザー必要」と返してきます。私のアプリの DAU 800 で半分を実験に振ると、必要日数は 14 日。私はこの計算を**全実験で必ず**回します。これをやらない実験は「小さすぎる効果を、検出できないサンプルで追いかけてしまう」罠にハマります。
+
+## サンプル比率不一致（SRM）— 見ないと気づけないバグ
+
+50/50 で配信しているはずの実験で、実際の暴露比率が 50/50 ぴったりにはならないのは普通です。ただし「片腕あたり 10,000 ユーザーで 53/47 になっている」ような偏りがあるなら、上流のどこかが壊れています。これがサンプル比率不一致（SRM）で、過小評価されがちな最重要の診断指標です。
+
+GrowthBook は SRM を自動検出し、検出されると結果を信頼しなくなります。私が見てきた原因は次の 3 つ。
+
+- 片方のバリエーションでクラッシュが多発し、再起動時に再バケットされる
+- `trackingCallback` のバグでイベントが二重発火している
+- キャッシュ層に古いフラグ割り当てが残っていて、実験開始前のインストールユーザーが影響を受けている
+
+SRM が出たときの正解は「結果をデバッグする」ではなく「基盤をデバッグする」です。私は一度、`useEffect` のクリーンアップ関数で暴露が三重発火していたことに気づくのに 2 日溶かしました。「結果が悪い」のではなく「基盤が嘘をついていた」のです。プライマリメトリクスより前に SRM の健全性をチェックする習慣を、ぜひ持ってください。
+
+## 規模感とコストの比較
+
+個人開発者にとって、コストはこの構成を選ぶ第一の理由ではないはずですが、移行の労力に見合うかの判断材料として、私の MAU 30,000 規模での実コストを共有します。
+
+- **GrowthBook Cloud（無料枠）**：$0 — 管理者 3 名まで
+- **GrowthBook 自己ホスト（Fly.io）**：256MB RAM マシン + MongoDB Atlas 無料枠で月 $3 程度
+- **PostHog Cloud**：月間 100 万イベント以下なら $0。私のアプリは月 60 万イベントで無料枠内
+- **Cloudflare Workers**：有料プラン $5/月（無料枠は 10 万リクエスト/日でモバイルアプリだとすぐ超える）
+
+合計：月 $8 程度です。Firebase Blaze プランで Analytics + Crashlytics + Remote Config を同じワークロードで動かすと、イベント量次第で月 $40〜$100 まで膨らむことがあります。
+
+ただ金額以上に大きいのは**生データを自分のノートブックに引っ張ってきて任意の分析ができる**こと、**実験定義が自分の DB に保存されている**こと、ベンダーの値上げや終了判断に振り回されないことです。
+
+## このスタックが向かないケース
+
+正直に書いておきます。この構成はすべての Rork プロジェクトに合うわけではありません。
+
+DAU が 1,000 未満のアプリでは、A/B テストで何かを学ぶための統計的検出力がそもそも足りません。そのエネルギーはユーザーインタビューや直接観察に振り向けたほうがいい。私自身も壁紙アプリの DAU が 5,000 を超えてから初めてこの構成を入れました。
+
+チームが 1 人で、リリース頻度が月 1 回程度なら、フラグや実験を管理する運用負荷が機能開発の時間を奪います。損益分岐点は「週 1 回以上ユーザーに見える変更を出していて、その変更の効果を測りたい」段階です。
+
+App Store のエディトリアル特集や季節イベントへの即応性が事業の核なら、リアルタイム実験のサイクルは事業判断のスピードに合いません。「出してみてダメだったら戻す」が正解の場合もあります。
+
+このスタックは「効果を検出できるユーザー基盤がある」「定期的に変更を出している」「すでに当たり前のこと（オンボーディング・料金体系・コアフロー）が動いている」状況で初めて真価を発揮します。意思決定の代わりではなく、意思決定の品質を底上げする道具として捉えるのが健全です。
+
+## Firebase からの移行手順
+
+すでに Firebase A/B Testing が動いていて段階的に移行したい場合、最初にやり方を間違えた経験を踏まえて、おすすめの順序を共有します。
+
+**2 週間は両スタックを並走させる**。Firebase は無効化しないこと。GrowthBook + PostHog を並べて立ち上げ、同じイベントを両方に流し、ダッシュボードを見比べます。これで新スタックへの信頼が積み上がり、移行中のバグも旧データを残したまま見つけられます。
+
+**メトリクスは 1 つずつ移す**。Firebase Analytics のイベントを一度に PostHog で再現しようとしないこと。実験で重要な 3〜5 個を先に PostHog で完成させ、それが GrowthBook で動いてから次を増やします。
+
+**Firebase Remote Config の切り替えは最後**。覚えていないコードのどこかで使われている可能性が一番高いのが Remote Config です。実験用途を移したあとも、サーバー URL やキルスイッチなど非実験用途のフォールバックとして 1 ヶ月は残しておきます。
+
+私は最初、3 つを同時に切り替えて 2 度ロールバックしました。順番にやると 1 週間余分にカレンダーを使うが、週末を 1 つ救えます。
+
+## プライバシーと App Store 審査について
+
+これは私が過小評価していた点で、PostHog のデフォルト設定は App Store のレビュアーが見たくないものまで取得しています。プライバシーマニフェスト（iOS 17 以降）でのイベント収集の宣言と、App Store Connect のプライバシーアンケートでの第三者データ共有の開示が必要になります。
+
+提出前に最低限やっておくこと。
+
+- 本番では PostHog の `autocapture` 機能を無効化します。デフォルトでは全タップを取るので、レビュアーは嫌がります。
+- IDFA や ATT のゲート対象になる識別子を PostHog が送らないように設定します。
+- オンボーディングで明示的なオプトイン UI を入れる（「匿名の利用データ送信に協力する」のトグル）。
+
+私はこれで一度差し戻しを食らい、プライバシー関連のチェックリストを身に染みて学びました。最初から同意フローを組み込むことで、Apple との往復 1 週間を回避できます。
+
+## 運用で痛い目を見ないための 3 つの落とし穴
+
+実験を 1 年ほど回してきて、特に痛い思いをしたパターンを 3 つ挙げます。
+
+ひとつめは**識別子のドリフト**で、PostHog の `distinctId` が「匿名 ID から認証後ユーザー ID へ昇格する」タイミングで、GrowthBook の `attributes.id` が更新されないと暴露データとコンバージョンが結合できません。私は `posthog.alias()` を呼んだ直後に GrowthBook の `setAttributes()` を必ず呼ぶよう、共通フックでラップしました。
+
+ふたつめは**ネットワーク不安定時のキャッシュ不整合**で、機内モードや地下鉄でアプリを開いた瞬間にフラグ評価が走ると、デフォルト値（control）にフォールバックします。これが多いと「本当は treatment になるはずだったユーザーが control に分類される」ノイズが増えます。私は `growthbook.loadFeatures({ timeout: 2000 })` で 2 秒のタイムアウトを設定し、それ以内に取れなかったら次回起動まで前回のキャッシュを使う実装にしています。
+
+みっつめは**App Review でのフラグ評価**で、Apple のレビュアーがアプリを起動したときに treatment を引いてしまい、レビュー仕様と異なる挙動を見せて差し戻された経験があります。レビュー期間中だけ treatment 配信を 0% に戻すか、あるいは「reviewer」属性を判定して必ず control を返すフォールバックを入れることで防げます。
+
+## まとめと次の一歩
+
+ここまでの構成で、Rork アプリに本格的な実験基盤を組むベースができたはずです。次に試すなら、まずは「変更コストが低くて、効果が見えやすい実験」から始めることをおすすめします。私の場合は**有料プランの料金表記の言い回しを 2 種類比較する**実験から始めました。コードは 1 時間、結果が出るのに 2 週間でしたが、CTR が 18% 改善し、自己ホスト基盤の費用を 1 ヶ月で回収できました。
+
+最初の実験を回したときの達成感はなかなかのもので、自分のアプリのどこを改善すべきかを「勘」ではなく「データに支えられた仮説検証」で判断できるようになります。実験基盤そのものが目的ではなく、ユーザーに毎日少しだけ良い体験を届けるための土台として、長く付き合える構成だと感じています。
+
+より体系的に A/B テストの統計設計を学びたい方には、[『A/B テスト実践ガイド：真に再現性のある結果を得るための実験デザイン』（Ron Kohavi 他、訳：大杉直也）](https://www.amazon.co.jp/dp/4048930745/?tag=pinocchio-22) の第 2 部「実験の統計」が、本記事のベイズ統計の判断基準と相補的に役立ちます。Microsoft Bing の検索チームが運用してきた実験の知見が下敷きになっており、ガードレールメトリクスやサンプル比率不一致（SRM）の章は何度も読み返しています。
+
+関連する記事として、PostHog の基礎を押さえたい方は [Rork × PostHog でユーザー行動を可視化する：プロダクトアナリティクス完全導入ガイド](/articles/rork-dev/rork-posthog-product-analytics-guide) を、Firebase ベースの A/B テストとの比較を整理したい方は [Rork Max × Firebase Analytics でユーザー行動分析と A/B テストを実装する完全ガイド](/articles/rork-dev/rork-max-firebase-analytics-ab-testing) を併せて読んでみてください。
+
+最後までお付き合いいただき、ありがとうございました。実験を一緒に楽しめる方が増えると嬉しいです。
