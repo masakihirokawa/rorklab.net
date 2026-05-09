@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "TRAFFIC743K — Rork が月間 743k MAU・85% 成長を達成、AI モバイルビルダー市場の最大手に（5月）",
     "RORK15M — Rork が $1500 万シードを調達、Left Lane Capital 主導・a16z Speedrun も参加（4/10）",
     "RORKMAX — Rork Max が Claude Opus 4.6 ベースで Swift native アプリを量産、ARR 短期間で倍増（5月）",
     "CLOUDCOMPILE — Rork Max Cloud Compile が Mac 不要に、クラウド Mac 上で署名・配布まで完結（4〜5月）",
     "LOVABLEAPP — Lovable iOS/Android リリース、バイブコーディング競合がスマホ完結に（4/28）",
-    "STITCHFLOW — Stitch でデザイン → Antigravity で設計 → Rork Max でアプリ完成のフルパス確立（5月）",
-    "WWDC2026 — Apple WWDC 2026 が 6/8 開催、iOS 27 Siri に Claude・Gemini・ChatGPT が統合（6月）",
+    "VIBE12B — Vibe Coding 市場が 2027 年に $12.3B 予測、ユーザーの 63% が非開発者（Taskade 調査）",
   ],
   en: [
+    "TRAFFIC743K — Rork hits 743K monthly visits with 85% growth, leading the AI mobile builder market (May)",
     "RORK15M — Rork raises $15M seed led by Left Lane Capital with a16z Speedrun also joining (4/10)",
     "RORKMAX — Rork Max ships native Swift apps powered by Claude Opus 4.6, ARR doubling quickly (May)",
     "CLOUDCOMPILE — Rork Max Cloud Compile removes the Mac requirement, signs and ships from the cloud (Apr-May)",
     "LOVABLEAPP — Lovable launches iOS/Android, bringing vibe coding fully onto the phone (4/28)",
-    "STITCHFLOW — Stitch → Antigravity → Rork Max becomes the canonical AI-native build pipeline (May)",
-    "WWDC2026 — Apple WWDC 2026 on June 8 brings iOS 27, integrating Claude, Gemini, and ChatGPT into Siri (Jun)",
+    "VIBE12B — Vibe coding market projected at $12.3B by 2027, with 63% of users being non-developers (Taskade)",
   ],
 };
 
