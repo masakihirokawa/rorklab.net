@@ -1,0 +1,207 @@
+---
+title: "Adding Swift Charts to a Rork Max App: Setup, and Why It Stutters Past a Few Hundred Points"
+slug: "rork-max-swift-charts-implementation-performance-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-10T12:00"
+updated: "2026-05-10T12:00"
+author: "Rork Lab"
+description: "How to drop Swift Charts into the SwiftUI code Rork Max generates, where the framework starts choking once your dataset grows past a thousand points, and the downsampling and animation patterns that keep things at 60 fps on real devices."
+tags: ["Rork Max", "Swift Charts", "SwiftUI", "iOS 16", "Performance"]
+---
+
+A few weeks ago I helped two indie developers debug the same problem: a budget tracker built with Rork Max felt buttery for the first month of data, then crawled the moment a user expanded the chart to a full year. Half of that comes from how the SwiftUI view is structured, the other half from Swift Charts itself. Apple's sample code does not flag any of this, so I want to walk through the setup from the very beginning and then point out what bites later.
+
+## What Rork Max generates the first time you ask for a chart
+
+Ask Rork Max for "a SwiftUI view that shows an array of dates and values as a line chart" and you get something close to this. I'm quoting it verbatim so we have a shared starting point.
+
+```swift
+import SwiftUI
+import Charts
+
+struct DailyValue: Identifiable {
+    let id = UUID()
+    let date: Date
+    let value: Double
+}
+
+struct SimpleLineChart: View {
+    let points: [DailyValue]
+
+    var body: some View {
+        Chart(points) { point in
+            LineMark(
+                x: .value("Date", point.date),
+                y: .value("Value", point.value)
+            )
+            .interpolationMethod(.monotone)
+        }
+        .chartYAxis {
+            AxisMarks(position: .leading)
+        }
+        .frame(height: 240)
+    }
+}
+
+// Expected behavior: x-axis at the bottom, y-axis on the left,
+// smooth monotone interpolation. Stays at 60 fps on a Pixel 7 or
+// iPhone 14 from roughly 30 to 90 points.
+```
+
+Nothing here is wrong. Previews and devices both render it cleanly. Trouble starts somewhere past a thousand points, and the change is sudden enough that it surprises every developer I have watched encounter it for the first time.
+
+## What is actually slowing down
+
+`LineMark` re-evaluates every point you hand it on each frame. Scrolling, zooming, or replacing the data each triggers a SwiftUI redraw plus a fresh `MarkData` calculation, and the cost grows roughly linearly with the point count. If you open Instruments and look at the Time Profiler, you will see `Charts._ChartProxy.markFrames` climbing as the dataset gets longer.
+
+The official documentation says Swift Charts can render "hundreds to thousands of points smoothly," but in my hands that "smoothly" only holds for static charts. Add scrolling, tap-to-inspect, or animated updates and devices older than the iPhone 13 dropped below 30 fps once I crossed 1,000 points.
+
+The "just hand the framework everything" instinct does not work here, the same way it does not work for any native rendering API. The code Rork Max emits is intentionally simple, so this gap is something you have to close yourself before shipping.
+
+## Downsample before you draw
+
+The single biggest win is to downsample on the way in. A year of daily budget entries is 365 points, but a chart with 60 to 90 points still reads as the same shape to a user. If you want to preserve visible peaks, a small Largest-Triangle-Three-Buckets (LTTB) implementation does the job without bringing in a dependency.
+
+```swift
+extension Array where Element == DailyValue {
+    /// Reduces the array to roughly `threshold` points while preserving visual peaks.
+    func downsampled(to threshold: Int) -> [DailyValue] {
+        guard count > threshold, threshold >= 3 else { return self }
+
+        let bucketSize = Double(count - 2) / Double(threshold - 2)
+        var sampled: [DailyValue] = [self.first!]
+        var a = 0
+
+        for i in 0..<(threshold - 2) {
+            let rangeStart = Int(floor(Double(i + 1) * bucketSize)) + 1
+            let rangeEnd = min(Int(floor(Double(i + 2) * bucketSize)) + 1, count)
+            let bucket = Array(self[rangeStart..<rangeEnd])
+            let nextAvg = bucket.reduce(0.0) { $0 + $1.value } / Double(bucket.count)
+            let prev = self[a]
+            var maxArea = -1.0
+            var chosen = bucket.first!
+            for p in bucket {
+                let area = abs((prev.value - nextAvg) * Double(rangeEnd - a)
+                               - (prev.value - p.value) * Double(rangeEnd - a))
+                if area > maxArea { maxArea = area; chosen = p }
+            }
+            sampled.append(chosen)
+            a = self.firstIndex(where: { $0.id == chosen.id }) ?? a
+        }
+
+        sampled.append(self.last!)
+        return sampled
+    }
+}
+
+// Usage
+// let visible = points.downsampled(to: 80)
+// Effect: 365 points reduced to 80 keeps the visual peaks and
+// drops the per-frame draw cost to roughly a quarter.
+```
+
+After compressing 365 points down to 80 in my own budget tracker, an iPhone SE (2nd generation) held a steady 60 fps. The trick is to stop passing the source array directly to `Chart(points)` and pass a derived "what we actually need to draw" array instead.
+
+## Turn off animation by default, opt in only where it helps
+
+The other place SwiftUI developers walk into a wall is animation. Rork Max occasionally tacks on `.animation(.default, value: points)` because it looks polite. With small datasets it is. With large ones it becomes the dominant cost: Swift Charts diffs the array and interpolates between the two states, so you end up paying point-count multiplied by frame-count.
+
+What works for me is to turn animation off for full-array swaps and use `withAnimation` only on focused interactions like axis range changes or selection highlights.
+
+```swift
+struct OptimizedLineChart: View {
+    let points: [DailyValue]
+    @State private var visiblePoints: [DailyValue] = []
+
+    var body: some View {
+        Chart(visiblePoints) { point in
+            LineMark(
+                x: .value("Date", point.date),
+                y: .value("Value", point.value)
+            )
+        }
+        .frame(height: 240)
+        .onChange(of: points) { _, new in
+            // Full data replacement applied without animation.
+            visiblePoints = new.downsampled(to: 80)
+        }
+    }
+}
+
+// Expected behavior:
+// - No interpolation animation on data swaps.
+// - Each redraw completes in a single frame, so the fps dip disappears.
+```
+
+I covered the same "let the generated code work, then trim it down for production" mindset in [Refactoring patterns for SwiftUI generated by Rork Max](/articles/rork-dev/rork-max-swiftui-generated-code-production-refactoring-patterns), which is a useful companion piece if you are also stripping away other generated affordances.
+
+## Accessibility and the dark/light theme bug
+
+So far this has been a performance story, but the easiest wins after that are accessibility and color themes. Swift Charts can auto-generate a VoiceOver description through `accessibilityChartDescriptor`, but Rork Max does not include it by default. Adding it explicitly makes a meaningful difference at App Store review time.
+
+```swift
+import SwiftUI
+import Charts
+
+extension OptimizedLineChart: AXChartDescriptorRepresentable {
+    func makeChartDescriptor() -> AXChartDescriptor {
+        let xAxis = AXNumericDataAxisDescriptor(
+            title: "Date",
+            range: 0...Double(visiblePoints.count - 1),
+            gridlinePositions: []
+        ) { value in "Day \(Int(value))" }
+
+        let yAxis = AXNumericDataAxisDescriptor(
+            title: "Amount",
+            range: 0...(visiblePoints.map(\.value).max() ?? 1),
+            gridlinePositions: []
+        ) { value in "\(Int(value)) yen" }
+
+        let series = AXDataSeriesDescriptor(
+            name: "Trend",
+            isContinuous: true,
+            dataPoints: visiblePoints.enumerated().map { index, p in
+                .init(x: Double(index), y: p.value)
+            }
+        )
+
+        return AXChartDescriptor(
+            title: "Monthly trend",
+            summary: "Downsampled aggregate values",
+            xAxis: xAxis, yAxis: yAxis,
+            additionalAxes: [], series: [series]
+        )
+    }
+}
+
+// Expected behavior: VoiceOver reads "Monthly trend, downsampled
+// aggregate values, X axis Date..." when the chart receives focus.
+```
+
+The other quiet bug: lines that vanish in the opposite color scheme. Generated code often hardcodes `Color.black` or a literal hex, which becomes invisible in dark mode. Switching to a named asset like `Color("ChartLine")` and defining both variants in the asset catalog avoids the problem entirely. If you want a structured way to think about color decisions in a Rork Max app, [Accessibility implementation notes for Rork Max](/articles/rork-dev/rork-max-accessibility) covers the theme tokens I rely on.
+
+## When Swift Charts is the wrong choice
+
+Not every chart belongs in Swift Charts. Two scenarios in particular keep nudging me toward another approach.
+
+The first is when you need real-time updates faster than once per second. Swift Charts re-runs its layout pipeline on every state change, and that overhead becomes the bottleneck before the data does. For a stock-ticker style chart that ingests new ticks at 5 to 10 Hz, I reach for [SwiftUI Canvas with manual drawing](https://developer.apple.com/documentation/swiftui/canvas) or for [react-native-skia in cross-platform Rork projects](/articles/rork-dev/rork-react-native-skia-custom-graphics-guide). The trade-off is losing the declarative axis affordances, but you regain frame budget.
+
+The second is when you need detailed annotations on every point: tap targets, callouts, custom marker shapes per category. Swift Charts can express these, but you end up writing nearly as much code as you would with a hand-rolled view, and the framework starts to fight you on hit-testing inside scrollable containers. For a leaderboard-style data view, I usually implement the bars with `GeometryReader` plus a small `ZStack` per row, which gives me precise control over what tapping a row does.
+
+Neither of these means Swift Charts is bad. It means the framework is best at what it advertises: presenting structured aggregate data with sensible defaults. Push it past that and the cost of every workaround starts to add up.
+
+## A short pre-ship checklist
+
+Whenever I add a new Swift Charts view to a project, I stop and run through a small list before merging:
+
+- Decide on a hard ceiling for visible points (I aim for "the number of peaks a user can perceive, times three")
+- Pass the downsampled array to `Chart`, never the source array
+- Turn off animations for full-data swaps
+- Move axis labels and colors into the asset catalog
+- Implement at least the minimum `AXChartDescriptor` for VoiceOver
+
+If you want to dig deeper into how SwiftUI and Swift Charts compose, [Apple's SwiftUI by Tutorials (Kodeco)](https://www.amazon.co.jp/dp/B09Y2QKM2L/?tag=pinocchio-22) covers the framework in enough detail that the Charts integration patterns become a natural extension.
+
+The smallest next step you can take is the first item on that list: pick a number for your visible-point ceiling, hold it lightly, and let Instruments tell you if it needs to come down. I am still tuning that number for my own apps, and would be glad to hear what works in yours.

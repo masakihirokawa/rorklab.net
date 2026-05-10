@@ -1,0 +1,205 @@
+---
+title: "Rork Max + Swift Charts でアプリにグラフを実装する手順と、データ点が増えると重くなる原因"
+slug: "rork-max-swift-charts-implementation-performance-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-10T12:00"
+updated: "2026-05-10T12:00"
+author: "Rork Lab"
+description: "Rork Max が生成する SwiftUI コードに Swift Charts を組み込む流れと、1,000 点を超えたあたりからカクつき始める原因、そして実機で滑らかに描画させるための間引きとアニメーション制御の実装パターンを共有します。"
+tags: ["Rork Max", "Swift Charts", "SwiftUI", "iOS 16", "パフォーマンス"]
+---
+
+家計簿アプリの月次推移を Rork Max に SwiftUI で組ませた際、最初の 30 日分は気持ちよくスクロールしていたのに、ユーザーが 1 年分を表示しはじめた瞬間から急にカクつき出した、という相談を最近何度か受けました。原因の半分はビューの作り方、もう半分は Swift Charts そのものの描画コストです。Apple のサンプルどおりに書いただけでは気づきにくい部分なので、実装の入口から順に整理しておきます。
+
+## Rork Max が出してくる Swift Charts コードの素朴な姿
+
+Rork Max に「日付と値の配列を折れ線グラフで表示する SwiftUI ビュー」を依頼すると、おおむね次のような最小コードが返ってきます。説明を続けるためにそのまま引用します。
+
+```swift
+import SwiftUI
+import Charts
+
+struct DailyValue: Identifiable {
+    let id = UUID()
+    let date: Date
+    let value: Double
+}
+
+struct SimpleLineChart: View {
+    let points: [DailyValue]
+
+    var body: some View {
+        Chart(points) { point in
+            LineMark(
+                x: .value("Date", point.date),
+                y: .value("Value", point.value)
+            )
+            .interpolationMethod(.monotone)
+        }
+        .chartYAxis {
+            AxisMarks(position: .leading)
+        }
+        .frame(height: 240)
+    }
+}
+
+// 期待される表示: 日付軸が下、値軸が左、滑らかな単調補間の折れ線
+// 30〜90点までは Pixel 7 / iPhone 14 で 60 fps を維持できる
+```
+
+ここまでは何の問題もありません。プレビューでも実機でも軽快に動きます。問題は、`points` が 1,000 件を超えたあたりから突然挙動が変わる、というところにあります。
+
+## 1,000 点を超えるあたりから何が起きているか
+
+Swift Charts の `LineMark` は、内部的に渡された全データ点を毎フレーム再評価します。スクロールやズーム、データ更新のいずれの操作でも、SwiftUI のビュー再描画と Chart の `MarkData` 計算が連鎖して走るため、点数とほぼ比例して CPU 時間が増えていきます。Instruments の Time Profiler で計測すると、`Charts._ChartProxy.markFrames` の負荷が顕著に上がっていくのが見えます。
+
+公式ドキュメントには「Swift Charts は数百〜数千点を快適に描画できる」と書かれていますが、**その「快適に」は静的表示を指している**というのが、私の手元での率直な所感です。スクロール・タップ追従・アニメーション付き更新が組み合わさると、iPhone 12 以前では 1,000 点で 30 fps を割り込みました。
+
+「とりあえず全部渡しておけば良い」が通用しないのは、Swift Charts に限らずネイティブの描画 API 全般に共通する性質です。Rork Max が生成するコードはあえて素朴に書かれているので、本番運用に乗せる前にこの点だけは把握しておく必要があります。
+
+## 表示用に点を間引くダウンサンプリング
+
+最初に試して効果が大きいのが、表示前のダウンサンプリングです。月次の家計簿なら 365 点を 60〜90 点まで圧縮しても、ユーザーが知覚する形は変わりません。ピーク値を残したい場合は単純な等間隔抽出ではなく、LTTB（Largest-Triangle-Three-Buckets）の素朴な実装で十分役に立ちます。
+
+```swift
+extension Array where Element == DailyValue {
+    /// 指定したバケット数まで間引く。視覚的なピークを残す近似法。
+    func downsampled(to threshold: Int) -> [DailyValue] {
+        guard count > threshold, threshold >= 3 else { return self }
+
+        let bucketSize = Double(count - 2) / Double(threshold - 2)
+        var sampled: [DailyValue] = [self.first!]
+        var a = 0
+
+        for i in 0..<(threshold - 2) {
+            let rangeStart = Int(floor(Double(i + 1) * bucketSize)) + 1
+            let rangeEnd = min(Int(floor(Double(i + 2) * bucketSize)) + 1, count)
+            let bucket = Array(self[rangeStart..<rangeEnd])
+            // 直前の選択点と次バケットの平均で構成される三角形の面積を最大化する点を選ぶ
+            let nextAvg = bucket.reduce(0.0) { $0 + $1.value } / Double(bucket.count)
+            let prev = self[a]
+            var maxArea = -1.0
+            var chosen = bucket.first!
+            for p in bucket {
+                let area = abs((prev.value - nextAvg) * Double(rangeEnd - a)
+                               - (prev.value - p.value) * Double(rangeEnd - a))
+                if area > maxArea { maxArea = area; chosen = p }
+            }
+            sampled.append(chosen)
+            a = self.firstIndex(where: { $0.id == chosen.id }) ?? a
+        }
+
+        sampled.append(self.last!)
+        return sampled
+    }
+}
+
+// 使い方
+// let visible = points.downsampled(to: 80)
+// 期待される効果: 365点 → 80点でも視覚的なピークがほぼ保持され、描画コストが約1/4に
+```
+
+私の手元で 365 点 → 80 点に圧縮した家計簿アプリは、iPhone SE（第 2 世代）でも 60 fps が安定するようになりました。「公式の `Chart(points)` に全件渡す」をやめて、表示用の派生配列を作って渡すだけで、体感速度は明確に変わります。
+
+## アニメーションは「させない」のが第一選択
+
+もうひとつ、SwiftUI 視点でハマりやすいのがアニメーションです。Rork Max の出力は何気なく `.animation(.default, value: points)` を付けてくることがあります。一見親切なのですが、データ点が多い場合これが重さの主因になります。Swift Charts は配列差分から軌跡の補間アニメーションを生成するため、点数 × フレーム数のコストが発生するからです。
+
+私の運用上は、次の使い分けが安定しました。データの全件入れ替えが起きる箇所ではアニメーションを切り、軸の更新やフォーカス位置の変化など限定的な変化にだけ `withAnimation` を局所的に適用しています。
+
+```swift
+struct OptimizedLineChart: View {
+    let points: [DailyValue]
+    @State private var visiblePoints: [DailyValue] = []
+
+    var body: some View {
+        Chart(visiblePoints) { point in
+            LineMark(
+                x: .value("Date", point.date),
+                y: .value("Value", point.value)
+            )
+        }
+        .frame(height: 240)
+        .onChange(of: points) { _, new in
+            // データ全件入れ替えはアニメーションなしで反映
+            visiblePoints = new.downsampled(to: 80)
+        }
+    }
+}
+
+// 期待される挙動:
+// - データ件数が変わっても補間アニメーションが発生しない
+// - 描画は1フレームで完了するため fps の落ち込みが消える
+```
+
+[Rork Max が生成した SwiftUI のリファクタリング戦略](/articles/rork-dev/rork-max-swiftui-generated-code-production-refactoring-patterns) の記事でも触れたように、生成コードはまずシンプルに動かし、後から本番要件に合わせて削いでいく方が安全です。
+
+## アクセシビリティと、ダーク／ライト両対応の落とし穴
+
+性能の話ばかり続きましたが、もうひとつ見落としやすいのがアクセシビリティとカラーテーマです。Swift Charts は `.accessibilityChartDescriptor` で VoiceOver 対応を自動生成できる仕組みがありますが、Rork Max の初期出力では設定されていないことが多いため、自分で追加しておくと App Store 審査での印象が良くなります。
+
+```swift
+import SwiftUI
+import Charts
+
+extension OptimizedLineChart: AXChartDescriptorRepresentable {
+    func makeChartDescriptor() -> AXChartDescriptor {
+        let xAxis = AXNumericDataAxisDescriptor(
+            title: "日付",
+            range: 0...Double(visiblePoints.count - 1),
+            gridlinePositions: []
+        ) { value in "\(Int(value))日目" }
+
+        let yAxis = AXNumericDataAxisDescriptor(
+            title: "金額",
+            range: 0...(visiblePoints.map(\.value).max() ?? 1),
+            gridlinePositions: []
+        ) { value in "\(Int(value))円" }
+
+        let series = AXDataSeriesDescriptor(
+            name: "推移",
+            isContinuous: true,
+            dataPoints: visiblePoints.enumerated().map { index, p in
+                .init(x: Double(index), y: p.value)
+            }
+        )
+
+        return AXChartDescriptor(
+            title: "月次推移",
+            summary: "ダウンサンプリング後の集計値",
+            xAxis: xAxis, yAxis: yAxis,
+            additionalAxes: [], series: [series]
+        )
+    }
+}
+
+// 期待される動作: VoiceOver で「月次推移、ダウンサンプリング後の集計値、X軸日付…」と読み上げられる
+```
+
+ダーク／ライトの切り替えで折れ線が見えなくなるバグも、Rork Max のコードでは色をハードコードしているケースで発生します。`Color("ChartLine")` のように Asset Catalog の色を参照する形に書き換えれば、両モードで読みやすさを保てます。色の設計指針については [Rork Max のアクセシビリティ実装ポイント](/articles/rork-dev/rork-max-accessibility) も合わせて読むと整理しやすいと思います。
+
+## Swift Charts が向かない場面
+
+全てのグラフを Swift Charts に乗せるのが正解とは限りません。私自身、別のアプローチに切り替えている場面が二つあります。
+
+ひとつは、1 秒に複数回データが更新されるリアルタイム描画です。Swift Charts は状態変化のたびにレイアウトパイプラインを走らせるため、点数より先に再計算コストが頭打ちになります。秒間 5〜10 ティック入る株価チャートのようなケースでは、[SwiftUI Canvas での手動描画](https://developer.apple.com/documentation/swiftui/canvas)、もしくは Rork 上のクロスプラットフォーム実装なら [react-native-skia でグラフィックを自前実装する方法](/articles/rork-dev/rork-react-native-skia-custom-graphics-guide) を選んでいます。宣言的な軸装飾は失う代わりにフレームバジェットが取り戻せます。
+
+もうひとつは、点ごとに詳細なアノテーション（タップ領域、吹き出し、カテゴリ別マーカーなど）を持たせたい場合です。Swift Charts でも書けるのですが、自前のビューと同じくらいコード量が増え、スクロール内ヒットテストが思い通りに動かない場面が出てきます。リーダーボード的に行ごとの操作を細かく定義したい時は、`GeometryReader` と行ごとの `ZStack` で組む方が結果的に保守しやすいと感じます。
+
+どちらも「Swift Charts が劣る」という話ではなく、「公称どおりの用途では非常に強い」というだけのことです。集計済みデータを良い既定値で見せる用途を超えた瞬間に、回避策の負債が積み上がり始めます。
+
+## 実装中に立ち止まって確認したいこと
+
+最後に、私が新しく Swift Charts を入れる際に必ず手を止めて確認するチェック項目を共有します。
+
+- 表示する点数の上限を決める（私は「ユーザーが認識できるピークの数 × 3」を目安にしています）
+- ダウンサンプリング後の配列だけを `Chart` に渡す
+- データ全件入れ替えにアニメーションを付けない
+- 軸ラベルとカラーは Asset Catalog で参照する
+- VoiceOver の `AXChartDescriptor` を最低限実装する
+
+iOS の描画関連の細かな設計判断に踏み込みたい方には、[『SwiftUI ビジュアルディベロップメント』（高橋 真人）](https://www.amazon.co.jp/dp/4798069450/?tag=pinocchio-22) の Chart 章が、SwiftUI と Charts の関係を丁寧に追いかけていて参考になります。
+
+次に取り組めるのは、上記のチェック項目のうち「表示点数の上限を決める」の一点だけです。アプリのユースケースに応じて 60〜120 点のレンジで仮置きし、実機の Instruments で fps を確認するところから始めてみてください。私自身まだ最適点を模索している途中ですが、共に試行錯誤しながら積み上げていけたら嬉しく思います。
