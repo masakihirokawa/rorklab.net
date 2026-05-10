@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "PAPERLINE — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材獲得で開発力を強化（5/11）",
+    "OPUS47 — Rork Max が Claude Opus 4.7 に対応準備中、コーディング精度 +13% でより精度の高いアプリ生成へ（5/11）",
     "TRAFFIC743K — Rork が月間 743k MAU・85% 成長を達成、AI モバイルビルダー市場の最大手に（5月）",
     "RORK15M — Rork が $1500 万シードを調達、Left Lane Capital 主導・a16z Speedrun も参加（4/10）",
-    "RORKMAX — Rork Max が Claude Opus 4.6 ベースで Swift native アプリを量産、ARR 短期間で倍増（5月）",
+    "RORKMAX — Rork Max が Swift native アプリを量産、iPhone・iPad・Watch・TV・Vision Pro 全対応（5月）",
     "CLOUDCOMPILE — Rork Max Cloud Compile が Mac 不要に、クラウド Mac 上で署名・配布まで完結（4〜5月）",
-    "LOVABLEAPP — Lovable iOS/Android リリース、バイブコーディング競合がスマホ完結に（4/28）",
-    "VIBE12B — Vibe Coding 市場が 2027 年に $12.3B 予測、ユーザーの 63% が非開発者（Taskade 調査）",
   ],
   en: [
+    "PAPERLINE — Rork acquires AI app builder Paperline to strengthen engineering talent and capabilities (5/11)",
+    "OPUS47 — Rork Max prepares Claude Opus 4.7 integration: +13% coding accuracy means sharper app generation (5/11)",
     "TRAFFIC743K — Rork hits 743K monthly visits with 85% growth, leading the AI mobile builder market (May)",
     "RORK15M — Rork raises $15M seed led by Left Lane Capital with a16z Speedrun also joining (4/10)",
-    "RORKMAX — Rork Max ships native Swift apps powered by Claude Opus 4.6, ARR doubling quickly (May)",
-    "CLOUDCOMPILE — Rork Max Cloud Compile removes the Mac requirement, signs and ships from the cloud (Apr-May)",
-    "LOVABLEAPP — Lovable launches iOS/Android, bringing vibe coding fully onto the phone (4/28)",
-    "VIBE12B — Vibe coding market projected at $12.3B by 2027, with 63% of users being non-developers (Taskade)",
+    "RORKMAX — Rork Max ships native Swift apps for iPhone, iPad, Watch, TV, and Vision Pro (May)",
+    "CLOUDCOMPILE — Rork Max Cloud Compile removes the Mac requirement, signs and ships entirely from the cloud (Apr-May)",
   ],
 };
 
