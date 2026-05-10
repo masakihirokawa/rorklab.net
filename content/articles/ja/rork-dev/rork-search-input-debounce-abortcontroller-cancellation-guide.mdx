@@ -1,0 +1,223 @@
+---
+title: "Rork の検索フィールドが API を連打する問題を debounce と AbortController で止める"
+slug: "rork-search-input-debounce-abortcontroller-cancellation-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-10T17:00"
+updated: "2026-05-10T17:00"
+author: "Rork Lab"
+description: "検索バーで1文字打つたびに API が走り、古い結果が新しい結果を上書きする。Rork で作ったアプリでこの症状に当たったときの3点セット（debounce・AbortController・空結果の見せ方）を実装手順つきで紹介します。"
+tags: ["Rork", "React Native", "検索UI", "debounce", "AbortController", "個人開発"]
+---
+
+壁紙アプリの中に検索機能を後から足したとき、最初の実装は「TextInput が変わったら fetch する」だけでした。テストでは問題なく動いていたのですが、AdMob のリリースを見据えて実機で長文を打ってみたら、キーストロークごとにサーバーへリクエストが飛び、しかも遅いネットワークだと古いクエリの結果が新しいクエリの結果の後に到着して画面を上書きする現象に当たりました。Rork で UI のたたき台を生成したあと、こういう細部のレースコンディションは自分で詰めないといけません。
+
+累計5,000万DLのアプリ事業で何度も踏んだこの落とし穴を、Rork が出力する標準的な React Native 構造に合わせて直す手順をまとめておきます。debounce だけ入れて満足しがちですが、「古いリクエストを止める」工程を入れないと根本解決にはなりません。
+
+## 検索バーで起きる3つの問題を切り分ける
+
+「検索が重い」と一括りにせず、まず症状を分解します。私が壁紙アプリの検索を作り直したときは、次の3つが同時に起きていました。
+
+- **連打問題**: 1文字打つたびに fetch が走り、サーバー側のレートリミットに当たる
+- **競合問題**: ネットワーク往復のばらつきで、古いクエリの結果が新しいクエリの結果の後に届く
+- **見え方問題**: 検索中なのか、空結果なのか、エラーなのかが画面から判別できない
+
+debounce が解決するのは1番目だけです。2番目と3番目は別の対処が必要で、ここを混同したまま手を入れても症状は再発します。
+
+## ステップ1: useDebouncedValue で入力値を遅延させる
+
+Rork が生成する `app/search.tsx` のような画面に、まず入力値の遅延フックを追加します。
+
+```typescript
+// hooks/useDebouncedValue.ts
+import { useEffect, useState } from "react";
+
+/**
+ * 値の変化が一定時間止まってから後段に渡す。
+ * delay = 300ms が体感的にちょうどよく、200ms 以下だと連打、500ms 以上だと反応が遅く感じる。
+ */
+export function useDebouncedValue<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(id);
+  }, [value, delay]);
+
+  return debounced;
+}
+```
+
+そして検索画面側ではこう書きます。
+
+```typescript
+// app/search.tsx
+const [query, setQuery] = useState("");
+const debouncedQuery = useDebouncedValue(query, 300);
+
+// fetch は debouncedQuery が変わったときだけ実行する
+useEffect(() => {
+  if (debouncedQuery.length === 0) return;
+  fetchResults(debouncedQuery);
+}, [debouncedQuery]);
+```
+
+期待出力としては、ユーザーが「welcome」と打つと、本来 7回走るはずの fetch が1回（最後の確定値「welcome」のみ）に集約されます。
+
+ここまでが多くの記事で「これで解決」と書かれている内容ですが、実機で遅い回線をエミュレートすると競合問題が顔を出します。
+
+## ステップ2: AbortController で古いリクエストを止める
+
+入力が「we」→「wel」→「welcome」と進む途中で、たまたま「we」のリクエストが遅延していると、最後に届いた古い結果で新しい結果が上書きされます。これを防ぐには、新しい fetch を始める前に古い fetch を取り消します。
+
+```typescript
+// hooks/useSearchResults.ts
+import { useEffect, useState } from "react";
+
+type State<T> =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: T[] }
+  | { status: "empty" }
+  | { status: "error"; message: string };
+
+export function useSearchResults<T>(
+  query: string,
+  endpoint: (q: string, signal: AbortSignal) => Promise<T[]>,
+): State<T> {
+  const [state, setState] = useState<State<T>>({ status: "idle" });
+
+  useEffect(() => {
+    if (query.length === 0) {
+      setState({ status: "idle" });
+      return;
+    }
+
+    const controller = new AbortController();
+    setState({ status: "loading" });
+
+    endpoint(query, controller.signal)
+      .then((data) => {
+        if (controller.signal.aborted) return; // 取り消されたら無視
+        setState(data.length === 0 ? { status: "empty" } : { status: "success", data });
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        const message = err instanceof Error ? err.message : "通信エラー";
+        setState({ status: "error", message });
+      });
+
+    return () => {
+      // 次の query が来た瞬間に古いリクエストを破棄する
+      controller.abort();
+    };
+  }, [query, endpoint]);
+
+  return state;
+}
+```
+
+ポイントは `controller.signal.aborted` を **`then` の中でも明示的に確認している** ことです。fetch 実装によっては abort してもプロミスが reject されず resolve のまま戻ってくるパターンがあり、そこで古い結果が画面に流れてきます。signal.aborted の早期 return を入れておくと安全です。
+
+エンドポイント側はこう書きます。
+
+```typescript
+// lib/searchApi.ts
+export async function searchWallpapers(q: string, signal: AbortSignal) {
+  const res = await fetch(`https://api.example.com/search?q=${encodeURIComponent(q)}`, {
+    signal,
+  });
+
+  if (res.status === 429) throw new Error("ちょっと混雑しています。少し待ってから試してください");
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const json = await res.json();
+  return json.items as Array<{ id: string; title: string }>;
+}
+```
+
+429 と 5xx を分けて投げているのは、ステップ4の「見え方」でメッセージを分岐させるためです。
+
+## ステップ3: 4状態を画面に出し分ける
+
+ローディング・成功・空結果・エラーの4つを判別できるようにすると、ユーザーが「壊れた」と誤解しなくなります。私は壁紙アプリで空結果のメッセージをサボった結果、レビューで「検索しても何も出ない」という★1を何度かもらった経験があります。
+
+```typescript
+// app/search.tsx
+import { ActivityIndicator, FlatList, Text, TextInput, View } from "react-native";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useSearchResults } from "@/hooks/useSearchResults";
+import { searchWallpapers } from "@/lib/searchApi";
+
+export default function SearchScreen() {
+  const [query, setQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(query, 300);
+  const state = useSearchResults(debouncedQuery, searchWallpapers);
+
+  return (
+    <View style={{ flex: 1, padding: 16 }}>
+      <TextInput
+        value={query}
+        onChangeText={setQuery}
+        placeholder="壁紙を検索"
+        autoCorrect={false}
+        autoCapitalize="none"
+      />
+
+      {state.status === "loading" && <ActivityIndicator style={{ marginTop: 24 }} />}
+
+      {state.status === "empty" && (
+        <Text style={{ marginTop: 24, color: "#888" }}>
+          「{debouncedQuery}」に一致する壁紙は見つかりませんでした。別のキーワードをお試しください。
+        </Text>
+      )}
+
+      {state.status === "error" && (
+        <Text style={{ marginTop: 24, color: "#c00" }}>{state.message}</Text>
+      )}
+
+      {state.status === "success" && (
+        <FlatList
+          data={state.data}
+          keyExtractor={(item) => item.id}
+          renderItem={({ item }) => <Text>{item.title}</Text>}
+        />
+      )}
+    </View>
+  );
+}
+```
+
+`autoCorrect={false}` と `autoCapitalize="none"` は地味ですが必須です。これを忘れると iOS の自動補正が後から走って勝手に文字列を書き換え、debounced クエリと表示中のクエリがズレるという別のレースコンディションを呼びます。
+
+## ステップ4: 連打されてもサーバーを守る最後の砦
+
+ここまでで体感的な問題はだいたい消えますが、悪意のある連打や同時に何百台からアクセスされた場合に備えて、エンドポイント側にも軽い throttle を入れておくのが堅実です。Cloudflare Workers であれば、IP 単位の Rate Limiting Binding で十分対応できます。
+
+```typescript
+// Cloudflare Worker 例（参考実装）
+export default {
+  async fetch(req: Request, env: Env) {
+    const { success } = await env.RATE_LIMITER.limit({ key: req.headers.get("cf-connecting-ip") ?? "anon" });
+    if (!success) return new Response("Too Many Requests", { status: 429 });
+    return handleSearch(req, env);
+  },
+};
+```
+
+クライアント側で 429 を受け取ったときに「少し待ってから試してください」と出せば、ユーザーは混乱しません。サイレントに失敗するのが一番悪いというのは、AdMob で月150万円規模になっていた時期に、レビュー欄から学んだ感覚です。
+
+## このパターンと組み合わせると効くもの
+
+- [Rork × TanStack Query データフェッチ＆キャッシュ完全ガイド](/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide) — useSearchResults を TanStack Query に置き換えるとキャッシュも一緒に解決します
+- [Rork で作ったアプリの「原因不明クラッシュ」を撲滅する](/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide) — fetch の reject を握りつぶさない設計と組み合わせるとさらに堅牢になります
+- [Rork Maxアプリで実装するエラー耐性の高いAPI通信設計](/articles/rork-dev/rork-max-resilient-api-circuit-breaker-retry-guide) — リトライ・Circuit Breaker をかぶせる場合の設計
+
+React のコンカレント機能と AbortController の組み合わせは、[『りあクト！ TypeScriptで始めるつかえるReact 第5部』（大岡由佳）](https://www.amazon.co.jp/dp/B0CG7DJVG5/?tag=pinocchio-22) でも触れられています。useTransition と組み合わせると検索結果のチラつきがさらに抑えられます。
+
+## 次の一手
+
+検索画面のソースを開いて、「fetch を呼んでいる箇所が `useEffect` のクリーンアップ関数で AbortController を呼んでいるか」を1分だけ確認してみてください。私の壁紙アプリでは、ここを直しただけでサーバー負荷が3割ほど落ちました。
+
+宮大工だった祖父が「土台が水平でないと、その上にどれだけ綺麗な柱を立てても歪む」と言っていたのを、検索バーのデバッグをしながら時々思い出します。debounce と AbortController は、見えにくいけれども検索体験の土台です。

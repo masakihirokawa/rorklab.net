@@ -1,0 +1,219 @@
+---
+title: "Stop Your Rork App's Search Field from Hammering the API: debounce + AbortController + Empty States"
+slug: "rork-search-input-debounce-abortcontroller-cancellation-guide"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-10T17:00"
+updated: "2026-05-10T17:00"
+author: "Rork Lab"
+description: "A keystroke-by-keystroke search field looks fine on a laptop and starts misbehaving the moment a real phone hits a slow network. Here is the three-piece kit I keep coming back to in Rork apps: debounced input, abortable requests, and a state machine the UI actually understands."
+tags: ["Rork", "React Native", "Search UX", "debounce", "AbortController", "Indie dev"]
+---
+
+When I added a search bar to one of my wallpaper apps a few years back, the first version simply fired a fetch on every change of the `TextInput`. It was fine on the simulator. The moment I tested on a slower network with a real device, two things showed up at once: the server complained about the request rate, and stale results from earlier characters started overwriting fresher results. Rork can scaffold a beautiful search screen in seconds, but these timing details are still on us.
+
+This post walks through the fix I now apply by default in Rork projects, after running into the same trap on apps that have collectively crossed 50 million downloads. Most articles stop after introducing debounce. Debounce alone does not stop the race condition.
+
+## Three problems hide behind "search feels broken"
+
+Before reaching for a library, separate the symptoms. In my wallpaper app, three issues were stacked on top of each other.
+
+- **Hammering**: Every keystroke fires a request, and the backend's rate limit kicks in
+- **Race**: Network latency varies, so an older query's response lands after a newer query's response
+- **Visibility**: The screen does not communicate whether it is loading, empty, or broken
+
+Debounce only addresses the first. Mixing the second and third in with the same fix is what makes the symptoms come back later.
+
+## Step 1: defer keystrokes with useDebouncedValue
+
+Add a small hook to the screen Rork generated for you (something like `app/search.tsx`).
+
+```typescript
+// hooks/useDebouncedValue.ts
+import { useEffect, useState } from "react";
+
+/**
+ * Pass the value downstream only after it has been stable for `delay` ms.
+ * 300 ms is the sweet spot for me — under 200 still feels chatty, over 500 feels laggy.
+ */
+export function useDebouncedValue<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(id);
+  }, [value, delay]);
+
+  return debounced;
+}
+```
+
+In the screen itself:
+
+```typescript
+// app/search.tsx
+const [query, setQuery] = useState("");
+const debouncedQuery = useDebouncedValue(query, 300);
+
+// Only fetch when the debounced value changes
+useEffect(() => {
+  if (debouncedQuery.length === 0) return;
+  fetchResults(debouncedQuery);
+}, [debouncedQuery]);
+```
+
+The expected result: typing "welcome" triggers one fetch (for the final value) instead of seven. This is where most articles call it done. On a real phone with a slow connection, the race condition is still alive.
+
+## Step 2: cancel stale requests with AbortController
+
+If the user types "we" → "wel" → "welcome", and the "we" request happens to be slow, its response can arrive after "welcome" has already finished and overwrite it. The fix is to abort previous requests before starting the next one.
+
+```typescript
+// hooks/useSearchResults.ts
+import { useEffect, useState } from "react";
+
+type State<T> =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: T[] }
+  | { status: "empty" }
+  | { status: "error"; message: string };
+
+export function useSearchResults<T>(
+  query: string,
+  endpoint: (q: string, signal: AbortSignal) => Promise<T[]>,
+): State<T> {
+  const [state, setState] = useState<State<T>>({ status: "idle" });
+
+  useEffect(() => {
+    if (query.length === 0) {
+      setState({ status: "idle" });
+      return;
+    }
+
+    const controller = new AbortController();
+    setState({ status: "loading" });
+
+    endpoint(query, controller.signal)
+      .then((data) => {
+        if (controller.signal.aborted) return; // ignore canceled responses
+        setState(data.length === 0 ? { status: "empty" } : { status: "success", data });
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        const message = err instanceof Error ? err.message : "Network error";
+        setState({ status: "error", message });
+      });
+
+    return () => {
+      // The next query starts: discard whatever the old one is still doing
+      controller.abort();
+    };
+  }, [query, endpoint]);
+
+  return state;
+}
+```
+
+The detail that bit me the first time around: I check `controller.signal.aborted` **inside the `.then` callback** even though I already abort in the cleanup. Some fetch polyfills will still resolve the promise (rather than reject it) after an abort, and the resolved data slips into state. A short early return at the top of the success branch saves you from that.
+
+The endpoint:
+
+```typescript
+// lib/searchApi.ts
+export async function searchWallpapers(q: string, signal: AbortSignal) {
+  const res = await fetch(`https://api.example.com/search?q=${encodeURIComponent(q)}`, {
+    signal,
+  });
+
+  if (res.status === 429) throw new Error("Things are a bit busy. Please try again in a moment.");
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const json = await res.json();
+  return json.items as Array<{ id: string; title: string }>;
+}
+```
+
+Splitting 429 from 5xx makes the visibility step easier — the messages diverge naturally.
+
+## Step 3: render four distinct states
+
+Loading, success, empty, and error need to be visually distinguishable. I once shipped a wallpaper app where I had skipped the empty state copy, and the App Store reviews politely told me the search "didn't work" — when in fact it was returning zero results for unusual keywords. A line of text would have prevented those one-star reviews.
+
+```typescript
+// app/search.tsx
+import { ActivityIndicator, FlatList, Text, TextInput, View } from "react-native";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useSearchResults } from "@/hooks/useSearchResults";
+import { searchWallpapers } from "@/lib/searchApi";
+
+export default function SearchScreen() {
+  const [query, setQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(query, 300);
+  const state = useSearchResults(debouncedQuery, searchWallpapers);
+
+  return (
+    <View style={{ flex: 1, padding: 16 }}>
+      <TextInput
+        value={query}
+        onChangeText={setQuery}
+        placeholder="Search wallpapers"
+        autoCorrect={false}
+        autoCapitalize="none"
+      />
+
+      {state.status === "loading" && <ActivityIndicator style={{ marginTop: 24 }} />}
+
+      {state.status === "empty" && (
+        <Text style={{ marginTop: 24, color: "#888" }}>
+          No wallpapers matched "{debouncedQuery}". Try a different keyword.
+        </Text>
+      )}
+
+      {state.status === "error" && (
+        <Text style={{ marginTop: 24, color: "#c00" }}>{state.message}</Text>
+      )}
+
+      {state.status === "success" && (
+        <FlatList
+          data={state.data}
+          keyExtractor={(item) => item.id}
+          renderItem={({ item }) => <Text>{item.title}</Text>}
+        />
+      )}
+    </View>
+  );
+}
+```
+
+`autoCorrect={false}` and `autoCapitalize="none"` look cosmetic but are not. Leaving them on lets iOS rewrite the text after the user has stopped typing, producing a *different* race condition where the visible query and the debounced query disagree.
+
+## Step 4: protect the server too
+
+The client-side work covers the friendly case. For the unfriendly case — a bored user holding down a key, or a sudden traffic spike — keep a small throttle on the server side. With Cloudflare Workers, the Rate Limiting Binding gets you most of the way there.
+
+```typescript
+// Cloudflare Worker example (reference)
+export default {
+  async fetch(req: Request, env: Env) {
+    const { success } = await env.RATE_LIMITER.limit({ key: req.headers.get("cf-connecting-ip") ?? "anon" });
+    if (!success) return new Response("Too Many Requests", { status: 429 });
+    return handleSearch(req, env);
+  },
+};
+```
+
+When the client sees a 429, the friendly message in step 2 covers it gracefully. Silent failures are the worst possible outcome — that lesson came from the period when one of my apps was peaking at around 1.5M JPY/month in AdMob revenue and the App Store reviews were unforgiving.
+
+## Patterns that pair well with this
+
+- [Rork × TanStack Query: data fetching and cache guide](/en/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide) — swap `useSearchResults` for TanStack Query when you also want caching
+- [Eliminating the unknown-cause crashes in your Rork app](/en/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide) — pair this with proper unhandled-rejection capture
+- [Resilient API design for Rork Max apps](/en/articles/rork-dev/rork-max-resilient-api-circuit-breaker-retry-guide) — when retries and circuit breakers belong on top
+
+## One thing to do next
+
+Open the search screen in your current Rork project. Find the `useEffect` that triggers the fetch. If its cleanup function does not call `controller.abort()`, that is the single change that will pay back the most. In my wallpaper app, fixing only this dropped server load by roughly thirty percent.
+
+My grandfather, a temple carpenter, used to say that no matter how beautiful a pillar is, it will lean if the foundation underneath is not level. Debounce and AbortController are unglamorous foundations of search UX, but they decide whether the rest of the screen feels solid.
