@@ -1,0 +1,302 @@
+---
+title: "Rorkで作ったアプリのiOSウィジェットが「古いまま」になる本当の原因 — App Group共有とタイムライン更新の設計を見直す"
+slug: "rork-ios-widget-app-group-stale-data-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-10T04:45"
+updated: "2026-05-10T04:45"
+author: "Rork Lab"
+description: "Rorkで生成したアプリにiOSウィジェットを追加したら、起動するたびに古い情報を表示する。App Groupの発行・UserDefaults共有・タイムライン更新の3点を一本の設計に収めて、本番運用に耐える親子間データ共有を組み立てる実装ノートです。"
+tags: ["Rork", "WidgetKit", "App Group", "iOS", "ウィジェット", "React Native", "Expo Modules"]
+highlights:
+  - "ウィジェットが親アプリのデータを読めず詰まっていた人が、App Groupの発行からタイムライン更新までを今日動く形で手に入れられる"
+  - "UserDefaults共有コンテナとFile system共有の使い分けを、自分のアプリの構造に合わせて判断できるようになる"
+  - "起動直後にウィジェットだけ古い情報を出す現象を、設計レベルで再発させない構造を組み立てられる"
+---
+
+壁紙アプリの月次アップデートを配信したあと、ホーム画面ウィジェットだけが「先月のデイリー壁紙」を表示し続けたことがありました。アプリを開けば最新画像は更新されているのに、ウィジェットは数時間どころか丸一日前のサムネイルを出している。エンドユーザーから「古いままなんですが」とフィードバックが届いて、その晩は寝るどころではなくなりました。
+
+WidgetKitのドキュメントには「親アプリと共有するにはApp Groupを使ってください」と1行だけ書いてあります。けれど、実際にRorkで生成したReact NativeアプリにWidget Extensionを後から足すと、その「1行」の裏側で詰まる箇所が3つあります。App Groupの発行ミス、UserDefaultsの読み書きの非対称、そしてタイムライン更新を呼ぶタイミング。今回はこの3点を1本の設計図に乗せて、本番運用に耐えるウィジェットを組み立て直します。
+
+## 「ウィジェットが古いまま」が起きる仕組みのおさらい
+
+iOSのアプリは、それぞれが独立したサンドボックスで動きます。これはRorkで生成したアプリでも、Xcodeに後付けしたWidget Extensionでも変わりません。Widget Extensionは見た目こそ親アプリの一部に見えますが、実体は別プロセス・別バンドルIDで起動する小さなアプリです。
+
+つまり、親アプリが`UserDefaults.standard`に書いた値は、ウィジェット側から読んでも`nil`です。これは仕様であって、バグではありません。サンドボックスを越えてデータを共有するには、Appleが用意した「App Group」という共有ストアを明示的に発行する必要があります。
+
+ここで多くの人が最初に詰まります。私自身、最初の試作では「親アプリで保存→ウィジェットで読む」という処理を疑うことなくUserDefaults.standardで書いていて、シミュレータでは動くのに実機ではnilが返るという状況を半日かけて再現していました。原因はApp Groupを通していなかった、それだけでした。
+
+## App Groupの発行 — 「親アプリのIDをそのまま使う」が初期の落とし穴
+
+App Groupは、親アプリとExtensionが「共有のキー付き棚」を持つための仕組みです。Apple Developer Portalで発行し、両方のターゲットのCapabilitiesに追加します。命名は`group.{逆順ドメイン}.{アプリ名}.shared`が慣例です。
+
+ここで一番ハマりやすいのは「親アプリのバンドルID(`com.example.myapp`)をそのまま使ってしまう」ケースです。App Group IDは独立した別物として、頭に`group.`をつけて新規発行する必要があります。
+
+設定の流れは次のとおりです。
+
+1. Apple Developer Portalの「Identifiers → App Groups」で新規発行(例: `group.com.example.myapp.shared`)
+2. 親アプリのIdentifierとExtensionのIdentifierの両方で、CapabilitiesのApp Groupsにチェックを入れて関連付け
+3. Xcodeのプロジェクト設定 → Signing & Capabilitiesで、両方のターゲットに「App Groups」を追加し、上で発行したIDをチェック
+4. 両方のターゲットの`*.entitlements`ファイルに以下が自動追加されることを確認
+
+```xml
+<key>com.apple.security.application-groups</key>
+<array>
+  <string>group.com.example.myapp.shared</string>
+</array>
+```
+
+エンタイトルメントファイルが両方のターゲットに正しく書き込まれていない状態でビルドすると、ランタイムでは何のエラーも出ずに「データが書けたように見えるが読めない」という最悪の挙動になります。私はこれを2014年から個人開発でiOSアプリを触ってきた経験の中で何度も踏んでいて、いまでも新しいExtensionを足すたびにentitlementsの差分を最初に確認する癖がついています。
+
+## UserDefaults共有コンテナを動作確認まで持っていく
+
+App Groupが発行できたら、UserDefaultsの共有コンテナを使って親アプリとウィジェット間でデータを受け渡します。
+
+```swift
+// SharedStorage.swift — 親アプリとWidget Extensionの両方に追加する
+import Foundation
+import WidgetKit
+
+enum SharedStorage {
+    // App Group ID は両ターゲットで同じものを指す必要がある
+    private static let suiteName = "group.com.example.myapp.shared"
+
+    static var defaults: UserDefaults {
+        // 共有コンテナを取得。失敗するとnilを返すので必ずunwrapを安全に行う
+        guard let d = UserDefaults(suiteName: suiteName) else {
+            // 失敗するときはApp Groupの設定が両ターゲットで揃っていない
+            assertionFailure("App Group \(suiteName) is not configured")
+            return .standard
+        }
+        return d
+    }
+
+    // 親アプリ側 — 最新の壁紙メタデータを書き込む
+    static func saveWallpaper(id: String, title: String, date: Date) {
+        let data: [String: Any] = [
+            "id": id,
+            "title": title,
+            "date": date.timeIntervalSince1970
+        ]
+        defaults.set(data, forKey: "currentWallpaper")
+        // 書き込み直後にウィジェットへ通知
+        WidgetCenter.shared.reloadTimelines(ofKind: "DailyWallpaperWidget")
+    }
+
+    // ウィジェット側 — 取り出す
+    static func loadWallpaper() -> (id: String, title: String, date: Date)? {
+        guard let d = defaults.dictionary(forKey: "currentWallpaper"),
+              let id = d["id"] as? String,
+              let title = d["title"] as? String,
+              let ts = d["date"] as? TimeInterval else {
+            return nil
+        }
+        return (id, title, Date(timeIntervalSince1970: ts))
+    }
+}
+```
+
+このSharedStorage.swiftを親アプリとWidget Extensionの**両方のターゲット**に同じファイルとして追加します(Xcodeのファイルインスペクタで両方のターゲットチェックを入れる)。書く側と読む側で同じコードを共有することで、キー名の食い違いというありがちなバグを設計時点で潰しておきます。
+
+ここで動作確認を早めに入れます。Xcodeで親アプリを実機ビルドして、適当な値を保存してから、ウィジェットを長押し→「ウィジェットを編集」で表示しなおしたとき、保存した値が反映されているか確認します。シミュレータでも動きますが、Widget Extensionは実機の方が挙動が現実に近いので、私はここを実機で見るようにしています。
+
+## Rork（React Native）側からネイティブブリッジ越しに書き込む
+
+ここまでで「Swiftの世界」のデータ共有は組めました。次は、RorkでJS側で扱っているデータをこの共有コンテナへ書き込めるようにします。
+
+Rorkで生成されるアプリはExpo Managed構成が前提なので、`expo prebuild`でiOSプロジェクトを生成したうえで、Expo Moduleとしてネイティブブリッジを定義するのが一番ストレスがありません。Expo Modulesの初期セットアップが未経験の方は、[Rork生成アプリにネイティブモジュールを追加する — Expo Prebuild実践ガイド](/articles/rork-dev/rork-expo-prebuild-custom-native-modules-workflow)で全体像を確認してから戻ってくると、以下のコードがすっと入ってきます。
+
+```swift
+// modules/shared-storage/ios/SharedStorageModule.swift
+import ExpoModulesCore
+import WidgetKit
+
+public class SharedStorageModule: Module {
+    public func definition() -> ModuleDefinition {
+        Name("SharedStorage")
+
+        // JS側から呼ぶためのメソッドを公開する
+        AsyncFunction("saveWallpaper") { (id: String, title: String, dateMs: Double) in
+            // 受け取った値をSwift側のSharedStorageへ
+            let date = Date(timeIntervalSince1970: dateMs / 1000.0)
+            SharedStorage.saveWallpaper(id: id, title: title, date: date)
+        }
+
+        AsyncFunction("reloadWidgets") { () in
+            // 明示的にタイムライン更新を要求するエンドポイント
+            WidgetCenter.shared.reloadAllTimelines()
+        }
+    }
+}
+```
+
+JS側からの呼び出しは次の通りです。
+
+```typescript
+// app/services/shared-storage.ts
+import * as SharedStorageModule from "expo-modules-core";
+import { requireNativeModule } from "expo-modules-core";
+
+const NativeSharedStorage = requireNativeModule("SharedStorage");
+
+export async function publishCurrentWallpaper(wallpaper: {
+  id: string;
+  title: string;
+  date: Date;
+}) {
+  // ネイティブ側へ最新メタデータを渡す。dateはミリ秒に揃える
+  await NativeSharedStorage.saveWallpaper(
+    wallpaper.id,
+    wallpaper.title,
+    wallpaper.date.getTime()
+  );
+}
+
+export async function refreshWidgets() {
+  // 親アプリ起動時やバックグラウンド復帰時に明示呼び出し
+  await NativeSharedStorage.reloadWidgets();
+}
+
+// 期待される動作:
+//  - publishCurrentWallpaper を呼ぶと App Group へデータが書き込まれ、
+//    WidgetKit が次回のタイムライン更新でその値を読む。
+//  - refreshWidgets を呼ぶと WidgetCenter.reloadAllTimelines() が走り、
+//    システムが「次の機会」にタイムラインを再評価する。
+```
+
+注意点として、`reloadAllTimelines`を呼んでも「即座にウィジェットが書き換わる」わけではありません。WidgetKitは省電力のために独自の更新キューを持っており、`reloadTimelines`はあくまで「次の更新候補に挙げてください」という依頼です。ここを誤解していると、画面遷移直後に古い情報が見えて「動いていない」と感じます。
+
+## ウィジェットのタイムライン更新タイミング設計
+
+タイムラインを設計するときは、次の2系統で考えると整理がつきます。
+
+- **時間ベースの更新**: ウィジェットの`getTimeline`内で「次は1時間後に再評価してほしい」と指定する
+- **イベントベースの更新**: 親アプリがデータを更新した直後に`reloadTimelines`を呼ぶ
+
+Daily Wallpaperのような「日付が変わったら自動で次の壁紙に切り替えたい」ものは時間ベース、ユーザーがアプリ内で「お気に入り」を変更したら即反映したいケースはイベントベースで設計します。
+
+```swift
+// DailyWallpaperWidget.swift — Widget Extension側
+struct WallpaperProvider: TimelineProvider {
+    func placeholder(in context: Context) -> WallpaperEntry {
+        WallpaperEntry(date: Date(), title: "Today's Wallpaper", id: "placeholder")
+    }
+
+    func getSnapshot(in context: Context, completion: @escaping (WallpaperEntry) -> Void) {
+        completion(loadEntry())
+    }
+
+    func getTimeline(in context: Context, completion: @escaping (Timeline<WallpaperEntry>) -> Void) {
+        let entry = loadEntry()
+
+        // 翌日0時に次の更新を予約。これがないと日付が変わってもウィジェットが動かない
+        let nextMidnight = Calendar.current.nextDate(
+            after: Date(),
+            matching: DateComponents(hour: 0, minute: 0),
+            matchingPolicy: .nextTime
+        ) ?? Date().addingTimeInterval(60 * 60 * 24)
+
+        let timeline = Timeline(entries: [entry], policy: .after(nextMidnight))
+        completion(timeline)
+    }
+
+    private func loadEntry() -> WallpaperEntry {
+        if let w = SharedStorage.loadWallpaper() {
+            return WallpaperEntry(date: w.date, title: w.title, id: w.id)
+        }
+        return WallpaperEntry(date: Date(), title: "—", id: "empty")
+    }
+}
+```
+
+ここでよくある間違いが、`policy: .atEnd`で済ませてしまうケースです。`.atEnd`は「entriesの最後の日時を過ぎたら更新」という意味なので、entriesが1件しかない場合は実質ほぼ更新が走りません。日付ベースの更新を狙うなら、`.after(nextMidnight)`のように明示的に「次の評価時刻」を渡すのが安全です。
+
+## Before/After: 起動直後にウィジェットが追従しない問題
+
+最初の壁紙アプリ実装で起きていた現象は次のようなものでした。
+
+**Before（直したい状態）**
+- 親アプリ起動 → ネット越しに最新壁紙を取得 → AsyncStorageに保存 → ウィジェットは古いまま
+- ユーザーが「再読み込み」しても変わらない
+- アプリを閉じて1時間後にホーム画面に戻ると、たまたま反映されている
+
+原因は2つ重なっていました。1つはApp Groupを使わずAsyncStorageに書いていたこと。AsyncStorageはJS側のローカル領域に書くだけで、ネイティブ側のApp Groupには触れません。もう1つは、親アプリ側で値を更新したあとに`WidgetCenter.shared.reloadTimelines`をまったく呼んでいなかったことです。
+
+**After（直したあとの動き）**
+- 親アプリ起動 → 最新壁紙取得 → `publishCurrentWallpaper`経由でApp Groupへ書き込み → 同じパスで`refreshWidgets`を呼ぶ
+- WidgetKitは数秒〜数十秒以内にタイムラインを再評価し、ホームに戻るとほぼ追従している
+
+```typescript
+// app/screens/home.tsx
+import { useEffect } from "react";
+import { fetchTodayWallpaper } from "../api/wallpaper";
+import { publishCurrentWallpaper, refreshWidgets } from "../services/shared-storage";
+
+export default function HomeScreen() {
+  useEffect(() => {
+    (async () => {
+      const w = await fetchTodayWallpaper();
+      // ① 共有コンテナへ書く
+      await publishCurrentWallpaper(w);
+      // ② ウィジェットへ更新依頼を送る
+      await refreshWidgets();
+    })();
+  }, []);
+  // ...
+}
+```
+
+「書いてからリロードを呼ぶ」を1セットの作法として`publishCurrentWallpaper`の最後に組み込んでしまうのも有効です。今回は分離する形で書きましたが、私はチームでメンテする箇所では、書く側で必ずreloadも呼ぶラッパーを作って、呼び忘れを根絶しています。
+
+## 大容量データはファイルシステム共有に切り替える
+
+UserDefaultsは「設定値や軽いメタデータ」を共有するための仕組みであり、画像データそのものを置く場所ではありません。ドキュメント上は最大4MB前後と書かれていることもありますが、実運用では数百KBを超える時点で読み書きが目に見えて遅くなります。
+
+私が運営している壁紙アプリでは、ウィジェットに表示する高解像度画像をUserDefaults経由で渡そうとした初期実装で、ホーム画面から戻ったときに数秒間真っ白になる現象が起きました。原因はUserDefaultsから巨大なBase64文字列を読み込んでデコードしていたことで、すぐにファイルシステム共有に切り替えました。
+
+```swift
+// 共有コンテナ上のファイルパスを取得するヘルパー
+extension SharedStorage {
+    static var sharedContainerURL: URL? {
+        FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: suiteName
+        )
+    }
+
+    static func saveWallpaperImage(data: Data, name: String) throws {
+        guard let dir = sharedContainerURL else { return }
+        let url = dir.appendingPathComponent(name)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func loadWallpaperImageURL(name: String) -> URL? {
+        sharedContainerURL?.appendingPathComponent(name)
+    }
+}
+```
+
+ウィジェット側は`Image(uiImage: UIImage(contentsOfFile: url.path))`の形で読み込めば、UserDefaultsを経由せずに高速に表示できます。UserDefaultsには「現在表示すべき画像のファイル名」だけを書き、実体はファイルシステムに置く、という分業が運用上いちばん安定します。
+
+## TestFlightでは動くがApp Storeレビューで引っかかる落とし穴
+
+最後に、私自身もハマった本番特有の落とし穴に触れておきます。
+
+開発・TestFlight配信ではApp Groupは「Development」用のプロビジョニングプロファイルで通ります。けれどApp Store配信用に切り替えると、別のプロファイルが必要で、ここでApp Group capabilityが正しく転写されていないと、ストア配信版だけでウィジェットが起動しないという現象が起きます。
+
+回避手順は次のとおりです。
+
+- Apple Developer Portalの「Profiles」で、親アプリ・Widget ExtensionそれぞれのDistribution用プロファイルを作り直す
+- 両方のプロファイルでCapabilitiesに「App Groups」が含まれていることをWebで目視確認する
+- Xcode → Settings → Accounts → 「Download Manual Profiles」で取得し直す
+- Archiveしたあと、`Show Package Contents → embedded.mobileprovision`を開いて、entitlementsに`com.apple.security.application-groups`が含まれているか確認する
+
+ここまで確認してからストアにアップロードすれば、本番環境でApp Groupが取れない事故はほぼ起きなくなります。AdMob収益が月150万円を超えていた時期も、いまもアプリ事業を続けているのは、こういう「TestFlightでは見えない落とし穴」を一つずつ踏んで覚えてきたからだと振り返ると感じます。手を動かして整えるという、宮大工だった祖父の仕事の感覚に通じる地味な作業を、ここでも省略しないことが結局いちばん早い道だと思っています。
+
+## 明日からできる、最初の1ステップ
+
+Rorkで生成したアプリにiOSウィジェットを足すなら、最初に固めるべき設計はApp GroupのID命名規則とSharedStorage.swiftの置き場所です。バンドルIDとは別物としてApp Groupを発行し、Swiftの共有コードを親アプリ・Extensionの両ターゲットに同じファイルとして登録するところから始めると、その後のExpo Module化やタイムライン設計に大きな手戻りが出ません。
+
+サンプルとして紹介した`SharedStorage.swift`をプロジェクトに1ファイル追加して、「親アプリで`saveWallpaper`を呼ぶ → 実機でウィジェットを長押しして編集モードに入って表示が変わるか確認する」という最小ループをまず動かしてみてください。ここが動けば、あとはJSブリッジもタイムライン設計も、同じSharedStorageを通じて拡張していけます。
+
+ウィジェットまわりはRorkだけでは閉じられない領域ですが、その分だけ実装できると個人開発の幅がぐっと広がる場所でもあります。共に学んでいけたら嬉しいです。お読みいただきありがとうございました。
