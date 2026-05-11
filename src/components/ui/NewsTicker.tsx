@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PAPERLINE — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材獲得で開発力を強化（5/11）",
-    "OPUS47 — Rork Max が Claude Opus 4.7 に対応準備中、コーディング精度 +13% でより精度の高いアプリ生成へ（5/11）",
-    "TRAFFIC743K — Rork が月間 743k MAU・85% 成長を達成、AI モバイルビルダー市場の最大手に（5月）",
-    "RORK15M — Rork が $1500 万シードを調達、Left Lane Capital 主導・a16z Speedrun も参加（4/10）",
-    "RORKMAX — Rork Max が Swift native アプリを量産、iPhone・iPad・Watch・TV・Vision Pro 全対応（5月）",
-    "CLOUDCOMPILE — Rork Max Cloud Compile が Mac 不要に、クラウド Mac 上で署名・配布まで完結（4〜5月）",
+    "GROWTH — Rork が月間 743k MAU・85% 成長を達成、AI モバイルビルダー市場の世界最大手に（5月）",
+    "FUNDING — Rork が $15M シード調達。Left Lane Capital 主導、Peak XV・a16z Speedrun 参加（4/10）",
+    "PAPERLINE — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材獲得目的（4〜5月）",
+    "RORKMAX — Rork Max（Swift native）が Claude Opus 4.7 ベースに進化、Apple 全デバイス対応を強化（5月）",
+    "VIBECODING — 「バイブコーディング」がモバイル開発の主流に。自然言語からプロダクション級アプリを生成（2026年）",
+    "COMPARISON — Rork vs Lovable vs Bolt.new 徹底比較：Cloud Compile・ATTダイアログ・background refresh で差別化（5月）",
   ],
   en: [
-    "PAPERLINE — Rork acquires AI app builder Paperline to strengthen engineering talent and capabilities (5/11)",
-    "OPUS47 — Rork Max prepares Claude Opus 4.7 integration: +13% coding accuracy means sharper app generation (5/11)",
-    "TRAFFIC743K — Rork hits 743K monthly visits with 85% growth, leading the AI mobile builder market (May)",
-    "RORK15M — Rork raises $15M seed led by Left Lane Capital with a16z Speedrun also joining (4/10)",
-    "RORKMAX — Rork Max ships native Swift apps for iPhone, iPad, Watch, TV, and Vision Pro (May)",
-    "CLOUDCOMPILE — Rork Max Cloud Compile removes the Mac requirement, signs and ships entirely from the cloud (Apr-May)",
+    "GROWTH — Rork hits 743k MAU with 85% growth, becoming the world's largest AI mobile builder platform (May)",
+    "FUNDING — Rork raises $15M seed led by Left Lane Capital with Peak XV & a16z Speedrun (4/10)",
+    "PAPERLINE — Rork acquires AI app builder Paperline for engineering talent, signals more acquisitions (Apr-May)",
+    "RORKMAX — Rork Max (Swift native) upgrades to Claude Opus 4.7 base with enhanced full Apple device support (May)",
+    "VIBECODING — Vibe coding goes mainstream: natural language to production-grade mobile apps is now standard (2026)",
+    "COMPARISON — Rork vs Lovable vs Bolt.new: Cloud Compile, ATT dialog & background refresh set Rork apart (May)",
   ],
 };
 
