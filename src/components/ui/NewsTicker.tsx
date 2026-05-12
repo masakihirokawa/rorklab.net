@@ -5,19 +5,19 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
     "GROWTH — Rork が月間 743k MAU・85% 成長を達成、AI モバイルビルダー市場の世界最大手に（5月）",
-    "FUNDING — Rork が $15M シード調達。Left Lane Capital 主導、Peak XV・a16z Speedrun 参加（4/10）",
-    "PAPERLINE — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材獲得目的（4〜5月）",
-    "RORKMAX — Rork Max（Swift native）が Claude Opus 4.7 ベースに進化、Apple 全デバイス対応を強化（5月）",
-    "VIBECODING — 「バイブコーディング」がモバイル開発の主流に。自然言語からプロダクション級アプリを生成（2026年）",
-    "COMPARISON — Rork vs Lovable vs Bolt.new 徹底比較：Cloud Compile・ATTダイアログ・background refresh で差別化（5月）",
+    "SWIFT — Rork Max が Swift ネイティブコード生成に完全移行、React Native 不使用で人間開発者と同水準の品質",
+    "FUNDING — Rork が $15M シード調達（4/10）。Left Lane Capital 主導、a16z Speedrun 参加。ARR $1.5M を3日で達成",
+    "CLOUD — Cloud Compile で Mac・Xcode 不要の署名・配布フローを確立、2クリックで App Store 公開可能",
+    "LOVABLE — Lovable が iOS / Android アプリをリリース（4/28）、モバイルからのバイブコーディングが標準化へ",
+    "MARKET — Vibe Coding 市場は 2027年に $12.3B 規模へ。非開発者63%が活用、4ツールによる競争が激化",
   ],
   en: [
-    "GROWTH — Rork hits 743k MAU with 85% growth, becoming the world's largest AI mobile builder platform (May)",
-    "FUNDING — Rork raises $15M seed led by Left Lane Capital with Peak XV & a16z Speedrun (4/10)",
-    "PAPERLINE — Rork acquires AI app builder Paperline for engineering talent, signals more acquisitions (Apr-May)",
-    "RORKMAX — Rork Max (Swift native) upgrades to Claude Opus 4.7 base with enhanced full Apple device support (May)",
-    "VIBECODING — Vibe coding goes mainstream: natural language to production-grade mobile apps is now standard (2026)",
-    "COMPARISON — Rork vs Lovable vs Bolt.new: Cloud Compile, ATT dialog & background refresh set Rork apart (May)",
+    "GROWTH — Rork hits 743k MAU with 85% growth, cementing its lead as the top AI mobile builder platform (May)",
+    "SWIFT — Rork Max fully pivots to native Swift codegen — no React Native, matching human developer quality",
+    "FUNDING — Rork raises $15M seed (4/10), a16z Speedrun joins; booked $1.5M ARR in just 3 days post-launch",
+    "CLOUD — Cloud Compile enables 2-click App Store publishing with no Mac or Xcode required",
+    "LOVABLE — Lovable launches iOS & Android app (4/28), normalizing mobile vibe coding for builders everywhere",
+    "MARKET — Vibe Coding market headed for $12.3B by 2027; 63% non-developers driving four-way platform race",
   ],
 };
 
