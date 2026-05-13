@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "ACQUISITION — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材強化・今後も買収継続の方針（5月）",
     "GROWTH — Rork が月間 743k MAU・85% 成長を達成、AI モバイルビルダー市場の世界最大手に（5月）",
-    "SWIFT — Rork Max が Swift ネイティブコード生成に完全移行、React Native 不使用で人間開発者と同水準の品質",
-    "FUNDING — Rork が $15M シード調達（4/10）。Left Lane Capital 主導、a16z Speedrun 参加。ARR $1.5M を3日で達成",
+    "SWIFT — Rork Max が Swift ネイティブコード生成に完全移行、Claude Code + Opus 4.6 搭載で X に800万ビュー超",
+    "FUNDING — Rork が $15M シード調達（4/10）。Left Lane Capital 主導、Peak XV・True Ventures・a16z Speedrun 参加",
     "CLOUD — Cloud Compile で Mac・Xcode 不要の署名・配布フローを確立、2クリックで App Store 公開可能",
-    "LOVABLE — Lovable が iOS / Android アプリをリリース（4/28）、モバイルからのバイブコーディングが標準化へ",
-    "MARKET — Vibe Coding 市場は 2027年に $12.3B 規模へ。非開発者63%が活用、4ツールによる競争が激化",
+    "MARKET — Vibe Coding 市場は 2027年に $12.3B 規模へ。非開発者63%が活用、AI ネイティブ開発が主流に",
   ],
   en: [
+    "ACQUISITION — Rork acquires AI app builder Paperline to expand engineering talent (May 2026, more acquisitions planned)",
     "GROWTH — Rork hits 743k MAU with 85% growth, cementing its lead as the top AI mobile builder platform (May)",
-    "SWIFT — Rork Max fully pivots to native Swift codegen — no React Native, matching human developer quality",
-    "FUNDING — Rork raises $15M seed (4/10), a16z Speedrun joins; booked $1.5M ARR in just 3 days post-launch",
-    "CLOUD — Cloud Compile enables 2-click App Store publishing with no Mac or Xcode required",
-    "LOVABLE — Lovable launches iOS & Android app (4/28), normalizing mobile vibe coding for builders everywhere",
-    "MARKET — Vibe Coding market headed for $12.3B by 2027; 63% non-developers driving four-way platform race",
+    "SWIFT — Rork Max on Claude Code + Opus 4.6 goes fully native Swift — 8M+ X views, doubled ARR in 2 weeks",
+    "FUNDING — Rork raises $15M seed (4/10): Left Lane Capital leads; Peak XV, True Ventures & a16z Speedrun join",
+    "CLOUD — Cloud Compile: 2-click App Store publishing with no Mac or Xcode required",
+    "MARKET — Vibe Coding market headed for $12.3B by 2027; 63% non-developers driving AI-native app development",
   ],
 };
 
