@@ -1,0 +1,482 @@
+---
+title: "Building a Short Video Feed with Rork Max — Camera Recording, Supabase Upload & Vertical Scroll Patterns"
+slug: "rork-max-short-video-vertical-feed-implementation-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-14T04:45"
+updated: "2026-05-14T04:45"
+author: "Rork Lab"
+description: "A hands-on guide to implementing a TikTok/Reels-style vertical video feed with Rork Max. Covers camera recording, background upload to Supabase Storage, and infinite scroll with active-video detection."
+tags: ["Rork Max", "short video", "vertical feed", "Supabase", "expo-camera", "FlatList", "video upload", "indie dev"]
+highlights:
+  - "Discover why the first camera recording code from Rork Max didn't work — and the step-by-step prompting strategy that brought it to production quality"
+  - "Get three copy-paste-ready implementations: camera recording with correct async handling, background Supabase upload, and a FlatList feed with auto-play on scroll"
+  - "Learn the three UX design patterns that prevent feed abandonment, drawn from building apps with over 50 million total downloads"
+---
+
+When I first asked Rork Max to build a TikTok-style video feed, the output looked plausible — until I actually tried to record something.
+
+The camera would initialize but never start recording. The upload blocked the entire UI for thirty seconds. The FlatList scrolled smoothly, but three videos were playing at once. Rork Max confidently told me "the feature is complete."
+
+Having shipped apps with over 50 million downloads over the past decade, I've come to accept that video is one of the hardest categories for AI code generation. Unlike a static list or a form, a video feed requires recording, encoding, uploading, and playback to work asynchronously in concert. When an AI generates each piece in isolation, the seams break.
+
+This guide covers what I actually had to fix, and how to prompt Rork Max to get correct output from the start.
+
+---
+
+## Why Video Feeds Break in Rork Max Outputs
+
+Before diving into implementation, it helps to understand the failure modes.
+
+A short video feed requires:
+
+- **Camera permission management** — both camera and microphone, sequentially
+- **Non-blocking recording** — `recordAsync()` must not be awaited
+- **Background upload** — user should be able to edit captions while upload runs
+- **Feed pre-buffering** — pre-load the next video before the user scrolls to it
+- **Exclusive playback** — only the visible video should play; all others pause
+
+Asking Rork Max to implement all of this in one prompt produces code where each part individually works, but the connections between them fail. The solution is staged prompting: implement and verify each piece before moving to the next.
+
+---
+
+## Architecture Overview
+
+Here's the overall data flow we're building.
+
+```
+[User] → Camera recording → Local temp file
+    ↓
+[Background upload] → Supabase Storage
+    ↓
+[Supabase Edge Function] → Thumbnail generation → DB row inserted
+    ↓
+[Feed API] → Video metadata → FlatList rendered
+```
+
+### Supabase Schema
+
+```sql
+create table videos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id),
+  storage_path text not null,
+  thumbnail_path text,
+  duration_seconds integer,
+  caption text,
+  like_count integer default 0,
+  view_count integer default 0,
+  created_at timestamptz default now()
+);
+
+alter table videos enable row level security;
+create policy "videos_read" on videos for select using (true);
+create policy "videos_insert" on videos for insert with check (auth.uid() = user_id);
+create policy "videos_delete" on videos for delete using (auth.uid() = user_id);
+```
+
+---
+
+## Step 1: Camera Recording Component
+
+This is where most implementations fail. The root cause is a fundamental misunderstanding of how `recordAsync()` works.
+
+### ❌ What Rork Max produces by default (broken)
+
+```typescript
+const startRecording = async () => {
+  if (cameraRef.current) {
+    const video = await cameraRef.current.recordAsync(); // blocks forever
+    setVideoUri(video.uri);
+  }
+};
+```
+
+`recordAsync()` returns a Promise that only resolves when recording *stops*. Awaiting it here means the function hangs until recording ends — which only happens when you call `stopRecording()` from somewhere else. But since this function is blocked, you can never get there.
+
+### ✅ Correct implementation
+
+```typescript
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import { useRef, useState, useCallback } from 'react';
+
+interface RecordingState {
+  isRecording: boolean;
+  videoUri: string | null;
+  duration: number;
+}
+
+export function VideoRecorder({ onVideoReady }: { onVideoReady: (uri: string) => void }) {
+  const [permission, requestPermission] = useCameraPermissions();
+  const [state, setState] = useState<RecordingState>({
+    isRecording: false,
+    videoUri: null,
+    duration: 0,
+  });
+  const cameraRef = useRef<CameraView>(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const startRecording = useCallback(async () => {
+    if (!cameraRef.current || state.isRecording) return;
+
+    setState(prev => ({ ...prev, isRecording: true, duration: 0 }));
+
+    // Duration counter updates UI only — no blocking
+    timerRef.current = setInterval(() => {
+      setState(prev => {
+        if (prev.duration >= 60) {
+          stopRecording();
+          return prev;
+        }
+        return { ...prev, duration: prev.duration + 1 };
+      });
+    }, 1000);
+
+    // Do NOT await. Use .then() to receive the result when recording stops.
+    cameraRef.current.recordAsync({
+      maxDuration: 60,
+      quality: '720p',
+    }).then((video) => {
+      if (video?.uri) {
+        setState(prev => ({ ...prev, videoUri: video.uri }));
+        onVideoReady(video.uri);
+      }
+    }).catch((error) => {
+      console.warn('Recording error:', error);
+    });
+  }, [state.isRecording]);
+
+  const stopRecording = useCallback(() => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    cameraRef.current?.stopRecording();
+    setState(prev => ({ ...prev, isRecording: false }));
+  }, []);
+
+  if (!permission?.granted) {
+    return <Button title="Allow Camera Access" onPress={requestPermission} />;
+  }
+
+  return (
+    <CameraView ref={cameraRef} style={{ flex: 1 }} facing="back" mode="video">
+      <TouchableOpacity
+        onPress={state.isRecording ? stopRecording : startRecording}
+        style={styles.recordButton}
+      >
+        <View style={[styles.inner, state.isRecording && styles.recording]} />
+      </TouchableOpacity>
+      {state.isRecording && (
+        <Text style={styles.duration}>{state.duration}s</Text>
+      )}
+    </CameraView>
+  );
+}
+```
+
+**Rork Max prompt that generates this correctly:**
+
+> "Create a `VideoRecorder` component using expo-camera. Use `recordAsync()` with `.then()` — do NOT use await. The component should maintain `isRecording` state, count elapsed seconds up to 60, auto-stop at 60 seconds, and call `onVideoReady(uri)` when recording completes."
+
+---
+
+## Step 2: Background Upload to Supabase Storage
+
+The second common failure is blocking the UI during upload. An upload of a 60-second video can take 10–30 seconds on mobile networks. The user should be able to write a caption, browse the app, or even navigate away while the upload runs.
+
+### Background upload hook
+
+```typescript
+import { useState, useCallback } from 'react';
+import { supabase } from '@/lib/supabase';
+import * as FileSystem from 'expo-file-system';
+
+interface UploadProgress {
+  status: 'idle' | 'uploading' | 'success' | 'error';
+  progress: number;
+  storagePath: string | null;
+  error: string | null;
+}
+
+export function useVideoUpload() {
+  const [uploadState, setUploadState] = useState<UploadProgress>({
+    status: 'idle',
+    progress: 0,
+    storagePath: null,
+    error: null,
+  });
+
+  const uploadVideo = useCallback(async (localUri: string, userId: string) => {
+    setUploadState({ status: 'uploading', progress: 0, storagePath: null, error: null });
+
+    try {
+      const base64 = await FileSystem.readAsStringAsync(localUri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      // Convert base64 to binary
+      const byteCharacters = atob(base64);
+      const byteArray = new Uint8Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteArray[i] = byteCharacters.charCodeAt(i);
+      }
+
+      const storagePath = `${userId}/${Date.now()}.mp4`;
+      setUploadState(prev => ({ ...prev, progress: 10 }));
+
+      const { error: uploadError } = await supabase.storage
+        .from('videos')
+        .upload(storagePath, byteArray.buffer, {
+          contentType: 'video/mp4',
+          cacheControl: '3600',
+        });
+
+      if (uploadError) throw uploadError;
+      setUploadState(prev => ({ ...prev, progress: 80 }));
+
+      // Insert metadata into DB
+      const { data: video, error: dbError } = await supabase
+        .from('videos')
+        .insert({ user_id: userId, storage_path: storagePath })
+        .select()
+        .single();
+
+      if (dbError) throw dbError;
+
+      setUploadState({ status: 'success', progress: 100, storagePath, error: null });
+      return video;
+
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Upload failed';
+      setUploadState({ status: 'error', progress: 0, storagePath: null, error: message });
+      throw error;
+    }
+  }, []);
+
+  return { uploadState, uploadVideo };
+}
+```
+
+**Key design decision**: Call `uploadVideo()` without `await` at the call site. This fires off the upload and immediately returns, keeping the UI responsive.
+
+```typescript
+const handleVideoReady = (localUri: string) => {
+  uploadVideo(localUri, user.id);  // fire and forget — UI stays responsive
+  router.push('/post/caption');    // navigate immediately
+};
+```
+
+---
+
+## Step 3: Vertical Scroll Feed with Active Video Detection
+
+The FlatList feed needs to know which video is currently "in view" so it can play only that one. The standard React Native mechanism for this is `viewabilityConfigCallbackPairs`.
+
+### Feed component
+
+```typescript
+import { FlatList, ViewabilityConfig, ViewToken, Dimensions } from 'react-native';
+import { useCallback, useRef, useState } from 'react';
+
+const { height: SCREEN_HEIGHT, width: SCREEN_WIDTH } = Dimensions.get('window');
+
+const VIEWABILITY_CONFIG: ViewabilityConfig = {
+  itemVisiblePercentThreshold: 80,  // 80% visible = active
+  minimumViewTime: 100,
+};
+
+export function VideoFeed({ videos }: { videos: Video[] }) {
+  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
+
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
+      if (viewableItems.length > 0) {
+        setActiveVideoId(viewableItems[0].item.id);
+      }
+    },
+    []
+  );
+
+  // Must be stable across renders — use useRef
+  const viewabilityConfigCallbackPairs = useRef([
+    { viewabilityConfig: VIEWABILITY_CONFIG, onViewableItemsChanged },
+  ]);
+
+  return (
+    <FlatList
+      data={videos}
+      keyExtractor={(item) => item.id}
+      renderItem={({ item }) => (
+        <VideoFeedItem video={item} isActive={activeVideoId === item.id} />
+      )}
+      pagingEnabled
+      showsVerticalScrollIndicator={false}
+      decelerationRate="fast"
+      viewabilityConfigCallbackPairs={viewabilityConfigCallbackPairs.current}
+      getItemLayout={(_, index) => ({
+        length: SCREEN_HEIGHT,
+        offset: SCREEN_HEIGHT * index,
+        index,
+      })}
+      initialNumToRender={2}
+      maxToRenderPerBatch={3}
+      windowSize={5}
+      removeClippedSubviews={true}
+    />
+  );
+}
+```
+
+### VideoFeedItem — play/pause based on visibility
+
+```typescript
+import { Video, ResizeMode } from 'expo-av';
+import { useEffect, useRef } from 'react';
+
+export function VideoFeedItem({ video, isActive }: { video: Video; isActive: boolean }) {
+  const videoRef = useRef<Video>(null);
+
+  useEffect(() => {
+    if (!videoRef.current) return;
+
+    if (isActive) {
+      videoRef.current.playAsync().catch(() => {});
+    } else {
+      videoRef.current.pauseAsync().catch(() => {});
+      videoRef.current.setPositionAsync(0).catch(() => {}); // reset to start
+    }
+  }, [isActive]);
+
+  return (
+    <View style={{ height: SCREEN_HEIGHT, width: SCREEN_WIDTH }}>
+      <Video
+        ref={videoRef}
+        source={{ uri: getPublicUrl(video.storage_path) }}
+        style={{ flex: 1 }}
+        resizeMode={ResizeMode.COVER}
+        isLooping
+        shouldPlay={false}  // controlled by isActive effect
+        useNativeControls={false}
+      />
+      <VideoActions video={video} />
+    </View>
+  );
+}
+```
+
+---
+
+## Step 4: URL Caching for Supabase Storage
+
+Requesting a public URL on every render adds unnecessary overhead. Cache them in a module-level Map.
+
+```typescript
+const urlCache = new Map<string, string>();
+
+export function getPublicUrl(storagePath: string): string {
+  if (urlCache.has(storagePath)) {
+    return urlCache.get(storagePath)!;
+  }
+  const { data } = supabase.storage.from('videos').getPublicUrl(storagePath);
+  urlCache.set(storagePath, data.publicUrl);
+  return data.publicUrl;
+}
+```
+
+---
+
+## Three Production Optimizations
+
+After releasing, I found three issues that weren't visible in development.
+
+**1. Pre-buffering the next video**
+
+Without prefetching, the next video shows a loading spinner for 1–2 seconds after the user swipes. Pre-load it while the current one is playing.
+
+```typescript
+const prefetchNextVideo = useCallback((currentIndex: number) => {
+  const next = videos[currentIndex + 1];
+  if (!next) return;
+  const url = getPublicUrl(next.storage_path);
+  Video.loadAsync({ uri: url }, {}, false).catch(() => {});
+}, [videos]);
+```
+
+**2. Recovering playback after app backgrounding**
+
+On iOS, playback sometimes fails silently when the app returns to the foreground.
+
+```typescript
+useEffect(() => {
+  const sub = AppState.addEventListener('change', (state) => {
+    if (state === 'active' && isActive) {
+      videoRef.current?.playAsync().catch(() => {
+        setTimeout(() => videoRef.current?.playAsync(), 300);
+      });
+    }
+  });
+  return () => sub.remove();
+}, [isActive]);
+```
+
+**3. Storage check before upload**
+
+A 60-second video can reach 100–200MB. Check available disk space before starting the upload.
+
+```typescript
+import * as FileSystem from 'expo-file-system';
+
+const checkStorage = async (fileSizeMB: number) => {
+  const free = await FileSystem.getFreeDiskStorageAsync();
+  const freeMB = free / 1024 / 1024;
+  if (freeMB < fileSizeMB * 2) {
+    throw new Error(`Not enough storage. Available: ${Math.floor(freeMB)}MB`);
+  }
+};
+```
+
+---
+
+## Rork Max Prompt Strategy: Before / After
+
+**❌ Prompt that produces broken output**
+
+> "Build a TikTok-style app where users can record and post short videos and browse a feed."
+
+This generates plausible-looking code where each feature works in isolation but the connections break.
+
+**✅ Staged prompts that generate working code**
+
+```
+Prompt 1:
+"Create a VideoRecorder component using expo-camera. 
+Call recordAsync() with .then() — NOT await. 
+Maintain isRecording state, count elapsed seconds up to 60, 
+auto-stop at 60 seconds, and call onVideoReady(uri) on completion."
+
+Prompt 2:
+"Create a useVideoUpload hook that uploads a local video file to 
+Supabase Storage bucket 'videos'. The hook should expose 
+uploadState (status/progress/storagePath) and an uploadVideo(localUri, userId) 
+function. uploadVideo should run asynchronously — callers do not await it."
+
+Prompt 3:
+"Create a VideoFeed component using FlatList with pagingEnabled. 
+Use viewabilityConfigCallbackPairs with 80% threshold to track the 
+active video ID. Pass isActive prop to each VideoFeedItem."
+```
+
+Verify each step before moving to the next. The integration bugs that frustrated me for hours disappeared when I switched to this staged approach.
+
+---
+
+## A Note from the Developer
+
+Having shipped wallpaper, wellness, and manifestation apps that collectively reached 50 million downloads, I've found that the first three seconds of the feed experience determine whether someone stays or leaves.
+
+The video must start the moment the feed appears. Scrolling must feel frictionless. The cut to the next video must feel intentional, not accidental. These aren't aesthetic preferences — they're the difference between a 30% and 70% day-one retention rate.
+
+My grandfather was a temple carpenter who used to say that working carefully with your hands is its own form of devotion. I think about that when debugging video timing issues at 2am. The craft is in the details.
+
+Rork Max accelerates the implementation, but knowing *why* the implementation must be structured a specific way is what produces quality output. Start with the `VideoRecorder` component today. Record something. Then move to upload. Then the feed. Each step confirmed is one less edge case you'll fight in production.
+
+I'm still iterating on this myself — if you find patterns that work better, I'd genuinely like to know.

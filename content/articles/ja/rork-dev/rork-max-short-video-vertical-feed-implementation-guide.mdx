@@ -1,0 +1,570 @@
+---
+title: "Rork Max でショート動画フィードを実装する — カメラ撮影・Supabase アップロード・縦型スクロールの設計パターン"
+slug: "rork-max-short-video-vertical-feed-implementation-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-14T04:45"
+updated: "2026-05-14T04:45"
+author: "Rork Lab"
+description: "Rork Max でTikTok/Reels風の縦型ショート動画フィードを実装する実践ガイド。カメラ撮影・動画アップロード・無限スクロールフィードの設計パターンとRork Maxへの効果的なプロンプト戦略を徹底解説します。"
+tags: ["Rork Max", "ショート動画", "縦型動画", "Supabase", "expo-camera", "FlatList", "動画アップロード", "個人開発"]
+highlights:
+  - "Rork Maxに頼んで最初に出力された動画コードが使い物にならなかった理由と、段階的なプロンプト設計で本番品質に持ち込むまでの試行錯誤を公開する"
+  - "カメラ撮影・Supabase Storageへのバックグラウンドアップロード・FlatList縦型スクロールの3つの実装を、そのままコピーして動くコード付きで解説する"
+  - "累計5,000万DLのアプリ開発経験から導いた、動画フィードでユーザーが離脱しない3つのUX設計パターンを具体的な実装と紐付けて説明する"
+---
+
+縦型動画のフィードをRork Maxに丸投げしたら、最初に出てきたコードはほぼ使い物になりませんでした。
+
+`expo-camera`の初期化タイミングがずれて録画が開始されない、Supabaseへのアップロード中にUIが完全にフリーズする、FlatListのスクロールが動画の再生と競合してカクつく——これらの問題が同時に発生した状態で、「この機能は完成しています」とRork Maxは返してきたのです。
+
+個人開発でアプリを作り続けて10年以上になりますが、動画機能は特にAIコード生成と相性が悪い領域の一つだと感じています。静止画とは異なり、録画・エンコード・アップロード・再生が非同期で連鎖するため、AIが各パーツを独立して生成しても、繋ぎ目の処理でバグが出やすいのです。
+
+この記事では、そうした問題にぶつかりながら実際に動くショート動画フィードを完成させた経験から、Rork Maxへの効果的なプロンプト戦略と、そのまま使える実装パターンをまとめます。
+
+---
+
+## なぜショート動画フィードはRork Maxで詰まりやすいのか
+
+まず前提として、ショート動画機能が技術的に複雑な理由を整理します。
+
+一般的なアプリ機能と異なり、縦型動画フィードには以下が必要です。
+
+- **カメラパーミッション管理**（カメラ・マイクの2段階許可）
+- **録画中のパフォーマンス確保**（録画とUI更新の競合回避）
+- **アップロードの非同期処理**（バックグラウンドでアップロードしながらユーザーは別の操作ができる状態）
+- **動画フィードの先読み**（スクロール直前のアイテムを事前バッファリング）
+- **再生の排他制御**（画面内に表示されている動画だけが自動再生）
+
+Rork Maxにこれらを一度のプロンプトで全部渡すと、部分的には動くコードが出てきますが、連携部分でバグが生じます。個人開発では、こうした複雑機能を「小さな単位に分割して依頼する」アプローチが鍵になります。
+
+---
+
+## アーキテクチャ全体像
+
+実装を始める前に、全体の構成を整理します。
+
+### データフロー
+
+```
+[ユーザー] → カメラ録画 → ローカル一時ファイル保存
+    ↓
+[バックグラウンドアップロード] → Supabase Storage
+    ↓
+[Supabase Edge Function] → サムネイル生成 → DB保存
+    ↓
+[フィードAPI] → 動画メタデータ取得 → FlatList表示
+```
+
+### Supabase テーブル設計
+
+```sql
+-- videos テーブル
+create table videos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id),
+  storage_path text not null,        -- Supabase Storage のパス
+  thumbnail_path text,               -- サムネイル画像のパス
+  duration_seconds integer,          -- 動画の長さ（秒）
+  width integer,
+  height integer,
+  caption text,
+  like_count integer default 0,
+  view_count integer default 0,
+  created_at timestamptz default now()
+);
+
+-- RLS: 投稿者本人のみ削除可能、閲覧は全員可
+alter table videos enable row level security;
+create policy "videos_read" on videos for select using (true);
+create policy "videos_insert" on videos for insert with check (auth.uid() = user_id);
+create policy "videos_delete" on videos for delete using (auth.uid() = user_id);
+```
+
+---
+
+## Step 1: カメラ録画コンポーネントの実装
+
+ここが最初の壁になります。Rork Maxへの最初のプロンプトで「TikTok風の録画画面を作って」と渡すと、録画ボタンのUIは綺麗に出てきますが、実際の録画処理が不完全なことが多いです。
+
+### ❌ Rork Maxが最初に出してきたコード（動かない）
+
+```typescript
+// 問題のあるコード例
+const startRecording = async () => {
+  if (cameraRef.current) {
+    const video = await cameraRef.current.recordAsync(); // ← awaitで止まる
+    setVideoUri(video.uri);
+  }
+};
+```
+
+`recordAsync()` はPromiseが解決しないまま録画が続くため、`await` で待機すると関数がブロックされます。停止処理を別途呼び出す必要があります。
+
+### ✅ 修正後の正しい実装
+
+```typescript
+import { CameraView, CameraType, useCameraPermissions } from 'expo-camera';
+import { useRef, useState, useCallback } from 'react';
+
+interface RecordingState {
+  isRecording: boolean;
+  videoUri: string | null;
+  duration: number;
+}
+
+export function VideoRecorder({ onVideoReady }: { onVideoReady: (uri: string) => void }) {
+  const [permission, requestPermission] = useCameraPermissions();
+  const [state, setState] = useState<RecordingState>({
+    isRecording: false,
+    videoUri: null,
+    duration: 0,
+  });
+  const cameraRef = useRef<CameraView>(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const startRecording = useCallback(async () => {
+    if (!cameraRef.current || state.isRecording) return;
+
+    setState(prev => ({ ...prev, isRecording: true, duration: 0 }));
+
+    // duration カウントアップ（UIのみ、awaitを使わない）
+    timerRef.current = setInterval(() => {
+      setState(prev => {
+        if (prev.duration >= 60) {
+          stopRecording();  // 最大60秒で自動停止
+          return prev;
+        }
+        return { ...prev, duration: prev.duration + 1 };
+      });
+    }, 1000);
+
+    // recordAsync はawaitせず、コールバックで結果を受け取る
+    cameraRef.current.recordAsync({
+      maxDuration: 60,
+      quality: '720p',
+    }).then((video) => {
+      if (video?.uri) {
+        setState(prev => ({ ...prev, videoUri: video.uri }));
+        onVideoReady(video.uri);
+      }
+    }).catch((error) => {
+      console.warn('録画エラー:', error);
+    });
+  }, [state.isRecording]);
+
+  const stopRecording = useCallback(() => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    cameraRef.current?.stopRecording();
+    setState(prev => ({ ...prev, isRecording: false }));
+  }, []);
+
+  if (!permission) return null;
+  if (!permission.granted) {
+    return (
+      <Button title="カメラへのアクセスを許可" onPress={requestPermission} />
+    );
+  }
+
+  return (
+    <CameraView
+      ref={cameraRef}
+      style={{ flex: 1 }}
+      facing="back"
+      mode="video"
+    >
+      {/* 録画ボタン */}
+      <TouchableOpacity
+        onPress={state.isRecording ? stopRecording : startRecording}
+        style={styles.recordButton}
+      >
+        <View style={[
+          styles.recordButtonInner,
+          state.isRecording && styles.recordButtonActive
+        ]} />
+      </TouchableOpacity>
+
+      {/* 録画時間表示 */}
+      {state.isRecording && (
+        <Text style={styles.duration}>{state.duration}s</Text>
+      )}
+    </CameraView>
+  );
+}
+```
+
+Rork Maxへの修正依頼プロンプトは次のように渡しました。
+
+> 「録画コンポーネントで、`recordAsync()` を `await` せずに `.then()` で処理するよう修正してください。録画中は `isRecording: true` の状態を保持し、`stopRecording()` で停止後に `onVideoReady` コールバックを呼ぶ構成にしてください」
+
+このように「何が問題か」を具体的に伝えると、Rork Maxは正しいパターンを生成してくれます。
+
+---
+
+## Step 2: Supabase Storageへのバックグラウンドアップロード
+
+録画完了後、すぐにアップロード処理を開始しますが、UIをブロックしてはいけません。アップロード中もユーザーはキャプションの編集や他の操作ができる必要があります。
+
+### アップロードフック
+
+```typescript
+import { useState, useCallback } from 'react';
+import { supabase } from '@/lib/supabase';
+import * as FileSystem from 'expo-file-system';
+
+interface UploadProgress {
+  status: 'idle' | 'uploading' | 'success' | 'error';
+  progress: number;  // 0〜100
+  storagePath: string | null;
+  error: string | null;
+}
+
+export function useVideoUpload() {
+  const [uploadState, setUploadState] = useState<UploadProgress>({
+    status: 'idle',
+    progress: 0,
+    storagePath: null,
+    error: null,
+  });
+
+  const uploadVideo = useCallback(async (
+    localUri: string,
+    userId: string
+  ) => {
+    setUploadState({ status: 'uploading', progress: 0, storagePath: null, error: null });
+
+    try {
+      // ファイルをArrayBufferとして読み込む
+      const fileInfo = await FileSystem.getInfoAsync(localUri, { size: true });
+      if (!fileInfo.exists) throw new Error('ファイルが見つかりません');
+
+      const base64 = await FileSystem.readAsStringAsync(localUri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      // バイナリに変換
+      const byteCharacters = atob(base64);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+
+      // Supabase Storage へアップロード
+      const storagePath = `${userId}/${Date.now()}.mp4`;
+
+      setUploadState(prev => ({ ...prev, progress: 10 }));
+
+      const { error: uploadError } = await supabase.storage
+        .from('videos')
+        .upload(storagePath, byteArray.buffer, {
+          contentType: 'video/mp4',
+          cacheControl: '3600',
+          upsert: false,
+        });
+
+      if (uploadError) throw uploadError;
+
+      setUploadState(prev => ({ ...prev, progress: 80 }));
+
+      // DB に動画メタデータを保存
+      const { data: video, error: dbError } = await supabase
+        .from('videos')
+        .insert({
+          user_id: userId,
+          storage_path: storagePath,
+        })
+        .select()
+        .single();
+
+      if (dbError) throw dbError;
+
+      setUploadState({
+        status: 'success',
+        progress: 100,
+        storagePath: storagePath,
+        error: null,
+      });
+
+      return video;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'アップロードに失敗しました';
+      setUploadState({
+        status: 'error',
+        progress: 0,
+        storagePath: null,
+        error: message,
+      });
+      throw error;
+    }
+  }, []);
+
+  return { uploadState, uploadVideo };
+}
+```
+
+**重要な設計判断**: このフックは `await` なしで呼び出すことで、UIはブロックされません。アップロードの進捗は `uploadState.progress` で追跡できます。
+
+```typescript
+// 呼び出し側（awaitしない）
+const handleVideoReady = (localUri: string) => {
+  uploadVideo(localUri, user.id);  // 非同期で開始、完了を待たない
+  // 同時にキャプション編集画面へ遷移できる
+  router.push('/post/caption');
+};
+```
+
+---
+
+## Step 3: 縦型スクロールフィードの実装
+
+これが最も技術的に重要な部分です。TikTok風のフィードでは「画面内に表示された動画のみが自動再生し、スクロールで画面外に出た動画は一時停止する」という挙動が必要です。
+
+### viewabilityConfig によるアクティブ動画の検出
+
+```typescript
+import { FlatList, ViewabilityConfig, ViewToken } from 'react-native';
+import { useCallback, useRef, useState } from 'react';
+import { VideoFeedItem } from './VideoFeedItem';
+
+const VIEWABILITY_CONFIG: ViewabilityConfig = {
+  itemVisiblePercentThreshold: 80,  // 80%以上表示されたら「アクティブ」とみなす
+  minimumViewTime: 100,             // 100ms以上表示されないとカウントしない
+};
+
+export function VideoFeed({ videos }: { videos: Video[] }) {
+  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
+
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
+      if (viewableItems.length > 0) {
+        setActiveVideoId(viewableItems[0].item.id);
+      }
+    },
+    []
+  );
+
+  // viewabilityConfigCallbackPairs は useMemo/useRef で固定する必要がある
+  const viewabilityConfigCallbackPairs = useRef([
+    {
+      viewabilityConfig: VIEWABILITY_CONFIG,
+      onViewableItemsChanged,
+    },
+  ]);
+
+  return (
+    <FlatList
+      data={videos}
+      keyExtractor={(item) => item.id}
+      renderItem={({ item }) => (
+        <VideoFeedItem
+          video={item}
+          isActive={activeVideoId === item.id}
+        />
+      )}
+      pagingEnabled                        // 1アイテムずつスナップ
+      showsVerticalScrollIndicator={false}
+      decelerationRate="fast"
+      viewabilityConfigCallbackPairs={viewabilityConfigCallbackPairs.current}
+      getItemLayout={(_, index) => ({     // 固定高さで最適化
+        length: SCREEN_HEIGHT,
+        offset: SCREEN_HEIGHT * index,
+        index,
+      })}
+      initialNumToRender={2}
+      maxToRenderPerBatch={3}
+      windowSize={5}
+      removeClippedSubviews={true}
+    />
+  );
+}
+```
+
+### VideoFeedItem コンポーネント
+
+```typescript
+import { Video, ResizeMode } from 'expo-av';
+import { useEffect, useRef } from 'react';
+
+interface VideoFeedItemProps {
+  video: Video;
+  isActive: boolean;
+}
+
+export function VideoFeedItem({ video, isActive }: VideoFeedItemProps) {
+  const videoRef = useRef<Video>(null);
+
+  useEffect(() => {
+    if (!videoRef.current) return;
+
+    if (isActive) {
+      // フォアグラウンドに来たら再生開始
+      videoRef.current.playAsync().catch(() => {});
+    } else {
+      // 画面外に出たら一時停止（メモリとCPUを節約）
+      videoRef.current.pauseAsync().catch(() => {});
+      videoRef.current.setPositionAsync(0).catch(() => {});  // 先頭に戻す
+    }
+  }, [isActive]);
+
+  return (
+    <View style={{ height: SCREEN_HEIGHT, width: SCREEN_WIDTH }}>
+      <Video
+        ref={videoRef}
+        source={{ uri: getPublicUrl(video.storage_path) }}
+        style={{ flex: 1 }}
+        resizeMode={ResizeMode.COVER}
+        isLooping
+        isMuted={false}
+        useNativeControls={false}
+        shouldPlay={false}  // 初期再生はisActiveに委ねる
+      />
+      {/* いいね・コメント・シェアボタン */}
+      <VideoActions video={video} />
+    </View>
+  );
+}
+```
+
+---
+
+## Step 4: Supabase公開URLの取得とキャッシュ
+
+動画URLは毎回Supabaseに問い合わせるのではなく、一度取得したものをメモリキャッシュに保持します。
+
+```typescript
+const urlCache = new Map<string, string>();
+
+export function getPublicUrl(storagePath: string): string {
+  if (urlCache.has(storagePath)) {
+    return urlCache.get(storagePath)!;
+  }
+
+  const { data } = supabase.storage
+    .from('videos')
+    .getPublicUrl(storagePath);
+
+  urlCache.set(storagePath, data.publicUrl);
+  return data.publicUrl;
+}
+```
+
+---
+
+## 本番運用で必要な3つの最適化
+
+実際にリリースして気づいた問題と対処法をまとめます。
+
+### 1. 動画の先読み（prefetch）
+
+スクロールする直前のアイテムが読み込まれていないとカクつきます。`onEndReached` を使ってページネーションしつつ、次の動画のURLを事前にフェッチします。
+
+```typescript
+// フィード内で次の動画をprefetch
+const prefetchNextVideo = useCallback((currentIndex: number) => {
+  const nextVideo = videos[currentIndex + 1];
+  if (!nextVideo) return;
+
+  const url = getPublicUrl(nextVideo.storage_path);
+
+  // expo-av のprefetch（URLにアクセスさせてキャッシュに乗せる）
+  Video.loadAsync({ uri: url }, {}, false)
+    .catch(() => {}); // エラーは無視
+}, [videos]);
+```
+
+### 2. 再生が始まらない場合のフォールバック
+
+iOSでバックグラウンドから復帰した際に `playAsync()` が失敗することがあります。
+
+```typescript
+// App State の変化を監視して再生を回復
+useEffect(() => {
+  const subscription = AppState.addEventListener('change', (nextState) => {
+    if (nextState === 'active' && isActive && videoRef.current) {
+      videoRef.current.playAsync().catch(() => {
+        // 300ms後にリトライ
+        setTimeout(() => videoRef.current?.playAsync(), 300);
+      });
+    }
+  });
+  return () => subscription.remove();
+}, [isActive]);
+```
+
+### 3. アップロードサイズの制限
+
+ユーザーが長時間録画すると動画サイズが大きくなり、アップロードが失敗しやすくなります。録画前にストレージ残量を確認する処理を追加します。
+
+```typescript
+import * as FileSystem from 'expo-file-system';
+
+const checkStorageBeforeUpload = async (fileSizeMB: number) => {
+  const freeSpace = await FileSystem.getFreeDiskStorageAsync();
+  const freeSpaceMB = freeSpace / 1024 / 1024;
+
+  if (freeSpaceMB < fileSizeMB * 2) {  // 圧縮バッファとして2倍を確保
+    throw new Error(`ストレージ残量が不足しています（残り ${Math.floor(freeSpaceMB)}MB）`);
+  }
+};
+```
+
+---
+
+## Rork Maxへのプロンプト設計：Before/After
+
+動画機能全体を一度に依頼するのではなく、機能を分割して依頼するのが成功の鍵です。
+
+### ❌ うまくいかないプロンプト
+
+> 「TikTokのようなショート動画アプリを作ってください。録画して投稿できて、フィードで見られるようにしてください」
+
+→ 各機能のコードは出てきますが、録画→アップロード→フィード表示の連携が壊れていることが多いです。
+
+### ✅ 機能分割した依頼パターン
+
+```
+Step 1: 「expo-camera で動画を録画し、ローカルURIを onVideoReady コールバックで返す
+         VideoRecorder コンポーネントを作ってください。
+         recordAsync() はawaitせず、.then() で結果を受け取る実装にしてください」
+
+Step 2: 「Supabase Storage の 'videos' バケットに動画ファイルをアップロードする
+         useVideoUpload フックを作ってください。
+         uploadState に status/progress/storagePath を持ち、
+         uploadVideo(localUri, userId) を呼ぶと非同期でアップロードを開始します」
+
+Step 3: 「FlatList で縦型スクロールフィードを実装してください。
+         viewabilityConfigCallbackPairs を使って、80%以上表示されたアイテムの
+         IDを activeVideoId として管理してください。pagingEnabled を使って
+         1動画ずつスナップするUIにしてください」
+```
+
+このように1ステップずつ実装・確認してから次に進むことで、Rork Maxの出力品質が大きく向上します。
+
+---
+
+## 個人開発者の視点から
+
+累計5,000万ダウンロードのアプリ群を運営してきた感覚として、動画コンテンツを扱うアプリは「最初の3秒」の体験設計が離脱率を大きく左右します。
+
+フィードが表示された瞬間に動画が始まること、スクロールがなめらかであること、次の動画への切り替えがすっと入ること——これらは技術的な実装の問題であると同時に、使う人への誠実さの表れだと感じています。
+
+祖父たちが宮大工として「手を動かすことが一つの信心」と言っていたように、細部を丁寧に仕上げることが、最終的にユーザーへの信頼に繋がると思っています。
+
+Rork Maxはこうした細部の実装を加速してくれますが、「なぜこの実装でなければいけないのか」を理解した上でプロンプトを書くことが、品質のある出力に繋がります。
+
+今日からでも、まずカメラ録画コンポーネント1つをRork Maxで実装し、実際に録画できることを確認してから次のステップへ進んでみてください。最初の「撮れた」の喜びが、機能の完成まで引っ張ってくれます。
+
+---
+
+## まとめ：次のアクション
+
+1. `VideoRecorder` コンポーネントを実装し、ローカルで録画できることを確認する
+2. Supabase Storage に `videos` バケットを作成し、`useVideoUpload` でアップロードをテストする
+3. `VideoFeed` でハードコードした動画URLでFlatListのスクロールを確認する
+4. 3つが単独で動いたら、録画→アップロード→フィード表示の連携を統合する
+
+機能を小さく確認しながら積み上げることで、Rork Maxの生成コードを最大限に活かせます。
+
+私自身もまだこの実装を改善し続けていますが、同じ課題に取り組む方の参考になれば嬉しいです。
