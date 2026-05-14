@@ -193,6 +193,15 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-trpc-cloudflare-workers-type-safe-backend-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-turborepo-monorepo-shared-components-guide", to: "/articles/rork-dev" },
+
+  // 2026-05-15 GSC崩壊対応 Phase 3: 4+違反の重度低品質記事を削除
+  { from: "/articles/rork-ai/rork-ai-image-generation", to: "/articles/rork-ai" },
+  { from: "/articles/rork-business/rork-automated-revenue-pipeline-complete-design", to: "/articles/rork-business" },
+  { from: "/articles/rork-business/rork-max-revenue-optimization-playbook-2026", to: "/articles/rork-business" },
+  { from: "/articles/rork-dev/rork-ai-stylist-outfit-recommendation-app", to: "/articles/rork-dev" },
+  { from: "/articles/rork-dev/rork-coupon-stamp-card-app-tutorial", to: "/articles/rork-dev" },
+  { from: "/articles/rork-dev/rork-custom-hooks-reusable-logic", to: "/articles/rork-dev" },
+  { from: "/articles/rork-dev/rork-victory-native-charts-dashboard", to: "/articles/rork-dev" },
 ];
 
 const buildAuditRedirects = () => {
