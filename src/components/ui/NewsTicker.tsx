@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ACQUISITION — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材強化・今後も買収継続の方針（5月）",
-    "GROWTH — Rork が月間 743k MAU・85% 成長を達成、AI モバイルビルダー市場の世界最大手に（5月）",
-    "SWIFT — Rork Max が Swift ネイティブコード生成に完全移行、Claude Code + Opus 4.6 搭載で X に800万ビュー超",
-    "FUNDING — Rork が $15M シード調達（4/10）。Left Lane Capital 主導、Peak XV・True Ventures・a16z Speedrun 参加",
-    "CLOUD — Cloud Compile で Mac・Xcode 不要の署名・配布フローを確立、2クリックで App Store 公開可能",
-    "MARKET — Vibe Coding 市場は 2027年に $12.3B 規模へ。非開発者63%が活用、AI ネイティブ開発が主流に",
+    "RORK — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材の確保を目的に今後も買収継続の方針",
+    "GROWTH — Rork の月間訪問数が 743,000 を突破、前年比 85% 成長で AI モバイルビルダー市場の最大手に",
+    "FUNDING — Rork が $1,500 万シードを調達（4/10）、Left Lane Capital 主導・a16z Speedrun など参加",
+    "MAX — Rork Max（Claude Code + Opus 4.6）がネイティブ Swift アプリを直接生成、X で 800 万ビュー突破",
+    "MARKET — Bubble・Lovable・Natively など AI ネイティブ開発ツールが増加、Rork は Swift 生成で市場を差別化",
+    "APPSTORE — Rork が「次世代の個人開発者プラットフォーム」として App Store 起業家を本格支援",
   ],
   en: [
-    "ACQUISITION — Rork acquires AI app builder Paperline to expand engineering talent (May 2026, more acquisitions planned)",
-    "GROWTH — Rork hits 743k MAU with 85% growth, cementing its lead as the top AI mobile builder platform (May)",
-    "SWIFT — Rork Max on Claude Code + Opus 4.6 goes fully native Swift — 8M+ X views, doubled ARR in 2 weeks",
-    "FUNDING — Rork raises $15M seed (4/10): Left Lane Capital leads; Peak XV, True Ventures & a16z Speedrun join",
-    "CLOUD — Cloud Compile: 2-click App Store publishing with no Mac or Xcode required",
-    "MARKET — Vibe Coding market headed for $12.3B by 2027; 63% non-developers driving AI-native app development",
+    "RORK — Rork acquires AI app builder Paperline for engineering talent; plans to stay acquisitive going forward",
+    "GROWTH — Rork hits 743k monthly visitors with 85% YoY growth, cementing its lead in the AI mobile builder market",
+    "FUNDING — Rork raises $15M seed (Apr 10) led by Left Lane Capital, with a16z Speedrun & Peak XV joining",
+    "MAX — Rork Max (Claude Code + Opus 4.6) generates native Swift apps directly; hit 8M views on X at launch",
+    "MARKET — AI-native builders like Bubble, Lovable & Natively proliferate; Rork differentiates with Swift generation",
+    "APPSTORE — Rork positions itself as 'the next-gen indie developer platform' to back the next wave of App Store entrepreneurs",
   ],
 };
 
