@@ -173,16 +173,19 @@ function JaContent() {
         国際芸術賞17冠のグラフィック／現代美術家・アプリデベロッパー。欧州・アジア・米州での展示や、美術書・学術誌への掲載を通じて、日本特有の祈りを背景に、集団心理と認知世界の構造、根源意識を主題として制作しています。
       </p>
       <p>
-        アートとテクノロジーの両領域を架橋し、デジタルと詩的感性の狭間に宿る表現を追求し続けています。
+        アートとテクノロジーの両領域を架橋し、デジタルと詩的感性の狭間に宿る表現を追求し続けています。その創作は、繊細な共感覚と静かな神秘性が共存する、静謐で超現実的な世界を立ち上げます。
       </p>
 
       {/* Bio */}
       <h2>略歴</h2>
       <p>
-        1997年に独学でWebデザインとプログラミングを学び始め、株式会社NTT DATAでのシステムエンジニア、フリーランスクリエイターを経て、2013年に独立系スマートフォンアプリ事業を開始。現在に至るまで累計5,000万ダウンロードを超え、月間アクティブユーザー300万人超のサービスを運営しています。
+        1997年に独学でWebデザインとプログラミングを学び始め、1999年に株式会社国和システムへDTPオペレーターとして入社。2002年には株式会社NTT DATAにてプログラマー／システムエンジニアとして基幹システム開発に従事し、2005年よりフリーランスとして独立しました。以降、Webデザイン、プログラミング、グラフィック制作、インタラクティブムービー制作など、幅広い領域で活動を展開しています。
       </p>
       <p>
-        2019年よりグラフィックアート制作を本格的に再開し、欧州・アジア・米州を中心に国際展への出展を活発化。作品は人間の意識、美、崩壊の狭間にある象徴的世界を描き出し、夢と現実の境界を詩的にたどります。
+        2011年にはテクニカルアーティストとしてゲーム開発に参加し、2013年には独立系スマートフォンアプリ事業を開始。現在に至るまで累計5,000万ダウンロードを超え、月間アクティブユーザー300万人超のユーザーに支えられながら、開発・グローバルマーケティング・運営を継続しています。
+      </p>
+      <p>
+        2019年よりグラフィックアート制作を本格的に再開し、欧州・アジア・米州を中心に国際展への出展を活発化。作品は、人間の意識、美、崩壊の狭間にある象徴的世界を描き出し、夢と現実の境界を詩的にたどります。
       </p>
 
       {/* Career */}
@@ -196,35 +199,93 @@ function JaContent() {
         UX／UI設計から実装まで一貫して担当。2008年以降、デザイン書籍への寄稿多数。
       </p>
       <p>
+        <strong>テクニカルアーティスト</strong>（ゲーム開発）、2011年<br />
+        制作統括。
+      </p>
+      <p>
         <strong>プログラマー／SE</strong>（株式会社NTT データ）、2002年<br />
         基幹システムの設計、実装。
       </p>
+      <p>
+        <strong>DTPオペレーター</strong>（株式会社国和システム）、2000年<br />
+        プリプレス、レイアウト、制作。
+      </p>
 
       {/* Awards */}
-      <h2>主な受賞歴</h2>
+      <h2>受賞歴</h2>
       <p>
-        2025–2026年 DAC – Design Classifications「世界14位」選出（A' Design Award 主催）<br />
-        2025年 Award of Achievement（ギリシャ・ハニア 人道文化領事館）<br />
-        2025年 The New Great Masters in New York（Fondazione Effetto Arte）<br />
-        2024年 Meritorious Service to the Arts Award（Luxembourg Art Prize）<br />
-        2024年 Phoenix for the Arts（Fondazione Effetto Arte）<br />
-        2024年 Global Art Virtuoso Award（Contemporary Art Collectors）<br />
-        2023年 ミケランジェロ国際芸術賞（Fondazione Effetto Arte）<br />
-        2023年 A' Design Award Golden Award（写真・フォトマニピュレーション部門）<br />
-        2021年 ARTIST OF THE YEAR（ITSLIQUID Group）<br />
-        2006年 MTV SO-ZO Competition 優秀賞受賞
+        2025–2026年 DAC – Design Classifications「世界14位」選出（A&apos; Design Award 主催）<br />
+        2025年 Award of Achievement（ギリシャ・ハニア 人道文化領事館 主催）<br />
+        2025年 The New Great Masters in New York（Fondazione Effetto Arte 主催）<br />
+        2025年 W* Recognition（A&apos;Design Award 主催）<br />
+        2024年 Meritorious Service to the Arts Award（Luxembourg Art Prize 主催）<br />
+        2024年 Phoenix for the Arts（Fondazione Effetto Arte 主催）<br />
+        2024年 Global Art Virtuoso Award（Contemporary Art Collectors 主催）<br />
+        2023年 Harmony for Humanity Art Prize（Contemporary Art Collectors 主催）<br />
+        2023年 Career Art Award（Fondazione Effetto Arte 主催）<br />
+        2023年 The Genius of Italy – ミケランジェロ国際芸術賞（Fondazione Effetto Arte 主催）<br />
+        2023年 A&apos;Design Award Golden Award（写真・フォトマニピュレーション部門）<br />
+        2022年 第12回 ITSLIQUID International Contest 栄誉賞<br />
+        2022年 BEST COVER ARTIST AWARD（365 Art+ Business Magazine 主催）<br />
+        2022年 A&apos;Design Award Iron Award（グラフィックデザイン部門）<br />
+        2021年 第11回 ITSLIQUID International Contest 栄誉賞<br />
+        2021年 ARTIST OF THE YEAR（ITSLIQUID Group 主催）<br />
+        2006年 MTV SO-ZO Competition supported by AMD『Webスクリーンセーバー部門』優秀賞受賞
       </p>
 
       {/* Exhibitions */}
       <h2>主な展覧会</h2>
       <p>
-        LA Art Show（ロサンゼルス）、Ansan International Photo Festival（韓国・安山）、RenovArt Project（イタリア・マテーラ）、Rome International Art Fair（ローマ）、Paris International Contemporary Art Fair（パリ）、CONTEMPORARY VENICE（ヴェネツィア）、LONDON CONTEMPORARY（ロンドン）ほか多数。
+        LA Art Show（ロサンゼルス）、Ansan International Photo Festival（韓国・安山）、RenovArt Project（イタリア・マテーラ）、Rome International Art Fair（ローマ）、Paris International Contemporary Art Fair（パリ）、CONTEMPORARY VENICE（ヴェネツィア）、LONDON CONTEMPORARY（ロンドン）、KINTSUGI／TRACES OF DREAMS（M.A.D.S. ART GALLERY／ミラノ）ほか多数。
       </p>
 
       {/* Publications */}
       <h2>掲載誌・書籍（抜粋）</h2>
       <p>
-        Le Musee Plus Magazine、365 Art+ Magazine、The Best Contemporary Masters、Imago（Galleria Tilde）、ANTHOLOGY THE LAST DECADE 2015–2025、MacPeople、MdN 各誌ほか。
+        Le Musee Plus Magazine、365 Art+ Magazine、The Best Contemporary Masters、Imago（Galleria Tilde）、ANTHOLOGY THE LAST DECADE 2015–2025、Digital Art Creators、The Luxury Collection of Contemporary Artistry、MacPeople、MdN 各誌ほか。
+      </p>
+
+      {/* Documents */}
+      <h2>ドキュメント</h2>
+      <p>
+        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アーティストプロフィール（日本語版）PDF</a>
+        <br />
+        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (English) PDF</a>
+        <br />
+        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アートワーク・ドキュメンテーション PDF</a>
+      </p>
+
+      {/* Influences */}
+      <h2>影響について</h2>
+      <p>
+        私が16歳だった1997年頃、当時まだ新しかったインターネットに強く心を惹かれ、それをきっかけに独学でウェブデザインを学び始めました。ネットという場を通して、国境を越えてデザイナー、プログラマー、アーティストの方々と出会えたことは、私の視野を大きく広げ、多分野を横断して物事を見る姿勢を形作って行きました。
+      </p>
+      <p>
+        一方で、より静かな継承もありました。私の両祖父は共に宮大工として、社寺建築の建造や修復に携わっていました。そこから私は、形や空間は目に見えないものを受け止める器になり得ること、そして手を動かすことそのものが一つの信心であり得ることを、自然と受け取っていたのだと思います。この感覚は、私が一見アートとは無縁に見える分野で働いていた時期にも、ずっと根底に流れていました。
+      </p>
+      <p>
+        その後、私の歩みは基幹システム開発、インタラクティブムービー制作、グラフィックデザイン書籍の執筆、ゲーム開発、アプリ開発へと広がり、2019年からは改めてグラフィックアートに舵を切りました。同年の晩秋、東京・吉祥寺駅の夜空の下で、私は不思議な光の輪を目にしました。それは言葉を伴わない指示であり、どこかラテン語で語りかけられているような感覚でもあり、今後は視覚表現に心血を注ぎなさいと告げられているかのようでした。その体験が、象徴的で夢幻的な作品を一気に制作していく大きな転機となりました。
+      </p>
+      <p>
+        私は、自由で主権的な表現を貫いた画家レオノール・フィニに深い敬意を抱き、またエンジニア出身でありながら構造的で詩的な作品を作り上げたハンス・ベルメールの美意識にも強く惹かれています。これらの作家を最初に知ったのは澁澤龍彦氏の著作を通してでしたが、その世界観は若い頃の私に決定的な影響を与えました。なかでも最も大きな影響を与えてくれたのは、17歳の時にオンラインで出会った一人の指導者です。芸術とは高尚な特別のものではなく、本来は全ての人に開かれた自然な言語である——そのことを、彼は教えてくれました。
+      </p>
+
+      {/* Future Vision */}
+      <h2>将来への展望</h2>
+      <p>
+        私の創作上の目標は、精神性と科学が接するところに立ち現れる「余剰次元」を視覚化することと深く結びついています。一般相対性理論や量子力学、因果集合論に触れながら、一方で最愛の祖父母が大切にしていた仏教の信仰にも改めて向き合うことで、この関心は少しずつ育まれてきました。
+      </p>
+      <p>
+        作品を通じて、聖なるものと世俗的なものとの断絶を少しでも和らげ、人と自然との細やかな結びつきを回復させたいと考えています。自然の象徴、人間の哲学的な思考、そして現代科学のイメージを視覚的な物語として織り上げることで、内に潜む聖なる次元が、私たちが生きる広い世界と対話できるようにしたいのです。
+      </p>
+      <p>
+        要するに、私の作品が、これら幾つもの領域のあいだに静かに立つ仲立ちとなり、作品を観てくださる方々が、自分自身と宇宙のより深い層に触れるきっかけになれば、それが私の創作の役割だと考えています。
+      </p>
+
+      {/* Children */}
+      <h2>子どもたちに見せる世界</h2>
+      <p>
+        この願いは、同時にとても個人的なものでもあります。今は離れて暮らす子どもたちの父として、また転居や別離、様々な困難をくぐり抜けてきた者として、私は、芸術とは次の世代に温もりと強さ、そして美しさを託して行こうとする、一生を懸けた誓いの形なのだと感じています。言葉は時に不器用ですが、作品は、たとえ離れていても、世代と世代、言葉と言葉、内なる世界と外の世界を静かに結び直す架け橋になり得ます。
       </p>
 
       {/* Apps */}
@@ -287,10 +348,13 @@ function EnContent() {
       {/* Bio */}
       <h2>Biography</h2>
       <p>
-        Self-taught in web design and programming since 1997, Hirokawa worked as a systems engineer at NTT DATA Corporation before becoming an independent creator. In 2013, he launched an independent smartphone app business that has since surpassed 50 million cumulative downloads worldwide, with more than 3 million monthly active users.
+        Self-taught in web design and programming since 1997, Hirokawa joined Kokuwa System Co., Ltd. in 1999 as a DTP operator. In 2002, he worked at NTT DATA Corporation as a programmer and systems engineer, contributing to core system development. In 2005, he became an independent creator and expanded his activities across web design, programming, graphic production, and interactive movie projects.
       </p>
       <p>
-        Since 2019, he has resumed full-scale production of graphic art and has actively exhibited in international shows across Europe, Asia, and the Americas. His works depict a symbolic world at the intersection of human consciousness, beauty, and decay, poetically tracing the boundary between dream and reality.
+        In 2011, he participated in game development as a technical artist, and in 2013 he launched an independent smartphone app business that has since surpassed 50 million cumulative downloads worldwide, with more than 3 million monthly active users. He continues to lead development, global marketing, and operations.
+      </p>
+      <p>
+        Since 2019, Hirokawa has resumed full-scale production of graphic art and has actively exhibited in international shows across Europe, Asia, and the Americas. His works depict a symbolic world at the intersection of human consciousness, beauty, and decay, poetically tracing the boundary between dream and reality.
       </p>
 
       {/* Career */}
@@ -304,35 +368,93 @@ function EnContent() {
         End-to-end UX/UI design and implementation. Frequent contributor to design publications since 2008.
       </p>
       <p>
+        <strong>Technical Artist</strong> (Game Development), 2011<br />
+        Production oversight and supervision.
+      </p>
+      <p>
         <strong>Programmer / Systems Engineer</strong> (NTT DATA Corporation), 2002<br />
         Design and implementation of core enterprise systems.
       </p>
+      <p>
+        <strong>DTP Operator</strong> (Kokuwa System Co., Ltd.), 2000<br />
+        Prepress, layout, and production.
+      </p>
 
       {/* Awards */}
-      <h2>Selected Awards</h2>
+      <h2>Awards</h2>
       <p>
         2025–2026 – World&apos;s 14th Best Designer, DAC – Design Classifications (A&apos; Design Award)<br />
-        2025 – Award of Achievement (The Consulate of Humanitarian &amp; Culture, Greece)<br />
+        2025 – Award of Achievement (The Consulate of Humanitarian &amp; Culture in Chania, Greece)<br />
         2025 – The New Great Masters in New York (Fondazione Effetto Arte)<br />
+        2025 – W* Recognition (A&apos;Design Award)<br />
         2024 – Meritorious Service to the Arts Award (Luxembourg Art Prize)<br />
         2024 – Phoenix for the Arts (Fondazione Effetto Arte)<br />
         2024 – Global Art Virtuoso Award (Contemporary Art Collectors)<br />
-        2023 – Michelangelo International Art Prize (Fondazione Effetto Arte)<br />
-        2023 – A&apos; Design Award Golden Award (Photography &amp; Photo Manipulation)<br />
+        2023 – Harmony for Humanity Art Prize (Contemporary Art Collectors)<br />
+        2023 – Career Art Award (Fondazione Effetto Arte)<br />
+        2023 – The Genius of Italy – Michelangelo International Art Prize (Fondazione Effetto Arte)<br />
+        2023 – A&apos;Design Award Golden Award (Photography &amp; Photo Manipulation)<br />
+        2022 – ITSLIQUID International Contest – 12th Edition, Honorable Mention<br />
+        2022 – BEST COVER ARTIST AWARD (365 Art+ 6 Stars AWARDS)<br />
+        2022 – A&apos;Design Award Iron Award (Graphic Design)<br />
+        2021 – ITSLIQUID International Contest – 11th Edition, Honorable Mention<br />
         2021 – ARTIST OF THE YEAR (ITSLIQUID Group)<br />
-        2006 – Excellence Prize, MTV SO-ZO Competition (AMD)
+        2006 – Excellence Prize, Web Screensaver Category, MTV SO-ZO Competition supported by AMD
       </p>
 
       {/* Exhibitions */}
       <h2>Selected Exhibitions</h2>
       <p>
-        LA Art Show (Los Angeles), Ansan International Photo Festival (South Korea), RenovArt Project (Matera, Italy), Rome International Art Fair (Rome), Paris International Contemporary Art Fair (Paris), CONTEMPORARY VENICE (Venice), LONDON CONTEMPORARY (London), and many more.
+        LA Art Show (Los Angeles), Ansan International Photo Festival (Ansan, South Korea), RenovArt Project (Matera, Italy), Rome International Art Fair (Rome), Paris International Contemporary Art Fair (Paris), CONTEMPORARY VENICE (Venice), LONDON CONTEMPORARY (London), KINTSUGI / TRACES OF DREAMS (M.A.D.S. ART GALLERY, Milan), and many more.
       </p>
 
       {/* Publications */}
       <h2>Selected Publications</h2>
       <p>
-        Le Musee Plus Magazine, 365 Art+ Magazine, The Best Contemporary Masters, Imago (Galleria Tilde), ANTHOLOGY THE LAST DECADE 2015–2025, MacPeople, MdN publications, and others.
+        Le Musee Plus Magazine, 365 Art+ Magazine, The Best Contemporary Masters, Imago (Galleria Tilde), ANTHOLOGY THE LAST DECADE 2015–2025, Digital Art Creators, The Luxury Collection of Contemporary Artistry, MacPeople, MdN publications, and others.
+      </p>
+
+      {/* Documents */}
+      <h2>Documents</h2>
+      <p>
+        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (English) PDF</a>
+        <br />
+        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (Japanese) PDF</a>
+        <br />
+        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artwork Documentation PDF</a>
+      </p>
+
+      {/* Influences */}
+      <h2>Influences</h2>
+      <p>
+        Around 1997, when I was sixteen, I found myself deeply drawn to what was then the still-new world of the internet. That encounter led me to teach myself web design. Through this online space, I was able to connect across borders with designers, programmers, and artists, and those encounters greatly broadened my perspective. They nurtured in me a way of looking at things that naturally crosses disciplines and fields.
+      </p>
+      <p>
+        At the same time, there was a quieter form of inheritance at work. Both of my grandfathers were miyadaiku — master carpenters involved in the construction and restoration of shrines and temples. From them, I seem to have absorbed the sense that form and space can become vessels for what cannot be seen, and that the act of working with one&apos;s hands can itself be a kind of devotion. Even during the years when I was working in fields that might appear, at first glance, to be far removed from art, this feeling continued to flow quietly at the foundation of my practice.
+      </p>
+      <p>
+        My path later expanded into core system development, interactive movie production, authoring books on graphic design, game development, and app development, and from 2019 onward I decisively shifted my focus back to graphic art. In late autumn of that same year, under the night sky above Kichijōji Station in Tokyo, I witnessed a mysterious ring of light. It felt like a wordless directive, almost as though someone were speaking to me in Latin, telling me to devote my lifeblood from now on to visual expression. That experience became a major turning point, propelling me into the intense creation of symbolic and dreamlike works.
+      </p>
+      <p>
+        I hold deep respect for the painter Leonor Fini, who maintained a free and sovereign mode of expression, and I am strongly drawn to the aesthetics of Hans Bellmer, who, despite his engineering background, created works that are both structural and poetic. I first encountered these artists through the writings of Tatsuhiko Shibusawa, whose worldview had a decisive impact on me when I was young. Among all these influences, the greatest came from a mentor I met online at the age of seventeen. He taught me that art is not something lofty or reserved for the few, but rather a natural language originally open to everyone.
+      </p>
+
+      {/* Future Vision */}
+      <h2>Future Aspirations and Vision</h2>
+      <p>
+        My artistic aims are closely tied to the attempt to visualize the &ldquo;surplus dimensions&rdquo; that emerge where spirituality and science intersect. As I have engaged with general relativity, quantum mechanics, and causal set theory, while at the same time returning to the Buddhist faith cherished by my grandparents, this preoccupation has gradually taken shape within me.
+      </p>
+      <p>
+        Through my work, I hope to soften the divide between the sacred and the secular, and to help restore the subtle bonds between human beings and nature. By weaving together natural symbolism, philosophical reflection, and images drawn from contemporary science into visual narratives, I seek to allow the sacred dimensions that lie within us to enter into dialogue with the wider world in which we live.
+      </p>
+      <p>
+        In essence, I hope that my works can quietly stand as intermediaries between these multiple domains, and that encountering them may offer viewers an opportunity to touch deeper layers of both themselves and the cosmos. That, to me, is the role of my practice.
+      </p>
+
+      {/* Children */}
+      <h2>The World I Hope to Show My Children</h2>
+      <p>
+        This aspiration is also deeply personal. As the father of children with whom I now live apart, and as someone who has passed through relocations, separation, and various hardships, I have come to feel that art is a lifelong vow to entrust warmth, strength, and beauty to the next generation. Words can be clumsy at times, but a work of art can quietly become a bridge — connecting generations and languages, and reconnecting the inner worlds we carry with the outer world, even when we are far from one another.
       </p>
 
       {/* Apps */}
