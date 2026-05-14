@@ -226,6 +226,33 @@ function JaContent() {
       <p>
         Le Musee Plus Magazine、365 Art+ Magazine、The Best Contemporary Masters、Imago（Galleria Tilde）、ANTHOLOGY THE LAST DECADE 2015–2025、MacPeople、MdN 各誌ほか。
       </p>
+
+      {/* Apps */}
+      <h2>運営中のアプリ</h2>
+      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 16 }}>
+        2013年の独立アプリ事業開始以降、現在も継続して運営しているアプリ群です。累計5,000万ダウンロードを超え、月間アクティブユーザー300万人超を維持しています。
+      </p>
+      <p>
+        <strong>綺麗な壁紙 4K/HDR</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id706533906" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        {" / "}
+        <a href="https://play.google.com/store/apps/details?id=net.dolice.beautifulwallpapers" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
+        <br />
+        <strong>浮世絵壁紙</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id835559799" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        {" / "}
+        <a href="https://play.google.com/store/apps/details?id=net.dolice.ukiyoe" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
+        <br />
+        <strong>望みが叶う！引き寄せの法則アプリ</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id841157677" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        <br />
+        <strong>リラックス・ヒーリング</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id694492667" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+      </p>
     </>
   );
 }
@@ -306,6 +333,33 @@ function EnContent() {
       <h2>Selected Publications</h2>
       <p>
         Le Musee Plus Magazine, 365 Art+ Magazine, The Best Contemporary Masters, Imago (Galleria Tilde), ANTHOLOGY THE LAST DECADE 2015–2025, MacPeople, MdN publications, and others.
+      </p>
+
+      {/* Apps */}
+      <h2>Mobile Apps in Production</h2>
+      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 16 }}>
+        Apps actively maintained since the independent app business launched in 2013. Combined downloads exceed 50 million, with over 3 million monthly active users.
+      </p>
+      <p>
+        <strong>Beautiful HD Wallpapers</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id706533906" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        {" / "}
+        <a href="https://play.google.com/store/apps/details?id=net.dolice.beautifulwallpapers" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
+        <br />
+        <strong>Ukiyo-e Wallpapers</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id835559799" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        {" / "}
+        <a href="https://play.google.com/store/apps/details?id=net.dolice.ukiyoe" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
+        <br />
+        <strong>Law of Attraction Everyday</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id841157677" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        <br />
+        <strong>Relaxing Healing</strong>
+        {" — "}
+        <a href="https://apps.apple.com/app/id694492667" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
       </p>
     </>
   );
