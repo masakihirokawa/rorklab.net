@@ -142,7 +142,7 @@ export default async function AboutPage({ params }: Props) {
         </p>
 
         <p style={{ color: "var(--text-faint)", fontSize: 13, marginTop: 48 }}>
-          {isJa ? "最終更新日: 2026年3月" : "Last updated: March 2026"}
+          {isJa ? "最終更新日: 2026年5月" : "Last updated: May 2026"}
         </p>
       </div>
     </div>
@@ -203,11 +203,11 @@ function JaContent() {
         制作統括。
       </p>
       <p>
-        <strong>プログラマー／SE</strong>（株式会社NTT データ）、2002年<br />
+        <strong>プログラマー／SE</strong>（株式会社 NTT データ）、2002年<br />
         基幹システムの設計、実装。
       </p>
       <p>
-        <strong>DTPオペレーター</strong>（株式会社国和システム）、2000年<br />
+        <strong>DTP オペレーター</strong>（株式会社国和システム）、2000年<br />
         プリプレス、レイアウト、制作。
       </p>
 
@@ -217,17 +217,17 @@ function JaContent() {
         2025–2026年 DAC – Design Classifications「世界14位」選出（A&apos; Design Award 主催）<br />
         2025年 Award of Achievement（ギリシャ・ハニア 人道文化領事館 主催）<br />
         2025年 The New Great Masters in New York（Fondazione Effetto Arte 主催）<br />
-        2025年 W* Recognition（A&apos;Design Award 主催）<br />
+        2025年 W* Recognition（A&apos; Design Award 主催）<br />
         2024年 Meritorious Service to the Arts Award（Luxembourg Art Prize 主催）<br />
         2024年 Phoenix for the Arts（Fondazione Effetto Arte 主催）<br />
         2024年 Global Art Virtuoso Award（Contemporary Art Collectors 主催）<br />
         2023年 Harmony for Humanity Art Prize（Contemporary Art Collectors 主催）<br />
         2023年 Career Art Award（Fondazione Effetto Arte 主催）<br />
         2023年 The Genius of Italy – ミケランジェロ国際芸術賞（Fondazione Effetto Arte 主催）<br />
-        2023年 A&apos;Design Award Golden Award（写真・フォトマニピュレーション部門）<br />
+        2023年 A&apos; Design Award Golden Award（写真・フォトマニピュレーション部門）<br />
         2022年 第12回 ITSLIQUID International Contest 栄誉賞<br />
         2022年 BEST COVER ARTIST AWARD（365 Art+ Business Magazine 主催）<br />
-        2022年 A&apos;Design Award Iron Award（グラフィックデザイン部門）<br />
+        2022年 A&apos; Design Award Iron Award（グラフィックデザイン部門）<br />
         2021年 第11回 ITSLIQUID International Contest 栄誉賞<br />
         2021年 ARTIST OF THE YEAR（ITSLIQUID Group 主催）<br />
         2006年 MTV SO-ZO Competition supported by AMD『Webスクリーンセーバー部門』優秀賞受賞
@@ -243,16 +243,6 @@ function JaContent() {
       <h2>掲載誌・書籍（抜粋）</h2>
       <p>
         Le Musee Plus Magazine、365 Art+ Magazine、The Best Contemporary Masters、Imago（Galleria Tilde）、ANTHOLOGY THE LAST DECADE 2015–2025、Digital Art Creators、The Luxury Collection of Contemporary Artistry、MacPeople、MdN 各誌ほか。
-      </p>
-
-      {/* Documents */}
-      <h2>ドキュメント</h2>
-      <p>
-        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アーティストプロフィール（日本語版）PDF</a>
-        <br />
-        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (English) PDF</a>
-        <br />
-        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アートワーク・ドキュメンテーション PDF</a>
       </p>
 
       {/* Influences */}
@@ -313,6 +303,17 @@ function JaContent() {
         <strong>リラックス・ヒーリング</strong>
         {" — "}
         <a href="https://apps.apple.com/app/id694492667" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+      </p>
+
+      {/* Documents */}
+      <h2>プロフィール資料</h2>
+      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 12 }}>
+        ご利用・ご参照用の PDF 資料です。展覧会・出版・取材等にお役立てください。
+      </p>
+      <p>
+        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アーティストプロフィール（日本語版）PDF</a>
+        <br />
+        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アートワーク・ドキュメンテーション PDF</a>
       </p>
     </>
   );
@@ -386,17 +387,17 @@ function EnContent() {
         2025–2026 – World&apos;s 14th Best Designer, DAC – Design Classifications (A&apos; Design Award)<br />
         2025 – Award of Achievement (The Consulate of Humanitarian &amp; Culture in Chania, Greece)<br />
         2025 – The New Great Masters in New York (Fondazione Effetto Arte)<br />
-        2025 – W* Recognition (A&apos;Design Award)<br />
+        2025 – W* Recognition (A&apos; Design Award)<br />
         2024 – Meritorious Service to the Arts Award (Luxembourg Art Prize)<br />
         2024 – Phoenix for the Arts (Fondazione Effetto Arte)<br />
         2024 – Global Art Virtuoso Award (Contemporary Art Collectors)<br />
         2023 – Harmony for Humanity Art Prize (Contemporary Art Collectors)<br />
         2023 – Career Art Award (Fondazione Effetto Arte)<br />
         2023 – The Genius of Italy – Michelangelo International Art Prize (Fondazione Effetto Arte)<br />
-        2023 – A&apos;Design Award Golden Award (Photography &amp; Photo Manipulation)<br />
+        2023 – A&apos; Design Award Golden Award (Photography &amp; Photo Manipulation)<br />
         2022 – ITSLIQUID International Contest – 12th Edition, Honorable Mention<br />
         2022 – BEST COVER ARTIST AWARD (365 Art+ 6 Stars AWARDS)<br />
-        2022 – A&apos;Design Award Iron Award (Graphic Design)<br />
+        2022 – A&apos; Design Award Iron Award (Graphic Design)<br />
         2021 – ITSLIQUID International Contest – 11th Edition, Honorable Mention<br />
         2021 – ARTIST OF THE YEAR (ITSLIQUID Group)<br />
         2006 – Excellence Prize, Web Screensaver Category, MTV SO-ZO Competition supported by AMD
@@ -412,16 +413,6 @@ function EnContent() {
       <h2>Selected Publications</h2>
       <p>
         Le Musee Plus Magazine, 365 Art+ Magazine, The Best Contemporary Masters, Imago (Galleria Tilde), ANTHOLOGY THE LAST DECADE 2015–2025, Digital Art Creators, The Luxury Collection of Contemporary Artistry, MacPeople, MdN publications, and others.
-      </p>
-
-      {/* Documents */}
-      <h2>Documents</h2>
-      <p>
-        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (English) PDF</a>
-        <br />
-        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (Japanese) PDF</a>
-        <br />
-        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artwork Documentation PDF</a>
       </p>
 
       {/* Influences */}
@@ -482,6 +473,17 @@ function EnContent() {
         <strong>Relaxing Healing</strong>
         {" — "}
         <a href="https://apps.apple.com/app/id694492667" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+      </p>
+
+      {/* Documents */}
+      <h2>Press Kit</h2>
+      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 12 }}>
+        PDF documents available for press, exhibitions, publications, and interviews.
+      </p>
+      <p>
+        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (English) PDF</a>
+        <br />
+        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artwork Documentation PDF</a>
       </p>
     </>
   );
