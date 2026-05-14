@@ -71,6 +71,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
       languages: {
         ja: `${base}/level/${level}`,
         en: `${base}/en/level/${level}`,
+          "x-default": `${base}/en/level/${level}`,
       },
     },
   };
