@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材の確保を目的に今後も買収継続の方針",
-    "GROWTH — Rork の月間訪問数が 743,000 を突破、前年比 85% 成長で AI モバイルビルダー市場の最大手に",
-    "FUNDING — Rork が $1,500 万シードを調達（4/10）、Left Lane Capital 主導・a16z Speedrun など参加",
-    "MAX — Rork Max（Claude Code + Opus 4.6）がネイティブ Swift アプリを直接生成、X で 800 万ビュー突破",
-    "MARKET — Bubble・Lovable・Natively など AI ネイティブ開発ツールが増加、Rork は Swift 生成で市場を差別化",
-    "APPSTORE — Rork が「次世代の個人開発者プラットフォーム」として App Store 起業家を本格支援",
+    "RORK — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材の強化を目的に今後も買収継続の方針（5月）",
+    "MAX — Rork Max（Claude Code + Claude Opus 4.6）がネイティブ Swift を直接生成、X で 800 万ビュー・ARR が 2週間で 2倍に",
+    "GROWTH — Rork の月間訪問数が 743,000 を突破、前年比 85% 成長で AI モバイルビルダー市場の世界最大手に",
+    "FUNDING — Rork が $1,500 万シードを調達（4/10）、Left Lane Capital 主導・a16z Speedrun・Peak XV など参加",
+    "NATIVE — Rork Max が iPhone・iPad・Apple Watch・Vision Pro に対応、Dynamic Island・Live Activities・Siri Intents も実装可能",
+    "MARKET — App Store に AI コーディングツール活用の個人開発ブーム到来、2026年の新規アプリの80%以上が AI 搭載",
   ],
   en: [
-    "RORK — Rork acquires AI app builder Paperline for engineering talent; plans to stay acquisitive going forward",
-    "GROWTH — Rork hits 743k monthly visitors with 85% YoY growth, cementing its lead in the AI mobile builder market",
+    "RORK — Rork acquires AI app builder Paperline for engineering talent, with more acquisitions planned ahead (May)",
+    "MAX — Rork Max (Claude Code + Claude Opus 4.6) generates native Swift directly; 8M X views, ARR doubled in 2 weeks",
+    "GROWTH — Rork hits 743k monthly visitors with 85% YoY growth, becoming the #1 AI mobile builder by web traffic",
     "FUNDING — Rork raises $15M seed (Apr 10) led by Left Lane Capital, with a16z Speedrun & Peak XV joining",
-    "MAX — Rork Max (Claude Code + Opus 4.6) generates native Swift apps directly; hit 8M views on X at launch",
-    "MARKET — AI-native builders like Bubble, Lovable & Natively proliferate; Rork differentiates with Swift generation",
-    "APPSTORE — Rork positions itself as 'the next-gen indie developer platform' to back the next wave of App Store entrepreneurs",
+    "NATIVE — Rork Max supports iPhone, iPad, Apple Watch & Vision Pro — Dynamic Island, Live Activities & Siri Intents included",
+    "MARKET — AI coding tools spark an indie dev boom on the App Store; 80%+ of new apps in 2026 ship with AI built in",
   ],
 };
 
