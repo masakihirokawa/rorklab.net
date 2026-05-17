@@ -99,6 +99,39 @@ export function getAllArticleSlugs(
   return entries.map((a) => ({ category: a.category, slug: a.slug }));
 }
 
+
+/**
+ * Get article counts per tag for a locale.
+ * Used for tag cloud authority signal (Simon Willison-style: "ai 2024").
+ */
+export function getTagCounts(locale: string): Map<string, number> {
+  const entries = articles[locale] || [];
+  const counts = new Map<string, number>();
+  for (const e of entries) {
+    for (const t of (e.tags || []) as string[]) {
+      const norm = (t || "").trim();
+      if (!norm) continue;
+      counts.set(norm, (counts.get(norm) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/**
+ * Count articles with a specific tag (case-insensitive).
+ */
+export function countArticlesByTag(locale: string, tag: string): number {
+  const entries = articles[locale] || [];
+  const needle = (tag || "").toLowerCase();
+  let count = 0;
+  for (const e of entries) {
+    if (((e.tags || []) as string[]).some((t) => (t || "").toLowerCase() === needle)) {
+      count++;
+    }
+  }
+  return count;
+}
+
 export const CATEGORIES = [
   { id: "rork-basics", icon: "◈", color: "var(--accent-coral)" },
   { id: "rork-dev", icon: "⬡", color: "var(--accent-blue)" },

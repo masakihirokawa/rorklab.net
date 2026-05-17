@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { getArticle, getArticleContent, getAllArticleSlugs, CATEGORIES } from "@/lib/content";
+import { getArticle, getArticleContent, getAllArticleSlugs, CATEGORIES, getTagCounts } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
@@ -113,6 +113,8 @@ function extractTocItems(html: string): { id: string; text: string; level: numbe
 }
 export default async function ArticlePage({ params }: Props) {
   const { locale, category, slug } = await params;
+  const LOCALE_PREFIX = locale === "ja" ? "" : `/${locale}`;
+  const tagCounts = getTagCounts(locale);
   const article = getArticle(locale, category, slug);
 
   if (!article) {
@@ -267,21 +269,32 @@ export default async function ArticlePage({ params }: Props) {
 
         {article.meta.tags.length > 0 && (
           <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
-            {article.meta.tags.map((tag) => (
-              <span
-                key={tag}
-                style={{
-                  fontSize: 11,
-                  padding: "2px 10px",
-                  borderRadius: 3,
-                  border: "1px solid var(--border-subtle)",
-                  color: "var(--text-dim)",
-                  fontFamily: "'DM Mono', monospace",
-                }}
-              >
-                {tag}
-              </span>
-            ))}
+            {article.meta.tags.map((tag) => {
+              const count = tagCounts.get(tag) || 0;
+              return (
+                <a
+                  key={tag}
+                  href={`${LOCALE_PREFIX}/tag/${encodeURIComponent(tag)}`}
+                  style={{
+                    fontSize: 11,
+                    padding: "2px 10px",
+                    borderRadius: 3,
+                    border: "1px solid var(--border-subtle)",
+                    color: "var(--text-dim)",
+                    fontFamily: "'DM Mono', monospace",
+                    textDecoration: "none",
+                    transition: "all 0.2s",
+                  }}
+                >
+                  {tag}
+                  {count > 1 && (
+                    <sup style={{ fontSize: 9, marginLeft: 3, color: "var(--text-faint)" }}>
+                      {count}
+                    </sup>
+                  )}
+                </a>
+              );
+            })}
           </div>
         )}
       </div>
