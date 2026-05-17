@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Max が Claude Code + Claude Opus 4.6 を採用、Native Swift アプリを直接生成、X で 800 万ビュー獲得（2/2026）",
-    "FUND — Rork が Left Lane Capital リードで $15M シード調達、次世代 App Store 起業家を支援するプラットフォームを強化（4/9）",
-    "ACQ — Rork が AI アプリビルダー Paperline を買収、エンジニアリング人材を強化し機能拡充を加速（5/2026）",
-    "GROWTH — Rork の月間訪問数が 743k MAU を突破、前年比 85% 成長で AI モバイルビルダー市場の最大手に（5/2026）",
-    "RIVAL — OpenAI が Codex を ChatGPT モバイルに展開（5/14）、Rork の Native Swift 差別化と ARKit 活用が競争優位に",
-    "NATIVE — Rork Max が SwiftUI・AR/LiDAR・Dynamic Island・Live Activities・Siri Intents に直接対応、他の AI ビルダーと一線（2/2026）",
+    "FUND — Rork が Left Lane Capital 主導で $1500 万シードラウンド調達、Paperline 買収・積極 M&A 方針を表明（2026年4月）",
+    "MAX — Rork Max 正式リリース、React Native から脱却しネイティブ Swift アプリをブラウザから直接生成（2026年2月）",
+    "TEST — Rork Companion アプリで Apple Developer アカウントなしに実機テスト可能に、個人開発のハードルが大幅低下",
+    "GROWTH — Rork が月間 743,000 訪問・成長率 85% を達成、AI アプリビルダー市場でのプレゼンス急拡大",
+    "SPEED — AI がテキストプロンプトから Android アプリを 1 時間以内に生成、ビルド→テスト→公開まで自動実行（2026年4月）",
+    "MARKET — AI ノーコードビルダー市場が急拡大、Rork・Bubble・Adalo が「真のネイティブアプリ生成」で差別化競争へ",
   ],
   en: [
-    "MAX — Rork Max powered by Claude Code & Opus 4.6 builds native Swift apps directly; 8M X views, ARR doubled in 2 weeks (Feb 2026)",
-    "FUND — Rork raises $15M seed led by Left Lane Capital to power the next generation of App Store entrepreneurs (Apr 9)",
-    "ACQ — Rork acquires AI app builder Paperline to bring in engineering talent and accelerate feature development (May 2026)",
-    "GROWTH — Rork hits 743k MAU with 85% YoY growth, becoming the largest AI mobile builder platform (May 2026)",
-    "RIVAL — OpenAI deploys Codex to ChatGPT mobile (May 14); Rork's native Swift & ARKit edge remains a key differentiator",
-    "NATIVE — Rork Max supports SwiftUI, AR/LiDAR, Dynamic Island, Live Activities & Siri Intents — no other AI builder matches this (Feb 2026)",
+    "FUND — Rork raises $15M seed round led by Left Lane Capital, acquires Paperline, plans continued M&A (April 2026)",
+    "MAX — Rork Max launches: generates native Swift apps instead of React Native, directly from a browser (February 2026)",
+    "TEST — Rork Companion app enables real-device testing without an Apple Developer account, lowering the barrier for indie devs",
+    "GROWTH — Rork hits 743,000 monthly visits with 85% growth rate, rapidly expanding presence in AI app builder market",
+    "SPEED — AI generates a working Android app from a text prompt in under an hour: build, test & publish fully automated (April 2026)",
+    "MARKET — AI no-code builder market booms as Rork, Bubble & Adalo compete on 'true native app generation' capability",
   ],
 };
 
