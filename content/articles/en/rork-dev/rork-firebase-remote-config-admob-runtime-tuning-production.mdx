@@ -1,0 +1,273 @@
+---
+title: "Rork × Firebase Remote Config: Tuning AdMob Safely in Production — Run App Open Frequency Caps Without a Release"
+slug: "rork-firebase-remote-config-admob-runtime-tuning-production"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-18T17:00"
+author: "Rork Lab"
+description: "From the experience of pushing wallpaper-app App Open ads too hard and watching DAU drop, here is a design for treating AdMob format mix, frequency caps, and exclusions as a Firebase Remote Config contract. Expo/Rork wiring, fail-safe defaults, A/B testing, and metric joins included."
+tags: ["Rork", "AdMob", "Firebase Remote Config", "Expo", "indie developer", "monetization"]
+highlights:
+  - "Design AdMob format mix, frequency caps, and exclusions as a typed Remote Config contract, not a flag bag"
+  - "Wire fetchAndActivate into Expo/Rork startup without delaying launch, with a fail-closed fallback chain"
+  - "Join AdMob and Firebase Analytics via ad_config_version so you can judge variants on a three-day rhythm"
+---
+
+I have never been fond of apps that show an ad the moment they open. I also know exactly how it feels to be on the other side of that decision: in one of my wallpaper apps, I pushed App Open ads a little too hard and watched DAU drop in a way that took me a week to notice. By the time I realised that it was users disappearing rather than ad impressions softening, I had already lost the easy headroom that early DAU gives you. The weight of that week stayed with me.
+
+What I took from it was simple but important: ad-side configuration needs to move at a finer grain than your release cycle. Waiting on App Store or Google Play review to change a 30-second interval to 60 seconds is too slow for the rhythms of solo development. I wanted to leave the binary alone and just nudge how ads are served.
+
+When I hit the same problem again on a newer wallpaper app generated through Rork, I rebuilt the setup around **Firebase Remote Config as the contract that drives AdMob behaviour**. Format mix, frequency caps, first-day exclusion, ATT/UMP ordering — all of it became something I could move without shipping a new build. The notes below are the design that finally calmed me down, plus the small habits I have collected over twelve years of running AdMob across roughly 50 million downloads.
+
+## Why AdMob and Remote Config fit together
+
+The AdMob dashboard lets you change a few things without a release: unit on/off, price floors per unit, mediation waterfall edits. What it does **not** let you change without a release is the **app-side logic** — whether you show App Open at all, what the interval is, which screen transitions trigger interstitials, whether to exclude first-day users. That logic lives in your code unless you build a way to move it without a release.
+
+Firebase Remote Config fits there neatly.
+
+- Values live on the server and are fetched at launch
+- Each parameter can be conditioned on OS, version, country, user property, or audience
+- It plugs into Firebase A/B Testing so you can serve different values to different buckets
+- It sits in the same Firebase project as Crashlytics and Analytics
+
+After more than a decade of indie app development, the single biggest determinant of whether I sleep well during a monetization change has been whether the ad logic is **decoupled from the release**. When it is welded to a release, every tweak feels heavier, and over time I stop tweaking. That is the worst possible failure mode for an ad setup.
+
+## Treat Remote Config as a contract, not a flag bag
+
+Early on I used Remote Config as a place to park a single `enable_admob` boolean. That is easy to ship but does not let you express anything interesting. The shape that has held up for me is to treat the ad configuration as a small typed **contract** — a structured document describing how ads should behave for this user, this app version, this country, this experiment bucket.
+
+Concretely, that means parameters like:
+
+- `ad_config_version` — version number of the contract (vital for analytics joins)
+- `show_app_open` — show App Open ads at all
+- `app_open_min_interval_sec` — minimum seconds between two App Open shows
+- `app_open_first_session_excluded` — skip App Open during the first session window
+- `interstitial_after_n_screens` — interstitial every N screen transitions (0 disables)
+- `rewarded_optin_position` — where the rewarded entry point lives (`detail` / `tab` / `none`)
+- `paywall_probability` — probability of routing to the paywall on a particular surface
+
+The crucial habit is to **type these on the client**, not to read them as raw strings. Remote Config will happily hand you any value; the app must enforce the schema.
+
+```typescript
+// types/AdConfig.ts
+export type AdConfig = {
+  ad_config_version: number;
+  show_app_open: boolean;
+  app_open_min_interval_sec: number;
+  app_open_first_session_excluded: boolean;
+  interstitial_after_n_screens: number;
+  rewarded_optin_position: "detail" | "tab" | "none";
+  paywall_probability: number;
+};
+
+export const DEFAULT_AD_CONFIG: AdConfig = {
+  ad_config_version: 1,
+  show_app_open: true,
+  app_open_min_interval_sec: 60,
+  app_open_first_session_excluded: true,
+  interstitial_after_n_screens: 5,
+  rewarded_optin_position: "detail",
+  paywall_probability: 0.0,
+};
+```
+
+The defaults lean **conservative**. That is intentional, and we will come back to why under the fail-safe section.
+
+## Wiring it up in Expo / Rork
+
+Firebase Remote Config does not run in Expo Go because it relies on a native module. You need an EAS development build or production build. The same applies to projects generated by Rork: in practice I keep an EAS development build with AdMob and Firebase Remote Config both enabled, and iterate there.
+
+The init flow I have settled on looks like this.
+
+```typescript
+// src/lib/adConfig.ts
+import remoteConfig from "@react-native-firebase/remote-config";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { AdConfig, DEFAULT_AD_CONFIG } from "../types/AdConfig";
+
+const CACHE_KEY = "ad_config_cached_v1";
+
+async function fetchFromRemote(): Promise<AdConfig> {
+  await remoteConfig().setDefaults(DEFAULT_AD_CONFIG as any);
+  await remoteConfig().setConfigSettings({
+    minimumFetchIntervalMillis: __DEV__ ? 0 : 60 * 60 * 1000,
+    fetchTimeMillis: 8000,
+  });
+  await remoteConfig().fetchAndActivate();
+  return readAdConfigFromRC();
+}
+
+function readAdConfigFromRC(): AdConfig {
+  const rc = remoteConfig();
+  return {
+    ad_config_version: rc.getValue("ad_config_version").asNumber(),
+    show_app_open: rc.getValue("show_app_open").asBoolean(),
+    app_open_min_interval_sec: rc.getValue("app_open_min_interval_sec").asNumber(),
+    app_open_first_session_excluded: rc.getValue("app_open_first_session_excluded").asBoolean(),
+    interstitial_after_n_screens: rc.getValue("interstitial_after_n_screens").asNumber(),
+    rewarded_optin_position: rc.getValue("rewarded_optin_position").asString() as AdConfig["rewarded_optin_position"],
+    paywall_probability: rc.getValue("paywall_probability").asNumber(),
+  };
+}
+
+export async function loadAdConfig(): Promise<AdConfig> {
+  try {
+    const fresh = await fetchFromRemote();
+    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(fresh));
+    return fresh;
+  } catch {
+    const cached = await AsyncStorage.getItem(CACHE_KEY);
+    if (cached) return { ...DEFAULT_AD_CONFIG, ...JSON.parse(cached) };
+    return DEFAULT_AD_CONFIG;
+  }
+}
+```
+
+There is a three-step fallback in there:
+
+1. If remote fetch succeeds, use that and cache it locally
+2. If remote fetch fails, fall back to the AsyncStorage cache from a previous successful fetch
+3. If even the cache is unavailable, use the TypeScript defaults
+
+`fetchTimeMillis` is capped at 8 seconds to keep launch responsive. I treat the fetch as fire-and-forget for the initial paint: the splash and the home view come up using whatever value the previous launch cached, and the fresh values take effect on the next session. That trade-off is worth it. Holding launch on a network request for a non-critical configuration value is exactly the kind of detail that erodes a user's patience.
+
+## Moving the App Open frequency cap without a release
+
+App Open is the format where dials matter most. From the failure I described in the intro, what I learned was that **users do not lose trust in the ad — they lose trust in the app that shows it**. The signal is quiet: clicks do not drop, but cold starts do. AdMob's report alone will not surface this; you need to look at `app_open` events in Firebase Analytics over time.
+
+```typescript
+// src/services/AppOpenAdManager.ts
+import { AppOpenAd, AdEventType, TestIds } from "react-native-google-mobile-ads";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { loadAdConfig } from "../lib/adConfig";
+
+const LAST_SHOWN_KEY = "app_open_last_shown_at";
+const FIRST_SEEN_KEY = "first_seen_at";
+const UNIT_ID = __DEV__ ? TestIds.APP_OPEN : "ca-app-pub-YOUR_PUB/YOUR_UNIT";
+
+export async function maybeShowAppOpenAd(): Promise<void> {
+  const config = await loadAdConfig();
+  if (!config.show_app_open) return;
+
+  const now = Date.now();
+  const firstSeen = Number(await AsyncStorage.getItem(FIRST_SEEN_KEY)) || now;
+  if (!await AsyncStorage.getItem(FIRST_SEEN_KEY)) {
+    await AsyncStorage.setItem(FIRST_SEEN_KEY, String(firstSeen));
+  }
+
+  // First-day exclusion
+  const FIRST_24H = 24 * 60 * 60 * 1000;
+  if (config.app_open_first_session_excluded && now - firstSeen < FIRST_24H) return;
+
+  // Min interval
+  const lastShown = Number(await AsyncStorage.getItem(LAST_SHOWN_KEY)) || 0;
+  const intervalMs = config.app_open_min_interval_sec * 1000;
+  if (now - lastShown < intervalMs) return;
+
+  const ad = AppOpenAd.createForAdRequest(UNIT_ID, { requestNonPersonalizedAdsOnly: false });
+  ad.addAdEventListener(AdEventType.LOADED, () => ad.show());
+  ad.addAdEventListener(AdEventType.OPENED, async () => {
+    await AsyncStorage.setItem(LAST_SHOWN_KEY, String(Date.now()));
+  });
+  ad.load();
+}
+```
+
+The before/after I lived through:
+
+- **Before**: `app_open_min_interval_sec = 0`, `app_open_first_session_excluded = false`, `show_app_open = true`. A brand-new user's very first launch begins with an ad. The opening moment of the app is an ad.
+- **After**: `app_open_min_interval_sec = 60–90`, `app_open_first_session_excluded = true`, `show_app_open = true`. The first day shows no App Open ads. From day two, two cold starts within 60 seconds will not both see an ad.
+
+That switch is now a Remote Config change. Code unchanged. The asymmetry is what matters: the move toward "softer ads" no longer carries the weight of a release. That alone lowers the threshold for making the move at all.
+
+## A/B testing pitfalls: exposed vs applied users
+
+When you layer Firebase A/B Testing on top of Remote Config and roll variants out in production, users get sorted by `ad_config_version` into buckets. There are three pitfalls I have actually hit:
+
+**1. Confusing exposed and applied populations.** Firebase A/B Testing only treats a session as "applied" if you fire an event during the session that proves the variant took effect. Without it, the experiment view will list participants who never actually saw the variant. I emit a custom event called `experiment_applied` from inside `loadAdConfig` on success, so the population I judge is the population that actually ran the new config.
+
+**2. Audiences that are too small for significance.** Indie developer audiences are not always large enough to slice by country and OS at once. I aim for at least 5,000 sessions per arm, sustained for at least two weeks. If the math says we cannot reach that, I shrink the dimension before shrinking the experiment.
+
+**3. Not excluding yourself.** Your own test device pollutes the metrics. I keep a Remote Config Condition named `dev_devices` that targets a "dev" audience, and I add my Firebase Installations IDs to that audience. The override forces `show_app_open: false` and `paywall_probability: 0.0` for me.
+
+```text
+[Remote Config Condition example]
+Condition: dev_devices
+  User in audience: "dev"
+Parameter overrides:
+  show_app_open: false
+  paywall_probability: 0.0
+```
+
+Once that condition is in place, my own clicks and impressions cannot drift into the experiment data. That is a practical defense that has saved me more than once.
+
+## Fail-safe: a fetch failure must not amplify ads
+
+This is the part I most wanted to write. **Remote Config's behaviour on failure is itself a design surface.** What I have settled on:
+
+- On failure, prefer cache; if no cache, prefer defaults
+- Defaults are conservative — ads are weaker, not stronger
+- Ad logic never runs before the final value is resolved
+
+Why conservative? Because amplification on failure punishes users on weak networks the most. I once shipped a build whose fail-open default served maximum-aggression App Open ads when the review network could not fetch Remote Config; the build was rejected for ad-policy reasons. That was a design failure, not a coding bug. Fail toward "fewer ads".
+
+```typescript
+// Bad: fail-open into the most aggressive config
+const config = (await loadAdConfig()) ?? {
+  show_app_open: true,
+  app_open_min_interval_sec: 0, // amplified on every failure
+  paywall_probability: 1.0,
+};
+
+// Good: fail-closed into the gentlest config
+const config = (await loadAdConfig()) ?? {
+  ...DEFAULT_AD_CONFIG,
+  show_app_open: false,
+  paywall_probability: 0.0,
+};
+```
+
+## Joining AdMob and Analytics via ad_config_version
+
+`ad_config_version` exists so you can look back at the data weeks later and know which user saw which contract. I set it as a Firebase Analytics user property.
+
+```typescript
+import analytics from "@react-native-firebase/analytics";
+
+export async function applyAdConfigToAnalytics(version: number) {
+  await analytics().setUserProperty("ad_config_version", String(version));
+}
+```
+
+Once it is a user property, every analysis tool inside Firebase — exploration reports, BigQuery export, Looker Studio — can slice sessions, retention, and purchases by the contract version. The rhythm I run on is:
+
+1. **Day 3**: is retention obviously worse? If so, roll back immediately.
+2. **Day 7**: review eCPM × ARPDAU × Day 1–7 retention together.
+3. **Day 14**: decide — keep, revert, or refine.
+
+The "three days then judge" cadence is something I have arrived at the slow way. Ads create a delayed response in users. Day 1 numbers will mislead you almost every time. Day 3 is when the shape of the change becomes honest.
+
+## Letting Remote Config order ATT and UMP
+
+iOS ATT prompts and EU/UK UMP (User Messaging Platform) consent flows interact with AdMob initialization and App Open in ways that are easy to tangle. I park the ordering knobs in Remote Config too:
+
+- `consent_flow_position` — `onboarding` / `first_view` / `pre_paywall`
+- `att_request_delay_sec` — delay between launch and the ATT prompt
+- `app_open_after_consent_only` — do not show App Open until consent is captured
+
+Review teams react differently to where UMP appears. Some apps do well with consent on the very first launch; others get higher consent rates if they let users feel a primary feature first. Hard-coding the position locks you out of learning that. Leaving it in Remote Config lets the market answer.
+
+## Twelve years in, and what I have settled into
+
+A few habits I'll close on.
+
+**Do not move ads fast.** Increasing frequency aggressively shows good numbers on day one. By day three the effect catches up; by day seven retention is visibly down. Softening also unsettles AdMob's bidding side. I now hold to **changes within ±20%, at a three-day cadence**, and that has been the most stable rhythm I have found.
+
+**Do not judge by a single metric.** Watching eCPM alone hides the case where impressions fall, unit prices rise, and revenue looks stable — but DAU has quietly eroded. `AdRevenue / DAU` is the number I keep on the dashboard.
+
+**The peace of being able to roll back protects your focus.** Knowing that any change is reversible without a release is, in the long run, the most important thing Remote Config gives you. Since I added it, I have made *more* small adjustments to AdMob, not fewer. The willingness to keep adjusting compounds.
+
+Both of my grandfathers were temple carpenters (miyadaiku). I grew up around the idea that work built carefully holds up for decades. I bring the same instinct to code and to operations. Ads sit on the business side of an app, where speed matters, but the *adjustment* of ads benefits from being quiet, reversible, and judged three days at a time.
+
+Being able to roll back without a release is, I have come to believe, a craft habit that protects an indie developer's attention. I hope these notes are useful to anyone working on the same problem.

@@ -1,0 +1,274 @@
+---
+title: "Rork × Firebase Remote Config で AdMob を本番のまま安全に切り替える — 起動広告と頻度キャップを「リリースなし」で動かす運用"
+slug: "rork-firebase-remote-config-admob-runtime-tuning-production"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-18T17:00"
+author: "Rork Lab"
+description: "壁紙アプリ運用で起動広告を強くしすぎて DAU が落ちた経験から、AdMob のフォーマット配信比率・頻度キャップ・除外条件を Firebase Remote Config で扱う設計をまとめました。Expo/Rork での実装、フェイルセーフ、A/B、指標の繋ぎ込みまで。"
+tags: ["Rork", "AdMob", "Firebase Remote Config", "Expo", "個人開発", "収益化"]
+highlights:
+  - "AdMob のフォーマット出し分け・頻度キャップ・除外条件を Remote Config の「広告契約」として型化する設計"
+  - "Expo/Rork で fetchAndActivate を初期化フローに組み込み、起動を遅らせない fail-closed 実装"
+  - "Firebase A/B Testing と AdMob 指標を ad_config_version で結びつけ、3 日単位で判定するための監視構成"
+---
+
+起動した瞬間に広告が出るアプリが嫌いです。自分でも壁紙アプリの起動広告（App Open Ads）を強くしすぎて、想定外に DAU が落ちた経験があります。リリースしてから 1 週間ほど見ていて、ようやく「広告ではなくユーザーが消えていた」と気づいた、あの時の重さを今もよく覚えています。
+
+このとき痛感したのは、広告まわりの設定は「リリースの粒度より細かく動かしたい」ということでした。Apple や Google の審査を待ってから 30 秒のインターバルを 60 秒に変える、という運用は、個人開発のスピード感に合わない。本番アプリのまま、コードを変えずに、広告の出し方だけを徐々に調整したい。
+
+その後、Rork で作った新しい壁紙アプリでも同じ問題に直面したとき、私は **Firebase Remote Config を「広告の契約書」として使う設計** に切り替えました。AdMob のフォーマット出し分け、頻度キャップ、初日除外、ATT/UMP との順序まで、すべてリリース不要で動かせるようにしてあります。この設計に落ち着くまでに踏んだ落とし穴と、12 年の AdMob 運用で身についた「広告は静かに調整する」という作法を、この記事にまとめておきます。
+
+## なぜ AdMob は Remote Config と相性が良いのか
+
+AdMob の設定は、AdMob 管理画面側でも一部はリリースなしで変えられます。たとえばユニットの有効/無効や、ad unit の単価フロアは管理画面から触れます。ただし、**アプリ側のロジック** — 起動広告を出すかどうか、何秒間隔で出すか、どの画面遷移で出すか、初日のユーザーを除外するか — はコードに書かれていて、リリース不要で動かす仕組みを自分で用意しないと変えられません。
+
+Firebase Remote Config はここに綺麗にハマります。
+
+- 値はサーバー側に保管され、起動時に取りに行く
+- パラメータ単位で条件分岐できる（OS／バージョン／国／プロパティ／オーディエンス）
+- Firebase A/B Testing と直結していて、抽出されたバケットごとに値を出し分けられる
+- Crashlytics・Analytics と並んで Firebase の同じプロジェクトに同居する
+
+2014 年から個人アプリ開発を続けていて、累計 5,000 万 DL を超えるまで色々な収益化の試行錯誤をしてきましたが、「広告ロジックをアプリのリリースから切り離せたかどうか」が、その後の精神的余裕を大きく左右する分岐点でした。リリースに紐付いた広告ロジックは、いざ何かあったときに戻すコストが大きく、慎重さがどんどん増していきます。
+
+## 設計：Remote Config を「フラグ集」ではなく「広告契約」として扱う
+
+最初の頃、私は Remote Config を `enable_admob` のような単純なブール値の置き場として使っていました。これは扱いが楽な一方、出せる工夫が限られます。やがて、広告の運用は「契約書」のような構造として扱うほうがずっと自然だと考えるようになりました。
+
+ここでいう「契約」は、たとえば次のようなパラメータ群です。
+
+- `ad_config_version`：契約のバージョン番号（後述する分析で必須）
+- `show_app_open`：起動広告を出すか
+- `app_open_min_interval_sec`：起動広告の最小インターバル秒
+- `app_open_first_session_excluded`：初回起動セッションを除外するか
+- `interstitial_after_n_screens`：n 画面遷移ごとに出す（0 で停止）
+- `rewarded_optin_position`：リワード広告の導線を出す位置（`detail` / `tab` / `none`）
+- `paywall_probability`：ペイウォール導線を出す確率（0.0〜1.0）
+
+ポイントは、これらを **TypeScript の型で固める** ことです。Remote Config の値は何でも入れられる代わりに、何が入っているかコード側で保証されません。型の枠を先に作り、Remote Config の値はそこに当てはめる方針にしておくと、3 か月後の自分が壊さずに済みます。
+
+```typescript
+// types/AdConfig.ts
+export type AdConfig = {
+  ad_config_version: number;
+  show_app_open: boolean;
+  app_open_min_interval_sec: number;
+  app_open_first_session_excluded: boolean;
+  interstitial_after_n_screens: number;
+  rewarded_optin_position: "detail" | "tab" | "none";
+  paywall_probability: number;
+};
+
+export const DEFAULT_AD_CONFIG: AdConfig = {
+  ad_config_version: 1,
+  show_app_open: true,
+  app_open_min_interval_sec: 60,
+  app_open_first_session_excluded: true,
+  interstitial_after_n_screens: 5,
+  rewarded_optin_position: "detail",
+  paywall_probability: 0.0,
+};
+```
+
+デフォルト値は **安全側（保守的）** に振っておきます。後で詳しく触れますが、これは Remote Config が取れなかったときに過剰広告で事故らないためのフェイルセーフです。
+
+## 実装：Expo / Rork での Remote Config 接続
+
+Expo Go では Firebase Remote Config のネイティブモジュールが動きません。EAS Dev Build か本番ビルドが前提になります。Rork で生成したプロジェクトでも同様で、開発中は EAS の development build に Remote Config と AdMob を両方入れた状態で確認していくのが現実的です。
+
+初期化は次のような流れにしています。
+
+```typescript
+// src/lib/adConfig.ts
+import remoteConfig from "@react-native-firebase/remote-config";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { AdConfig, DEFAULT_AD_CONFIG } from "../types/AdConfig";
+
+const CACHE_KEY = "ad_config_cached_v1";
+
+async function fetchFromRemote(): Promise<AdConfig> {
+  await remoteConfig().setDefaults(DEFAULT_AD_CONFIG as any);
+  await remoteConfig().setConfigSettings({
+    minimumFetchIntervalMillis: __DEV__ ? 0 : 60 * 60 * 1000, // 本番は 1 時間
+    fetchTimeMillis: 8000,
+  });
+  await remoteConfig().fetchAndActivate();
+  return readAdConfigFromRC();
+}
+
+function readAdConfigFromRC(): AdConfig {
+  const rc = remoteConfig();
+  return {
+    ad_config_version: rc.getValue("ad_config_version").asNumber(),
+    show_app_open: rc.getValue("show_app_open").asBoolean(),
+    app_open_min_interval_sec: rc.getValue("app_open_min_interval_sec").asNumber(),
+    app_open_first_session_excluded: rc.getValue("app_open_first_session_excluded").asBoolean(),
+    interstitial_after_n_screens: rc.getValue("interstitial_after_n_screens").asNumber(),
+    rewarded_optin_position: rc.getValue("rewarded_optin_position").asString() as AdConfig["rewarded_optin_position"],
+    paywall_probability: rc.getValue("paywall_probability").asNumber(),
+  };
+}
+
+export async function loadAdConfig(): Promise<AdConfig> {
+  try {
+    const fresh = await fetchFromRemote();
+    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(fresh));
+    return fresh;
+  } catch {
+    const cached = await AsyncStorage.getItem(CACHE_KEY);
+    if (cached) return { ...DEFAULT_AD_CONFIG, ...JSON.parse(cached) };
+    return DEFAULT_AD_CONFIG;
+  }
+}
+```
+
+3 段のフォールバックがポイントです。
+
+1. リモートから取得できれば、それを使う＆キャッシュに保存
+2. リモートで失敗したら、AsyncStorage のキャッシュに戻る
+3. キャッシュも無ければ、TypeScript で定義したデフォルト値に戻る
+
+起動時間を遅らせないために、`fetchTimeMillis` は 8 秒以下にしています。fetchAndActivate の待ち時間が起動ブロックにならないよう、初期化 → スプラッシュ → ヘルメット表示の流れで非同期に取りにいき、間に合えば反映、間に合わなければ次回起動時に有効化、という運用がやりやすいです。
+
+## 起動広告（App Open）の頻度キャップを動的に変える
+
+起動広告は、強さの調整がきわめて繊細です。私が壁紙アプリで失敗した時の感覚で言うと、「ユーザーは広告自体ではなく、広告を出すアプリへの信頼を少しずつ失っていく」という静かな現象が起きます。クリックが減るのではなく、起動そのものが減る。これは AdMob のレポートだけ見ていても見つけにくく、Firebase Analytics の `app_open` イベント数を時系列で見て初めて分かりました。
+
+```typescript
+// src/services/AppOpenAdManager.ts
+import { AppOpenAd, AdEventType, TestIds } from "react-native-google-mobile-ads";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { loadAdConfig } from "../lib/adConfig";
+
+const LAST_SHOWN_KEY = "app_open_last_shown_at";
+const FIRST_SEEN_KEY = "first_seen_at";
+const UNIT_ID = __DEV__ ? TestIds.APP_OPEN : "ca-app-pub-YOUR_PUB/YOUR_UNIT";
+
+export async function maybeShowAppOpenAd(): Promise<void> {
+  const config = await loadAdConfig();
+  if (!config.show_app_open) return;
+
+  const now = Date.now();
+  const firstSeen = Number(await AsyncStorage.getItem(FIRST_SEEN_KEY)) || now;
+  if (!await AsyncStorage.getItem(FIRST_SEEN_KEY)) {
+    await AsyncStorage.setItem(FIRST_SEEN_KEY, String(firstSeen));
+  }
+
+  // 初日の除外
+  const FIRST_24H = 24 * 60 * 60 * 1000;
+  if (config.app_open_first_session_excluded && now - firstSeen < FIRST_24H) return;
+
+  // インターバル
+  const lastShown = Number(await AsyncStorage.getItem(LAST_SHOWN_KEY)) || 0;
+  const intervalMs = config.app_open_min_interval_sec * 1000;
+  if (now - lastShown < intervalMs) return;
+
+  const ad = AppOpenAd.createForAdRequest(UNIT_ID, { requestNonPersonalizedAdsOnly: false });
+  ad.addAdEventListener(AdEventType.LOADED, () => ad.show());
+  ad.addAdEventListener(AdEventType.OPENED, async () => {
+    await AsyncStorage.setItem(LAST_SHOWN_KEY, String(Date.now()));
+  });
+  ad.load();
+}
+```
+
+Before / After の感触で言うと、
+
+- **Before**：`app_open_min_interval_sec = 0`、`app_open_first_session_excluded = false`、`show_app_open = true`。新規ユーザーが入ってきた最初の起動から広告が出る。起動の体験が広告から始まる。
+- **After**：`app_open_min_interval_sec = 60〜90`、`app_open_first_session_excluded = true`、`show_app_open = true`。初日は広告を出さず、2 日目以降は 60 秒未満の連続起動には出さない。
+
+これは Remote Config の値を変えるだけで切り替えられます。コードは触っていません。「広告を弱める」の側に動かす作業が、リリース 1 回分の重さを持たないだけで、判断のハードルが大きく下がります。
+
+## A/B テストの組み方：Firebase A/B Testing の落とし穴
+
+Remote Config に Firebase A/B Testing を被せて、配信比率を本番に出すと、`ad_config_version` の値ごとにユーザーが振り分けられます。ここでの落とし穴は 3 つでした。
+
+**1. exposed と applied の差を見落とす。** Firebase A/B Testing の実験は、起動時にエクスペリメントを「適用された」と判定するためにイベントが必要です。これがないと、Firebase 側では実験参加者として認識されません。私は `experiment_applied` というカスタムイベントを `loadAdConfig` の成功時に発火させて、適用済みユーザーを明示的にトラッキングしています。
+
+**2. ターゲティングのオーディエンスが小さすぎる。** 個人アプリの場合、地域や OS をまたぐオーディエンスを切ると、片側が極端に少なくなって統計的有意性が出ないままタイムオーバーすることがあります。最低 2 週間、片側 5,000 セッション程度を目安にしています。
+
+**3. 開発者自身を除外していない。** 自分のテストデバイスは、Remote Config の Conditions で `User in audience: dev` のように除外しておかないと、開発中のクリックが指標を狂わせます。`firebase.installations` のインスタンス ID をオーディエンスに登録するのが私のやり方です。
+
+```text
+[Remote Config の Condition 例]
+Condition: dev_devices
+  User in audience: "dev"
+Parameter override:
+  show_app_open: false
+  paywall_probability: 0.0
+```
+
+開発者を完全に「広告ゼロ」状態にしておけば、自分のクリック・自分の表示が混ざる事故を物理的に防げます。
+
+## フェイルセーフ：fetch できなかったときに過剰広告を出さない
+
+ここは最も書きたかったポイントです。Remote Config は **取れなかったときの挙動こそ設計対象** です。私が試した範囲では、次の原則に落ち着きました。
+
+- 取得失敗 = キャッシュ → デフォルト値 の順にフォールバック
+- デフォルト値は **保守的**（広告を弱めに寄せる）に振る
+- いかなる経路でも、最終値が決まる前に広告ロジックを動かさない
+
+なぜ「保守的に寄せる」のか。fetch 失敗時に過剰広告が出ると、ネットワークが弱い環境のユーザーほどダメージを受けます。ストア審査のときに審査用ネットワークから fetch が通らなくて、デフォルトの過剰広告がそのまま出てしまい、ガイドライン違反でリジェクトされたことがあります。これは技術的なミスというより、設計の方向感の問題でした。フェイルセーフは「広告が消える方向」に倒すのが安全です。
+
+```typescript
+// Bad: fetch 失敗時に過剰広告
+const config = (await loadAdConfig()) ?? {
+  show_app_open: true,
+  app_open_min_interval_sec: 0, // ← 失敗時に最も強い設定
+  paywall_probability: 1.0,
+};
+
+// Good: fetch 失敗時は最も弱い設定
+const config = (await loadAdConfig()) ?? {
+  ...DEFAULT_AD_CONFIG,
+  show_app_open: false,
+  paywall_probability: 0.0,
+};
+```
+
+## 監視：AdMob と Analytics を ad_config_version で繋ぐ
+
+`ad_config_version` を Remote Config のパラメータに必ず含めるのは、後で振り返るためです。私は次のように使っています。
+
+```typescript
+// 全イベントに ad_config_version を付ける（user property として）
+import analytics from "@react-native-firebase/analytics";
+
+export async function applyAdConfigToAnalytics(version: number) {
+  await analytics().setUserProperty("ad_config_version", String(version));
+}
+```
+
+`user_property` として持たせると、Firebase Analytics の探索レポート・BigQuery エクスポート・Looker Studio のどれからでも、`ad_config_version` を軸にセッション数・継続率・購入率を切り出せるようになります。私はだいたい次の流れで見ます。
+
+1. **3 日目**：明らかに継続率が落ちていないか確認（ここで落ちていれば即ロールバック）
+2. **7 日目**：eCPM × ARPDAU × retention day 1〜7 のバランス
+3. **14 日目**：判定（採用 / 戻す / 中間調整）
+
+「3 日見て判断」のリズムは、12 年やってきて身につけた感覚に近いものがあります。広告は変化に対するユーザーの反応が遅く、初日の数字に踊らされやすい。3 日待って、影響が想定通りかを見るほうが安定します。
+
+## ATT / UMP との順序を Remote Config 内で制御する
+
+iOS の ATT プロンプトや、EU/UK 向けの UMP（User Messaging Platform）の同意フローと、AdMob の初期化・起動広告の表示タイミングは、絡まると非常に面倒です。Remote Config のパラメータに、次のような順序制御のフラグを足しておくと、後から動かせて助かります。
+
+- `consent_flow_position`：`onboarding` / `first_view` / `pre_paywall`
+- `att_request_delay_sec`：起動から ATT プロンプトを出すまでの遅延
+- `app_open_after_consent_only`：同意取得後でないと起動広告を出さない
+
+UMP の表示位置は、ストアの審査チームがどこを見ているかで反応が変わります。アプリの種類によっては「初回起動時に出してしまうのが楽」というケースもあれば、「最初の主要機能を触ったあとに出すほうが同意率が高い」ケースもあります。これらをコードに固定せず、Remote Config に逃がしておくと、市場の反応を見て後から動かせます。
+
+## 12 年やって分かった「広告は静かに調整する」
+
+最後に、運用の作法として身につけた感覚をいくつか書いておきます。
+
+**急変させない**。広告の頻度を一気に強めると、ユーザーの離脱は遅れて効きます。1 日目は数字が良く見えても、3 日目から効いてきて、7 日目には DAU が削れている、という流れを何度か経験しました。逆に弱める時も、急に弱めると AdMob 側の単価最適化アルゴリズムが揺れます。**± 20% 以内、3 日刻みで動かす** のがいま私が落ち着いている方針です。
+
+**指標を 1 つに絞らない**。eCPM だけ見ていると、表示回数が減ったときに単価が上がって、見かけ上の収益は維持されたように見えます。実際には DAU と継続率が削れていて、長期では大きな損になります。`AdRevenue / DAU` で見るのが私の習慣です。
+
+**戻せる安心感は集中力を守る**。「いつでもリリースなしで戻せる」という前提が手元にあるかどうかは、個人開発の精神衛生に大きく効きます。広告まわりの調整は、その都度ストア審査を待つ運用ではすぐに止まってしまいます。Remote Config を入れて以降、AdMob の設定に対して「触る回数」が増えました。これは数字以上に大きな副作用でした。
+
+両家の祖父がともに宮大工で、丁寧に組み上げたものが何十年も持つのを近くで見て育ちました。コードや設定の運用にも同じ感覚を持っていて、急いで建てた構造は早く壊れる、という肌感があります。広告は事業として急ぐべき領域ですが、調整のプロセスは静かに、戻せる前提で、3 日単位で見るほうが結果として遠くまで行けます。
+
+リリースなしで戻せる安心感は、個人開発の集中力を守る作法だと感じています。同じ課題に取り組んでいる方の参考になれば幸いです。
