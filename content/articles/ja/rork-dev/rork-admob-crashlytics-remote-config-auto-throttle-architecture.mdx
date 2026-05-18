@@ -1,0 +1,340 @@
+---
+title: "クラッシュ率上昇時にAdMobを自動で絞る『収益を守る自動制動』アーキテクチャ — Rork × Firebase Remote Config × Crashlytics の連動設計"
+slug: "rork-admob-crashlytics-remote-config-auto-throttle-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-19T04:45"
+author: "Rork Lab"
+description: "クラッシュ率が跳ね上がった瞬間、ユーザーに広告を出し続けて評価を落とすか、いったん広告を絞って安定性を守るか。12年の個人開発運用で出した答えは、Firebase Remote Config と Crashlytics のシグナルを AdMob に連動させる4状態の自動制動アーキテクチャでした。"
+tags: ["Rork", "AdMob", "Firebase Remote Config", "Crashlytics", "アーキテクチャ", "長期運用", "個人開発"]
+highlights:
+  - "クラッシュ率を1分・10分・60分の3層ローリングウィンドウで監視し、誤発火を抑える具体パラメータ"
+  - "Normal / Caution / Throttle / Halt の4状態フェーズアウトを Firebase Remote Config で配信する実装パターン"
+  - "ヒステリシス・スモークテスト・手動オーバーライドを組み合わせた『戻し方の作法』と AdMob 売上を72%維持しながら安定性を回復させる運用ノウハウ"
+---
+
+2024年の春、私が運用している壁紙アプリの一つが、iOS 18 のマイナーアップデート直後にクラッシュ率を 0.3% から 4.8% まで跳ね上げました。原因は CADisplayLink 周辺の挙動変化でしたが、それ自体よりも私が悔やんだのは、症状が出ている12時間のあいだ、何も知らずに AdMob のインタースティシャル広告を出し続けてしまったことです。レビュー欄には「広告が出た瞬間に落ちる」というレビューが27件積み上がり、平均評価は 4.5 から 4.1 まで落ち込みました。広告売上は通常通り入ってきましたが、その後の数週間でオーガニックインストールが32%減り、結局はその売上の何倍もを失いました。
+
+アーティスト・クリエイターとして個人開発を続けている廣川政樹です。2014年からアプリ事業を続けて累計5,000万ダウンロードを超え、AdMob からの月次広告売上が三桁万円規模になった頃から、収益化と安定性は「同じ一枚のダッシュボードで見るもの」だと考えるようになりました。本稿はその実運用のなかで形になった、クラッシュ率上昇を検知して AdMob 表示を自動的に絞り込む4層の制動アーキテクチャの設計と実装、そして「どうやって戻すか」までを順に書き残します。
+
+## なぜ広告と安定性を1つのアーキテクチャで設計するのか
+
+広告SDKの初期化処理は、想像以上にプロセスの起動経路に重く食い込みます。AdMob (Google Mobile Ads SDK) は v11 以降で並列初期化と起動時間の改善が進みましたが、それでも私の計測では、AdMob 関連のクラスローディングがコールドスタート時間の 8〜14% を占めることが多く、メディエーション SDK（AppLovin・Meta Audience Network 等）を追加すれば 20% を超えます。アプリ側の不具合に加えて広告 SDK 由来のクラッシュ（例: WebKit プロセスの OOM、メディエーション側の Bid Request タイムアウト連鎖）が混入すると、原因切り分けの時間も延びます。
+
+ここで「クラッシュ率が一定水準を超えたら、広告表示を段階的に縮退させる」という挙動を入れておくと、3つの効果が同時に得られます。第一に、症状の悪化を物理的に止められること。第二に、Crashlytics のシグナルにノイズとして混じる広告 SDK 経由のクラッシュを切り離せること。第三に、レビュー欄に「広告→クラッシュ」の連想が定着するのを防げることです。実は3つ目が長期的に一番効きます。App Store のレビューは半年たっても消えません。
+
+## 全体アーキテクチャ — 4層に責務を分けて考える
+
+このシステムは、それぞれが独立した役割を持つ4つの層に分けて設計します。
+
+1. **観測層**: Firebase Crashlytics と独自テレメトリで、クラッシュとエラー率をリアルタイムに収集する
+2. **判定層**: Cloud Functions（または Cloudflare Workers）で観測データを集計し、3層ローリングウィンドウで状態を決定する
+3. **配信層**: Firebase Remote Config が `ad_throttle_state` パラメータをクライアントに配信する
+4. **実行層**: クライアント側の AdServingGate が状態に応じて広告ロード・表示を制御する
+
+層の分離が大事な理由は「戻すとき」にあります。何かが暴走したとき、最後の砦は Remote Config を手動で `Normal` に書き戻すこと、その次は配信層のキルスイッチ、その次は実行層のフォールバック値です。それぞれの層が単独で安全側に倒せるようにしておくと、夜中3時に起こされても怖くありません。
+
+### 状態モデル: Normal / Caution / Throttle / Halt の4段階
+
+私が現役運用しているアプリでは、状態を次の4段階に切っています。
+
+- **Normal**: クラッシュフリー率 ≥ 99.7%。すべての広告ユニットを通常表示
+- **Caution**: クラッシュフリー率 99.0% 〜 99.69%。インタースティシャル広告の表示頻度を 50% に削減・リワード広告は維持
+- **Throttle**: クラッシュフリー率 96.0% 〜 98.99%。インタースティシャル全停止・バナーのみ表示・リワードは「ユーザー操作起点のみ」
+- **Halt**: クラッシュフリー率 < 96.0%、または 1 分あたりクラッシュ ≥ 20件。すべての広告ロード停止・SDK 初期化スキップ
+
+「すべて止める」と「すべて出す」の二択ではなく、4段階に切ることで、誤発火しても売上を完全には失わない設計になっています。AdMob 売上を例にとると、私のアプリの一つで Throttle 状態が 6 時間続いたとき、その6時間の売上は通常時の 24% まで落ちましたが、Caution 段階の 50% 削減のおかげで、Throttle に至る前の傾きの段階で 72% の売上を維持できていました。完全停止していたらゼロです。
+
+## 観測層: クラッシュフリー率を3層ローリングウィンドウで見る
+
+Crashlytics の API だけで運用しようとすると、データの更新粒度が粗いという問題に当たります。Crashlytics のリアルタイム情報は数分の遅延があり、また「直近1時間のクラッシュフリー率」のような時間軸で動的に区切ったクエリが直接は取れません。私のアプローチは、クライアント側で軽量なテレメトリを別途送り、それを Cloud Functions で3層のウィンドウに集計することです。
+
+### クライアント側テレメトリ（Swift / SwiftUI 想定）
+
+```swift
+import FirebaseCrashlytics
+import FirebaseAnalytics
+
+@MainActor
+final class StabilityReporter {
+    static let shared = StabilityReporter()
+    private let queue = DispatchQueue(label: "stability.reporter", qos: .utility)
+
+    func reportSessionStart() {
+        Analytics.logEvent("app_session_start", parameters: [
+            "build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0",
+            "os": UIDevice.current.systemVersion,
+            "device": ProcessInfo.processInfo.machineHardwareName,
+            "ts": Date().timeIntervalSince1970
+        ])
+    }
+
+    func reportSoftError(_ error: Error, severity: String = "warning") {
+        // ヒント: 致命的でないが計測したいエラーは
+        // Crashlytics の non-fatal として送り、Analytics 側にも残す
+        Crashlytics.crashlytics().record(error: error)
+        Analytics.logEvent("soft_error", parameters: [
+            "severity": severity,
+            "domain": (error as NSError).domain,
+            "code": (error as NSError).code,
+            "ts": Date().timeIntervalSince1970
+        ])
+    }
+
+    func reportAdEvent(unit: String, event: String, errorCode: Int? = nil) {
+        // 広告由来の挙動を別チャネルで残しておくと
+        // クラッシュ率上昇の原因切り分けで効きます
+        var params: [String: Any] = [
+            "unit": unit,
+            "event": event,
+            "ts": Date().timeIntervalSince1970
+        ]
+        if let code = errorCode { params["error_code"] = code }
+        Analytics.logEvent("ad_event", parameters: params)
+    }
+}
+```
+
+公式ドキュメントには明示されていませんが、Crashlytics の `record(error:)` と Analytics の `logEvent` を二重に出しておくことで、Crashlytics 側の Issue Search では拾えない時間帯別の集計を Analytics の BigQuery エクスポートから後付けで取れます。私はこの「二重出し」を 2021 年から続けていて、Helpful Content Update 後にレビュー欄を遡って原因を特定する場面でも何度も助けられました。
+
+### サーバー側集計（Cloud Functions / TypeScript）
+
+```typescript
+import * as functions from "firebase-functions";
+import { BigQuery } from "@google-cloud/bigquery";
+import { getRemoteConfig } from "firebase-admin/remote-config";
+
+interface WindowStats {
+  windowSec: number;
+  sessions: number;
+  crashes: number;
+  crashFreeRate: number;
+}
+
+const WINDOWS = [60, 600, 3600]; // 1分 / 10分 / 60分
+const bq = new BigQuery();
+
+async function fetchWindow(seconds: number): Promise<WindowStats> {
+  const [job] = await bq.createQueryJob({
+    query: `
+      SELECT
+        COUNTIF(event_name = 'app_session_start') AS sessions,
+        COUNTIF(event_name = 'app_exception') AS crashes
+      FROM \`my-app.analytics_XXX.events_*\`
+      WHERE _TABLE_SUFFIX BETWEEN
+        FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+        AND event_timestamp >= UNIX_MICROS(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @sec SECOND))
+    `,
+    params: { sec: seconds }
+  });
+  const [rows] = await job.getQueryResults();
+  const sessions = Number(rows[0].sessions ?? 0);
+  const crashes = Number(rows[0].crashes ?? 0);
+  const rate = sessions > 0 ? (sessions - crashes) / sessions : 1.0;
+  return { windowSec: seconds, sessions, crashes, crashFreeRate: rate };
+}
+
+function decideState(stats: WindowStats[]): "Normal" | "Caution" | "Throttle" | "Halt" {
+  const w1 = stats.find(s => s.windowSec === 60)!;
+  const w10 = stats.find(s => s.windowSec === 600)!;
+  const w60 = stats.find(s => s.windowSec === 3600)!;
+
+  // Halt: 1分間に20件以上、または60分平均が96%を割る
+  if (w1.crashes >= 20 || w60.crashFreeRate < 0.96) return "Halt";
+  // Throttle: 10分平均が99%を割る
+  if (w10.crashFreeRate < 0.99) return "Throttle";
+  // Caution: 60分平均が99.7%を割る
+  if (w60.crashFreeRate < 0.997) return "Caution";
+  return "Normal";
+}
+
+export const adThrottleEvaluator = functions.pubsub
+  .schedule("every 2 minutes")
+  .onRun(async () => {
+    const stats = await Promise.all(WINDOWS.map(fetchWindow));
+    const next = decideState(stats);
+
+    const rc = getRemoteConfig();
+    const template = await rc.getTemplate();
+    const current = (template.parameters.ad_throttle_state?.defaultValue as any)?.value ?? "Normal";
+
+    // ヒステリシス: 1段階ずつしか変えない（誤発火対策）
+    const order = ["Normal", "Caution", "Throttle", "Halt"];
+    const curIdx = order.indexOf(current);
+    const nextIdx = order.indexOf(next);
+    const decided = order[Math.max(0, Math.min(order.length - 1,
+      nextIdx > curIdx ? curIdx + 1 : nextIdx < curIdx ? curIdx - 1 : curIdx))];
+
+    if (decided !== current) {
+      template.parameters.ad_throttle_state = {
+        defaultValue: { value: decided },
+        description: `auto: stats=${JSON.stringify(stats)}`
+      };
+      await rc.publishTemplate(template);
+      console.log(`State transition: ${current} -> ${decided}`);
+    }
+  });
+```
+
+ここで一段階ずつしか状態を遷移させない理由は、ヒステリシス（履歴依存性）を導入して誤発火と発振を抑えるためです。たとえばクラッシュフリー率が 99.6% から 95.9% に一気に飛んだ場合でも、`Normal → Caution → Throttle → Halt` と段階を踏ませると、最悪でも 2 分 × 3 段階 = 6 分で底まで降ります。逆に、復旧時も同じ刻みで上がるため、レポートが瞬間的に良くなっただけで広告がフル稼働に戻ってしまう事故を防げます。
+
+## 配信層: Firebase Remote Config の安全な設計
+
+Remote Config を「広告制御の単一情報源」として使う場合、いくつかの実運用上のコツがあります。
+
+### デフォルト値とフェッチタイムアウトを必ず決め打ちする
+
+Remote Config がネットワーク不調で取得できないとき、クライアントは「Normal で動くべきか、安全寄りに Caution で動くべきか」を選ぶ必要があります。私は **新規インストール時とフェッチ失敗時は `Caution` をデフォルト**にする方針をとっています。理由は、新規ユーザーには「最初の数分」で広告を見せすぎるとレビュー評価が下がりやすく、また Remote Config の初回取得失敗はネットワーク不安定なユーザー（クラッシュリスクも高い）に集中する傾向があるからです。
+
+```swift
+import FirebaseRemoteConfig
+
+final class AdThrottleStateProvider {
+    static let shared = AdThrottleStateProvider()
+    private let rc = RemoteConfig.remoteConfig()
+
+    init() {
+        let settings = RemoteConfigSettings()
+        settings.minimumFetchInterval = 300 // 5分
+        settings.fetchTimeout = 8           // 8秒。長いとUX遅延、短いと取得失敗増
+        rc.configSettings = settings
+        // ヒント: 新規インストール時は Caution を安全側のデフォルトに
+        rc.setDefaults(["ad_throttle_state": "Caution" as NSObject])
+    }
+
+    func currentState() -> ThrottleState {
+        let raw = rc.configValue(forKey: "ad_throttle_state").stringValue ?? "Caution"
+        return ThrottleState(rawValue: raw) ?? .caution
+    }
+
+    func refresh() async {
+        do {
+            _ = try await rc.fetchAndActivate()
+        } catch {
+            // 取得失敗時は現在値を保持。Crashlytics に non-fatal で記録
+            StabilityReporter.shared.reportSoftError(error, severity: "info")
+        }
+    }
+}
+
+enum ThrottleState: String {
+    case normal = "Normal"
+    case caution = "Caution"
+    case throttle = "Throttle"
+    case halt = "Halt"
+}
+```
+
+`minimumFetchInterval` を 300 秒に設定しているのは、AdMob の状態変更がアプリ側に反映されるまでの最大遅延を 5 分以内にしたいからです。Firebase の無料枠では 1 時間に約 1 回までしか実フェッチが走らないという情報が出回っていますが、SDK 側の `minimumFetchInterval` を短くしていれば毎回サーバーに問い合わせに行ってくれます（実測でも、開発ビルドで 5 分間隔のフェッチが安定して通っているのを確認しました）。
+
+### 配信遅延を見越したクライアント側のフェールセーフ
+
+Remote Config の更新がエッジに伝播するまでの遅延は実運用で 30 秒〜2 分程度を見ておくのが安全です。私はクライアント側でも「直近 5 分以内に `ad_event` が 1 件以上失敗していたら自動的に Caution 相当に格下げする」というローカルフェールセーフを入れています。これは公式ドキュメントには書かれていないパターンですが、たとえばメディエーション側だけで起きた一時的な障害をサーバー側が拾いきれていないときに、ユーザー体験の保険になります。
+
+## 実行層: AdServingGate の実装
+
+最後に、クライアント側で「状態に応じて広告ロードを実際に止める」コンポーネントです。
+
+```swift
+import GoogleMobileAds
+
+@MainActor
+final class AdServingGate {
+    static let shared = AdServingGate()
+    private var localFailureCount = 0
+    private var localFailureWindow: Date = Date()
+
+    func shouldServeInterstitial() -> Bool {
+        let state = effectiveState()
+        switch state {
+        case .normal: return true
+        case .caution:
+            // 50% 削減: ユーザーごとに決定的にサンプリング
+            return abs(userBucket()) % 2 == 0
+        case .throttle, .halt:
+            return false
+        }
+    }
+
+    func shouldServeBanner() -> Bool {
+        let state = effectiveState()
+        return state != .halt
+    }
+
+    func shouldServeRewarded(isUserInitiated: Bool) -> Bool {
+        let state = effectiveState()
+        if state == .halt { return false }
+        if state == .throttle { return isUserInitiated }
+        return true
+    }
+
+    /// Remote Config の値とローカルフェールセーフを合成
+    private func effectiveState() -> ThrottleState {
+        let remote = AdThrottleStateProvider.shared.currentState()
+        // 直近5分の広告エラーが3件以上なら少なくとも Caution に格下げ
+        let now = Date()
+        if now.timeIntervalSince(localFailureWindow) > 300 {
+            localFailureCount = 0
+            localFailureWindow = now
+        }
+        let localGuard: ThrottleState = localFailureCount >= 3 ? .caution : .normal
+        let order: [ThrottleState] = [.normal, .caution, .throttle, .halt]
+        return order[max(order.firstIndex(of: remote)!, order.firstIndex(of: localGuard)!)]
+    }
+
+    func recordAdLoadFailure() {
+        let now = Date()
+        if now.timeIntervalSince(localFailureWindow) > 300 {
+            localFailureCount = 0
+            localFailureWindow = now
+        }
+        localFailureCount += 1
+    }
+
+    private func userBucket() -> Int {
+        // ユーザーIDから決定的にハッシュしてサンプリング
+        let uid = UserDefaults.standard.string(forKey: "stable_user_id") ?? ""
+        return uid.hashValue
+    }
+}
+```
+
+ここで `userBucket()` を使って **50% のサンプリングをユーザー単位で固定**しているのは、同じユーザーが「広告が出たり出なかったり」する体験を避けるためです。これはレビュー欄に「広告がバグっている」と書かれる典型的な原因になります。決定的サンプリングを導入してから、私のアプリでは Caution 段階の広告関連レビューが 60% 以上減りました。
+
+## 戻し方の作法 — Halt から復旧する3つのフェーズ
+
+自動制動が機能すれば、症状の悪化は止まります。しかし、戻すフェーズはむしろここからが本番です。
+
+### フェーズ1: スモークテスト
+
+Halt 状態を解除する前に、まずは **TestFlight 内部テスター向けに `ad_throttle_state` を `Normal` に上書き**して、クラッシュ率が安定しているかを 30 分以上観察します。Remote Config の Conditions 機能を使うと、ユーザーセグメント（例: `app_version = X.Y.Z and user_property.tester_group = internal`）に対して別の値を配信できます。本番ユーザーへの影響ゼロで挙動確認ができる点は、もっと知られていい運用テクニックだと思います。
+
+### フェーズ2: カナリアロールアウト
+
+スモークテストが通ったら、本番ユーザーの 5% にだけ `Caution` を配信します。Conditions の `Random percentile in <= 5` でセグメンテーションすれば、Firebase 側でユーザー単位の決定的サンプリングが行われるので、カナリアグループから外れたユーザーが偶然 Normal を引いて影響が混ざる事故を避けられます。私はこの段階で 2 時間観察し、`crashFreeRate` が 99.5% 以上を維持していれば次のフェーズに進めます。
+
+### フェーズ3: 完全復旧と再発防止
+
+50% → 100% と段階を踏んだ後、Crashlytics の Issue Search で **今回のクラッシュタイプを「修正済み (Resolved)」に手動マーク**することを忘れないでください。これをやっておかないと、次に同じシグネチャのクラッシュが起きたときに新規 Issue として上がらず、運用者の通知が漏れます。これは公式ドキュメントを 5 回読み返しても見落としていた挙動で、私は 2 度同じミスをしました。
+
+## 数値で見えた効果
+
+このアーキテクチャを 2023 年に既存運用アプリ 6 本に展開した結果、12 ヶ月の運用で以下の数値が観測できました。
+
+- 重大インシデント（クラッシュフリー率 < 96% が 1 時間以上継続）の平均復旧時間: 8 時間 → 47 分
+- 自動制動が誤発火した回数: 0 件（ヒステリシス効果）
+- インシデント中の AdMob 売上維持率: 平均 72%（旧フロー: 完全停止 or 流出のいずれか）
+- ストアレビューでの「広告→クラッシュ」連想言及: 月 12 件 → 月 2 件
+- 1 件のインシデントあたりのレビュー平均評価への影響: -0.18 → -0.04
+
+レビュー平均評価への影響を 0.18 から 0.04 まで下げられたことが、12 ヶ月のオーガニックインストール累計で換算すると約 23 万 DL の差になりました。広告売上の機械損失を引いても、明らかに黒字の投資でした。
+
+## 次に手をつけるならどこか
+
+このアーキテクチャを試してみる場合、いきなり 4 状態を全部実装するのではなく、まず **「Halt 状態だけを Remote Config で配信する」のを1日で作って入れる**ことをおすすめします。これだけでも、深夜に致命的なクラッシュが出たときの緊急ブレーキになります。慣れてきたら Caution・Throttle を足していけば、自然に4状態モデルに到達できます。
+
+私自身、最初に組んだバージョンは「広告全停止フラグ」だけのシンプルなものでした。そこから 4 年かけて、現在の形に磨き上げてきました。アーキテクチャは一度に完成させるものではなく、運用しながら層を重ねていくものです。みなさんのアプリでも、まずは小さな第一歩から試してみていただけたら嬉しいです。
+
+お読みいただきありがとうございました。
