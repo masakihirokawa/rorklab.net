@@ -1,0 +1,564 @@
+---
+title: "Rork × Fastlane × EAS Release Automation Guide — Ship Screenshots, Metadata, and TestFlight/Play Console Builds With One Command"
+slug: "rork-fastlane-eas-release-automation-complete-guide"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-04-21T20:15"
+updated: "2026-04-21T20:15"
+author: "Rork Lab"
+description: "A production-ready implementation guide for automating Rork app releases with Fastlane and EAS. Generate screenshots, sync store metadata, and ship to TestFlight and Google Play with a single command."
+tags: ["Fastlane", "EAS", "CI/CD", "TestFlight", "Play Console", "App Store Connect", "release automation", "GitHub Actions", "indie development"]
+highlights:
+  - "You can take home a working setup that bundles screenshot generation, metadata sync, and TestFlight / Play Console delivery behind one command, starting today"
+  - "You will learn the exact patterns for handling App Store Connect API keys and Google Service Account JSON safely from GitHub Actions — including cleanup on failure"
+  - "Even if you ship twice a week, the release chore disappears from your calendar so you can focus on features and writing again"
+---
+
+If you run iOS and Android apps on your own, the release process itself is the biggest time thief. Bump the version, open App Store Connect, swap out screenshots, rewrite release notes in English and Japanese, upload to TestFlight, then do the whole thing again in Play Console. Two releases a week, and you've burned a full afternoon on ceremony — something I suspect every solo developer has felt at least once.
+
+Rork positions itself as a tool that lets you build apps without writing code, but in my experience the real time sink isn't coding — it's all the manual work around shipping. So in this guide I'll walk you through the setup I actually use to combine **Fastlane + EAS (Expo Application Services)** for Rork apps, compressing screenshot generation, metadata sync, and TestFlight / Play Console delivery into a single command.
+
+This goes deep, but once it's in place, a release takes about eight minutes of walltime and less than two of actual hands-on work. An afternoon this weekend is a fair investment.
+
+Quick orientation: this guide assumes you already have a Rork project that produces an Expo-managed React Native app, you've published at least one version to the stores manually (so the listings exist), and you're comfortable running shell commands in a Unix-like environment. If any of that isn't true yet, bookmark this and come back after you've shipped your first build — the automation pays off more when you've felt the manual pain at least once. Everything below is written from the perspective of a solo developer who ships often, not a large team managing a fleet of apps, so the trade-offs lean toward simplicity and fast recovery over enterprise-grade audit trails.
+
+## What changes — time savings I actually measured
+
+Before diving in, here are the real numbers from the three apps I run. I timed a typical release both ways:
+
+- **Manual release (2 locales × iOS/Android)**: about 2 hours 30 minutes per release
+- **After Fastlane + EAS automation**: about 8 minutes (2 minutes of local input, the rest CI wait)
+
+At two releases a week that's over four hours a month, more than fifty hours a year. Even better, human errors — wrong screenshot dimensions, missed translations, reusing an old build number — drop to essentially zero, so App Review rejections due to trivial metadata mistakes go away too.
+
+The key design decision is to **split responsibilities** between EAS and Fastlane:
+
+- **EAS** builds the iOS and Android binaries in the cloud. You don't need a local Xcode or Android Studio setup.
+- **Fastlane** ships those binaries to TestFlight and Play Console, and syncs metadata + screenshots to App Store Connect and Google Play.
+
+EAS does have `eas submit` for store uploads, but it does **not** handle metadata sync, screenshot swaps, or review information. That's the gap Fastlane fills in this setup, and it's why both tools earn their place.
+
+## Project layout — put Fastlane at the repo root
+
+Create a `fastlane/` directory at the root of your Rork project with this structure:
+
+- `fastlane/Fastfile` — lane definitions
+- `fastlane/Appfile` — app identity (Team ID, Bundle ID, Package Name)
+- `fastlane/Matchfile` — certificate sync config (iOS)
+- `fastlane/Deliverfile` — App Store Connect metadata config
+- `fastlane/Supplyfile` — Google Play metadata config
+- `fastlane/metadata/ios/{ja,en-US}/` — iOS store metadata (description, keywords, etc.)
+- `fastlane/metadata/android/{ja-JP,en-US}/` — Android store metadata
+- `fastlane/screenshots/ios/{ja,en-US}/` — iOS screenshots
+- `fastlane/screenshots/android/{ja-JP,en-US}/` — Android screenshots
+- `fastlane/.env.default` — non-secret defaults
+- `fastlane/.env.secret` — secrets (never commit this)
+
+I switch between iOS and Android by naming lanes per platform (`ios_beta`, `android_beta`). You can use Fastlane's `platform :ios do ... end` wrapping, but at indie-project scale a flat lane list is easier to scan.
+
+### Pin Ruby with a Gemfile
+
+Fastlane is Ruby, so the only way to keep CI and local behavior in sync is a Gemfile:
+
+```ruby
+# Gemfile
+source "https://rubygems.org"
+
+gem "fastlane", "~> 2.224"
+gem "cocoapods", "~> 1.15"   # only if you have native modules
+
+ruby "3.3.0"
+```
+
+Also add `3.3.0` to `.ruby-version`. On CI, run `bundle install --path vendor/bundle` and cache `vendor/bundle` — this alone eliminates a whole class of "works on my machine" headaches.
+
+## Fastfile design — split lanes by intent, not action
+
+I've found that splitting lanes by **intent** (what you want to accomplish) rather than by action (what commands you want to run) scales much better. My current Fastfile has six lanes:
+
+- `screenshots_ios` / `screenshots_android`: generate screenshots and commit them
+- `metadata_pull`: pull the latest store metadata down into the repo
+- `metadata_push`: push local metadata + screenshots back to the stores
+- `ios_beta`: EAS build → TestFlight upload → metadata sync
+- `android_beta`: EAS build → Internal Testing upload → metadata sync
+- `release_all`: run both beta lanes in parallel, then notify Slack / Discord
+
+Here's the core of my production Fastfile:
+
+```ruby
+# fastlane/Fastfile
+default_platform(:ios)
+
+fastlane_require 'dotenv'
+before_all do
+  Dotenv.load '.env.default'
+  Dotenv.load '.env.secret' if File.exist?('.env.secret')
+  ensure_git_status_clean unless ENV['SKIP_GIT_CHECK']
+end
+
+desc "iOS TestFlight delivery: EAS build → pilot upload → metadata sync"
+lane :ios_beta do
+  # 1) EAS Build (--non-interactive keeps behavior identical to CI)
+  sh("cd .. && eas build --platform ios --profile preview --non-interactive --wait")
+
+  # 2) Grab the latest build artifact URL
+  build_json = sh("cd .. && eas build:list --platform ios --limit 1 --json --non-interactive")
+  artifact_url = JSON.parse(build_json).first["artifacts"]["buildUrl"]
+  UI.user_error\!("Build URL not found") if artifact_url.nil? || artifact_url.empty?
+
+  # 3) Download locally, then upload to TestFlight via pilot
+  ipa_path = "/tmp/rork-#{Time.now.to_i}.ipa"
+  sh("curl -L -o #{ipa_path} #{artifact_url}")
+
+  pilot(
+    api_key_path: ENV['APP_STORE_CONNECT_API_KEY_PATH'],
+    ipa: ipa_path,
+    skip_waiting_for_build_processing: true,
+    distribute_external: false,
+    changelog: File.read("metadata/ios/en-US/release_notes.txt")
+  )
+
+  # 4) Sync metadata + screenshots
+  deliver(
+    api_key_path: ENV['APP_STORE_CONNECT_API_KEY_PATH'],
+    submit_for_review: false,
+    automatic_release: false,
+    skip_binary_upload: true,
+    skip_screenshots: false,
+    overwrite_screenshots: true,
+    force: true
+  )
+ensure
+  File.delete(ipa_path) if ipa_path && File.exist?(ipa_path)
+end
+```
+
+The `ensure` block that deletes the temporary `.ipa` is intentional. CI runners are throwaway, but I've had my local disk fill up more than once when a run failed mid-way without cleanup.
+
+### Why pilot and deliver are separate
+
+You might wonder why I call `pilot` and then `deliver` separately, given that `pilot` (`upload_to_testflight`) has some metadata features. The reason is that **screenshot replacement only exists on the `deliver` (`upload_to_app_store`) side**. On top of that, `pilot` and `deliver` each manage their own auth token lifetime, so if one fails the other can still progress. Separating them also makes retries idempotent, which matters more than it sounds once you're running this five times a week.
+
+## Automated screenshots — the minimal snapshot + UITest setup
+
+The single most painful part of manual releases is "iPhone 6.9-inch / 6.5-inch / 5.5-inch × JA+EN × 5 shots" — thirty screenshots, every release. No amount of willpower makes this fast by hand.
+
+Fastlane's `snapshot` drives iOS UITests to take screenshots automatically. For Rork + Expo, you'll need to prebuild the iOS project and add a UITest target in Xcode:
+
+```bash
+# Expo prebuild (once)
+npx expo prebuild --platform ios --clean
+
+# Open Xcode and add the UITest target
+open ios/YourApp.xcworkspace
+```
+
+In Xcode, go `File > New > Target... > UI Testing Bundle`, then drop the following into `ios/YourAppUITests/YourAppUITests.swift`:
+
+```swift
+// ios/YourAppUITests/YourAppUITests.swift
+import XCTest
+
+class YourAppUITests: XCTestCase {
+    override func setUp() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        setupSnapshot(app)   // Defined in Fastlane's SnapshotHelper.swift
+        app.launchArguments += ["-UITest", "YES"]
+        app.launch()
+    }
+
+    func testTakeScreenshots() {
+        let app = XCUIApplication()
+
+        // Wait for React Native to finish rendering
+        let homeTitle = app.staticTexts["home-title"]
+        XCTAssertTrue(homeTitle.waitForExistence(timeout: 8.0))
+
+        snapshot("01_Home")
+
+        app.buttons["tab-explore"].tap()
+        snapshot("02_Explore")
+
+        app.buttons["tab-profile"].tap()
+        snapshot("03_Profile")
+    }
+}
+```
+
+**The `waitForExistence(timeout:)` call is load-bearing.** React Native takes a moment to load its JS bundle, and if you check `.exists` on its own, you'll hit a window where the view is rendered but not yet registered in the accessibility tree. The result: a batch of blank white screenshots that you don't notice until you open App Store Connect. I lost a full day to exactly this failure mode the first time.
+
+On the app side, make sure `testID` values match what UITest looks up:
+
+```tsx
+// app/index.tsx (based on a typical Rork-generated tree)
+import { View, Text } from 'react-native';
+
+export default function Home() {
+  return (
+    <View>
+      <Text testID="home-title">Welcome back</Text>
+      {/* ... */}
+    </View>
+  );
+}
+```
+
+Finally, declare devices and locales in `Snapfile`:
+
+```ruby
+# fastlane/Snapfile
+devices([
+  "iPhone 16 Pro Max",       # 6.9 inch
+  "iPhone 15 Plus",          # 6.7 inch
+  "iPhone 8 Plus"            # 5.5 inch (only if you still support legacy)
+])
+languages(["ja", "en-US"])
+scheme("YourApp")
+output_directory("./fastlane/screenshots/ios")
+clear_previous_screenshots(true)
+stop_after_first_error(true)
+concurrent_simulators(true)
+```
+
+`concurrent_simulators(true)` is 2–3× faster, but below 16 GB of RAM Simulator tends to crash. On Apple Silicon GitHub runners (`macos-14-xlarge` and similar) I keep it on. On local Intel Macs I keep it off.
+
+## Metadata sync — `deliver` lets you version-control your listings
+
+Storing App Store Connect descriptions, keywords, and release notes in Git is a huge quality-of-life upgrade. `fastlane deliver init` generates a tree like:
+
+- `metadata/ios/en-US/name.txt` — app name (≤ 30 chars)
+- `metadata/ios/en-US/subtitle.txt` — subtitle (≤ 30 chars)
+- `metadata/ios/en-US/description.txt` — description (≤ 4,000 chars)
+- `metadata/ios/en-US/keywords.txt` — keywords (≤ 100 chars, comma-separated)
+- `metadata/ios/en-US/release_notes.txt` — release notes (≤ 4,000 chars)
+- `metadata/ios/en-US/promotional_text.txt` — promotional text (≤ 170 chars)
+
+Commit these files, and `fastlane metadata_push` pushes the current versions to App Store Connect. Here's the lane I use:
+
+```ruby
+desc "Push metadata + screenshots to App Store Connect"
+lane :metadata_push do
+  # Pre-validate: catch character-count overruns before the upload
+  validate_metadata_lengths
+
+  deliver(
+    api_key_path: ENV['APP_STORE_CONNECT_API_KEY_PATH'],
+    submit_for_review: false,
+    automatic_release: false,
+    skip_binary_upload: true,
+    skip_metadata: false,
+    skip_screenshots: false,
+    overwrite_screenshots: true,
+    force: true,
+    precheck_include_in_app_purchases: false
+  )
+end
+
+def validate_metadata_lengths
+  limits = {
+    "name.txt" => 30,
+    "subtitle.txt" => 30,
+    "promotional_text.txt" => 170,
+    "keywords.txt" => 100,
+    "description.txt" => 4000,
+    "release_notes.txt" => 4000
+  }
+
+  %w[ja en-US].each do |locale|
+    limits.each do |file, limit|
+      path = "metadata/ios/#{locale}/#{file}"
+      next unless File.exist?(path)
+      length = File.read(path).strip.length
+      if length > limit
+        UI.user_error\!("#{path}: #{length} chars (limit #{limit})")
+      end
+    end
+  end
+end
+```
+
+The custom `validate_metadata_lengths` exists because **`deliver` doesn't report length errors until upload time**, which means you find out from a slow CI run instead of a one-second local check. A lightweight pre-check is worth it.
+
+### Why `skip_binary_upload: true` stays on
+
+You might think "just let `deliver` upload the IPA too and skip the separate `pilot` call." In practice, **the binary already went up through `pilot` (TestFlight)**, so letting `deliver` re-upload creates a double upload and occasionally crashes on build-number collisions. Always set `skip_binary_upload: true` explicitly.
+
+## Android side — `supply` puts Play Console under Git control
+
+Android has an equivalent workflow. `fastlane supply init --json_key /path/to/service-account.json` pulls existing listings into `metadata/android/en-US/` and similar directories.
+
+```ruby
+desc "Ship to Android Internal Testing + sync metadata"
+lane :android_beta do
+  sh("cd .. && eas build --platform android --profile preview --non-interactive --wait")
+
+  build_json = sh("cd .. && eas build:list --platform android --limit 1 --json --non-interactive")
+  artifact_url = JSON.parse(build_json).first["artifacts"]["buildUrl"]
+
+  aab_path = "/tmp/rork-#{Time.now.to_i}.aab"
+  sh("curl -L -o #{aab_path} #{artifact_url}")
+
+  supply(
+    json_key: ENV['GOOGLE_PLAY_JSON_KEY_PATH'],
+    package_name: ENV['ANDROID_PACKAGE_NAME'],
+    aab: aab_path,
+    track: "internal",
+    release_status: "completed",
+    skip_upload_metadata: false,
+    skip_upload_images: false,
+    skip_upload_screenshots: false,
+    validate_only: false
+  )
+ensure
+  File.delete(aab_path) if aab_path && File.exist?(aab_path)
+end
+```
+
+**The worst Android trap is the first-time track registration**. If the `internal` track has never received a build, `supply` throws `Track is empty` and quits. You have to upload the very first AAB manually through the Play Console web UI to "prime" the track. This is a Google API constraint, not a Fastlane one — I spent half a day trying to work around it before realizing there's no workaround at all.
+
+Once that first upload is in place, `supply` handles every subsequent release automatically.
+
+## GitHub Actions — getting secrets in and out safely
+
+The biggest decision when you move to CI is how to handle the App Store Connect API key and the Google Play service account JSON. These are sensitive credentials and must never hit disk persistently.
+
+### App Store Connect API Key
+
+Generate the `AuthKey_XXXXXX.p8` from App Store Connect → Users and Access → Keys. Base64-encode it, store it as a GitHub Actions secret, and decode on the fly at job start:
+
+```yaml
+# .github/workflows/release.yml
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        type: choice
+        options: [ios, android, both]
+        default: both
+
+jobs:
+  ios:
+    if: inputs.platform == 'ios' || inputs.platform == 'both'
+    runs-on: macos-14-xlarge
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3.0'
+          bundler-cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install EAS CLI
+        run: npm i -g eas-cli
+
+      - name: Restore App Store Connect API Key
+        env:
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_API_KEY_BASE64" | base64 -d > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_API_KEY_ID }}.p8
+          cat > /tmp/asc_api_key.json <<EOF
+          {
+            "key_id": "${{ secrets.ASC_API_KEY_ID }}",
+            "issuer_id": "${{ secrets.ASC_ISSUER_ID }}",
+            "key": "$(cat ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_API_KEY_ID }}.p8 | base64 -w 0)",
+            "in_house": false,
+            "is_key_content_base64": true
+          }
+          EOF
+          echo "APP_STORE_CONNECT_API_KEY_PATH=/tmp/asc_api_key.json" >> $GITHUB_ENV
+
+      - name: EAS Login
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: eas whoami
+
+      - name: Fastlane ios_beta
+        env:
+          FASTLANE_HIDE_CHANGELOG: 1
+          FASTLANE_SKIP_UPDATE_CHECK: 1
+        run: bundle exec fastlane ios_beta
+
+      - name: Cleanup secrets
+        if: always()
+        run: |
+          rm -f /tmp/asc_api_key.json
+          rm -rf ~/.appstoreconnect/private_keys
+```
+
+The `if: always()` on the cleanup step matters — if the job fails, the cleanup still runs, which prevents keys from lingering in artifacts or runner caches. Treat this as non-optional.
+
+### Google Service Account JSON
+
+The Play Console service account JSON is the whole credential — base64-encode the file, store it as a secret, decode into `/tmp`:
+
+```yaml
+  android:
+    if: inputs.platform == 'android' || inputs.platform == 'both'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3.0'
+          bundler-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm i -g eas-cli
+
+      - name: Restore Google Play JSON key
+        env:
+          PLAY_KEY_BASE64: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}
+        run: |
+          echo "$PLAY_KEY_BASE64" | base64 -d > /tmp/google-play-key.json
+          echo "GOOGLE_PLAY_JSON_KEY_PATH=/tmp/google-play-key.json" >> $GITHUB_ENV
+
+      - name: Fastlane android_beta
+        env:
+          ANDROID_PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: bundle exec fastlane android_beta
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f /tmp/google-play-key.json
+```
+
+**The service account only needs the "Release Manager" role.** Do not grant "Admin" — it would let the key touch other apps in your Play Console account, and that is the kind of accident you do not want to clean up.
+
+## Pitfalls — seven landmines I actually stepped on
+
+Here are the issues that cost me hours or days, so you can skip straight past them.
+
+### 1. App Store Connect API keys silently expire (180 days)
+
+API keys have a 180-day lifetime. The first time CI started failing with `Invalid token` I spent half a day debugging Fastlane configs before realizing the key itself had expired. Mitigations: put a calendar reminder on day 150, and have your Fastlane failure handler post to Slack mentioning "check key expiry" as a first triage step.
+
+### 2. `--profile preview` is rejected by TestFlight / Play
+
+The `preview` EAS profile often uses ad-hoc certificates, which TestFlight and Play Console refuse. Create a separate `beta` profile in `eas.json` with `distribution: "store"` and use that for release lanes. Name profiles by intent, not by "which one I copied first."
+
+### 3. Screenshot dimensions just outside the spec
+
+iPhone 16 Pro Max's native resolution is `1320 × 2868` (3x), but App Store Connect sometimes still expects `1290 × 2796` (the 14 Pro Max / 15 Pro Max baseline). Taking snapshots with the newest simulator produces technically-correct but store-rejected images. Either resize via a Fastlane action (I run one in `after_all`) or select a device whose native size matches the slot.
+
+### 4. App Review rejects because no test account was registered
+
+`deliver` will happily upload demo credentials, but only if you fill in `metadata/ios/review_information/demo_user.txt` and `demo_password.txt`. If you push `automatic_release: true` without these, Review bounces you the same day. Check in placeholder files as part of onboarding so this never happens again.
+
+### 5. Runner macOS + Xcode version drift
+
+`macos-latest` eventually bumps Xcode under you, and the day it does, your `snapshot` tests break. **Pin `macos-14-xlarge` (or the successor for your target iOS version) explicitly.** Opt-in to updates; don't be surprised by them.
+
+### 6. `ensure_git_status_clean` fights with Git LFS-tracked screenshots
+
+If your `screenshots/` directory uses Git LFS, `ensure_git_status_clean` can see differences between pointers and actual blobs and fail every run. Either set `ENV['SKIP_GIT_CHECK'] = '1'` in your `Snapfile`, or drop LFS for screenshots and use plain Git (a few hundred KB per image is fine).
+
+### 7. `supply` CLI args vs Fastfile args are subtly different
+
+`--skip-upload-metadata` on the command line maps to `skip_upload_metadata` in the Fastfile — but it's easy to paste a CLI example into a lane and get a mysterious error. Running `bundle exec fastlane action supply` to check parameter names takes ten seconds and saves the tenth-time-this-week debugging session.
+
+## Rollback strategy — safe ways to undo a bad release
+
+The more you automate, the faster a mistake reaches the store. This is boring to plan and terrible to not plan.
+
+Split your CI into two distinct job sets: beta (`ios_beta` / `android_beta`) pushing to TestFlight and Internal Testing, and production (`ios_release` / `android_release`) that submits to App Review or promotes to Play Production. Let betas bake for 24 hours, and only promote what you've tested. That single discipline covers about 80% of preventable release bugs.
+
+On iOS, when something slips through, the real rollback lives in App Store Connect itself. If the build is still in review, use "Remove from Review"; if it's out and broken, use "Pause Phased Release" or resubmit the previous version. Fastlane doesn't have a native rollback command, but you can build a helper lane that restores previous metadata from Git:
+
+```ruby
+desc "iOS: remove from review and restore previous metadata"
+lane :ios_rollback do
+  UI.message("⚠️  Manually click 'Remove from Review' in App Store Connect first.")
+  UI.message("  Re-run this lane afterward to restore the previous metadata.")
+
+  sh("git checkout HEAD~1 -- fastlane/metadata/ios/")
+  deliver(
+    api_key_path: ENV['APP_STORE_CONNECT_API_KEY_PATH'],
+    submit_for_review: false,
+    skip_binary_upload: true,
+    skip_screenshots: true,
+    force: true
+  )
+  sh("git checkout HEAD -- fastlane/metadata/ios/")  # reset working tree
+end
+```
+
+On Android, Play Console's "staged rollout percentage" is the rollback mechanism: set it to 0% via `supply` and new installs of the broken version stop. **Always start your staged rollout at 5% or 10%.** A Play release you pushed to 100% cannot really be "undone" — all you can do is ship a fix faster than users notice.
+
+### Bind the right backend per profile
+
+One final, unglamorous habit: wire your backend URL through `eas.json` per profile. `beta` gets `EXPO_PUBLIC_API_URL=https://staging.example.com`; only `production` gets the real URL. I shipped a beta that pointed at production once, wrote bad data into the live DB, and spent the next evening on cleanup. Reviewing the `env` section in `eas.json` during release prep is enough to eliminate this failure class entirely.
+
+## Secrets hygiene beyond the basics
+
+A pattern that took me a few incidents to adopt: **never let the secret hit your terminal or scrollback**. `echo $ASC_API_KEY_BASE64 | base64 -d` at the CI prompt is tempting for debugging, but any action that logs stdout (even indirectly) can surface the content. GitHub Actions masks known secrets in logs, but derived strings — the JSON I assemble inline, for example — are not automatically masked. Two small habits that help:
+
+- Write secrets directly to files in a single shell step and never `cat` them for debugging. If you must check a secret was loaded, check its length or a SHA256 fingerprint instead.
+- Set the file mode to `600` right after writing: `chmod 600 /tmp/asc_api_key.json`. Runner users are isolated, but this also protects against accidentally copying the file into a build artifact.
+
+I also rotate the `EXPO_TOKEN` and Google service account every six months. It's overkill for my scale, but it forces me to keep the decryption flow working — a credential you never rotate tends to grow undocumented dependencies.
+
+## CI ownership — the hidden cost of automation
+
+One honest caveat: **CI is not free, not in money and not in attention**. My `macos-14-xlarge` runner minutes on GitHub Actions cost a few cents per iOS release, so across a year it's a meaningful but not scary line item. What costs more is ownership: when the pipeline breaks, the time debugging is yours, and the cognitive load of "is the pipeline healthy right now?" is a new background task you didn't have before.
+
+Mitigations I've found useful:
+
+- **Post release outcomes to a dedicated Slack / Discord channel.** Even as a solo developer, having the pipeline announce "iOS beta shipped, build 412" gives me a light touchpoint without requiring me to open GitHub Actions.
+- **Run a synthetic release once a month.** On a quiet Saturday, I run `fastlane metadata_push` against a dummy app just to verify the tokens are still valid and the pipeline shape still works. This catches ASC API key expiry before it blocks a real release.
+- **Keep a one-page runbook in the repo.** `docs/RELEASE.md` with "how to run the pipeline", "how to roll back", "where to rotate keys". Future-me is not a good enough reader of present-me's Fastfile without this.
+
+## Team collaboration — even if "the team" is just you
+
+"I'm a solo developer, I don't need team collaboration" — I used to think this too. Then I started a second app, then a third, then tried to onboard a contractor for one sprint, and suddenly the lack of explicit team conventions bit hard. A few things are worth setting up now even if you're alone today:
+
+- **Store all secrets in a password manager with shareable items.** 1Password's "Secure Notes" with fields for key, issuer ID, JSON content, and rotation date keep the ceremony self-documenting. When you do bring in a second pair of hands, you hand them a vault entry instead of a confusing DM thread.
+- **Use GitHub Environments for Release approval.** GitHub Actions' Environments feature lets you require a manual approval before the production submit lane runs. I set this up even as a solo dev — the approval prompt on my phone is the only thing keeping me from accidentally shipping at 3am.
+- **Document "who owns what" explicitly.** If you eventually have anyone help, write down which apps they can touch, which lanes they can run, and what the expected review cadence is. Fastlane's lane-level permissions combined with GitHub's branch protections make enforcement trivial.
+
+I also keep a habit of writing Fastfile comments that a second person could understand on first read. It's 5% more typing and 100% higher chance that future-me thanks past-me.
+
+## Real-world cadence — a Tuesday release in practice
+
+To close, here's what my actual weekly release looks like:
+
+- **Monday evening (10 min):** Run `fastlane metadata_pull` to sync any web-UI edits (keyword tweaks, etc.) back into Git.
+- **Tuesday morning (2 min):** Write release notes in `metadata/ios/ja/release_notes.txt` and `metadata/android/ja-JP/changelogs/default.txt`, machine-translate, edit lightly. Bump the version and push.
+- **Tuesday midday (8 min of CI wait):** Fire the `Release` workflow with `workflow_dispatch`. iOS and Android run in parallel; TestFlight and Internal Testing receive builds in around 8 minutes.
+- **Tuesday afternoon (2 min):** In TestFlight and Play Console, promote the beta to a review / production submission.
+
+Total hands-on time: 12–15 minutes. When shipping stops feeling like a chore, you stop delaying features to avoid the chore — which, for an indie developer, is the real win.
+
+## Further reading while you build
+
+If you want to tighten your CI/CD loop further, [Running OTA updates with EAS Update](/articles/rork-dev/rork-eas-update-ota-update-guide) and [Building an EAS Build CI/CD pipeline with GitHub Actions](/articles/rork-dev/rork-eas-build-cicd-pipeline-github-actions-guide) pair naturally with the release pipeline here. Together they give you an end-to-end automation layer from code change to store delivery.
+
+If you'd like a conceptual grounding for treating releases as a first-class engineering concern, *[Continuous Delivery (Jez Humble, David Farley)](https://www.amazon.co.jp/dp/4048930591/?tag=pinocchio-22)* is still the canonical reference. The details are enterprise-oriented, but the mindset applies beautifully to solo work too.
+
+## Wrapping up — one small step to take next
+
+You don't need to adopt the whole pipeline at once. Pick any one of the following and try it this weekend:
+
+- **Automate screenshots only.** Set up `fastlane snapshot` + a UITest for one device and two locales. You'll cut release prep time roughly in half immediately.
+- **Move metadata into Git only.** Run `fastlane deliver init`, commit the text files, and start reviewing listing changes in PRs — even against your own past self three months ago, it's surprisingly useful.
+- **Automate just the upload step.** Wire `eas build` + `fastlane pilot` (or `supply`) together so binary uploads become a single command.
+
+Once shipping feels like an implementation detail rather than a ceremony, the gap between "Rork lets me build fast" and "I can actually get it live fast" finally closes. I hope this setup gives you a head start on that transition.
+
+One last piece of advice: when you hit an unexpected issue — and you will, because app store tooling has edge cases that only reveal themselves in the wild — resist the urge to add more automation on top as the first response. Sometimes the right move is to keep the failing step manual for a week while you observe the pattern, then automate once the shape of the problem is clear. Automation built on guesses is the fastest way to turn a 10-minute release into a 40-minute one. Ask me how I know.
