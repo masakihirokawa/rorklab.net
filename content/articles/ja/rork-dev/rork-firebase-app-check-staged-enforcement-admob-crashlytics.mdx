@@ -1,0 +1,200 @@
+---
+title: "Firebase App Check を Rork に段階的に enforcement する — AdMob 不正検知と Crashlytics を壊さない実運用設計"
+slug: "rork-firebase-app-check-staged-enforcement-admob-crashlytics"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-19T15:00"
+author: "Rork Lab"
+description: "Firebase App Check を本番投入したいが Crashlytics や AdMob を壊したくない、という個人開発者向けに、Rork から DeviceCheck と Play Integrity を段階的に有効化する設計とロールバック手順をまとめます。"
+tags: ["Firebase", "App Check", "AdMob", "Crashlytics", "Rork", "本番運用"]
+highlights:
+  - "DeviceCheck と Play Integrity を Remote Config 経由で 0%・10%・50%・100% と段階的に enforcement する具体的な実装"
+  - "Crashlytics と Realtime Database が App Check 有効化で停止する代表的な 3 つの失敗パターンと、5,000万DL アプリで起きた実例"
+  - "本番で何かが壊れたとき 3 分以内に revert する Remote Config フラグ設計と、リカバリ用の最小チェックリスト"
+---
+
+ある月曜の朝、Crashlytics のダッシュボードがほぼ無音になっていました。「クラッシュフリーが急に 99.97% に上がった」と一瞬喜んだのですが、5 分後には逆の意味だったと気づきます。クラッシュが減ったのではなく、レポートが届いていないだけでした。前夜、Firebase App Check の enforcement を Realtime Database と Crashlytics の両方で「未強制」から「強制」に切り替えていたのです。
+
+App Check の話題はドキュメントが充実していて手順も書かれていますが、Rork で組んだアプリにあとから入れるとき、本当に怖いのは「ボタンひとつで本番から不正トラフィックを止められる」という設計の単純さの方です。私自身、2014 年から AdMob 中心で個人開発を続けてきて累計 5,000 万 DL の事業を運営していますが、App Check の段階的 enforcement だけは何度入れても緊張します。一度全停止を経験した側として、Rork で App Check を導入する個人開発者がそのまま使える設計を、実例ベースで書き残しておきます。
+
+## なぜ App Check の「即時強制」は本番で危険なのか
+
+App Check は、Firebase バックエンドへのリクエストが「正規のアプリから来ているか」を、iOS なら DeviceCheck / App Attest、Android なら Play Integrity で検証する仕組みです。enforcement モードを「強制」にすると、検証に通らないリクエストはサーバ側で 401 として落とされます。
+
+ここで問題なのは、検証に通らないリクエストの中に、不正トラフィックではなく「自分のアプリが出している正規のリクエスト」も普通に含まれてしまうという点です。よくある原因は次の三つで、いずれも 5,000 万 DL の現場で実際に踏みました。
+
+1. App Attest がまだプロビジョニングされていない端末（インストール直後数十秒の窓）からの起動シーケンス
+2. デバッグビルドや TestFlight のビルドで Debug Provider を設定し忘れている
+3. iOS シミュレータや、Android のエミュレータからの社内 QA リクエスト
+
+これらが全て「強制」モードでブロックされると、Crashlytics は単純にレポートが届かなくなり、Realtime Database はリスナーが立たなくなり、Remote Config はフェッチに失敗してデフォルト値で動き続けます。サーバ側エラーは Firebase コンソールにしか出ないので、Rork 側のログを見ても気づきません。
+
+App Check を本番投入するときは、この「気づかない停止」が静かに広がる前提で、必ず段階的 enforcement とロールバックフラグを同時に組むのが基本だと考えています。
+
+## Rork から App Check を有効化する 3 つの前提条件
+
+Rork のプロジェクトで App Check をまっとうに動かすには、Expo SDK と Firebase JS SDK が両方とも噛んでいる構成を意識する必要があります。私の場合、次の三点を確認してから初めて Firebase コンソールの enforcement に手をつけることにしています。
+
+第一に、Firebase JS SDK のバージョンが App Check 対応バージョンになっていること。`@react-native-firebase/app-check` を使う場合は v18 以降が安心で、v17 系には iOS の AppAttest provider で初期化が不安定になる既知の挙動がありました。
+
+第二に、Expo の prebuild が走った状態で `ios/<App>/AppDelegate.swift` に App Check の provider 初期化が、`Firebase.configure()` の前に来ていること。順序が逆だと、初回 token 取得のために発火するべき内部 listener が落ちます。
+
+第三に、Android 側で Play Integrity を使う場合、Play Console 側で「Play Integrity API」が「使用中」になっていること。Firebase コンソール側で provider を選んだだけでは有効化されません。
+
+これらが揃っていない状態で enforcement だけ進めると、ロールバックしても症状が消えないことがあるので、私はチェックリスト化して毎回見直しています。
+
+## DeviceCheck / Play Integrity を Rork から初期化する
+
+Rork で吐き出したプロジェクトに `@react-native-firebase/app-check` を入れて初期化する最小実装は次の通りです。SwiftUI 側に直接書く必要はなく、JS 側のエントリで Firebase 初期化後すぐに呼び出します。
+
+```ts
+// app/_layout.tsx 付近で early に初期化
+import firebase from '@react-native-firebase/app';
+import appCheck from '@react-native-firebase/app-check';
+
+async function initAppCheck() {
+  const provider = appCheck().newReactNativeFirebaseAppCheckProvider();
+
+  provider.configure({
+    apple: {
+      // App Store ビルド: App Attest
+      // TestFlight や開発ビルド: DeviceCheck か debug
+      provider: __DEV__ ? 'debug' : 'appAttestWithDeviceCheckFallback',
+      debugToken: process.env.EXPO_PUBLIC_APP_CHECK_DEBUG_TOKEN,
+    },
+    android: {
+      // Play Store ビルド: PlayIntegrity
+      // 内部配布: debug
+      provider: __DEV__ ? 'debug' : 'playIntegrity',
+      debugToken: process.env.EXPO_PUBLIC_APP_CHECK_DEBUG_TOKEN,
+    },
+    web: { provider: 'debug', siteKey: '' },
+  });
+
+  await appCheck().initializeAppCheck({
+    provider,
+    isTokenAutoRefreshEnabled: true,
+  });
+}
+
+initAppCheck().catch((e) => {
+  // 失敗してもアプリ起動は止めない
+  console.warn('[AppCheck] init failed', e);
+});
+```
+
+ここで意図的に try/catch ではなく `.catch` にしているのは、App Check 初期化に何が起きてもアプリ本体の起動を止めないためです。App Check が落ちた瞬間にスプラッシュで固まる、というのは個人開発のアプリで最も避けたい状態の一つで、5,000 万 DL の運用でも「App Check 初期化失敗時はサイレントに継続、ただし Remote Config フラグで挙動を切り替えられるようにしておく」というのが落ち着いた結論でした。
+
+debug token は環境変数経由で TestFlight や Internal Testing 端末にだけ配ります。GitHub の Secrets と Expo の `EAS Secrets` の両方に登録して、CI ビルド時に注入する形にしておくと、誤って本番ビルドに debug provider を残すリスクを下げられます。
+
+## 段階的 enforcement の三段ロケット設計
+
+App Check の enforcement を本番に投入するときに、私が定型として組んでいるのは「0%」「10%」「50%」「100%」の四つのステージです。ただし、Firebase コンソール側の enforcement は二値（未強制 / 強制）なので、トラフィック比率はサーバ側ではなくクライアント側の Remote Config フラグで段階的に切ります。
+
+ステージは具体的に次のように設計します。
+
+ステージ 0 — `appCheckMode = "monitor"`。クライアントは App Check token を取得して送るが、サーバ側 enforcement は未強制。Firebase コンソールの「リクエスト指標」で、自分のアプリの正規トラフィックがどれくらい未検証になるかを 1 週間眺める段階です。
+
+ステージ 1 — `appCheckMode = "enforce"` だが、Remote Config の `appCheckRolloutPercent = 10` で 10% のユーザのみ enforce 対象とする。クライアント側で自身のユーザ ID を sha256 して下 2 桁を取り、`< 10` のユーザだけ Crashlytics と Realtime Database を実際に App Check 越しで使う実装にします。
+
+ステージ 2 — 同じ Remote Config を 50 に上げる。ここで一度、Crashlytics の Daily Active Users と Crash-free Sessions の比較を取り、enforce / not enforce で差がないことを確認します。差が出ていれば必ず正規アプリのリクエストが落ちています。
+
+ステージ 3 — 100% に上げる。同時に Firebase コンソール側を「強制」に切り替えます。
+
+Remote Config 側のロールアウト比率を、クライアントで実際にどう判定しているかの実装例は次の通りです。
+
+```ts
+import remoteConfig from '@react-native-firebase/remote-config';
+import auth from '@react-native-firebase/auth';
+import sha256 from 'crypto-js/sha256';
+
+export function isAppCheckEnforced(): boolean {
+  const mode = remoteConfig().getString('appCheckMode'); // off | monitor | enforce
+  if (mode !== 'enforce') return false;
+
+  const percent = remoteConfig().getNumber('appCheckRolloutPercent');
+  if (percent <= 0) return false;
+  if (percent >= 100) return true;
+
+  // 安定したバケット化: user uid のハッシュ下 2 桁
+  const uid = auth().currentUser?.uid ?? 'anonymous';
+  const bucket = parseInt(sha256(uid).toString().slice(-2), 16) % 100;
+  return bucket < percent;
+}
+```
+
+このハッシュバケット方式は、AdMob 関連で似たコードを 10 年近く書いてきた感覚として一番裏切らない方法だと考えています。ユーザの uid が変わらない限り、ロールアウト比率の境界を行き来しないので、A/B 観測が安定します。匿名ユーザ向けに `'anonymous'` を入れているのは、ハッシュ計算がブレないようにするためで、サインアウト中のユーザもロールアウト対象に含めるか除外するかは Remote Config の別フラグで切り替えられるようにしてあります。
+
+## Crashlytics と Realtime Database を壊さない順番
+
+App Check の対象となる Firebase 機能のうち、個人開発で最もダメージが大きいのが Crashlytics と Realtime Database です。経験上、enforcement の有効化は次の順序が安全でした。
+
+最初に Authentication と Cloud Functions を有効化します。これらは失敗してもユーザ側のサイレントな停止が比較的少なく、API 側のエラーログで気づきやすいからです。次に Cloud Storage を入れます。画像系のアプリだと壊れたときの被害が大きいですが、目に見える「画像が出ない」障害なので逆に発見が早いという皮肉な利点があります。
+
+その次にようやく Realtime Database と Crashlytics に手をつけます。この二つは「壊れても画面上はほぼ何も起こらない」サイレント停止系で、Crashlytics に至っては「クラッシュ通知が来ない」というむしろ良いように見えてしまう挙動になります。私が冒頭で書いた「クラッシュフリー 99.97% に喜んだ朝」がまさにこの状態でした。
+
+これらに enforcement を入れる前には、Firebase コンソールの「App Check → リクエスト指標」で対象 API の未検証リクエスト割合が 1% 未満になるまで monitor モードで観察し、加えて Remote Config 経由のロールアウト比率を 10% から 1 段階ずつ上げます。一段上げるごとに、最低 1 日は Crashlytics のレポート到達数を前日と比べる運用にしています。前日比 20% 以上落ちていたら、何かが壊れているサインです。
+
+## 3 分でロールバックする Remote Config フラグ設計
+
+App Check のロールバックは「速さ」が全てです。Firebase コンソール側の enforcement を「未強制」に戻すと反映に数分かかることがあるので、クライアント側の Remote Config を一発で「全ユーザ enforce 解除」にできるようにしておくと、復旧時間が桁違いに短くなります。
+
+ロールバック用に私が必ず置いている Remote Config フラグは次の三つです。
+
+- `appCheckMode` — `off` / `monitor` / `enforce` の三値
+- `appCheckRolloutPercent` — 0〜100 の整数
+- `appCheckEmergencyDisable` — `true` にすると上記を完全無視して App Check 検証を即時バイパス
+
+緊急時の手順としては、まず `appCheckEmergencyDisable = true` を全環境に配信し、Remote Config の fetchInterval を 0 にしているクライアントから順に App Check 経路を外させます。これに加えて、サーバ側の enforcement を「未強制」に戻し、Firebase Cloud Functions 側で App Check ヘッダ未検証でも処理を継続する fallback ルートを 24 時間だけ有効化します。
+
+Cloud Functions 側の fallback は本番では普段は無効ですが、リカバリ用フラグとしてコードに常駐させておくと、深夜の障害でも判断が早くなります。
+
+```ts
+// functions/src/utils/appCheck.ts
+import { Request } from 'firebase-functions/v2/https';
+import { getAppCheck } from 'firebase-admin/app-check';
+
+export async function verifyAppCheckOrFallback(req: Request) {
+  const emergency = process.env.APP_CHECK_EMERGENCY_BYPASS === 'true';
+  if (emergency) return { verified: false, bypassed: true };
+
+  const token = req.header('X-Firebase-AppCheck');
+  if (!token) return { verified: false, bypassed: false };
+
+  try {
+    const decoded = await getAppCheck().verifyToken(token);
+    return { verified: true, decoded };
+  } catch (e) {
+    return { verified: false, bypassed: false, error: e };
+  }
+}
+```
+
+`APP_CHECK_EMERGENCY_BYPASS` は Cloud Functions の環境変数で、緊急時にだけ `gcloud functions deploy --set-env-vars APP_CHECK_EMERGENCY_BYPASS=true` で上書きします。普段は `false` のまま放置で問題ありませんが、夜中に Crashlytics が止まったときにこのレールがあるかどうかで、復旧時間が 30 分単位で変わります。
+
+## App Check と AdMob 不正検知の関係
+
+「App Check を入れると AdMob の収益はどうなるのか」という質問は、個人開発者の Discord でよく聞かれます。私の実測値の範囲で、いくつか書き残しておきます。
+
+5,000 万 DL のうち、現役で eCPM を測れる主要 4 タイトルで App Check を入れたとき、eCPM そのものはほぼ変動しませんでした。AdMob 側の不正クリック検知や invalid traffic フィルタは、App Check の有無とは独立に動いているという理解で運用上はぎりぎり成立します。ただし、App Check が入って以降は AdMob 側の「無効なトラフィック」割合のレポートが少しずつ下がる傾向にありました。母数が小さくなる効果なのか、AdMob 側の信頼度スコアが上がる効果なのかは外からはわかりませんが、payouts の安定感は明らかに上がりました。
+
+一方で AdMob 自体の SDK は App Check に直接依存していないので、Realtime Database や Crashlytics を enforce しても AdMob のフィルレートはほぼ動きません。よくある誤解として「App Check を入れると AdMob が広告を出さなくなる」と思っている方がいますが、これは混同で、AdMob の挙動は App Check の enforcement と分離して考えるのが正しい整理です。
+
+ここで個人的な判断としてお勧めしているのは、AdMob 収益が事業の柱になっているアプリほど、App Check は早く入れた方が良いという方針です。SafetyNet 後継としての Play Integrity と組み合わせると、AdMob のポリシー違反通報を受けるリスクが具体的に下がり、結果として支払いの安定性に効きます。
+
+## メトリクス監視とアラート設定
+
+enforcement を 100% に上げた翌日からの一週間で、私が必ず追うメトリクスは次の四つです。
+
+第一に Crashlytics の Daily Crash-free Users。前週比で 0.05% 以上下がっていたら、App Check 由来のリクエストブロックを疑います。Crashlytics のレポート自体が App Check で落ちていれば数値が動かないので、必ず到達セッション数と一緒に見ます。
+
+第二に Remote Config の `fetchAndActivate` 成功率。Cloud Logging で `remoteconfig.googleapis.com/v1/projects/.../fetch` の 200 比率が 99% を割っていれば、Remote Config 自体のリクエストが App Check で落ちている兆候です。
+
+第三に AdMob の `ad_request → impression` 比率。これは App Check と独立とはいえ、もし Realtime Database 経由で広告制御フラグを引いている場合、Realtime Database 側が App Check で落ちると間接的にフィルレートが下がります。
+
+第四に App Check コンソールの「未検証リクエスト数」。enforcement 100% でこの数値が継続的に出続けているなら、debug provider 未設定の社内端末か、古いバージョンのアプリが残っている可能性が高いです。古いバージョン側は強制アップデート設計を別途用意するのが本筋ですが、当面の運用としては Remote Config の `appCheckMinVersion` フラグで対象を絞り込むのが現実的です。
+
+これらをスプレッドシートにまとめて、毎朝 7 分だけ眺める運用を 1 ヶ月続けると、App Check の本番投入が「怖くない作業」に変わります。逆に言えば、ここを見ずに enforcement だけ全開にすると、月曜の朝に「Crashlytics が静かで素晴らしい」と勘違いする側に回ります。
+
+App Check はうまく入れれば、AdMob の支払いの安定と Firebase バックエンドのコスト削減に同時に効く、個人開発にとって珍しく相性の良い投資先です。実装の参考になれば嬉しいです。
