@@ -1,0 +1,163 @@
+---
+title: "Fixing 'Row too big to fit into CursorWindow' on Android When AsyncStorage Holds Too Much in Rork"
+slug: "rork-asyncstorage-cursorwindow-row-too-big-android-fix"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-19T11:30"
+updated: "2026-05-19T11:30"
+author: "Rork Lab"
+description: "When a React Native app generated with Rork stores large JSON or image metadata in AsyncStorage, Android can throw a Row too big to fit into CursorWindow exception. Here are the practical fixes — MMKV migration, chunked keys, payload trimming, and compression — explained from real wallpaper-app experience."
+tags: ["AsyncStorage", "Android", "CursorWindow", "React Native", "MMKV", "Rork", "Troubleshooting"]
+---
+
+A Rork-generated React Native app can run perfectly on iOS for months and then, one day, an Android user reports a blank screen on launch. In `adb logcat` you find an exception that mentions `Row too big to fit into CursorWindow: requested ... allocated ...`. Writes seem to succeed, but reads quietly fail — which makes it look as if data has vanished.
+
+I've been shipping iPhone and Android apps as an indie developer since 2014, with around 50 million downloads across them, and I ran into this exact trap several times on the wallpaper and relaxation apps in my catalog. The cause and the fixes are well-defined once you know what's happening underneath.
+
+## Why it only breaks on Android
+
+AsyncStorage on Android is backed by SQLite. When the runtime reads rows back, it loads them into a shared memory buffer called `CursorWindow` whose default size is about 2 MB. If the value you stored under a single key grows beyond that, the read crashes with `CursorWindowAllocationException`. iOS uses a file-based backend, so the same code stays happy there.
+
+In my case the chain looked like this:
+
+- Favourited wallpapers were being saved as a single JSON blob containing URLs, tags, and base64 thumbnails.
+- As users saved hundreds of items, the blob grew past 3 MB.
+- On launch the app froze on a white screen.
+- `adb logcat` lit up with the cursor exception on every cold start.
+
+The "writes succeed, reads fail" asymmetry is why people often misdiagnose this as a Firebase or backend issue. It is purely a local storage problem.
+
+## Two things to check first
+
+Before touching the code, gather a couple of numbers so you know how serious the situation is.
+
+### Measure what you're actually storing
+
+A one-line logger around your writes is the fastest path. Run it on a fresh build and watch real device usage for a day or two.
+
+```ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+async function setItemWithSizeLog(key: string, value: unknown) {
+  const json = JSON.stringify(value);
+  const sizeKB = (new Blob([json]).size / 1024).toFixed(1);
+  console.log(`[AsyncStorage] ${key} -> ${sizeKB} KB`);
+  await AsyncStorage.setItem(key, json);
+}
+```
+
+In my experience anything over 500 KB per key deserves attention, and 1 MB is the level where you should already be planning a fix. Devices and OS versions differ in how much headroom they leave inside the 2 MB window, so do not treat the number as a guarantee.
+
+### Decide whether to grow the buffer or change strategy
+
+Some Android SDK versions allow the cursor window size to be tweaked, but the value lives in the OS image, not in your app, so you cannot reliably enlarge it for users. I recommend treating that path as a dead end and using the time saved to migrate to a storage layer that does not pass through SQLite.
+
+## Fix 1: Migrate to MMKV
+
+Switching the persistence library is the cleanest move. `react-native-mmkv`, based on the MMKV library released by WeChat, does not go through `CursorWindow` on Android, and reads and writes are dramatically faster than AsyncStorage on both platforms.
+
+```ts
+import { MMKV } from "react-native-mmkv";
+
+const storage = new MMKV({
+  id: "favorites",
+  encryptionKey: "user-derived-key",
+});
+
+storage.set("favorites", JSON.stringify(favorites));
+const raw = storage.getString("favorites");
+const data = raw ? JSON.parse(raw) : [];
+```
+
+On Expo you install it with `expo install react-native-mmkv` and rebuild a Dev Client or EAS Build, since MMKV ships native code. If you took a Rork-generated app out to your own Expo project, this is a good time to centralise reads and writes behind a small helper so future swaps stay easy.
+
+Two warnings: never hard-code the encryption key, and never ship the migration without a one-time copy step that moves the existing AsyncStorage data over so users do not lose their progress.
+
+```ts
+async function migrateFromAsyncStorage() {
+  if (storage.getBoolean("__migrated_v1")) return;
+
+  const raw = await AsyncStorage.getItem("favorites");
+  if (raw) {
+    storage.set("favorites", raw);
+    await AsyncStorage.removeItem("favorites");
+  }
+  storage.set("__migrated_v1", true);
+}
+```
+
+## Fix 2: Split a single key into chunks
+
+If you would rather avoid a new dependency, you can keep AsyncStorage and slice the value across many keys. An array of items splits naturally into chunks of, say, 100 records; a single huge JSON blob can be cut into 256 KB pieces.
+
+```ts
+const CHUNK_SIZE = 100;
+
+async function saveChunked(baseKey: string, items: unknown[]) {
+  const chunks: unknown[][] = [];
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    chunks.push(items.slice(i, i + CHUNK_SIZE));
+  }
+
+  await AsyncStorage.setItem(`${baseKey}__count`, String(chunks.length));
+  await Promise.all(
+    chunks.map((chunk, idx) =>
+      AsyncStorage.setItem(`${baseKey}__${idx}`, JSON.stringify(chunk))
+    )
+  );
+}
+
+async function loadChunked<T>(baseKey: string): Promise<T[]> {
+  const countStr = await AsyncStorage.getItem(`${baseKey}__count`);
+  const count = countStr ? Number(countStr) : 0;
+  const keys = Array.from({ length: count }, (_, i) => `${baseKey}__${i}`);
+  const pairs = await AsyncStorage.multiGet(keys);
+  return pairs.flatMap(([, v]) => (v ? (JSON.parse(v) as T[]) : []));
+}
+```
+
+`multiGet` and `multiSet` are noticeably faster than serial calls, which also helps cold start time.
+
+## Fix 3: Rethink what you are saving
+
+The most underrated fix is to ask whether everything in that bucket actually belongs in persistent storage. In my wallpaper app the killer was base64-encoded thumbnails. Base64 inflates binary by roughly 33%, so a couple hundred thumbnails reaches megabytes very quickly.
+
+- Save images as real files via `expo-file-system` and keep only the file path in AsyncStorage.
+- If you cache an entire API response, trim it down to the few fields the UI actually reads.
+- Audit whether the same payload is being duplicated under more than one key.
+
+"Storage is cheap" is true in absolute terms, but the Android CursorWindow constraint is about the size of a single value, not the total. That is the part many teams miss the first time.
+
+## Fix 4: Compress the JSON
+
+A last-resort option is to gzip the payload before writing it. `pako` is a pure-JS library that handles this without native modules.
+
+```ts
+import pako from "pako";
+
+function setCompressed(key: string, value: unknown) {
+  const json = JSON.stringify(value);
+  const compressed = pako.deflate(json, { level: 9 });
+  const base64 = Buffer.from(compressed).toString("base64");
+  return AsyncStorage.setItem(key, base64);
+}
+
+async function getCompressed<T>(key: string): Promise<T | null> {
+  const base64 = await AsyncStorage.getItem(key);
+  if (!base64) return null;
+  const buf = Buffer.from(base64, "base64");
+  const json = pako.inflate(buf, { to: "string" });
+  return JSON.parse(json) as T;
+}
+```
+
+The catch is that base64 inflates the result again, and gzip is CPU-bound. For frequently accessed data, MMKV or chunking is the better choice.
+
+## Which approach to pick
+
+For new apps I now reach for MMKV from day one. For existing apps I lean on chunking plus payload trimming, because both can be shipped without forcing a native rebuild on day one. Rork's generated templates tend to assume AsyncStorage, so a quick storage-layer review once an app starts gaining real users tends to pay back quietly in lower Android crash rates.
+
+If you monetise with AdMob on a free app, a launch-time crash translates directly into lost ad impressions, and CursorWindow exceptions are the kind of bug that Crashlytics can underreport — you may only learn about it from a user review that says "the app stopped opening for me." Keeping an eye on daily launch-success rate in Crashlytics or Firebase is the simplest way to catch storage-layer rot before it spreads.
+
+Hope this saves someone the afternoon I spent puzzling over it. Thanks for reading.

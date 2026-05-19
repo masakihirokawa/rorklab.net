@@ -1,0 +1,169 @@
+---
+title: "Rork で AsyncStorage に大容量データを保存すると Android で CursorWindow エラーが出る原因と対処"
+slug: "rork-asyncstorage-cursorwindow-row-too-big-android-fix"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-19T11:30"
+updated: "2026-05-19T11:30"
+author: "Rork Lab"
+description: "Rork（React Native）で AsyncStorage に大きな JSON や画像メタデータを保存すると Android で発生する Row too big to fit into CursorWindow エラーの原因と、MMKV・SQLite・分割保存・圧縮など複数の現実的な対処をまとめています。"
+tags: ["AsyncStorage", "Android", "CursorWindow", "React Native", "MMKV", "Rork", "トラブルシューティング"]
+---
+
+Rork で生成した React Native アプリを Android の実機でしばらく使い込むと、ある日突然データが読めなくなったり、`Row too big to fit into CursorWindow: requested ... allocated ...` という SQLite 系のエラーがログに流れる場面に出くわすことがあります。iOS では何の問題もなく動いていたのに、Android だけで起きる——これは AsyncStorage の内部実装が Android では SQLite を使っていることに起因する、地味だけれど厄介な問題です。
+
+2014年から個人で iPhone / Android アプリを開発してきて、累計5,000万ダウンロードのうち癒し系・壁紙系のアプリで何度かこの罠にハマりました。原因と対処はパターン化されているので、整理しておきます。
+
+## どんなときに起きるか
+
+Android の AsyncStorage は、Facebook 製の AsyncStorage 実装が SQLite に値を書き込みます。読み出すときには `CursorWindow` という共有メモリバッファ（既定で約 2 MB）にレコードを載せてプロセス間でやり取りします。
+
+つまり、ひとつのキーに対して保存する**値のサイズが約 2 MB を超えると、読み出し時に `Row too big to fit into CursorWindow` 例外**が飛びます。書き込みは成功するのに読み出しで失敗するため、見た目には「アプリが起動しなくなった」「データが消えた」ように振る舞うのが厄介です。
+
+私が壁紙アプリで踏んだケースを挙げるとこんな具合です。
+
+- お気に入りに登録した壁紙の URL とメタデータ（タグ・サムネイル Base64）を 1 つのキーにまとめて保存していた
+- ユーザーが数百枚を保存するうちに JSON が肥大化し、3〜4 MB に到達
+- 起動時にアプリが白い画面で固まる
+- `adb logcat` を見ると `android.database.CursorWindowAllocationException` が連発
+
+iOS では SQLite ではなくファイルベースなので、同じコードでも問題なく動きます。Android でだけ再現することが、原因特定を遅らせる典型的な要因になります。
+
+## まず確認すべきこと
+
+修正に入る前に、現状を把握する手段を 2 つ用意します。
+
+### 1. 保存しているデータのサイズを測る
+
+開発中であれば、書き込み時にサイズをログに出してしまうのがいちばん早い方法です。
+
+```ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+async function setItemWithSizeLog(key: string, value: unknown) {
+  const json = JSON.stringify(value);
+  const sizeKB = (new Blob([json]).size / 1024).toFixed(1);
+  console.log(`[AsyncStorage] ${key} -> ${sizeKB} KB`);
+  await AsyncStorage.setItem(key, json);
+}
+```
+
+500 KB を超えたあたりから黄信号、1 MB を超えたら確実に対処すべきラインだと考えています。Android のバッファ既定値は 2 MB ですが、機種や OS バージョンによって余裕が違います。
+
+### 2. CursorWindow のサイズ拡張で延命できるか試す
+
+`react-native.config.js` ではなく、Android ネイティブ側のシステムプロパティから推測する方法もありますが、ユーザーの端末で制御できる値ではないため、根本対処にはなりません。延命策として `react-native-mmkv` などへの移行を検討するきっかけとして使う程度に留めるのが現実的です。
+
+## 対処法 1：MMKV へ移行する
+
+いちばん筋がいいのは、保存ライブラリそのものを切り替えることです。`react-native-mmkv` は WeChat が公開している MMKV をブリッジしたもので、Android でも CursorWindow を経由しません。読み書き速度が AsyncStorage の数十倍速いという副産物もあります。
+
+```ts
+import { MMKV } from "react-native-mmkv";
+
+const storage = new MMKV({
+  id: "favorites",
+  encryptionKey: "user-derived-key",
+});
+
+// AsyncStorage と同じ感覚で使えます
+storage.set("favorites", JSON.stringify(favorites));
+const raw = storage.getString("favorites");
+const data = raw ? JSON.parse(raw) : [];
+```
+
+Expo 環境では `expo install react-native-mmkv` で導入し、Dev Client または EAS Build を作成し直す必要があります。Rork で生成したアプリをローカルに引き取った後、書き込みヘルパー関数を 1 箇所に集約しておくと、後からこうした差し替えがスムーズになります。
+
+注意点として、暗号化キーをハードコードしないこと、そして既存ユーザーのデータを失わないために移行スクリプトを必ず用意することの 2 点です。次のように、AsyncStorage 側に残っている値を一度読んで MMKV に書き直し、終わったら AsyncStorage から削除します。
+
+```ts
+async function migrateFromAsyncStorage() {
+  const migrated = storage.getBoolean("__migrated_v1");
+  if (migrated) return;
+
+  const raw = await AsyncStorage.getItem("favorites");
+  if (raw) {
+    storage.set("favorites", raw);
+    await AsyncStorage.removeItem("favorites");
+  }
+  storage.set("__migrated_v1", true);
+}
+```
+
+## 対処法 2：分割保存（チャンク化）
+
+ライブラリを増やしたくない場合や、影響範囲を最小限にしたい場合は、ひとつのキーを複数のキーに分割して保存します。配列であれば 100 件ずつ、巨大な JSON であれば 256 KB ずつ、といった単位に切るのが現実的です。
+
+```ts
+const CHUNK_SIZE = 100;
+
+async function saveChunked(baseKey: string, items: unknown[]) {
+  const chunks: unknown[][] = [];
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    chunks.push(items.slice(i, i + CHUNK_SIZE));
+  }
+
+  await AsyncStorage.setItem(`${baseKey}__count`, String(chunks.length));
+  await Promise.all(
+    chunks.map((chunk, idx) =>
+      AsyncStorage.setItem(`${baseKey}__${idx}`, JSON.stringify(chunk))
+    )
+  );
+}
+
+async function loadChunked<T>(baseKey: string): Promise<T[]> {
+  const countStr = await AsyncStorage.getItem(`${baseKey}__count`);
+  const count = countStr ? Number(countStr) : 0;
+  const keys = Array.from({ length: count }, (_, i) => `${baseKey}__${i}`);
+  const pairs = await AsyncStorage.multiGet(keys);
+  return pairs.flatMap(([, v]) => (v ? (JSON.parse(v) as T[]) : []));
+}
+```
+
+`multiGet` を使うとパフォーマンスが目に見えて良くなります。書き込みも `multiSet` でまとめると、I/O 回数が減って起動時間に効いてきます。
+
+## 対処法 3：保存内容を見直してそもそも小さくする
+
+3 つ目はやや地味ですが、いちばん効果が高い場合もあります。AsyncStorage に「キャッシュ可能なもの」を入れてしまっていないか、設計を見直すアプローチです。
+
+私のケースでは、サムネイル画像を Base64 文字列にして保存していたのが致命傷でした。Base64 はバイナリより約 33% 肥大化するため、200 枚のサムネイルでメガバイト級に膨れ上がります。
+
+- 画像は `expo-file-system` でローカルファイルとして保存し、ファイルパスだけを AsyncStorage に入れる
+- API のレスポンス全体を保存しているなら、UI で必要な最小フィールドだけに削る
+- 同じデータを複数キーに重複して持っていないか確認する
+
+「ストレージは安いのだから保存しておけばいい」と思いがちですが、Android のこのバッファ制約は、保存量そのものではなく**ひとつのキーのサイズ**に効く点が落とし穴です。
+
+## 対処法 4：圧縮する
+
+最終手段として、JSON を gzip 等で圧縮してから保存する方法もあります。`pako` のようなライブラリで JS だけで完結します。
+
+```ts
+import pako from "pako";
+
+function setCompressed(key: string, value: unknown) {
+  const json = JSON.stringify(value);
+  const compressed = pako.deflate(json, { level: 9 });
+  const base64 = Buffer.from(compressed).toString("base64");
+  return AsyncStorage.setItem(key, base64);
+}
+
+async function getCompressed<T>(key: string): Promise<T | null> {
+  const base64 = await AsyncStorage.getItem(key);
+  if (!base64) return null;
+  const buf = Buffer.from(base64, "base64");
+  const json = pako.inflate(buf, { to: "string" });
+  return JSON.parse(json) as T;
+}
+```
+
+ただし Base64 化で再び肥大化するうえ、CPU を食うので頻繁に読み書きするデータには向きません。MMKV への移行や分割保存で解決できるなら、そちらを優先してください。
+
+## どれを選ぶか
+
+私が現在主軸にしているのは、新規アプリでは最初から MMKV、既存アプリでは分割保存 + 保存内容の最適化、という方針です。Rork が出力するテンプレートは AsyncStorage を前提にしていることが多いので、ある程度ユーザー数が伸びてきたタイミングで保存層を見直すと、Android クラッシュ率が静かに下がっていきます。
+
+特に AdMob を組み込んだ無料アプリでは、起動時のクラッシュがそのまま広告インプレッションの損失になります。CursorWindow 例外は Crashlytics で気づきにくいタイプの問題で、ユーザーがレビューに「最近開かなくなった」と書き残して初めて発覚することもあります。日次の起動成功率を Crashlytics や Firebase で見ておく習慣をつけると、こうした保存層の劣化を早めに察知できます。
+
+実装の参考になれば幸いです。お読みいただきありがとうございました。
