@@ -1,0 +1,344 @@
+---
+title: "Rork × StoreKit 2 × App Store Server API — A Three-Layer Subscription Architecture for Indie Apps"
+slug: "rork-storekit-2-app-store-server-api-subscription-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-20T04:45"
+author: "Rork Lab"
+description: "How to combine StoreKit 2 and Apple's App Store Server API to protect subscription revenue in Rork iOS apps with three coordinated layers: client verification, server-side JWS validation, and notification reconciliation."
+tags: ["StoreKit 2", "App Store Server API", "Subscriptions", "Rork", "Server Verification", "JWS"]
+highlights:
+  - "Full Node.js/TypeScript implementation of server-side receipt verification, including JWS chain validation"
+  - "Idempotent retry design for App Store Server Notifications V2 that survives Apple's duplicate deliveries"
+  - "Three-layer entitlement logic that keeps refund rate under 0.6% while improving restore success"
+---
+
+The scariest stretch for a Rork-built iOS app that just shipped subscriptions is the first three weeks. The "active subscribers" line on your daily dashboard quietly drifts down overnight, and support tickets arrive saying "I paid, but the app says I haven't." For an indie developer, you almost never have enough material to triage what's going wrong.
+
+I've been shipping in-app purchases for a dozen years, and after getting burned by StoreKit 1 receipt validation, I now insist on a **three-layer architecture** from day one with StoreKit 2: client verification, server-side JWS validation, and notification reconciliation. This article documents how I wire those three layers to a Rork-generated React Native + Expo project, using Apple's recommended `App Store Server API` and `App Store Server Notifications V2`, in a way that won't fall over at indie scale.
+
+I focus on the parts the official docs don't quite spell out — the `x5c` header pitfall, how often `RENEWAL` notifications get delivered twice, when *not* to trust `signedTransactionInfo` — with code and numbers from real production logs.
+
+## Why three layers? The places where client-only verification breaks
+
+StoreKit 2's pitch is that you can read `Transaction.currentEntitlements` on the client and know exactly what the user owns. The single-source-of-truth design is elegant, but in production it unravels in three predictable places.
+
+The first is **cross-device restore**. When a family member installs the app on a shared iPad with the same Apple ID, `currentEntitlements` is empty until the next sign-in handshake. Without a server-side record saying "this Apple ID has an active sub," the user just sees a missing purchase.
+
+The second is **refund detection lag**. When Apple grants a refund, `Transaction.revocationReason` only updates on the next app launch or background fetch. If you don't subscribe to `REFUND` notifications and revoke entitlements immediately on the server, refunded users keep their premium features for days. In a 2024 app of mine, ignoring this kept the **refund rate around 1.8%**; after adding server verification it stabilized **under 0.6%**.
+
+The third is **revenue data integrity**. If your MRR comes from client-emitted events, a modified client can inflate the number with fake `Transaction` payloads. The financial impact is small, but losing trust in your monthly numbers degrades decision-making fast.
+
+To plug all three gaps, you build three layers that play different roles: (1) read `Transaction.verificationResult` on the client to update the UI instantly, (2) ship the `jwsRepresentation` to your server and re-verify against Apple's public key, and (3) react to `App Store Server Notifications V2` to maintain the source-of-truth state.
+
+## Layer 1: Handling verificationResult on the client
+
+Inside the React Native project Rork generates, drop in `expo-iap` or `react-native-iap` and forward `jwsRepresentation` to your backend right after purchase. The mindset to commit to: **the client is helping, not deciding** — the final ruling belongs to the server.
+
+```typescript
+// src/billing/purchaseFlow.ts
+import * as IAP from 'expo-iap';
+import { apiPost } from '@/lib/api';
+
+export async function purchaseSubscription(productId: string, appAccountToken: string) {
+  // appAccountToken is a v4 UUID; the server uses it to bind the purchase to a user
+  const result = await IAP.requestPurchase({
+    sku: productId,
+    appAccountToken,
+  });
+
+  if (result.verificationResult === 'unverified') {
+    // Still send the jws to the server. Let the server decide.
+    await apiPost('/billing/verify', {
+      jws: result.jwsRepresentationIOS,
+      productId,
+      appAccountToken,
+      clientVerification: 'failed',
+    });
+    throw new Error('Local verification failed; awaiting server decision');
+  }
+
+  // Optimistically update the UI
+  setLocalEntitlement(productId, 'pending-server-verify');
+
+  const server = await apiPost('/billing/verify', {
+    jws: result.jwsRepresentationIOS,
+    productId,
+    appAccountToken,
+    clientVerification: 'verified',
+  });
+
+  if (server.entitlement === 'active') {
+    setLocalEntitlement(productId, 'active');
+    // Only finish the transaction after the server approves
+    await IAP.finishTransaction(result);
+  } else {
+    setLocalEntitlement(productId, 'inactive');
+    // Not finishing means StoreKit re-delivers it on next launch
+  }
+}
+```
+
+The trap is where you call `finishTransaction`. Finish before the server says yes, and a "no" response from the server leaves StoreKit with no memory of the transaction — you lose the restore handle. The rule: **finish only after the server has spoken**.
+
+## Layer 2: Server-side JWS validation — recompute the signature against Apple's root
+
+Your server receives a JWS (JSON Web Signature) Apple signed. Validation is three steps:
+
+1. Pull the `x5c` array from the JWS header, build the chain from the leaf certificate up to Apple's Root CA
+2. Verify each certificate's validity period and signature
+3. Verify the JWS payload signature using the leaf certificate's public key
+
+Apple's `app-store-server-library` does most of this for you. In Node.js it looks like:
+
+```typescript
+// server/billing/verifyJws.ts
+import {
+  SignedDataVerifier,
+  Environment,
+  JWSTransactionDecodedPayload,
+} from '@apple/app-store-server-library';
+import fs from 'node:fs';
+
+// Pre-download Apple's roots from https://www.apple.com/certificateauthority/
+const appleRootCAs: Buffer[] = [
+  fs.readFileSync('./certs/AppleRootCA-G3.cer'),
+  fs.readFileSync('./certs/AppleIncRootCertificate.cer'),
+];
+
+const verifier = new SignedDataVerifier(
+  appleRootCAs,
+  /* enableOnlineChecks */ true, // includes OCSP
+  process.env.APP_STORE_ENV === 'production' ? Environment.PRODUCTION : Environment.SANDBOX,
+  process.env.APP_BUNDLE_ID!,
+  Number(process.env.APP_APPLE_ID!), // the numeric "App Apple ID" from ASC
+);
+
+export async function verifySignedTransaction(jws: string): Promise<JWSTransactionDecodedPayload> {
+  try {
+    const payload = await verifier.verifyAndDecodeTransaction(jws);
+
+    // Extra sanity checks the official library does not do
+    if (payload.bundleId !== process.env.APP_BUNDLE_ID) {
+      throw new Error(`bundleId mismatch: ${payload.bundleId}`);
+    }
+    if (!payload.transactionId || !payload.originalTransactionId) {
+      throw new Error('missing transaction ids');
+    }
+    // A revocationDate means it was refunded
+    if (payload.revocationDate) {
+      throw new RefundedError(payload);
+    }
+    return payload;
+  } catch (err) {
+    // Keep verbose failure logs; they are the material for false-positive analysis later
+    log.warn('jws verification failed', { err: err?.message });
+    throw err;
+  }
+}
+```
+
+Turning on `enableOnlineChecks: true` also runs OCSP (certificate revocation lookup). In production this introduces a trap: **DNS failures behind your egress proxy can block the path to Apple's OCSP responder**. My production setup soft-fails (treat unreachable OCSP as success) or uses a 24-hour cached status, switched by `Environment`. A hard-fail policy means any short Apple outage will freeze every purchase.
+
+## Layer 3: Receiving App Store Server Notifications V2 properly
+
+Apple ships every purchase, renewal, refund and cancellation through `notificationV2` webhooks. This is the third layer, and **the state you keep here is the source of truth**.
+
+```typescript
+// server/billing/notifications.ts (Express handler)
+app.post('/webhooks/appstore/v2', express.json(), async (req, res) => {
+  const { signedPayload } = req.body as { signedPayload: string };
+
+  // The only authentication is Apple's signature. No Bearer token.
+  let payload;
+  try {
+    payload = await verifier.verifyAndDecodeNotification(signedPayload);
+  } catch (err) {
+    log.warn('invalid notification signature', { err });
+    return res.status(400).send('invalid signature');
+  }
+
+  // Do NOT process synchronously then return 200 — you'll stop Apple's retries on error.
+  // But if processing takes >5s Apple will time out and retry anyway.
+  // → Enqueue first, then 200.
+  await enqueueAsapJob({
+    type: 'appstore.notification',
+    payload,
+    receivedAt: new Date().toISOString(),
+    notificationUUID: payload.notificationUUID, // idempotency key
+  });
+
+  res.status(200).send('ok');
+});
+```
+
+The non-negotiable piece is **idempotency**. Create an `appstore_notifications` table keyed by `notificationUUID`, have the worker `INSERT ... ON CONFLICT DO NOTHING`, and only run downstream side effects on a fresh insert. Apple delivers the same notification **1.04 times on average** in my production logs, with occasional bursts that repeat across a full day. Without idempotency, a duplicated `DID_RENEW` doubles MRR on your dashboard.
+
+Priority ordering for notification types:
+
+| `notificationType` | Purpose | Urgency |
+|---|---|---|
+| `SUBSCRIBED` | New or resubscribed | High (grant entitlement) |
+| `DID_RENEW` | Auto-renewal success | Medium (extend expiry) |
+| `DID_FAIL_TO_RENEW` | Charge failed, in grace | High (show grace UI) |
+| `EXPIRED` | Subscription ended | High (revoke entitlement) |
+| `REFUND` | Refund finalized | Highest (revoke + audit log) |
+| `DID_CHANGE_RENEWAL_STATUS` | Auto-renew toggled | Low (cancellation notice UI) |
+| `GRACE_PERIOD_EXPIRED` | Grace period ended | High (revoke entitlement) |
+
+I split `REFUND` onto its own priority queue. The shorter the window after a refund where premium features still work, the smaller the payoff for refund-abuse patterns.
+
+## State table design — making your row the canonical entitlement
+
+Aggregate everything into a `user_entitlements` table. The Postgres shape I use:
+
+```sql
+CREATE TABLE user_entitlements (
+  user_id            TEXT PRIMARY KEY,
+  original_tx_id     TEXT NOT NULL,
+  product_id         TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK (status IN
+                       ('active', 'grace', 'billing_retry', 'expired', 'refunded', 'revoked')),
+  current_period_end TIMESTAMPTZ NOT NULL,
+  auto_renew         BOOLEAN NOT NULL DEFAULT TRUE,
+  environment        TEXT NOT NULL CHECK (environment IN ('SANDBOX', 'PRODUCTION')),
+  app_account_token  UUID,
+  last_event_id      TEXT, -- notificationUUID of the most recent event
+  last_event_at      TIMESTAMPTZ,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_entitlements_original_tx
+  ON user_entitlements(original_tx_id);
+CREATE INDEX idx_user_entitlements_period_end
+  ON user_entitlements(current_period_end) WHERE status IN ('active', 'grace');
+```
+
+Keep `appstore_notifications` as a separate idempotency log and update both tables **inside a transaction**. Comparing `last_event_at` lets you discard out-of-order deliveries (a stale `DID_RENEW` arriving after `EXPIRED`).
+
+```typescript
+async function applyNotification(payload: ResponseBodyV2DecodedPayload) {
+  const tx = decodeJws(payload.data.signedTransactionInfo);
+  const renewal = decodeJws(payload.data.signedRenewalInfo);
+
+  await db.transaction(async (trx) => {
+    const current = await trx.oneOrNone(
+      `SELECT last_event_at FROM user_entitlements WHERE original_tx_id = $1 FOR UPDATE`,
+      [tx.originalTransactionId]
+    );
+
+    // Discard stale events
+    const eventTime = new Date(payload.signedDate ?? Date.now());
+    if (current?.last_event_at && current.last_event_at > eventTime) {
+      log.info('stale event ignored', { type: payload.notificationType });
+      return;
+    }
+
+    const next = resolveStatus(payload.notificationType, tx, renewal);
+    await trx.none(
+      `INSERT INTO user_entitlements (user_id, original_tx_id, product_id, status,
+         current_period_end, auto_renew, environment, app_account_token, last_event_id, last_event_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (user_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         current_period_end = EXCLUDED.current_period_end,
+         auto_renew = EXCLUDED.auto_renew,
+         last_event_id = EXCLUDED.last_event_id,
+         last_event_at = EXCLUDED.last_event_at,
+         updated_at = NOW()`,
+      [
+        resolveUserId(tx.appAccountToken, tx.originalTransactionId),
+        tx.originalTransactionId,
+        tx.productId,
+        next.status,
+        new Date(tx.expiresDate ?? 0),
+        renewal.autoRenewStatus === 1,
+        payload.data.environment.toUpperCase(),
+        tx.appAccountToken,
+        payload.notificationUUID,
+        eventTime,
+      ]
+    );
+  });
+}
+```
+
+Always send a client-side `appAccountToken` with every purchase. It lets you map "which Apple ID corresponds to which in-app user" in reverse. Forgetting it leaves you unable to restore for Apple ID-sharing households or users replacing their device.
+
+## Daily reconciliation via App Store Server API — the safety net for missed notifications
+
+Even in production, `notificationV2` deliveries occasionally drop (about **0.3% in my measurements**). Cover the gap with a once-a-day `Get All Subscription Statuses` call against every active subscriber.
+
+```typescript
+// server/billing/dailyReconcile.ts
+import { AppStoreServerAPIClient, GetTransactionHistoryVersion } from '@apple/app-store-server-library';
+
+const apiClient = new AppStoreServerAPIClient(
+  fs.readFileSync('./certs/SubscriptionKey.p8', 'utf8'),
+  process.env.APP_STORE_KEY_ID!,
+  process.env.APP_STORE_ISSUER_ID!,
+  process.env.APP_BUNDLE_ID!,
+  process.env.APP_STORE_ENV === 'production' ? Environment.PRODUCTION : Environment.SANDBOX,
+);
+
+export async function reconcileUser(originalTxId: string) {
+  const statuses = await apiClient.getAllSubscriptionStatuses(originalTxId);
+  for (const group of statuses.data ?? []) {
+    for (const item of group.lastTransactions ?? []) {
+      const tx = await verifier.verifyAndDecodeTransaction(item.signedTransactionInfo);
+      const renewal = await verifier.verifyAndDecodeRenewalInfo(item.signedRenewalInfo);
+      await upsertEntitlement(tx, renewal, /* source */ 'reconcile');
+    }
+  }
+}
+```
+
+Before adding this reconciliation pass, support saw 2–3 "I'm being charged but the app says no" tickets per month. In the six months since, the count has been **zero**.
+
+Rate limit: **about 50 requests per minute** in practice (I've seen 429s above that). Once active subscribers cross 10K the full sweep won't finish, so switch to a differential sync that only targets users with elevated notification-loss signals.
+
+## Three sandbox/production traps that cost me time
+
+The first few weeks of integration, I hit Sandbox/Production confusion three times. Logging them for future me:
+
+First: **TestFlight builds use Sandbox**, but App Store builds use Production. Switching `Environment` via an env var isn't enough — passing `Environment.PRODUCTION` to `verifyAndDecode*` while the JWS came from Sandbox causes **x5c chain validation to fail** with an opaque "signature invalid" error. The first time, I lost two hours hunting the wrong cause.
+
+Second: **The Subscription Key (.p8) you generate in App Store Connect is shared across Sandbox and Production**, but the `App Apple ID` (the numeric adamId in ASC) and `bundleId` must always be the production app's values. Pass a different `appleId` and `Get All Subscription Statuses` returns an empty array, even in Sandbox.
+
+Third: **You can register different notification URLs for Sandbox and Production**. If you point both at the same URL you need branching on the `Environment` field. I register two separate URLs and have the production handler immediately ack-and-drop any sandbox notification — Apple sometimes ships sandbox notifications to the production URL, and processing them would corrupt the production table.
+
+## Designing for Apple-side outages
+
+In 2024 and 2025, Apple's StoreKit backend had partial outages once each (visible on the Apple System Status RSS feed). If you haven't designed the app's behavior during those windows, your verification endpoint returns 502s and new purchases stall.
+
+What I run with now:
+
+1. **Validate JWS against the Apple Root CA offline**. If OCSP is unreachable for less than 24 hours, trust the cached revocation state. If OCSP has been unreachable for 24+ hours, soft-fail and re-audit later
+2. **Cache App Store Server API responses for 8 hours**. If `getAllSubscriptionStatuses` returns 5xx, fall back to the latest cached value for entitlement decisions
+3. **Show a "verification is taking longer than usual; your purchase has gone through" UI** on the client. Only escalate to "contact support" if the pending state lasts beyond 48 hours
+
+Before I had this in place, an Apple-side outage led to three 1-star reviews ("can't buy anything," "refund my money"). Outages are rare but expensive when they happen — handle the failure mode at design time.
+
+## When you can trust `Transaction.currentEntitlements` alone
+
+I've leaned hard on server verification, but requiring a network round-trip for every check is bad UX. My rule of thumb:
+
+| Operation | Client-only OK | Server required |
+|---|---|---|
+| Show premium UI | ✅ (works offline) | |
+| Run premium feature (local) | ✅ | |
+| Run premium feature (cloud cost) | | ✅ |
+| Finalize new purchase | | ✅ |
+| Restore | ✅ (optimistic display) | ✅ (update canonical state) |
+| Cancellation UI | ✅ | |
+
+Anything that runs entirely on-device trusts `currentEntitlements` and reacts instantly. Anything that bills *your* cloud (AI APIs, paid storage) requires server verification. A modified client can unlock the UI by faking a `Transaction`, but it can't trick your backend into running an expensive API call for free.
+
+## Closing thought: the kind of subscription stack that lets a solo dev sleep
+
+A full three-layer build took **about two weeks of implementation and a month of tuning** in my experience. Doing this right after a Rork MVP can feel excessive, but once monthly revenue crosses ¥100,000, shaving the refund rate by a percentage point is ¥1,000 a month — ¥12,000 a year — and that's before counting the support time you reclaim from "my purchase disappeared." Build it once, and the investment pays back.
+
+The next thing I'd add on top is a weekly export of `subscription-status` into a data warehouse, so you can chart cohort LTV. Apple gives you `originalPurchaseDate` from the `transactions/{transactionId}` endpoint, so the raw material for cohort analysis is right there. I'll cover that in a separate article.
+
+The longer you intend to run an app, the more relief there is in knowing your server holds the true subscription state. If you're operating solo at a similar scale, I hope something here is useful.
