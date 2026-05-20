@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
+    "SEED15M — Rork が $15M シード調達（2026/4/9）、Left Lane Capital リード・Peak XV / True Ventures / Goodwater / a16z Speedrun が参加",
+    "DOUBLED — Rork Max 発表後 2週間で年間収益が倍増、X で 8M+ ビューを獲得し App Store エントリ層を一気に獲得",
+    "TOP2DEV — App Store「Developer Tools」カテゴリで世界2位以内を継続、モバイル AI コーディングのトップ プラットフォーム化",
     "MAXSWIFT — Rork Max が React Native ではなくネイティブ Swift アプリを生成、Claude Code + Opus 4.6 駆動でリリース3日 ARR $1.5M（2月〜）",
-    "APPLEFULL — Rork Max は iPhone・iPad・Watch・TV・Vision Pro・iMessage と AR/LiDAR・Metal 3D・Live Activities・Core ML までフル対応",
-    "TWOCLICK — Cloud Mac フリート上で native compile、Xcode・Mac 不要で 2-click App Store publishing が可能に",
     "AISTUDIORIVAL — Google AI Studio Android が I/O 2026 で事前登録開始、Kotlin vibe coding で Rork の Android 領域に直接競合（5/19）",
-    "MAXPRICING — Rork Max は $200/月 + Apple Developer Program $99/年、ネイティブビルド無制限の Max プラン継続",
     "DUALTRACK — Rork オリジナル（React Native/Expo）と Rork Max（Native Swift）の二本立てで、Android 廉価帯と Apple ネイティブを使い分け",
   ],
   en: [
+    "SEED15M — Rork closes a $15M Seed round (2026/4/9) led by Left Lane Capital with Peak XV, True Ventures, Goodwater, and a16z Speedrun",
+    "DOUBLED — Rork Max's launch announcement drew 8M+ views on X and doubled annual revenue inside two weeks by capturing App Store newcomers",
+    "TOP2DEV — Rork stays inside the top two of the App Store's worldwide Developer Tools category, leading the mobile AI coding platform race",
     "MAXSWIFT — Rork Max generates native Swift apps instead of React Native, powered by Claude Code + Opus 4.6 and hit $1.5M ARR within 3 days (since Feb)",
-    "APPLEFULL — Rork Max ships for iPhone, iPad, Watch, TV, Vision Pro, and iMessage with full access to AR/LiDAR, Metal 3D, Live Activities, and Core ML",
-    "TWOCLICK — Rork Max compiles on a Cloud Mac fleet, enabling 2-click App Store publishing with no Xcode and no Mac required",
     "AISTUDIORIVAL — Google AI Studio for Android opened pre-registration at I/O 2026, putting Kotlin vibe coding head-to-head with Rork on Android (5/19)",
-    "MAXPRICING — Rork Max remains $200/month plus Apple Developer Program ($99/year), with unlimited native Swift builds on the Max plan",
     "DUALTRACK — Rork's dual-track strategy (React Native + Native Swift) covers low-cost Android and premium Apple-native workflows side by side",
   ],
 };
