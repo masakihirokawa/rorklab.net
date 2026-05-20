@@ -1,0 +1,140 @@
+---
+title: "Fixing 0x8badf00d Watchdog Kills That Wipe Out Rork Apps at Launch"
+slug: "rork-ios-launch-watchdog-0x8badf00d-fix"
+category: "rork-dev"
+level: "intermediate"
+date: "2026-05-20T11:30"
+author: "Rork Lab"
+description: "Your Rork iOS app dies right after launch on real devices. Crashlytics shows exception code 0x8badf00d. Here is the watchdog termination story and the exact steps an indie developer running React Native apps for 50M downloads uses to make it stop."
+tags: ["rork", "ios", "crash", "watchdog", "launch", "react-native", "expo"]
+premium: false
+---
+
+# Fixing 0x8badf00d Watchdog Kills That Wipe Out Rork Apps at Launch
+
+The shape of the bug is always the same: the App Store build dies the instant a user taps the icon, you cannot reproduce it on your own iPhone, and Crashlytics shows `EXC_CRASH (SIGKILL)` with exception code `0x8badf00d`. Apple intends that hex string to read as "ate bad food," and it is iOS telling you the watchdog killed the process for taking too long to launch.
+
+I am Hirokawa, an indie developer who has been shipping iOS and Android apps since 2014 and crossed 50 million downloads across a wallpaper-and-relaxation portfolio. Every time I add a new SDK, this 0x8badf00d shows up first on iPhone 8 and SE second generation, then disappears once I rearrange the launch sequence. Here is the playbook that has held up across many Rork-style React Native projects.
+
+## What Watchdog Actually Measures
+
+iOS gives `application(_:didFinishLaunchingWithOptions:)` a budget in the 5 to 20 second range, picked dynamically by the device. On a recent iPhone in a normal room the practical ceiling is around 10 seconds; on a colder device with low battery it shrinks. If the call does not return in time, the system sends `SIGKILL` and records `0x8badf00d` in the crash log. There is no warning, and no way to opt out.
+
+For React Native and Expo, everything up to and including the first `requireApplicationRegister` from your JavaScript bundle gets counted against that budget. A Rork-generated template that boots AdMob, AppOpen, Firebase, RevenueCat, Sentry, and Branch synchronously from `AppDelegate` will sail past 8 seconds on a modern iPhone, which makes the older devices crash.
+
+The trap is that your dev machine launches the same build in 2 seconds. The watchdog does not look at your average; it looks at this specific cold start on this specific device under the current thermal and battery conditions.
+
+## Confirming the Diagnosis From the Crash Log
+
+In Crashlytics or Xcode Organizer the signature is unambiguous:
+
+- Exception Type: `EXC_CRASH (SIGKILL)`
+- Exception Codes: `0x8badf00d`
+- Termination Reason: `FRONTBOARD 0x8badf00d ... (scene-create watchdog transgression: ...)`
+- The triggered thread is usually thread 0 with frames inside `RCTCxxBridge`, `facebook::hermes::HermesRuntime`, `expo-modules-core`, or `+[FIRApp configure]`
+
+If you see those four marks together, stop investigating other crash categories. This is a launch-time block, not a memory issue, not a missing entitlement.
+
+## The Four Things That Block Launch in a Rork App
+
+In my own postmortems, more than ninety percent of 0x8badf00d cases came from one of these four:
+
+1. **A wall of synchronous SDK init calls in AppDelegate** — AdMob, Firebase, RevenueCat, Branch, and Sentry chained on the same thread because every vendor's docs say "call this at app start."
+2. **Synchronous reads from MMKV, AsyncStorage, or SQLite** — pulling user preferences, theme, or A/B flags inside `didFinishLaunching` before returning.
+3. **AppOpen ad preload that effectively blocks** — wrapping `GADAppOpenAd.load` in a structure that waits on the network before handing control back.
+4. **Heavy JavaScript top-level imports** — `App.tsx` importing a 1 MB constants module (huge JSON, hardcoded wallpaper catalogs, full i18n trees) before the first render.
+
+The Rork starter does not always force this, but it is the path of least resistance, so it is where most projects end up.
+
+## The Fix: Push Everything Heavy Out of the Launch Path
+
+### Native side (AppDelegate or ExpoAppDelegateSubscriber)
+
+```objc
+// Risky — everything is synchronous and on the launch path
+- (BOOL)application:(UIApplication *)application
+    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+  [FIRApp configure];
+  [GADMobileAds.sharedInstance startWithCompletionHandler:nil];
+  [RCPurchases configureWithAPIKey:@"YOUR_REVENUECAT_KEY"];
+  [Branch.getInstance initSessionWithLaunchOptions:launchOptions
+                              andRegisterDeepLinkHandler:^(NSDictionary *params, NSError *error){}];
+  return [super application:application didFinishLaunchingWithOptions:launchOptions];
+}
+```
+
+Keep only the absolute minimum on the launch path, and defer the rest behind a `dispatch_async` so they run after the first frame.
+
+```objc
+- (BOOL)application:(UIApplication *)application
+    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+  // Keep crash reporting first so any later failures still get captured
+  [FIRApp configure];
+
+  // Defer everything else to after the first frame
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [GADMobileAds.sharedInstance startWithCompletionHandler:nil];
+    [RCPurchases configureWithAPIKey:@"YOUR_REVENUECAT_KEY"];
+    [Branch.getInstance initSessionWithLaunchOptions:launchOptions
+                                andRegisterDeepLinkHandler:^(NSDictionary *params, NSError *error){}];
+  });
+
+  return [super application:application didFinishLaunchingWithOptions:launchOptions];
+}
+```
+
+Initializing Firebase first is intentional: if AppOpen or RevenueCat crashes a moment later, Crashlytics is already alive to record it.
+
+### JavaScript side
+
+```tsx
+// App.tsx — get the first paint done, then load everything else
+import { useEffect, useState } from "react";
+import { View } from "react-native";
+
+export default function App() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    // Run after the first paint so the watchdog window is already closed
+    (async () => {
+      const [{ initAnalytics }, { initRemoteConfig }] = await Promise.all([
+        import("./bootstrap/analytics"),
+        import("./bootstrap/remote-config"),
+      ]);
+      await Promise.all([initAnalytics(), initRemoteConfig()]);
+      setReady(true);
+    })();
+  }, []);
+
+  return <View>{/* a cheap splash-equivalent here */}</View>;
+}
+```
+
+Hermes handles `await import()` cleanly. In one of my wallpaper apps cold start dropped from 2.4 s to 1.3 s after deferring just two startup modules, and the 0x8badf00d rate on iPhone 8 went from 0.7% to 0.04%.
+
+## Reproducing TestFlight-Only Crashes Locally
+
+Watchdog enforcement gets stricter when the device is cold, low on battery, and on a bad network. To make a stubborn 0x8badf00d show up on your bench:
+
+1. Drain a real iPhone below 20% before testing
+2. Enable "Settings → Developer → Network Link Conditioner → Very Bad Network"
+3. Fully terminate the app (background is not enough) and tap the icon
+
+That sequence reproduces the iPhone 8 crash about three times out of five for me. Firebase Test Lab on a physical iPhone 8 works too, but it costs more, so I do the local trick first.
+
+## A Pre-release Checklist to Keep 0x8badf00d Out
+
+Instruments → App Launch is the only honest measurement, and I run it on every release branch in Apps/iOS Apps. The three gates I enforce are:
+
+- App Launch (Pre-main + Time to first frame) under 1.8 s on a recent iPhone and under 3.5 s on SE second generation
+- No new `await` or synchronous file reads added inside `didFinishLaunching`
+- No new heavyweight SDK appearing in `package.json` on the launch path; if it must, it has to be lazy-loaded
+
+In Crashlytics I split `EXC_CRASH (SIGKILL) 0x8badf00d` into its own velocity alert. If the rate per release ever crosses 0.05% I halt the phased rollout before it can hurt retention.
+
+## What to Do Next
+
+If a recent release is showing 0x8badf00d in Crashlytics, open AppDelegate, pick one SDK init that is currently synchronous, and move it inside a `dispatch_async(dispatch_get_main_queue(), …)` block. Even moving a single one buys back noticeable headroom on older devices. Then look at `App.tsx`, pick the heaviest top-level import, and convert it to `await import()` inside `useEffect`. Those two edits, in that order, take the watchdog kill from a release-blocker to a non-issue in most Rork projects I have shipped.
+
+Thank you for reading. I hope this helps the next person who sees that hex string in a crash log.
