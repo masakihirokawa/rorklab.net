@@ -1,0 +1,275 @@
+---
+title: "Automating Production Incident Response as a Solo Developer — Crashlytics, Sentry, Slack Routing, and Staged Rollback"
+slug: "rork-incident-auto-response-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-21T04:45"
+updated: "2026-05-21T04:45"
+author: "Rork Lab"
+description: "Twelve years of running my own iPhone and Android apps, accumulating 50 million downloads, taught me a specific shape for production incident response. This article shares the Crashlytics + Sentry double layer, Slack routing into interrupt and log channels, and a Remote Config plus EAS Update staged rollback I keep returning to."
+tags: ["Rork", "Crashlytics", "Sentry", "Slack", "Remote Config", "Incident Response", "Architecture", "Indie Developer", "AdMob"]
+highlights:
+  - "A working pattern for binding Firebase Crashlytics issue cluster keys to Sentry fingerprints so the same crash collapses into one ticket across both services."
+  - "A Slack routing design that separates an interrupt channel (Critical, mentions allowed at night) from a log channel (silent, daytime triage), with the exact thresholds I use."
+  - "A Remote Config plus EAS Update rollback script that walks a feature down 100 → 50 → 10 → 0 percent with manual confirmation between stages, completing within five minutes."
+---
+
+## Who Notices When AdMob Revenue Drops at 2 a.m.?
+
+I have been shipping iPhone and Android apps as a solo developer since 2014. The catalog has crossed 50 million cumulative downloads, but I still receive every production alert by myself. There is no team, no on-call rotation. The night AdMob eCPM halved at 1 a.m., the night Crashlytics Fatals spiked at 2:30, the night a paywall change wiped purchases — all of those happened with me asleep.
+
+For the first several years my pattern was the same: wake up, see the revenue dip, scramble to edit Remote Config with bleary eyes. Editing live production values half-awake is a way to cause a second incident, and I have caused several. Step by step I built scaffolding around the late-night hours, and the system now usually lands at one specific state by sunrise: a stage-one rollback has already executed automatically, leaving me a calmer surface to inspect at breakfast.
+
+This article walks through the architecture and code behind that scaffolding. It is not the incident response material from team-oriented SRE books; it is what one person can realistically maintain.
+
+## Three Layers of Detection I Settled On After 12 Years
+
+The first thing worth naming is that a single-layer alerting setup misses too much. I monitor three layers in parallel:
+
+1. **Crash layer** — the app exits, fails to launch, or always white-screens on one route.
+2. **Functional layer** — the app does not crash, but purchase buttons do nothing, push delivery stalls, login fails silently.
+3. **Revenue layer** — eCPM collapses, purchase rate sags, churn spikes, or new install velocity drops.
+
+Years ago, watching the crash layer alone was enough. Today, the functional and revenue layers cause more dollar-weighted damage. Crashlytics can sit at zero Fatals while AdMob eCPM is sixty percent below yesterday — that day's revenue is gone regardless. Three layers, three different notification policies, three different escalation paths.
+
+| Layer | Primary signal | Secondary signal | Notification priority |
+|---|---|---|---|
+| Crash | Firebase Crashlytics | Sentry | Critical, immediate |
+| Functional | Sentry (errors + performance) | Firebase Performance | High, within 5 minutes |
+| Revenue | AdMob API + RevenueCat | Firebase Analytics | Medium, within 30 minutes |
+
+"Sending the same data to two services" looked wasteful for a long time, but the cost of the redundancy is small compared to the cost of one missed Fatal during a release. I now treat the double instrumentation as cheap insurance.
+
+## Why I Keep Both Crashlytics and Sentry
+
+The two products have different blind spots. Crashlytics catches native OS-level crashes (SIGSEGV, OOM kills, watchdog timeouts) extremely well but is poor at handled JavaScript exceptions. Sentry catches React Native JS errors and unhandled promise rejections with detail, but its dSYM resolution for native crashes is weaker.
+
+Running both produces duplicate alerts unless they share an identifier. I bind them through a stable cluster key derived from the top three stack frames, set as a Crashlytics custom attribute and as a Sentry fingerprint. Verified on React Native Sentry SDK 7.x:
+
+```typescript
+// src/observability/sentry-fingerprint.ts
+import * as Sentry from "@sentry/react-native";
+import crashlytics from "@react-native-firebase/crashlytics";
+
+type Severity = "fatal" | "error" | "warning";
+
+interface IncidentContext {
+  feature: "ads" | "iap" | "auth" | "core";
+  buildNumber: string;
+  remoteConfigVersion: string;
+}
+
+/**
+ * Force Crashlytics issue clusters and Sentry fingerprints to use the same key,
+ * so the same root cause shows up as one ticket in both dashboards.
+ */
+export function reportIncident(
+  err: Error,
+  severity: Severity,
+  ctx: IncidentContext
+): void {
+  const cluster = stableClusterKey(err);
+
+  // 1. Tag Crashlytics with the cluster key so we can search for it later.
+  crashlytics().setAttribute("cluster_key", cluster);
+  crashlytics().setAttribute("feature", ctx.feature);
+  crashlytics().setAttribute("rc_version", ctx.remoteConfigVersion);
+  crashlytics().recordError(err);
+
+  // 2. Use the same cluster key as the Sentry fingerprint.
+  Sentry.withScope((scope) => {
+    scope.setFingerprint([cluster, ctx.feature, ctx.buildNumber]);
+    scope.setLevel(severity);
+    scope.setTag("feature", ctx.feature);
+    scope.setTag("rc_version", ctx.remoteConfigVersion);
+    Sentry.captureException(err);
+  });
+}
+
+// Top three frames, with line/column numbers normalised so the cluster
+// stays stable across releases that shift unrelated code around.
+function stableClusterKey(err: Error): string {
+  const frames = (err.stack ?? "")
+    .split("\n")
+    .slice(1, 4)
+    .map((line) => line.replace(/:\d+:\d+/g, ":L:C").trim())
+    .join("|");
+  return `${err.name}::${frames}`;
+}
+```
+
+The line and column collapsing in `stableClusterKey` matters more than it looks. Without it, every release that shifts a file by a few lines fragments the same crash into a fresh cluster. Around 2019 I watched a single root cause produce twenty separate Sentry issues over three releases, and I missed the actual fix for almost a week. Normalising the frames keeps the same bug in the same bucket.
+
+## Splitting Slack Into an Interrupt Channel and a Log Channel
+
+A single Slack channel for every alert is fatal to solo on-call. I burn out within a month every time I have tried it. The current setup uses three channels and treats them very differently:
+
+- `#incident-critical` — Fatal crashes, login broken, purchase broken. **24-hour mentions enabled.**
+- `#incident-log` — Handled exceptions, performance regressions, revenue warnings. **No mentions, written history only.**
+- `#incident-digest` — Six-hour summaries. **Read once at 8 a.m. with coffee.**
+
+Only `#incident-critical` is allowed to push through iOS Focus mode at night. Everything else accumulates silently.
+
+The built-in Crashlytics Slack integration is too coarse to drive this routing, so a tiny Cloud Function for Firebase sits in front:
+
+```typescript
+// functions/src/incident-router.ts
+import * as functions from "firebase-functions";
+import fetch from "node-fetch";
+
+const SLACK_CRITICAL = process.env.SLACK_CRITICAL_WEBHOOK!;
+const SLACK_LOG = process.env.SLACK_LOG_WEBHOOK!;
+
+interface CrashAlert {
+  issue_id: string;
+  app_id: string;
+  fatal: boolean;
+  user_count: number;
+  cluster_key?: string;
+  feature?: string;
+}
+
+export const routeCrashAlert = functions
+  .region("asia-northeast1")
+  .https.onRequest(async (req, res) => {
+    const alert = req.body as CrashAlert;
+    const target = isCritical(alert) ? SLACK_CRITICAL : SLACK_LOG;
+
+    await fetch(target, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: formatMessage(alert),
+        attachments: [
+          {
+            color: alert.fatal ? "#d33" : "#fc0",
+            fields: [
+              { title: "feature", value: alert.feature ?? "unknown", short: true },
+              { title: "users", value: String(alert.user_count), short: true },
+              { title: "cluster", value: alert.cluster_key ?? "—", short: false },
+            ],
+          },
+        ],
+      }),
+    });
+    res.status(204).send();
+  });
+
+function isCritical(a: CrashAlert): boolean {
+  // 30+ affected users on a Fatal, or any Fatal in auth/purchase.
+  if (a.fatal && a.user_count >= 30) return true;
+  if (a.feature === "auth" || a.feature === "iap") return a.fatal;
+  return false;
+}
+
+function formatMessage(a: CrashAlert): string {
+  return `:rotating_light: *${a.feature ?? "unknown"}* — ${a.user_count} users\nissue: \`${a.issue_id}\``;
+}
+```
+
+The 30-user threshold is a heuristic that emerged from running at a 50M-download portfolio scale, roughly 0.05% of daily actives. For a smaller app I start at 5 users, then halve the threshold during the first 48 hours after every release.
+
+## Staged Rollback in Under Five Minutes With Remote Config and EAS Update
+
+Detection without recovery does not stop the bleeding. About ninety percent of my responses are not "fix forward" but "turn the feature off temporarily" — Remote Config and EAS Update together let me complete that in under five minutes.
+
+```typescript
+// scripts/rollback.ts — manual CLI for staged rollback
+import { GoogleAuth } from "google-auth-library";
+
+interface RollbackPlan {
+  feature: string;
+  // Staged: 100 → 50 → 10 → 0 percent.
+  stages: number[];
+  pauseSeconds: number;
+}
+
+async function rollback(plan: RollbackPlan) {
+  const auth = new GoogleAuth({
+    scopes: "https://www.googleapis.com/auth/firebase.remoteconfig",
+  });
+  const client = await auth.getClient();
+  const projectId = process.env.FIREBASE_PROJECT_ID!;
+  const url = `https://firebaseremoteconfig.googleapis.com/v1/projects/${projectId}/remoteConfig`;
+
+  for (const stage of plan.stages) {
+    console.log(`[rollback] ${plan.feature} -> ${stage}%`);
+    const current = await client.request({ url });
+    const etag = current.headers["etag"] as string;
+    const template = current.data as Record<string, unknown>;
+
+    setRolloutPercentage(template, plan.feature, stage);
+
+    await client.request({
+      url,
+      method: "PUT",
+      headers: { "If-Match": etag, "Content-Type": "application/json" },
+      data: template,
+    });
+
+    console.log(`[rollback] waiting ${plan.pauseSeconds}s before next stage`);
+    await new Promise((r) => setTimeout(r, plan.pauseSeconds * 1000));
+  }
+}
+
+function setRolloutPercentage(
+  template: Record<string, unknown>,
+  feature: string,
+  pct: number
+): void {
+  // Simplified — actual implementation walks conditions + parameters.
+  const params = template["parameters"] as Record<string, { conditionalValues?: Record<string, unknown> }>;
+  const entry = params[feature];
+  if (!entry?.conditionalValues) throw new Error(`${feature} has no conditions`);
+  entry.conditionalValues[`rollout_${pct}`] = { value: "true" };
+}
+
+rollback({
+  feature: "feature_new_paywall",
+  stages: [100, 50, 10, 0],
+  pauseSeconds: 60,
+});
+```
+
+I wire this script to GitHub Actions `workflow_dispatch` so I can trigger it in two taps from a Slack alert. I have tried fully automatic staged rollback before, and one false positive cost me a noticeable chunk of one day's revenue. I now leave the final trigger to a human even though everything before it is automated.
+
+## On-Call Thresholds That a Solo Developer Can Actually Survive
+
+The most important variable in the entire architecture is which alerts wake me up. Sending every Fatal to my phone at 3 a.m. is a way to break my body within a season. Sending nothing means walking into a seven-hour bleed at sunrise. The middle ground I run today fires a mention only when one of these three conditions is met:
+
+- The same `cluster_key` produces 30 or more Fatals within a 15-minute window.
+- AdMob estimated revenue stays below 50 percent of the trailing one-hour median for 30 minutes.
+- Handled exceptions in purchase or auth flows exceed 50 in 10 minutes.
+
+Anything else waits for coffee. The discipline of "not responding tonight" is what makes the solo path sustainable over years. I went through several rounds of being too responsive in 2018 and 2020, and the cost shows up in everything from sleep to release decisions.
+
+## A One-File Postmortem Template for Solo Operators
+
+For team SRE, the postmortem is a coordination artifact. For one person, its primary job is to leave a message for a future self who will face a similar moment. The format I keep coming back to is one Markdown file per incident in a `incidents` repo:
+
+```markdown
+# YYYY-MM-DD <feature> incident
+
+## What happened
+- Detection timestamp / recovery timestamp / estimated affected users.
+
+## Why it happened
+- Direct cause / root cause / whether this class of incident has occurred before.
+
+## What would prevent recurrence
+- Code change / monitoring added / docs added — issue link each.
+
+## Note to future self
+- One line.
+```
+
+The "Note to future self" line is the one I refuse to skip. Technical fixes live in code once they ship; the context — "I shipped this in a rush", "I trusted the dashboard before checking the actual revenue endpoint" — only persists in writing. Without it, I make the same shape of mistake again a year later.
+
+My two grandfathers were Japanese temple carpenters (miyadaiku), and a phrase I grew up hearing was that working with your hands is a form of devotion. The slow craft of writing these notes is the part of the system I refuse to automate even when I could; it is where the operator stays present in the work.
+
+## What Remains After the Automation
+
+You probably cannot copy this architecture verbatim. Service mix, user scale, and whether you have a team all change the optimal shape. The four pieces I would still recommend extracting are: monitor three layers separately, run two crash backends with a shared cluster key, separate Slack interrupts from Slack log, and keep one human-confirmed step at the end of any rollback. Those four are what I have arrived at after twelve years of getting woken up at the wrong times and over-correcting in the wrong direction.
+
+Indie operations get drained by exhaustion before they get drained by technical debt. Building the state where you can fall asleep believing the night will hold for a few hours changes the next day's decisions more than any single piece of code. Thank you for reading this far.

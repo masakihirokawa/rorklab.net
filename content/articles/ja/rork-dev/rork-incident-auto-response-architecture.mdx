@@ -1,0 +1,277 @@
+---
+title: "個人開発で『本番障害の自動応答』を仕組み化する ― Crashlytics・Sentry・Slack 通知・段階的ロールバックの設計"
+slug: "rork-incident-auto-response-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-21T04:45"
+updated: "2026-05-21T04:45"
+author: "Rork Lab"
+description: "個人開発で 12 年・累計 5,000 万 DL を運用してきた中で組み上げた、本番障害の自動応答アーキテクチャをまとめます。Crashlytics と Sentry の二段重ね、Slack 通知の階層化、Remote Config による段階的ロールバックの実装例を共有します。"
+tags: ["Rork", "Crashlytics", "Sentry", "Slack", "Remote Config", "インシデント対応", "アーキテクチャ", "個人開発", "AdMob"]
+highlights:
+  - "Firebase Crashlytics の Issue cluster_id を Sentry の Fingerprint に紐付けて、同一障害をひとつのチケットに統合する実装パターン"
+  - "Slack を『割り込み層（深夜は #incident-critical だけ）』と『記録層（日中の #incident-log）』に分ける on-call routing 設定の具体例"
+  - "Remote Config と EAS Update を組み合わせ、5 分以内に AdMob プレースメントと Feature Flag を段階的にロールバックする自動化スクリプト"
+---
+
+## 深夜 2 時に AdMob 収益が落ちたとき、誰が気づくのか
+
+2014 年から個人で iPhone / Android アプリを運用してきて、累計 5,000 万ダウンロードに到達した今でも、本番障害の最初の通知に気づくのは私ひとりです。チームも、夜勤の運用要員もいません。それでも AdMob の eCPM が深夜に半減した日、Crashlytics の Fatal が午前 2 時に跳ね上がった日、何度もありました。
+
+最初の数年は、朝起きてから初めて売上の落ち込みに気づいて、慌てて Remote Config を書き換える、という対応の繰り返しでした。寝起きの頭で本番の値を変えるのは怖い作業で、二次障害も何度か出しています。そこから少しずつ仕組みを足し、今では「深夜に発生した障害が、起床時には自動で 1 段階ロールバック済み」という状態を維持しています。
+
+本記事は、その仕組みの設計と実装を共有するものです。チーム開発前提のインシデント本に書かれている内容ではなく、ひとりで動かしている人が現実的に組める範囲のアーキテクチャに絞っています。
+
+## 個人開発 12 年で見えた『障害検知の三層構造』
+
+最初に整理したいのは、個人で運用するアプリで監視すべき層は 3 つあるという点です。
+
+1. **クラッシュ層** ― アプリが落ちる、起動できない、特定画面で必ず白画面になる
+2. **機能層** ― クラッシュはしないが、課金ボタンが効かない、通知が来ない、ログインできない
+3. **収益層** ― eCPM の急落、購入レート低下、解約率の急増、新規 DL の急減
+
+クラッシュ層だけ見ていれば充分だった時代もありましたが、今は機能層と収益層の方が事業へのダメージが大きい状況が増えています。Crashlytics の Fatal が 0 件でも、AdMob の eCPM が前日比 60% まで落ちていたら、その日の収益は半分になります。3 層を別系統で見て、それぞれに別の通知ポリシーを当てるのが基本方針です。
+
+私の場合、3 層の責任分担はこう決めています。
+
+| 層 | 一次データソース | 二次データソース | 通知優先度 |
+|---|---|---|---|
+| クラッシュ層 | Firebase Crashlytics | Sentry | Critical（即時） |
+| 機能層 | Sentry（Performance + Error） | Firebase Performance | High（5 分以内） |
+| 収益層 | AdMob API + RevenueCat | Firebase Analytics | Medium（30 分以内） |
+
+「同じデータをふたつのサービスに送るのは無駄では？」と思っていた時期もありましたが、後述の二段重ね設計で、運用コストよりも誤検知の見落としを減らす効果の方が大きいと判断しています。
+
+## Firebase Crashlytics × Sentry を二段重ねにする理由
+
+クラッシュ層の検知に Crashlytics と Sentry の両方を使っているのは、それぞれが見落とすケースが違うからです。Crashlytics は OS 由来のクラッシュ（SIGSEGV、メモリ不足、watchdog timeout など）に強い反面、JavaScript レイヤの handled exception を取りこぼします。逆に Sentry は React Native の JS エラーや非同期処理の rejected promise を細かく拾いますが、ネイティブクラッシュの dSYM 解決は弱めです。
+
+両方使うと重複アラートが鬱陶しいので、Sentry 側で Crashlytics の Issue を `fingerprint` 経由で同一視させる実装にしています。React Native の Sentry SDK 7 系で動作確認済みのコードを共有します。
+
+```typescript
+// src/observability/sentry-fingerprint.ts
+import * as Sentry from "@sentry/react-native";
+import crashlytics from "@react-native-firebase/crashlytics";
+
+type Severity = "fatal" | "error" | "warning";
+
+interface IncidentContext {
+  feature: "ads" | "iap" | "auth" | "core";
+  buildNumber: string;
+  remoteConfigVersion: string;
+}
+
+/**
+ * Crashlytics 側の Issue cluster と Sentry の Fingerprint を揃える。
+ * 同じ stack を持つ障害は、両サービスでひとつのチケットに収束する。
+ */
+export function reportIncident(
+  err: Error,
+  severity: Severity,
+  ctx: IncidentContext
+): void {
+  const cluster = stableClusterKey(err);
+
+  // 1. Crashlytics に Custom Key を付与（後で Issue Search で引ける）
+  crashlytics().setAttribute("cluster_key", cluster);
+  crashlytics().setAttribute("feature", ctx.feature);
+  crashlytics().setAttribute("rc_version", ctx.remoteConfigVersion);
+  crashlytics().recordError(err);
+
+  // 2. Sentry には fingerprint として cluster_key を渡す
+  Sentry.withScope((scope) => {
+    scope.setFingerprint([cluster, ctx.feature, ctx.buildNumber]);
+    scope.setLevel(severity);
+    scope.setTag("feature", ctx.feature);
+    scope.setTag("rc_version", ctx.remoteConfigVersion);
+    Sentry.captureException(err);
+  });
+}
+
+// stack trace の上位 3 フレームのみで cluster key を作る。
+// インライン関数名・ライン番号の揺れを丸めて、同一原因の障害を統合する。
+function stableClusterKey(err: Error): string {
+  const frames = (err.stack ?? "")
+    .split("\n")
+    .slice(1, 4)
+    .map((line) => line.replace(/:\d+:\d+/g, ":L:C").trim())
+    .join("|");
+  return `${err.name}::${frames}`;
+}
+```
+
+`stableClusterKey` の中で行番号を `:L:C` に潰しているのが小さなポイントです。リリースごとに行番号がずれるとクラスタリングが崩れ、本来同じ障害なのに別 Issue として 10 件・20 件と積み上がります。これは Sentry も Crashlytics も同じ問題を抱えていて、私自身、2019 年頃に Issue ダッシュボードが同種の障害で埋め尽くされて辛い思いをしました。
+
+## Slack 通知を『割り込み層』と『記録層』に分ける
+
+通知を一本のチャンネルに流すと、個人開発では確実に通知疲れで麻痺します。私は以下の 3 チャンネルに分けて、深夜帯と日中で挙動を変えています。
+
+- `#incident-critical` ― クラッシュ層の Fatal、ログイン不能、課金不能。**24 時間 mention あり**
+- `#incident-log` ― handled exception、Performance 低下、収益層の警告。**mention なし・記録のみ**
+- `#incident-digest` ― 6 時間ごとの集計サマリ。**朝 8 時に必ず読む**
+
+`#incident-critical` だけが「割り込み層」で、Slack の通知設定で iPhone の Focus モードを突破させています。それ以外は黙って積もる「記録層」として扱います。
+
+Firebase Crashlytics → Slack の標準連携は粒度が荒すぎるので、Cloud Functions for Firebase でルーティングを挟むのが結局いちばん安定でした。簡略化したサンプルです。
+
+```typescript
+// functions/src/incident-router.ts
+import * as functions from "firebase-functions";
+import fetch from "node-fetch";
+
+const SLACK_CRITICAL = process.env.SLACK_CRITICAL_WEBHOOK!;
+const SLACK_LOG = process.env.SLACK_LOG_WEBHOOK!;
+
+interface CrashAlert {
+  issue_id: string;
+  app_id: string;
+  fatal: boolean;
+  user_count: number;
+  cluster_key?: string;
+  feature?: string;
+}
+
+export const routeCrashAlert = functions
+  .region("asia-northeast1")
+  .https.onRequest(async (req, res) => {
+    const alert = req.body as CrashAlert;
+    const target = isCritical(alert) ? SLACK_CRITICAL : SLACK_LOG;
+
+    await fetch(target, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: formatMessage(alert),
+        attachments: [
+          {
+            color: alert.fatal ? "#d33" : "#fc0",
+            fields: [
+              { title: "feature", value: alert.feature ?? "unknown", short: true },
+              { title: "users", value: String(alert.user_count), short: true },
+              { title: "cluster", value: alert.cluster_key ?? "—", short: false },
+            ],
+          },
+        ],
+      }),
+    });
+    res.status(204).send();
+  });
+
+function isCritical(a: CrashAlert): boolean {
+  // 30 ユーザー以上に影響している Fatal、または認証/課金機能のクラッシュ
+  if (a.fatal && a.user_count >= 30) return true;
+  if (a.feature === "auth" || a.feature === "iap") return a.fatal;
+  return false;
+}
+
+function formatMessage(a: CrashAlert): string {
+  return `:rotating_light: *${a.feature ?? "unknown"}* — ${a.user_count} users\nissue: \`${a.issue_id}\``;
+}
+```
+
+しきい値は 30 ユーザーに設定しています。これは累計 5,000 万 DL の規模で、日次アクティブの 0.05% 程度を境にする経験則からです。アプリ規模が小さいうちは 5 ユーザーから始めて、新規リリース後 48 時間は半分に下げる運用にしています。
+
+## Remote Config × EAS Update で 5 分以内に段階的ロールバック
+
+検知ができても、復旧が遅ければ事業へのダメージは止まりません。私の場合、対応の 90% は「直す」ではなく「機能を一時的に切る」で、これは Remote Config と EAS Update を組み合わせると 5 分以内に完了します。
+
+```typescript
+// scripts/rollback.ts ― ローカル CLI から実行する自動ロールバック
+import { GoogleAuth } from "google-auth-library";
+
+interface RollbackPlan {
+  feature: string;
+  // 段階的に下げる: 100 → 50 → 10 → 0
+  stages: number[];
+  pauseSeconds: number;
+}
+
+async function rollback(plan: RollbackPlan) {
+  const auth = new GoogleAuth({
+    scopes: "https://www.googleapis.com/auth/firebase.remoteconfig",
+  });
+  const client = await auth.getClient();
+  const projectId = process.env.FIREBASE_PROJECT_ID!;
+  const url = `https://firebaseremoteconfig.googleapis.com/v1/projects/${projectId}/remoteConfig`;
+
+  for (const stage of plan.stages) {
+    console.log(`[rollback] ${plan.feature} -> ${stage}%`);
+    const current = await client.request({ url });
+    const etag = current.headers["etag"] as string;
+    const template = current.data as Record<string, unknown>;
+
+    setRolloutPercentage(template, plan.feature, stage);
+
+    await client.request({
+      url,
+      method: "PUT",
+      headers: { "If-Match": etag, "Content-Type": "application/json" },
+      data: template,
+    });
+
+    console.log(`[rollback] waiting ${plan.pauseSeconds}s before next stage`);
+    await new Promise((r) => setTimeout(r, plan.pauseSeconds * 1000));
+  }
+}
+
+function setRolloutPercentage(
+  template: Record<string, unknown>,
+  feature: string,
+  pct: number
+): void {
+  // 簡略化 — 実際は conditions と parameter の組み合わせを書き換える
+  const params = template["parameters"] as Record<string, { conditionalValues?: Record<string, unknown> }>;
+  const entry = params[feature];
+  if (!entry?.conditionalValues) throw new Error(`${feature} has no conditions`);
+  entry.conditionalValues[`rollout_${pct}`] = { value: "true" };
+}
+
+rollback({
+  feature: "feature_new_paywall",
+  stages: [100, 50, 10, 0],
+  pauseSeconds: 60,
+});
+```
+
+このスクリプトを GitHub Actions の `workflow_dispatch` で起動できるようにしておくと、Slack 通知から 2 タップで起動できます。手動コマンドより 1 段階だけ自動化を足したこの形が、私の運用では最も安定しました。完全自動の段階ロールバックも試しましたが、誤検知 1 回で売上が落ちた経験があり、最後の発射ボタンだけは人間が押す設計に戻しています。
+
+## 個人開発者が無理せず on-call できる『就寝中アラート』のしきい値
+
+仕組みの中で最も重要なのは、寝てる時間に何をアラートとして受け取るかです。すべての Fatal を深夜に通知すると、まず体が壊れます。一方、何も通知しないと、朝起きたときに 7 時間分の失血を見ることになります。私はこの中間点を、以下の 3 条件のいずれかが揃ったときだけ深夜 mention する、という設定で運用しています。
+
+- 同一 cluster_key の Fatal が 15 分以内に 30 件以上発生
+- AdMob 推定収益が直近 1 時間の中央値の 50% を下回る状態が 30 分継続
+- 課金または認証の handled exception が 10 分で 50 件以上
+
+逆に言えば、これ以外の障害は「明日の朝、コーヒーを淹れてから対応する」と決めています。個人で長く続けるための割り切りで、ここで遠慮するとアプリ事業は数年で続かなくなるというのが、12 年運用してきた私の実感です。
+
+## 本番障害の事後レビューを 1 ファイルで回す『Solo Postmortem』
+
+事後レビューは「忘れないために書く」が個人の場合は最大の目的になります。チームでやるような責任分担の確認は不要で、未来の自分にメッセージを残すために書きます。私は GitHub の incidents リポジトリに、以下のテンプレで `YYYY-MM-DD-<feature>.md` を 1 件 1 ファイル作るだけにしています。
+
+```markdown
+# YYYY-MM-DD <feature> incident
+
+## 何が起きたか
+- 検知時刻 / 復旧時刻 / 影響ユーザー数の見積もり
+
+## なぜ起きたか
+- 直接原因 / 根本原因 / 同種の障害を過去に出していたか
+
+## 何を変えれば二度と起きないか
+- コード変更 / 監視追加 / ドキュメント追加 — 各々 issue リンク
+
+## このインシデントから学んだこと（未来の自分宛て）
+- 1 行
+```
+
+最後の「未来の自分宛て」だけは必ず書きます。技術的な再発防止はコードに反映すれば残りますが、「あのとき本番反映を急ぎすぎた」「リリース直前に焦った」という文脈は文章にしておかないと、また同じ判断をしてしまうからです。
+
+宮大工だった両祖父が「手を動かすことが信心」と言っていた感覚に、最近この作業は近いと感じます。仕組みで自動化できる部分はすべて自動化したうえで、それでも手で書く事後レビューに、運用者として向き合う時間が確かに残ります。
+
+## 仕組みのあとに残るもの
+
+ここまで紹介したアーキテクチャは、誰かのプロジェクトにそのまま貼り付けても動かないかもしれません。サービスの種類、ユーザー規模、チームの有無で最適な構成は変わります。それでも、3 層構造で見ること・二段重ねで誤検知を吸収すること・割り込み層と記録層を分けること・最後の発射ボタンは人間が押すこと、この 4 つは私自身が 12 年で繰り返し痛い目を見て辿り着いた判断で、骨格としては再利用しやすいと思っています。
+
+個人開発の運用は、技術より体力で削れていきがちです。寝る前に「今夜は何が起きてもひと晩は持つ」と思える状態を作れると、翌日の判断もずいぶん変わります。お読みいただきありがとうございました。
