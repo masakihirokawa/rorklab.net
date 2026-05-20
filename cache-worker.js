@@ -10,7 +10,7 @@
 import nextHandler from "./.open-next/worker";
 
 // ── Config ──────────────────────────────────────────────────────
-const DEPLOY_VERSION = "2026-05-18-robotstxt-fix";
+const DEPLOY_VERSION = "2026-05-20-immutable-static";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 // ── __name polyfill (Turbopack / esbuild compat) ────────────────
@@ -89,6 +89,12 @@ export default {
     if (shouldSkipCache(url, request)) {
       const resp = await nextHandler.fetch(request, env, ctx);
       const ct = resp.headers.get("content-type") || "";
+      // /_next/static/* assets have content-hashed filenames — safe to cache for 1 year (immutable)
+      if (url.pathname.startsWith("/_next/static/") && resp.status === 200) {
+        const h = new Headers(resp.headers);
+        h.set("Cache-Control", "public, max-age=31536000, immutable");
+        return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: h });
+      }
       return ct.includes("text/html") ? injectPolyfill(resp) : resp;
     }
 
