@@ -1,0 +1,218 @@
+---
+title: "Putting AdMob Bidding into Production for a Rork App — Five Networks Bidding in Parallel, eCPM Trends, and Daily Operations"
+slug: "rork-admob-bidding-five-network-production-implementation"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-05-21T08:10"
+author: "Rork Lab"
+description: "I moved the AdMob mediation layer of my Rork-generated apps from waterfall to bidding, with five ad networks bidding in parallel. Here are my real-world numbers after three weeks of production, the SDK pitfalls, and how I delegate daily monitoring to Claude in Chrome."
+tags: ["AdMob", "Bidding", "Mediation", "Rork", "eCPM", "Indie Development"]
+highlights:
+  - "Concrete SDK integration steps for AdMob Bidding alongside an existing waterfall setup, with the gotchas I hit on iOS and Android"
+  - "Three weeks of measured eCPM, fill rate, and latency numbers across five networks (AppLovin / Meta Audience Network / Unity Ads / Pangle / Liftoff)"
+  - "How I delegate the morning dashboard rounds to Claude in Chrome, including the prompt structure and the alert rules I rely on"
+---
+
+The morning I opened the AdMob dashboard and saw the bidding acceptance rate sitting near 100% across the day, I finally felt that the migration work was behind me. The Rork-generated apps I run had been moving from waterfall mediation to bidding for the past three weeks, and that day was the first one where the numbers looked stable.
+
+I have been shipping mobile apps as an indie developer since 2014. Among everything that has shifted around AdMob, the move from waterfall (call networks in sequence) to bidding (have them bid in parallel) is one of the most meaningful changes for solo operators. On the surface it looks like a single checkbox in the AdMob console, but actually running it in production with several networks side by side took quite a bit of tuning across SDK setup, console configuration, and daily monitoring.
+
+In this post I'm sharing the implementation notes from migrating six wallpaper apps to bidding in parallel. The combined catalog has crossed 50 million downloads over the years, so the numbers below reflect real production traffic, not test environments. I'll cover the integration code I changed on top of the Rork-generated baseline, the three pitfalls that cost me the most time, the eCPM and fill rate shifts I measured against the prior waterfall configuration, and the daily monitoring loop I now run through Claude in Chrome.
+
+## Why I Moved off Waterfall — The Ceiling I Could Feel but Not Measure
+
+With waterfall, AdMob queries networks in order of their declared eCPM floor. If I set AppLovin's floor at $2.00 and Unity Ads at $1.50, requests go to AppLovin first and fall through to Unity Ads only when AppLovin doesn't fill. It is a clean mental model, but in my apps it had two limits I kept bumping into.
+
+The first one was that **floor values are static, which means they cannot absorb variability across currency, hour of day, and audience composition**. AppLovin tends to dominate during Japanese hours; Meta Audience Network shows up stronger during overseas hours. Watching the dashboards I could see the patterns, but adjusting floor values by hand to chase them is not realistic when you have six apps to maintain.
+
+The second one was that **unfilled-impression opportunity cost is hard to see**. In the waterfall logs you can see "AppLovin didn't fill, so the request went to network 2," but you can't see "if all five networks had bid in parallel, what eCPM would the auction have produced?" Bidding shows you that number every time, because the auction actually happens.
+
+In a bidding setup, AdMob sends a parallel bid request to all participating networks and instantly picks the highest bid that arrives inside the time window. The mechanism removes both limits above. Google has been steering publishers toward bidding in their docs as well, and the case for it is especially strong when you have multiple SDKs co-resident in the same app.
+
+The final shape I landed on is a hybrid: one or two networks stay on the waterfall (because their adapter doesn't support bidding yet), and the five networks that do support bidding compete in parallel.
+
+## Separating the Code You Leave Alone from the Code You Touch
+
+A Rork-generated app comes with a reasonable AdMob initialization scaffold. In my wallpaper apps I keep that initialization centralized in `App.tsx`, and I let all the mediation SDKs load as AdMob adapters rather than as direct SDKs. This keeps the code footprint small and matches what bidding wants.
+
+I use Google's official `react-native-google-mobile-ads` package rather than the older Firebase wrapper. Bidding has strict requirements around SDK and adapter versions — get them wrong, and bidding will appear to be enabled in the console but never actually fill an impression.
+
+```bash
+# package.json dependencies
+"react-native-google-mobile-ads": "^14.7.0",
+"@react-native-async-storage/async-storage": "^1.23.1",
+```
+
+Adapters are picked up through EAS Build natively. In `app.json` I declare them like this:
+
+```json
+{
+  "plugins": [
+    [
+      "react-native-google-mobile-ads",
+      {
+        "androidAppId": "ca-app-pub-XXXXXXXXXXXXXXXX~XXXXXXXXXX",
+        "iosAppId": "ca-app-pub-XXXXXXXXXXXXXXXX~XXXXXXXXXX",
+        "userTrackingUsageDescription": "Used to measure ad performance for the apps you enjoy.",
+        "skAdNetworkItems": [
+          "cstr6suwn9.skadnetwork",
+          "4fzdc2evr5.skadnetwork",
+          "ydx93a7ass.skadnetwork"
+        ]
+      }
+    ]
+  ]
+}
+```
+
+Every network publishes the SKAdNetwork IDs it needs declared in `Info.plist`. AppLovin, Unity Ads, Pangle, Liftoff, and Meta Audience Network each have their own list, and I learned to enumerate all of them in `skAdNetworkItems`. Miss one, and on iOS you can see impressions in the console but the attribution silently breaks, which means the eCPM reports do not reflect actual revenue several days later.
+
+The Rork-generated code itself I leave essentially intact. The three additions I make are: an initialization hook, environment-variable-based ad unit IDs, and an adjustment to where the App Tracking Transparency (ATT) prompt sits in the launch sequence.
+
+```tsx
+// hooks/useAdMobInit.ts
+import { useEffect } from "react";
+import { Platform } from "react-native";
+import mobileAds, { MaxAdContentRating } from "react-native-google-mobile-ads";
+import { request, PERMISSIONS, RESULTS } from "react-native-permissions";
+
+export const useAdMobInit = () => {
+  useEffect(() => {
+    const init = async () => {
+      if (Platform.OS === "ios") {
+        // Resolve ATT before initializing AdMob
+        await request(PERMISSIONS.IOS.APP_TRACKING_TRANSPARENCY);
+      }
+      await mobileAds()
+        .setRequestConfiguration({
+          maxAdContentRating: MaxAdContentRating.PG,
+          tagForChildDirectedTreatment: false,
+          tagForUnderAgeOfConsent: false,
+        })
+        .then(() => mobileAds().initialize());
+    };
+    void init();
+  }, []);
+};
+```
+
+The detail that matters is resolving the ATT dialog **before** AdMob initializes. Reversing the order causes personalized ads to drop off on iOS 14.5+ devices and, in my measurements, takes 20–25% off the bidding eCPM. The same principle applied under waterfall, but the impact is larger now that bidding amplifies competition for ATT-authorized impressions.
+
+## Configuring Bidding in the AdMob Console — The Pitfalls That Cost Me Days
+
+This is where most of the practical learning happened. Below are the three pitfalls that absorbed the most time during my migration.
+
+### Pitfall 1: Enabling Bidding in AdMob Is Not Enough
+
+In the AdMob console you create a new Mediation Group, pick the bidding-capable networks, and save. The screen confirms "Bidding enabled." But until you complete the mapping inside each network's own management console — minting a bidding-specific ID and pasting it back into AdMob — no actual bid requests reach those networks.
+
+I lost two days on AppLovin, three days on Meta Audience Network, and a day on Pangle this way. Each network's flow is slightly different, and each one has a setting that *looks* connected but isn't until you paste the right bidding ID into AdMob.
+
+### Pitfall 2: Adapter Versions Are Strict
+
+Bidding support is gated by adapter major version. AppLovin SDK 11.x is waterfall-only; 12.x is where bidding starts. Each network has its own breakpoint. I grep `Podfile.lock` and `android/app/build.gradle` to confirm versions before flipping bidding on.
+
+Three of my five adapters needed updates as part of the migration. Adapter updates sometimes change how ad unit IDs are passed in at initialization time, so I treated each one as a small refactor rather than a version bump.
+
+```kotlin
+// android/app/src/main/java/.../MainApplication.kt (excerpt)
+override fun onCreate() {
+  super.onCreate()
+  MobileAds.initialize(this) { status ->
+    status.adapterStatusMap.forEach { (adapter, state) ->
+      Log.i("AdMobInit", "$adapter: ${state.initializationState}")
+    }
+  }
+}
+```
+
+If even one adapter is in a state other than `READY`, that network drops out of the auction completely. I now make a habit of checking the Logcat output at startup before shipping any release.
+
+### Pitfall 3: Test Devices Cannot Reproduce Bidding
+
+The AdMob test ad unit IDs never reflect bidding behavior — they always return test creatives. To validate bidding you have to use production ad units, but you cannot let your own developer device serve real impressions in production without risking ad spam.
+
+My workflow is to enroll a handful of beta testers through TestFlight and Google Play Internal Testing, then watch the "Bidding report" section in the AdMob console for each ad unit. When I see "impressions through bidding > 0," I consider the migration successful for that app.
+
+## Three Weeks of Production Numbers — eCPM, Fill Rate, and Latency
+
+Across five wallpaper apps that I migrated in waves over three weeks, the weighted-average comparison against the prior waterfall configuration looks like this. Numbers move app by app, but the direction has been consistent.
+
+| Metric | Waterfall | After bidding | Change |
+| --- | --- | --- | --- |
+| Banner eCPM (Japan) | $0.42 | $0.51 | +21% |
+| Interstitial eCPM (Japan) | $4.20 | $5.45 | +29% |
+| Rewarded eCPM (Japan) | $7.80 | $9.10 | +16% |
+| Banner fill rate | 92.4% | 96.8% | +4.4pt |
+| Interstitial fill rate | 88.6% | 94.1% | +5.5pt |
+| Average ad load latency | 712ms | 540ms | -24% |
+
+The biggest mover was interstitial eCPM. During hours where my Japanese audience is concentrated, interstitial eCPM peaked at +35% above the waterfall baseline. The story behind that number is that Meta Audience Network surprisingly often submits very strong bids in Japan, and under waterfall it was sitting behind AppLovin and rarely getting served. With bidding it competes head-on every impression.
+
+Fill rate improvements sound modest as percentages, but five percentage points of interstitial fill across millions of impressions per month adds up to real money. Latency dropping was the result I least expected. I assumed parallel requests would be slower than sequential ones, but the waterfall path's tail latency was dragged down by "network 1 timed out, try network 2," which the bidding model bounds with a single auction window.
+
+## Delegating the Daily Round to Claude in Chrome
+
+The economics are one story; the daily operations are another. With six apps in production, opening every AdMob console and every network's dashboard every morning is not realistic. AdMob has an API, but the network dashboards each require their own API setup, and standing all of that up myself for a six-app catalog is a full project on its own.
+
+I have been doing my morning round through Claude in Chrome instead. Since 1997, when I first taught myself to code, I have been looking for ways to push manual work onto the next layer of automation. Delegating browser UI navigation to an AI is the latest layer, and for indie developers it feels like a real shift.
+
+The prompt I send each morning looks roughly like this:
+
+```
+# Morning AdMob round
+
+Visit each site in order and report the listed metrics in a single markdown table.
+Add a "Notes" column for anything unusual.
+
+1. AdMob Console (https://apps.admob.com)
+   - Past 24h estimated earnings (per app)
+   - Past 24h eCPM (banner / interstitial / rewarded, per app)
+   - Bidding acceptance rate (Mediation > Optimization > Bidding analysis)
+
+2. AppLovin Dashboard
+   - Past 24h Revenue / Impressions / eCPM (per app)
+   - Delivery error rate (Diagnostics)
+
+3. Meta Audience Network
+   - Past 24h Revenue / Impressions / eCPM
+   - Watch for elevated "no bid" rates
+
+4. Same for Unity Ads / Pangle / Liftoff.
+
+## Alert rules
+- Mark any app with eCPM down >25% day-over-day with "⚠️".
+- Mark any app with fill rate under 80% with "🔻".
+- If delivery error rate exceeds 5%, add a separate root-cause section.
+```
+
+Claude in Chrome opens each site, pulls the tables, and sends me a single consolidated digest. I read the report on my phone while the coffee brews. The state of six apps in production is in my hands before the day starts.
+
+It is not fully autonomous yet. AppLovin sometimes logs me out daily; when that happens, Claude pauses partway through and asks for the 2FA code, which I provide. Even with that small interaction, the time savings versus visiting six dashboards manually are an order of magnitude.
+
+## Rollback Design — What I Always Have Ready Before Flipping the Switch
+
+Bidding has clear upside, but it has one operational constraint: configuration lives per-app in the console, and if something goes wrong for a single app you need a way back. I do not flip an app to bidding without the following three pieces of fallback in place.
+
+1. **Preserve the previous mediation group.** Instead of deleting the waterfall mediation group when I create the bidding one, I keep it and set its status to disabled. If bidding goes sideways, flipping the status back is one click and zero rebuilds.
+2. **Switch ad unit IDs through Firebase Remote Config.** The app carries two sets of ad unit IDs — the bidding ones and the legacy ones — and reads which set to use from Remote Config. This means I can roll back an app without resubmitting to the stores.
+3. **Tag ad-related exceptions in Crashlytics.** Each network's stack traces look different. I attach custom keys to ad-related exceptions so I can filter Crashlytics by network when something starts failing on a specific SDK.
+
+I have actually used the Remote Config switch once during the migration. One app showed unexpected eCPM movement for the first 48 hours and I rolled it back, investigated, fixed an adapter version mismatch, and re-enabled bidding two days later. Without that switch in place I would have been waiting on App Store review to ship a hotfix.
+
+## Should an Indie Developer Move to Bidding?
+
+For solo developers considering the move, here are the three questions I would ask first.
+
+The first is whether **the mediation SDKs you currently use are on the bidding-capable adapter generation**. Networks whose adapters have stopped getting major updates are not migration candidates; leave them in the waterfall residual.
+
+The second is whether **your traffic volume justifies the work**. I would say that around 5,000–10,000 DAU is the threshold where bidding starts paying back the setup time. Below that, the number of bidders per auction is low enough that the eCPM gains tend not to be dramatic, and the operational overhead does not amortize.
+
+The third is whether **you can sustain daily monitoring**. Bidding revenue is more sensitive to network health than waterfall revenue, because if one major bidder goes quiet the auction can soften noticeably. If you can wire up something like Claude in Chrome (or a custom API integration) for the daily round, you're fine. If not, a well-tuned waterfall might be the better operational fit even if the absolute eCPM is lower.
+
+In my own apps, after three weeks of work and adjustment, I feel I should have done this migration sooner. Rork-generated apps come with the AdMob foundations already in place, which makes bidding migration *easier* than it would be on a hand-built codebase, not harder.
+
+If you are still on waterfall, the most practical next step is to pick one app, confirm your SDK adapter versions support bidding, and walk through the console mapping with the three pitfalls above in mind. Once the first app is stable in production, the rest of your portfolio takes far less time per app.
+
+I am still learning as I go. If any of this is useful to other indie developers monetizing through AdMob, I would be glad to hear about your numbers as well. Thanks very much for reading.

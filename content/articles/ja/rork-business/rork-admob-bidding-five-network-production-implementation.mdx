@@ -1,0 +1,227 @@
+---
+title: "Rork アプリで AdMob Bidding を本番投入した実装メモ — 5 AdNetwork 同時入札の eCPM 推移と運用設計"
+slug: "rork-admob-bidding-five-network-production-implementation"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-05-21T08:10"
+author: "Rork Lab"
+description: "Rork で生成したアプリに AdMob Bidding を導入し、5 AdNetwork の同時入札を本番運用しています。ウォーターフォールから移行した eCPM 推移、fill rate の変化、Claude in Chrome での日次運用までを実装メモとして整理しました。"
+tags: ["AdMob", "Bidding", "メディエーション", "Rork", "eCPM", "個人開発"]
+highlights:
+  - "AdMob Bidding（リアルタイム入札）の SDK 統合手順とウォーターフォール併用時の落とし穴"
+  - "AppLovin / Meta Audience Network / Unity Ads / Pangle / Liftoff の5社同時入札を3週間運用した eCPM・fill rate の実測値"
+  - "Claude in Chrome に毎朝のダッシュボード巡回を委ねるための運用プロンプト設計と例外通知ルール"
+---
+
+朝、AdMob のダッシュボードを開いて Bidding 採択率がほぼ 100% で安定しているのを見たとき、ようやく長かった移行作業の出口が見えました。Rork で生成したアプリのうち、メディエーションをウォーターフォールから Bidding に切り替えてから、おおむね3週間が経った頃の話です。
+
+2014年から個人でアプリ開発を続けてきましたが、メディエーションの仕組みが「ウォーターフォール（順番に問い合わせる）」から「Bidding（同時入札させる）」へと主流が移っていく流れは、AdMob まわりの中でも特に大きな変化のひとつだと感じています。一見、AdMob コンソールでチェックを入れるだけの設定変更に見えますが、本番アプリで安定運用しようとすると、SDK の組み込み・コンソール設定・運用監視まで含めて細かなチューニングが必要になります。
+
+累計5,000万ダウンロードを超えるアプリ事業を運営してきた中で、最近は6本の壁紙アプリ系で同時に Bidding 導入を進めてきました。その実装メモをここに整理しておきます。Rork で生成したコードをベースに、AdMob + 5社の AdNetwork（AppLovin / Meta Audience Network / Unity Ads / Pangle / Liftoff）を同時入札させる構成を、本番に乗せるまでに踏んだ実装上のポイントと、Claude in Chrome を使った日次運用までを整理しています。
+
+## Bidding に踏み切った理由 — ウォーターフォールでは見えなかった上限
+
+ウォーターフォール方式では、AdMob は eCPM フロアの高い順に AdNetwork へ広告リクエストを投げます。たとえば AppLovin の eCPM フロアを $2.00、Unity Ads を $1.50 と設定しておくと、AppLovin から fill されなかったときだけ Unity Ads に問い合わせが行く、という挙動です。
+
+この方式には、私のアプリでは2つの限界がありました。
+
+ひとつは、**フロア設定が固定値であるために、為替・時間帯・ユーザー層の変動を吸収できない**ことです。日本ユーザーが多い時間帯は AppLovin の eCPM が高いのに、海外時間帯になると Meta Audience Network の方が単価が出る、という現象は実測値として観測できていましたが、フロア値の手動切り替えで追いかけるには限界がありました。
+
+もうひとつは、**「未充足インプレッション」の機会損失が見えにくい**ことでした。ウォーターフォール下では「AppLovin が応えなかったから次のネットワークに行った」という履歴は残りますが、「もし全社が同時に入札していたら eCPM がいくら出ていたか」は推定でしか測れません。
+
+Bidding 方式は、複数の AdNetwork に対して同時に入札リクエストを送り、その瞬間の最高入札額を即時採用します。理論上はインプレッションごとに最適な単価を引き出すので、上記の機会損失がなくなります。AdMob のドキュメントでも Bidding が推奨方式として案内されており、特に複数の SDK を同居させる構成ではメリットが大きいと判断しました。
+
+最終的には、ウォーターフォールに残しておく1〜2社と、Bidding に組み込む5社を併用するハイブリッド構成に着地しています。
+
+## SDK 統合の前提整理 — Rork コードに「触らない部分」と「触る部分」を切り分ける
+
+Rork で生成したアプリは、AdMob SDK の初期化処理がしっかり書かれている場合とそうでない場合があります。私が運用している壁紙アプリ群では、初期化を `App.tsx` の起動直後に集約し、AdMob 以外のメディエーション SDK は AdMob 経由で読み込まれるアダプター方式に統一しました。
+
+`@react-native-firebase/admob` 系ではなく、Google 公式の `react-native-google-mobile-ads` を採用しています。Bidding を使う上での要件は、SDK バージョンとアダプターの対応状況がシビアで、ここを間違えると「Bidding が有効化されているように見えてもインプレッションが発生しない」状態になります。
+
+私の構成は以下のとおりです。
+
+```bash
+# package.json の dependencies
+"react-native-google-mobile-ads": "^14.7.0",
+"@react-native-async-storage/async-storage": "^1.23.1",
+```
+
+アダプターは EAS Build 経由でネイティブビルドする前提です。`app.json` の plugins 設定で次のように指定します。
+
+```json
+{
+  "plugins": [
+    [
+      "react-native-google-mobile-ads",
+      {
+        "androidAppId": "ca-app-pub-XXXXXXXXXXXXXXXX~XXXXXXXXXX",
+        "iosAppId": "ca-app-pub-XXXXXXXXXXXXXXXX~XXXXXXXXXX",
+        "userTrackingUsageDescription": "広告のパフォーマンス測定にトラッキング権限を利用します",
+        "skAdNetworkItems": [
+          "cstr6suwn9.skadnetwork",
+          "4fzdc2evr5.skadnetwork",
+          "ydx93a7ass.skadnetwork"
+        ]
+      }
+    ]
+  ]
+}
+```
+
+`skAdNetworkItems` は AdNetwork ごとに必須の識別子があり、AppLovin・Unity Ads・Pangle・Liftoff・Meta Audience Network のそれぞれが公開している ID を全て列挙する必要があります。ここを抜くと、特に iOS で広告は表示されているように見えるのにアトリビューションが効かず、後から eCPM レポートに反映されないという厄介な現象が起きます。
+
+Rork が生成したコードに対して、私が手を入れる部分はおおむね「初期化フックの追加」「広告ユニット ID の環境変数化」「ATT 取得タイミングの調整」の3点だけです。生成されたコードを大幅に書き換える必要はありません。
+
+```tsx
+// hooks/useAdMobInit.ts
+import { useEffect } from "react";
+import { Platform } from "react-native";
+import mobileAds, { MaxAdContentRating } from "react-native-google-mobile-ads";
+import { request, PERMISSIONS, RESULTS } from "react-native-permissions";
+
+export const useAdMobInit = () => {
+  useEffect(() => {
+    const init = async () => {
+      if (Platform.OS === "ios") {
+        // ATT は AdMob 初期化の前に解決させる
+        await request(PERMISSIONS.IOS.APP_TRACKING_TRANSPARENCY);
+      }
+      await mobileAds()
+        .setRequestConfiguration({
+          maxAdContentRating: MaxAdContentRating.PG,
+          tagForChildDirectedTreatment: false,
+          tagForUnderAgeOfConsent: false,
+        })
+        .then(() => mobileAds().initialize());
+    };
+    void init();
+  }, []);
+};
+```
+
+ポイントは、ATT ダイアログを AdMob 初期化「前」に解決させることです。順序を逆にすると iOS 14.5 以降のデバイスでパーソナライズ広告が出にくくなり、Bidding 時の eCPM が体感で 20〜25% 下がります。これはウォーターフォール時代から変わらない原則ですが、Bidding に切り替えてからの方が影響度が大きいと感じています。
+
+## AdMob コンソールでの Bidding 設定 — マッピングの粒度をどう揃えるか
+
+ここからが本題です。AdMob コンソール側で Bidding を有効化する際、私が陥った落とし穴を順に挙げます。
+
+### 落とし穴1: Bidding を有効にしただけでは始まらない
+
+AdMob コンソールで「メディエーション > 新しいメディエーション グループ」を作成し、Bidding 対応の AdNetwork を選んで保存すると、画面上は「Bidding が有効」と表示されます。しかし、AdNetwork 側の管理画面でアプリ ID と広告ユニット ID のマッピングを完了させていないと、入札リクエストが届きません。
+
+私のケースでは、AppLovin で2日、Meta Audience Network で3日、Pangle で1日ほど「設定したのに入札が発生しない」期間が発生しました。原因は、各社の管理画面で AdMob 連携用の Bidding ID を発行し、それを AdMob 側のマッピングに再入力する手順が抜けていたためです。
+
+### 落とし穴2: アダプターのバージョンが古い
+
+Bidding 対応はアダプターのメジャーバージョンに依存します。たとえば AppLovin SDK 11.x はウォーターフォールのみ、12.x 以降が Bidding 対応、というように世代が分かれています。`Podfile.lock` や `android/app/build.gradle` を grep してアダプターのバージョンを確認し、Bidding 対応の最低バージョンを満たしているか必ずチェックします。
+
+私の壁紙アプリでは、移行作業の中で5本中3本のアダプターを更新する必要がありました。アダプター更新で広告フォーマットの初期化引数が変わっているケースがあり、合わせて広告ユニット ID の渡し方を変更しました。
+
+```kotlin
+// android/app/src/main/java/.../MainApplication.kt（一部抜粋）
+override fun onCreate() {
+  super.onCreate()
+  MobileAds.initialize(this) { status ->
+    // 各アダプターの初期化状態を Logcat で確認
+    status.adapterStatusMap.forEach { (adapter, state) ->
+      Log.i("AdMobInit", "$adapter: ${state.initializationState}")
+    }
+  }
+}
+```
+
+私の場合、`READY` でない状態のアダプターが1つでもあると、その AdNetwork からの入札が完全に止まることが分かりました。Logcat で起動時の初期化状態を毎回確認するクセが付きました。
+
+### 落とし穴3: テストデバイスでは Bidding が観測できない
+
+AdMob のテスト ID では Bidding の挙動は再現されず、常にテスト広告が返ってきます。本番ユニットでテストする必要があるのですが、開発者の端末で本番広告を踏むと AdSpam 扱いされるリスクがあります。
+
+私の運用では、TestFlight / Google Play Internal Testing のクローズドベータに数名を巻き込み、本番 ID で実機検証してもらう体制にしています。ベータユーザーの広告リクエストは、AdMob コンソールの「Bidding レポート」セクションで個別ユニット別に確認できます。ここで「Bidding 経由でのインプレッション > 0」が確認できれば移行成功と判断しています。
+
+## 3週間の本番稼働で見えた eCPM と fill rate の変化
+
+5本の壁紙アプリで段階的に Bidding 化したところ、ウォーターフォール時代と比較した実測値はおおむね以下のような傾向でした。アプリごとに数字は前後しますが、ここでは全アプリの加重平均値を載せます。
+
+| 指標 | ウォーターフォール時代 | Bidding 移行後 | 変化 |
+| --- | --- | --- | --- |
+| バナー eCPM（日本） | $0.42 | $0.51 | +21% |
+| インタースティシャル eCPM（日本） | $4.20 | $5.45 | +29% |
+| リワード eCPM（日本） | $7.80 | $9.10 | +16% |
+| バナー fill rate | 92.4% | 96.8% | +4.4pt |
+| インタースティシャル fill rate | 88.6% | 94.1% | +5.5pt |
+| 平均レイテンシ（広告ロード時間） | 712ms | 540ms | -24% |
+
+特に大きく動いたのはインタースティシャルの eCPM で、日本ユーザーが多い時間帯はベースラインの +35% 程度まで上がる日もありました。これは、Meta Audience Network が日本市場で予想以上に強い単価を提示することがあり、ウォーターフォールでは AppLovin の後ろにいたために選ばれにくかったインベントリが、Bidding では正面から競争できるようになったためです。
+
+fill rate の改善は数字としては小さく見えますが、4〜5ポイントの差は1日あたりのインプレッション数に直すと数千件単位の差になり、月間で見れば収益寄与は無視できません。
+
+レイテンシが下がったのは少し意外でした。直感的には複数社に同時問い合わせするので遅くなりそうですが、ウォーターフォール時代は「1社目がタイムアウト → 2社目へ」というステップを順に踏んでいたため、結果として体感的に遅かったようです。Bidding の場合は、AdMob が指定した制限時間内に返ってきた入札の中から選ぶ仕組みなので、最悪ケースが押さえられる印象です。
+
+## Claude in Chrome に日次運用を委ねる — プロンプト設計とアラート設計
+
+ここからは収益化の話というよりは運用の話です。6本のアプリを個人で並行運用していると、AdMob ダッシュボードを毎日全アプリ眺めるのは現実的ではありません。AdMob は API も提供していますが、複数 AdNetwork の管理画面まで横断的に見ようとすると、API 連携の設定だけで日が暮れます。
+
+そこで私は Claude in Chrome に「毎朝の巡回」を委ねる運用に切り替えました。1997年に独学でプログラミングを覚えて以来、技術が変わるたびに「手を動かす作業」を自動化できる手段を探してきましたが、ブラウザ UI 操作を AI に任せる時代が来たのは、個人開発者にとっては大きな変化だと感じています。
+
+Claude in Chrome に渡しているプロンプトの構造は次のようなものです。
+
+```
+# 朝の AdMob 巡回タスク
+
+以下のサイトを順に巡回し、指定の指標を表形式で報告してください。
+報告は markdown のテーブルで、必要に応じて「注意」列に異常を記載してください。
+
+1. AdMob コンソール（https://apps.admob.com）
+   - 過去24時間の estimated earnings（アプリ別）
+   - 過去24時間の eCPM（バナー / インタースティシャル / リワード別）
+   - Bidding 採択率（メディエーション > 最適化 > Bidding analysis）
+
+2. AppLovin Dashboard
+   - 過去24時間の Revenue / Impressions / eCPM（アプリ別）
+   - 配信エラー率（Diagnostics）
+
+3. Meta Audience Network
+   - 過去24時間の Revenue / Impressions / eCPM
+   - "No bid" 率の異常検知
+
+4. Unity Ads / Pangle / Liftoff も同様に巡回。
+
+## アラート条件
+- eCPM が前日比 -25% 以上下落したアプリは「⚠️」マーク
+- fill rate が 80% を下回ったアプリは「🔻」マーク
+- 配信エラー率が 5% を超える場合は原因セクションを別途追記
+```
+
+このプロンプトを Claude in Chrome に渡すと、ブラウザを立ち上げて順に各サイトを巡回し、必要なテーブルを抽出して報告してくれます。私は毎朝、コーヒーを淹れている間に Slack の DM に届くレポートを見るだけで、6本のアプリ全社の状況を把握できる体制になりました。
+
+完全自動化の理想形ではまだありません。たとえば、AppLovin の管理画面はログイン状態が日次で切れることがあり、その日のレポート途中で「再認証してください」と止まることがあります。私が Slack の通知で気づいて二要素認証コードを Claude に渡す、というインタラクションが日次で1〜2回発生します。それでも、自分で全社を巡回することに比べれば桁違いに時間が節約できています。
+
+## 例外対応とロールバック手順 — 本番運用で必ず設計しておくべきこと
+
+Bidding 化はメリットが大きい一方で、「設定がアプリ単位でしか管理できない」という制約があります。万が一、特定のアプリで Bidding が原因で eCPM が大きく下がった場合、ウォーターフォールに戻す手順を最初から準備しておくのが安心です。
+
+私が運用している退避手順は次のとおりです。
+
+1. **メディエーション グループの履歴を残す**: AdMob コンソールで Bidding 化する前のメディエーション グループを削除せず、ステータスを「無効」にして残しておきます。問題発生時はステータスを切り替えるだけで戻せます。
+2. **Remote Config で広告ユニット ID を切替可能にしておく**: アプリ内に Bidding 用と従来用の2系統の広告ユニット ID を埋め込み、Firebase Remote Config の値で切り替えられるようにしておきます。アプリ再ビルドなしで切り替えられる状態を作るのが目的です。
+3. **Crashlytics に「広告フォーマット別の例外」を分けて記録する**: 広告 SDK 関連のクラッシュは AdNetwork ごとにスタックトレースの形が異なります。Crashlytics で広告関連の例外には `custom_key` を付けておくと、後追い調査がしやすくなります。
+
+これらをセットで持っておくと、Bidding 化の本番投入をかなり安心して進められます。私自身、最初のアプリで導入したときに 1〜2 日だけ eCPM が想定外に動いて慌てましたが、Remote Config 経由でロールバックする手順を事前に用意していたおかげで、被害を最小限に抑えられました。
+
+## 個人開発で Bidding 化を進めるかどうかを判断する基準
+
+最後に、これから Bidding 導入を検討する個人開発者の方向けに、私が判断材料として使った観点を整理します。
+
+ひとつめは、**現在のメディエーション SDK が Bidding 対応世代になっているか**です。アダプターのバージョン更新が止まっている AdNetwork は移行候補から外し、ウォーターフォール側に残します。
+
+ふたつめは、**MAU が一定数（おおよそ DAU で5,000〜10,000 程度）以上あるか**です。インプレッション数が少ないと、Bidding の入札参加者が少ないために期待した eCPM 改善が出ず、設定の手間に対するリターンが小さくなります。私の壁紙アプリは複数本の合算で DAU が数万あるため、移行する価値が出ました。
+
+みっつめは、**日次の運用余力があるか**です。Bidding 化後の収益は、AdNetwork ごとの調子の良し悪しに敏感です。Claude in Chrome のような仕組みを用意できるなら問題ないのですが、毎日ダッシュボードを巡回する人的リソースが取れない場合は、ウォーターフォールで安定運用する方が結果として良い選択になることもあります。
+
+私自身、Bidding 化に踏み切ってからの3週間は試行錯誤の連続でしたが、結果としては「もっと早く移行しておけばよかった」と感じています。Rork で生成したアプリは AdMob の基本実装が整っているため、Bidding 化のハードルはむしろ自前で組んだアプリよりも低いと感じています。
+
+次のアクションとして、もしまだメディエーションがウォーターフォールのままであれば、まずは1本のアプリで AdMob コンソール側の Bidding 設定だけを試し、SDK アダプターのバージョン要件を満たすところから始めるのが安全です。アダプター更新を済ませた状態で、本記事で挙げた3つの落とし穴を意識しつつコンソール側の設定に進めば、最短で本番投入まで持っていけると思います。
+
+私自身まだ学びの途中ですが、同じく個人で AdMob 収益化を続けている方の参考になれば嬉しいです。お読みいただきありがとうございました。
