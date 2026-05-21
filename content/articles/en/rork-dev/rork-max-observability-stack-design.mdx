@@ -1,0 +1,190 @@
+---
+title: "Designing an Observability Stack for Rork Max — Unifying Sentry, Crashlytics, and Cloudflare Logs from a Solo Developer's View"
+slug: "rork-max-observability-stack-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-22T04:45"
+updated: "2026-05-22T04:45"
+author: "Rork Lab"
+description: "A practical observability stack design for apps shipped with Rork Max, covering Sentry, Crashlytics, and Cloudflare Logs role separation, scenario-based incident tracing routes, and how a solo developer can sustain it over years."
+tags: ["rork-max", "observability", "sentry", "crashlytics", "cloudflare", "architecture", "monitoring", "production"]
+highlights:
+  - "A flag-driven separation between Sentry and Crashlytics, with reporter code that prevents duplicate events at the source"
+  - "Scenario-based triage routes for AdMob revenue drops, startup crashes, and subscription renewal failures that reach the root cause in under a minute"
+  - "An automation pattern that connects Cloudflare Logpush to a daily Crashlytics summary via Claude in Chrome, sustainable for a one-person team"
+---
+
+## Why Solo Developer Observability Collapses Under Tool Sprawl
+
+One morning, AdMob revenue on one of my apps dropped 32% from the previous day. Tracking down the cause meant opening Crashlytics, Sentry, Cloudflare Logs, the Stripe dashboard, the AdMob report, and GA4 in sequence, then visually cross-checking them. After two hours I found it: a one-character typo in an ad unit ID I had shipped the day before. Something that should have taken five minutes to detect.
+
+I am Masaki Hirokawa. I have been shipping personal apps since 2014, growing to a cumulative 50 million downloads, and during that time I have rebuilt my observability setup more times than I want to admit. Since I started leaning on Rork Max for generated code, I can ship faster — but I have also felt the cost of "broken code I cannot trace." Reading logs gets harder when part of the codebase is no longer fully in your head, because the AI filled it in.
+
+A solo developer's observability cannot be designed like an SRE team's. You have to start from the assumption that nobody is on call. The real design question is: when an alert fires at 3 AM, how does it reach me, and once I open my laptop, where do I look in the first sixty seconds to get to the root cause? That routing problem comes before tool selection.
+
+## The Three Pillars, Re-Framed by Who Looks at Them
+
+Textbooks describe observability as Logs / Metrics / Traces. In my own setup I redefine them by who looks at them, when, and at what granularity.
+
+- Logs: things I read in reverse during incidents. I open them only after being paged.
+- Metrics: revenue, retention, crash-free rate. A five-minute morning habit.
+- Traces: things I open only after metrics and logs have narrowed the problem. Never on a routine basis.
+
+Treating the three as equal in cost and attention will burn out a single developer. Metrics should live on a single dashboard combining AdMob, Stripe, and Crashlytics. Logs should be structured around "open them only when paged." Traces should stay reserved for reproducing a specific incident.
+
+### My Selection Criteria
+
+I now pick tools against three criteria.
+
+1. **For the mobile front, use vendor SDKs.** Crashlytics and Sentry can capture OS-level signals (memory warnings, ANRs, watchdog kills) that generic loggers cannot.
+2. **For backends, keep raw logs in your own storage.** With Cloudflare Workers I push everything to R2 via Logpush and stay independent of any single SaaS.
+3. **Route every alert through one channel.** Sentry, Crashlytics, and Stripe webhook alerts all land in one Slack channel, color-coded by priority.
+
+"Install everything" always breaks for solo developers. After three years you will find at least one paid monitoring service that you stopped logging into.
+
+## Scenario-Based Triage: Decide the Route in Under a Minute
+
+An observability stack is not done when the tools are chosen. The real artifact is the documented order in which you check things during an incident. Here are the three I use most.
+
+### Scenario A: AdMob Revenue Drops 30%+ Day Over Day
+
+1. Open the AdMob report. Confirm whether eCPM or impressions dropped (under one minute).
+2. If impressions dropped: check the Crashlytics crash-free rate over the last 24 hours.
+3. If eCPM dropped: check mediation results to see whether one network slashed its fill rate.
+4. If neither: diff today's and yesterday's release through `git log`.
+
+This flow has to be written down. At 3 AM you cannot reconstruct the right order from memory. I keep an "Incident Triage" page in Notion accessible from a lock-screen shortcut so I can open it with two taps.
+
+### Scenario B: Crash Spike Right After Launch
+
+1. Use Crashlytics realtime to identify the affected OS version (thirty seconds).
+2. Cross-reference with Sentry for app-layer exceptions.
+3. Halt the phased rollout in App Store Connect.
+4. Check Cloudflare Workers Logs for any 5xx increase on the backend side.
+
+About 80% of crashes cluster around specific OS versions or devices, so Crashlytics-first is the shortest path. Sentry comes first only for non-native exceptions (for example Hermes errors in React Native bundles).
+
+### Scenario C: Subscription Renewal Failures Spike
+
+1. Check Renewal Failure Rate on the RevenueCat dashboard.
+2. List `invoice.payment_failed` webhooks in Stripe for the affected window.
+3. Search the Cloudflare Workers webhook handler logs via Logpush.
+4. Verify there are no signature validation errors from Apple Server Notifications v2.
+
+Subscriptions are the area most directly tied to revenue and the most painful to debug for solo developers. Putting RevenueCat in the middle normalizes Apple, Stripe, and Google into one API, which is why I always include it.
+
+## Drawing the Line Between Sentry and Crashlytics
+
+"Both installed but boundaries unclear" is the most common anti-pattern I see in solo setups. I enforce a strict split.
+
+- Send to Crashlytics: native crashes, ANRs, watchdog kills, OOM-related forced terminations.
+- Send to Sentry: caught application exceptions, Workers / Cloudflare Pages exceptions, uncaught frontend errors.
+
+To enforce the boundary in code, I insert this reporter flag into the error handlers in Rork Max generated projects.
+
+```typescript
+// errorReporter.ts
+type ErrorTier = "native_crash" | "app_exception" | "warning";
+
+interface ReportOptions {
+  tier: ErrorTier;
+  context?: Record<string, unknown>;
+  user?: { id: string; tier: "free" | "premium" };
+}
+
+export function reportError(error: Error, options: ReportOptions) {
+  // The destination is forced by tier. Never both.
+  switch (options.tier) {
+    case "native_crash":
+      // Native bridge -> Crashlytics only
+      NativeModules.CrashReporter.recordError(error, options.context);
+      break;
+    case "app_exception":
+      // Sentry only. Do not forward to Crashlytics.
+      Sentry.captureException(error, {
+        contexts: { app: options.context },
+        user: options.user,
+        tags: { tier: options.user?.tier ?? "anonymous" },
+      });
+      break;
+    case "warning":
+      // Just a breadcrumb on Sentry to avoid duplicate alerts.
+      Sentry.addBreadcrumb({
+        category: "warning",
+        message: error.message,
+        level: "warning",
+        data: options.context,
+      });
+      break;
+  }
+}
+```
+
+In production this dropped my monthly alert count from roughly 4x to 1.2x what it used to be. Once duplicates disappear, you regain the instinct to actually look at every alert. That cultural shift mattered to me more than the raw numbers.
+
+## "Own Your Logs" with Cloudflare Workers and Logpush
+
+`console.log` in Cloudflare Workers shows only recent realtime logs on the free plan. After three years of operation, there is always a moment when you need "that log from two months ago," so I push everything to R2 with Logpush.
+
+```toml
+# wrangler.toml
+[[logpush]]
+destination = "r2://logs-prod/workers/{DATE}.ndjson.gz"
+dataset = "workers_trace_events"
+filter = '{"where":{"and":[{"key":"Outcome","operator":"eq","value":"ok"}]}}'
+
+[[logpush]]
+destination = "r2://logs-prod/workers-errors/{DATE}.ndjson.gz"
+dataset = "workers_trace_events"
+filter = '{"where":{"and":[{"key":"Outcome","operator":"ne","value":"ok"}]}}'
+```
+
+Splitting errors into their own file shrinks the grep target by two orders of magnitude. The end state I aim for in production monitoring is "the line I want is the first thing I see when I open the log."
+
+### Retention and Cost
+
+I keep error logs for 90 days and normal logs for 30 days. R2 charges $0.015 per GB-month, so 5 GB of compressed monthly logs costs about $0.075 per month, well under a dollar per year. Trying to do the same in Sentry alone requires at least the $26/month plan and bumps against log volume caps. "Owning your logs" is not always the cheapest path, but on Workers the affinity with R2 makes it an obvious win.
+
+## Claude in Chrome × Crashlytics: Daily Triage on Autopilot
+
+This part is an ongoing experiment. I have been having Claude in Chrome open my Crashlytics dashboard each morning and summarize the top five stack traces into Slack.
+
+A human pass through Crashlytics takes 5–10 minutes for an experienced developer. Shortening it to 30 seconds reclaims 30+ hours a year for higher-leverage work. The implementation is a simple instruction prompt saved on the extension side.
+
+```text
+Open the Crashlytics Issues tab. For the top five issues by occurrence in the
+last 24 hours, summarize the top stack frame and a likely cause in one line each.
+Format: "[count] thread name: likely cause". Five lines separated by newlines.
+If two issues share the same cause, merge them into one line.
+```
+
+The key is "summarize, do not transcribe." Dumping raw stack traces into Slack adds noise that gets ignored. Asking Claude for "top frame plus likely cause" pitches the abstraction at the right level for a human to act on. One pitfall in production: Crashlytics DOM changes during a UI update can break the prompt overnight, so I added a self-check that compares each day's output to the previous seven days and flags large structural diffs.
+
+## Reframing Monitoring as a Revenue Protection Center
+
+Solo developers tend to see monitoring as a cost center. I treat it as a revenue protection center. The math is what changed my mind.
+
+- A 5% drop in AdMob eCPM, undetected for one day, costs roughly 2,500 yen per day in revenue for an app earning 1.5 million yen per month. That is 75,000 yen per month.
+- Detecting one day earlier protects more than 900,000 yen per year.
+- Total monitoring cost: about $26/month for Sentry Team, free for Crashlytics, around $5/month for Cloudflare Logpush. Roughly $400 per year.
+
+That is a roughly 60,000 yen investment to protect 900,000 yen of revenue, year over year. If you do not currently look at eCPM and ARPU every morning, my recommendation is to start with the five-minute metrics habit. That alone will surface at least one anomaly per month.
+
+## Three Years In: Fighting Alert Fatigue
+
+The hardest part of long-term operation is alert fatigue. Since 1997, when I first connected to the internet at 16, I have leaned toward "precision over volume" in notifications. When alerts get noisy, humans always habituate to them. That is true on a team and it is true alone.
+
+My three-tier alert routing looks like this.
+
+1. **P0 (wake me up)**: app launch rate below 50% in the last hour, or Crashlytics crash-free rate below 95%. Slack plus iOS Critical Alert, audible at night.
+2. **P1 (check next morning)**: day-over-day revenue down 20%+, more than five new Sentry issues in 24 hours, webhook failure rate above 1%. Normal Slack channel.
+3. **P2 (weekly review)**: p95 latency increase on a single endpoint, drop in Day 7 retention, crash rate up on a specific device. Weekly email digest.
+
+"Make everything P0" is the typical solo-developer failure mode. After three months you will have chronic fatigue and start missing the alerts that actually matter. In my operation, P0 fires less than once a month, P1 two or three times a week, and the P2 digest arrives every Friday by email — a balance I can sustain.
+
+### What to Do Next
+
+The single concrete step worth doing this week is to check whether the same exception is being recorded in both Sentry and Crashlytics. In my experience, almost no solo developer's stack is duplicate-free on first inspection. Eliminating those overlaps alone will measurably reduce your alert volume.
+
+Thank you for reading. This is the design decision I look back on most fondly across three years of operation. I hope it is useful to other developers running multiple apps on their own.
