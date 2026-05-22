@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
@@ -55,9 +54,88 @@ export default async function TagPage({ params, searchParams }: Props) {
     (a.tags || []).some((t) => t.toLowerCase() === decoded.toLowerCase())
   );
 
-  /* Return proper 404 for unknown tags — prevents soft 404 (#84) */
+  /* Empty tag: return noindex page with navigation fallback.
+   * Reverses #84 because the 0-article path was generating 100s of real 404s in GSC
+   * after the large 2026-05 content cleanup. The page is already marked noindex via
+   * generateMetadata's robots field, so Google will naturally de-index it. */
   if (articles.length === 0) {
-    notFound();
+    const tagFreq = new Map<string, number>();
+    for (const a of allArticles) {
+      for (const t of a.tags || []) {
+        tagFreq.set(t, (tagFreq.get(t) || 0) + 1);
+      }
+    }
+    const popularTags = Array.from(tagFreq.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12);
+    return (
+      <div style={{ maxWidth: 900, margin: "0 auto", padding: "60px 24px 120px" }}>
+        <div style={{ marginBottom: 32 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+            <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-blue) 40%, transparent)" }} />
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+              TAG
+            </span>
+          </div>
+          <h1 style={{ fontSize: "clamp(20px, 3vw, 28px)", fontWeight: 300, color: "var(--text-primary)", marginBottom: 12 }}>
+            {locale === "ja" ? `「${decoded}」の記事は見つかりませんでした` : `No articles tagged "${decoded}"`}
+          </h1>
+          <p style={{ color: "var(--text-dim)", lineHeight: 1.7 }}>
+            {locale === "ja"
+              ? "このタグに該当する記事は現在ありません。下記から関連するカテゴリや人気タグをご覧いただけます。"
+              : "There are no articles matching this tag right now. Browse a category or popular tag below."}
+          </p>
+        </div>
+        <div style={{ marginBottom: 40 }}>
+          <h2 style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 12, fontFamily: "'DM Mono', monospace", letterSpacing: "0.15em" }}>
+            {locale === "ja" ? "カテゴリで探す" : "BROWSE BY CATEGORY"}
+          </h2>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {CATEGORIES.map((c) => (
+              <a
+                key={c.id}
+                href={`${prefix}/articles/${c.id}`}
+                style={{
+                  padding: "8px 16px",
+                  border: "1px solid var(--border)",
+                  borderRadius: 4,
+                  textDecoration: "none",
+                  color: "var(--text-primary)",
+                  fontSize: 13,
+                }}
+              >
+                {CATEGORY_LABELS[locale]?.[c.id] || c.id}
+              </a>
+            ))}
+          </div>
+        </div>
+        {popularTags.length > 0 && (
+          <div>
+            <h2 style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 12, fontFamily: "'DM Mono', monospace", letterSpacing: "0.15em" }}>
+              {locale === "ja" ? "人気のタグ" : "POPULAR TAGS"}
+            </h2>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {popularTags.map(([t, n]) => (
+                <a
+                  key={t}
+                  href={`${prefix}/tag/${encodeURIComponent(t)}`}
+                  style={{
+                    padding: "4px 10px",
+                    background: "color-mix(in srgb, var(--accent-blue) 10%, transparent)",
+                    color: "var(--accent-blue)",
+                    borderRadius: 4,
+                    fontSize: 12,
+                    textDecoration: "none",
+                  }}
+                >
+                  {t} <span style={{ opacity: 0.6 }}>({n})</span>
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
   }
 
   /* Pagination */
