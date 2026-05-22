@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAXSWIFT — Rork Max が React Native ではなくネイティブ Swift アプリを生成、Claude Code + Opus 駆動で2-click App Store 公開を実現",
-    "COMPANION — Rork Companion アプリ経由で有料 Apple Developer アカウントなしに実機 iPhone でテスト可能に（2026）",
-    "CLOUDMAC — Rork Max は cloud Mac fleet でネイティブコンパイル、Xcode/Mac を持たずに HealthKit や AR 機能まで実装可能",
-    "AISTUDIORIVAL — Google AI Studio Android が I/O 2026 で事前登録開始、Kotlin vibe coding で Rork の Android 領域に直接競合（5/19）",
-    "LOWCODE75 — Gartner 予測: 2026 年に新規アプリ開発の 75% が low-code/no-code に、80% を非IT 人材が担う見込み",
-    "MAXPRICE — Rork Max は月 $200 プランで Swift ビルド無制限、無料枠は週5プロンプトに制限",
+    "MAX2026 — Rork Max が 2026年2月にローンチ、React Native ではなくネイティブ Swift アプリビルダーとして Apple 全エコシステムへ対応",
+    "ARR15M — Rork Max ローンチから 3日 で ARR $1.5M を突破、Left Lane Capital リードで $15M シード調達済み",
+    "VISIONPRO — Rork Max が Vision Pro / Apple Watch / Apple TV / iMessage / iPad / iPhone に正式対応、AR・LiDAR・Metal を一気通貫で利用可能",
+    "HEALTHKIT — HealthKit・HomeKit・NFC・App Clips・Core ML on-device ML までネイティブ機能をブラウザ完結で実装可能に",
+    "CLOUDMAC — Rork Max は cloud Mac fleet で Swift コードをコンパイル、ストリーミングシミュレータでブラウザ内アプリ実行を実現",
+    "PAPERLINE — Rork が アプリビルダー Paperline を買収、エンジニア人材を取り込み AI ネイティブ開発体制を強化",
   ],
   en: [
-    "MAXSWIFT — Rork Max generates native Swift apps instead of React Native, powered by Claude Code + Opus with 2-click App Store publishing built in",
-    "COMPANION — Rork Companion app lets you test creations on a real iPhone without a paid Apple Developer account (2026)",
-    "CLOUDMAC — Rork Max compiles natively on a cloud Mac fleet, enabling HealthKit, AR, and other native features without owning Xcode or a Mac",
-    "AISTUDIORIVAL — Google AI Studio for Android opened pre-registration at I/O 2026, putting Kotlin vibe coding head-to-head with Rork on Android (5/19)",
-    "LOWCODE75 — Gartner forecast: 75% of new application development will use low-code/no-code by 2026, with 80% built by non-IT professionals",
-    "MAXPRICE — Rork Max sells at $200/month with unlimited native Swift builds; the free tier is capped at roughly 5 prompts per week",
+    "MAX2026 — Rork Max launched in February 2026 as a native Swift app builder that ships across the entire Apple ecosystem instead of React Native",
+    "ARR15M — Rork Max hit $1.5M ARR within three days of launch and closed a $15M seed led by Left Lane Capital",
+    "VISIONPRO — Rork Max now targets Vision Pro, Apple Watch, Apple TV, iMessage, iPad, and iPhone with first-class AR, LiDAR, and Metal support",
+    "HEALTHKIT — HealthKit, HomeKit, NFC, App Clips, and on-device Core ML are all available in-browser without leaving the Rork Max workflow",
+    "CLOUDMAC — Rork Max compiles Swift on a cloud Mac fleet and streams a live simulator into your browser so you never install Xcode",
+    "PAPERLINE — Rork acquired app builder Paperline to bring in engineering talent and accelerate its AI-native development stack",
   ],
 };
 
