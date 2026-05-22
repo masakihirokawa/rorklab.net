@@ -1,0 +1,145 @@
+---
+title: "FlatList の onEndReached が連続発火して API を叩きすぎる問題の原因と対処"
+slug: "rork-flatlist-onendreached-multiple-fire-fix"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-22T11:00"
+author: "Rork Lab"
+description: "FlatList の onEndReached が画面遷移時や初期描画時に何度も呼ばれて、ページネーション API を多重に叩いてしまう問題。Rork で生成したリスト画面でも頻発するこの挙動の原因と、実運用で使える対処パターンを整理しました。"
+tags: ["FlatList", "onEndReached", "React Native", "Rork", "ページネーション", "トラブルシューティング", "パフォーマンス"]
+---
+
+# FlatList の onEndReached が連続発火して API を叩きすぎる問題の原因と対処
+
+無限スクロールを実装したあとに API の呼び出しログを眺めて、「ページ 2 を取得」「ページ 3 を取得」「ページ 3 を取得」「ページ 3 を取得」と同じリクエストが続けて並んでいるのを見つけることがあります。Rork で生成された FlatList のコードをそのまま実機に乗せると、特に初期描画と画面復帰のタイミングで `onEndReached` が連続発火しやすく、放っておくとサーバ側で重複データが入ったり、無料枠の API クォータをあっという間に消費したりします。
+
+私自身、個人開発で運営している壁紙系アプリ（累計 5,000 万ダウンロード規模）でも、サムネイル一覧を FlatList から FlashList へ載せ替えたタイミングで同じ症状に遭遇しました。AdMob のネイティブ広告を 8 枚おきに差し込んでいるリストだったので、無駄ロードが入ると広告計測の duplicated impression まで誘発し、収益面でもダメージが大きい問題です。
+
+## なぜ `onEndReached` は意図せず複数回呼ばれるのか
+
+`onEndReached` は内部で `_maybeCallOnEndReached` を介して呼ばれ、可視領域の末端が `onEndReachedThreshold` の範囲に入った瞬間に発火します。問題は、React Native の FlatList が次の 3 つのタイミングで「末端に到達した」と判定してしまう点です。
+
+第一に、データ件数が画面の高さに満たない初期描画。リストの末尾がそのまま可視領域に入っているため、`onEndReached` が即座に呼ばれます。第二に、データ更新で再レンダリングが走った直後。リストの高さが変わると同じ位置でもう一度発火します。第三に、画面復帰時の `getDerivedStateFromProps` 経由の再計算。タブ切り替えや戻る操作で復帰したときに、スクロール位置が末端に近ければ再度発火します。
+
+つまり `onEndReached` は「ユーザがスクロールしてリストの末尾に近づいた」というユーザ操作のイベントではなく、「末端のセルが可視領域に入った」という描画ベースのイベントです。ここを誤解したまま「次のページを取りに行く」処理だけを直接書くと、誰も触っていないのにページ取得が走ります。
+
+## 最小の防御策: `onMomentumScrollBegin` ゲート
+
+最も軽量で確実な対処は、ユーザが実際にスクロールしたフラグが立つまで `onEndReached` を無視することです。`onMomentumScrollBegin` は実際の慣性スクロール開始時に呼ばれるため、自動描画では発火しません。
+
+```typescript
+import { FlatList } from 'react-native';
+import { useCallback, useRef } from 'react';
+
+export function PostListScreen({ posts, loadNext }: Props) {
+  const onEndReachedCalledDuringMomentum = useRef(true);
+
+  const handleEndReached = useCallback(() => {
+    if (onEndReachedCalledDuringMomentum.current) return;
+    onEndReachedCalledDuringMomentum.current = true;
+    loadNext();
+  }, [loadNext]);
+
+  return (
+    <FlatList
+      data={posts}
+      keyExtractor={(item) => item.id}
+      renderItem={({ item }) => <PostCard post={item} />}
+      onEndReached={handleEndReached}
+      onEndReachedThreshold={0.5}
+      onMomentumScrollBegin={() => {
+        onEndReachedCalledDuringMomentum.current = false;
+      }}
+    />
+  );
+}
+```
+
+ポイントは ref の初期値を `true` にしておくことです。これで初期描画時にいきなり `onEndReached` が走っても無視され、ユーザが指でスクロールを開始した瞬間にだけフラグが解除されます。
+
+## ページネーション側にも「同一ページの再リクエスト禁止」を入れる
+
+UI 側のゲートだけでは、フラグ解除直後にスクロール慣性で連続発火するケースを取りこぼします。フェッチ関数側にも、同じカーソルでの再リクエストを弾く仕組みを入れておくと安全です。
+
+```typescript
+import { useRef, useCallback, useState } from 'react';
+
+export function usePaginatedPosts() {
+  const [posts, setPosts] = useState<Post[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const inflightCursor = useRef<string | null | undefined>(undefined);
+
+  const loadNext = useCallback(async () => {
+    // 同じカーソルへのリクエストが進行中なら無視
+    if (inflightCursor.current === cursor) return;
+    inflightCursor.current = cursor;
+
+    try {
+      const res = await fetch(`/api/posts?cursor=${cursor ?? ''}`);
+      const data = await res.json();
+      setPosts((prev) => [...prev, ...data.items]);
+      setCursor(data.nextCursor);
+    } finally {
+      // 別のカーソルが要求されたら次のリクエストを受け付ける
+      if (inflightCursor.current === cursor) {
+        inflightCursor.current = undefined;
+      }
+    }
+  }, [cursor]);
+
+  return { posts, loadNext };
+}
+```
+
+カーソルベースの API なら「進行中のカーソルと同じなら弾く」、ページ番号ベースの API なら「現在ページ番号 + 1 が進行中なら弾く」とロジックを置き換えるだけで、同じ考え方が使えます。
+
+## TanStack Query / SWR を使っているときの注意
+
+TanStack Query の `useInfiniteQuery` を使っていると、`fetchNextPage` 自体がインフライト中の重複呼び出しを内部で無視してくれます。にもかかわらず連続発火が止まらない場合、ほぼ確実に `hasNextPage` のチェックを忘れているのが原因です。
+
+```typescript
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
+  queryKey: ['posts'],
+  queryFn: ({ pageParam }) => fetchPosts(pageParam),
+  initialPageParam: null as string | null,
+  getNextPageParam: (last) => last.nextCursor ?? undefined,
+});
+
+const handleEndReached = useCallback(() => {
+  if (!hasNextPage || isFetchingNextPage) return;
+  fetchNextPage();
+}, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+```
+
+`hasNextPage` と `isFetchingNextPage` の両方を見るのが重要です。前者だけだと、ネットワークが遅いときに重複リクエストが走ります。
+
+## FlashList に乗り換えるときの落とし穴
+
+パフォーマンス改善で Shopify の FlashList へ移行すると、`onEndReached` の挙動が微妙に変わります。FlashList は recycling と推定アイテム高で先読みするため、`onEndReachedThreshold` を 0.5 のままにしておくと FlatList より早めに発火します。私のアプリでは 0.3 まで下げて、`estimatedItemSize` も実測値に近づけたことで、想定外の発火がほぼ消えました。
+
+## 検証手順: ログだけで原因を切り分ける
+
+修正前後の挙動を確かめるときは、`onEndReached` 直下にカーソルとフレームタイムスタンプを出すと診断が早くなります。
+
+```typescript
+const handleEndReached = () => {
+  console.log('[onEndReached]', { cursor, now: Date.now() });
+  // ...
+};
+```
+
+連続する 2 回が 100ms 以内に並んでいれば、ほぼ描画ベースの再発火です。500ms 以上離れているなら、ユーザがスクロールを止めて再開しているケースか、フラグ解除が早すぎる可能性が高いです。
+
+## 実装時のチェックリスト
+
+実装が終わったら、push 前に次の 4 点だけ手元で確認しておくと、本番でやらかすことが減ります。
+
+1. リストの初期件数が画面より少ない状態で開いて、最初の `loadNext` が呼ばれていないこと
+2. データ更新（pull-to-refresh など）の直後に `loadNext` が呼ばれていないこと
+3. タブを切り替えて戻ったときに `loadNext` が呼ばれていないこと
+4. 高速スクロールで末端に張り付いたとき、同一カーソルへのリクエストが 1 回しか飛ばないこと
+
+このうち 3 番は AdMob の収益にも直結するので、私の場合はリリース前に必ず手で触って確認しています。
+
+無限スクロールは「動いて見えるけど内部では暴走している」状態に陥りやすい機能です。`onEndReached` の挙動を理解して UI 側とフェッチ側で二重に防御を入れておくと、夜中にサーバログを見て青ざめる回数を確実に減らせます。お読みいただきありがとうございました。
