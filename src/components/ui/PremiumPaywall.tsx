@@ -111,7 +111,7 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
   };
 
   return (
-    <div
+    <div className="paywall"
       style={{
         position: "relative",
         marginTop: -200,

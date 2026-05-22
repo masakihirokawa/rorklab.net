@@ -161,6 +161,18 @@ export default async function ArticlePage({ params }: Props) {
       "@type": "SpeakableSpecification",
       cssSelector: ["h1", ".article-content h2", ".article-content p:first-of-type"],
     },
+    // Google Flexible Sampling: declare paywalled content properly
+    // https://developers.google.com/search/docs/appearance/structured-data/paywalled-content
+    ...(article.meta.premium ? {
+      isAccessibleForFree: false,
+      hasPart: {
+        "@type": "WebPageElement",
+        isAccessibleForFree: false,
+        cssSelector: ".paywall",
+      },
+    } : {
+      isAccessibleForFree: true,
+    }),
   };
 
   // BreadcrumbList for AI crawlers & Google rich results
