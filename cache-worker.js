@@ -10,7 +10,7 @@
 import nextHandler from "./.open-next/worker";
 
 // ── Config ──────────────────────────────────────────────────────
-const DEPLOY_VERSION = "2026-05-20-immutable-static-v2";
+const DEPLOY_VERSION = "2026-05-18-paywall-schema-fix";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 // ── __name polyfill (Turbopack / esbuild compat) ────────────────
