@@ -1,0 +1,289 @@
+---
+title: "Enforcing AI Cost Ceilings at Runtime — A Budget-Guard Architecture for Rork Apps"
+slug: "rork-ai-runtime-budget-enforcement-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-24T04:45"
+updated: "2026-05-24T04:45"
+author: "Rork Lab"
+description: "How to stop runaway AI bills not by optimizing, but by physically enforcing budget at runtime. An indie developer's three-layer architecture using Cloudflare Durable Objects, with hard-won lessons from running 50M-download apps."
+tags: ["Rork", "AI cost", "Cloudflare Workers", "Durable Objects", "Architecture", "Indie Dev", "Production"]
+highlights:
+  - "Three-layer (client / edge / origin) defense pattern with concrete code"
+  - "Per-user balance counters in Durable Objects with strong consistency — and why KV is not enough"
+  - "Tiered model downgrade pattern to protect subscription margins during cost spikes"
+---
+
+I'm Masaki Hirokawa. I've been shipping indie apps since 2014 and reached 50 million cumulative downloads across my AdMob-monetized portfolio. Earlier this year, one of my Rork-built apps surprised me with a monthly API bill 3.8x the projection. The cause was embarrassingly simple: a client-side retry loop ran overnight and burned through tens of thousands of tokens before sunrise.
+
+That morning I started treating "optimization" and "enforcement" as separate disciplines. Caching, prompt trimming, and on-device inference are all good ideas for lowering steady-state cost, but they cannot stop an incident. Only a runtime wall that physically refuses requests can do that. This article describes where I learned to place those walls, with concrete code in Cloudflare Workers, Durable Objects, and React Native.
+
+## Why Optimization Alone Cannot Prevent Cost Incidents
+
+Search the web and you'll find plenty of guides on AI cost optimization. They're all sound: token reduction, response caching, on-device inference. The problem is they describe steady-state efficiency, not where the system hard-stops during an anomaly.
+
+The three cost spikes I've personally observed in the last six months were:
+
+1. A client-side exponential backoff that didn't actually apply exponentiation due to a wrapper, so a single user retried thousands of times during an upstream incident
+2. An onboarding suggestion feature that fired 6 to 8 API calls per tap because of a UI race condition
+3. A leaked token from a deleted account being hammered by an external party at roughly 220 req/min
+
+Cache hit ratios cannot save you here. They're averaged metrics — they smooth over the very anomalies that bankrupt an indie operation. With monthly subscription revenue of ¥580 per user and an average AI cost of ¥65, my worst-case user once cost me ¥4,800 in a single month. Once that worst case slips past your ceiling, the loss is locked in. There is no business without enforcement.
+
+## Three Layers — Where Each Wall Goes
+
+A single point of enforcement always fails. Trust the client and someone tampers with the JS. Rely only on the edge and you still pay the egress for runaway requests. Lean on the origin (OpenAI, Anthropic) and you've burned everything between you and them.
+
+| Layer | Responsibility | Purpose | When it fires |
+| --- | --- | --- | --- |
+| Client | Pre-flight estimation, UI gating | Prevent unnecessary calls | Before the request |
+| Edge (Workers) | Per-user / per-app balance check | Block abuse and runaway | At request ingress |
+| Origin | Hard caps, model restrictions | Last-resort provider-side limit | At request arrival |
+
+In my operation, the client is the smartest layer (to protect UX), the edge is the strictest layer (to protect the business), and the origin is the simplest layer (to absolutely never let incidents through).
+
+## Layer 1: Client-Side Pre-Flight Estimation
+
+The client cannot be trusted, but it is still worth placing the first wall there for UX. If I can estimate token count before sending and compare it to a fetched remaining budget, the user can see "you have 8 calls left today" before tapping.
+
+```ts
+// src/lib/ai/estimate.ts
+import { encode } from "gpt-tokenizer";
+
+type EstimateInput = {
+  systemPrompt: string;
+  userPrompt: string;
+  maxOutputTokens: number;
+};
+
+export function estimateCostJpy(input: EstimateInput, model: "sonnet" | "haiku") {
+  const promptTokens = encode(input.systemPrompt + input.userPrompt).length;
+  // Reference rates as of 2026-05; refresh periodically
+  const rate = model === "sonnet"
+    ? { in: 0.45, out: 2.25 }  // JPY per 1K tokens
+    : { in: 0.12, out: 0.60 };
+  const inJpy = (promptTokens / 1000) * rate.in;
+  const outJpy = (input.maxOutputTokens / 1000) * rate.out;
+  return {
+    promptTokens,
+    estimatedJpy: Math.ceil((inJpy + outJpy) * 100) / 100,
+  };
+}
+```
+
+Wire this into your submit button and disable it when the estimate would push the user past their remaining budget. Edge rejection feels rough ("try it and see the error"), but client-side gating lets you say "you have 8 calls left today" gently. I measured `gpt-tokenizer`'s estimation error at ±6% in production, which is well within tolerance for premium-tier projections.
+
+## Layer 2: Per-User Balance at the Edge — Why KV Falls Short
+
+This is the real wall. Because the client is mutable, you need a strongly consistent counter at the edge. My first attempt used Cloudflare KV and it failed in a textbook way: KV is eventually consistent, so during a burst of requests the balance read was stale and the user blew through 3x the limit before the writes caught up.
+
+The right tool is **Durable Objects**. One DO per user means concurrent requests from that user are serialized inside that instance, giving you strong consistency for the counter. Minimal Hono setup:
+
+```ts
+// src/durable/userBudget.ts
+import { DurableObject } from "cloudflare:workers";
+
+const DEFAULT_DAILY_JPY = 80;
+const FALLBACK_SOFT_RATIO = 0.7;
+
+export class UserBudget extends DurableObject {
+  async tryReserve(estimatedJpy: number): Promise<{
+    ok: boolean;
+    remainingJpy: number;
+    suggestModel: "sonnet" | "haiku" | "deny";
+  }> {
+    const today = new Date().toISOString().slice(0, 10);
+    const key = `spent:${today}`;
+    const spent = (await this.ctx.storage.get<number>(key)) ?? 0;
+    const limit = (await this.ctx.storage.get<number>("limit")) ?? DEFAULT_DAILY_JPY;
+
+    if (spent + estimatedJpy > limit) {
+      return { ok: false, remainingJpy: Math.max(0, limit - spent), suggestModel: "deny" };
+    }
+    // Reservation; actual cost settled in finalize()
+    await this.ctx.storage.put(key, spent + estimatedJpy);
+    const suggestModel = (spent / limit) > FALLBACK_SOFT_RATIO ? "haiku" : "sonnet";
+    return { ok: true, remainingJpy: limit - spent - estimatedJpy, suggestModel };
+  }
+
+  async finalize(estimatedJpy: number, actualJpy: number) {
+    const today = new Date().toISOString().slice(0, 10);
+    const key = `spent:${today}`;
+    const spent = (await this.ctx.storage.get<number>(key)) ?? 0;
+    await this.ctx.storage.put(key, spent - estimatedJpy + actualJpy);
+  }
+}
+```
+
+Your Hono route queries that DO, calls the upstream if reserved, then reconciles with the real cost:
+
+```ts
+// src/index.ts (Workers)
+import { Hono } from "hono";
+import { Env } from "./env";
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/v1/chat", async (c) => {
+  const userId = c.req.header("x-user-id");
+  if (!userId) return c.json({ error: "unauth" }, 401);
+
+  const { estimatedJpy, messages } = await c.req.json();
+
+  const id = c.env.USER_BUDGET.idFromName(userId);
+  const stub = c.env.USER_BUDGET.get(id);
+  const reserve = await stub.tryReserve(estimatedJpy);
+
+  if (!reserve.ok) {
+    return c.json({
+      error: "budget_exceeded",
+      remainingJpy: reserve.remainingJpy,
+      hint: "You've reached today's AI quota. It resets at 0:00 local.",
+    }, 429);
+  }
+
+  const model = reserve.suggestModel === "haiku" ? "claude-haiku-4-5" : "claude-sonnet-4-6";
+  const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": c.env.ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ model, messages, max_tokens: 1024 }),
+  });
+
+  const result = await upstream.json<{ usage: { input_tokens: number; output_tokens: number } }>();
+  const actualJpy = computeJpyFromUsage(result.usage, model);
+  await stub.finalize(estimatedJpy, actualJpy);
+
+  return c.json({ result, remainingJpy: reserve.remainingJpy + estimatedJpy - actualJpy });
+});
+
+export default app;
+```
+
+The two-phase reservation matters. Reserving before the upstream call and reconciling after means a user firing several requests in parallel cannot double-spend. The DO's internal state is strongly consistent within a single instance, so you don't fight the lag you'd get with KV.
+
+## Layer 3: Aborting Mid-Stream, and the Cost of Stopping Too Late
+
+Streaming responses are tricky. Tokens flow while you're still measuring, so by the time you decide to abort you may already be past budget. Wait for completion and you overspend; abort immediately and UX suffers.
+
+I settled on a two-tier ceiling. The hard ceiling (say, 2,048 tokens per request) goes to the provider via `max_tokens`. The operational ceiling (remaining budget) is monitored at the edge during streaming.
+
+```ts
+// streamWithGuard.ts
+export async function streamWithGuard(
+  upstream: Response,
+  budget: { stub: DurableObjectStub; estimatedJpy: number; cancelAt: number },
+) {
+  const reader = upstream.body!.getReader();
+  let bytesRead = 0;
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      const { value, done } = await reader.read();
+      if (done) return controller.close();
+      bytesRead += value.byteLength;
+
+      // Re-check budget every ~5KB; cancel if projection exceeds cap
+      if (bytesRead % 5120 < value.byteLength) {
+        const proj = bytesRead / 1024 * 0.012; // rough JPY projection
+        if (proj > budget.cancelAt) {
+          await reader.cancel();
+          await budget.stub.finalize(budget.estimatedJpy, proj);
+          controller.close();
+          return;
+        }
+      }
+      controller.enqueue(value);
+    },
+  });
+
+  return new Response(stream, { headers: upstream.headers });
+}
+```
+
+A gotcha I hit: `reader.cancel()` does not instantly stop the provider's billing. The TCP close stops generation, but the tokens already produced are still billed. In production I budget a 1.08x safety multiplier in `finalize` because I measured 3–8% over-charge after cancellation.
+
+## Detecting Runaway Patterns Early
+
+I've seen three distinct runaway patterns, each needing a different detector.
+
+The first is the **client retry storm**, where exponential backoff fails because of an outer try/catch swallowing the delay. At the edge I keep a ring buffer in the DO: more than 30 requests from one userId in 60 seconds triggers an automatic 5-minute cooldown.
+
+The second is the **autosuggest race condition**, where input debouncing breaks across SDK versions and every keystroke calls the API. Detection is hard from outside, so I use a blunt threshold: more than 100 API calls in a single user session triggers a warning.
+
+The third is the **leaked-token attack**, which causes the worst dollar blow. I record `cf-connecting-ip` per request into the DO and force-revoke any token hit from more than 12 unique IPs within 24 hours. This actually fired once in early May and I caught a real attempt at 4 a.m.
+
+## Tiered Model Downgrade — Graceful Cost Compression
+
+It's far more humane to compress quality progressively than to slam the door. My production tiers:
+
+1. **0–50% spent**: Sonnet at full `max_tokens`
+2. **50–75%**: Sonnet at half `max_tokens` for less verbose output
+3. **75–95%**: Force downgrade to Haiku
+4. **>95%**: API calls blocked; serve only from cache
+
+Externalize the table so Firebase Remote Config can adjust thresholds per cohort. Premium subscribers get a 1.5x multiplier on these tiers in my setup.
+
+```ts
+const TIERS = [
+  { upto: 0.50, model: "sonnet", maxTokens: 1024 },
+  { upto: 0.75, model: "sonnet", maxTokens: 512 },
+  { upto: 0.95, model: "haiku",  maxTokens: 512 },
+  { upto: 1.00, model: "cache-only", maxTokens: 0 },
+];
+
+export function pickTier(spentRatio: number) {
+  return TIERS.find((t) => spentRatio <= t.upto) ?? TIERS[TIERS.length - 1];
+}
+```
+
+I originally went with a binary "all-on / all-off" design. Once I introduced staged downgrade, subscription cancellations from hitting the ceiling roughly halved. People accept a lighter answer far more readily than a closed door.
+
+## Failure UX — Stopping Quietly
+
+A hard wall is useless if it ruins the experience. Three things I always make sure of:
+
+First, **visualize remaining quota** — not "8 calls left" but "you've used 70% of today's AI." Concrete counts are misleading because request size varies.
+
+Second, **soften the refusal**. Returning 429 with "limit reached" is sterile. I always pair it with "resets at midnight local" and "Pro plan raises this limit 5x." This is the moment to offer the upgrade. My conversion to Pro from a quota wall sits at 4.2% — far higher than my generic CTA conversion.
+
+Third, **prefer staged fallback over a hard stop**. If Haiku can answer, return Haiku. The perceived quality drop in my usage is around 12%, low enough that average users don't notice.
+
+## Early-Warning Alerts and the Kill Switch
+
+The final layer is the human-asleep alert. Each DO writes `spent_jpy` per minute into Cloudflare Analytics Engine, and I run two windows: a 5-minute and a 1-hour aggregate.
+
+```sql
+-- Analytics Engine SQL (5-minute window)
+SELECT
+  toStartOfFiveMinutes(timestamp) AS bucket,
+  sum(spent_jpy) AS total
+FROM ai_spend
+WHERE timestamp >= now() - INTERVAL '1' HOUR
+GROUP BY bucket
+HAVING total > 800;  -- alert if 5-min total exceeds ¥800
+```
+
+A non-empty result pushes to Slack and onward to my Apple Watch. If the 1-hour window exceeds 4x the 7-day same-hour median, a shell script flips a Workers secret `AI_KILL_SWITCH=on` via `wrangler secret put` and freezes all AI features. Shutting things down is the last resort, but the business survives a frozen feature far better than a runaway bill.
+
+```bash
+# kill-switch.sh
+if [ "$(curl -s ... | jq '.alert')" = "true" ]; then
+  echo "on" | wrangler secret put AI_KILL_SWITCH --env production
+  curl -X POST $SLACK_HOOK -d '{"text":"🚨 AI kill-switch activated"}'
+fi
+```
+
+In six months of production, the kill switch has fired exactly once. That single fire saved roughly ¥38,000 in budget that month. For an indie developer whose cash flow is partly tied to art-practice expenses, that kind of safety valve is what keeps the business running through surprises.
+
+## What Three Decades of Indie Work Taught Me About Guards
+
+I started programming in 1997 at age 16, self-taught, and have been shipping personal apps since 2014. Some months AdMob revenue passes ¥1.5M; other months an AI cost surprise wipes out half the profit. After almost three decades of running small operations, what I've come to believe is that survival doesn't come from talent — it comes from quietly building the systems that absorb the unexpected.
+
+A budget-guard architecture is not glamorous. Nobody sees it, it doesn't lift subscription revenue, and it doesn't show up in screenshots. But it's the layer that lets me say yes to risky feature additions without losing sleep. As an artist as well as a developer, I've learned the same thing about good underpainting: the invisible layers are what make later freedom possible.
+
+Thank you for reading. I hope this helps anyone running indie operations at similar scale.

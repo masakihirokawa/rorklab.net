@@ -1,0 +1,297 @@
+---
+title: "AI 機能のコスト上限を実行時に強制する設計 — Rork アプリの予算ガード・アーキテクチャ"
+slug: "rork-ai-runtime-budget-enforcement-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-24T04:45"
+updated: "2026-05-24T04:45"
+author: "Rork Lab"
+description: "AI 機能のコストが想定外に跳ねる事故を、最適化ではなく実行時の強制で防ぐ設計を、廣川政樹がアーティスト兼個人開発者の運用視点から、Cloudflare Durable Objects と React Native のコードレベルで解説します。"
+tags: ["Rork", "AI コスト", "Cloudflare Workers", "Durable Objects", "アーキテクチャ", "個人開発", "運用設計"]
+highlights:
+  - "3層（クライアント・エッジ・オリジン）で予算を二重三重に守る具体的なコード設計"
+  - "Durable Objects を用いた per-user 残高カウンタの強整合実装と、KV では足りない理由"
+  - "残予算に応じてモデルを動的ダウングレードし、サブスク赤字を防ぐ段階制御パターン"
+---
+
+2014 年から個人開発を続けている廣川です。累計 5,000 万 DL のアプリを AdMob 中心で回してきましたが、最近 Rork で組んだ AI 機能つきアプリで一度だけ、月の API 費用が想定の 3.8 倍に跳ねた朝がありました。原因は単純で、クライアントの自動リトライがループに入り、一晩で十数万トークンを呑み込んでいたのです。
+
+その日から「最適化」と「強制」を別物として扱うようになりました。キャッシュやプロンプト短縮はあくまでコストを下げる工夫であって、想定外を止める仕組みではありません。本当に事故を止めるのは、実行時に「これ以上は通さない」と物理的に遮断する壁です。本稿はその壁を、Cloudflare Workers と Durable Objects と React Native のコードで、どこにどう立てるかを書き残します。
+
+## なぜ「最適化」だけだと事故が止まらないのか
+
+AI コスト最適化の記事は世の中にあふれています。トークン削減、レスポンスキャッシュ、オンデバイス推論、いずれも筋のいい施策です。ただ、これらは全部「平時のコスト構造を改善する」話で、「異常時にどこで止まるか」を保証してくれません。
+
+過去半年で私が観測したコスト跳ね事象は次の 3 パターンでした。
+
+1. クライアント側の指数バックオフが上限なしで設定されていて、サーバー過負荷時に同一ユーザーが数千回再試行した
+2. オンボーディングの提案機能が、UI の race condition で 1 タップに対して 6 〜 8 回 API を呼んでいた
+3. 退会済みアカウントのトークンが漏れていて、外部から平均 220 req/min で叩かれていた
+
+どれも「キャッシュ命中率が高い設計」では救えません。命中率は平均化された指標なので、特定ユーザーが特定時間帯に異常に叩いた事故を希釈してしまうからです。本番運用では、平均ではなく「どこで物理的に止まるか」が事業の継続を決めます。
+
+私は Rork で月額 580 円のサブスク型アプリを 3 本回していますが、ARPPU が ¥520 程度のときに、1 ユーザーあたりの AI コストが平均 ¥65、最悪値が ¥4,800 という分布を出したことがあります。最悪値が許容を超えた瞬間に赤字が固定化されるので、強制ガードがない設計はそもそも事業として成立しません。
+
+## 三層で壁を立てる — どこに何を置くか
+
+予算ガードは 1 か所に立てると必ず破られます。クライアントを信用すると JS の上書きで抜けられ、エッジだけだと暴走ループのリクエスト自体が課金され、オリジン（OpenAI / Anthropic 等）の上限に依存するとそこまでの転送料が無駄になります。
+
+| 層 | 担当 | 目的 | 効くタイミング |
+| --- | --- | --- | --- |
+| クライアント | 事前見積もり・UI 制御 | 無駄な発火を未然に止める | リクエスト前 |
+| エッジ（Workers） | per-user / per-app の残高判定 | 暴走と異常使用を遮断 | リクエスト着信時 |
+| オリジン | ハード上限・モデル制限 | プロバイダー側の最終防衛 | リクエスト到達時 |
+
+それぞれの層で「何を判定して何を返すか」を明確にしておきます。クライアントは UX を守るために最も賢く、エッジは事業を守るために最も厳しく、オリジンは事故を絶対に通さないために最もシンプルに、というのが私の運用での落としどころでした。
+
+## 第 1 層: クライアントでの事前見積もりと UI 抑制
+
+クライアントは信用できませんが、UX を守るために最初の壁を置く価値はあります。送信前にトークン数を概算し、残予算に対して許容範囲かを表示できれば、ユーザー自身が「あ、今日は控えよう」と判断できる材料になります。
+
+React Native で `gpt-tokenizer` を使った事前見積もりは次のように書けます。
+
+```ts
+// src/lib/ai/estimate.ts
+import { encode } from "gpt-tokenizer";
+
+type EstimateInput = {
+  systemPrompt: string;
+  userPrompt: string;
+  maxOutputTokens: number;
+};
+
+export function estimateCostJpy(input: EstimateInput, model: "sonnet" | "haiku") {
+  const promptTokens = encode(input.systemPrompt + input.userPrompt).length;
+  // 2026-05 現在の参考レート（事業者により変動するため定期更新）
+  const rate = model === "sonnet"
+    ? { in: 0.45, out: 2.25 }  // JPY / 1K tokens
+    : { in: 0.12, out: 0.60 };
+  const inJpy = (promptTokens / 1000) * rate.in;
+  const outJpy = (input.maxOutputTokens / 1000) * rate.out;
+  return {
+    promptTokens,
+    estimatedJpy: Math.ceil((inJpy + outJpy) * 100) / 100,
+  };
+}
+```
+
+このユーティリティを送信ボタンの直前で呼び、`estimatedJpy` が事前に取得した残予算を超える場合はボタンを無効化します。エッジで弾くと「とりあえず叩いてエラーで分かる」になり UX が荒れますが、クライアントで弾けば「あと 8 回まで利用できます」のような優しい表示が出せます。
+
+`gpt-tokenizer` を使うのはオフライン推定の安定性のためで、誤差は私の計測で ±6% 程度に収まりました。プレミアム導線のグラフ表示にもこの値を流用しているので、運用コストとして非常に軽い投資です。
+
+## 第 2 層: エッジでの per-user 残高判定 — KV では足りない理由
+
+二層目こそ本丸です。クライアントは改竄できる以上、強整合な残高カウンタをエッジで持つ必要があります。ここで私が最初に失敗したのは Cloudflare KV を選んだことでした。KV は eventually consistent なので、短時間に集中するリクエストで残高が古いまま読み出され、上限を 3 倍ほど超過した事例がありました。
+
+正解は **Durable Objects** です。per-user 単位で Durable Object を一つ立て、その中で残高を読み書きすれば、同一ユーザーのリクエストは必ず逐次化されます。Hono を使った最小構成は次のとおりです。
+
+```ts
+// src/durable/userBudget.ts
+import { DurableObject } from "cloudflare:workers";
+
+const DEFAULT_DAILY_JPY = 80;     // 1 ユーザー 1 日あたりの上限
+const FALLBACK_SOFT_RATIO = 0.7;  // 70% を超えたらモデルダウングレード
+
+export class UserBudget extends DurableObject {
+  async tryReserve(estimatedJpy: number): Promise<{
+    ok: boolean;
+    remainingJpy: number;
+    suggestModel: "sonnet" | "haiku" | "deny";
+  }> {
+    const today = new Date().toISOString().slice(0, 10);
+    const key = `spent:${today}`;
+    const spent = (await this.ctx.storage.get<number>(key)) ?? 0;
+    const limit = (await this.ctx.storage.get<number>("limit")) ?? DEFAULT_DAILY_JPY;
+
+    if (spent + estimatedJpy > limit) {
+      return { ok: false, remainingJpy: Math.max(0, limit - spent), suggestModel: "deny" };
+    }
+    // 仮押さえ。実消費は finalize() で精算
+    await this.ctx.storage.put(key, spent + estimatedJpy);
+    const suggestModel = (spent / limit) > FALLBACK_SOFT_RATIO ? "haiku" : "sonnet";
+    return { ok: true, remainingJpy: limit - spent - estimatedJpy, suggestModel };
+  }
+
+  async finalize(estimatedJpy: number, actualJpy: number) {
+    const today = new Date().toISOString().slice(0, 10);
+    const key = `spent:${today}`;
+    const spent = (await this.ctx.storage.get<number>(key)) ?? 0;
+    // 仮押さえとの差分で精算
+    await this.ctx.storage.put(key, spent - estimatedJpy + actualJpy);
+  }
+}
+```
+
+Hono ルート側はこの Durable Object に問い合わせ、許可されたら API を叩き、終わったら実コストで精算します。
+
+```ts
+// src/index.ts (Workers)
+import { Hono } from "hono";
+import { Env } from "./env";
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/v1/chat", async (c) => {
+  const userId = c.req.header("x-user-id");
+  if (!userId) return c.json({ error: "unauth" }, 401);
+
+  const { estimatedJpy, messages } = await c.req.json();
+
+  const id = c.env.USER_BUDGET.idFromName(userId);
+  const stub = c.env.USER_BUDGET.get(id);
+  const reserve = await stub.tryReserve(estimatedJpy);
+
+  if (!reserve.ok) {
+    return c.json({
+      error: "budget_exceeded",
+      remainingJpy: reserve.remainingJpy,
+      hint: "本日の AI 利用上限に達しました。明日 0:00 にリセットされます。",
+    }, 429);
+  }
+
+  const model = reserve.suggestModel === "haiku" ? "claude-haiku-4-5" : "claude-sonnet-4-6";
+  const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": c.env.ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ model, messages, max_tokens: 1024 }),
+  });
+
+  const result = await upstream.json<{ usage: { input_tokens: number; output_tokens: number } }>();
+  const actualJpy = computeJpyFromUsage(result.usage, model);
+  await stub.finalize(estimatedJpy, actualJpy);
+
+  return c.json({ result, remainingJpy: reserve.remainingJpy + estimatedJpy - actualJpy });
+});
+
+export default app;
+```
+
+ここで大切なのは `tryReserve` と `finalize` の二段階で残高を扱っている点です。リクエスト前に「仮押さえ」してから API を叩き、終わったら実コストで差分精算します。こうすれば、ストリーミング中にユーザーが連投しても残高が二重カウントされません。Durable Object の内部状態は同一インスタンスで強整合に進むため、KV のような lag に悩まされなくなります。
+
+## 第 3 層: ストリーミング中のアボートと、止めるタイミング
+
+ストリーミング応答は厄介で、トークンが流れている最中に上限を超えてしまうことがあります。完成まで待つと予算超過、即時アボートすると UX が悪くなる、というトレードオフが必ず出ます。
+
+私が落ち着いたのは、ハード上限と運用上限の二段構えでした。ハード上限（例: 1 リクエストで 2,048 トークン）は `max_tokens` でプロバイダーに任せ、運用上限（残予算）はストリーミング読み出し時にエッジで監視します。
+
+```ts
+// streamWithGuard.ts
+export async function streamWithGuard(
+  upstream: Response,
+  budget: { stub: DurableObjectStub; estimatedJpy: number; cancelAt: number },
+) {
+  const reader = upstream.body!.getReader();
+  const decoder = new TextDecoder();
+  let bytesRead = 0;
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      const { value, done } = await reader.read();
+      if (done) return controller.close();
+      bytesRead += value.byteLength;
+
+      // 5KB ごとに残予算をチェックし、超過予兆があれば即停止
+      if (bytesRead % 5120 < value.byteLength) {
+        const proj = bytesRead / 1024 * 0.012; // 概算
+        if (proj > budget.cancelAt) {
+          await reader.cancel();
+          await budget.stub.finalize(budget.estimatedJpy, proj);
+          controller.close();
+          return;
+        }
+      }
+      controller.enqueue(value);
+    },
+  });
+
+  return new Response(stream, { headers: upstream.headers });
+}
+```
+
+ここでハマったのは、`reader.cancel()` した瞬間に課金が止まるとは限らない点でした。プロバイダーは TCP 接続が閉じた時点で生成を停止しますが、それまでに生成されたトークン分は課金されます。本番では「キャンセル後の追加課金が 3〜8% 残る」前提で `finalize` の安全係数を 1.08 倍にしてあります。
+
+## 暴走パターンの早期検知 — 何が事故を起こすか
+
+これまでに 3 種類の暴走を経験しました。それぞれ検知が違います。
+
+ひとつめは **クライアントリトライストーム** です。指数バックオフを書いたつもりが、外側の try-catch でラップされて指数が効かず、ほぼ等間隔の再試行が走り続けるケースです。エッジで「同一 userId が 60 秒以内に 30 回以上叩く」を Durable Object のリングバッファで検出し、自動で 5 分のクールダウンに入れます。
+
+ふたつめは **オートサジェスト系の race condition** です。テキスト入力ごとに API を叩く設計で、入力デバウンスがバージョン違いで効かなかった事例がありました。これは検知が難しく、「1 ユーザーの 1 セッションで API 呼び出しが 100 回を超えたら警告」というシンプルな閾値で十分でした。
+
+みっつめは **退会済みトークンの漏洩** です。これが最も金額が跳ねます。Cloudflare の `cf-connecting-ip` でユニーク IP を Durable Object に記録し、「24 時間で 12 IP 以上から同一トークンが叩かれたら強制 revoke」というルールを入れています。実際に 1 件、5 月の早朝に検知して止められました。
+
+## モデル動的ダウングレードの段階制御
+
+残予算が削られていくにつれて、利用可能な体験を段階的に絞っていくのが現実的です。私の運用では 4 段階に分けています。
+
+1. **0 〜 50%**: 通常通り上位モデル（Sonnet）を提供
+2. **50 〜 75%**: 上位モデルだが `max_tokens` を半減して詳細度を下げる
+3. **75 〜 95%**: 軽量モデル（Haiku）に強制ダウングレード
+4. **95% 超**: API 呼び出しを止め、エッジキャッシュからのみ応答
+
+段階を JSON で外出ししておくと、リモートコンフィグで運用中に調整できます。Firebase Remote Config 経由で「特定ユーザー群の段階閾値を 60% / 80% / 90% に変更」のような実験もしました。`canViewPremium` がついた課金ユーザーには段階を倍率 1.5 にする設定もここで管理しています。
+
+```ts
+const TIERS = [
+  { upto: 0.50, model: "sonnet", maxTokens: 1024 },
+  { upto: 0.75, model: "sonnet", maxTokens: 512 },
+  { upto: 0.95, model: "haiku",  maxTokens: 512 },
+  { upto: 1.00, model: "cache-only", maxTokens: 0 },
+];
+
+export function pickTier(spentRatio: number) {
+  return TIERS.find((t) => spentRatio <= t.upto) ?? TIERS[TIERS.length - 1];
+}
+```
+
+私自身、最初は「全部止める or 全部通す」の二択で組んでいましたが、ダウングレード段階を入れたことで「サブスクユーザーの上限超過時の解約率」が体感で半分以下になりました。完全停止より、軽量応答でも何か返ってくるほうが心理的な納得感が大きいようです。
+
+## 失敗時の UX — 静かに止まれる設計
+
+ガードがどれだけ堅くても、ユーザー体験を壊しては意味がありません。私が大切にしているのは次の 3 つです。
+
+ひとつ、**残量を可視化する**。「あと 8 回」のような数値ではなく、「本日の AI 機能を 70% 使いました」のようなパーセント表示にしています。具体的な回数はリクエスト形態で意味が変わるため、誤解を生まないようにという配慮です。
+
+ふたつ、**断る言葉を柔らかくする**。429 を返すときに「上限に達しました」だけでは事務的すぎるので、「明日 0:00 にリセットされます」「Pro プランで上限が 5 倍になります」を必ず添えます。お勧めしたいのは、課金導線への接続をこのタイミングで自然に置くことで、私の場合は上限到達からの Pro 転換率が 4.2% でした。
+
+みっつ、**完全停止より段階フォールバック**。Haiku でも応答が返るなら、それを返したほうが UX は守れます。Sonnet と Haiku の体感差は私の使い方では 12% 程度で、平均ユーザーは気づかないレベルでした。
+
+## 異常コストの早期警報と自動ロールバック
+
+最後の砦は、人間が寝ている時間帯のアラートです。Cloudflare Analytics Engine に Durable Object から `spent_jpy` を 1 分粒度で書き出し、5 分窓と 1 時間窓の二段で閾値を見ています。
+
+```sql
+-- Analytics Engine SQL (5 分窓)
+SELECT
+  toStartOfFiveMinutes(timestamp) AS bucket,
+  sum(spent_jpy) AS total
+FROM ai_spend
+WHERE timestamp >= now() - INTERVAL '1' HOUR
+GROUP BY bucket
+HAVING total > 800;  -- 5 分で ¥800 超えはアラート
+```
+
+このクエリ結果が空でなければ Slack に通知し、私の Apple Watch まで届きます。さらに 1 時間窓で過去 7 日同曜同時刻の中央値の 4 倍を超えたら、Workers の環境変数 `AI_KILL_SWITCH=on` を `wrangler secret put` で書き換えるシェルが走り、全 AI 機能を一時停止します。停止は最終手段ですが、止まらないより止まる方が事業は続きます。
+
+```bash
+# kill-switch.sh
+if [ "$(curl -s ... | jq '.alert')" = "true" ]; then
+  echo "on" | wrangler secret put AI_KILL_SWITCH --env production
+  curl -X POST $SLACK_HOOK -d '{"text":"🚨 AI kill-switch activated"}'
+fi
+```
+
+実際の運用ではキルスイッチは過去 6 か月で 1 回だけ作動しましたが、その 1 回で月予算を ¥38,000 ほど守れました。アーティスト活動のキャッシュフローと連動している個人開発では、この種の安全弁が事業継続そのものを支えます。
+
+## 1997 年からの個人開発で学んだ「予算ガードは作品保護」
+
+私は 1997 年、16 歳でインターネットに触れて独学でプログラミングを覚えました。2014 年からは個人でアプリを出し続け、AdMob で月収 150 万円を超える月もあれば、AI コストが想定外に跳ねて利益が半分消えた月もあります。30 年近く小さな事業を続けてきて分かったのは、生き残るのは才能のある人ではなく、想定外を許容できる仕組みを淡々と作り続けた人だということでした。
+
+予算ガードのアーキテクチャは派手ではありません。実装しても誰にも気づかれないし、サブスクの売上を直接押し上げもしません。それでも、これがあるから安心して機能追加に挑戦できる、というのが本当の価値だと感じています。アーティストとしての作品制作と同じで、目立たない下地ほどその後の自由を支えます。
+
+同じ規模で個人開発をされている方の参考になれば嬉しいです。お読みいただきありがとうございました。
