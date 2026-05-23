@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX2026 — Rork Max が 2026年2月にローンチ、React Native ではなくネイティブ Swift アプリビルダーとして Apple 全エコシステムへ対応",
-    "ARR15M — Rork Max ローンチから 3日 で ARR $1.5M を突破、Left Lane Capital リードで $15M シード調達済み",
-    "VISIONPRO — Rork Max が Vision Pro / Apple Watch / Apple TV / iMessage / iPad / iPhone に正式対応、AR・LiDAR・Metal を一気通貫で利用可能",
-    "HEALTHKIT — HealthKit・HomeKit・NFC・App Clips・Core ML on-device ML までネイティブ機能をブラウザ完結で実装可能に",
-    "CLOUDMAC — Rork Max は cloud Mac fleet で Swift コードをコンパイル、ストリーミングシミュレータでブラウザ内アプリ実行を実現",
-    "PAPERLINE — Rork が アプリビルダー Paperline を買収、エンジニア人材を取り込み AI ネイティブ開発体制を強化",
+    "SEED15M — Rork が $15M シードラウンド調達、Left Lane Capital がリード・a16z 継続出資（4月）",
+    "RORKMAX — Rork Max が native Swift アプリ生成、iPhone/iPad/Watch/TV/Vision Pro 全対応（2月）",
+    "CLOUDMAC — Rork Max がクラウド Mac fleet で native コンパイル、Xcode・Mac 不要に（2月）",
+    "GROWTH743K — Rork が月間 743,000 訪問・成長率 85% に到達、ノーコード AI 市場で急成長（4月）",
+    "AISTUDIOAND — Google AI Studio が native Android アプリ生成に対応、競合環境が激化（5/19）",
+    "MIGRATION — Android Studio Migration Assistant、React Native→Kotlin 移行が週→時間に（5/19）",
   ],
   en: [
-    "MAX2026 — Rork Max launched in February 2026 as a native Swift app builder that ships across the entire Apple ecosystem instead of React Native",
-    "ARR15M — Rork Max hit $1.5M ARR within three days of launch and closed a $15M seed led by Left Lane Capital",
-    "VISIONPRO — Rork Max now targets Vision Pro, Apple Watch, Apple TV, iMessage, iPad, and iPhone with first-class AR, LiDAR, and Metal support",
-    "HEALTHKIT — HealthKit, HomeKit, NFC, App Clips, and on-device Core ML are all available in-browser without leaving the Rork Max workflow",
-    "CLOUDMAC — Rork Max compiles Swift on a cloud Mac fleet and streams a live simulator into your browser so you never install Xcode",
-    "PAPERLINE — Rork acquired app builder Paperline to bring in engineering talent and accelerate its AI-native development stack",
+    "SEED15M — Rork raises $15M seed led by Left Lane Capital, a16z continues backing (Apr)",
+    "RORKMAX — Rork Max generates native Swift apps for iPhone/iPad/Watch/TV/Vision Pro (Feb)",
+    "CLOUDMAC — Rork Max compiles natively on cloud Mac fleet, no Xcode or Mac required (Feb)",
+    "GROWTH743K — Rork hits 743K monthly visits with 85% growth in no-code AI market (Apr)",
+    "AISTUDIOAND — Google AI Studio now generates native Android apps, competition intensifies (5/19)",
+    "MIGRATION — Android Studio Migration Assistant cuts React Native to Kotlin port to hours (5/19)",
   ],
 };
 
