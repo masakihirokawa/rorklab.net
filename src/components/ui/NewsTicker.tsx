@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SEED15M — Rork が $15M シードラウンド調達、Left Lane Capital がリード・a16z 継続出資（4月）",
-    "RORKMAX — Rork Max が native Swift アプリ生成、iPhone/iPad/Watch/TV/Vision Pro 全対応（2月）",
-    "CLOUDMAC — Rork Max がクラウド Mac fleet で native コンパイル、Xcode・Mac 不要に（2月）",
-    "GROWTH743K — Rork が月間 743,000 訪問・成長率 85% に到達、ノーコード AI 市場で急成長（4月）",
-    "AISTUDIOAND — Google AI Studio が native Android アプリ生成に対応、競合環境が激化（5/19）",
-    "MIGRATION — Android Studio Migration Assistant、React Native→Kotlin 移行が週→時間に（5/19）",
+    "SEED15M — Rork が $15M シードラウンド調達、Left Lane Capital リード・a16z 継続出資（4月）",
+    "RORKMAX — Rork Max が native Swift アプリ生成、iPhone/iPad/Watch/TV/Vision Pro/iMessage を全網羅（2月〜）",
+    "NATIVEAPI — Rork Max が AR/LiDAR・Dynamic Island・Live Activities・HealthKit・HomeKit・Core ML を解禁、RN では不可だった機能に到達（2026）",
+    "COMPANION — Rork Companion アプリで Apple Developer 未契約でも実機テスト可、2クリックで App Store 配信（2026）",
+    "GROWTH743K — Rork 月間 743,000 訪問・成長率 85%、Paperline 買収で人材取り込みも加速（4月）",
+    "AISTUDIOAND — Google AI Studio が native Android 生成に参入、ノーコード AI 競争が一段加速（5/19）",
   ],
   en: [
-    "SEED15M — Rork raises $15M seed led by Left Lane Capital, a16z continues backing (Apr)",
-    "RORKMAX — Rork Max generates native Swift apps for iPhone/iPad/Watch/TV/Vision Pro (Feb)",
-    "CLOUDMAC — Rork Max compiles natively on cloud Mac fleet, no Xcode or Mac required (Feb)",
-    "GROWTH743K — Rork hits 743K monthly visits with 85% growth in no-code AI market (Apr)",
-    "AISTUDIOAND — Google AI Studio now generates native Android apps, competition intensifies (5/19)",
-    "MIGRATION — Android Studio Migration Assistant cuts React Native to Kotlin port to hours (5/19)",
+    "SEED15M — Rork closes $15M seed led by Left Lane Capital, with continued backing from a16z (Apr)",
+    "RORKMAX — Rork Max generates native Swift apps across iPhone, iPad, Watch, TV, Vision Pro, and iMessage (Feb onward)",
+    "NATIVEAPI — Rork Max unlocks AR/LiDAR, Dynamic Island, Live Activities, HealthKit, HomeKit, and Core ML — capabilities React Native could not reach (2026)",
+    "COMPANION — Rork Companion app lets builders test on real iPhones without a paid Apple Developer account, two-click App Store publish supported (2026)",
+    "GROWTH743K — Rork hits 743K monthly visits at 85% growth, accelerated by the Paperline acquisition for talent (Apr)",
+    "AISTUDIOAND — Google AI Studio enters native Android generation, raising the no-code AI competition another notch (5/19)",
   ],
 };
 
