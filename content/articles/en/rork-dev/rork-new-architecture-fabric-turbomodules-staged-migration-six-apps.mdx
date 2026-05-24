@@ -1,0 +1,193 @@
+---
+title: "Staged migration of a Rork-generated RN project to the New Architecture — notes from running six wallpaper apps in parallel"
+slug: "rork-new-architecture-fabric-turbomodules-staged-migration-six-apps"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-24T04:45"
+author: "Rork Lab"
+description: "An implementation log for incrementally enabling Fabric and TurboModules on a Rork-generated React Native project, validated in parallel across six wallpaper apps. Covers flag design, compatibility triage, and KPI comparison based on actual production data."
+tags: ["Rork", "React Native", "New Architecture", "Fabric", "TurboModules", "Hermes", "Staged Rollout"]
+highlights:
+  - "A step-by-step setup for introducing the `newArchEnabled` flag into a freshly generated Rork project using expo-build-properties"
+  - "A decision flow for wrapping non-Fabric legacy native modules through the Interop Layer while tracking remaining risk"
+  - "A KPI comparison template covering cold-start, JS-thread load, and crash rate across six wallpaper apps over two-week cycles"
+---
+
+I'm Masaki Hirokawa, an independent app developer who has been shipping iOS and Android apps since 2014. The React Native projects that Rork generates are a wonderful starting point, but every time I take one toward production I run into the same question: when should I enable React Native's New Architecture — Fabric, TurboModules, and Bridgeless mode? In this note I'll walk through how I staged that migration across my own catalog of wallpaper apps. With more than 50 million cumulative downloads spread across six titles, I never had the courage to flip a single flag for all of them at once. What worked instead was breaking the risk into smaller pieces and lining everything up so I could compare numbers honestly.
+
+## Why I call this a "staged introduction" rather than a "migration"
+
+React Native's New Architecture is the kind of change that feels like flipping a single switch — bridge gone, Fabric in, TurboModules everywhere. From the operator's side though, that one switch hides a lot of subtlety. My layered stack on top of Rork's scaffolding includes AdMob, Firebase, Skia, Reanimated, MMKV, and AppLovin MAX, replicated across six apps. I learned the hard way that turning `newArchEnabled = true` in a single push can silently break a non-Fabric native module during launch, and I sometimes didn't notice until TestFlight builds were already going out.
+
+So in my own docs I now use the phrase "staged introduction" instead of "migration." I split it into four phases:
+
+1. Baseline measurement — keep Old Architecture and measure cold start, JS-thread load, and crash rate for two weeks.
+2. Flag plumbing — make `newArchEnabled` switchable per build via `expo-build-properties`.
+3. Canary rollout — pick the lowest-DAU app of the six and let it ride internal + TestFlight builds for a week.
+4. Horizontal expansion — promote apps one by one if KPIs are at least equivalent, roll back if anything regresses.
+
+It sounds like a simple rule — "don't switch every production app at once" — but operationally that's the part that matters most. Rork's generated code is typically clean enough for the New Architecture; almost everything that breaks lives in the native dependencies I added on top later.
+
+## Step 1: How to gather baseline numbers
+
+The baseline phase can stay on Old Architecture. Skipping this step is what leads to the vague "feels faster but I can't prove it" kind of decision later. I aim for at least 14 consecutive days of measurement.
+
+I lock the measurement to these five signals:
+
+- Cold start: Firebase Performance Monitoring's `_app_start` at p50 and p95
+- JS-thread load: 30 samples of the primary navigation flow with the Hermes profiler
+- Native memory: same scenario three times under Xcode Instruments and Android Profiler
+- Crash rate: Crashlytics' Crash-free users for the trailing 14 days
+- ANR rate (Android): the 7-day median from Play Console's Android Vitals
+
+I paste these five into a Notion table and append the same columns every two weeks afterward. Locking the format up front saves a surprising amount of time when comparing notes — nobody has to argue about what each number means.
+
+## Step 2: A flag that flips `newArchEnabled` per build
+
+Starting from the `app.config.ts` Rork generates, I inject the New Architecture flag through `expo-build-properties`. I keep that plugin block isolated from optimizations like `enableProguardInReleaseBuilds`, because mixing those would blur what I'm actually rolling back when something breaks.
+
+```ts
+// app.config.ts
+import type { ExpoConfig } from "expo/config";
+
+const enableNewArch = process.env.NEW_ARCH === "1";
+
+const config: ExpoConfig = {
+  name: "WallpaperApp",
+  slug: "wallpaper-app",
+  plugins: [
+    [
+      "expo-build-properties",
+      {
+        ios: {
+          newArchEnabled: enableNewArch,
+          deploymentTarget: "15.1",
+        },
+        android: {
+          newArchEnabled: enableNewArch,
+          minSdkVersion: 24,
+          compileSdkVersion: 35,
+          targetSdkVersion: 35,
+        },
+      },
+    ],
+  ],
+  ios: { bundleIdentifier: "com.dolice.wallpaperapp" },
+  android: { package: "com.dolice.wallpaperapp" },
+};
+
+export default config;
+```
+
+On the CI side I let branches pass `NEW_ARCH=1`. I use EAS Build, so I keep two profiles — `production` and `production-newarch` — running in parallel. That means two AAB/IPA streams per app while a rollout is in flight, which I accept only for the duration of the experiment.
+
+```jsonc
+// eas.json (excerpt)
+{
+  "build": {
+    "production": {
+      "channel": "production",
+      "env": { "NEW_ARCH": "0" }
+    },
+    "production-newarch": {
+      "channel": "production-newarch",
+      "env": { "NEW_ARCH": "1" }
+    }
+  }
+}
+```
+
+One thing that bit me: Hermes bytecode caches are not compatible between Old and New. If you don't split channels, an EAS Update can push a JS bundle into "the wrong architecture at runtime" and you get a white screen on launch. Splitting channels feels like extra work, but once it's done a rollback is literally a one-line channel swap.
+
+## Step 3: Wrapping non-Fabric modules through the Interop Layer
+
+The phase that eats the most time during staged introduction is triaging your own native modules and third-party libraries for Fabric/TurboModule readiness. React Native 0.74+ ships the Interop Layer, which keeps legacy Native Modules and legacy UIManager-based components alive for a while — but that compatibility layer costs you some startup time.
+
+My triage flow is three steps:
+
+1. `grep` the upstream repo for `RCT_NEW_ARCH_ENABLED` — should take under a minute.
+2. If it's there, bump to the latest npm release, then re-run `RCT_NEW_ARCH_ENABLED=1 pod install`.
+3. If it isn't, leave it on the Interop Layer for now and log a replacement candidate in a tracker.
+
+That tracker lives in a Notion database with five columns: library name / compatibility status / dropped frames via Interop / replacement candidate / deadline. I cap the deadline at 90 days. If a library passes that mark, I start peeling it out, beginning from the smallest-DAU app first.
+
+As a concrete example, here's the Codegen flow for a small TurboModule I wrote myself. With the spec file alone Codegen takes care of the scaffolding, and if I keep the custom logic behind `requireNativeModule` calls, switching between Old and New stays manageable.
+
+```ts
+// specs/NativeWallpaperGallery.ts
+import type { TurboModule } from "react-native";
+import { TurboModuleRegistry } from "react-native";
+
+export interface Spec extends TurboModule {
+  pickWallpaper(category: string): Promise<{ uri: string; width: number; height: number }>;
+  scheduleDailyRotation(hourJst: number): Promise<boolean>;
+}
+
+export default TurboModuleRegistry.getEnforcing<Spec>("WallpaperGallery");
+```
+
+```ts
+// src/lib/wallpaperGallery.ts
+import NativeWallpaperGallery from "../../specs/NativeWallpaperGallery";
+
+export async function pickTodayWallpaper(category: string) {
+  return NativeWallpaperGallery.pickWallpaper(category);
+}
+```
+
+Standardizing on the Codegen-produced types makes it easier to keep the same interface even when you need an Old Architecture fallback. In my own apps I found that checking `global?.RN$Bridgeless` at startup was more reliable than branching on `Platform.constants.reactNativeVersion?.minor`. Once you know you're Bridgeless, you can confidently push UI code toward Reanimated over `Animated`, or pivot from `SectionList` to a Fabric-optimized `FlashList`.
+
+```ts
+// src/lib/runtime.ts
+export const isBridgeless: boolean =
+  // @ts-expect-error: New Architecture only
+  typeof globalThis.RN$Bridgeless === "boolean" ? globalThis.RN$Bridgeless : false;
+
+export function selectListComponent<T>() {
+  // Under Bridgeless, FlashList keeps initial-scroll jank meaningfully lower.
+  return isBridgeless ? "FlashList" : "FlatList";
+}
+```
+
+## Step 4: Running two-week KPI cycles across six wallpaper apps
+
+Once a canary app has finished its one-week window, I evaluate the four axes side by side with the old build. In my measurements, apps built on Rork's scaffold with Skia and Reanimated on top showed the early-second-of-launch JS task cluster easing up after Bridgeless was on — p95 cold start tends to shorten by roughly 12 to 18%. Apps running AppLovin MAX through AdMob mediation, on the other hand, occasionally saw banner initialization pulled forward into the main thread right after the switch, which temporarily pushed CPU usage during the first three seconds up by 6 to 9 points.
+
+I keep the evaluation in a table like the one below. Setting the thresholds for what counts as "equivalent" up front is just as important as collecting the numbers. My fixed rules are: "fail if p95 cold start regresses by 5% or more" and "fail if Crash-free drops by 0.3 points or more."
+
+| Metric | Old Architecture (avg) | New Architecture (avg) | Pass criterion |
+|---|---|---|---|
+| Cold start p50 (Android Pixel 6) | ~820 ms | ~740 ms | Pass at >=5% improvement |
+| Cold start p95 (iPhone 12) | ~1,420 ms | ~1,190 ms | Allow at <=5% regression |
+| Crash-free users (14 days) | 99.62% | 99.71% | Stay within 0.3 pt |
+| ANR rate (Android) | 0.18% | 0.14% | Stay within 0.05 pt |
+| AdMob impressions / DAU | 6.2 | 6.1 | Stay within 5% |
+
+Those numbers come from one representative title in my six-app wallpaper portfolio (the Beautiful HD Wallpapers family). The absolute values will vary with each app's profile — what matters is the structure of putting Old and New on the same axes before making a call.
+
+## Designing the rollback and "how to stop a canary"
+
+The scariest failure mode during staged introduction is delaying the stop signal on a canary until every other app waiting in line is also affected. In my setup, the decision to stop is handed to a human via Slack rather than to CI. Crashlytics Velocity Alerts and Play Console ANR notifications are routed into `#alerts-newarch`, and the runbook says I have to roll the canary channel back to `production` within 30 minutes of crossing the threshold.
+
+```bash
+#!/usr/bin/env bash
+# scripts/rollback-newarch.sh
+set -euo pipefail
+
+APP_SLUG="$1"  # e.g. wallpaper-app-relax
+eas channel:edit production-newarch \
+  --branch "production" \
+  --json | tee "logs/rollback-${APP_SLUG}-$(date +%Y%m%d_%H%M%S).json"
+echo "[rollback] ${APP_SLUG} reverted to production channel"
+```
+
+This script is a one-liner that just rewrites the channel, but if your CI is wired so that swapping EAS Update channels delivers the Old Architecture bundle, you can stop the bleeding before you even start root-causing. For deeper problems that require a binary rebuild, I keep the App Store / Play Console staged release pinned at 1% and simply close the new-download path entirely.
+
+## What's left and what I want to clean up next quarter
+
+After promoting three apps, the remaining three are blocked on two fronts. Two are waiting on Fabric support from libraries — the ones using more exotic Skia shaders. The last one has an old AdMob mediation adapter that throws a load error under Bridgeless. AppLovin's SDK 13.x line is expected to resolve this, so the plan is: SDK update in June, re-canary, then horizontal expansion.
+
+For long-term operations, my rule is to wait until all six apps are on the New Architecture before reconsidering Fabric-only features like Reanimated 4 or FlashList v2. Adding new functionality while still in mixed Old/New territory makes root-cause work dramatically harder. Keeping "architecture migration" and "feature additions" out of the same sprint has paid off, even for a solo developer.
+
+Rork is excellent at standing up React Native projects quickly, but the longer you operate them, the more thought you have to put into when and in what order to introduce the New Architecture. I hope this staged-introduction flow is useful to anyone juggling multiple apps and weighing the same decision. Thanks for reading.
