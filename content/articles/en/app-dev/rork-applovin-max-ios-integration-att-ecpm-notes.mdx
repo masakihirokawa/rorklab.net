@@ -1,0 +1,213 @@
+---
+title: "Adding AppLovin MAX to a Rork-Generated iOS Project — A Field Note on Init Order, ATT Consent, and eCPM A/B Testing"
+slug: "rork-applovin-max-ios-integration-att-ecpm-notes"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-05-24T16:30"
+author: "Rork Lab"
+description: "A field note from an indie developer on layering AppLovin MAX on top of a Rork-generated iOS app: SDK initialization order, ATT and MAX consent flag sync, and a minimal A/B setup to compare eCPM against AdMob-only."
+tags: ["Rork", "AppLovin MAX", "AdMob", "iOS", "ATT", "eCPM", "Mediation"]
+highlights:
+  - "A practical sequence for wiring AppLovin MAX into a Rork-scaffolded iOS app via SwiftPM, without touching the React Native ad call sites"
+  - "How to align the ATT prompt, MAX privacy flags, and AdMob initialization so the order does not silently degrade eCPM"
+  - "A minimal Remote Config + Crashlytics A/B setup that lets a solo developer compare AdMob-only vs AdMob + AppLovin MAX in two weeks"
+---
+
+I am Hirokawa, an indie developer who has been shipping apps as a personal developer since 2014. I recently spent a couple of weeks layering AppLovin MAX on top of an iOS app whose scaffold came out of Rork, and the work turned out to be more delicate than I expected. After years of running AdMob solo across the wallpaper apps that together have crossed 50 million downloads, I rediscovered how easily a single misplaced initialization call can either silence the first banner at launch or quietly miswire the consent state behind the ATT dialog.
+
+Rork is excellent at giving you a working skeleton fast, but the monetization layer is still on you to assemble. This note is the implementation memo I wish I had on hand when I started: it covers what worked when slotting AppLovin MAX into a Rork-generated iOS target, with the goal of running it alongside AdMob through mediation rather than swapping AdMob out entirely.
+
+## Why I moved from AdMob-only to running MAX in parallel
+
+The trigger was a stretch of days during the most recent Beautiful HD Wallpapers update where AdMob banner and app-open eCPM hit a clear regional ceiling. Between mid-April and early May, U.S. and Indonesia eCPM each dropped roughly 18% and 22% week over week, while fill rate stayed above 95%. Revenue was sliding without an impression problem, which is exactly when it becomes worth widening the mediation denominator.
+
+Wiring AppLovin MAX in via AdMob mediation lets me keep the GoogleMobileAds call sites essentially untouched. The Rork output here is React Native based, so I added a thin native bridge on the iOS side and contained the entire MAX integration in native code. The JavaScript layer still talks to AdMob; only the iOS target gained an additional SDK and consent path.
+
+In practice, when running two ad SDKs in parallel, the time sink is not adding lines of code. It is keeping the initialization order and consent flags in sync. This note focuses on that.
+
+## SDK initialization order with SwiftPM
+
+To add AppLovin MAX to the iOS target via SwiftPM, declare the package dependency on `https://github.com/AppLovin/AppLovin-MAX-SDK-iOS` in Xcode's Package Dependencies. If you are still migrating Firebase from CocoaPods to SPM at the same time, finish the Firebase SPM migration first to avoid Package.resolved fighting with Podfile.lock. I keep the Firebase migration steps in an internal doc and only add the AppLovin MAX dependency after the SPM-only state is stable.
+
+The launch sequence I now use is:
+
+1. Inside `application(_:didFinishLaunchingWithOptions:)`, call `FirebaseApp.configure()` first.
+2. Defer the ATT prompt to `applicationDidBecomeActive(_:)` rather than asking at launch.
+3. After ATT resolves, call `ALSdk.shared().initialize(with: config)`.
+4. From the AppLovin init completion callback, call `GADMobileAds.sharedInstance().start(completionHandler:)`.
+5. Only after step 4 completes, post an "ads ready" event to the React Native side.
+
+The point is "never call `GADMobileAds.start` before ATT resolves." If you do, AdMob direct campaigns may lock into a non-IDFA-aware targeting state that does not fully recover until the next process launch.
+
+```swift
+import AppTrackingTransparency
+import AppLovinSDK
+import GoogleMobileAds
+import FirebaseCore
+
+final class AdsBootstrap {
+    static let shared = AdsBootstrap()
+    private(set) var isReady = false
+    private var initInFlight = false
+
+    func configureOnLaunch() {
+        FirebaseApp.configure()
+    }
+
+    func startAfterActive() {
+        guard !isReady, !initInFlight else { return }
+        initInFlight = true
+        ATTrackingManager.requestTrackingAuthorization { [weak self] status in
+            DispatchQueue.main.async {
+                self?.bootstrapMax(attStatus: status)
+            }
+        }
+    }
+
+    private func bootstrapMax(attStatus: ATTrackingManager.AuthorizationStatus) {
+        let config = ALSdkInitializationConfiguration(sdkKey: AppEnv.applovinSdkKey) { builder in
+            builder.mediationProvider = ALMediationProviderMAX
+            builder.testDeviceAdvertisingIdentifiers = AppEnv.testDeviceIDFAs
+        }
+        ALSdk.shared().initialize(with: config) { [weak self] _ in
+            self?.bootstrapAdMob(attStatus: attStatus)
+        }
+    }
+
+    private func bootstrapAdMob(attStatus: ATTrackingManager.AuthorizationStatus) {
+        GADMobileAds.sharedInstance().start { [weak self] _ in
+            self?.isReady = true
+            self?.initInFlight = false
+            NotificationCenter.default.post(name: .adsBootstrapReady, object: nil, userInfo: [
+                "att": attStatus.rawValue,
+            ])
+        }
+    }
+}
+
+extension Notification.Name {
+    static let adsBootstrapReady = Notification.Name("AdsBootstrapReady")
+}
+```
+
+The React Native side subscribes to this `AdsBootstrapReady` notification through a native module and exposes a `useAdsReady()` hook to JavaScript. Once your call sites gate on a single boolean, the launch-time race conditions stop reproducing in testing.
+
+## Aligning the ATT prompt with AppLovin's consent flags
+
+After ATT resolves, you also need to relay the user's consent state into AppLovin via `ALPrivacySettings`. The minimum set is `hasUserConsent`, `isAgeRestrictedUser`, and `isDoNotSell`. I treat `ATT.authorized` as `hasUserConsent = true` and everything else as `false`, then override with the Google UMP CMP result for EEA traffic.
+
+```swift
+func syncPrivacySignals(att: ATTrackingManager.AuthorizationStatus, isEEA: Bool) {
+    let consent = (att == .authorized)
+    ALPrivacySettings.setHasUserConsent(consent)
+    ALPrivacySettings.setDoNotSell(!consent)
+    ALPrivacySettings.setIsAgeRestrictedUser(false)
+
+    if isEEA {
+        let cmp = CMPStore.shared.latestPurposes
+        ALPrivacySettings.setHasUserConsent(cmp.consentForPurpose1)
+    }
+}
+```
+
+The gotcha I hit: if you only call `syncPrivacySignals` once during initialization and never again after ATT resolves, AppLovin sits with stale `false` flags. In my first pass, that left rewarded fill from AppLovin pinned to the low-eCPM non-personalized bucket for users who had actually granted ATT. Calling `syncPrivacySignals` both inside the MAX init completion and again right after the ATT callback (a double-guard) made the issue disappear.
+
+## Running MAX as an AdMob mediation adapter, not as a takeover
+
+There is a meaningful operational difference between treating AppLovin MAX as your "main mediation server" and treating it as one adapter inside AdMob mediation. They can look similar in the SDK, but the day-to-day work differs.
+
+Because my wallpaper apps already run multiple networks through AdMob mediation, switching to MAX-as-primary all at once felt like too much risk. I started with MAX added as a bidding adapter inside AdMob mediation, attached to the existing ad units. The bidding group fills faster than waterfall, but reconciling AppLovin's dashboard numbers against AdMob's reports adds operational overhead. My pragmatic sequence: drop MAX into the waterfall with a conservative floor for the first week, observe behavior, then promote to bidding once nothing is on fire.
+
+If you ship the same app on both App Store and Google Play, doing iOS first and then mirroring the configuration to Android lets you internalize the AppLovin dashboard workflow before doubling the surface area.
+
+## Minimal A/B setup to actually compare eCPM
+
+Running the two networks in parallel is only useful if you collect comparable numbers. The minimum viable setup I landed on is Firebase Remote Config plus AdMob floor configuration, splitting users into two cohorts:
+
+- A cohort: existing AdMob-only setup
+- B cohort: AdMob mediation with AppLovin MAX added as a bidding adapter
+
+Remote Config delivers an `ads_variant` value of `A` or `B`, and `AdsBootstrap` only initializes the AppLovin SDK for B. I also pair each variant with separate ad units on the AdMob side, and write `ads_variant` into Crashlytics as a custom key so I can break crash-free rates by cohort.
+
+```swift
+let variant = RemoteConfig.remoteConfig().configValue(forKey: "ads_variant").stringValue ?? "A"
+Crashlytics.crashlytics().setCustomValue(variant, forKey: "ads_variant")
+
+if variant == "B" {
+    AdsBootstrap.shared.startAfterActive()
+} else {
+    AdMobOnly.shared.startAfterActive()
+}
+```
+
+For a solo developer, runtime switching inside a single binary is a much better trade-off than shipping two builds. App Store review only happens once, and binary size stays under control.
+
+The four metrics I track during the experiment:
+
+1. eCPM per 100 impressions (USD)
+2. Fill rate against requests (%)
+3. Crash-free rate via Crashlytics (Day 1 and Day 7)
+4. Time from process launch to first banner display (seconds, with a custom trace)
+
+Two weeks of observation is usually enough to see whether eCPM differences fall outside noise. If the deltas are real, you can confidently promote bidding or rebalance the cohort split. If the deltas look like noise, the responsible move is to plan the rollback.
+
+## Quieting the "blank banner on launch" pattern
+
+A common regression right after adding AppLovin MAX is that banner requests during the first 2 to 3 seconds of launch fail to fill. With AdMob alone you may never have seen this, but mediation adapter initialization shifts the timing slightly and exposes the gap.
+
+The fix I now use is to defer instantiating the ad view at all until `AdsBootstrap.isReady` is true. On the React Native side, the hook is essentially a suspense-style wait:
+
+```ts
+import { useEffect, useState } from 'react';
+import { NativeEventEmitter, NativeModules } from 'react-native';
+
+const emitter = new NativeEventEmitter(NativeModules.AdsBootstrap);
+
+export function useAdsReady() {
+  const [ready, setReady] = useState<boolean>(false);
+
+  useEffect(() => {
+    NativeModules.AdsBootstrap.isReady().then(setReady);
+    const sub = emitter.addListener('AdsBootstrapReady', () => setReady(true));
+    return () => sub.remove();
+  }, []);
+
+  return ready;
+}
+```
+
+Components that render banners read `const ready = useAdsReady()` and show a placeholder while `ready === false`. The before version requested an ad on mount; the after version waits for ready and only then requests. Eliminating the "blank box for 1.5 seconds" also fixes the layout jump that comes from late-arriving ad views.
+
+## Triaging the first crashes that show up via Crashlytics
+
+Within the first three days of running MAX in parallel, a small number of AppLovin-related stack traces appeared in Crashlytics. Most were the usual "listener torn down in the wrong order around rewarded ad close" pattern, but distinguishing them from AdMob-side crashes is much easier thanks to the `ads_variant` custom key.
+
+I opened a Claude in Chrome session and asked it to read the Crashlytics dashboard, pull only stack traces tagged `ads_variant=B`, summarize the top three signatures, and cross-reference each one with AppLovin's published known-issues. Doing that interactively through a single agent session compressed roughly an hour of manual dashboard hopping into about fifteen minutes. The agent can also screenshot the AppLovin dashboard and produce a small table of top-three regional eCPM and fill rate for the week, which kept the operational overhead from eating into actual coding time.
+
+## Rewarded ads: same AdMob API, different normalization needs
+
+Beyond banners and app-open, I also routed rewarded ads through AdMob mediation into AppLovin MAX. The `GADRewardedAd` API itself is abstracted by AdMob, so the call sites stay the same. What does change is that AppLovin needs its own rewarded placement configured in its dashboard, and the `GADAdReward` payload that comes back is not perfectly normalized between networks.
+
+In my first integration, AppLovin-routed rewards arrived with `amount = 0` in a small percentage of cases. For an app where the reward feeds a game-like loop, that is a real risk of either zero-grant or double-grant bugs. The safe pattern is to add a normalization layer that clamps to your own sane defaults.
+
+```swift
+rewardedAd.present(fromRootViewController: vc) { [weak self] in
+    let raw = rewardedAd.adReward
+    let amount = max(1, raw.amount.intValue)
+    let type = raw.type.isEmpty ? "coin" : raw.type
+    self?.rewardLedger.grant(amount: amount, type: type, source: variant)
+}
+```
+
+The lesson from the field: every time you add a mediation network, also add a normalization layer for reward payloads.
+
+## Realistic solo-developer time budget and a rollback plan
+
+Bringing this back to the practical level, adding AppLovin MAX is not technically hard, but the three-axis cost (init order, consent flags, parallel operation) is real. For the iOS build of Beautiful HD Wallpapers, my elapsed engineering time from design to two-week A/B observation was roughly 18 to 22 hours. That is achievable in part because Rork already gave me a working skeleton; writing the same ad layer fully by hand would likely have doubled that.
+
+Plan the rollback before you plan the launch. I wired `ads_variant` so that flipping Remote Config to `A` for everyone effectively disables AppLovin MAX without a store update. If crash-free rate slides or eCPM moves in the wrong direction, I can revert in minutes rather than waiting for review. That safety valve matters a lot for indie developers who do not have a team to cover for them.
+
+The real work is not adding the SDK. It is staying disciplined about the data you collect and giving yourself room to pull back when the numbers do not justify the operational overhead. After twelve years of solo app work, I have come to value experiments whose exits are as well-defined as their entries.
+
+Thanks for reading. I hope this is useful to others walking the same path.

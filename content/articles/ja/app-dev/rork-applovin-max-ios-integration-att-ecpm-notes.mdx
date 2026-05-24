@@ -1,0 +1,219 @@
+---
+title: "Rork プロジェクトに AppLovin MAX を後付けした実装ノート — 初期化順序・ATT 同意・eCPM 検証の三軸メモ"
+slug: "rork-applovin-max-ios-integration-att-ecpm-notes"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-05-24T16:30"
+author: "Rork Lab"
+description: "Rork で組み立てた iOS アプリに AppLovin MAX を後付けする際の初期化順序、ATT 同意との噛み合わせ、AdMob との並走で eCPM を比較する実装メモを、個人開発の現場目線でまとめます。"
+tags: ["Rork", "AppLovin MAX", "AdMob", "iOS", "ATT", "eCPM", "メディエーション"]
+highlights:
+  - "Rork が出力した最小構成の iOS プロジェクトに AppLovin MAX を SwiftPM 経由で後付けする実装フロー"
+  - "ATT ダイアログ・MAX 同意フラグ・AdMob 初期化の順序を崩さないための初期化ガード設計"
+  - "AdMob 単独と AppLovin MAX 並走の eCPM/fill rate を 2 週間で比較するための最小 A/B テスト構成"
+---
+
+個人でアプリ開発を 2014 年から続けている廣川政樹です。最近、Rork で叩き台を作った iOS アプリに AppLovin MAX を後付けする作業をしていて、想像していたよりも段取りが繊細でした。AdMob 単体運用を長くやってきた身からすると、初期化の順序ひとつで起動直後のバナーが沈黙したり、ATT 同意ダイアログの裏側で広告ネットワークの同意状態がずれたりと、検証しないと気付けない落とし穴がいくつもあります。
+
+Rork は素早くアプリの骨格を吐き出してくれますが、収益化レイヤーは自分で組み上げる必要があります。本ノートは、累計 5,000 万 DL を超えた壁紙アプリ群の運用で蓄積した感覚を、Rork が出した雛形に流し込むときの実装手順としてまとめました。AdMob から AppLovin MAX へ「乗り換える」のではなく、AdMob メディエーション経由で AppLovin MAX を併走させ、運用しながら判断材料を集める方向性です。
+
+## なぜ AdMob 単体から AppLovin MAX 併走へ動いたか
+
+きっかけは Beautiful HD Wallpapers の最新アップデートで、AdMob のバナーと AppOpen の eCPM が地域別に明確な天井に張り付いた日が連続したことでした。同じインプレッション量で 4 月の中旬から 5 月の初旬にかけて、米国とインドネシアの eCPM が前月比でそれぞれ約 18% と約 22% 沈んだ週がありました。フィルレートは 95% 以上を維持しているのに収益が落ちる状況で、メディエーションの分母を増やす実験を本気で検討する時期だと感じました。
+
+AppLovin MAX は AdMob メディエーション経由で組み込む形にすると、既存の GoogleMobileAds の呼び出し側コードをほぼ触らずに済みます。私の場合、Rork が吐き出したコードベースは React Native ベースですが、iOS ネイティブのブリッジを薄く挟んでメディエーションを完結させる構成にしました。これにより JavaScript 側のロジックは AdMob のままで、ネイティブ側だけで AppLovin MAX を増設できる形にしています。
+
+実体験として、SDK を 2 社並走させる場合に最も時間を持っていかれるのは、コードの追加そのものではなく初期化の順序と同意状態の同期です。本記事はここを重点的にメモします。
+
+## SwiftPM 経由で AppLovin MAX を入れるときの初期化順序
+
+Rork が出力した iOS ターゲットに AppLovin MAX を SwiftPM で追加する場合、依存解決は Xcode の Package Dependencies から `https://github.com/AppLovin/AppLovin-MAX-SDK-iOS` を指定する手順で完結します。CocoaPods から SwiftPM への移行と並行している場合、Firebase 側の SPM 化を先に終わらせておくと Podfile と Package.resolved の衝突が起きません。Firebase SPM 移行については `Apps/iOS Apps/_documents/firebase-cocoapods-to-spm-migration-plan-ja.md` に作業手順をまとめてあるので、SPM 統一を済ませてから AppLovin MAX を足す順序にしています。
+
+初期化の順序は、以下の流れを守るとアダプタ初期化のタイミング不整合を避けやすくなります。
+
+1. `application(_:didFinishLaunchingWithOptions:)` で Firebase の `FirebaseApp.configure()` を最初に呼ぶ
+2. ATT のリクエストを `applicationDidBecomeActive(_:)` に切り出して遅延起動する
+3. ATT の応答結果を受けてから `ALSdk.shared().initialize(with: config)` を呼ぶ
+4. AppLovin の初期化完了コールバックを待ってから `GADMobileAds.sharedInstance().start(completionHandler:)` を呼ぶ
+5. 4 が完了してから React Native 側に「広告 SDK 準備 OK」のイベントを送出する
+
+「ATT が確定する前に GADMobileAds.start を呼ばない」のがポイントです。ATT の応答前に GADMobileAds を初期化すると、IDFA 取得を前提とした AdMob 直接配信のターゲティングが意図と違う形で確定し、復旧に再起動が必要になるケースがありました。
+
+```swift
+import AppTrackingTransparency
+import AppLovinSDK
+import GoogleMobileAds
+import FirebaseCore
+
+final class AdsBootstrap {
+    static let shared = AdsBootstrap()
+    private(set) var isReady = false
+    private var initInFlight = false
+
+    func configureOnLaunch() {
+        FirebaseApp.configure()
+    }
+
+    func startAfterActive() {
+        guard !isReady, !initInFlight else { return }
+        initInFlight = true
+        ATTrackingManager.requestTrackingAuthorization { [weak self] status in
+            DispatchQueue.main.async {
+                self?.bootstrapMax(attStatus: status)
+            }
+        }
+    }
+
+    private func bootstrapMax(attStatus: ATTrackingManager.AuthorizationStatus) {
+        let config = ALSdkInitializationConfiguration(sdkKey: AppEnv.applovinSdkKey) { builder in
+            builder.mediationProvider = ALMediationProviderMAX
+            builder.testDeviceAdvertisingIdentifiers = AppEnv.testDeviceIDFAs
+        }
+        ALSdk.shared().initialize(with: config) { [weak self] _ in
+            self?.bootstrapAdMob(attStatus: attStatus)
+        }
+    }
+
+    private func bootstrapAdMob(attStatus: ATTrackingManager.AuthorizationStatus) {
+        GADMobileAds.sharedInstance().start { [weak self] _ in
+            self?.isReady = true
+            self?.initInFlight = false
+            NotificationCenter.default.post(name: .adsBootstrapReady, object: nil, userInfo: [
+                "att": attStatus.rawValue,
+            ])
+        }
+    }
+}
+
+extension Notification.Name {
+    static let adsBootstrapReady = Notification.Name("AdsBootstrapReady")
+}
+```
+
+React Native 側はこの `AdsBootstrapReady` 通知を Native Module で購読し、JavaScript 側のフックに `useAdsReady()` のような形で渡しています。広告呼び出し側のコードが「準備完了」の真偽値で待機するように一本化すると、起動直後のレースコンディションが消えて検証が一段楽になります。
+
+## ATT ダイアログと AppLovin の同意フラグの整合
+
+ATT のステータスを取ったあと、AppLovin MAX 側にも同意状態を伝える必要があります。`ALPrivacySettings` 経由で `hasUserConsent` と `isAgeRestrictedUser`、`isDoNotSell` を設定するのが基本フローです。ATT の応答が `.authorized` のときは `hasUserConsent = true`、それ以外は `false` に揃えるシンプルな運用にしていますが、欧州 EEA 向けには Google UMP 側で CMP 同意を取得して別フラグで上書きしています。
+
+```swift
+func syncPrivacySignals(att: ATTrackingManager.AuthorizationStatus, isEEA: Bool) {
+    let consent = (att == .authorized)
+    ALPrivacySettings.setHasUserConsent(consent)
+    ALPrivacySettings.setDoNotSell(!consent)
+    ALPrivacySettings.setIsAgeRestrictedUser(false)
+
+    if isEEA {
+        // UMP 同意取得後にここで GDPR フラグを正式化する
+        let cmp = CMPStore.shared.latestPurposes
+        ALPrivacySettings.setHasUserConsent(cmp.consentForPurpose1)
+    }
+}
+```
+
+落とし穴として、ATT の応答取得後に `syncPrivacySignals` を必ず呼ぶ運用にしておかないと、AppLovin 側に古い `false` が残ったままになります。私の手元では、最初の実装で「初期化中に一度フラグを書いて、ATT 応答時には書き直していなかった」せいで、AppLovin 経由のリワード広告が同意 OK ユーザーに対してパーソナライズなしの低 eCPM 帯に固定される事象を確認しました。`AdsBootstrap.bootstrapMax` の初期化完了コールバック内で `syncPrivacySignals` を必ず呼ぶように修正し、ATT 応答時にも再呼び出しする二重ガードにしてから現象が消えました。
+
+## AdMob メディエーション経由で MAX を回す並走判断
+
+AppLovin MAX を「メインメディエーションサーバー」として使う運用と、AdMob メディエーションの中の 1 アダプタとして並走させる運用は、見た目は同じに見えても運用負荷が異なります。私の場合、すでに AdMob メディエーションで複数ネットワークを回している壁紙アプリ群を急に MAX 中心に切り替えるとリスクが大きすぎるため、最初は AdMob メディエーション内の入札アダプタとして MAX を追加する構成から始めました。
+
+AdMob 管理画面の入札（Bidding）グループに AppLovin を追加し、対象広告ユニットに紐付けて配信を開始する流れです。Bidding グループに入れるか Waterfall に入れるかで動きが変わり、Bidding の方が在庫消化のスピードは速いものの、AppLovin 側のレポートと AdMob 側のレポートを突き合わせる作業負荷は増えます。最初の 1 週間は Waterfall に低めの eCPM フロアで入れて挙動を見て、安定したら Bidding に昇格させるのが、私の中では現実的な進め方です。
+
+App Store と Google Play 双方で同じアプリを運用している場合、iOS で先にこの構成を試してから Android に展開すると、AppLovin の管理画面の運用感も両プラットフォーム横断で揃えやすくなります。
+
+## eCPM 比較を取るための最小 A/B 計測の組み方
+
+並走の意味は、数値で意思決定するための比較材料を集めることにあります。私は Firebase Remote Config と AdMob のフロア設定を組み合わせて、ユーザーを 2 群に分割する最小構成を作りました。
+
+- A 群: AdMob 既存セットアップのみ
+- B 群: AdMob メディエーション内に AppLovin MAX 入札を追加
+
+Remote Config で `ads_variant` を `A` または `B` で配り、`AdsBootstrap` の初期化時に B のときだけ AppLovin SDK の初期化を行います。AdMob 側でも対象広告ユニットを A 用と B 用で 2 系統用意し、Crashlytics のカスタムキーに `ads_variant` を埋めて、クラッシュ率がどちらの群で増えたかを切り分けられる状態にしています。
+
+```swift
+let variant = RemoteConfig.remoteConfig().configValue(forKey: "ads_variant").stringValue ?? "A"
+Crashlytics.crashlytics().setCustomValue(variant, forKey: "ads_variant")
+
+if variant == "B" {
+    AdsBootstrap.shared.startAfterActive()
+} else {
+    // 既存の AdMob 単独初期化
+    AdMobOnly.shared.startAfterActive()
+}
+```
+
+実体験として、SDK バイナリサイズが増えると Android 側の dex 制限や iOS 側のアプリサイズ閾値に効いてくるため、A 群と B 群でアプリバイナリ自体を分けるのではなく「同一バイナリ内でランタイム切替」する構成が個人開発者にとっては現実的でした。アプリストア審査も 1 本で済みます。
+
+評価指標は次の 4 つに絞っています。
+
+1. 100 インプレッションあたりの eCPM（USD）
+2. リクエスト数に対する fill rate（%）
+3. クラッシュフリー率（Crashlytics ベース、Day 1 と Day 7）
+4. 起動から最初のバナー表示までの所要時間（秒、計測点を実装）
+
+2 週間程度の観測で eCPM の差分が信頼区間に収まるなら、安心して Bidding 昇格や A/B のロールアウト比率変更に進めます。逆に差分が誤差レベルのときは、撤退判断も視野に入れて切り戻し計画を準備します。
+
+## 起動直後のバナーが沈黙する事象への対処
+
+AppLovin MAX を入れた直後によく起きるのが、起動から 2〜3 秒の間にバナーをロードしようとして埋まらない事象です。AdMob 単体だったときには起こらなかったタイミング問題が、メディエーションのアダプタ初期化を待つ分だけずれて顕在化します。
+
+対処として、`AdsBootstrap.isReady` が `true` になるまで広告ビューのインスタンス化自体を遅延させる構造に変更しました。React Native 側のフックは以下のように `Suspense` 風の待機 API になっています。
+
+```ts
+import { useEffect, useState } from 'react';
+import { NativeEventEmitter, NativeModules } from 'react-native';
+
+const emitter = new NativeEventEmitter(NativeModules.AdsBootstrap);
+
+export function useAdsReady() {
+  const [ready, setReady] = useState<boolean>(false);
+
+  useEffect(() => {
+    NativeModules.AdsBootstrap.isReady().then(setReady);
+    const sub = emitter.addListener('AdsBootstrapReady', () => setReady(true));
+    return () => sub.remove();
+  }, []);
+
+  return ready;
+}
+```
+
+バナーを描画するコンポーネント側は `const ready = useAdsReady();` を見て、`ready === false` の間はプレースホルダー UI を出すだけにしてあります。これにより起動直後の 1〜2 秒間に「広告枠が空っぽに見える」状態を防ぎ、レイアウトジャンプも避けられます。
+
+Before のコードは「マウント時に即時 load を呼ぶ」設計でしたが、After では「ready を待ってから load を呼ぶ」に変更しています。広告 SDK が成熟するほどこの種の待機 API は重要度が増す体感です。
+
+## Firebase Crashlytics に流れてきたクラッシュをどう切り分けるか
+
+並走を始めた最初の 3 日間で、Crashlytics に AppLovin 由来のスタックトレースが少量混じり始めました。多くは「リワード広告のクローズタイミングで Notification のリスナー解除順序が逆」というよくあるパターンでしたが、AdMob 由来のクラッシュと切り分けるには、先述の `ads_variant` カスタムキーが効きます。
+
+私は Claude in Chrome のセッションを開いて、Crashlytics の管理画面を読ませながら「`ads_variant=B` のスタックトレースのみ抜き出して、上位 3 件をシグネチャごとに要約し、AppLovin 公式の Known Issue リストと突き合わせて」と作業を依頼しました。手動でブラウザを操作するより時間が圧縮でき、AppLovin の管理画面と Crashlytics の管理画面を横断する作業の体感が一段軽くなります。
+
+ここでも書いておくと、Claude in Chrome に AppLovin 管理画面のスクリーンショットを読ませて「この週の eCPM トップ 3 地域とフィルレートを表にして」と依頼するのも有効でした。アプリ開発の本流から外れた運用作業をエージェントに渡せると、コードを書く時間が確実に増えます。
+
+## リワード広告の Mediation 設定とデリゲートの差分
+
+バナーと AppOpen 以外に、リワード広告でも AdMob メディエーションから AppLovin MAX を回す構成を試しました。`GADRewardedAd` の API は AdMob 側で抽象化されているため、コード上は何も変える必要がありませんが、AppLovin の管理画面側で `rewarded` 用のプレースメントを別途作る必要があります。
+
+注意点として、AdMob の `userDidEarnRewardHandler` は AppLovin 経由でも発火しますが、ネットワーク間で `GADAdReward` の `amount` と `type` の値の正規化が完全ではなく、自前で `amount = 1`、`type = "coin"` のように後段で正規化するレイヤーを挟む方が安全です。最初の実装で AppLovin 経由のときだけ `amount` がゼロで降ってきたケースがあり、ゲーム性のあるアプリで報酬が二重付与されたりゼロ付与になるリスクの芽になりました。
+
+```swift
+rewardedAd.present(fromRootViewController: vc) { [weak self] in
+    let raw = rewardedAd.adReward
+    let amount = max(1, raw.amount.intValue)
+    let type = raw.type.isEmpty ? "coin" : raw.type
+    self?.rewardLedger.grant(amount: amount, type: type, source: variant)
+}
+```
+
+メディエーションを増やしたら「報酬計算の正規化」を必ず挟む、というのが個人開発の現場で得た教訓です。
+
+## 個人開発者の現実的な投下時間と切り戻し計画
+
+ここまでをまとめると、AppLovin MAX の後付けは技術的に難しい作業ではないものの、初期化順序・同意フラグ・並走時の運用負荷の三軸で時間を取られます。私の場合、Beautiful HD Wallpapers の iOS 版に組み込み、A/B を 2 週間回して結果を見るまでの実工数が、設計から検証までで概算 18〜22 時間でした。これは Rork で骨格を作ったアプリだからこその短さで、ゼロから手書きで広告レイヤーを作っていたらこの倍は掛かったと感じます。
+
+切り戻し計画は最初から準備しておくのが望ましいです。私は Remote Config の `ads_variant` を `A` 固定に切り替えるトグルだけで AppLovin MAX を実質的に停止できる構成にしました。これにより、万一クラッシュ率が悪化したり eCPM が逆に下がるパターンが見えても、ストア審査を待たずに数分で切り戻せます。個人開発者にとってこの安全装置は精神衛生上の意味でも大きいです。
+
+導入そのものより、撤退も含めた「並走を続けるか、片方に寄せるか、両方やめるか」の判断材料を集める姿勢が肝心だと、12 年やってきて感じています。AppLovin MAX を入れること自体が目的化しないよう、Remote Config と Crashlytics の数値を毎週見直す習慣を組み合わせるところまでセットでの設計にしておくのが安心です。
+
+同じ題材で取り組んでいる個人開発者の方の判断材料になればうれしいです。お読みいただきありがとうございました。
