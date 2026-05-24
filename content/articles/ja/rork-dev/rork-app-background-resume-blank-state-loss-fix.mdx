@@ -1,0 +1,259 @@
+---
+title: "Rork アプリでバックグラウンド復帰時に画面が真っ白／状態が消える原因の切り分け"
+slug: "rork-app-background-resume-blank-state-loss-fix"
+category: "rork-dev"
+level: "intermediate"
+date: "2026-05-24T14:30"
+author: "Rork Lab"
+description: "Rork で作ったアプリをバックグラウンドに置いたまま数時間放置して戻ると、画面が真っ白になったり、編集途中のデータが消えていたり、再ログインを求められたりする。AppState・AsyncStorage 復元タイミング・iOS のメモリ回収・Navigation state 復元の4つの観点から切り分ける手順を、5,000万DL の壁紙・癒し系アプリを個人開発してきた経験を交えてまとめます。"
+tags: ["rork", "react-native", "appstate", "background", "troubleshooting"]
+premium: false
+---
+
+# Rork アプリでバックグラウンド復帰時に画面が真っ白／状態が消える原因の切り分け
+
+アーティスト・クリエイターの廣川政樹です。Rork で作ったアプリを TestFlight に上げて自分の端末で1日使い、翌朝起きてアプリに戻ると画面が真っ白だった。あるいは、編集途中のメモやお気に入りに登録した壁紙が消えていた。こうした「バックグラウンド復帰時の事故」は、シミュレーターでは絶対に再現しないため、原因の特定がいちばん難しい部類のトラブルです。
+
+私は 2014年から個人でアプリ開発を続けており、累計 5,000万DL を超える壁紙・癒し系アプリを今も AdMob 収益でまわしています。同じ症状をこれまで何度も踏み抜いてきたので、自分用のチェックリストを共有します。原因は大きく4つに分かれ、それぞれ別の場所で対処しないと永遠に再発します。
+
+## まず切り分けるべき4つの状態
+
+「バックグラウンドから戻ったらおかしい」という症状は、実は内部で起きていることが全く違います。最初に4つのどれなのかを区別することが、解決までの最短距離です。
+
+| 症状 | 主な原因 | 対処カテゴリ |
+| --- | --- | --- |
+| 真っ白で操作できない | プロセス再起動でバンドル/state が未復元 | iOS の再起動扱い |
+| 画面は表示されるがログイン切れ | SecureStore は残るが Auth 状態が初期化 | AppState 復帰時の再認証 |
+| 入力途中の文字や下書きが消えた | コンポーネント state はメモリ依存・永続化なし | 下書き永続化の追加 |
+| ナビゲーションが Tab1 に戻る | NavigationContainer の state 復元未設定 | Navigation 永続化の追加 |
+
+iOS は OS 側の判断でいつでもバックグラウンドのアプリプロセスを終了します。Apple のドキュメントが言う「Suspended → Terminated」が起きると、戻ってきた時はコールドスタートと同じ扱いになります。Android はメモリ余裕があれば JS の実行コンテキスト自体は生きていることが多く、症状の出方が違います。**iOS で出るのか、Android で出るのか、両方なのか**を最初にメモすることが大事です。
+
+## AppState が `active` に戻った時に何が起きているか
+
+`react-native` の `AppState` は `active` / `background` / `inactive` の3状態を返します。プロセスが完全に殺されていなければ、復帰時に `background` → `active` のリスナーが発火します。逆に、リスナーがまったく発火せず JS バンドルのロードからやり直しになる場合は「プロセスごと再起動した」と判定できます。
+
+切り分けの第一歩として、AppState の遷移をログに残す最小コードを入れておきます。
+
+```tsx
+// src/lib/appstate-logger.tsx
+import { AppState, AppStateStatus } from "react-native";
+import { useEffect } from "react";
+import * as FileSystem from "expo-file-system";
+
+const LOG_FILE = FileSystem.documentDirectory + "appstate.log";
+
+export function useAppStateLogger() {
+  useEffect(() => {
+    const handle = async (next: AppStateStatus) => {
+      const line = `${new Date().toISOString()} ${next}\n`;
+      try {
+        await FileSystem.writeAsStringAsync(LOG_FILE, line, {
+          encoding: FileSystem.EncodingType.UTF8,
+          // 追記モード相当: 既存内容を読んで連結
+        });
+      } catch (e) {
+        console.warn("appstate log failed", e);
+      }
+    };
+    const sub = AppState.addEventListener("change", handle);
+    handle(AppState.currentState);
+    return () => sub.remove();
+  }, []);
+}
+```
+
+このフックをルートレイアウトで一度だけ呼んでおき、症状が出た端末で `appstate.log` を取り出すと「リスナーが発火していない＝コールドスタート」と「発火しているのに UI が真っ白」がはっきり分かれます。私の場合、5,000万DL の壁紙アプリで最も多かったのは前者でした。iOS で6時間以上バックグラウンドに置かれた端末では、ほぼ確実にプロセスが回収されています。
+
+## ケース1: iOS によるプロセス回収 — コールドスタート前提で書く
+
+iOS のメモリ回収は防ぎようがありません。バックグラウンドに置けば必ず殺される可能性があるという前提で書く、というのが対策のすべてです。
+
+具体的には次の3つを守ります。
+
+1. 起動時に必要な永続データは **すべて AsyncStorage / SecureStore / SQLite に書く**（メモリだけに置かない）
+2. JS のグローバル変数や Zustand のメモリ store は「キャッシュ」と割り切る
+3. スプラッシュ画面は復元処理が完了してから手動で非表示にする
+
+スプラッシュの制御は `expo-splash-screen` の `preventAutoHideAsync` で止めて、復元処理の完了後に `hideAsync` する形が安全です。
+
+```tsx
+// src/app/_layout.tsx
+import { useEffect, useState } from "react";
+import * as SplashScreen from "expo-splash-screen";
+import { restoreAppState } from "@/lib/restore";
+
+SplashScreen.preventAutoHideAsync().catch(() => {});
+
+export default function RootLayout() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await restoreAppState(); // AsyncStorage + Auth 復元
+      } finally {
+        setReady(true);
+        await SplashScreen.hideAsync();
+      }
+    })();
+  }, []);
+
+  if (!ready) return null;
+  return <AppNavigator />;
+}
+```
+
+`ready` が `false` の間に `null` を返すのがポイントです。よくあるのは、復元処理が走る前に「ログイン画面」と「ホーム画面」のどちらに行くかを判定してしまい、未復元の `null` トークンを見て常にログイン画面に流す、というバグです。これが「バックグラウンド復帰したらログアウトしている」の正体であることが多いです。
+
+## ケース2: 入力途中のデータが消える — 下書き自動保存の最小実装
+
+コンポーネント state は揮発性なので、メモやコメントなど「ユーザーが書き途中の文字」は秒単位で AsyncStorage に逃がしておく必要があります。私が癒し系アプリのジャーナル機能で使っているのは、debounce 付きの最小実装です。
+
+```tsx
+// src/hooks/useDraft.ts
+import { useEffect, useRef, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export function useDraft(key: string, initial = "") {
+  const [value, setValue] = useState(initial);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 初回マウントで復元
+  useEffect(() => {
+    AsyncStorage.getItem(key).then((v) => {
+      if (v !== null) setValue(v);
+    });
+  }, [key]);
+
+  // 500ms debounce で保存
+  useEffect(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      AsyncStorage.setItem(key, value).catch(() => {});
+    }, 500);
+    return () => {
+      if (timer.current) clearTimeout(timer.current);
+    };
+  }, [key, value]);
+
+  const clear = async () => {
+    await AsyncStorage.removeItem(key);
+    setValue("");
+  };
+
+  return [value, setValue, clear] as const;
+}
+```
+
+注意点として、`AppState` が `background` に遷移した瞬間に **即座に書く処理** も追加しておくと安全です。iOS は `background` 通知後に数秒で `Suspended` に入るため、debounce の500ms が間に合わないことがあります。
+
+```tsx
+useEffect(() => {
+  const sub = AppState.addEventListener("change", (s) => {
+    if (s === "background" && timer.current) {
+      clearTimeout(timer.current);
+      AsyncStorage.setItem(key, value).catch(() => {});
+    }
+  });
+  return () => sub.remove();
+}, [key, value]);
+```
+
+## ケース3: ナビゲーションが必ず Tab1 に戻る — state 永続化の設定
+
+React Navigation の `NavigationContainer` は、デフォルトでは state を永続化しません。プロセス再起動するたびに最初のスクリーンに戻ります。これも「バックグラウンドから戻ったら別の画面に飛ばされた」と感じる主な理由のひとつです。
+
+`initialState` / `onStateChange` を使った最小の永続化はこうなります。
+
+```tsx
+// src/navigation/PersistentNavigationContainer.tsx
+import { useEffect, useState } from "react";
+import { NavigationContainer, NavigationState } from "@react-navigation/native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const PERSISTENCE_KEY = "NAV_STATE_V1";
+
+export function PersistentNavigationContainer({ children }: { children: React.ReactNode }) {
+  const [isReady, setIsReady] = useState(false);
+  const [initialState, setInitialState] = useState<NavigationState | undefined>();
+
+  useEffect(() => {
+    const restore = async () => {
+      try {
+        const saved = await AsyncStorage.getItem(PERSISTENCE_KEY);
+        if (saved) setInitialState(JSON.parse(saved));
+      } catch {}
+      setIsReady(true);
+    };
+    restore();
+  }, []);
+
+  if (!isReady) return null;
+
+  return (
+    <NavigationContainer
+      initialState={initialState}
+      onStateChange={(state) => {
+        AsyncStorage.setItem(PERSISTENCE_KEY, JSON.stringify(state)).catch(() => {});
+      }}
+    >
+      {children}
+    </NavigationContainer>
+  );
+}
+```
+
+`PERSISTENCE_KEY` にバージョン番号を入れているのは意図的です。Navigation の構造（タブ名・スクリーン名）を変更した時にキーを上げないと、古い state を復元してクラッシュします。アプリの審査リジェクト経由でこれを学びました。
+
+`expo-router` を使っている場合は、現時点では state の手動永続化 API が公式に提供されていません。代わりに、深いリンク（deep link）として最後のパスを `AsyncStorage` に保存しておき、起動時に `router.replace(savedPath)` する戦略が現実的です。
+
+## ケース4: メモリ警告で Zustand が消える — 永続化ミドルウェアを足す
+
+`Zustand` や `Jotai` の store はメモリ上の値なので、プロセス再起動で必ず消えます。これは設計通りの挙動ですが、ユーザーから見ると「お気に入りが消えた」「設定がリセットされた」になります。
+
+Zustand なら `persist` ミドルウェアを足すだけで解決します。
+
+```tsx
+// src/store/favorites.ts
+import { create } from "zustand";
+import { persist, createJSONStorage } from "zustand/middleware";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+type FavoritesState = {
+  ids: string[];
+  toggle: (id: string) => void;
+};
+
+export const useFavorites = create<FavoritesState>()(
+  persist(
+    (set, get) => ({
+      ids: [],
+      toggle: (id) => {
+        const cur = get().ids;
+        set({ ids: cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id] });
+      },
+    }),
+    {
+      name: "favorites-v1",
+      storage: createJSONStorage(() => AsyncStorage),
+      version: 1,
+    }
+  )
+);
+```
+
+ハマりやすいのは、復元前に画面が描画されて空配列のまま表示されるパターンです。`useFavorites.persist.hasHydrated()` を `_layout.tsx` 側で待ち、復元が終わってから子コンポーネントを描画する形にすると安全です。
+
+## 再現環境を手元に作る
+
+最後に、これらの問題を出社前のシミュレーターで再現する方法です。バックグラウンド復帰の事故は端末でないと出ないと信じられがちですが、iOS シミュレーターでも `Device → Erase All Content and Settings` を経由せずに再現できます。
+
+- **iOS シミュレーター**: アプリをホームに送ったあと、`xcrun simctl terminate booted <bundle-id>` でプロセスだけ落とす。次にアプリを開くとプロセス再起動になる
+- **Android エミュレーター**: `adb shell am force-stop <package-name>` で同じことができる
+
+これを CI ではなく日常の手動テストに組み込むだけで、リリース前に大半の事故を潰せます。私は新機能を入れるたびに、`terminate` → 再起動 → 復元できているか、というチェックを5パターンほどルーチン化しています。
+
+バックグラウンド復帰の事故は派手なクラッシュとして表に出ないので、ユーザーは静かに離脱します。レビュー欄に「久しぶりに開いたらデータが全部消えていた」と書かれて初めて気付く、というのが最悪のシナリオです。AppState・永続化・Navigation・スプラッシュの4点を最初に整えておけば、長く運用する個人開発アプリにとって最も静かなトラブル源を一つ減らせます。
+
+お読みいただきありがとうございました。同じ症状で苦戦している方の切り分けの一助になれば嬉しいです。

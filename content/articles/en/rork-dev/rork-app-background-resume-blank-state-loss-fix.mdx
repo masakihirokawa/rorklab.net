@@ -1,0 +1,256 @@
+---
+title: "Why your Rork app shows a blank screen or loses state after returning from background"
+slug: "rork-app-background-resume-blank-state-loss-fix"
+category: "rork-dev"
+level: "intermediate"
+date: "2026-05-24T14:30"
+author: "Rork Lab"
+description: "Your Rork app sits in the background overnight, you tap the icon the next morning, and the screen is blank — or your drafts have disappeared, or you have been silently logged out. iOS process reclamation, AsyncStorage rehydration timing, and Navigation state restoration each cause a different version of this bug. Notes from running wallpaper and wellness apps with 50M downloads as an indie developer."
+tags: ["rork", "react-native", "appstate", "background", "troubleshooting"]
+premium: false
+---
+
+# Why your Rork app shows a blank screen or loses state after returning from background
+
+I am Masaki Hirokawa, an artist and indie developer. You ship your Rork app to TestFlight, use it for a day, leave it in the background overnight, and the next morning it opens to a blank screen. Or your in-progress notes are gone. Or your saved wallpapers vanished. These "background resume" failures are some of the hardest bugs to chase because the iOS simulator almost never reproduces them.
+
+I have been building mobile apps since 2014 and currently run a portfolio of wallpaper and wellness apps that have crossed 50 million downloads, monetized mostly through AdMob. I have walked into this trap many times, so here is the checklist I keep next to my desk. The root cause is almost always one of four things, and each one needs to be fixed in a different place.
+
+## Four distinct symptoms hide under one complaint
+
+"My app is broken after coming back from background" is shorthand for four very different problems. Knowing which one you have is the fastest path to a fix.
+
+| Symptom | Most likely cause | Where to fix |
+| --- | --- | --- |
+| Blank, unresponsive screen | Process killed, bundle/state not restored | Cold-start path |
+| Visible UI but user is logged out | SecureStore is fine, auth state was in memory | AppState resume handler |
+| Draft text or unsaved input gone | Component state is volatile, no persistence | Add draft persistence |
+| Always lands back on Tab 1 | NavigationContainer state not persisted | Add navigation persistence |
+
+iOS reclaims background app processes whenever it wants. Apple's documentation calls this "Suspended → Terminated", and once it happens, your next launch is a cold start. Android keeps the JS context alive more often when memory is available, so the symptoms differ. The first thing to write down is **does this happen on iOS, Android, or both?**
+
+## What actually happens when AppState becomes `active`
+
+`AppState` from `react-native` reports `active`, `background`, and `inactive`. If the process is still alive, the listener fires when the user returns. If the listener never fires and you watch JS bundles reload from scratch, the OS killed your process.
+
+A minimal AppState logger I drop into every project:
+
+```tsx
+// src/lib/appstate-logger.tsx
+import { AppState, AppStateStatus } from "react-native";
+import { useEffect } from "react";
+import * as FileSystem from "expo-file-system";
+
+const LOG_FILE = FileSystem.documentDirectory + "appstate.log";
+
+export function useAppStateLogger() {
+  useEffect(() => {
+    const handle = async (next: AppStateStatus) => {
+      const line = `${new Date().toISOString()} ${next}\n`;
+      try {
+        await FileSystem.writeAsStringAsync(LOG_FILE, line, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+      } catch (e) {
+        console.warn("appstate log failed", e);
+      }
+    };
+    const sub = AppState.addEventListener("change", handle);
+    handle(AppState.currentState);
+    return () => sub.remove();
+  }, []);
+}
+```
+
+Call this hook once in your root layout, then pull `appstate.log` from a device showing the bug. The distinction between "listener never fired = cold start" and "listener fired but UI is blank" is the single most useful piece of information you can collect. In my wallpaper app catalog with 50M total downloads, the cold-start case dominates on iPhones left untouched for six hours or more.
+
+## Case 1: iOS killed the process — write for cold start by default
+
+You cannot prevent iOS from reclaiming a backgrounded process. The only durable fix is to write every screen as if it might launch from scratch.
+
+Three rules to follow:
+
+1. Anything required to render the first screen must live in AsyncStorage / SecureStore / SQLite, never only in JS memory.
+2. Treat in-memory Zustand or global variables as a cache, not a source of truth.
+3. Keep the splash screen up until restoration finishes — never let an unrestored render flash.
+
+`expo-splash-screen` handles step 3 cleanly:
+
+```tsx
+// src/app/_layout.tsx
+import { useEffect, useState } from "react";
+import * as SplashScreen from "expo-splash-screen";
+import { restoreAppState } from "@/lib/restore";
+
+SplashScreen.preventAutoHideAsync().catch(() => {});
+
+export default function RootLayout() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await restoreAppState(); // AsyncStorage + auth restore
+      } finally {
+        setReady(true);
+        await SplashScreen.hideAsync();
+      }
+    })();
+  }, []);
+
+  if (!ready) return null;
+  return <AppNavigator />;
+}
+```
+
+Returning `null` while `ready` is `false` is the critical part. The most common bug I see is code that decides between "login screen" and "home screen" before the token has been pulled from SecureStore, sees a `null` token, and sends every returning user back to login. That is the real reason your app "always logs me out after I leave it overnight".
+
+## Case 2: drafts disappear — minimal autosave
+
+Component state is volatile. Anything the user typed — notes, comments, search queries — needs to be mirrored to AsyncStorage on a tight cadence. Here is the debounced draft hook I use in my journaling app:
+
+```tsx
+// src/hooks/useDraft.ts
+import { useEffect, useRef, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export function useDraft(key: string, initial = "") {
+  const [value, setValue] = useState(initial);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    AsyncStorage.getItem(key).then((v) => {
+      if (v !== null) setValue(v);
+    });
+  }, [key]);
+
+  useEffect(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      AsyncStorage.setItem(key, value).catch(() => {});
+    }, 500);
+    return () => {
+      if (timer.current) clearTimeout(timer.current);
+    };
+  }, [key, value]);
+
+  const clear = async () => {
+    await AsyncStorage.removeItem(key);
+    setValue("");
+  };
+
+  return [value, setValue, clear] as const;
+}
+```
+
+Add a synchronous flush on background transition, since iOS may suspend you within seconds and the 500 ms debounce can lose its last write:
+
+```tsx
+useEffect(() => {
+  const sub = AppState.addEventListener("change", (s) => {
+    if (s === "background" && timer.current) {
+      clearTimeout(timer.current);
+      AsyncStorage.setItem(key, value).catch(() => {});
+    }
+  });
+  return () => sub.remove();
+}, [key, value]);
+```
+
+## Case 3: navigation always lands back on Tab 1 — persist the nav state
+
+`NavigationContainer` does not persist state by default. After a process restart, your user lands on the first registered screen. To users this reads as "the app forgot where I was".
+
+Minimal manual persistence:
+
+```tsx
+// src/navigation/PersistentNavigationContainer.tsx
+import { useEffect, useState } from "react";
+import { NavigationContainer, NavigationState } from "@react-navigation/native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const PERSISTENCE_KEY = "NAV_STATE_V1";
+
+export function PersistentNavigationContainer({ children }: { children: React.ReactNode }) {
+  const [isReady, setIsReady] = useState(false);
+  const [initialState, setInitialState] = useState<NavigationState | undefined>();
+
+  useEffect(() => {
+    const restore = async () => {
+      try {
+        const saved = await AsyncStorage.getItem(PERSISTENCE_KEY);
+        if (saved) setInitialState(JSON.parse(saved));
+      } catch {}
+      setIsReady(true);
+    };
+    restore();
+  }, []);
+
+  if (!isReady) return null;
+
+  return (
+    <NavigationContainer
+      initialState={initialState}
+      onStateChange={(state) => {
+        AsyncStorage.setItem(PERSISTENCE_KEY, JSON.stringify(state)).catch(() => {});
+      }}
+    >
+      {children}
+    </NavigationContainer>
+  );
+}
+```
+
+The `_V1` suffix on the key is intentional. Any change to your tab or screen structure should bump the version, otherwise a stale saved state can restore a screen that no longer exists and crash on launch. I learned this through an App Store rejection — funniest review note I have ever received.
+
+For `expo-router` projects there is no official manual persistence API yet. A pragmatic substitute is to save the last known path to AsyncStorage and `router.replace(savedPath)` once your restoration is done.
+
+## Case 4: memory warnings clear Zustand — add the persist middleware
+
+`Zustand` and `Jotai` stores live in memory and disappear on every process restart. That is by design, but to a user it looks like "my favorites were wiped".
+
+Zustand fixes this with one middleware:
+
+```tsx
+// src/store/favorites.ts
+import { create } from "zustand";
+import { persist, createJSONStorage } from "zustand/middleware";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+type FavoritesState = {
+  ids: string[];
+  toggle: (id: string) => void;
+};
+
+export const useFavorites = create<FavoritesState>()(
+  persist(
+    (set, get) => ({
+      ids: [],
+      toggle: (id) => {
+        const cur = get().ids;
+        set({ ids: cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id] });
+      },
+    }),
+    {
+      name: "favorites-v1",
+      storage: createJSONStorage(() => AsyncStorage),
+      version: 1,
+    }
+  )
+);
+```
+
+The trap is rendering children before hydration completes — the user sees an empty list for a half second. Use `useFavorites.persist.hasHydrated()` at the root and gate the render until it returns true.
+
+## Reproducing the bug on a simulator
+
+Background-resume bugs are easy to dismiss as "only happens on real devices", but you can reproduce most of them deterministically without erasing the simulator:
+
+- **iOS Simulator**: send the app to the home screen, then run `xcrun simctl terminate booted <bundle-id>` to kill only the process. Opening the app afterwards triggers a full cold start.
+- **Android Emulator**: `adb shell am force-stop <package-name>` does the same.
+
+Wire this into manual QA before every release. I run this 5-step check on every new feature in my apps: terminate → relaunch → confirm restoration → terminate again from a deep screen → confirm restoration. It catches almost all of these issues before they reach a real user.
+
+Background-resume failures rarely surface as loud crashes — users just quietly stop opening the app. The worst version of this story is reading "lost everything when I came back" in a review weeks later. Getting AppState handling, persistence, navigation restoration, and splash gating right at the start removes one of the quietest, most damaging sources of churn for a long-lived indie app.
+
+Thanks for reading — I hope this helps you isolate your version of the bug faster than I did.
