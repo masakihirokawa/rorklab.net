@@ -337,15 +337,25 @@ export default async function ArticlePage({ params }: Props) {
             className="article-content"
             dangerouslySetInnerHTML={{ __html: previewContent }}
           />
-          {/* Soft inline CTA at preview cutoff — links to membership */}
-          <div className="preview-continue-link" style={{ margin: "40px 0 32px", padding: "20px 24px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)", textAlign: "center" }}>
-            <p style={{ fontSize: 14, color: "var(--text-dim)", margin: "0 0 12px", lineHeight: 1.7 }}>
-              {locale === "ja" ? "✦ ここから先はメンバーシップ会員限定です" : "✦ The rest is available to members"}
+          {/* Minimal inline CTA at preview cutoff — uses wording from original PremiumPaywall */}
+          <div className="preview-continue-link" style={{ maxWidth: 480, margin: "40px auto", padding: "32px 24px", borderRadius: 12, border: "1px solid color-mix(in srgb, var(--accent-coral) 30%, transparent)", background: "color-mix(in srgb, var(--accent-coral) 4%, var(--bg-surface))", textAlign: "center" }}>
+            <div style={{ fontSize: 28, marginBottom: 12 }}>✦</div>
+            <p style={{ fontSize: 13, color: "var(--text-dim)", lineHeight: 1.7, marginBottom: 12 }}>
+              {locale === "ja" ? "ここまでお読みいただきありがとうございます。" : "Thank you for reading this far."}
             </p>
-            <a href={locale === "ja" ? "/membership" : "/en/membership"} style={{ display: "inline-block", padding: "10px 24px", borderRadius: 6, background: "var(--accent-coral)", color: "#fff", textDecoration: "none", fontSize: 14, fontWeight: 500 }}>
-              {locale === "ja" ? "メンバーシップで続きを読む →" : "Continue reading with membership →"}
+            <h3 style={{ fontSize: 18, fontWeight: 600, color: "var(--text-primary)", marginBottom: 12 }}>
+              {locale === "ja" ? "この記事の続きを読む" : "Continue Reading"}
+            </h3>
+            <p style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.7, marginBottom: 20 }}>
+              {locale === "ja"
+                ? "この先には、実装コードや実務でお役に立てる内容をご用意しています。このサイトは広告を掲載しておらず、サーバーや開発にかかる費用はメンバーの皆様のご支援で成り立っています。"
+                : "What follows includes implementation code and practical content we hope you'll find useful. This site runs without ads — server and development costs are supported entirely by members like you."}
+            </p>
+            <a href={locale === "ja" ? "/membership" : "/en/membership"} style={{ display: "inline-block", padding: "12px 28px", borderRadius: 8, background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)", border: "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)", color: "var(--accent-coral)", textDecoration: "none", fontSize: 14, fontWeight: 700 }}>
+              {locale === "ja" ? "メンバーシップで全文を読む" : "Read full article with membership"}
             </a>
           </div>
+          
           <div
             className="paywall-hidden-content"
             style={{ display: "none" }}
