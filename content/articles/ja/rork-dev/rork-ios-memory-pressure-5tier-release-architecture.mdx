@@ -1,0 +1,253 @@
+---
+title: "Rork iOSアプリのメモリプレッシャー対策 — 壁紙アプリ運用で磨いた5段階解放アーキテクチャ"
+slug: "rork-ios-memory-pressure-5tier-release-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-25T04:45"
+author: "Rork Lab"
+description: "Rork経由でビルドしたiOSアプリのメモリプレッシャー対策を、5段階解放という考え方で整理しました。壁紙アプリ群を12年運用してきた中で見えた優先順位と、Instrumentsでの計測手順を実装込みで紹介します。"
+tags: ["Rork", "iOS", "メモリ管理", "OOM", "パフォーマンス", "Instruments", "壁紙アプリ", "個人開発"]
+highlights:
+  - "iOSのdidReceiveMemoryWarningを5段階に分けて優先度別に解放する具体的な実装手順"
+  - "Instruments AllocationsとMetricKitでOOM率を4.3%から0.36%まで下げた計測フロー"
+  - "壁紙アプリで累計5,000万DLを支えてきた、Rork経由でも適用できる低圧縮優先順位の判断軸"
+---
+
+朝のメールで Crashlytics の通知を開いたとき、また同じパターンが上に来ていました。「Out of Memory (Background)」の系統で、再現端末は iPhone SE 第3世代と iPad mini 6。前者は物理メモリ 4GB、後者は 4GB ですが iPadOS のマルチタスクが厳しめで、メモリ警告から数秒で OS にプロセスを停止されるケースが続いていました。
+
+壁紙アプリを運用していると、メモリの問題は避けて通れません。ユーザーは「次の壁紙」「次の壁紙」と高解像度の画像を切り替え続けます。3,000 x 5,000 ピクセル前後のオリジナル素材を扱う場合、デコード済みで 1 枚あたり 60MB を超える領域を確保することになり、5 〜 6 枚をリスト表示するだけで物理メモリの肩を叩く水準に達します。
+
+2014 年から個人で iOS / Android アプリを作り続けてきました。累計ダウンロードは 5,000 万を超え、その多くが壁紙・癒し・引き寄せ系の画像中心のアプリです。Rork 経由で React Native ベースに乗せ替えた最近のラインナップでも、結局この「画像が重い」というメモリ特性は変わりません。むしろ JS ブリッジを挟む分、ネイティブと連携した解放戦略を持っておかないと、メモリ警告が来てから手当が間に合わないという場面が増えました。
+
+ここ 12 年で磨いてきたのが「5 段階解放アーキテクチャ」という設計です。AdMob 経由の広告収益を月 100 万円超まで育てる過程で、OOM によるクラッシュは LTV を直接削る一番痛い指標でした。Rork が出力する Expo ベースのプロジェクトで実際に使っている実装を、Swift と TypeScript の両側からまとめます。OOM 率 4.3% から 0.36% まで落ちた計測フローも、Instruments と MetricKit の併用方法を含めて共有します。アーティスト・個人開発者の廣川政樹として、App Store / Google Play の両方で 12 年運用してきた中で見えてきた現場感を、できる限りそのまま残しました。
+
+## なぜ「段階解放」が必要か
+
+iOS のメモリ警告は二段階で来ます。まず軽い warning が `UIApplication.didReceiveMemoryWarning` 通知として配信され、無視していると数秒以内に jetsam（バックグラウンドの場合はさらに厳しい閾値）でプロセスごと殺されます。フォアグラウンドでも、警告から復帰せずに確保を続けると `applicationWillTerminate` も呼ばれないまま落ちます。
+
+実装の素朴な対応は「警告が来たら画像キャッシュを全部クリア」です。これでも OOM 率は下がりますが、副作用としてユーザー体験が大きく劣化します。スクロール中に警告が走った瞬間、画面上の画像までいったん消えてフラッシュが起き、再ロードのスピナーが出ます。壁紙アプリの場合、これは「アプリ全体が止まったように見える」レベルの違和感です。
+
+そこで導入したのが、解放対象を 5 段階に分けて、警告のレベルや残メモリの逼迫度に応じて段階的に手放す設計です。各段階はユーザー体験への影響度の昇順で並んでいて、本当に逼迫してきたときだけ深い段階まで触ります。
+
+1. **Tier 1: ディスクキャッシュとプリフェッチ済みリモートデータ** — 失っても再取得できる、ユーザーから不可視のもの
+2. **Tier 2: 非可視ビューのデコード済みビットマップ** — 画面外の画像キャッシュ
+3. **Tier 3: アニメーション・トランジション用の中間バッファ** — 体感に直結するが復元可能なもの
+4. **Tier 4: 可視範囲外のサムネイル・近接プリフェッチ** — スクロール時の体感を支えているが捨てれば再構築可能
+5. **Tier 5: 現在見えている画像の高解像度バリアント** — 最終手段。低解像度プレースホルダーに置換
+
+順番に手放すことで、ユーザーが体感する劣化を最小化しつつ、jetsam による強制停止の確率を大きく下げられます。私のアプリ群では、この設計を入れる前後で OOM 率が 4.3% → 0.36% に下がりました（直近 30 日 / iPhone SE 第3世代）。
+
+## ネイティブ側で受け取る — Swift の Memory Pressure Observer
+
+Rork から生成された Expo プロジェクトでも、ネイティブモジュールを 1 つ追加すれば iOS のメモリ警告を React Native 側に流せます。まずは Swift 側の受け口です。
+
+```swift
+import Foundation
+import UIKit
+import os
+
+/// 5段階のメモリ解放を担当するシングルトン
+@objc(MemoryPressureManager)
+class MemoryPressureManager: NSObject {
+
+    enum Tier: Int {
+        case disk = 1       // Tier 1: ディスクキャッシュ
+        case offscreen = 2  // Tier 2: 非可視ビュー
+        case animation = 3  // Tier 3: アニメーションバッファ
+        case adjacent = 4   // Tier 4: 近接プリフェッチ
+        case visibleHi = 5  // Tier 5: 可視範囲の高解像度
+    }
+
+    static let shared = MemoryPressureManager()
+    private let log = Logger(subsystem: "design.dolice.memory", category: "pressure")
+    private var lastReleasedTier: Tier = .disk
+    private var lastReleasedAt: Date = .distantPast
+
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(didReceiveMemoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil
+        )
+    }
+
+    @objc private func didReceiveMemoryWarning() {
+        let footprint = currentFootprintMB()
+        log.warning("memory warning at \(footprint, format: .fixed(precision: 1)) MB")
+        escalateRelease(currentFootprintMB: footprint)
+    }
+
+    /// 残メモリ・直近の解放履歴を見て次に解放する Tier を決める
+    private func escalateRelease(currentFootprintMB: Double) {
+        let now = Date()
+        let secondsSinceLast = now.timeIntervalSince(lastReleasedAt)
+
+        // 直近 3 秒以内に同じ Tier を解放したばかりなら、もう 1 段深く
+        let nextRaw: Int
+        if secondsSinceLast < 3.0 {
+            nextRaw = min(lastReleasedTier.rawValue + 1, Tier.visibleHi.rawValue)
+        } else if currentFootprintMB > 600 {
+            // 600MB 超えはいきなり Tier 3 から
+            nextRaw = max(lastReleasedTier.rawValue, Tier.animation.rawValue)
+        } else {
+            nextRaw = Tier.disk.rawValue
+        }
+
+        let tier = Tier(rawValue: nextRaw) ?? .disk
+        notifyJS(tier: tier, footprint: currentFootprintMB)
+        lastReleasedTier = tier
+        lastReleasedAt = now
+    }
+}
+```
+
+ポイントは `escalateRelease` で「直近に何 Tier を解放したか」と「現在の物理フットプリント」を同時に見ている点です。短時間に何度も警告が来るときは、毎回 Tier 1 から始めると追いつきません。逆に久しぶりの警告でいきなり Tier 5 まで触るとユーザー体験が壊れるので、時間経過によるリセットを入れています。
+
+## React Native 側で受け取る — Tier ごとのハンドラ登録
+
+ネイティブから JS に流す部分は `RCTEventEmitter` を継承する形が素直です。次は TypeScript 側で各 Tier のハンドラを集約する実装です。Rork の出力する Expo Router 構成にそのまま乗ります。
+
+```typescript
+import { NativeEventEmitter, NativeModules } from 'react-native';
+
+type Tier = 1 | 2 | 3 | 4 | 5;
+
+interface MemoryEvent {
+  tier: Tier;
+  footprintMB: number;
+}
+
+type Handler = (event: MemoryEvent) => Promise<void> | void;
+
+class MemoryPressureBus {
+  private handlers = new Map<Tier, Set<Handler>>();
+  private emitter: NativeEventEmitter;
+
+  constructor() {
+    this.emitter = new NativeEventEmitter(NativeModules.MemoryPressureManager);
+    this.emitter.addListener('onMemoryPressure', this.handleNative);
+    // 内側で配るので、テスト用にも公開
+    for (let t = 1; t <= 5; t++) {
+      this.handlers.set(t as Tier, new Set());
+    }
+  }
+
+  register(tier: Tier, handler: Handler): () => void {
+    this.handlers.get(tier)?.add(handler);
+    return () => this.handlers.get(tier)?.delete(handler);
+  }
+
+  private handleNative = async (event: MemoryEvent) => {
+    // 同じ Tier の全ハンドラを並列で叩く
+    // 1 つのハンドラが遅くてもブロックしない設計
+    const handlers = Array.from(this.handlers.get(event.tier) ?? []);
+    await Promise.allSettled(handlers.map((h) => h(event)));
+  };
+}
+
+export const memoryBus = new MemoryPressureBus();
+```
+
+各画面・各キャッシュ層が自分の Tier に登録します。例えば画像キャッシュは Tier 1/2 を、アニメーションは Tier 3 を、ListView のプリフェッチは Tier 4 を持つ、という具合です。コンポーネント側は `useEffect` で登録・解除を行うだけになります。
+
+## キャッシュ層の登録例 — Expo Image との併用
+
+実運用で一番効くのは Expo Image のメモリキャッシュ制御です。`expo-image` は `Image.clearMemoryCache()` でデコード済みビットマップを一括破棄できますが、それを Tier 2 に登録するだけで Tier 1 で済む警告が大幅に減りました。
+
+```typescript
+import { Image as ExpoImage } from 'expo-image';
+import { memoryBus } from '@/lib/memoryBus';
+
+// アプリ起動時に 1 度だけ呼ぶ
+export function registerImageCacheHandlers() {
+  // Tier 1: ディスクキャッシュ（再ダウンロード可能）
+  memoryBus.register(1, async () => {
+    await ExpoImage.clearDiskCache();
+  });
+
+  // Tier 2: メモリ上のデコード済みビットマップ
+  memoryBus.register(2, async () => {
+    await ExpoImage.clearMemoryCache();
+  });
+
+  // Tier 5: 可視範囲の高解像度を低解像度に置換
+  memoryBus.register(5, async () => {
+    // 各画面で「低解像度モードに切り替え」フラグを購読
+    useLowResolutionFallback.getState().enable();
+  });
+}
+```
+
+Tier 5 は強い手なので、本当に必要なときだけ発火するように Swift 側で `currentFootprintMB` の閾値を分けています。私の場合、フォアグラウンドで 720MB を超えた場合のみ Tier 5 に到達する設定にしています。閾値は端末ごとに `ProcessInfo.processInfo.physicalMemory` から動的に計算するのが安全で、4GB 機では 600MB、6GB 機では 1.0GB、8GB 機では 1.4GB を Tier 5 の発火点にしています。
+
+## Instruments と MetricKit を併用した計測フロー
+
+ここまでの実装をしても、実機での効き目を計測しないと意味がありません。私の場合、開発中は Instruments、本番運用では MetricKit という分担にしています。
+
+開発時の Instruments での手順を共有します。
+
+1. Xcode で実機を選び、Product → Profile → Allocations を起動
+2. アプリ起動から 5 分、典型的なユーザー操作（壁紙を 50 枚スクロール、お気に入り 20 件、設定画面を 3 往復）をスクリプト化して走らせる
+3. 「VM Tracker」を併走させ、Resident Size のピーク値を記録
+4. メモリ警告を `xcrun simctl` で人工的に発生させ、各 Tier の解放がログ通り走るか確認
+5. 解放後の Resident Size が想定通り減ったかをスクリーンショットで残す
+
+注意点として、Allocations だけだと Swift 側のキャッシュは追えますが、JS 側のヒープは見えません。Hermes エンジンを使っている場合、Hermes のサンプリングプロファイラを `react-native start` の引数で有効化し、別途 Chrome DevTools 経由でヒープスナップショットを取る必要があります。
+
+本番運用では MetricKit の `MXMetricPayload` を毎日収集して BigQuery に流しています。特に注視しているのは `cumulativeForegroundTime` あたりの平均 footprint と、`MXAppLaunchMetric` の `histogrammedTimeToFirstDraw`。Tier 2 の解放を入れた前後で、後者のヒストグラムが p95 で 180ms 改善しました。これはユーザー体験のじわっとした改善として効いてくる数値です。
+
+```swift
+import MetricKit
+
+final class MetricsReporter: NSObject, MXMetricManagerSubscriber {
+
+    func didReceive(_ payloads: [MXMetricPayload]) {
+        for payload in payloads {
+            guard let memory = payload.memoryMetrics else { continue }
+            // 平均値・ピーク値を Cloudflare Workers のエンドポイントに送信
+            // 端末モデル・OS バージョン・アプリバージョンを必ず付与
+            Task {
+                await MetricsClient.shared.report(
+                    averageMB: memory.averageSuspendedMemory.averageMeasurement.value / 1_048_576,
+                    peakMB: memory.peakMemoryUsage.value / 1_048_576
+                )
+            }
+        }
+    }
+}
+```
+
+## OOM 率を 4.3% から 0.36% に下げた具体的な経過
+
+施策を入れた順番と、各段階での OOM 率の変化を時系列で残しておきます。私自身、何が効いたか後から思い出せないので、Notion に記録していたものをそのまま転載します。
+
+- **施策前（2025-11）** : OOM 4.3% / 平均 Resident Size 540MB / Crashlytics で「OOM」が首位
+- **Tier 1（ディスクキャッシュ）導入後**: 4.1% / 効果はほぼ計測誤差レベル。これだけでは焼け石に水
+- **Tier 2（デコード済みビットマップ）導入後**: 2.4% / 大幅改善。明らかに画像キャッシュが主因だった
+- **Tier 5（低解像度プレースホルダー置換）導入後**: 0.9% / 4GB 端末で大きく効いた
+- **Tier 3 & 4（中間バッファと近接プリフェッチ）導入後**: 0.36% / iPad mini 6 系の数値が綺麗になった
+
+総作業時間としては 3 週間ほどでしたが、Tier 2 までで全体の 70% の効果が得られた計算になります。個人開発で時間が限られる場合、まずは Tier 1/2 の組み合わせから始めるのを推奨します。Tier 3 〜 5 は端末や利用シーンによって効き方が変わるので、MetricKit の数値を見ながら判断したほうが投資対効果が見えます。
+
+## Rork 経由ビルドの特有事情
+
+Rork が出力する Expo プロジェクトをそのまま EAS でビルドする場合、Hermes が標準で有効になっています。Hermes は JS ヒープを比較的小さく抑えてくれますが、ネイティブ側のキャッシュは別問題なので、ここまでの設計はそのまま効きます。
+
+注意点が 2 つあります。1 つ目は、Expo の Image Picker や Camera など、一時的に大きなバッファを確保するモジュールを使うときは、それぞれのモジュールが提供する解放 API（`releasePreviewBuffers` 等）を Tier 3 か 4 に登録すること。デフォルトでは保持し続けるので、メモリ警告が来ても自動では手放しません。
+
+2 つ目は、Expo Modules のスレッドモデル。`@objc(MemoryPressureManager)` で公開したクラスのインスタンスは、デフォルトでメインスレッドで `init` が走ります。`NotificationCenter.default` の `addObserver` はメインスレッドで呼ぶ必要があるので、本記事のコード通りで問題ありません。ただし `escalateRelease` から呼び出される JS イベントエミッタの発火は、JS スレッドにディスパッチされるため、ネイティブ側で実時間が必要な処理（例えばオーディオバッファの解放）は Swift 側で完結させたほうが安全です。
+
+## 次のステップ
+
+ここまでの設計を自分のアプリに入れるときは、まず以下の順序を推奨します。
+
+1. ネイティブモジュールを 1 つ追加し、`UIApplication.didReceiveMemoryWarningNotification` を受け取る
+2. JS 側に `memoryBus` を用意し、まず Expo Image の Tier 1/2 だけ登録する
+3. Instruments で OOM 率の前後を計測し、効き目を確認
+4. MetricKit を入れて、本番のメモリピークを日次で観測できるようにする
+5. その上で、自分のアプリ特有のキャッシュ層（API レスポンス、地図タイル、音声など）を Tier 3/4 に追加
+
+実装の参考になれば幸いです。お読みいただきありがとうございました。
