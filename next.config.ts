@@ -202,6 +202,10 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/rork-dev/rork-coupon-stamp-card-app-tutorial", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-custom-hooks-reusable-logic", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-victory-native-charts-dashboard", to: "/articles/rork-dev" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/rork-business/rork-app-valuation-maximization-premium-guide", to: "/articles/rork-business" },
+  // 2026-05-25 YMYL (tax) removal
+  { from: "/articles/rork-business/rork-first-week-revenue-pricing-trial-design", to: "/articles/rork-business" },
 ];
 
 const buildAuditRedirects = () => {
