@@ -134,13 +134,13 @@ export default async function ArticlePage({ params }: Props) {
   const previewContent = (() => {
     const h2s = Array.from(content.matchAll(/<h2[\s>]/g));
     const cutIdx = h2s.length >= 4
-      ? Math.floor(h2s.length / 2)   // ≥4 H2s → cut at halfway
+      ? 2   // ≥4 H2s → cut at halfway
       : h2s.length >= 2
-      ? h2s.length - 1               // 2-3 H2s → show all but last section
+      ? 1                            // 2-3 H2s → show only first section (GSC recovery)
       : 1;
     return (h2s[cutIdx]?.index !== undefined)
       ? content.slice(0, h2s[cutIdx].index)
-      : content.slice(0, Math.floor(content.length / 2));
+      : content.slice(0, Math.floor(content.length / 4));
   })();
 
   const articleUrl = `https://rorklab.net${prefix}/articles/${category}/${slug}`;
@@ -337,7 +337,15 @@ export default async function ArticlePage({ params }: Props) {
             className="article-content"
             dangerouslySetInnerHTML={{ __html: previewContent }}
           />
-          {/* Flexible Sampling: hidden content remains in HTML for Googlebot */}
+          {/* Soft inline CTA at preview cutoff — links to membership */}
+          <div className="preview-continue-link" style={{ margin: "40px 0 32px", padding: "20px 24px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "color-mix(in srgb, var(--accent-coral) 4%, transparent)", textAlign: "center" }}>
+            <p style={{ fontSize: 14, color: "var(--text-dim)", margin: "0 0 12px", lineHeight: 1.7 }}>
+              {locale === "ja" ? "✦ ここから先はメンバーシップ会員限定です" : "✦ The rest is available to members"}
+            </p>
+            <a href={locale === "ja" ? "/membership" : "/en/membership"} style={{ display: "inline-block", padding: "10px 24px", borderRadius: 6, background: "var(--accent-coral)", color: "#fff", textDecoration: "none", fontSize: 14, fontWeight: 500 }}>
+              {locale === "ja" ? "メンバーシップで続きを読む →" : "Continue reading with membership →"}
+            </a>
+          </div>
           <div
             className="paywall-hidden-content"
             style={{ display: "none" }}
