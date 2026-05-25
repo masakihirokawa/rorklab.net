@@ -83,6 +83,7 @@ export function getArticle(
       description: entry.description || "",
       tags: entry.tags || [],
       premium: entry.premium || false,
+      highlights: entry.highlights || undefined,
     },
     content: "",
   };
