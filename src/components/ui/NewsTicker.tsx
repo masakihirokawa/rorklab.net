@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ARR15M — Rork Max ローンチから3日で $1.5M ARR 達成と複数メディアが報道、AI アプリビルダー史上最速級の立ち上がり（2月〜）",
-    "MAXPRICE — Rork Max は $200/月（無料枠は週5プロンプト程度）、Native Swift 生成の対価として開発者層に定着（5月）",
-    "ALLAPPLE — Rork Max が iPhone/iPad/Watch/TV/Vision Pro/iMessage 全 Apple プラットフォームを単一プロンプトで網羅（2026）",
-    "NATIVEAPI — AR/LiDAR・Metal 3D・Dynamic Island・Live Activities・Siri Intents・HealthKit・HomeKit・NFC・Core ML まで対応、RN 不可領域に到達（2026）",
-    "COMPANION — Rork Companion アプリで Apple Developer 未契約でも実機テスト可、$99/年なしで開発を開始できる（2026）",
-    "AISTUDIOAND — Google AI Studio が native Android 生成に参入、ノーコード AI 競争が iOS と Android の両側面で激化（5/19）",
+    "MAX — Rork Max は Apple プラットフォーム横断の SwiftUI 出力、iPhone / iPad / Watch / TV / Vision Pro / iMessage を 1 プロジェクトで対応（5/27）",
+    "SIM — ブラウザ内の iOS Simulator が Mac クラウド上の本物の Simulator を低遅延ストリーミング、60fps を維持（5/27）",
+    "DEPLOY — App Store / TestFlight への直接サブミットに対応、証明書と Provisioning Profile は Rork が自動管理（5/27）",
+    "COMPANION — Rork Companion で $99/年 の Apple Developer Program なしでも実機テスト可能（5月）",
+    "SEED — Rork が Left Lane Capital リードで $15M シードラウンド調達（4月）、月間訪問は 743,000、成長率 85%（5月）",
+    "AISTUDIO — Google AI Studio が Jetpack Compose + Kotlin の Android 生成を開始、iOS 側は Rork Max の独自ポジション（5/19）",
   ],
   en: [
-    "ARR15M — Rork Max reportedly hit $1.5M ARR in three days after launch — one of the fastest ramps in AI app builders (Feb onward)",
-    "MAXPRICE — Rork Max is $200/month (free tier offers ~5 prompts/week), positioned as the price of true native Swift generation (May)",
-    "ALLAPPLE — A single prompt in Rork Max produces apps for iPhone, iPad, Watch, TV, Vision Pro, and iMessage (2026)",
-    "NATIVEAPI — Unlocks AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, Siri Intents, HealthKit, HomeKit, NFC, and Core ML — territory React Native cannot reach (2026)",
-    "COMPANION — The Rork Companion app enables real-iPhone testing without a paid Apple Developer account — no $99/year required to start (2026)",
-    "AISTUDIOAND — Google AI Studio enters native Android generation; the no-code AI race now heats up on both iOS and Android sides (5/19)",
+    "MAX — Rork Max produces SwiftUI across Apple platforms, covering iPhone, iPad, Watch, TV, Vision Pro, and iMessage from one project (May 27)",
+    "SIM — The in-browser iOS Simulator streams a real Simulator on a cloud Mac with low latency, holding 60fps (May 27)",
+    "DEPLOY — Direct submission to App Store and TestFlight is built in; Rork manages certificates and provisioning profiles automatically (May 27)",
+    "COMPANION — The Rork Companion app enables real-device testing without the $99/year Apple Developer Program (May)",
+    "SEED — Rork raised a $15M seed led by Left Lane Capital (April); the platform reports 743K monthly visits and 85% growth (May)",
+    "AISTUDIO — Google AI Studio begins generating Android apps in Jetpack Compose + Kotlin; on iOS, Rork Max holds its distinctive position (May 19)",
   ],
 };
 
