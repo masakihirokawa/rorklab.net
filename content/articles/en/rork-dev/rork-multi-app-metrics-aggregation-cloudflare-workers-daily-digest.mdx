@@ -1,0 +1,292 @@
+---
+title: "Aggregating App Store Connect, RevenueCat, and AdMob into One Morning Digest with Cloudflare Workers — A Six-App Indie Architecture"
+slug: "rork-multi-app-metrics-aggregation-cloudflare-workers-daily-digest"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-26T04:45"
+author: "Rork Lab"
+description: "A practical architecture for indie developers running multiple Rork apps: aggregate App Store Connect API, RevenueCat REST, and AdMob Reporting API in a Cloudflare Workers Cron job and ship a single daily Slack digest each morning."
+tags: ["Rork", "Cloudflare Workers", "App Store Connect API", "RevenueCat", "AdMob", "indie developer", "metrics", "architecture"]
+highlights:
+  - "Full code for signing App Store Connect JWTs (ES256), pulling RevenueCat REST overview, and calling the AdMob Reporting API from a Cloudflare Workers Cron — including the gotchas with JWT aud, gzipped TSV, and AdMob streaming JSON"
+  - "Real numbers: 30–40 minutes of morning dashboard hopping compressed to under 5 minutes across six apps, run on Workers + KV + D1 within a monthly cost of $0–$5"
+  - "Anomaly detection thresholds (DL ±20%, revenue ±25%, crash-free-users dropping below 99.5%) routed into Slack Block Kit so only the abnormal lines demand attention"
+---
+
+Before I'd even poured the coffee, I would open App Store Connect, then RevenueCat, then AdMob, then Firebase Console, then Crashlytics. Six tabs per app. For six apps, that's thirty-something tabs, a spreadsheet copy-paste session, and forty minutes gone. Some mornings the Crashlytics graph would pull my mood down; other mornings the RevenueCat MRR line would loosen my shoulders. Either way, by the time I had the numbers in my head I had also lost the freshest part of my day.
+
+I have been shipping iOS and Android apps as a one-person developer since 2014. Cumulative downloads now exceed 50 million, mostly across wallpaper, healing, and manifestation-style image apps. My current portfolio of 5–7 active titles holds AdMob revenue over one million yen per month, but that number is held up by the unglamorous habit of looking at numbers every morning and deciding the day's tuning. When the numbers alone took 30–40 minutes, that habit was being squeezed at its narrowest point.
+
+This article walks through the architecture I actually run in production today: an App Store Connect API + RevenueCat REST + AdMob Reporting API aggregator on Cloudflare Workers Cron Triggers, posting a single morning digest to Slack at 08:00 JST. The morning check is now under five minutes. The monthly Cloudflare bill sits at $0–$5, which is fair for a one-person operation.
+
+## What we're aggregating, and where the data comes from
+
+Before any code, lay the sources side by side. Each API has its own auth, rate limit, and freshness, and ignoring this leads to swampy code later.
+
+| Source | Metrics | Auth | Freshness | Rate limit |
+| --- | --- | --- | --- | --- |
+| App Store Connect API | downloads, revenue, IAP counts per app | JWT (ES256) | T-1 day | 200 req/min |
+| RevenueCat REST v1 | MRR, retention, cancellations | Bearer Token | near real-time | 1,200 req/min |
+| AdMob Reporting API | eCPM, impressions, revenue per app | OAuth 2.0 | T-1 day | 750 req/min |
+| Firebase Crashlytics (via BigQuery export) | crash-free users, impacted users | Service Account | T-1 day (requires export) | BigQuery quotas |
+
+App Store Connect API and AdMob Reporting API finalize "yesterday" sometime around noon the next day. For an 08:00 run, you're safely reading **the day before yesterday**. RevenueCat allows same-day reads, but cancellations take up to two hours to reflect, so I anchor on the 23:59 JST snapshot of the previous day. Stable beats fresh here.
+
+## High-level architecture
+
+The whole system runs on Cloudflare Workers. To keep the monthly cost at zero, the only state stores are Workers KV (for the previous-day snapshot used in diff calculations) and D1 (for the rolling 30-day history that powers weekly retro views).
+
+```text
+┌────────────────────────────────────────────┐
+│  Cloudflare Workers (Cron: 0 23 * * *)     │
+│  ┌────────────────────────────────────┐    │
+│  │  1. fetch App Store Connect API    │    │
+│  │  2. fetch RevenueCat REST           │    │
+│  │  3. fetch AdMob Reporting API       │    │
+│  │  4. fetch Crashlytics (BigQuery)    │    │
+│  │  5. normalize + diff vs prev day    │    │
+│  │  6. detect anomalies (±20% / +0.5pt)│    │
+│  │  7. post to Slack (Block Kit)       │    │
+│  └────────────────────────────────────┘    │
+│              ↓                ↓             │
+│        Workers KV         D1 (history)      │
+│   (last snapshot)    (last 30 days)         │
+└────────────────────────────────────────────┘
+```
+
+Anything older than 30 days I defer to GA4's BigQuery export rather than carry inside Workers. As an indie, dragging long-horizon data into a hand-rolled store creates a quiet maintenance debt I do not want to own.
+
+## Step 1: Signing the App Store Connect JWT
+
+App Store Connect API expects an ES256 (ECDSA + SHA-256) JWT. Cloudflare Workers cannot use Node's `jsonwebtoken` directly, so we lean on the Web Crypto API. The `.p8` private key contents are base64-encoded and stored as a Workers Secret.
+
+```typescript
+// src/asc.ts
+const ASC_KEY_ID = "XXXXXXXXXX";
+const ASC_ISSUER_ID = "00000000-0000-0000-0000-000000000000";
+
+export async function signAscJwt(env: Env): Promise<string> {
+  const pem = atob(env.ASC_PRIVATE_KEY_B64);
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToBinary(pem),
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+
+  const header = { alg: "ES256", kid: ASC_KEY_ID, typ: "JWT" };
+  const payload = {
+    iss: ASC_ISSUER_ID,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 1200, // 20 min
+    aud: "appstoreconnect-v1",
+  };
+
+  const headerB64 = base64UrlEncode(JSON.stringify(header));
+  const payloadB64 = base64UrlEncode(JSON.stringify(payload));
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: { name: "SHA-256" } },
+    key,
+    new TextEncoder().encode(signingInput),
+  );
+
+  return `${signingInput}.${base64UrlEncode(signature)}`;
+}
+```
+
+The expiry of 20 minutes is the documented ceiling — anything longer returns 401. **The first gotcha is `aud`**: some older docs suggest `"https://api.appstoreconnect.apple.com"`, but the current contract is `"appstoreconnect-v1"`. I lost an hour to that drift the first time around.
+
+The Sales and Trends report comes back as gzipped TSV, so unpack it in-Worker with the Compression Streams API rather than dragging in a dependency.
+
+```typescript
+export async function fetchAscSalesReport(env: Env, dateYmd: string) {
+  const jwt = await signAscJwt(env);
+  const url = new URL("https://api.appstoreconnect.apple.com/v1/salesReports");
+  url.searchParams.set("filter[frequency]", "DAILY");
+  url.searchParams.set("filter[reportType]", "SALES");
+  url.searchParams.set("filter[reportSubType]", "SUMMARY");
+  url.searchParams.set("filter[vendorNumber]", env.ASC_VENDOR_NUMBER);
+  url.searchParams.set("filter[reportDate]", dateYmd);
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${jwt}`, Accept: "application/a-gzip" },
+  });
+  if (res.status === 404) return null; // report not yet finalized
+  if (!res.ok) throw new Error(`ASC ${res.status}`);
+
+  const ds = new DecompressionStream("gzip");
+  const decompressed = res.body!.pipeThrough(ds);
+  const text = await new Response(decompressed).text();
+  return parseTsv(text);
+}
+```
+
+## Step 2: RevenueCat and AdMob
+
+RevenueCat is the gentle one. A simple Bearer Token in `Authorization` is enough. The Public API v1's `/v1/projects/{project_id}/overview` endpoint returns MRR, Active Subscribers, and Trial counts in a single call.
+
+```typescript
+export async function fetchRevenueCatOverview(env: Env) {
+  const res = await fetch(
+    `https://api.revenuecat.com/v1/projects/${env.RC_PROJECT_ID}/overview`,
+    { headers: { Authorization: `Bearer ${env.RC_SECRET_KEY}` } },
+  );
+  if (!res.ok) throw new Error(`RC ${res.status}`);
+  return res.json();
+}
+```
+
+AdMob Reporting API uses OAuth 2.0 with a refresh-token-for-access-token exchange. Refresh tokens do not expire, so you store one in Workers Secret and rotate access tokens per run. The v1beta `networkReport:generate` endpoint accepts filters covering all six apps in one call.
+
+```typescript
+export async function fetchAdMobReport(env: Env, dateYmd: string) {
+  const access = await refreshAdMobAccessToken(env);
+  const body = {
+    reportSpec: {
+      dateRange: { startDate: ymdToObj(dateYmd), endDate: ymdToObj(dateYmd) },
+      dimensions: ["APP", "COUNTRY"],
+      metrics: ["ESTIMATED_EARNINGS", "IMPRESSIONS", "CLICKS", "IMPRESSION_RPM"],
+    },
+  };
+  const res = await fetch(
+    `https://admob.googleapis.com/v1beta/accounts/${env.ADMOB_PUBLISHER_ID}/networkReport:generate`,
+    { method: "POST", headers: { Authorization: `Bearer ${access}` }, body: JSON.stringify(body) },
+  );
+  if (!res.ok) throw new Error(`AdMob ${res.status}`);
+  return parseAdMobReport(await res.json());
+}
+```
+
+**The AdMob gotcha** is the response shape. It is not a flat JSON object but a streaming-friendly array where each element is one of `header`, `row`, or `footer`. The first time I wrote against it, I reached for `response.row` and lost half a day before reading the spec carefully.
+
+## Step 3: Normalize and diff
+
+Each API uses different identifiers for the same app — ASC uses `appAppleId`, RevenueCat uses `app_id`, AdMob uses an internal `app_id` with `ca-app-pub-` prefixes. A small hand-maintained mapping is the simplest reliable shim.
+
+```typescript
+// src/config.ts
+export const APP_REGISTRY = [
+  { slug: "shooting-stars", asc: "123456789", rc: "app_abc", admob: "ca-app-pub-.../9999" },
+  { slug: "moon-phases", asc: "234567890", rc: "app_def", admob: "ca-app-pub-.../8888" },
+  // ... 6 apps
+] as const;
+```
+
+After normalization, compare against yesterday's snapshot in Workers KV under `snapshot:YYYY-MM-DD` to compute `Δ DL`, `Δ Revenue`, and `Δ Crashes`. Move older-than-30-day rows from KV to D1 to keep the KV namespace tidy.
+
+## Step 4: Anomaly detection and Slack
+
+Eyeballing every metric across six apps every morning is unrealistic, so highlight only what is outside normal range. My thresholds, calibrated over years of running this portfolio:
+
+1. **Downloads ±20% (yellow) / ±40% (red)** — abnormal jumps or drops
+2. **Revenue ±25% (yellow) / ±50% (red)** — AdMob CPM swings or campaign side effects
+3. **Crash-free Users below 99.5% (yellow) / below 99.0% (red)** — release regressions
+4. **Trial starts -30% or worse (yellow)** — onboarding breakage
+5. **Refunds +200% over month average (red)** — Family Sharing abuse or release-linked refund spikes
+
+These aren't textbook numbers — they're calibrated against the texture of running a 50-million-download portfolio over a decade. Tune yours to your own pace.
+
+Build the Slack payload with Block Kit so the anomalies surface first, then per-app summary lines follow under a divider.
+
+```typescript
+function buildSlackBlocks(report: DailyReport) {
+  const anomalies = report.apps.flatMap(detectAnomalies);
+  const blocks: any[] = [
+    { type: "header", text: { type: "plain_text", text: `Daily Metrics — ${report.date}` } },
+  ];
+  if (anomalies.length > 0) {
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `:rotating_light: *Anomalies (${anomalies.length})*\n` +
+          anomalies.map(a => `• \`${a.app}\` ${a.metric}: ${a.delta} (${a.severity})`).join("\n"),
+      },
+    });
+    blocks.push({ type: "divider" });
+  }
+  for (const app of report.apps) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: formatAppLine(app) },
+    });
+  }
+  return blocks;
+}
+```
+
+I switch `username` and `icon_emoji` between calm (`:bar_chart:`, silent) and alerting (`:rotating_light:`, with sound). Changing the haptic profile of the morning notification did more for my decision speed than any dashboard tweak.
+
+## Step 5: wrangler.toml and Cron Triggers
+
+Cron Triggers run on UTC, so 08:00 JST is `0 23 * * *`. Workers Cron does not guarantee sub-minute precision per the documentation, so don't depend on second-level alignment.
+
+```toml
+# wrangler.toml
+name = "rork-multiapp-metrics"
+main = "src/index.ts"
+compatibility_date = "2026-05-15"
+
+[triggers]
+crons = ["0 23 * * *"]
+
+[[kv_namespaces]]
+binding = "METRICS_KV"
+id = "..."
+
+[[d1_databases]]
+binding = "METRICS_D1"
+database_name = "metrics-history"
+database_id = "..."
+
+# Secrets via `wrangler secret put`:
+# - ASC_PRIVATE_KEY_B64
+# - ASC_VENDOR_NUMBER
+# - RC_SECRET_KEY
+# - RC_PROJECT_ID
+# - ADMOB_PUBLISHER_ID
+# - ADMOB_REFRESH_TOKEN
+# - SLACK_WEBHOOK_URL
+```
+
+Wire both `fetch` and `scheduled` handlers. The HTTP entry point lets you manually re-run a past day (`GET /run?date=2026-05-25`), which I use frequently for backfills.
+
+## Six months of cost and time
+
+Workers' free tier (100,000 req/day) and KV (1,000 ops/day) are more than enough for a once-daily job that runs ~12 seconds. D1 has 5M read ops/day and 100K write ops/day on the free tier, and we use a tiny fraction. Six months in, my Cloudflare invoice lists only "Workers Free" and "KV Free". Slack's free plan covers the Webhook.
+
+The time impact:
+
+| Item | Before (manual) | After (Workers aggregation) |
+| --- | --- | --- |
+| Morning metrics review | 30–40 min | under 5 min |
+| Anomaly-to-awareness latency | 4–6 hours on average | immediate at 08:00 |
+| Missed crash-rate spikes (six months) | 3 | 0 |
+| AdMob eCPM-drop response time | next afternoon | same morning |
+
+The line that mattered most for me was "missed crash-rate spikes". After moving some of my Rork-generated apps to a unified React Native base, I saw a handful of Android-device-specific crash regressions in the months that followed. Catching them in the morning Slack — rather than two days later through user emails — directly protects Day-2 retention. AdMob eCPM cliffs happen a few times a year; catching them in the morning rather than the next afternoon lets me reallocate mediation that same day.
+
+## Pitfalls and a recommended build order
+
+Trying to ship this in a single sitting almost guarantees you abandon it. The order I recommend:
+
+1. **Start with Slack Webhook + Cron only.** `console.log` is enough. Spend 2–3 days confirming the schedule fires reliably.
+2. **Add RevenueCat first.** Cleanest auth, cleanest response shape. Use it to lock down the Slack Block Kit layout.
+3. **Add AdMob next.** Get past OAuth 2.0 refresh tokens and the streaming JSON quirk.
+4. **App Store Connect last.** JWT signing, gzip unpack, TSV parsing — three layers stacked. Worth doing once the other pieces are stable.
+5. **Crashlytics only after BigQuery export is enabled.** Don't blow your weekend on this without that prerequisite.
+6. **Anomaly detection at the very end.** You need a month of unflagged data to know what "normal" looks like for your apps.
+
+When JWT signing fights you, generate a known-good JWT locally with Node + `jose` and compare byte-for-byte against the Workers output. I burned two hours on a DER-to-JOSE signature conversion bug; reaching for a known-good reference closed the loop in minutes the next time.
+
+## Is it worth it for fewer apps?
+
+Honestly, no. With one app, the standard App Store Connect app on your phone is enough. With two apps, tab-flipping is fine. Past three apps, the morning ritual starts eating the freshest part of the day and you'll feel it. This architecture earns its keep at three apps and absolutely pays off at six.
+
+AI-driven app generators like Rork make it easy to grow the portfolio fast. The downside is that operations don't scale at the same rate. From 1997 when I first taught myself to code, I've been drawn to running multiple things at once, but without operational scaffolding the apps eat the operator. Compressing the daily numbers check from forty minutes to five is a small, unsexy investment that frees the rest of the day for the next app.
+
+Thanks for reading. If you're juggling multiple indie apps, I hope a piece of this is useful.

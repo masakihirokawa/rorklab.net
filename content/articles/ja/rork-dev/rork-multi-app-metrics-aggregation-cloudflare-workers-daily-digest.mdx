@@ -1,0 +1,293 @@
+---
+title: "App Store Connect・RevenueCat・AdMob の朝の指標を Cloudflare Workers で1本化する — 6アプリ運用の日次集約アーキテクチャ"
+slug: "rork-multi-app-metrics-aggregation-cloudflare-workers-daily-digest"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-26T04:45"
+author: "Rork Lab"
+description: "Rork で複数アプリを運用する個人開発者向けに、App Store Connect API・RevenueCat REST・AdMob Reporting API を Cloudflare Workers Cron で集約し、毎朝1通の日次レポートに統合する実装手順をまとめました。"
+tags: ["Rork", "Cloudflare Workers", "App Store Connect API", "RevenueCat", "AdMob", "個人開発", "メトリクス", "アーキテクチャ"]
+highlights:
+  - "App Store Connect API JWT・RevenueCat REST・AdMob Reporting API を Cloudflare Workers Cron で日次集約する完全なコード例と、JWT 署名・トークン保管・レート制限回避の判断軸"
+  - "6 アプリ同時運用で毎朝 30〜40 分かかっていた指標確認を 5 分以下に縮めた実測値と、Workers + KV + D1 を月額 $0〜$5 のレンジに収める構成"
+  - "Slack Block Kit で構造化したレポートに、前日比 ±20% やクラッシュ率 +0.5pt の閾値で自動アラートを分岐させる異常値検出ロジック"
+---
+
+朝、コーヒーを淹れる前に App Store Connect を開き、続けて RevenueCat、AdMob、Firebase Console、Crashlytics と 6 つのタブを巡る。これを 6 つのアプリ分繰り返していました。タブの数だけで 30 を超え、必要な数値をスプレッドシートに転記し終わるころには 30 分から 40 分が消えています。Crashlytics のグラフが目に飛び込んできて気持ちが沈む朝もあれば、RevenueCat の MRR が伸びていて少し肩の力が抜ける朝もあります。
+
+2014 年から個人で iOS / Android アプリを作り続けてきました。累計ダウンロードは 5,000 万を超え、その多くは壁紙・癒し・引き寄せ系の画像中心のアプリです。Rork 経由で React Native 系に乗り換えた最近のラインナップでも、運用しているアプリは常に 5〜7 本。AdMob の月収はそのポートフォリオで 100 万円超を維持していますが、これは「毎朝指標を見て、その日のチューニングを決める」という地味な反復で支えられています。指標を見るだけで 30 分以上かかる状態は、その地味な反復のいちばん細い首根っこを締めていました。
+
+私自身の運用で実際に使っている「App Store Connect API・RevenueCat REST・AdMob Reporting API を Cloudflare Workers の Cron Triggers で 1 本化し、毎朝 JST 8:00 に Slack へ 1 通の日次レポートを届ける」アーキテクチャを、コードと判断軸を含めて共有します。指標確認の時間は 5 分以下まで縮みました。Workers の月額コストは $0〜$5 のレンジに収まっており、個人開発者の運用負荷としては許容範囲です。
+
+## 集約対象とデータ取得方式の整理
+
+最初に、何をどこから取るのかを表で整理します。各 API は認証方式・レート制限・データの新鮮度がバラバラなので、ここを揃えないと後で泥沼になります。
+
+| ソース | 取得項目 | 認証 | データ新鮮度 | レート制限 |
+| --- | --- | --- | --- | --- |
+| App Store Connect API | アプリ別 DL 数・売上・課金件数 | JWT (ES256) | T-1 日 | 200 req/min |
+| RevenueCat REST v1 | サブスク MRR・継続率・解約数 | Bearer Token | リアルタイム | 1200 req/min |
+| AdMob Reporting API | アプリ別 eCPM・インプレッション・収益 | OAuth 2.0 | T-1 日 | 750 req/min |
+| Firebase Crashlytics (BigQuery export) | クラッシュ率・影響ユーザー数 | Service Account | T-1 日（要 export 設定） | BigQuery 制限 |
+
+App Store Connect API と AdMob Reporting API は「前日分の確定値」が翌日の昼ごろに揃います。朝 8:00 に走らせる場合、取得するのは **前々日分** が安全です。RevenueCat は当日分も取れますが、解約は反映に最大 2 時間かかるので、私は安定運用のため前日 23:59 JST スナップショットを基準にしています。
+
+## アーキテクチャの全体像
+
+Cloudflare Workers を中心に置いた、シンプルな構成にしています。月額ゼロで運用するために、外部 DB は使わず Workers KV と D1 の Free 枠で完結させました。
+
+```text
+┌────────────────────────────────────────────┐
+│  Cloudflare Workers (Cron: 0 23 * * *)     │
+│  ┌────────────────────────────────────┐    │
+│  │  1. fetch App Store Connect API    │    │
+│  │  2. fetch RevenueCat REST           │    │
+│  │  3. fetch AdMob Reporting API       │    │
+│  │  4. fetch Crashlytics (BigQuery)    │    │
+│  │  5. normalize + diff vs prev day    │    │
+│  │  6. detect anomalies (±20% / +0.5pt)│    │
+│  │  7. post to Slack (Block Kit)       │    │
+│  └────────────────────────────────────┘    │
+│              ↓                ↓             │
+│        Workers KV         D1 (履歴)         │
+│   (last snapshot)    (30日分のメトリクス)   │
+└────────────────────────────────────────────┘
+```
+
+KV は「前日比の差分計算」に使うスナップショット保管庫として、D1 は週次・月次の振り返り用にメトリクスの履歴を 30 日分だけ保持しています。30 日を超える分析は GA4 BigQuery に丸投げする方針で、Workers 側で長期保持はしません。個人開発者がここを背負うとデータの保全責任が重くなりすぎます。
+
+## Step 1: App Store Connect API の JWT 署名
+
+App Store Connect API は ES256 (ECDSA + SHA-256) で JWT を署名する必要があります。Cloudflare Workers は Node.js の `jsonwebtoken` を直接動かせないので、Web Crypto API で実装します。`private_key.p8` の中身は base64 化して Workers Secret に格納します。
+
+```typescript
+// src/asc.ts
+const ASC_KEY_ID = "XXXXXXXXXX";
+const ASC_ISSUER_ID = "00000000-0000-0000-0000-000000000000";
+
+export async function signAscJwt(env: Env): Promise<string> {
+  const pem = atob(env.ASC_PRIVATE_KEY_B64);
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToBinary(pem),
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+
+  const header = { alg: "ES256", kid: ASC_KEY_ID, typ: "JWT" };
+  const payload = {
+    iss: ASC_ISSUER_ID,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 1200, // 20 min
+    aud: "appstoreconnect-v1",
+  };
+
+  const headerB64 = base64UrlEncode(JSON.stringify(header));
+  const payloadB64 = base64UrlEncode(JSON.stringify(payload));
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: { name: "SHA-256" } },
+    key,
+    new TextEncoder().encode(signingInput),
+  );
+
+  return `${signingInput}.${base64UrlEncode(signature)}`;
+}
+```
+
+`pemToBinary` と `base64UrlEncode` は素朴な実装で十分です。`exp` を 20 分にしているのは、Apple のドキュメントの上限（最大 20 分）に合わせるためで、これを超えると 401 が返ってきます。**最初の落とし穴は `aud` を `"appstoreconnect-v1"` ではなく `"https://api.appstoreconnect.apple.com"` と書いてしまうケース**。Apple のドキュメントの古い版にあった表記に引きずられがちですが、現行仕様は前者です。
+
+Sales and Trends Report は CSV（gzip）で返ってくるので、Workers 内で展開する必要があります。Compression Streams API を使うと外部依存なしで処理できます。
+
+```typescript
+export async function fetchAscSalesReport(env: Env, dateYmd: string) {
+  const jwt = await signAscJwt(env);
+  const url = new URL("https://api.appstoreconnect.apple.com/v1/salesReports");
+  url.searchParams.set("filter[frequency]", "DAILY");
+  url.searchParams.set("filter[reportType]", "SALES");
+  url.searchParams.set("filter[reportSubType]", "SUMMARY");
+  url.searchParams.set("filter[vendorNumber]", env.ASC_VENDOR_NUMBER);
+  url.searchParams.set("filter[reportDate]", dateYmd);
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${jwt}`, Accept: "application/a-gzip" },
+  });
+  if (res.status === 404) return null; // 当該日のレポート未確定
+  if (!res.ok) throw new Error(`ASC ${res.status}`);
+
+  const ds = new DecompressionStream("gzip");
+  const decompressed = res.body!.pipeThrough(ds);
+  const text = await new Response(decompressed).text();
+  return parseTsv(text); // TSV を行・列のオブジェクトに
+}
+```
+
+## Step 2: RevenueCat と AdMob の取得
+
+RevenueCat は Bearer Token を `Authorization` に入れるだけで、JWT のような細工は不要です。Public API v1 の `/v1/overview/{project_id}` あたりが MRR・Active Subscribers・Trial 数まで一括で返してくれます。
+
+```typescript
+export async function fetchRevenueCatOverview(env: Env) {
+  const res = await fetch(
+    `https://api.revenuecat.com/v1/projects/${env.RC_PROJECT_ID}/overview`,
+    { headers: { Authorization: `Bearer ${env.RC_SECRET_KEY}` } },
+  );
+  if (!res.ok) throw new Error(`RC ${res.status}`);
+  return res.json();
+}
+```
+
+AdMob Reporting API は OAuth 2.0 で、Refresh Token から Access Token を毎回取り直す方式です。Refresh Token は失効しないので、Workers Secret に置いて使い続けられます。Reporting API v1beta は GraphQL ではなく REST + JSON 仕様で、`networkReport:generate` というエンドポイントに 6 アプリ分のフィルタを束ねて投げます。
+
+```typescript
+export async function fetchAdMobReport(env: Env, dateYmd: string) {
+  const access = await refreshAdMobAccessToken(env);
+  const body = {
+    reportSpec: {
+      dateRange: { startDate: ymdToObj(dateYmd), endDate: ymdToObj(dateYmd) },
+      dimensions: ["APP", "COUNTRY"],
+      metrics: ["ESTIMATED_EARNINGS", "IMPRESSIONS", "CLICKS", "IMPRESSION_RPM"],
+    },
+  };
+  const res = await fetch(
+    `https://admob.googleapis.com/v1beta/accounts/${env.ADMOB_PUBLISHER_ID}/networkReport:generate`,
+    { method: "POST", headers: { Authorization: `Bearer ${access}` }, body: JSON.stringify(body) },
+  );
+  if (!res.ok) throw new Error(`AdMob ${res.status}`);
+  // 1 行目 header, 中間 rows, 最終行 footer の streaming JSON
+  return parseAdMobReport(await res.json());
+}
+```
+
+**ここでハマりやすいのが AdMob のレスポンス形式**。普通の JSON ではなく、配列の各要素が `header`・`row`・`footer` のいずれかという streaming-friendly な形になっています。最初に書いたとき、`response.row` のような属性アクセスを期待して挙動が読めず、半日溶かしました。
+
+## Step 3: 正規化と差分計算
+
+3 つの API のレスポンスをアプリ単位の共通スキーマにマップします。アプリの識別子が ASC では `appAppleId`、RevenueCat では `app_id`、AdMob では `app_id` ですが値の形式が違うので、`config.ts` に手動マッピングを書いておきます。
+
+```typescript
+// src/config.ts
+export const APP_REGISTRY = [
+  { slug: "shooting-stars", asc: "123456789", rc: "app_abc", admob: "ca-app-pub-.../9999" },
+  { slug: "moon-phases", asc: "234567890", rc: "app_def", admob: "ca-app-pub-.../8888" },
+  // ... 6 apps
+] as const;
+```
+
+正規化後、Workers KV に保存していた前日分と比較して、`Δ DL`、`Δ Revenue`、`Δ Crashes` を計算します。KV のキーは `snapshot:YYYY-MM-DD` で固定です。30 日を超える履歴は D1 に move して、KV からは消します。
+
+## Step 4: 異常値検出と Slack 通知
+
+朝のレポートで全アプリの全指標を眺めるのは現実的ではないので、異常値のみ赤・黄でハイライトします。私が運用している閾値は以下です。これは 2014 年から累計 5,000 万 DL を運用してきた感覚値に近く、ポートフォリオごとに調整するべきです。
+
+1. **DL ±20%（黄）/±40%（赤）** — 通常レンジ外の急変化を検知
+2. **Revenue ±25%（黄）/±50%（赤）** — AdMob CPM の急変動 or キャンペーン影響
+3. **Crash-free Users 99.5% 未満（黄）/99.0% 未満（赤）** — リリース直後のリグレッション検知
+4. **Subscription Trial 数 -30% 以上（黄）** — オンボーディング不具合の早期発見
+5. **Refund 件数が当月平均 +200%（赤）** — Family Sharing 経由の自爆や不具合連動の返金急増
+
+Slack は Block Kit で構造化します。アプリ別のセクションを `divider` で区切り、異常値だけ `:rotating_light:` 絵文字を付けて先頭に出します。
+
+```typescript
+function buildSlackBlocks(report: DailyReport) {
+  const anomalies = report.apps.flatMap(detectAnomalies);
+  const blocks: any[] = [
+    { type: "header", text: { type: "plain_text", text: `Daily Metrics — ${report.date}` } },
+  ];
+  if (anomalies.length > 0) {
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `:rotating_light: *Anomalies (${anomalies.length})*\n` +
+          anomalies.map(a => `• \`${a.app}\` ${a.metric}: ${a.delta} (${a.severity})`).join("\n"),
+      },
+    });
+    blocks.push({ type: "divider" });
+  }
+  for (const app of report.apps) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: formatAppLine(app) },
+    });
+  }
+  return blocks;
+}
+```
+
+異常値があるときは Slack の通知が必ず音付きで届くように、`username` と `icon_emoji` を変えています。普段は `:bar_chart:` でサイレント、異常時は `:rotating_light:` で音あり。スマホ通知の触感を変えるだけで、朝の判断スピードが体感で変わります。
+
+## Step 5: wrangler.toml と Cron Triggers の構成
+
+Cron Triggers は UTC 指定なので、JST 8:00 に走らせるには 23:00 UTC を指定します。Workers の Cron は 1 分単位の精度がないと公式に明記されているので、厳密な分秒の整合性に依存する処理は避けます。
+
+```toml
+# wrangler.toml
+name = "rork-multiapp-metrics"
+main = "src/index.ts"
+compatibility_date = "2026-05-15"
+
+[triggers]
+crons = ["0 23 * * *"]
+
+[[kv_namespaces]]
+binding = "METRICS_KV"
+id = "..."
+
+[[d1_databases]]
+binding = "METRICS_D1"
+database_name = "metrics-history"
+database_id = "..."
+
+# Secrets を wrangler secret put で投入
+# - ASC_PRIVATE_KEY_B64
+# - ASC_VENDOR_NUMBER
+# - RC_SECRET_KEY
+# - RC_PROJECT_ID
+# - ADMOB_PUBLISHER_ID
+# - ADMOB_REFRESH_TOKEN
+# - SLACK_WEBHOOK_URL
+```
+
+`fetch` ハンドラと `scheduled` ハンドラを両方実装しておくと、デバッグ時に手動でも走らせられて便利です。私の環境では `GET /run?date=2026-05-25` で過去日付の再計算ができるようにしています。
+
+## 月額コストと実運用 6 ヶ月の所感
+
+Cloudflare の料金体系では、Workers の無料枠 100,000 req/day と KV 1,000 ops/day で完結します。Cron は 1 日 1 回・処理時間 12 秒前後なので、Workers の CPU タイムも問題になりません。D1 は読み取り 5M ops/day と書き込み 100K ops/day の無料枠があるので、月数十回の書き込みでは全く触りません。
+
+実運用 6 ヶ月の累計コストは $0 で、Cloudflare の請求書には「Workers Free」と「KV Free」しか並んでいません。Slack の Free プランで Webhook を使えば、こちらも追加コストはゼロです。
+
+時間効率の比較は以下です。
+
+| 項目 | 導入前（手動） | 導入後（Workers 集約） |
+| --- | --- | --- |
+| 朝の指標確認時間 | 30〜40 分 | 5 分以下 |
+| 異常検知までのリードタイム | 平均 4〜6 時間 | 朝 8:00 即時 |
+| クラッシュ率上昇の見逃し件数（半年） | 3 件 | 0 件 |
+| AdMob eCPM 急落への対応開始時刻 | 翌日午後 | 当日朝 |
+
+私の場合、特に効いたのは「クラッシュ率上昇の見逃しゼロ化」でした。Rork 経由で React Native 系に統合した直後の数ヶ月は、特定の Android 端末でだけクラッシュが伸びる事象が何度かあり、これを朝の Slack でその場で気づけるかどうかで Day-2 Retention に直接響きます。AdMob の eCPM が CPM のテリトリーごと急落する日も年に数回ありますが、これも朝に気づければ当日中に媒介配分を変えられます。
+
+## 落とし穴とおすすめの実装順序
+
+このアーキテクチャを 1 日で組もうとすると確実に挫折します。私が推奨する実装順序は次のとおりです。
+
+1. **まず Slack Webhook と Cron だけ動かす** — `console.log` で十分。スケジュール起動が安定することを 2〜3 日確認する
+2. **RevenueCat だけを統合する** — 認証が一番素直で、API レスポンスが整っている。ここで Slack Block Kit の形を固める
+3. **AdMob を統合する** — OAuth 2.0 と streaming JSON のクセに慣れる
+4. **App Store Connect API を統合する** — JWT 署名・gzip 展開・TSV パースの 3 段抜き。ここが最難関
+5. **Crashlytics は最後に** — BigQuery export 設定が前提なので、必要性が見えてから入れる
+6. **異常値検出は最後の最後** — 1 ヶ月の通常レンジを観測してから閾値を決めないと、ノイズだらけになる
+
+JWT 署名で詰まったときは、ローカルの Node.js + `jose` ライブラリで先に通る JWT を生成しておき、Workers 側の出力と byte 単位で比較すると原因が早く絞れます。私は ECDSA 署名の DER → JOSE 変換でハマって 2 時間溶かしましたが、ここを既知の良品と比較する手法を入れてから類似の詰まりはゼロになりました。
+
+## 6 アプリ運用が前提なら投資する価値はあるか
+
+私見では、運用アプリが 3 本以上になった時点で投資対効果は明確に黒字です。1 本だけなら App Store Connect の標準アプリで十分ですし、2 本でもタブの往復で済みます。3 本を越えたあたりから、毎朝の指標確認が「考える前に決まっていた一日の最初の作業」になり、頭の鮮度が削られる感覚がはっきり出てきます。
+
+このアーキテクチャは、Rork のような AI コード生成ツールで「アプリを増やしやすい」時代と相性が良いと感じています。1997 年に独学でプログラミングを始めた頃から「一人で複数のものを動かす」ことに惹かれてきましたが、Rork で生成スピードが上がる一方で、運用側の道具を持っていないとアプリの数だけ自分が削れていきます。指標を見る作業を 5 分以下に圧縮する仕組みは、個人開発者が次のアプリに集中するための地味な、しかし効く投資だと感じています。
+
+お読みいただきありがとうございました。同じように複数アプリを並行運用している方の参考になれば幸いです。
