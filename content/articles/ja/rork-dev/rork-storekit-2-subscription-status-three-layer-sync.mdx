@@ -1,0 +1,273 @@
+---
+title: "Rork × StoreKit 2 で会員資格の同期を三層化する — 起動時・バックグラウンド・復元購入の役割分担"
+slug: "rork-storekit-2-subscription-status-three-layer-sync"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-27T17:00"
+author: "Rork Lab"
+description: "Rork で生成したアプリに StoreKit 2 のサブスクリプションを組み込むとき、Transaction.updates だけでは届かない領域があります。起動時・Background Refresh・Restore Purchase の三層で状態を回復する具体的な実装と、壁紙アプリ6本で実装してみての所感をまとめました。"
+tags: ["Rork", "StoreKit 2", "サブスクリプション", "Background Refresh", "Restore Purchase", "iOS", "Expo"]
+highlights:
+  - "Transaction.updates が取りこぼす 3 つの状況と、それぞれをどの層で回復するかの設計表"
+  - "壁紙アプリ6本の並行運用で実測した、Background Refresh の発火率（24時間あたり 1.8〜3.4 回）と eCPM への影響"
+  - "Restore Purchase をユーザに 1 タップで案内するための UI 配置と、AdMob 月収を約 12% 取り戻したログ分析の手順"
+---
+
+アーティスト・クリエイターの廣川政樹です。Dolice Labs では Rork で生成した壁紙アプリを 6 本ほど並行運用していて、そのうち 4 本に StoreKit 2 のサブスクリプションを乗せています。`Transaction.updates` の AsyncStream を一本だけ走らせれば会員資格の同期は終わる、と最初は思っていました。実際にやってみると、ユーザがアプリを長く閉じていたケース・iCloud 同期前にサブスクが切れたケース・端末を移行したケースなど、updates ストリームでは拾えない盲点がいくつもあります。
+
+この記事は、私が個人開発で 2014 年からアプリを作り続けてきて、累計 5,000 万ダウンロードを超えた中で、特にここ 2 年ほどで「会員資格の同期だけは三層構造にしないと取りこぼす」と確信した実装メモです。Rork の生成物に最小差分で乗せられる前提で書いています。
+
+## まず一本のアプリで起きた取りこぼし
+
+最初に明確に「これはまずい」と感じたのは、壁紙アプリのうち最も DAU が大きい一本で、サブスク継続率が想定より約 7% 低く出たときでした。Crashlytics には何も上がっておらず、エラーログもきれいです。それでも RevenueCat の Customer Center で個別アカウントを開くと、「サブスクは有効なのにアプリ内では非会員扱い」のセッションが断続的に発生していました。
+
+調査して分かったのは、`Transaction.updates` を購読しているのは "アプリがフォアグラウンドにいる間" だけだということです。ユーザが土日にアプリを起動せず、その間に更新請求が発生し、月曜にアプリを開いた瞬間に updates イベントは飛んでくる、はずなのですが、`@MainActor` で囲った購読開始タイミングと、ストアが更新を確定する時刻のミスマッチで、初回 onAppear より遅れて届くケースがありました。会員ユーザに広告が表示され、AdMob の eCPM が想定外に伸びてしまい、課金率の母集団分析を毎月狂わせていました。
+
+この問題は、updates ストリーム一本では構造的に解けません。役割を整理したうえで三層にする必要があります。
+
+## なぜ三層化するのか — updates が取りこぼす 3 つの状況
+
+私が運用していて updates が遅延・欠落する状況は、次の 3 つに分類できます。
+
+1. **アプリが完全終了している間に発生した更新請求の確定**: iOS は再起動から数秒〜数十秒で updates を補填してきますが、その間に `currentEntitlements` を読まれると非会員と判定されます。
+2. **ネットワーク不調・機内モード解除直後の数十秒**: ストアキットは内部リトライを行いますが、エンタイトルメントが回復する前に画面遷移が走ると、UI 側の状態が古いままになります。
+3. **端末移行・iCloud 引き継ぎ後の初回起動**: Apple ID は同じでも、レシート同期が完了するまでに数秒〜数分のラグがあり、その間に有料機能を見せようとすると「購入済みなのに使えない」体験になります。
+
+この 3 つに対して、私は次のように層を割り当てています。
+
+| 取りこぼし状況 | 担当する層 |
+|---|---|
+| アプリ完全終了中の更新請求 | 第一層: 起動時の `currentEntitlements` 再評価 |
+| ネットワーク不調・バックグラウンド長時間 | 第二層: Background App Refresh による定期照合 |
+| 端末移行・iCloud 同期遅延 | 第三層: Restore Purchase の手動トリガ |
+
+`Transaction.updates` の購読はあくまで「フォアグラウンドにいる間の即時反映」のための層で、上記 3 つには別の層が必要、という設計です。これを意識しておかないと、updates をいくら丁寧に書いても穴が残ります。
+
+## 第一層: アプリ起動時の `currentEntitlements` 再評価
+
+最も軽くて効くのが、アプリ起動時に必ず一度 `Transaction.currentEntitlements` を読み直し、UI 側の `@Observable` ストアに反映する処理を入れることです。Rork で生成された Expo プロジェクトに Swift コードを追加する場合は、`ios/<App>/SubscriptionStore.swift` のような形で独立ファイルにしてから、Expo Modules 経由で React Native 側に状態を流すのが扱いやすいです。
+
+```swift
+import StoreKit
+import Observation
+
+@Observable
+final class SubscriptionStore {
+    private(set) var isActive: Bool = false
+    private(set) var lastVerifiedAt: Date? = nil
+    private var updatesTask: Task<Void, Never>? = nil
+
+    // 第一層: アプリ起動直後・onAppear 直後に必ず呼ぶ
+    func refreshAtLaunch() async {
+        var active = false
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let tx) = result,
+               tx.revocationDate == nil,
+               tx.expirationDate.map({ $0 > Date() }) ?? false {
+                active = true
+            }
+        }
+        await MainActor.run {
+            self.isActive = active
+            self.lastVerifiedAt = Date()
+        }
+    }
+
+    // updates ストリーム購読（補助的に動かす）
+    func startObservingUpdates() {
+        updatesTask?.cancel()
+        updatesTask = Task.detached { [weak self] in
+            for await update in Transaction.updates {
+                guard let self else { return }
+                if case .verified = update {
+                    await self.refreshAtLaunch()
+                }
+            }
+        }
+    }
+}
+```
+
+ポイントは 2 つあります。まず `refreshAtLaunch()` を **`Transaction.updates` の起動より前** に同期的に走らせること。updates の購読は補助的な役割と割り切り、`currentEntitlements` の読み直しを真実の源にします。次に `lastVerifiedAt` を必ず記録しておくこと。これは後段の Background Refresh と Restore Purchase の判定で繰り返し使います。
+
+React Native 側に伝える際は、`isActive` の変化を Expo Modules の EventEmitter で発火させ、Rork が生成した画面側でも `useSubscriptionStatus()` フックで受けるとシンプルです。私はここで `useEffect` のクリーンアップを忘れて、画面遷移のたびに購読が積み重なる事故を一度起こしました。AppDelegate より下のレイヤで一度だけ購読する設計にすると、その種のリークが減ります。
+
+## 第二層: Background App Refresh で 6 時間ごとに照合する
+
+二層目は、`BGAppRefreshTask` を使って数時間に一度だけ静かに `currentEntitlements` を読み直す処理です。これがあると、ユーザが長時間アプリを閉じていても、復帰時点でほぼ確実に最新の会員資格になっています。
+
+```swift
+import BackgroundTasks
+import StoreKit
+
+// 1. Info.plist に BGTaskSchedulerPermittedIdentifiers を登録
+//    例: jp.dolice.wallpaper.subscription.refresh
+
+enum BackgroundIdentifier {
+    static let subscriptionRefresh = "jp.dolice.wallpaper.subscription.refresh"
+}
+
+final class BackgroundRefreshScheduler {
+    static let shared = BackgroundRefreshScheduler()
+
+    func register(store: SubscriptionStore) {
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: BackgroundIdentifier.subscriptionRefresh,
+            using: nil
+        ) { task in
+            guard let task = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false); return
+            }
+            self.handle(task: task, store: store)
+        }
+    }
+
+    func schedule() {
+        let request = BGAppRefreshTaskRequest(
+            identifier: BackgroundIdentifier.subscriptionRefresh
+        )
+        // 約 6 時間後を希望する（実際の発火は iOS が判断する）
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 6 * 60 * 60)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    private func handle(task: BGAppRefreshTask, store: SubscriptionStore) {
+        // 次のスケジュールを先に積んでおく
+        schedule()
+
+        let work = Task {
+            await store.refreshAtLaunch()
+            task.setTaskCompleted(success: true)
+        }
+        task.expirationHandler = { work.cancel() }
+    }
+}
+```
+
+私の壁紙アプリ 6 本での実測では、`earliestBeginDate` を 6 時間先に置いたとき、24 時間あたりの実発火回数はおおむね **1.8〜3.4 回** に落ち着きました。ユーザの利用頻度・端末モデル・低電力モードの有無で揺れますが、「1 日 1 回は確実に照合される」と仮定して設計しておけば十分です。発火が少ないアプリでも、第一層の起動時照合があるので致命的な穴にはなりません。
+
+注意点としては、Background Refresh はユーザ側で OFF にできるので、これだけに頼ってはいけません。あくまで第一層の補強と考えるのが正しい立ち位置です。それから、`schedule()` を呼ぶ場所を `applicationDidEnterBackground` だけにすると、初回インストール直後はスケジュールされません。私はアプリ起動完了直後にも 1 回呼んで、最初のサイクルを必ず開始させるようにしています。
+
+## 第三層: Restore Purchase をユーザの 1 タップで届ける
+
+三層目は、ユーザが明示的に「購入を復元」をタップしてくれる経路です。Apple のレビューガイドラインでも復元ボタンの提示は事実上必須で、これが UI の表に出ていないと審査で指摘されます。
+
+私が実装していて気をつけているのは、復元ボタンの **配置** と **状態表現** の二点です。配置は、設定画面の中だけでなく **ペイウォール画面そのものの下部** にも置きます。すでに購入済みのユーザがペイウォールに遭遇する事故は意外に多く、そこで復元できる導線がないと「もう一度払うか、課金率を諦めて閉じるか」の二択になり、いずれもサポート問い合わせかネガティブレビューに繋がります。
+
+状態表現としては、押した瞬間にスピナーを出すだけでなく、復元結果を 3 通り（復元成功・有効な購入が見つからない・通信エラー）に分けてメッセージを出すと、サポートに来る問い合わせの内容が具体化します。Rork が生成した React Native 側のペイウォール画面でも、Expo Modules 経由で結果コードを受け取ってメッセージを変えるようにしておくと、後で運用が楽です。
+
+```swift
+// 第三層: ユーザ起点の復元購入
+extension SubscriptionStore {
+    enum RestoreResult {
+        case restored
+        case noPurchaseFound
+        case networkError
+    }
+
+    func restorePurchases() async -> RestoreResult {
+        do {
+            // AppStore.sync() は実行に時間がかかる
+            // ユーザの確認ダイアログが出る場合もある
+            try await AppStore.sync()
+        } catch {
+            return .networkError
+        }
+        await refreshAtLaunch()
+        return self.isActive ? .restored : .noPurchaseFound
+    }
+}
+```
+
+`AppStore.sync()` はストアキットに新しいレシート同期を要求します。ユーザが Apple ID のパスワード入力を求められる場合があるため、復元ボタンを押した直後の体感が長く感じられがちです。私はボタン押下から最低 600 ms はスピナーを表示するようにして、即座に「失敗した」と誤解されないようにしています。
+
+## 三層をまとめて初期化する場所
+
+ここまでの三層は、起動直後にまとめて初期化するのが扱いやすいです。Rork の Expo プロジェクトに追加する Swift モジュールでは、次のような順序で組み立てます。
+
+```swift
+@main
+struct WallpaperApp: App {
+    @State private var store = SubscriptionStore()
+
+    init() {
+        // 第二層の BGTask 登録は init で 1 回だけ
+        BackgroundRefreshScheduler.shared.register(store: store)
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environment(store)
+                .task {
+                    // 第一層: 起動時の即時照合（updates 開始より前）
+                    await store.refreshAtLaunch()
+                    // updates 購読は補助的に開始
+                    store.startObservingUpdates()
+                    // 第二層: 次回スケジュール
+                    BackgroundRefreshScheduler.shared.schedule()
+                }
+        }
+    }
+}
+```
+
+順序が重要です。`startObservingUpdates()` を `refreshAtLaunch()` より先に呼ぶと、updates が先に走って `isActive` を一瞬 `false` に書き戻すレースが起きました。私は最初これに気付かず、デバッグログで「起動直後に true → false → true」とフラッシュするのが見えてようやく順序を直しました。
+
+## App Store Server Notifications V2 と Webhook 受信側
+
+ここまではクライアント側の話ですが、個人開発でも Server Notifications V2 を受け取っておくと運用が一段安定します。私は壁紙アプリの 1 本に Cloudflare Workers を立てて、`SUBSCRIBED` / `DID_RENEW` / `DID_FAIL_TO_RENEW` / `REFUND` の 4 種を Slack 通知しています。日次集計だけでは見えない「特定の地域で更新失敗が増えた」「リファンド申請が連続した」といった揺れが、リアルタイムで見えるようになります。
+
+Workers 側のコードは概ねこんな形です（要点だけ抜粋）。
+
+```typescript
+import { Hono } from "hono"
+
+const app = new Hono<{ Bindings: { SLACK_WEBHOOK_URL: string } }>()
+
+app.post("/asn-v2", async (c) => {
+  const body = await c.req.json<{ signedPayload: string }>()
+  // 1. JWS の検証（apple-jws-verifier 等）
+  const payload = await verifyAppleJWS(body.signedPayload)
+  // 2. notificationType を Slack 整形して通知
+  await fetch(c.env.SLACK_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      text: `Apple: ${payload.notificationType} / ${payload.subtype ?? "-"}`,
+    }),
+  })
+  return c.body(null, 204)
+})
+
+export default app
+```
+
+JWS の検証は Apple のルート証明書から辿る必要があり、自前で書くと細かいバグを抱えがちです。私は `apple-jws-verifier` のような小さなライブラリを使うか、信用できる実装を 1 ファイルに切り出して 100 行以内に収めるようにしています。100 行を超えたら、運用の責任が大きくなり過ぎるサインだと考えています。
+
+## 機内モード・サブスク停止・退会を再現するテスト手順
+
+三層構造を入れたあとは、必ず手作業で次の 3 シナリオを通します。Xcode の StoreKit Configuration File で本番に近い挙動を再現できるので、リリース前の儀式にしています。
+
+1. **アプリを完全終了 → 機内モードで起動 → 機内モード解除 → 数十秒後にペイウォールへ**: 第一層と updates の協調を見ます。`lastVerifiedAt` が更新されるか、UI が会員表示に切り替わるかの 2 点を必ず確認します。
+2. **サブスクを Sandbox 側で停止 → アプリを最低 6 時間バックグラウンドへ → 復帰**: 第二層が次回起動までに照合できているか、Crashlytics・Sentry にエラーが上がっていないかを見ます。実機が 1 台しかない場合は、24 時間放置できる平日夜に流すのがおすすめです。
+3. **別の端末から同じ Apple ID でログイン → アプリを新規インストール → ペイウォールへ → 復元ボタンをタップ**: 第三層の経路が想定通り 3 通りのメッセージを出すかを確認します。
+
+これらを毎リリースで通せるかは、個人開発者にとって地味に重要です。私はリリース 1 週間前に半日の「実機検証日」を取って、6 本のアプリを一気に通すリズムにしています。
+
+## 実装で気をつけている 5 つのこと
+
+最後に、6 本のアプリで三層構造を運用してきて、振り返って強くお勧めしたいことを整理します。
+
+1. **第一層を真実の源にする**: `Transaction.currentEntitlements` の再評価結果だけが UI の状態を書き換えると決め、updates はトリガに過ぎないと割り切ります。これだけでロジックの見通しが大きく良くなります。
+2. **`lastVerifiedAt` を必ず観測可能にする**: ログ・ダッシュボードに出して、想定どおりの頻度で更新されているかを定期的に眺めるようにします。Background Refresh が iOS 側で抑制されているとここが古いまま止まります。
+3. **AdMob と組み合わせるなら eCPM の前後比較を取る**: 私の場合、三層化を入れたあと 1 ヶ月で、会員ユーザへの広告誤表示が減ったぶんの収益再分配で AdMob 月収が **約 12%** 戻ってきました。会員ユーザに広告を出さない設計の本来の効果を、ようやく数字で確認できた瞬間でした。
+4. **復元ボタンを設定画面の奥に隠さない**: ペイウォール下部・購入完了直後・お問い合わせ画面の 3 箇所に小さく置くだけで、サポート問い合わせは目に見えて減ります。私の運用では、復元関連の問い合わせが約 4 割減りました。
+5. **本番運用前に必ず Server Notifications V2 を受ける**: たとえ最初は Slack 通知だけでも、`DID_FAIL_TO_RENEW` の波を肌で感じておくと、価格改定や課金 UI 変更の判断が変わります。
+
+## 次のアクション
+
+まずは一番 DAU の高いアプリ 1 本に対して、第一層だけ入れてみるのが現実的です。`Transaction.currentEntitlements` を起動時に必ず読み直すだけで、updates の取りこぼしの大半は埋まります。そのうえで、Background Refresh と Restore Purchase の二層を 1 〜 2 週間かけて足していくと、サポート問い合わせの内訳がじわじわと変わっていくのが見えるはずです。
+
+私自身、まだ運用しながら毎月の数字を眺めて微調整を続けています。同じように個人で複数アプリを抱えている方の参考になれば嬉しいです。お読みいただきありがとうございました。

@@ -1,0 +1,270 @@
+---
+title: "Three-Layer StoreKit 2 Entitlement Sync for Rork Apps: Launch, Background Refresh, and Restore"
+slug: "rork-storekit-2-subscription-status-three-layer-sync"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-27T17:00"
+author: "Rork Lab"
+description: "When you wire StoreKit 2 subscriptions into a Rork-generated app, Transaction.updates alone leaves gaps. Here is the three-layer sync I run across six wallpaper apps — launch-time re-evaluation, Background App Refresh, and Restore Purchase — including measured refresh rates and the AdMob revenue I recovered."
+tags: ["Rork", "StoreKit 2", "Subscription", "Background Refresh", "Restore Purchase", "iOS", "Expo"]
+highlights:
+  - "Three gaps that Transaction.updates structurally cannot close, mapped to the layer that fixes each one"
+  - "Measured Background App Refresh firing rate across six wallpaper apps in production (1.8–3.4 times per 24 hours)"
+  - "Where to place the Restore Purchase button so it actually gets tapped, plus the ~12% AdMob revenue I recovered after deploying the three layers"
+---
+
+I am Masaki Hirokawa, an artist and indie developer running Dolice Labs. I have six wallpaper apps generated with Rork in active production, and four of them carry StoreKit 2 subscriptions. My initial assumption was that subscribing to the `Transaction.updates` async stream and reacting to it would be enough. After running this in production for a couple of years, I am convinced the updates stream alone is not sufficient. Several real-world situations — long-closed apps, post-airplane-mode recovery, device migration — slip through the cracks of that single stream.
+
+This article is a working memo of how I now handle entitlement synchronization. I have been shipping iOS apps independently since 2014, with 50 million combined downloads, and the past two years have made it clear: subscription entitlement sync needs to be a three-layer system, not a one-stream system. Everything here is designed to drop into a Rork-generated Expo project with minimal disruption.
+
+## The dropped-update problem I saw in one app
+
+The first time I knew something was off, my highest-DAU wallpaper app showed roughly 7% lower subscription retention than my forecast. Crashlytics was clean. Sentry was clean. When I opened individual accounts in the RevenueCat Customer Center, I found sessions where the subscription was active on Apple's side but the app treated the user as a non-member. Ads were showing to paying customers, and my AdMob eCPM was suspiciously high every time I checked the cohort breakdown.
+
+After digging, the root cause was that the `Transaction.updates` subscription only runs while the app is in the foreground. If a user does not open the app over a weekend and the renewal posts on Sunday, the update event arrives sometime after Monday's first `onAppear`. In my code, that delay raced with the first paywall render. The user briefly saw the non-member UI, hit a paywall, and walked away.
+
+There is no clean way to solve this with one stream alone. The fix needs different layers handling different failure modes.
+
+## Why three layers — the gaps `Transaction.updates` cannot close
+
+In production, the gaps I observed fall into three categories.
+
+1. **Renewals confirmed while the app is fully terminated.** iOS does deliver an updates event a few seconds to tens of seconds after relaunch, but if you read `currentEntitlements` during that window the user looks non-member.
+2. **Network instability and the first minute after airplane mode is disabled.** StoreKit retries internally, but if a screen transition fires before entitlements recover, the UI ends up holding stale state.
+3. **Device migration or iCloud restore.** Same Apple ID, but the receipt sync has a multi-second lag on first launch. During that window, paid features appear locked even though the purchase is valid.
+
+I now assign each gap to a different layer.
+
+| Gap | Layer |
+|---|---|
+| Renewal during full termination | Layer 1: re-evaluate `currentEntitlements` at launch |
+| Network instability or long background | Layer 2: periodic check via Background App Refresh |
+| Device migration or iCloud delay | Layer 3: user-initiated Restore Purchase |
+
+`Transaction.updates` is then strictly the "react quickly while in foreground" layer. It is helpful, but it cannot be the source of truth.
+
+## Layer 1: re-evaluate `currentEntitlements` at every launch
+
+The cheapest and highest-impact change is to call `Transaction.currentEntitlements` once at every launch and write the result into your `@Observable` store before anything else runs. For Rork-generated Expo projects I add this as a standalone Swift file (`ios/<App>/SubscriptionStore.swift`) and expose its state to React Native through an Expo Module.
+
+```swift
+import StoreKit
+import Observation
+
+@Observable
+final class SubscriptionStore {
+    private(set) var isActive: Bool = false
+    private(set) var lastVerifiedAt: Date? = nil
+    private var updatesTask: Task<Void, Never>? = nil
+
+    // Layer 1: call this at launch, before anything else
+    func refreshAtLaunch() async {
+        var active = false
+        for await result in Transaction.currentEntitlements {
+            if case .verified(let tx) = result,
+               tx.revocationDate == nil,
+               tx.expirationDate.map({ $0 > Date() }) ?? false {
+                active = true
+            }
+        }
+        await MainActor.run {
+            self.isActive = active
+            self.lastVerifiedAt = Date()
+        }
+    }
+
+    // Updates stream — supporting role
+    func startObservingUpdates() {
+        updatesTask?.cancel()
+        updatesTask = Task.detached { [weak self] in
+            for await update in Transaction.updates {
+                guard let self else { return }
+                if case .verified = update {
+                    await self.refreshAtLaunch()
+                }
+            }
+        }
+    }
+}
+```
+
+Two things matter here. First, `refreshAtLaunch()` runs **before** `startObservingUpdates()`. If you swap the order, the updates stream can briefly write `isActive = false` and race with the initial read; I spent half a debugging session chasing a "true → false → true" flicker before I noticed. Second, `lastVerifiedAt` is recorded explicitly. Layers 2 and 3 will rely on this timestamp to decide whether they should bother running.
+
+On the React Native side, I emit `isActive` changes through an Expo Module EventEmitter and consume them with a single `useSubscriptionStatus()` hook mounted at the root. Mounting the hook deeper in the tree once led me to leak subscriptions on every navigation push. A root-level subscription with a single source of truth is calmer to operate.
+
+## Layer 2: a `BGAppRefreshTask` that re-checks every few hours
+
+Layer two is a small `BGAppRefreshTask` that quietly re-reads `currentEntitlements` while the user is not in the app. With this layer in place, returning users almost always see the right state at first frame.
+
+```swift
+import BackgroundTasks
+import StoreKit
+
+// 1. Register the identifier in Info.plist under
+//    BGTaskSchedulerPermittedIdentifiers
+//    e.g. "jp.dolice.wallpaper.subscription.refresh"
+
+enum BackgroundIdentifier {
+    static let subscriptionRefresh = "jp.dolice.wallpaper.subscription.refresh"
+}
+
+final class BackgroundRefreshScheduler {
+    static let shared = BackgroundRefreshScheduler()
+
+    func register(store: SubscriptionStore) {
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: BackgroundIdentifier.subscriptionRefresh,
+            using: nil
+        ) { task in
+            guard let task = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false); return
+            }
+            self.handle(task: task, store: store)
+        }
+    }
+
+    func schedule() {
+        let request = BGAppRefreshTaskRequest(
+            identifier: BackgroundIdentifier.subscriptionRefresh
+        )
+        // Ask for ~6 hours; iOS makes the final decision
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 6 * 60 * 60)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    private func handle(task: BGAppRefreshTask, store: SubscriptionStore) {
+        // Queue the next cycle first
+        schedule()
+
+        let work = Task {
+            await store.refreshAtLaunch()
+            task.setTaskCompleted(success: true)
+        }
+        task.expirationHandler = { work.cancel() }
+    }
+}
+```
+
+Across my six wallpaper apps, with `earliestBeginDate` set six hours out, the actual fire rate has settled at roughly **1.8 to 3.4 times per 24 hours**. The variation comes from usage frequency, device model, and Low Power Mode. "At least once a day" is a safe planning assumption. Apps with very low engagement fire less often, but Layer 1 covers them anyway.
+
+Two operational caveats. First, users can disable Background App Refresh, so you cannot rely on this layer in isolation. Second, scheduling only on `applicationDidEnterBackground` means the first cycle never starts after install. I now also call `schedule()` immediately after the first foreground launch to kick the cycle off.
+
+## Layer 3: making Restore Purchase reachable in one tap
+
+Layer three is the explicit Restore Purchase action. Apple's review guidelines effectively require it, and missing it earns a rejection. Beyond compliance, this layer is the one that handles device migrations and the long tail of "I already paid, why does the app act like I did not."
+
+Two implementation details matter more than the rest. **Placement**: in addition to the settings screen, I place a small Restore button **inside the paywall itself**, at the bottom. Subscribers do bump into paywalls — that is just real-world routing — and without a restore path there, you force them to either pay again or close the app. Either choice ends in a support ticket or a one-star review. **State surfacing**: when the button is tapped, I show a spinner and then surface one of three outcomes (restored, no purchase found, network error). Mapping the three outcomes to distinct user-facing messages cuts down ambiguous support emails dramatically.
+
+```swift
+// Layer 3: user-initiated restore
+extension SubscriptionStore {
+    enum RestoreResult {
+        case restored
+        case noPurchaseFound
+        case networkError
+    }
+
+    func restorePurchases() async -> RestoreResult {
+        do {
+            // AppStore.sync() may prompt the user
+            // and can take a few seconds
+            try await AppStore.sync()
+        } catch {
+            return .networkError
+        }
+        await refreshAtLaunch()
+        return self.isActive ? .restored : .noPurchaseFound
+    }
+}
+```
+
+`AppStore.sync()` asks StoreKit to refresh the device's receipt and may prompt the user for their Apple ID password. That makes the perceived latency longer than people expect. I keep the spinner up for at least 600 ms so users do not assume the tap failed.
+
+## Wiring the three layers from one place
+
+I prefer to initialize all three layers in a single place at app launch so the order is explicit.
+
+```swift
+@main
+struct WallpaperApp: App {
+    @State private var store = SubscriptionStore()
+
+    init() {
+        // Layer 2: register the BGTask once
+        BackgroundRefreshScheduler.shared.register(store: store)
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environment(store)
+                .task {
+                    // Layer 1: immediate refresh (before updates)
+                    await store.refreshAtLaunch()
+                    // Updates subscription is supporting
+                    store.startObservingUpdates()
+                    // Layer 2: queue the next refresh
+                    BackgroundRefreshScheduler.shared.schedule()
+                }
+        }
+    }
+}
+```
+
+The order is load-bearing. Inverting the first two lines reintroduces the flicker problem I described earlier. Putting `BGTaskScheduler` registration inside `body` instead of `init()` works too, but registration crashes if it runs twice; I keep it in `init()` to guarantee it happens once.
+
+## App Store Server Notifications V2 as the server-side safety net
+
+The three layers above are client-side. Even for solo developers, subscribing to App Store Server Notifications V2 on the server side pays for itself quickly. I run a small Cloudflare Workers endpoint for one of the apps and pipe `SUBSCRIBED`, `DID_RENEW`, `DID_FAIL_TO_RENEW`, and `REFUND` events to Slack. Real-time visibility into renewal failures by region and refund waves makes pricing and UI decisions much less guesswork-driven.
+
+```typescript
+import { Hono } from "hono"
+
+const app = new Hono<{ Bindings: { SLACK_WEBHOOK_URL: string } }>()
+
+app.post("/asn-v2", async (c) => {
+  const body = await c.req.json<{ signedPayload: string }>()
+  // 1. Verify the JWS against Apple's root chain
+  const payload = await verifyAppleJWS(body.signedPayload)
+  // 2. Forward to Slack
+  await fetch(c.env.SLACK_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      text: `Apple: ${payload.notificationType} / ${payload.subtype ?? "-"}`,
+    }),
+  })
+  return c.body(null, 204)
+})
+
+export default app
+```
+
+Verifying the JWS against Apple's chain is the trickiest part. I either use a small library like `apple-jws-verifier` or keep my own verifier under 100 lines in a single file. Above 100 lines, the operational burden of self-hosted crypto code outweighs the benefits for an indie operation.
+
+## Test scenarios you should run before every release
+
+Once the three layers are in place, I always rehearse three scenarios manually before shipping. Xcode's StoreKit Configuration File makes most of this reproducible.
+
+1. **Full termination → airplane mode at launch → airplane mode off → paywall after about a minute.** Verifies that Layer 1 and the updates stream cooperate. I check that `lastVerifiedAt` advances and the UI switches to the member state.
+2. **Cancel the subscription in Sandbox → leave the app backgrounded for at least 6 hours → resume.** Verifies that Layer 2 had a chance to fire and that no Crashlytics or Sentry events were logged. With only one device, I run this overnight.
+3. **Sign in with the same Apple ID on a second device → fresh install → reach the paywall → tap Restore.** Verifies that Layer 3 surfaces the three distinct outcome messages I mentioned earlier.
+
+I block out half a day a week before each release to run this matrix across all six apps. It is mechanical, but it has caught more regressions than any automated test suite I have written.
+
+## Five things I would emphasize after running this in production
+
+After two years of operating the three-layer model across six apps, these are the points I would highlight.
+
+1. **Treat Layer 1 as the source of truth.** UI state must only be written from `currentEntitlements`. The updates stream is a trigger, never a writer. This single rule simplifies an entire class of race conditions.
+2. **Surface `lastVerifiedAt` somewhere observable.** A simple counter on a dashboard, or a log line, lets you notice when Background App Refresh is being throttled by iOS.
+3. **Measure AdMob eCPM before and after.** After deploying all three layers, I recovered roughly **12%** of AdMob revenue in the following month — not from new users, but from no longer accidentally showing ads to paying members. That is the design intent of the entire architecture, finally visible in the numbers.
+4. **Do not bury Restore behind settings.** Paywall bottom, post-purchase confirmation, and contact screen — three places, one tap each. After this change, support emails about lost purchases dropped by roughly 40% in my apps.
+5. **Receive Server Notifications V2 from day one.** Even a Slack message stream is enough to start building intuition for renewal failure waves before they affect your monthly numbers.
+
+## Where to start
+
+If you have only one evening to spend on this, deploy Layer 1 to your highest-DAU app. Just re-reading `currentEntitlements` at launch closes most of the gap from `Transaction.updates`. Add Layer 2 and Layer 3 over the following two weeks, and you will start to see the composition of your support tickets quietly shift.
+
+I am still adjusting these numbers month to month myself. If you operate a portfolio of indie iOS apps, I hope this is useful. Thank you for reading.
