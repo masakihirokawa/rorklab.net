@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Max は Apple プラットフォーム横断の SwiftUI 出力、iPhone / iPad / Watch / TV / Vision Pro / iMessage を 1 プロジェクトで対応（5/27）",
-    "SIM — ブラウザ内の iOS Simulator が Mac クラウド上の本物の Simulator を低遅延ストリーミング、60fps を維持（5/27）",
-    "DEPLOY — App Store / TestFlight への直接サブミットに対応、証明書と Provisioning Profile は Rork が自動管理（5/27）",
-    "COMPANION — Rork Companion で $99/年 の Apple Developer Program なしでも実機テスト可能（5月）",
-    "SEED — Rork が Left Lane Capital リードで $15M シードラウンド調達（4月）、月間訪問は 743,000、成長率 85%（5月）",
-    "AISTUDIO — Google AI Studio が Jetpack Compose + Kotlin の Android 生成を開始、iOS 側は Rork Max の独自ポジション（5/19）",
+    "RORKMAX — Rork Max は Claude Code + Claude Opus 4.6 がエンジン、X で 800 万 view・2 週間で年商 2 倍化（2 月）",
+    "PAPERLINE — Rork が macOS の Swift ネイティブ AI アプリビルダー Paperline を買収、Xcode 置換ロードマップ加速（4/9）",
+    "SEED15M — Rork が $15M シード調達、Left Lane Capital リード（Peak XV / True Ventures / Goodwater / a16z Speedrun 参加）（4 月）",
+    "MAXAPPLE — Rork Max が iPhone / iPad / Watch / TV / Vision Pro / iMessage を 1 プロジェクトでカバー、Core ML 等も（5 月）",
+    "COMPANION — Rork Companion 経由なら Apple Developer Program なしでも実機テスト可能（5 月）",
+    "WWDC26 — WWDC 2026（6/8 開幕）で Xcode 26 が ChatGPT 統合、Rork Max の Xcode 置換戦略と対比（6 月予定）",
   ],
   en: [
-    "MAX — Rork Max produces SwiftUI across Apple platforms, covering iPhone, iPad, Watch, TV, Vision Pro, and iMessage from one project (May 27)",
-    "SIM — The in-browser iOS Simulator streams a real Simulator on a cloud Mac with low latency, holding 60fps (May 27)",
-    "DEPLOY — Direct submission to App Store and TestFlight is built in; Rork manages certificates and provisioning profiles automatically (May 27)",
-    "COMPANION — The Rork Companion app enables real-device testing without the $99/year Apple Developer Program (May)",
-    "SEED — Rork raised a $15M seed led by Left Lane Capital (April); the platform reports 743K monthly visits and 85% growth (May)",
-    "AISTUDIO — Google AI Studio begins generating Android apps in Jetpack Compose + Kotlin; on iOS, Rork Max holds its distinctive position (May 19)",
+    "RORKMAX — Rork Max runs on Claude Code + Claude Opus 4.6, hit 8M views on X and doubled ARR in 2 weeks (Feb)",
+    "PAPERLINE — Rork acquires Paperline, a macOS Swift-native AI app builder, accelerating Xcode replacement (4/9)",
+    "SEED15M — Rork raises $15M Seed led by Left Lane Capital with Peak XV, True Ventures, Goodwater, a16z Speedrun (Apr)",
+    "MAXAPPLE — Rork Max covers iPhone, iPad, Watch, TV, Vision Pro & iMessage in one project, incl. Core ML (May)",
+    "COMPANION — Rork Companion enables real-device testing without paid Apple Developer Program (May)",
+    "WWDC26 — WWDC 2026 (Jun 8) brings Xcode 26 with ChatGPT, contrasting Rork Max's Xcode-replacement bet (June)",
   ],
 };
 
