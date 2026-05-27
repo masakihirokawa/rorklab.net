@@ -1,0 +1,199 @@
+---
+title: "Making Silent Failures Visible Across 6 Rork Apps: An Early-Warning Design Note for Non-Crash Degradation"
+slug: "rork-silent-failure-early-warning-non-crash-degradation-six-apps"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-27T05:00"
+author: "Rork Lab"
+description: "Notes from running 6 wallpaper apps in parallel and the layer I built in 3 weeks to make Crashlytics-invisible failures observable. Beacons, timeouts, and a small Cloudflare Worker for cross-app aggregation."
+tags: ["Rork", "Crashlytics", "Observability", "AdMob", "Cloudflare Workers", "RevenueCat"]
+highlights:
+  - "8 categories of silent failure observed across 6 wallpaper apps over 3 weeks, with detection logic for each"
+  - "How a 12% drop in AdMob revenue was traced to unresponsive ad buttons, and the Beacon design that catches it within 24 hours"
+  - "An 80-line Cloudflare Workers aggregation layer that combines Crashlytics, Sentry, and a custom Beacon stream without duplicates"
+---
+
+One morning I opened the AdMob dashboard and saw monthly revenue down 12% week over week. Crashlytics was empty. Reviews were quiet. Server 5xx rates were normal. Revenue was simply gone, and it took me three full days to find the cause. As an indie developer who started building apps in 2014 and crossed 50 million cumulative downloads with my wallpaper apps, the failure mode I have grown to fear most is exactly this: **silent degradation**.
+
+When you run 6 apps in parallel, similar things happen weekly. The ad button is visible but tapping it does nothing. The purchase dialog never opens. The rewarded video plays to completion but the reward is never granted. None of these reach Crashlytics. This post is a working write-up of the early-warning layer I added to the 6 Rork apps over the last 3 weeks, with both the design choices and the operational numbers behind them.
+
+## Why silent failures are the scariest kind — what 12 years taught me
+
+Crashes get caught by Crashlytics. With a Velocity Alert you usually hear about them in Slack within 30 minutes. Those are observable failures.
+
+Silent degradation is not. Users still open the app, so DAU does not move. The ad button still appears, so impressions are still recorded. But somewhere inside the SDK call chain the actual ad never serves, and nobody knows until someone happens to open the AdMob report. From my side the three categories I most worry about are:
+
+- AdMob eCPM collapse limited to button-triggered rewards
+- RevenueCat `productPurchase` events going dark, so checkout entry rates disappear
+- A spike in the percentage of cold starts where the white screen lasts more than 4 seconds
+
+These never throw exceptions. They just stop happening, which is what makes them so hard to see. I once spent a night chasing one of these during the lead-up to an international art exhibition, which is a kind of time cost I am not willing to repeat, and that was the proximate reason I started designing this layer.
+
+## Classifying the 8 failures Crashlytics does not see
+
+"Silent failure" is one phrase but in practice it breaks into 8 distinct categories. Doing this taxonomy before writing any code made the rest of the design straightforward.
+
+1. **Ad button unresponsive**: Tap does not progress Interstitial / Rewarded from `load` to `show`
+2. **Reward not granted**: Video completes but the grant callback never fires
+3. **Purchase flow frozen**: `purchase()` is called but StoreKit / Billing never presents a dialog
+4. **Checkout zero-entry**: Users reach the purchase screen but the "Buy" button does not respond
+5. **Long white screen**: Cold start to first frame exceeds 4 seconds
+6. **Infinite loading**: A spinner spins for more than 8 seconds
+7. **Broken Remote Config rollout**: Empty string or null values reach the UI without throwing
+8. **Permission post-dialog silence**: After an ATT denial nothing visible happens
+
+What unifies them is that the failure is not in an exception path. It is the **non-event** of an expected action not happening within a deadline. Crashlytics is fundamentally not built to observe non-events, so you have to do it yourself.
+
+## Three design principles — Beacons, timeouts, reverse-aggregation
+
+The implementation collapsed into three principles.
+
+- **Beacons (lightweight events)**: Always emit a single event for "user tapped the ad button" or "user entered checkout" — an intent marker that exists before any failure could occur
+- **Timeout judgement**: For every Beacon that has a successful counterpart, flag the ones where the counterpart never arrives within N seconds, server-side
+- **Reverse aggregation**: Pull AdMob / RevenueCat reports via Cloudflare Workers Cron and reconcile against Beacon counts to derive the missing rate
+
+Doing the timeout judgement client-side alone is a trap. Network-flaky users will trigger false positives, and you lose the cross-app view that matters when you run 6 apps. I keep the aggregation layer deliberately separate from Firebase to avoid mixing billing-affecting events into Crashlytics' pricing tier.
+
+## The Cloudflare Worker that receives the Beacons
+
+The Worker is tiny — one POST endpoint, plus an hourly Cron that scans KV and emits "missing counterpart" lists. The production skeleton is below.
+
+```typescript
+// worker/beacon.ts
+import type { ExecutionContext, KVNamespace } from "@cloudflare/workers-types";
+
+type BeaconEvent = {
+  app: string;            // "wallpaper-a" etc — 6 app identifiers
+  kind: string;           // "ad-tap" / "rwd-watched" / "purchase-tap" etc
+  corrId: string;         // ID that ties an expected pair together
+  ts: number;             // ms epoch
+};
+
+interface Env { BEACON_KV: KVNamespace; }
+
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    if (req.method !== "POST") return new Response("", { status: 405 });
+    const ev = (await req.json()) as BeaconEvent;
+    if (!ev?.app || !ev?.kind || !ev?.corrId) {
+      return new Response("", { status: 400 });
+    }
+    const key = `beacon:${ev.app}:${ev.kind}:${ev.corrId}`;
+    // 24h TTL; the paired event will delete this key when it arrives
+    ctx.waitUntil(env.BEACON_KV.put(key, String(ev.ts), { expirationTtl: 86400 }));
+    return new Response("ok");
+  },
+};
+```
+
+When a paired event arrives, the Beacon is deleted rather than allowed to accumulate. If `ad-tap` is followed by `ad-shown` with the same `corrId` within 6 seconds, both get cleared and the pair is forgotten. The Beacons that **remain** are the silent-failure candidates.
+
+The Cron does not full-scan KV. It lists by `prefix=beacon:` hourly and only extracts threshold-breaching ones. Each app produces only a few hundred Beacons per hour, so the Workers CPU budget is more than enough.
+
+## Catching missing rewards within 24 hours via receipt reconciliation
+
+The reward-not-granted case is invisible from the client. Cases where the AdMob SDK fails to call `onUserEarnedReward` — mediation misconfig, SDK version mismatches — have hit me 3 times in 12 years. The most recent one is what cost me the 12% revenue drop I opened this post with.
+
+The catch happens in 3 steps:
+
+1. **Front Beacon**: emit `kind: "rwd-show"` the moment `RewardedAd.show()` is called
+2. **Dismiss Beacon**: emit `kind: "rwd-dismiss"` from `onAdDismissed` (correction signal)
+3. **Reward Beacon**: emit `kind: "rwd-earned"` inside `onUserEarnedReward`
+
+Then a daily Cron computes per-app "rwd-dismiss arrived but rwd-earned did not" ratios. In my apps the healthy baseline is 0.4 to 1.1% (users who interrupt mid-video, etc). **If it exceeds 3% over a rolling 24 hours**, Slack pages me. Two such alerts have fired in 3 weeks; one was a mediation-network setting that had been wiped to empty by a UI mis-click.
+
+The Rork (React Native) hook looks like this.
+
+```tsx
+import mobileAds, { RewardedAd, RewardedAdEventType } from "react-native-google-mobile-ads";
+
+const ad = RewardedAd.createForAdRequest("ca-app-pub-xxxx/yyyy");
+const corrId = () => Math.random().toString(36).slice(2);
+
+async function showRewarded(app: string) {
+  const id = corrId();
+  await beacon(app, "rwd-show", id);
+  const unsubLoaded = ad.addAdEventListener(RewardedAdEventType.LOADED, () => ad.show());
+  const unsubEarn = ad.addAdEventListener(RewardedAdEventType.EARNED_REWARD, () => {
+    beacon(app, "rwd-earned", id);  // ← absence of this is the smoking gun
+  });
+  ad.addAdEventListener(RewardedAdEventType.CLOSED, () => {
+    beacon(app, "rwd-dismiss", id);
+    unsubLoaded(); unsubEarn();
+  });
+  ad.load();
+}
+```
+
+Carrying the same `corrId` through all 3 events is the key. The server can then isolate `rwd-show → rwd-dismiss → no rwd-earned`, which is exactly the "watched to the end but reward never landed" case.
+
+## Catching frozen purchase flows via state-machine stall detection
+
+"Tapped buy, dialog never appeared" is another classic. StoreKit / Billing `purchase()` can stay in `Pending` indefinitely without returning an error. Crashlytics never sees it.
+
+A 4-state machine — `idle → tapping → presenting → completed / dismissed` — works well. If `tapping` lasts more than 6 seconds the state transitions to `stalled` and a Beacon is emitted.
+
+```ts
+type S = "idle" | "tapping" | "presenting" | "completed" | "dismissed" | "stalled";
+let s: S = "idle"; let stallTimer: any;
+
+async function buyPro(app: string) {
+  const id = Math.random().toString(36).slice(2);
+  s = "tapping";
+  await beacon(app, "purchase-tap", id);
+  stallTimer = setTimeout(async () => {
+    if (s === "tapping") {           // ← 6s elapsed, never reached presenting
+      s = "stalled";
+      await beacon(app, "purchase-stall", id);
+    }
+  }, 6000);
+
+  try {
+    await Purchases.purchaseProduct("pro_monthly", null, "subs");  // RevenueCat example
+    clearTimeout(stallTimer);
+    s = "completed";
+    await beacon(app, "purchase-ok", id);
+  } catch (e: any) {
+    clearTimeout(stallTimer);
+    s = "dismissed";
+    // normal user cancels do not page; purchase-stall is treated separately
+  }
+}
+```
+
+The threshold here is **0.5% in 24 hours** for `purchase-stall`. The healthy baseline is 0.1 to 0.2%, with most causes being network flakiness and OS dialog non-responsiveness. One alert fired in 3 weeks, which traced back to a StoreKit sandbox outage that leaked subtly into production. Apple's System Status flagged it an hour later.
+
+## 3 weeks of running it — detection counts and noise ratio
+
+After 3 weeks of parallel operation across all 6 apps, the numbers across all 8 silent-failure categories combined were:
+
+| Metric | Value |
+|---|---|
+| Total Beacons received | ~482,000 |
+| Silent-failure candidates extracted | 712 (0.15% of total) |
+| Slack notifications (threshold-breaching only) | 11 |
+| Of those, real-impact incidents | 4 (false-positive rate 64%) |
+| Estimated AdMob revenue impact | 1.5 to 4% per incident recovered |
+
+The 64% false-positive rate looks high at first glance, but Slack notifications are reviewed by a human, so it is fine in practice. More importantly, of the 4 real incidents, 1 is estimated to have shaved a week off detection time, which translates to roughly 3% of monthly AdMob revenue preserved. **For the first time in 12 years, silent degradation became something I can talk about with numbers.**
+
+## Cross-app operations — per-app toggles via Remote Config
+
+Running the same Beacon set across 6 apps means one noisy app can flood Slack. I keep `beacon_kinds_enabled` in Remote Config, per app, so I can:
+
+- Send only `rwd-earned` from apps trialling a new SDK
+- Temporarily disable `purchase-stall` from apps mid-billing-refactor
+- 50% sample all Beacons for the 48 hours after a release
+
+If you combine this with Crashlytics Velocity Alerts, you also have to loosen the Crashlytics thresholds in lockstep, otherwise crashes and silent degradations pile into the same Slack channel without prioritization.
+
+I split them into `silent-alerts` and `crash-alerts` channels with distinct colors — blue for silent, red for crash. That visual difference alone has cut my late-night response time by roughly 1.5x, subjectively.
+
+## "Silent degradation is worse than crashes" — taking 12 years to learn that
+
+When I started programming in 1997 at 16, I saw code in only two states: it runs or it does not. Run, fix, repeat. Very simple. By the time my wallpaper apps had crossed 50 million cumulative downloads since 2014, I had come to believe the scariest state is the one where the app "appears to work" while quietly degrading.
+
+Both my grandfathers were temple carpenters in Japan, and I watched them work as a child. They would say "this part is still fine" — and then check it again the next day, and the day after that. Keeping working things working costs more than building them in the first place, and far less of the work shows.
+
+The silent-failure layer is not exciting. But it is what protects the revenue of the 6 Rork apps I run, quietly, every day. I hope these notes are useful to anyone else operating multiple apps as a single person.

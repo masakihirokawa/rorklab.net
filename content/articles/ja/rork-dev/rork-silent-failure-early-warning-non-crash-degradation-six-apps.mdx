@@ -1,0 +1,203 @@
+---
+title: "Rork 6 アプリで「Crashlytics に映らない失敗」を観測可能にした — 無音劣化の早期検知設計ノート"
+slug: "rork-silent-failure-early-warning-non-crash-degradation-six-apps"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-27T05:00"
+author: "Rork Lab"
+description: "壁紙アプリ 6 本を並行運用するなかで気づいた、Crashlytics に出ない静かな失敗を 3 週間で観測可能にした設計を共有します。AdMob・課金・遷移の3層を Beacon と State Machine で拾います。"
+tags: ["Rork", "Crashlytics", "Observability", "AdMob", "Cloudflare Workers", "RevenueCat"]
+highlights:
+  - "壁紙アプリ 6 本で 3 週間運用した「無音劣化シグナル 8 種類」の選定基準と検出ロジック"
+  - "AdMob 月収が 12% 落ちて気づいた「広告ボタン無反応」を 24 時間以内に検知する Beacon 設計"
+  - "Crashlytics + Sentry + 自前 Beacon の三層から重複なく拾う Cloudflare Workers 80 行の集約レイヤ"
+---
+
+ある朝、AdMob ダッシュボードを開いたら前週比で月収が 12% 落ちていました。Crashlytics は 0 件、レビュー欄も静かで、サーバーの 5xx も平常。それでも収益だけが確実に減っていて、原因の特定に丸 3 日かかった、というのが今回の出発点です。2014 年から個人開発を続けて 12 年、累計 5,000 万ダウンロードを超えたあたりで、私が「クラッシュより怖い」と痛感したのは、まさにこの**無音劣化**でした。
+
+壁紙アプリを 6 本並行で運用していると、毎週どこかで似たことが起こります。広告ボタンは出ているがタップしても何も反応しない。課金フローの確認ダイアログが出ない。リワード視聴は完了するが報酬が付与されない。どれも Crashlytics には 1 件も飛びません。この記事のテーマは、Rork で配信している 6 アプリにこの 3 週間で組み込んだ「無音劣化の早期検知レイヤ」を、設計判断と運用数値の両方からまとめます。
+
+## 静かな失敗が一番怖い理由 — 12 年やってわかったこと
+
+クラッシュは Crashlytics が拾うので、最悪でも翌朝には気づきます。Velocity Alert を仕込んでおけば 30 分以内に Slack に飛びます。これは「観測可能な失敗」です。
+
+一方、無音劣化はそうではありません。ユーザーはアプリを開いてはいるので DAU は落ちません。広告ボタンが出ているのでインプレッションは記録されます。ところが、タップ後の SDK 呼び出しがどこかで詰まっていて広告が出ない、というケースでは、AdMob のレポートを開くまで誰も気づきません。私のサイドでは、
+
+- AdMob の eCPM 急落（ボタン経由のリワードだけが消える）
+- RevenueCat の `productPurchase` イベント途絶（チェックアウト導入率の指標が消える）
+- 「アプリ起動直後の白画面が 4 秒以上続く」割合の上昇
+
+の 3 種類が「絶対に Crashlytics に出ないが収益と直結する事象」の代表でした。広告 SDK の内部リトライが原因のこともあれば、Remote Config の値が壊れているだけのこともあります。共通点は、**例外を投げず、ただ何も起きない**ということです。
+
+国際芸術賞での展示準備中に、同じ夜にこの問題に気づいて未明まで原因を追ったことがあります。展示のための作業時間を削るほどコストが高い障害で、二度と同じことを繰り返したくないと考えたのが、この設計を組み始めた直接の動機でした。
+
+## 「Crashlytics に映らない 8 つの失敗」を分類する
+
+無音劣化と一口に言っても、設計上は次の 8 種類に整理できました。3 週間の運用前にこの分類をしておくと、それぞれにどの観測点を置くかが決めやすくなります。
+
+1. **広告ボタン無反応**: タップしても Interstitial / Rewarded が `load → show` まで進まない
+2. **リワード非付与**: 視聴は完了するが、報酬付与のコールバックが来ない
+3. **課金フロー停止**: `purchase()` を呼んでも StoreKit / Billing のダイアログが出ない
+4. **チェックアウト導入率ゼロ**: 課金画面に来るが「購入」ボタンが反応しない
+5. **白画面長期化**: 起動から最初のスクリーンが表示されるまで 4 秒以上
+6. **無限ローディング**: スピナーが 8 秒以上回り続ける
+7. **Remote Config 破損反映**: 値が空文字や null で UI が壊れているが落ちはしない
+8. **権限ダイアログ抑止後の無音**: ATT を拒否した瞬間に何も起きないように見える
+
+8 つすべてに共通するのは、「正常系の例外パス」ではなく**期待されたイベントが時間内に発生しなかった**こと、つまり **non-event** が観測対象である点です。Crashlytics が苦手とするのはまさにこの「起きなかった」ことの観測なので、自分で組むしかありません。
+
+## 無音劣化の検出原則 — Beacon・タイムアウト・遷移逆算
+
+実装方針は次の 3 つに集約しました。
+
+- **Beacon（軽量イベント）**: 「ボタンを押した」「チェックアウト画面に入った」など、ユーザーの意図を確実に 1 イベントとして送る。失敗時のための事前マーカーです
+- **タイムアウト判定**: Beacon を送った後、N 秒以内に対になる成功イベントが来ないものを無音劣化候補としてサーバ側で抽出する
+- **遷移逆算**: AdMob / RevenueCat 側の集計結果を Cloudflare Workers Cron で取り直し、Beacon と突き合わせて欠落率を計算する
+
+ここで重要なのは、Beacon を**フロント側だけ**で完結させず、必ずサーバに送ることです。フロントだけで「タイムアウトしたら警告」を実装すると、ネットワーク不調のユーザーで誤検知が出ますし、6 アプリ横断で見ることができません。
+
+私は Cloudflare Workers + KV + Logs を使って軽い集約レイヤを 80 行程度で組みました。Firebase 系では Crashlytics と被るのと、課金イベントを混ぜると料金体系が複雑になるので、観測専用の薄い箱を別に置いています。
+
+## Cloudflare Workers で受ける軽量 Beacon の実装
+
+Worker 側はとてもシンプルです。Beacon は POST 1 回で、24 時間ぶんを KV に積んでおき、毎時 Cron で「対になるイベントが来なかったもの」を抽出します。本番運用しているコードの骨格は次の通りです。
+
+```typescript
+// worker/beacon.ts
+import type { ExecutionContext, KVNamespace } from "@cloudflare/workers-types";
+
+type BeaconEvent = {
+  app: string;            // "wallpaper-a" など 6 アプリ識別
+  kind: string;           // "ad-tap" / "rwd-watched" / "purchase-tap" など
+  corrId: string;         // 期待ペアを紐づける ID
+  ts: number;             // ms epoch
+};
+
+interface Env { BEACON_KV: KVNamespace; }
+
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    if (req.method !== "POST") return new Response("", { status: 405 });
+    const ev = (await req.json()) as BeaconEvent;
+    if (!ev?.app || !ev?.kind || !ev?.corrId) {
+      return new Response("", { status: 400 });
+    }
+    const key = `beacon:${ev.app}:${ev.kind}:${ev.corrId}`;
+    // 24h TTL。対になるイベントが来たら相手側で delete する
+    ctx.waitUntil(env.BEACON_KV.put(key, String(ev.ts), { expirationTtl: 86400 }));
+    return new Response("ok");
+  },
+};
+```
+
+「対になるイベント」が来たら、Beacon は積まれっぱなしになるのではなく削除されます。たとえば `ad-tap` の Beacon が積まれてから 6 秒以内に `ad-shown` が同じ `corrId` で届けば、両方を消して終わりです。残った Beacon が、無音劣化候補そのものです。
+
+Cron 側は、KV をフルスキャンせず、毎時 `prefix=beacon:` で軽くリストして閾値超過だけ抽出します。1 アプリあたり 1 時間に数百件しか積まれないので、Workers の CPU 制限内で十分処理できます。
+
+## AdMob リワード非付与を Receipt 突き合わせで 24 時間以内に拾う
+
+リワード非付与は、フロント側だけでは見えません。AdMob SDK が `onUserEarnedReward` を呼ばないケース（仲介ネットワークの設定ミス・SDK バージョン不整合）は、過去 12 年で 3 回ありました。最後のひとつは AdMob 月収を 12% 落としたきっかけでもあります。
+
+ここでは次の 3 段階で拾います。
+
+1. **フロント Beacon**: `RewardedAd.show()` を呼んだ瞬間に `kind: "rwd-show"` を送る
+2. **完了 Beacon**: `onAdDismissed` で `kind: "rwd-dismiss"` を送る（補正用）
+3. **報酬 Beacon**: `onUserEarnedReward` の中で `kind: "rwd-earned"` を送る
+
+毎日 1 回、Cloudflare Workers Cron で「`rwd-dismiss` は来たが `rwd-earned` が来なかった割合」をアプリごとに計算します。私のアプリでは健全時は 0.4〜1.1% です（ユーザーが視聴途中で電源を切る等の自然原因）。これが**連続 24 時間で 3% を超えたら Slack に飛ぶ**ようにしました。3 週間で 2 回検出、うち 1 回は AdMob 仲介ネットワークの設定値が UI 操作で空になっていたケースでした。
+
+実装側のフックは Rork（React Native）で次のように書きました。
+
+```tsx
+import mobileAds, { RewardedAd, RewardedAdEventType } from "react-native-google-mobile-ads";
+
+const ad = RewardedAd.createForAdRequest("ca-app-pub-xxxx/yyyy");
+const corrId = () => Math.random().toString(36).slice(2);
+
+async function showRewarded(app: string) {
+  const id = corrId();
+  await beacon(app, "rwd-show", id);
+  const unsubLoaded = ad.addAdEventListener(RewardedAdEventType.LOADED, () => ad.show());
+  const unsubEarn = ad.addAdEventListener(RewardedAdEventType.EARNED_REWARD, () => {
+    beacon(app, "rwd-earned", id);  // ← これが来ないことが事故の証拠
+  });
+  ad.addAdEventListener(RewardedAdEventType.CLOSED, () => {
+    beacon(app, "rwd-dismiss", id);
+    unsubLoaded(); unsubEarn();
+  });
+  ad.load();
+}
+```
+
+`corrId` を 3 つのイベントすべてに同じ値で乗せておくのが肝です。サーバ側はこれで `rwd-show → rwd-dismiss → rwd-earned が来ない`、つまり「ユーザーは最後まで見たが報酬が付与されない」を厳密に抽出できます。
+
+## 課金ボタン無反応を State Machine の停滞検出で拾う
+
+課金フローの「ボタンを押したのにダイアログが出ない」も無音劣化の代表です。StoreKit / Billing の `purchase()` は環境によっては一切エラーを返さず、ただ `Pending` 状態のまま停止することがあります。これも Crashlytics には出ません。
+
+ここでは State Machine を `idle → tapping → presenting → completed / dismissed` の 4 状態で持ち、`tapping` のまま 6 秒以上止まったら自動で `stalled` に遷移させて Beacon を送ります。
+
+```ts
+type S = "idle" | "tapping" | "presenting" | "completed" | "dismissed" | "stalled";
+let s: S = "idle"; let stallTimer: any;
+
+async function buyPro(app: string) {
+  const id = Math.random().toString(36).slice(2);
+  s = "tapping";
+  await beacon(app, "purchase-tap", id);
+  stallTimer = setTimeout(async () => {
+    if (s === "tapping") {           // ← 6 秒経っても presenting にすら入っていない
+      s = "stalled";
+      await beacon(app, "purchase-stall", id);
+    }
+  }, 6000);
+
+  try {
+    await Purchases.purchaseProduct("pro_monthly", null, "subs");  // RevenueCat 例
+    clearTimeout(stallTimer);
+    s = "completed";
+    await beacon(app, "purchase-ok", id);
+  } catch (e: any) {
+    clearTimeout(stallTimer);
+    s = "dismissed";
+    // 通常のキャンセルは送らない。purchase-stall とは別物として扱う
+  }
+}
+```
+
+ここでも `purchase-stall` の発生率を**24 時間で 0.5% を超えたら通知**にしています。健全時は 0.1〜0.2% で、原因のほとんどはネットワーク不調と OS ダイアログの操作不能です。3 週間の運用で 1 回検出があり、それは StoreKit のサンドボックス障害がプロダクションに微妙に波及した日でした。Apple の System Status には 1 時間遅れて出ていました。
+
+## 3 週間の運用結果 — 検出件数とノイズ比率
+
+6 アプリ並列で 3 週間運用した結果は次の通りでした。集計は 8 種類の無音劣化シグナルすべての合算です。
+
+| 指標 | 値 |
+|---|---|
+| Beacon 受信総数 | 約 482,000 件 |
+| 無音劣化候補として抽出 | 712 件（全体の 0.15%） |
+| Slack 通知（閾値超過のみ） | 11 件 |
+| そのうち実害ありと判定 | 4 件（誤検知率 64%） |
+| AdMob 月収への影響推定 | 復旧 1 件あたり 1.5〜4% |
+
+誤検知率 64% は一見高く見えますが、Slack 通知の段階で人間が判断するワークフローなので問題にはなりません。一方で、見逃した日数を考えれば、4 件中 1 件は「気づくのに本来 1 週間かかっていたはず」と推定でき、AdMob 月収の合算で約 3% の差し戻しになっていました。**12 年やって初めて、無音劣化を「数値で語れる」状態になった**のがいちばん大きな変化です。
+
+## 6 アプリ並列の運用テンプレ — Remote Config で個別 off 可能に
+
+6 アプリで同じ Beacon を使い回すと、ノイジーなアプリ 1 本のせいで Slack が荒れます。私は Remote Config に `beacon_kinds_enabled` をアプリ別に持ち、
+
+- 新規 SDK 試験中のアプリは `rwd-earned` だけ送る
+- 課金フロー改修中のアプリは `purchase-stall` を一時 off
+- リリース直後の 48 時間は全 Beacon を 50% サンプリング
+
+といった制御を入れています。Crashlytics の Velocity Alert と組み合わせる場合は、Crashlytics 側の閾値も同時に緩めておかないと「クラッシュも無音劣化も同じ Slack に積み上がって優先順位がつかない」状態になるので注意が必要です。
+
+私はこれを `silent-alerts` チャンネルと `crash-alerts` チャンネルに**別チャンネル**で分け、無音劣化は色を青、クラッシュは赤に固定しました。色を分けるだけで、深夜に飛んでくる通知に対する自分の対応速度が体感で 1.5 倍速くなりました。
+
+## 「無音劣化はクラッシュより害悪」と気づくまでの 12 年
+
+1997 年、16 歳でインターネットに触れて独学でプログラミングを始めたとき、私は「動くか動かないか」だけでコードを見ていました。動かないなら直す、動くなら終わり。とてもシンプルです。2014 年に個人開発を始めて壁紙アプリの累計 5,000 万ダウンロードに届くころには、「動いているように見えるが、本当はずっと前から少しずつ壊れている」状況がいちばん怖いと気づきました。
+
+宮大工だった両祖父の仕事ぶりを子供のころに見ていた影響かもしれません。彼らは「ここはまだ大丈夫」と言いつつも、毎日少しずつ確認していました。動くものを動かし続けるためのコストは、最初に作るコストよりずっと地味で、ずっと重要です。離れて暮らす子どもたちにこの仕事を見せても恥ずかしくないものにしたい、というのが、私が観測レイヤを丁寧に作る理由でもあります。
+
+無音劣化の早期検知は、リリースの華やかさはありません。けれども、Rork で配信している 6 アプリの収益を静かに守るのは、結局このレイヤだと考えています。同じように個人で複数アプリを運用されている方の参考になれば嬉しいです。お読みいただきありがとうございました。
