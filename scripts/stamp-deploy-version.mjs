@@ -11,7 +11,7 @@
 import { readFileSync, writeFileSync } from "fs";
 
 const FILE = "cache-worker.js";
-const version = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+const version = new Date().toISOString().slice(0, 10);
 
 const src = readFileSync(FILE, "utf8");
 const updated = src.replace(
