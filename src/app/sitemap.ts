@@ -20,10 +20,39 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/tokusho", priority: 0.3, freq: "monthly" as const },
   ];
 
-  const entries: MetadataRoute.Sitemap = [];
+  // === Dynamic lastmod helpers (best practice: reflect newest article date) ===
+  const SITE_LAUNCHED_FALLBACK = new Date("2026-01-01");
+  const _jaArts = getArticles("ja");
+  const _jaBlog = getBlogPosts("ja");
+  function _latestDate(items: ReadonlyArray<{ updated?: string; date?: string }>): Date {
+    const dates = items
+      .map(a => new Date(a.updated || a.date || 0))
+      .filter(d => !isNaN(d.getTime()) && d.getTime() > 0);
+    return dates.length > 0
+      ? new Date(Math.max(...dates.map(d => d.getTime())))
+      : SITE_LAUNCHED_FALLBACK;
+  }
+  const latestArticleDate = _latestDate(_jaArts);
+  const latestBlogDate = _latestDate(_jaBlog);
+  const categoryLastmod: Record<string, Date> = {};
+  for (const a of _jaArts) {
+    const d = new Date(a.updated || a.date || 0);
+    if (!isNaN(d.getTime()) && d.getTime() > 0) {
+      const cur = categoryLastmod[a.category];
+      if (!cur || d.getTime() > cur.getTime()) categoryLastmod[a.category] = d;
+    }
+  }
+  function lastmodFor(path: string): Date {
+    if (path === "" || path === "/articles" || path === "/guides") return latestArticleDate;
+    if (path === "/blog") return latestBlogDate;
+    if (path.startsWith("/articles/")) {
+      const cat = path.replace("/articles/", "");
+      return categoryLastmod[cat] || latestArticleDate;
+    }
+    return SITE_LAUNCHED_FALLBACK;
+  }
 
-  // ⚠ Keep SITE_LAUNCHED fixed — never use new Date() for static pages (causes SEO churn)
-  const SITE_LAUNCHED = new Date("2026-01-01");
+  const entries: MetadataRoute.Sitemap = [];
   // Static pages with alternates
   for (const page of staticPages) {
     const jaUrl = `${baseUrl}${page.path || ""}`;
@@ -31,7 +60,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
     entries.push({
       url: jaUrl,
-      lastModified: SITE_LAUNCHED,
+      lastModified: lastmodFor(page.path),
       changeFrequency: page.freq,
       priority: page.priority,
       alternates: {
@@ -40,7 +69,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: SITE_LAUNCHED,
+      lastModified: lastmodFor(page.path),
       changeFrequency: page.freq,
       priority: Number(Math.max(page.priority - 0.1, 0.3).toFixed(1)),
       alternates: {
@@ -50,7 +79,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   }
 
   // Article pages with actual dates and alternates
-  const jaArticles = getArticles("ja");
+  const jaArticles = _jaArts;
 
   for (const article of jaArticles) {
     const jaUrl = `${baseUrl}/articles/${article.category}/${article.slug}`;
@@ -59,7 +88,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
     entries.push({
       url: jaUrl,
-      lastModified: date ? new Date(date) : SITE_LAUNCHED,
+      lastModified: date ? new Date(date) : SITE_LAUNCHED_FALLBACK,
       changeFrequency: "weekly",
       priority: 0.9,
       alternates: {
@@ -68,7 +97,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: date ? new Date(date) : SITE_LAUNCHED,
+      lastModified: date ? new Date(date) : SITE_LAUNCHED_FALLBACK,
       changeFrequency: "weekly",
       priority: 0.8,
       alternates: {
@@ -78,7 +107,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   }
 
   // Blog posts
-  const jaBlog = getBlogPosts("ja");
+  const jaBlog = _jaBlog;
 
   for (const post of jaBlog) {
     const jaUrl = `${baseUrl}/blog/${post.slug}`;
@@ -86,7 +115,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
     entries.push({
       url: jaUrl,
-      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED,
+      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED_FALLBACK,
       changeFrequency: "monthly",
       priority: 0.7,
       alternates: {
@@ -95,7 +124,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED,
+      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED_FALLBACK,
       changeFrequency: "monthly",
       priority: 0.6,
       alternates: {

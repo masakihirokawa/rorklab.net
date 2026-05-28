@@ -1,7 +1,7 @@
 /**
  * Cache wrapper for OpenNext Cloudflare Worker
  * ─────────────────────────────────────────────
- * - HTMLRewriter: injects __name polyfill before any Next.js script
+ * - (Removed: HTMLRewriter polyfill caused hydration mismatch — see injectPolyfill)
  * - Edge cache:   caches 200 HTML for CACHE_TTL (Workers Cache API)
  * - Version gate:  DEPLOY_VERSION invalidates stale cache entries
  * - Browser:       max-age=0, must-revalidate (edge is authoritative)
@@ -14,8 +14,6 @@ const DEPLOY_VERSION = "2026-05-18-paywall-schema-fix";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 // ── __name polyfill (Turbopack / esbuild compat) ────────────────
-const NAME_POLYFILL =
-  '<script>if(typeof __name==="undefined"){var __name=function(fn,name){Object.defineProperty(fn,"name",{value:name,configurable:true});return fn}}</script>';
 
 class HeadHandler {
   element(element) {
@@ -24,7 +22,9 @@ class HeadHandler {
 }
 
 function injectPolyfill(response) {
-  return new HTMLRewriter().on("head", new HeadHandler()).transform(response);
+  // Removed: HTMLRewriter __name polyfill caused React #418 Hydration mismatch.
+  // AntiGravity Lab works fine without it on Next.js 16 + current Turbopack.
+  return response;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
