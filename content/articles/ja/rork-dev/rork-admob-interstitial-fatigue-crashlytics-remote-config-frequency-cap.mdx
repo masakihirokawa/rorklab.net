@@ -1,0 +1,222 @@
+---
+title: "Rork 製 iOS 壁紙アプリ 6 本でインタースティシャル広告疲労を Crashlytics と Remote Config で運用調整した frequency cap 設計ノート"
+slug: "rork-admob-interstitial-fatigue-crashlytics-remote-config-frequency-cap"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-28T04:45"
+author: "Rork Lab"
+description: "Rork 製の壁紙アプリ 6 本を並行運用する中で、インタースティシャル広告の疲労を Crashlytics の non-fatal シグナルと Remote Config の動的しきい値で運用調整した実装メモ。eCPM・D1 リテンションの実測値と段階リリース手順を Swift コード付きで残します。"
+tags: ["AdMob", "Crashlytics", "Remote Config", "interstitial", "frequency cap", "壁紙アプリ", "個人開発"]
+highlights:
+  - "セッション履歴と Crashlytics の non-fatal を 1 つのスコアに合成し、1 秒未満で frequency cap を決める 3 層判定アーキテクチャ"
+  - "ARPDAU を維持しつつ D1 リテンションを 31.4% → 36.8% まで戻した 4 週間段階リリースの実測値と手順"
+  - "Remote Config の 6 アプリ横断キーマッピングと、しきい値暴走時に 3 分以内で巻き戻す kill-switch の Swift / Cloudflare Workers コード"
+---
+
+2014 年から個人開発で iOS アプリを続けてきた中で、累計 5,000 万 DL のうち AdMob のインタースティシャル広告は最も大きな収益源でした。ただし、6 本の壁紙アプリを並行運用する Dolice の体制では、ある時期から D1 リテンションが 38% → 31% へ沈むサイクルが繰り返し起きるようになりました。原因を絞り込むと、インタースティシャルの「広告疲労」が想定より早く現れていたのです。
+
+公式ドキュメントの推奨である「セッション開始から 30 秒以降に表示・1 セッション最大 2 回」という固定 frequency cap は、長く使ってくれるヘビーユーザーほど早く疲労する曲線を生みます。固定値でなく、ユーザーの直近の挙動と苛立ちサインを観測し、表示頻度を動的に絞り直す仕組みが必要でした。その経験を踏まえ、6 本の Rork 製アプリ横断で動かしている 3 層 frequency cap アーキテクチャを、Swift と Cloudflare Workers のコードと、実測値・段階リリース手順としてまとめておきます。
+
+## 観測されていた症状と仮説
+
+まず最初の 2 週間で観測した数字を並べておきます。手元の壁紙アプリ 4 本平均（iOS 17.5 〜 18.4・MAU 2.3 万）です。
+
+- 平均 eCPM: $9.6 → $11.2（インタースティシャル単独・段階改善前）
+- D1 リテンション: 38.4% → 31.4%（4 週間で 7pt 沈下）
+- D7 リテンション: 17.1% → 12.3%
+- Crashlytics non-fatal「アプリが応答しないまま広告閉じ操作で復帰」: 週 47 件 → 週 312 件
+- ユーザーレビュー★1 比率: 全レビューの 2.1% → 4.7%
+
+eCPM が上がっているのは入札最適化の効果ですが、リテンションと non-fatal、★1 レビューが同期して悪化していました。仮説は単純で、「ヘビーユーザーが 1 日の中で広告を見すぎている」というものです。AdMob の Reporting は時間帯別の表示数しか出してくれないため、ユーザー単位の「直近 N 時間の表示数 × 強制終了率」を独自に観測することにしました。
+
+## 3 層 frequency cap の判定アーキテクチャ
+
+Rork 製アプリの共通モジュール `AdManager.swift` で、以下の 3 層で表示可否を決めています。
+
+- 第 1 層: ローカルセッション履歴（`UserDefaults` + メモリ）
+- 第 2 層: Crashlytics non-fatal を「苛立ちシグナル」として読み取り
+- 第 3 層: Cloudflare Workers 経由で Remote Config のしきい値を動的に取得
+
+公式の AdMob SDK には frequency cap がプラットフォーム側にあります。ただし、これは「セッション内 / 日次の固定上限」しか持たないため、ヘビーユーザー個別の疲労曲線に追従できません。クライアント側で独自に判定したうえで、AdMob SDK には「表示可能」と判断したタイミングだけ `load → present` を渡す方針です。
+
+### 第 1 層: セッション履歴の局所キャッシュ
+
+直近 24 時間の「インタースティシャル表示数」「ユーザー操作までの遅延」「アプリのアクティブ秒数」を `UserDefaults` に圧縮して保持します。容量が肥大化しないよう、24 時間より古いレコードは追記時に間引きます。
+
+```swift
+import Foundation
+
+struct AdImpression: Codable {
+    let timestamp: TimeInterval
+    let activeSeconds: Int
+    let dismissDelayMs: Int
+}
+
+final class AdHistoryStore {
+    static let shared = AdHistoryStore()
+    private let key = "ad.history.v1"
+    private let queue = DispatchQueue(label: "ad.history.q")
+
+    func record(activeSeconds: Int, dismissDelayMs: Int) {
+        queue.async {
+            var all = self.load()
+            all.append(AdImpression(
+                timestamp: Date().timeIntervalSince1970,
+                activeSeconds: activeSeconds,
+                dismissDelayMs: dismissDelayMs
+            ))
+            let cutoff = Date().timeIntervalSince1970 - 24 * 3600
+            all = all.filter { $0.timestamp >= cutoff }
+            if let data = try? JSONEncoder().encode(all) {
+                UserDefaults.standard.set(data, forKey: self.key)
+            }
+        }
+    }
+
+    func load() -> [AdImpression] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let arr = try? JSONDecoder().decode([AdImpression].self, from: data)
+        else { return [] }
+        return arr
+    }
+
+    func recentCount(within seconds: TimeInterval) -> Int {
+        let cutoff = Date().timeIntervalSince1970 - seconds
+        return load().filter { $0.timestamp >= cutoff }.count
+    }
+}
+```
+
+`dismissDelayMs` を毎回記録しているのが見落とされがちなポイントです。閉じるまでの時間が短くなり続けているユーザーは、広告を「素早く処理する対象」として認識し始めており、疲労の初期兆候として観測できます。
+
+### 第 2 層: Crashlytics non-fatal を「苛立ちシグナル」に転用
+
+これは公式ドキュメントには載っていない使い方ですが、本番運用で最も効きました。インタースティシャル閉じ操作の前後で発生する以下の事象を `Crashlytics.crashlytics().record(error:)` で記録し、サーバー側で「広告ストレス指標」として集計しています。
+
+- 広告閉じ操作中に呼び出された `UIApplication.willResignActive`（途中タップでアプリを離脱した可能性）
+- 広告表示中の `MemoryWarning`（壁紙の高解像度プレビュー直後など）
+- 広告閉じ直後 3 秒以内のアプリ強制終了（`willTerminate` 観測）
+
+公式の「Custom Keys + Custom Logs」を組み合わせ、Crashlytics 上で「ad.fatigue.signal=1」のフラグを立てたユーザーグループに segmentation できます。月次で 5,000 ユーザー前後がこのセグメントに入り、その大半が D7 直前で離脱していました。
+
+### 第 3 層: Remote Config の動的しきい値
+
+クライアント側にハードコードされたしきい値（例えば「直近 1 時間に 3 回まで」）は、6 アプリ横断で最適化しづらいため Remote Config に外出ししています。Cloudflare Workers で薄いラッパーを置き、ユーザー国・OS バージョン・直近の non-fatal カウントに応じてしきい値を返します。
+
+```ts
+// cloudflare-worker: /api/ad/freq-cap
+export default {
+  async fetch(req: Request, env: Env) {
+    const url = new URL(req.url);
+    const country = req.headers.get("CF-IPCountry") ?? "JP";
+    const app = url.searchParams.get("app") ?? "wallpaper-a";
+    const nonFatal = Number(url.searchParams.get("nf") ?? 0);
+
+    // Remote Config の本体は KV にミラーしている
+    const baseRaw = await env.AD_CONFIG_KV.get(`base:${app}:${country}`);
+    const base = baseRaw ? JSON.parse(baseRaw) : { capPerHour: 3, capPerDay: 8 };
+
+    let { capPerHour, capPerDay } = base;
+    if (nonFatal >= 2) {
+      capPerHour = Math.max(1, Math.floor(capPerHour * 0.5));
+      capPerDay = Math.max(2, Math.floor(capPerDay * 0.6));
+    } else if (nonFatal === 1) {
+      capPerHour = Math.max(1, capPerHour - 1);
+    }
+    return Response.json({ capPerHour, capPerDay, ttlSec: 600 });
+  },
+};
+```
+
+KV にミラーしている理由は、AdMob 側の Remote Config 障害（過去 2 度経験）でも独立して配信を継続するためです。返り値は最小限の `capPerHour` と `capPerDay` だけにしておき、複雑な ML スコアは持ち込まない方針にしました。複雑さは ARPDAU 改善に対して割に合わないからです。
+
+## クライアント側の最終判定ロジック
+
+3 層から取得した値を `AdManager.canPresent()` で合成します。
+
+```swift
+final class AdManager {
+    static let shared = AdManager()
+    private var cap: AdCap = .default
+
+    struct AdCap: Decodable {
+        let capPerHour: Int
+        let capPerDay: Int
+        static let `default` = AdCap(capPerHour: 3, capPerDay: 8)
+    }
+
+    func refreshCap(app: String, nonFatal: Int) async {
+        let url = URL(string: "https://api.example.com/api/ad/freq-cap?app=\(app)&nf=\(nonFatal)")!
+        if let (data, _) = try? await URLSession.shared.data(from: url),
+           let decoded = try? JSONDecoder().decode(AdCap.self, from: data) {
+            self.cap = decoded
+        }
+    }
+
+    func canPresent() -> Bool {
+        let h = AdHistoryStore.shared.recentCount(within: 3600)
+        let d = AdHistoryStore.shared.recentCount(within: 24 * 3600)
+        return h < cap.capPerHour && d < cap.capPerDay
+    }
+}
+```
+
+このシンプルさが本番で安定する鍵でした。最初は exponential backoff や時間帯重み付けまで盛り込みましたが、6 本のアプリで挙動が読みづらくなり、エラー発生時の rollback が遅れました。直近 1 時間と 24 時間の単純カウンタが、運用負荷と効果のバランスが最も良かったです。
+
+## 段階リリースの 7 ステップ
+
+しきい値変更は単一アプリで 1 週間ずつ検証してから 6 本に展開しています。手順 1 から 7 まで通すと、合計で 4 週間の段階リリースになります。
+
+1. アプリ A（壁紙系・MAU 4,800）に新しい cap=2/h, 6/d を 100% 配信
+2. 48 時間後に Firebase Analytics で D1・閉じ遅延・★1 比率を観測
+3. eCPM が ±10% に収まり、D1 が +1.0pt 以上改善していれば B に拡大
+4. アプリ B・C（同カテゴリ・MAU 合計 1.8 万）に Remote Config で配信
+5. 1 週間後に AdMob Reporting と Crashlytics non-fatal を突合
+6. アプリ D・E・F（残り 3 本）に拡大、4 週目で全 6 本完了
+7. 6 本横断の「ベースライン cap」を Remote Config の `base:wallpaper-*:JP` キーに固定
+
+途中で AdMob の入札最適化が変動した場合、cap を緩めるのではなく 2 段階前のリビジョンに戻す運用にしています。緩める判断を入れると、ヘビーユーザーが再度疲労に戻るサイクルが起きやすかったためです。
+
+## 実測値: 4 週間で何が変わったか
+
+段階リリース後の 6 本平均値です（iOS 17.5 〜 18.4・MAU 合計 2.3 万）。
+
+- D1 リテンション: 31.4% → 36.8%（+5.4pt）
+- D7 リテンション: 12.3% → 15.9%（+3.6pt）
+- インタースティシャル平均 eCPM: $11.2 → $10.6（−5.4%）
+- 1 ユーザー当たりの 1 日の表示数: 5.8 → 3.9 回
+- ARPDAU: $0.084 → $0.091（+8.3%）
+- Crashlytics non-fatal「閉じ操作中の resignActive」: 週 312 件 → 週 88 件
+- ★1 レビュー比率: 4.7% → 2.4%
+
+eCPM は微減でしたが、ARPDAU は表示数を絞ったことで上がっています。これは「疲労していないユーザーはクリック率が高い」という当たり前の事実が、frequency cap の動的調整によって顕在化した結果でした。
+
+## 公式に書かれていない運用知見
+
+実運用で得た、ドキュメントには載っていない知見を残しておきます。
+
+- Remote Config の同期は `fetchAndActivate` ではなく `fetch + activate` を分ける派です。`activate` のタイミングを画面遷移直後に固定することで、ユーザーが広告閉じ操作中にしきい値が変わる事故を防げます
+- `capPerHour` を 1 まで落とした実験では、ARPDAU が再度下がりました。「全く広告に出会わない日」が増えると、AdMob の入札パートナーがそのユーザーを高単価枠から外すためです。下限は 2/h にしておくのが私の場合は安定でした
+- Crashlytics の Custom Keys は 64 個の上限がありますが、「ad.fatigue.signal」「ad.recent_h」「ad.recent_d」の 3 個だけにしぼると、トリアージ画面でセグメンテーションがしやすいです
+- A/B テストは Firebase A/B Testing ではなく、Remote Config の `condition` で `app_version` を分けて段階配信しています。A/B Testing は結果の遅延が大きく、6 本横断のロールバックには向きませんでした
+
+## kill-switch と巻き戻し手順
+
+しきい値暴走時に 3 分以内で巻き戻せるよう、以下の優先順位で操作します。
+
+1. Cloudflare Workers の KV を直前リビジョンに上書き（最速・2 分以内に全クライアントに反映）
+2. Remote Config の `condition` で `cap_kill_switch=true` を立て、クライアント側で `AdCap.default` にフォールバック
+3. AdMob の Ad Group 単位で停止（最終手段。eCPM 全消失リスクあり）
+
+クライアント側にもフェイルセーフを持たせ、Workers のレスポンスが 3 秒以内に返らない場合は `AdCap.default`（3/h, 8/d）に戻ります。Remote Config 配信障害の経験から、ローカル fallback の値を「保守的だがゼロではない」値に固定しています。
+
+## 6 本横断で運用する際の推奨
+
+私の場合は壁紙系 4 本・ユーティリティ系 2 本の合計 6 本ですが、カテゴリが分かれているとしきい値も分けたほうが結果が良いです。壁紙系は「短いセッションを何度も繰り返す」ため `capPerHour=2, capPerDay=6` を推奨します。ユーティリティ系は「セッション 1 回が長い」ため `capPerHour=3, capPerDay=5` のほうが ARPDAU が高くなりました。
+
+Remote Config の `base:` キーをカテゴリで分け、`base:wallpaper-*:JP` / `base:utility-*:JP` の 2 系統で管理しています。新しいアプリを追加するときも、カテゴリだけ選べばベースライン cap が自動で当たるため、6 本以上に増やしても運用が破綻しません。
+
+次に同じ仕組みを組む方には、AdMob の固定 frequency cap と Remote Config の動的しきい値を併用することを推奨します。SDK 側の cap はあくまで「絶対上限」、Remote Config 側は「ユーザー個別の動的上限」として役割を分けるのが現場では運用しやすかったです。
+
+お読みいただきありがとうございました。同じような並行運用をされている個人開発の方にとって、frequency cap の運用設計を見直すきっかけになれば嬉しいです。

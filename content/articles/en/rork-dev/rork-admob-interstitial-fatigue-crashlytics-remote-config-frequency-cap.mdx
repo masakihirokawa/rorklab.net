@@ -1,0 +1,222 @@
+---
+title: "Tuning Interstitial Ad Fatigue Across Six Rork iOS Wallpaper Apps with Crashlytics and Remote Config"
+slug: "rork-admob-interstitial-fatigue-crashlytics-remote-config-frequency-cap"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-28T04:45"
+author: "Rork Lab"
+description: "An implementation note from running six Rork-built iOS wallpaper apps in parallel and rebalancing interstitial fatigue with a three-layer frequency cap powered by Crashlytics non-fatal signals and Remote Config thresholds. Swift code, Cloudflare Workers config, and measured eCPM / D1 retention numbers from a four-week phased rollout."
+tags: ["AdMob", "Crashlytics", "Remote Config", "interstitial", "frequency cap", "wallpaper app", "indie developer"]
+highlights:
+  - "A three-layer frequency cap that fuses local session history with Crashlytics non-fatal signals and Remote Config thresholds in under a second"
+  - "Measured numbers from a four-week phased rollout: D1 retention 31.4% → 36.8% and ARPDAU +8.3% while keeping eCPM within −5.4%"
+  - "Cross-app key mapping in Remote Config for six apps and a Swift / Cloudflare Workers kill-switch that rolls back inside three minutes"
+---
+
+I have been shipping iOS apps as an indie developer since 2014, and across roughly 50 million cumulative downloads at Dolice, AdMob interstitials have been the single biggest revenue line. Running six wallpaper apps in parallel, however, exposed a pattern I did not expect: D1 retention kept sinking from 38% to 31% in cycles, and the cause traced back to interstitial fatigue arriving earlier than the official guidance assumed.
+
+The "show after 30 seconds, cap at two per session" rule from Google's docs creates a fatigue curve that bites heavy users first. A static frequency cap could not keep up. I needed a system that watched each user's recent behaviour and irritation signals, then adjusted the display cap dynamically. The architecture below is the three-layer frequency cap that now runs across six Rork-built iOS apps, with the Swift and Cloudflare Workers code, measured numbers, and the phased rollout plan.
+
+## What I was seeing before the change
+
+Numbers from the first two weeks of measurement, averaged across four wallpaper apps (iOS 17.5 to 18.4, combined MAU 23k):
+
+- Average interstitial eCPM: $9.6 → $11.2 (before phased rollout)
+- D1 retention: 38.4% → 31.4% (a 7pt drop in four weeks)
+- D7 retention: 17.1% → 12.3%
+- Crashlytics non-fatal "app unresponsive during ad dismiss": 47/week → 312/week
+- One-star review share: 2.1% → 4.7% of all reviews
+
+The eCPM was climbing because of bidding optimisation, but retention, non-fatals, and one-star reviews were moving in lock-step the wrong way. My hypothesis was simple: heavy users were seeing too many ads in a single day. AdMob Reporting only exposes time-bucketed impression counts, so I built a per-user observation of "recent N hours of impressions × forced-exit rate" on the client side.
+
+## The three-layer architecture
+
+A shared `AdManager.swift` module across the six Rork apps decides whether to present an interstitial through three layers:
+
+- Layer 1: Local session history (`UserDefaults` plus in-memory cache)
+- Layer 2: Crashlytics non-fatal events used as an "annoyance signal"
+- Layer 3: Dynamic threshold fetched from Cloudflare Workers wrapping Remote Config
+
+AdMob SDK itself has a frequency cap, but it only supports fixed per-session or per-day limits and cannot follow the fatigue curve of an individual heavy user. The pattern below decides on the client side first, and only when the verdict is "presentable" does it call AdMob's `load → present`.
+
+### Layer 1: Local session history cache
+
+The store keeps the last 24 hours of interstitial impressions, dismiss latency, and active seconds in `UserDefaults`. Old records are trimmed on append so the blob never grows unbounded.
+
+```swift
+import Foundation
+
+struct AdImpression: Codable {
+    let timestamp: TimeInterval
+    let activeSeconds: Int
+    let dismissDelayMs: Int
+}
+
+final class AdHistoryStore {
+    static let shared = AdHistoryStore()
+    private let key = "ad.history.v1"
+    private let queue = DispatchQueue(label: "ad.history.q")
+
+    func record(activeSeconds: Int, dismissDelayMs: Int) {
+        queue.async {
+            var all = self.load()
+            all.append(AdImpression(
+                timestamp: Date().timeIntervalSince1970,
+                activeSeconds: activeSeconds,
+                dismissDelayMs: dismissDelayMs
+            ))
+            let cutoff = Date().timeIntervalSince1970 - 24 * 3600
+            all = all.filter { $0.timestamp >= cutoff }
+            if let data = try? JSONEncoder().encode(all) {
+                UserDefaults.standard.set(data, forKey: self.key)
+            }
+        }
+    }
+
+    func load() -> [AdImpression] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let arr = try? JSONDecoder().decode([AdImpression].self, from: data)
+        else { return [] }
+        return arr
+    }
+
+    func recentCount(within seconds: TimeInterval) -> Int {
+        let cutoff = Date().timeIntervalSince1970 - seconds
+        return load().filter { $0.timestamp >= cutoff }.count
+    }
+}
+```
+
+The often-overlooked field is `dismissDelayMs`. Users whose dismiss latency keeps shrinking have started treating interstitials as a chore to clear quickly, and that is an early fatigue signal worth catching.
+
+### Layer 2: Crashlytics non-fatal as an annoyance signal
+
+This is the layer not covered by official documentation, and it has been the highest-impact change in production. I record the following events with `Crashlytics.crashlytics().record(error:)` and aggregate them server-side as a "stress index":
+
+- `UIApplication.willResignActive` fired during an ad dismiss (user likely left the app mid-tap)
+- `MemoryWarning` while an ad is presented (often right after a high-resolution wallpaper preview)
+- App force-quit within three seconds of an ad dismiss (`willTerminate` observed)
+
+Combining Custom Keys and Custom Logs, I tag users with `ad.fatigue.signal=1` and can segment them in the Crashlytics console. Roughly 5,000 users fall into this segment in any given month, and most of them churn just before D7.
+
+### Layer 3: Dynamic thresholds via Remote Config
+
+Hardcoded thresholds like "at most three per hour" are hard to optimise across six apps, so they live in Remote Config. A thin Cloudflare Workers wrapper returns thresholds keyed by country, app, and recent non-fatal count.
+
+```ts
+// cloudflare-worker: /api/ad/freq-cap
+export default {
+  async fetch(req: Request, env: Env) {
+    const url = new URL(req.url);
+    const country = req.headers.get("CF-IPCountry") ?? "JP";
+    const app = url.searchParams.get("app") ?? "wallpaper-a";
+    const nonFatal = Number(url.searchParams.get("nf") ?? 0);
+
+    // Remote Config base values are mirrored into KV
+    const baseRaw = await env.AD_CONFIG_KV.get(`base:${app}:${country}`);
+    const base = baseRaw ? JSON.parse(baseRaw) : { capPerHour: 3, capPerDay: 8 };
+
+    let { capPerHour, capPerDay } = base;
+    if (nonFatal >= 2) {
+      capPerHour = Math.max(1, Math.floor(capPerHour * 0.5));
+      capPerDay = Math.max(2, Math.floor(capPerDay * 0.6));
+    } else if (nonFatal === 1) {
+      capPerHour = Math.max(1, capPerHour - 1);
+    }
+    return Response.json({ capPerHour, capPerDay, ttlSec: 600 });
+  },
+};
+```
+
+I mirror Remote Config into KV because AdMob-side Remote Config has had two outages in my history, and I wanted independent delivery. The response intentionally stays minimal — just `capPerHour` and `capPerDay`. I do not pipe in any ML score; the operational complexity is not worth it against ARPDAU gains.
+
+## Client-side final verdict
+
+The values from all three layers come together in `AdManager.canPresent()`.
+
+```swift
+final class AdManager {
+    static let shared = AdManager()
+    private var cap: AdCap = .default
+
+    struct AdCap: Decodable {
+        let capPerHour: Int
+        let capPerDay: Int
+        static let `default` = AdCap(capPerHour: 3, capPerDay: 8)
+    }
+
+    func refreshCap(app: String, nonFatal: Int) async {
+        let url = URL(string: "https://api.example.com/api/ad/freq-cap?app=\(app)&nf=\(nonFatal)")!
+        if let (data, _) = try? await URLSession.shared.data(from: url),
+           let decoded = try? JSONDecoder().decode(AdCap.self, from: data) {
+            self.cap = decoded
+        }
+    }
+
+    func canPresent() -> Bool {
+        let h = AdHistoryStore.shared.recentCount(within: 3600)
+        let d = AdHistoryStore.shared.recentCount(within: 24 * 3600)
+        return h < cap.capPerHour && d < cap.capPerDay
+    }
+}
+```
+
+The simplicity is what makes this stable in production. My first attempt included exponential backoff and time-of-day weighting, but rollback became slow across six apps when something went wrong. A plain counter for the last hour and last day struck the best balance between operational load and impact.
+
+## Seven-step phased rollout
+
+I validate threshold changes on a single app for one week before fanning out across all six. The full plan covers four weeks.
+
+1. App A (wallpaper category, MAU 4,800) gets the new cap of 2/h, 6/d at 100%
+2. After 48 hours, check Firebase Analytics for D1, dismiss latency, and one-star share
+3. If eCPM stays within ±10% and D1 improves by at least +1.0pt, expand to B
+4. Roll out to apps B and C (same category, combined MAU 18k) via Remote Config
+5. After a week, cross-reference AdMob Reporting against Crashlytics non-fatals
+6. Roll out to D, E, and F (the remaining three apps); week four completes the cycle
+7. Pin the cross-app baseline cap to the Remote Config key `base:wallpaper-*:JP`
+
+If AdMob's bidder rebalances mid-rollout, I do not loosen the cap; I revert to the previous revision instead. Loosening tends to push heavy users right back into the fatigue cycle.
+
+## Measured numbers after four weeks
+
+Six-app averaged numbers after the phased rollout (iOS 17.5 to 18.4, combined MAU 23k):
+
+- D1 retention: 31.4% → 36.8% (+5.4pt)
+- D7 retention: 12.3% → 15.9% (+3.6pt)
+- Interstitial eCPM: $11.2 → $10.6 (−5.4%)
+- Impressions per user per day: 5.8 → 3.9
+- ARPDAU: $0.084 → $0.091 (+8.3%)
+- Crashlytics non-fatal "resignActive during dismiss": 312/week → 88/week
+- One-star review share: 4.7% → 2.4%
+
+eCPM slipped slightly, but ARPDAU improved because the unfatigued users click at much higher rates. That obvious fact only became measurable once the dynamic cap was in place.
+
+## Operational lessons not in the docs
+
+Things I learned in production that the official documentation does not cover:
+
+- Split `fetchAndActivate`. I call `fetch` early and `activate` only on screen transitions, so the threshold cannot change while a user is mid-dismiss
+- Capping at 1/h actually pulls ARPDAU down again. AdMob's bidding partners drop users who "rarely meet an ad" out of high-paying inventory. My personal floor is 2/h
+- Crashlytics has a 64-key Custom Keys limit. I keep only `ad.fatigue.signal`, `ad.recent_h`, and `ad.recent_d`. Three keys keep triage segmentation tractable
+- For A/B testing I do not use Firebase A/B Testing — its result latency was too high for a six-app rollback. Instead I split via Remote Config `condition` on `app_version`
+
+## Kill-switch and rollback path
+
+The rollback order, designed to land changes in under three minutes:
+
+1. Overwrite the Cloudflare Workers KV with the previous revision (fastest, propagates in under two minutes)
+2. Flip `cap_kill_switch=true` in Remote Config `condition` so clients fall back to `AdCap.default`
+3. Disable the affected Ad Group inside AdMob (last resort — full eCPM loss)
+
+The client also has a fail-safe: if the Workers call does not return within three seconds, it falls back to `AdCap.default` (3/h, 8/d). I learned from past Remote Config outages to pin the local fallback at "conservative but non-zero".
+
+## Recommendations for running this across six apps
+
+My mix is four wallpaper apps and two utility apps. Splitting the threshold by category produced better results than treating them uniformly. Wallpaper apps have many short sessions, so I recommend `capPerHour=2, capPerDay=6`. Utility apps have longer sessions, where `capPerHour=3, capPerDay=5` produced higher ARPDAU.
+
+I keep the `base:` keys split by category — `base:wallpaper-*:JP` and `base:utility-*:JP` — so adding a new app only requires choosing its category for the baseline cap to apply. The model continues to scale past six apps without operational fragility.
+
+If you are building something similar, I recommend pairing AdMob's static frequency cap with Remote Config's dynamic threshold rather than picking one. The SDK cap acts as the absolute ceiling, while Remote Config carries the per-user dynamic ceiling. Splitting roles between the two has been the easiest mental model to operate.
+
+Thank you for reading. If you run several apps in parallel as an indie developer, I hope this gives you a useful starting point for rethinking how your frequency caps are configured.
