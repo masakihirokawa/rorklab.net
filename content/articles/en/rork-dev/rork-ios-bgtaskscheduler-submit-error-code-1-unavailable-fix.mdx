@@ -1,0 +1,145 @@
+---
+title: "Tracking Down BGTaskScheduler.submit Error Code=1 (Unavailable) in Rork iOS Apps"
+slug: "rork-ios-bgtaskscheduler-submit-error-code-1-unavailable-fix"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-28T11:00"
+updated: "2026-05-28T11:00"
+author: "Rork Lab"
+description: "A field-tested checklist for diagnosing BGTaskScheduler.submit failing with Error Code=1 (Unavailable) in iOS apps built with Rork, walking through the six causes that account for nearly every case."
+tags: ["Rork", "iOS", "BGTaskScheduler", "Background Refresh", "Expo", "React Native"]
+---
+One of the easiest accidents to make in indie iOS development is shipping a background refresh path that quietly piles up `BGTaskSchedulerErrorDomain Code=1` in Crashlytics for months before anyone notices. Running 50 million cumulative downloads across a handful of apps since 2014, I have lost count of how many times I have hunted down this specific code. Once it goes unnoticed for half a year, daily active users start eroding in ways that are hard to attribute back.
+
+Code=1 is officially `BGTaskSchedulerErrorCodeUnavailable`, and Apple's documentation summarizes it in a single line: "Background App Refresh is disabled or scheduling is not currently possible." In practice it splits into about six distinct causes, and if you work through them top to bottom you will always land on the real one. This article assumes you bolted BGTaskScheduler onto a Rork-generated iOS app after the fact, and walks the six causes in order.
+
+Both of my grandfathers were temple carpenters, and growing up around their work taught me to enjoy this kind of one-rung-at-a-time inspection. I tend to obsess over the parts users never see, so I hope this writeup saves someone else half a day.
+
+## Pin down which kind of Code=1 you are looking at
+
+Code=1 multiplexes four or five different root causes into one number, so the single most useful thing you can do up front is decide *when* the error is occurring. Wrap `submit` with verbose logging and reproduce it on a physical device, simulator, and TestFlight build separately.
+
+```swift
+// AppDelegate.swift or your Expo native module
+import BackgroundTasks
+import os
+
+let log = Logger(subsystem: "net.rorklab.app", category: "bgtask")
+
+func scheduleAppRefresh() {
+    let request = BGAppRefreshTaskRequest(identifier: "net.rorklab.app.refresh")
+    request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+
+    do {
+        try BGTaskScheduler.shared.submit(request)
+        log.info("bgtask submitted: id=\(request.identifier)")
+    } catch let error as NSError {
+        log.error("bgtask submit failed: domain=\(error.domain) code=\(error.code) info=\(error.userInfo)")
+        // Forward userInfo (especially NSLocalizedFailureReason) into Crashlytics
+    }
+}
+```
+
+If you drop `userInfo` here, you will end up looping back through this checklist a second time. I always forward the whole `userInfo` dictionary into Crashlytics as a custom key.
+
+## Cause 1: identifier is missing from BGTaskSchedulerPermittedIdentifiers
+
+This is the most common culprit by a wide margin. If the identifier you pass to `submit` is not listed verbatim in the `BGTaskSchedulerPermittedIdentifiers` array of `Info.plist`, iOS returns Code=1. In Expo / Rork setups you inject this through `app.json` (or `app.config.ts`) under `ios.infoPlist`.
+
+```json
+{
+  "expo": {
+    "ios": {
+      "infoPlist": {
+        "BGTaskSchedulerPermittedIdentifiers": [
+          "net.rorklab.app.refresh",
+          "net.rorklab.app.processing"
+        ],
+        "UIBackgroundModes": ["fetch", "processing"]
+      }
+    }
+  }
+}
+```
+
+The identifier prefix does not have to match the bundle ID, but the string in `Info.plist` must be a character-for-character match for the one you submit. After `prebuild`, open `Info.plist` in Xcode and confirm the entry actually landed. EAS Build sometimes skips `prebuild` and reuses an outdated `Info.plist`, so running `eas build --clear-cache` once is a cheap safety net.
+
+## Cause 2: Background App Refresh is disabled in OS settings
+
+If you can reproduce on a device but not in the simulator, this is almost always it. When "Settings > General > Background App Refresh" is OFF, or Low Power Mode is on, the OS rejects `submit` with Code=1 on a per-user basis.
+
+There is no recovery from the app side, so I handle this with two UX touches:
+
+- On first launch, check `UIApplication.shared.backgroundRefreshStatus`. If it is `.denied` or `.restricted`, show a single non-pushy banner suggesting the user enable Background App Refresh so the app can fetch updates while closed.
+- Forward `backgroundRefreshStatus` to Crashlytics as a custom key on every launch. This lets you correlate Code=1 spikes with the OFF-user population after the fact.
+
+Adding just these two hooks revealed that, in one of my apps, roughly 70 percent of Code=1 errors were users with the OS setting off, not a code defect. I stopped wasting engineering time on reproductions I could not control.
+
+## Cause 3: You are running in the simulator
+
+This one quietly eats hours. BGTaskScheduler sometimes accepts `submit` in the simulator and sometimes returns Code=1 depending on iOS version (especially iOS 17+). When you want to actually exercise the handler locally, do not rely on `submit` succeeding. Trigger the task directly from the debugger instead.
+
+```text
+(lldb) e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"net.rorklab.app.refresh"]
+```
+
+That fires `handler` immediately, so you can focus on the handler logic without worrying about whether `submit` would have been accepted. Verify real-world `submit` success rates against Code=1 counts in Crashlytics after a TestFlight rollout, which is the only honest signal anyway.
+
+## Cause 4: Missing UIBackgroundModes entries
+
+`BGAppRefreshTaskRequest` requires `fetch` in `UIBackgroundModes`, and `BGProcessingTaskRequest` requires `processing`. That is straight from the docs, but in Expo / Rork projects, `prebuild` can quietly overwrite your `UIBackgroundModes` array if you forgot to declare it in `app.json`.
+
+```json
+{
+  "ios": {
+    "infoPlist": {
+      "UIBackgroundModes": ["fetch", "processing"]
+    }
+  }
+}
+```
+
+After `prebuild`, open `ios/{AppName}/Info.plist` and confirm `UIBackgroundModes` survived. If you submit a `BGProcessingTaskRequest` with only `fetch` declared, you will get Code=1 from the processing path while app refresh continues to work, which is a fun way to spend an evening.
+
+## Cause 5: earliestBeginDate is in the past or too close to now
+
+Setting `earliestBeginDate` to `Date()` or a moment in the past can cause iOS to return Code=1 depending on the scheduler's internal state. The safe pattern is at least 15 minutes in the future.
+
+```swift
+request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+```
+
+A past timestamp can also surface as behavior similar to `Code=3 (TooManyPendingTaskRequests)`. Trusting the code number alone wastes time. Keep `earliestBeginDate` either nil or at least 15 minutes out, and the behavior stabilizes.
+
+## Cause 6: register and submit identifiers do not match
+
+If the identifier passed to `BGTaskScheduler.shared.register` differs even by a single character from the one you `submit`, you get Code=1. When you edit Rork-generated code by hand, copy-paste drift sneaks in easily. Lock both sides to a constant.
+
+```swift
+enum BackgroundTaskID {
+    static let appRefresh = "net.rorklab.app.refresh"
+    static let processing = "net.rorklab.app.processing"
+}
+
+// AppDelegate.swift
+BGTaskScheduler.shared.register(forTaskWithIdentifier: BackgroundTaskID.appRefresh, using: nil) { task in
+    handleAppRefresh(task: task as! BGAppRefreshTask)
+}
+```
+
+I once spent two weeks shipping Code=1 in one of six wallpaper apps I run in parallel because of `app.refresh` versus `appRefresh` drift. Since then I always pin the identifier in an enum on day one.
+
+## What to do next, in order
+
+The triage above resolves to a short execution checklist. If you read nothing else, copy this:
+
+1. Add `userInfo`-aware logging around `submit` in your AppDelegate or Expo module (a few minutes)
+2. Verify `BGTaskSchedulerPermittedIdentifiers` and `UIBackgroundModes` in Xcode after `prebuild` (5 minutes)
+3. Reproduce on a physical device with Background App Refresh ON in Settings
+4. Pin `register` and `submit` identifiers to a Swift enum (10 minutes)
+5. Ship to TestFlight and watch Code=1 counts in Crashlytics for 24 hours
+
+This catches roughly 90 percent of Code=1 cases, and the remaining 10 percent traces back to user OS settings or Low Power Mode, which are honestly not your problem to solve in code. BGTaskScheduler exposes very few error codes, but its cause space is finite, so once you internalize the checklist, you can pinpoint future regressions in well under 30 minutes.
+
+I have run this same workflow across my apps with 50 million cumulative downloads, and the order above is what eventually settled out. Hope it saves you the same half-day it once cost me.
