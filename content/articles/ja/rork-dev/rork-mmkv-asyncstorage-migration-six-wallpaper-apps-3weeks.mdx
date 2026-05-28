@@ -1,0 +1,106 @@
+---
+title: "Rork で書いた 6 つの壁紙アプリで MMKV に移し替えた 3 週間の所感"
+slug: "rork-mmkv-asyncstorage-migration-six-wallpaper-apps-3weeks"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-05-28T10:30"
+updated: "2026-05-28T10:30"
+author: "Rork Lab"
+description: "壁紙アプリ 6 本で AsyncStorage から react-native-mmkv へ少しずつ移し替えてみた 3 週間分の手順と所感を、つまずいた点も含めて書き残します。2014年からの個人開発の現場感を踏まえて、判断のラインを共有します。"
+tags: ["Rork", "MMKV", "AsyncStorage", "壁紙アプリ", "個人開発", "ストレージ"]
+---
+
+2014年から個人で iOS / Android のアプリを作り続けて、累計 5,000 万ダウンロードを超えたあたりで、自分の中の「保存処理は AsyncStorage で十分」という感覚をいったん疑い直すことになりました。きっかけはユーザーさんの増えた壁紙アプリで、お気に入り登録数が数千件単位になり始めたユーザーから「起動が以前より重い」という声が増えたことです。
+
+主観で計測してみると、コールドスタートで体感 0.4〜0.6 秒ほどの差が出ていました。プロファイラを当てたら、起動直後の `AsyncStorage.multiGet` がメインスレッドではないにせよ、UI が動き出すまでの Promise 連鎖の中でじわじわ時間を食っていることが見えてきます。そこから「6 つの壁紙アプリ全部で MMKV に少しずつ寄せていく」という、ここ 3 週間の作業の話をまとめておきます。
+
+両家の祖父が宮大工だったので、壊さずに直すことの大事さを背中で見てきました。アプリのストレージも同じ感覚で、できれば既存ユーザーのデータを傷つけずに移し替えたい、というのが今回の前提です。
+
+## なぜ AsyncStorage を疑い直したか
+
+AsyncStorage は React Native の鉄板で、私自身、2018 年頃から壁紙アプリの設定保存に使い続けてきました。クラッシュ報告もほぼ無く、致命的な不満は無いまま 7 年近く経っています。
+
+ただ、壁紙アプリのお気に入り保存数が大きくなるにつれて、以下の 3 つが少しずつ無視できなくなってきました。
+
+- お気に入り 5,000 件を超えるユーザーで、起動直後の初回読み出しが目に見えて重い
+- すべての API が Promise なので、Hermes との相性は悪くないものの、起動時の同期初期化に組み込みづらい
+- Android で `CursorWindow` の上限に当たるケースが、ごく稀ながら出始めた（既存記事「AsyncStorage の row too big 修正」でも触れた挙動）
+
+特に最後の `CursorWindow` の警告は、運用していて一番心残りでした。完全に防ぐにはデータ構造を変えるか、ストレージそのものを変えるかの二択になります。MMKV は内部的に mmap を使う設計なので、サイズ上限のクラスは AsyncStorage とは違う性質に変わります。これが移し替えを進める一番の動機でした。
+
+## 移し替えの前に整理した 3 つの懸念
+
+実装に入る前に、6 アプリで同時並行で進めるための懸念を 3 つだけ紙に書き出しました。
+
+1. **既存ユーザーのデータを失わない**。壁紙アプリは「お気に入りに 3 年分溜めている」ユーザーが一定数いるので、移し替え失敗で空になる事態だけは避けたい
+2. **戻せるようにしておく**。MMKV にトラブルがあったときに AsyncStorage に戻せる導線を残しておく（少なくとも 2 リリース分は AsyncStorage 側のデータをそのまま残す）
+3. **6 アプリ同時にロールアウトしない**。1 アプリで 1 週間運用してから、残り 5 アプリに広げる
+
+3 番目は当たり前に見えますが、私のような個人開発者は「同じコードベースだから同時に出したくなる」誘惑が強い領域です。Crashlytics で別アプリの挙動から先に気付くケースも多いので、あえてばらつかせる方が情報源としては豊かでした。
+
+## 実際に書いた移し替えコード
+
+最小構成では、`react-native-mmkv` の初期化と「読み出しは MMKV を優先、無ければ AsyncStorage から引き、引けたものは MMKV に書き戻す」というラッパーを作りました。お気に入り保存以外（テーマ設定、起動回数、AdMob の同意ステータス等）も全部このラッパーを通すように寄せていきます。
+
+```ts
+import { MMKV } from "react-native-mmkv";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export const storage = new MMKV({ id: "wallpaper-app-default" });
+
+const MIGRATION_FLAG_KEY = "__mmkv_migrated__v1";
+
+export async function migrateLegacyKeys(keys: string[]) {
+  if (storage.getBoolean(MIGRATION_FLAG_KEY)) return;
+  const pairs = await AsyncStorage.multiGet(keys);
+  pairs.forEach(([k, v]) => {
+    if (v != null) storage.set(k, v);
+  });
+  storage.set(MIGRATION_FLAG_KEY, true);
+}
+
+export async function readString(key: string): Promise<string | null> {
+  const inMmkv = storage.getString(key);
+  if (inMmkv !== undefined) return inMmkv;
+  const legacy = await AsyncStorage.getItem(key);
+  if (legacy != null) storage.set(key, legacy);
+  return legacy;
+}
+
+export function writeString(key: string, value: string) {
+  storage.set(key, value);
+}
+```
+
+ポイントは 2 つです。1 つは `migrateLegacyKeys` を初回起動時に 1 度だけ呼んで、フラグを立ててしまう設計にしたこと。2 つ目は読み出しの `readString` 側でも「無ければ AsyncStorage から引き直す」フォールバックを残したこと。これがあるおかげで、移行漏れのキーがあっても透過的にカバーされて、サポート問い合わせが来る前に勝手に直っていきます。
+
+書き込み側は MMKV だけにしました。両方に書くと、後で AsyncStorage を捨てるときに整合性が崩れるので、書き込み一系統・読み出し二系統という非対称な構成にしています。
+
+## 3 週間運用して気づいたこと
+
+最初の 1 アプリで 1 週間運用して、その後の 2 週間で残りの 5 アプリに広げた段階での実測値と所感を残しておきます。
+
+**起動の体感**。コールドスタートの「設定読み出しから初回描画まで」の区間が、私の手元の iPhone 12 Pro と Pixel 7 で見ると、平均 120〜180ms ほど早まりました。3 年分のお気に入り 8,000 件ある端末で試すと、ここが 250〜300ms 縮みます。AdMob のフォアグラウンドリクエストも、結果として起動直後ピーク時の同時実行が少しほぐれました。
+
+**コードの読みやすさ**。これは予想外の副産物でしたが、`async/await` が要らなくなる場所がたくさんあって、テーマ切り替えや「最後に見た壁紙インデックス」のような同期処理が、見た目にも素直になりました。React の初期 state を `useMemo` 経由で `storage.getString("themeMode") ?? "system"` のように書けるのは、地味に開発体験を変えます。
+
+**Crashlytics の傾向**。3 週間で、ストレージ起因のクラッシュ報告はゼロ。AsyncStorage の `CursorWindow` 警告はそもそも頻度が低かったのでサンプル数として弱いですが、少なくとも追加で悪化したシグナルは見つかっていません。
+
+## 移行で詰まったポイントを 3 つ
+
+3 週間の作業で、私がはっきり詰まったポイントは 3 つありました。同じ構成で進める人の地雷除去になればと思って書き残します。
+
+**1. Expo Go では動かない**。MMKV は JSI を使うので、Expo Go 環境では即座にクラッシュします。Dev Client もしくは Bare workflow に寄せる必要がありました。私の場合は EAS Build で Dev Client を作って配布する運用に揃えたので、移行のタイミングで他のネイティブ依存も整理できたのは結果として良かったです。
+
+**2. 複合キーの命名で詰まる**。AsyncStorage は文字列ベースなのでキー設計が雑でも何とかなりますが、MMKV は型ごとに getter が分かれます（`getString` / `getNumber` / `getBoolean`）。お気に入りリストを JSON.stringify して保存しているキーを、誤って `getNumber` で読みに行って `0` が返ってきたのに気づかず数時間ハマりました。型ごとに命名規約を分ける（`favorites_json__`、`launch_count__num__` のような prefix）方針に切り替えてから安定しています。
+
+**3. テストでのリセットが面倒**。Jest 内で MMKV をモックするのが、AsyncStorage に比べて手間でした。最終的に `jest.mock("react-native-mmkv", () => ({ MMKV: jest.fn().mockImplementation(() => new Map()) }))` のような最小モックに落ち着きましたが、CI で揃えるまで 2 日くらい右往左往しました。E2E は Detox を通すので、ここは深追いせずに最小限で止めています。
+
+## これから取り組むこと
+
+3 週間の経過で、6 アプリのうち 5 アプリは MMKV 中心の構成に揃いました。残り 1 つは、お気に入り構造が独自で、移行時にスキーマ自体を見直したいので、別タスクに切り出しています。
+
+次に試そうとしているのは、`MMKV` インスタンスの `id` を分割して、共有用と端末固有用を分けることです。具体的には、AdMob の同意ステータスや言語設定のような「アプリ間で共有しても良いもの」と、お気に入りや視聴履歴のような「個別アプリの中で完結すべきもの」を、最初から別 ID で持つ設計にしたいと考えています。グループ ID を介した App Group 共有まで進めれば、ウィジェット側からも自然に参照できるはずです。
+
+このあたりは記事に書いた時点ではまだ仮説で、実装してから別記事に書き直す予定です。同じように壁紙アプリやコンテンツ系アプリを個人で運用している方の参考になれば幸いです。お読みいただきありがとうございました。
