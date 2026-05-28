@@ -13,11 +13,6 @@ import nextHandler from "./.open-next/worker";
 const DEPLOY_VERSION = "2026-05-18-paywall-schema-fix";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
-// ── __name polyfill (Turbopack / esbuild compat) ────────────────
-
-  }
-}
-
 function injectPolyfill(response) {
   // Removed: HTMLRewriter __name polyfill caused React #418 Hydration mismatch.
   // AntiGravity Lab works fine without it on Next.js 16 + current Turbopack.
