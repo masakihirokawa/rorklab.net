@@ -15,9 +15,6 @@ const CACHE_TTL = 14400; // 4 hours (edge only)
 
 // ── __name polyfill (Turbopack / esbuild compat) ────────────────
 
-class HeadHandler {
-  element(element) {
-    element.prepend(NAME_POLYFILL, { html: true });
   }
 }
 
