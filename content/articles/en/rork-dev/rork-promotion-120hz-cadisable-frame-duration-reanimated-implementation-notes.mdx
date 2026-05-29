@@ -1,0 +1,216 @@
+---
+title: "Bringing ProMotion 120Hz to a Wallpaper App — Implementation Notes on CADisableMinimumFrameDurationOnPhone and Reanimated v3"
+slug: "rork-promotion-120hz-cadisable-frame-duration-reanimated-implementation-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-29T17:00"
+author: "Rork Lab"
+description: "Implementation notes from making a Rork-generated wallpaper app run at 120Hz on ProMotion devices. Covers Info.plist setup, Expo config plugins, Reanimated v3 worklets, FlashList scroll gotchas, and AdMob eCPM lift measured across six wallpaper apps."
+tags: ["ProMotion", "120Hz", "Reanimated", "FlashList", "iOS", "Wallpaper"]
+highlights:
+  - "How to wire CADisableMinimumFrameDurationOnPhone via both Info.plist and an Expo config plugin so Rork prebuilds don't overwrite it"
+  - "Refactor of the wallpaper preview screen using Reanimated v3 useFrameCallback and useSharedValue to lift 60fps motion to true 120fps"
+  - "Concrete eCPM, session length, and retention deltas measured across six wallpaper apps after ProMotion went live"
+---
+
+The first thing I noticed using my wallpaper app on an iPhone 15 Pro was a gut feeling that the scrolling was running at 60fps. Safari on the same phone glides at 120Hz, and my app felt half a beat behind. With six wallpaper apps in production, leaving the ProMotion display under-used felt sloppy enough that I spent two solid weeks fixing it.
+
+Both of my grandfathers were temple carpenters, and I grew up watching them judge their own work by how it felt under the hand before they ever measured it. Scroll feel falls into the same category — you sense the lag before you can describe it in numbers. These notes capture what it took to push 120Hz through a Rork-generated React Native app, written from the perspective of someone running six wallpaper apps in parallel.
+
+## The lag I felt — and what was actually causing it
+
+I'm Masaki Hirokawa. I've been shipping iOS and Android apps as an indie developer since 2014, and my wallpaper catalogue alone has crossed 50 million downloads. Roughly 40% of new installs come from iPhone 15 Pro or newer ProMotion-capable models, and the AdMob dashboard shows that this slice runs about 1.3–1.5x the eCPM of older devices, with longer average sessions.
+
+That means any 120Hz sloppiness lands hardest on the most monetizable segment. Swiping through thousands of wallpaper thumbnails is the single most frequent gesture in this app, and the gap between 60fps and 120fps shows up immediately in how satisfying that motion feels.
+
+When I first profiled the app with Xcode Instruments, the GPU was capable of reaching 120Hz, but UIScrollView was being clamped to 60Hz. That's the iOS behavior introduced in 2022: CADisplayLink's minimum frame duration is locked to 60Hz unless the app explicitly opts in. All six of my apps were caught by this trap, because the Expo prebuild that Rork emits doesn't touch this particular Info.plist key.
+
+## Adding CADisableMinimumFrameDurationOnPhone the right way
+
+The first step to unlocking ProMotion is adding the following key to Info.plist. Apple's own documentation states that ProMotion apps must explicitly opt in.
+
+```xml
+<key>CADisableMinimumFrameDurationOnPhone</key>
+<true/>
+```
+
+You can hand-edit native code in a Rork project, but because I run EAS Build in CI, I recommend writing an Expo config plugin instead. Manually edited Info.plist files get overwritten the next time Rork syncs the project, and with six apps in the same monorepo, that kind of drift becomes expensive fast.
+
+```ts
+// plugins/withProMotion.ts
+import {
+  ConfigPlugin,
+  withInfoPlist,
+} from "@expo/config-plugins";
+
+const withProMotion: ConfigPlugin = (config) => {
+  return withInfoPlist(config, (cfg) => {
+    cfg.modResults.CADisableMinimumFrameDurationOnPhone = true;
+    return cfg;
+  });
+};
+
+export default withProMotion;
+```
+
+Adding `"plugins": ["./plugins/withProMotion"]` to `app.json` means `expo prebuild --clean` re-injects the key every time. In my monorepo, I promoted this plugin to a shared package so the six wallpaper apps can never forget it.
+
+One thing to keep in mind: the simulator will not show you 120Hz. Even on Apple Silicon Macs, `CADisplayLink.preferredFrameRateRange.preferred` returns 60. You have to test on a real ProMotion device. I keep an iPhone 15 Pro and an iPhone 16 Pro Max next to my workstation so I can compare them side by side.
+
+## Probing 120Hz with CADisplayLink to confirm it actually engaged
+
+Opting in via Info.plist does not unconditionally give every screen 120Hz. Apple's frame scheduler will downgrade the rate if there is no recent input, no visual change, or if the thermal budget gets tight. So before chasing animation polish, drop in a CADisplayLink probe so you can verify "is ProMotion actually engaging here?"
+
+```swift
+// RNProMotionProbe.swift
+import UIKit
+
+@objc(RNProMotionProbe)
+final class RNProMotionProbe: NSObject {
+  private var link: CADisplayLink?
+  private var lastTimestamp: CFTimeInterval = 0
+  private var intervals: [CFTimeInterval] = []
+
+  @objc func start() {
+    let displayLink = CADisplayLink(target: self, selector: #selector(tick(_:)))
+    displayLink.preferredFrameRateRange = CAFrameRateRange(
+      minimum: 80, maximum: 120, preferred: 120
+    )
+    displayLink.add(to: .main, forMode: .common)
+    self.link = displayLink
+  }
+
+  @objc private func tick(_ link: CADisplayLink) {
+    if lastTimestamp > 0 {
+      intervals.append(link.timestamp - lastTimestamp)
+    }
+    lastTimestamp = link.timestamp
+    if intervals.count >= 120 {
+      let avg = intervals.reduce(0, +) / Double(intervals.count)
+      print("ProMotion avg interval: \(avg * 1000) ms => \(1.0 / avg) fps")
+      intervals.removeAll()
+    }
+  }
+}
+```
+
+Wrap it in a TurboModule and you can call it from React Native with a single line. The development build's console then logs entries like `8.34 ms => 120 fps`. If Info.plist is set up correctly you see 120fps; if not, the value stays at a stubborn 60. When I first ran this across all six of my live wallpaper apps, exactly zero were reaching 120Hz.
+
+## Lifting 60fps to 120fps with Reanimated v3 worklets
+
+Info.plist is enough to let the display hardware accept 120Hz, but if the JS update loop is still tuned for a 16ms cadence, every other frame on a ProMotion device just renders the same value. ProMotion feels like nothing changed.
+
+I refactored the animations to use Reanimated v3's `useFrameCallback`, which lets a worklet run at the actual display rate. The two screens that benefit most are the pinch-to-zoom on the wallpaper preview and the inertial scroll on the thumbnail grid.
+
+```ts
+// hooks/useProMotionScale.ts
+import {
+  useFrameCallback,
+  useSharedValue,
+  useAnimatedStyle,
+} from "react-native-reanimated";
+
+export const useProMotionScale = (target: number) => {
+  const scale = useSharedValue(1);
+  const lastTs = useSharedValue(0);
+
+  useFrameCallback((frame) => {
+    "worklet";
+    const dt = lastTs.value ? frame.timeSinceFirstFrame - lastTs.value : 0;
+    lastTs.value = frame.timeSinceFirstFrame;
+
+    const speed = 120 / 1000; // tuned for 120Hz
+    const step = dt * speed * 0.01;
+    if (Math.abs(scale.value - target) < step) {
+      scale.value = target;
+      return;
+    }
+    scale.value = scale.value < target
+      ? scale.value + step
+      : scale.value - step;
+  });
+
+  const style = useAnimatedStyle(() => ({
+    transform: [{ scale: scale.value }],
+  }));
+
+  return style;
+};
+```
+
+The key idea is to compute motion as a function of `dt`, the time delta from `useFrameCallback`. If you rely on `withTiming` alone, a fixed duration on a ProMotion device feels smoother but visibly faster than the same duration on a 60Hz device. A dt-based step converges in the same wall-clock time across 60Hz, 90Hz, and 120Hz panels.
+
+After this change, Xcode Instruments' Animation Hitches metric dropped from 6.2 hitches per 1,000 frames to 0.4 — about a 15x improvement. On a real device it crossed the threshold where the app no longer feels different from Safari running beside it.
+
+## Three FlashList gotchas worth knowing before you flip the 120Hz switch
+
+The thumbnail grid uses Shopify's FlashList v2. FlashList itself doesn't block ProMotion, but three things bit me in production.
+
+1. **A loose `estimatedItemSize` causes frame drops about 200ms into a scroll.** FlashList measures the first few cells and re-estimates, and the layout pass that fires during that re-estimate stalls the scroll. I now measure my thumbnail height once and hardcode it: `estimatedItemSize={196}`.
+2. **You have to feed `onScroll` through `useAnimatedScrollHandler` to keep the JS thread quiet.** At 120Hz the callback fires twice as often, so any naive `useState` updater inside it can stall the list. Store the scroll offset in a SharedValue and keep all reads on the UI thread.
+3. **`automaticallyAdjustsScrollIndicatorInsets` behaves differently at 120Hz.** This looks like an Apple bug: unless you set `contentInsetAdjustmentBehavior="never"` explicitly, the list visibly jumps by one pixel at the start of a scroll. The jump is invisible at 60Hz, but a ProMotion device makes it noticeable. I standardized `never` across all six apps.
+
+The third one I only caught after shipping, when a TestFlight reviewer told me the screen "jumps for a moment." Crashlytics never sees this kind of bug, which is why I now recommend touching the app on a 15 Pro or newer for a full minute before promoting a build to production.
+
+## What ProMotion did to eCPM, session length, and retention
+
+Feel matters, but so do the numbers. I rolled ProMotion out to two of the six wallpaper apps first and ran a two-week before / after comparison.
+
+| Metric | Pre-ProMotion | Post-ProMotion | Change |
+| --- | --- | --- | --- |
+| eCPM on iPhone 15 Pro or newer | $7.20 | $8.40 | +16.7% |
+| Average iOS session length | 2 min 18 sec | 2 min 44 sec | +18.8% |
+| Day 7 retention | 14.2% | 16.1% | +1.9pt |
+| Interstitial exit rate | 23.6% | 21.4% | -2.2pt |
+
+The eCPM lift didn't come directly from ProMotion. It came indirectly: AdMob's auction values longer-session users more highly, so when session length rose, ARPDAU rose with it. Translated into ad revenue, the two apps together added roughly ¥120,000 in monthly net revenue. Extrapolating to all six suggests around ¥300,000 per month of room is sitting on the table for ProMotion work alone.
+
+The work isn't glamorous, and I hesitated to spend two weeks on it. But after 12 years of indie development, I've learned that the fixes that draw review comments like "this feels smoother now" tend to lift retention slowly but persistently. Investments that don't show up in short-term KPIs often compound the long-term inventory the most.
+
+## Variable Refresh Rate on Android — and why the rollout looks asymmetric
+
+Android 11 and later expose `Display#setFrameRate`, and devices like the Pixel 7 Pro and Galaxy S22 or newer can drive their LTPO panels at 120Hz. Operating it in production is messier than iOS, though.
+
+```kotlin
+// MainActivity.kt
+override fun onAttachedToWindow() {
+  super.onAttachedToWindow()
+  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+    window.attributes = window.attributes.apply {
+      preferredDisplayModeId = pick120HzModeId() ?: 0
+    }
+  }
+}
+
+private fun pick120HzModeId(): Int? {
+  val display = display ?: return null
+  return display.supportedModes
+    .filter { it.refreshRate >= 119.0f }
+    .maxByOrNull { it.physicalHeight }
+    ?.modeId
+}
+```
+
+The catch is device-specific behavior. Pixel devices honor the request reliably; some Samsung devices will request 120Hz but the system will quietly clamp them to 60Hz under power-saving mode. I wired a Firebase Remote Config flag named `android_promotion_enabled` so I can switch ProMotion on or off per device model from a dashboard. When Crashlytics shows a strange spike on one model, I can disable it without shipping a build.
+
+Variable Refresh Rate behavior has shifted across Android 13, 14, and 15, and just when you think you're done, a major release changes the contract. After two weeks of production data, I settled on an asymmetric approach: opt in statically on iOS, gate it with Remote Config on Android.
+
+## A checklist I now use across six wallpaper apps
+
+Here's the checklist I run before every TestFlight build and whenever I want to measure ProMotion's impact on AdMob.
+
+1. Does the post-prebuild Info.plist actually contain `CADisableMinimumFrameDurationOnPhone=true`?
+2. Is the Expo config plugin still registered from the shared monorepo package?
+3. Does the CADisplayLink probe report close to 120fps on real hardware? (Anything under 90 means something downgraded silently.)
+4. Are the `useFrameCallback` motions on key screens dt-based, not duration-based?
+5. Is FlashList's `estimatedItemSize` pinned to a measured value?
+6. Are scroll offsets backed by SharedValues via `useAnimatedScrollHandler`?
+7. Is `contentInsetAdjustmentBehavior="never"` applied uniformly across every ScrollView?
+8. On Android, is the `android_promotion_enabled` Remote Config flag wired up?
+9. Is Crashlytics free of new `Display.Mode` related anomalies?
+10. Have you done a two-week before / after comparison in AdMob for eCPM and average session length?
+
+I missed items 5 and 6 myself when I started, and the first week after merging only the Info.plist change, AdMob metrics didn't move at all. The numbers only started moving after the Reanimated refactor landed. The takeaway: you have to opt in on both the hardware side and the software side to see ProMotion pay off.
+
+What I want to try next is the FrameRate API revisions rumored for Android 16, and a fresh look at ProMotion on iPad under Stage Manager. When I've validated those across my own apps, I'll write up the next round of notes.
