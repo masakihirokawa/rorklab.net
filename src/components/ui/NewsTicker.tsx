@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX1.5M — Rork Max が2月ローンチから3日で $1.5M ARR 達成、Claude Code + Opus 4.6 をバックエンドに採用",
-    "APPLEFULL — Rork Max が iPhone / iPad / Apple Watch / Apple TV / Vision Pro / iMessage の全 Apple プラットフォームをカバー",
-    "NATIVEPOWER — AR/LiDAR・Metal 3D・Dynamic Island・HealthKit・Core ML 等 React Native では不可能なネイティブ機能を解放",
-    "TESTFLIGHT — Rork Companion で Apple Developer 有料登録なしで実機テスト、App Store / TestFlight 提出も完結",
-    "VIBE47B — Vibe coding 市場が $4.7B に到達、ユーザーの63%が非開発者というメインストリーム化",
-    "COMPETE — Replit Agent 4 が parallel task と Design Mode 対応、Lovable は $330M Series B / $6.6B 評価額に到達",
+    "RORKMAX — Rork Maxがネイティブ Swift アプリを生成、Vision Pro・Apple Watch・iMessageに対応（2026）",
+    "NATIVE — Rork MaxがAR/LiDAR・Metal 3D・Dynamic Island・HealthKit等のApple機能を解放（2026）",
+    "CLOUDSIM — クラウドiOSシミュレータでXcode/Mac不要、ブラウザでアプリをテスト（2026）",
+    "PUBLISH — ワンクリック/ツークリックでApp Store公開、デプロイを簡素化（2026）",
+    "CROSSPLAT — 従来RorkはReact Native+Expoでクロスプラットフォーム開発を高速化（2026）",
+    "CHOICE — クロスプラットフォームはRork、Appleネイティブの深い機能はRork Maxの使い分けが定着（2026）",
   ],
   en: [
-    "MAX1.5M — Rork Max hits $1.5M ARR in 3 days from its Feb launch, powered by Claude Code + Opus 4.6",
-    "APPLEFULL — Rork Max covers the full Apple stack: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, iMessage",
-    "NATIVEPOWER — Unlocks native-only features: AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, Core ML — beyond React Native",
-    "TESTFLIGHT — Test on real iPhone via Rork Companion without paid Apple Developer, ship to App Store / TestFlight from Rork",
-    "VIBE47B — Vibe coding market hits $4.7B with 63% non-developer users, going fully mainstream in 2026",
-    "COMPETE — Replit Agent 4 adds parallel tasks and Design Mode; Lovable closes $330M Series B at $6.6B valuation",
+    "RORKMAX — Rork Max generates native Swift apps for Vision Pro, Apple Watch and iMessage (2026)",
+    "NATIVE — Rork Max unlocks AR/LiDAR, Metal 3D, Dynamic Island, HealthKit and more (2026)",
+    "CLOUDSIM — Cloud iOS simulator tests apps in the browser — no Xcode or Mac required (2026)",
+    "PUBLISH — One- and two-click App Store publishing simplifies deployment (2026)",
+    "CROSSPLAT — Original Rork uses React Native + Expo for fast cross-platform builds (2026)",
+    "CHOICE — Use Rork for cross-platform, Rork Max for deep Apple-native features (2026)",
   ],
 };
 
