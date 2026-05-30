@@ -1,0 +1,134 @@
+---
+title: "iOSの壁紙アプリでサムネイル一覧のカクつきを消す — ImageIOダウンサンプリングの実装メモ"
+slug: "ios-thumbnail-downsampling-scroll-performance"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-05-30T18:30"
+author: "Rork Lab"
+description: "大量のサムネイルを並べるとスクロールがカクつき、メモリも膨らむ。原因はメインスレッドでのフルサイズ画像デコードでした。ImageIOによるダウンサンプリングとプリフェッチで、実測でメモリを大幅に削減した過程をまとめます。"
+tags: ["iOS", "Swift", "パフォーマンス", "UICollectionView", "ImageIO"]
+highlights:
+  - "cellForItemAt の中で同期デコードしていると、なぜスクロールが詰まるのかをメモリと一緒に説明します"
+  - "CGImageSourceCreateThumbnailAtIndex を使ったダウンサンプリングの実装コードと、指定すべきオプションの意味"
+  - "プリフェッチとNSCache、セル再利用時のキャンセル処理まで含めた、現場で動かしている構成"
+---
+
+## サムネイルを並べた瞬間にスクロールが詰まる
+
+私は2014年から個人開発を続けていて、壁紙アプリは累計5,000万ダウンロードを超えるまでになりました。長く運用していると、初期のコードがそのまま残っている箇所が必ず出てきます。今回つまずいたのもそこでした。
+
+サムネイルの一覧画面で、画像が数十枚を超えたあたりからスクロールが目に見えてカクつくのです。指を離した後の慣性スクロールが小刻みに引っかかり、端末によってはメモリ警告まで出る。手元の実機で計測すると、一覧を一度開いただけでアプリのメモリ使用量が約480MBまで跳ね上がっていました。壁紙という性質上、扱う画像が大きいことは分かっていましたが、サムネイルの表示にここまで食うのは明らかに何かがおかしい。
+
+## 原因はメインスレッドでのフルサイズデコードだった
+
+コードを追っていくと、原因は二つ重なっていました。
+
+ひとつは、`UICollectionView` の `cellForItemAt` の中で画像を同期的にデコードしていたこと。`UIImage(contentsOfFile:)` は一見すると軽い処理に見えますが、実際にピクセルへ展開（デコード）されるのは画像が描画される瞬間です。つまりスクロールで新しいセルが出てくるたびに、メインスレッド上で重いデコードが走っていたわけです。これがフレーム落ちの直接的な原因でした。
+
+もうひとつは、サムネイル表示なのにフルサイズ画像をそのまま読み込んでいたこと。表示領域はせいぜい一辺200ポイント程度なのに、数千ピクセル四方の元画像をメモリ上に展開していました。展開後のビットマップは「幅 × 高さ × 4バイト」で効いてくるので、大きい画像を何枚も保持すれば一気に数百MBになります。これがメモリ膨張の正体です。
+
+公式のサンプルでも `UIImage(named:)` や `contentsOfFile:` がよく登場しますが、一覧表示で大量に扱う場面では、このまま使うと破綻します。表示に必要なサイズまで「読み込む段階で」縮小しておく必要があるのです。
+
+## ImageIOでダウンサンプリングする
+
+縮小の鍵になるのが ImageIO の `CGImageSourceCreateThumbnailAtIndex` です。`UIImage` を作ってから `draw(in:)` でリサイズする方法もありますが、それだと一度フルサイズで展開してしまうため、メモリのピークを抑えられません。ImageIO なら、デコードと縮小をまとめて行い、必要な解像度のビットマップだけを生成できます。
+
+```swift
+import ImageIO
+import UIKit
+
+func downsampledImage(at url: URL, pointSize: CGSize, scale: CGFloat) -> UIImage? {
+    let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
+        return nil
+    }
+
+    let maxPixel = max(pointSize.width, pointSize.height) * scale
+    let thumbnailOptions = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixel
+    ] as CFDictionary
+
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else {
+        return nil
+    }
+    return UIImage(cgImage: cgImage)
+}
+```
+
+ポイントは三つあります。`kCGImageSourceShouldCache: false` でソース生成時の不要なキャッシュを避け、`kCGImageSourceShouldCacheImmediately: true` でこの呼び出しの中（=バックグラウンドスレッド）でデコードまで済ませてしまうこと。そして `kCGImageSourceThumbnailMaxPixelSize` に「ポイントサイズ × スケール」を渡すことで、Retinaでも過不足ない解像度に縮小できます。`kCGImageSourceCreateThumbnailWithTransform: true` を入れておくと、EXIFの回転情報も反映されます。
+
+## バックグラウンドキューで呼んでメインに戻す
+
+ダウンサンプリング自体は重い処理なので、必ずメインスレッドの外で走らせます。呼び出し側はシンプルです。
+
+```swift
+final class ThumbnailLoader {
+    private let queue = DispatchQueue(label: "thumbnail.downsample", qos: .userInitiated, attributes: .concurrent)
+    private let cache = NSCache<NSURL, UIImage>()
+
+    func loadThumbnail(url: URL, pointSize: CGSize, completion: @escaping (UIImage?) -> Void) {
+        if let cached = cache.object(forKey: url as NSURL) {
+            completion(cached)
+            return
+        }
+        queue.async { [weak self] in
+            let scale = UIScreen.main.scale
+            let image = downsampledImage(at: url, pointSize: pointSize, scale: scale)
+            if let image = image {
+                self?.cache.setObject(image, forKey: url as NSURL)
+            }
+            DispatchQueue.main.async { completion(image) }
+        }
+    }
+}
+```
+
+`NSCache` を挟むのは、一度縮小した画像を作り直さないためです。`NSCache` はメモリ逼迫時に自動でオブジェクトを破棄してくれるので、自前でメモリ管理を書くより安全です。壁紙アプリのように画像点数が読めない場面では、この「勝手に手放してくれる」性質が効きます。
+
+## プリフェッチとセル再利用のキャンセル
+
+スクロールをさらに滑らかにするには、`UICollectionViewDataSourcePrefetching` を使って、表示される少し前から縮小を始めておきます。
+
+```swift
+extension GalleryViewController: UICollectionViewDataSourcePrefetching {
+    func collectionView(_ collectionView: UICollectionView,
+                        prefetchItemsAt indexPaths: [IndexPath]) {
+        for indexPath in indexPaths {
+            let url = items[indexPath.item].fileURL
+            loader.loadThumbnail(url: url, pointSize: cellSize) { _ in }
+        }
+    }
+}
+```
+
+あわせて忘れてはいけないのが、セルが再利用されるときに古い読み込みを捨てることです。スクロールが速いと、まだ縮小が終わっていないセルが別の画像に使い回されます。完了ハンドラの中で「このセルが今もこのindexPathを表示しているか」を確認し、ずれていたら結果を破棄します。これをやらないと、一瞬だけ違う画像がちらつく、いわゆる「画像の入れ替わり」が起きます。
+
+```swift
+func collectionView(_ collectionView: UICollectionView,
+                    cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+    let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "Thumb", for: indexPath) as! ThumbCell
+    let url = items[indexPath.item].fileURL
+    cell.representedURL = url
+    loader.loadThumbnail(url: url, pointSize: cell.bounds.size) { image in
+        guard cell.representedURL == url else { return }   // 再利用でずれていたら破棄
+        cell.imageView.image = image
+    }
+    return cell
+}
+```
+
+## 実測でどれだけ変わったか
+
+この構成に入れ替えたところ、一覧を開いた直後のメモリ使用量は約480MBから約90MBまで落ちました。フルサイズのビットマップを保持しなくなったぶんが、ほぼそのまま効いた形です。スクロールも、メインスレッドからデコードを追い出したことで、引っかかりが体感でなくなりました。Instrumentsで見ても、スクロール中のフレーム落ちが大きく減っています。
+
+数字は端末や画像点数で変わりますが、「フルサイズで展開しない」「デコードをメインスレッドから外す」という二点を押さえるだけで、ここまで変わるという手応えがありました。
+
+## 手を動かして直すということ
+
+私の祖父は二人とも宮大工でした。木を一本ずつ手で削って組み上げていく姿を見て育ったので、「丁寧に手を入れることそのものが、ものづくりの信心のようなものだ」という感覚が自分の根っこにあります。パフォーマンス改善は派手な機能追加ではありませんが、ユーザーが毎日触る画面の手触りを静かに整える作業で、私はこういう仕事が好きです。
+
+もし同じように一覧のカクつきで悩んでいる方がいたら、まずは `cellForItemAt` の中で何をデコードしているかを疑ってみてください。多くの場合、答えはそこにあります。お読みいただきありがとうございました。

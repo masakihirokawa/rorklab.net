@@ -1,0 +1,134 @@
+---
+title: "Killing Thumbnail Scroll Jank in an iOS Wallpaper App — Notes on ImageIO Downsampling"
+slug: "ios-thumbnail-downsampling-scroll-performance"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-05-30T18:30"
+author: "Rork Lab"
+description: "Lay out a lot of thumbnails and scrolling stutters while memory balloons. The culprit was full-size image decoding on the main thread. Here is how ImageIO downsampling and prefetching cut measured memory dramatically."
+tags: ["iOS", "Swift", "Performance", "UICollectionView", "ImageIO"]
+highlights:
+  - "Why decoding synchronously inside cellForItemAt chokes scrolling, explained alongside memory"
+  - "The actual downsampling code using CGImageSourceCreateThumbnailAtIndex and what each option means"
+  - "The full setup I run in production: prefetching, NSCache, and cancellation on cell reuse"
+---
+
+## Scrolling stalls the moment thumbnails appear
+
+I have been building apps on my own since 2014, and my wallpaper apps have now passed 50 million downloads in total. When you run something for that long, early code inevitably survives in a corner somewhere. That is exactly where this problem was hiding.
+
+On the thumbnail grid, once the image count passed a few dozen, scrolling visibly stuttered. The inertial scroll after lifting your finger snagged in small jerks, and on some devices it even triggered memory warnings. Measuring on a real device, simply opening the grid once pushed the app's memory use up to about 480MB. Wallpapers are large by nature, so I expected some cost — but not that much just to show thumbnails. Something was clearly wrong.
+
+## The cause was full-size decoding on the main thread
+
+Tracing the code, two problems were stacked on top of each other.
+
+The first was decoding images synchronously inside `cellForItemAt`. `UIImage(contentsOfFile:)` looks lightweight, but the actual expansion into pixels (decoding) happens at draw time. So every time scrolling surfaced a new cell, a heavy decode ran on the main thread. That was the direct cause of the dropped frames.
+
+The second was loading full-size images even though these were thumbnails. The display area was maybe 200 points per side, yet the original images — several thousand pixels across — were being expanded into memory in full. A decoded bitmap costs roughly "width × height × 4 bytes," so holding several large ones balloons into hundreds of megabytes fast. That was the source of the memory growth.
+
+Official samples lean on `UIImage(named:)` and `contentsOfFile:` constantly, but in a grid that handles many images at once, this approach falls apart. You have to shrink to the size you actually need at the moment you load.
+
+## Downsampling with ImageIO
+
+The key to shrinking is ImageIO's `CGImageSourceCreateThumbnailAtIndex`. You could build a `UIImage` and resize it with `draw(in:)`, but that expands the full image first, so it never lowers the memory peak. ImageIO performs the decode and the resize together, producing only the bitmap at the resolution you need.
+
+```swift
+import ImageIO
+import UIKit
+
+func downsampledImage(at url: URL, pointSize: CGSize, scale: CGFloat) -> UIImage? {
+    let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
+        return nil
+    }
+
+    let maxPixel = max(pointSize.width, pointSize.height) * scale
+    let thumbnailOptions = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixel
+    ] as CFDictionary
+
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else {
+        return nil
+    }
+    return UIImage(cgImage: cgImage)
+}
+```
+
+Three things matter here. `kCGImageSourceShouldCache: false` avoids unnecessary caching at source creation, `kCGImageSourceShouldCacheImmediately: true` forces the decode to finish inside this call (i.e. on a background thread), and passing "point size × scale" to `kCGImageSourceThumbnailMaxPixelSize` shrinks to exactly the right resolution even on Retina. Adding `kCGImageSourceCreateThumbnailWithTransform: true` also honors EXIF rotation.
+
+## Call it on a background queue, return on main
+
+Downsampling is heavy, so always run it off the main thread. The call site stays simple.
+
+```swift
+final class ThumbnailLoader {
+    private let queue = DispatchQueue(label: "thumbnail.downsample", qos: .userInitiated, attributes: .concurrent)
+    private let cache = NSCache<NSURL, UIImage>()
+
+    func loadThumbnail(url: URL, pointSize: CGSize, completion: @escaping (UIImage?) -> Void) {
+        if let cached = cache.object(forKey: url as NSURL) {
+            completion(cached)
+            return
+        }
+        queue.async { [weak self] in
+            let scale = UIScreen.main.scale
+            let image = downsampledImage(at: url, pointSize: pointSize, scale: scale)
+            if let image = image {
+                self?.cache.setObject(image, forKey: url as NSURL)
+            }
+            DispatchQueue.main.async { completion(image) }
+        }
+    }
+}
+```
+
+`NSCache` is there so a shrunk image is not rebuilt repeatedly. It also discards objects automatically under memory pressure, which is safer than hand-rolling memory management. In a wallpaper app, where the image count is unpredictable, that "lets go on its own" behavior really helps.
+
+## Prefetching and canceling on cell reuse
+
+To smooth scrolling further, use `UICollectionViewDataSourcePrefetching` to start shrinking slightly before cells appear.
+
+```swift
+extension GalleryViewController: UICollectionViewDataSourcePrefetching {
+    func collectionView(_ collectionView: UICollectionView,
+                        prefetchItemsAt indexPaths: [IndexPath]) {
+        for indexPath in indexPaths {
+            let url = items[indexPath.item].fileURL
+            loader.loadThumbnail(url: url, pointSize: cellSize) { _ in }
+        }
+    }
+}
+```
+
+Just as important: discard a stale load when a cell is reused. During fast scrolling, a cell whose downsampling has not finished gets reassigned to a different image. In the completion handler, confirm the cell still represents the same indexPath and drop the result if not. Skip this and you get the brief flicker of a wrong image — the classic "image swap."
+
+```swift
+func collectionView(_ collectionView: UICollectionView,
+                    cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+    let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "Thumb", for: indexPath) as! ThumbCell
+    let url = items[indexPath.item].fileURL
+    cell.representedURL = url
+    loader.loadThumbnail(url: url, pointSize: cell.bounds.size) { image in
+        guard cell.representedURL == url else { return }   // discard if reused
+        cell.imageView.image = image
+    }
+    return cell
+}
+```
+
+## How much it actually changed
+
+After swapping in this setup, memory right after opening the grid dropped from about 480MB to about 90MB. No longer holding full-size bitmaps accounted for nearly all of it. Scrolling, with decoding pushed off the main thread, stopped snagging in everyday use. Instruments confirmed a large drop in dropped frames during scrolling.
+
+The numbers shift with the device and image count, but just honoring two principles — "never expand at full size" and "keep decoding off the main thread" — was enough to make this much difference.
+
+## On fixing things with your hands
+
+Both of my grandfathers were miya-daiku, traditional shrine and temple carpenters. Growing up watching them shave and join wood by hand left me with a feeling that careful handwork is itself a kind of devotion in making things. Performance work is not a flashy feature; it is the quiet job of smoothing the feel of a screen people touch every day, and it is the kind of work I love.
+
+If you are wrestling with the same grid jank, start by questioning what you decode inside `cellForItemAt`. More often than not, the answer is right there. Thank you for reading.
