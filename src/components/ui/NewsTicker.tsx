@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORKMAX — Rork Maxがネイティブ Swift アプリを生成、Vision Pro・Apple Watch・iMessageに対応（2026）",
-    "NATIVE — Rork MaxがAR/LiDAR・Metal 3D・Dynamic Island・HealthKit等のApple機能を解放（2026）",
-    "CLOUDSIM — クラウドiOSシミュレータでXcode/Mac不要、ブラウザでアプリをテスト（2026）",
-    "PUBLISH — ワンクリック/ツークリックでApp Store公開、デプロイを簡素化（2026）",
-    "CROSSPLAT — 従来RorkはReact Native+Expoでクロスプラットフォーム開発を高速化（2026）",
-    "CHOICE — クロスプラットフォームはRork、Appleネイティブの深い機能はRork Maxの使い分けが定着（2026）",
+    "RORKMAX — Rork MaxがネイティブSwiftアプリを生成、iPhone/iPad/Watch/TV/Vision Proに対応（2026年）",
+    "SEED — Rorkが$15Mシードを調達、Left Lane CapitalがリードしApp Store開発の刷新を加速（2026年）",
+    "PAPERLINE — Rorkがアプリビルダー Paperline を買収、エンジニア採用を加速（2026年）",
+    "SIMULATOR — クラウドiOSシミュレータでXcodeやMac不要のテスト環境を提供（2026年）",
+    "MIGRATION — Android StudioのMigration AssistantがiOS/React Native/Webアプリのネイティブ移行を支援（5月）",
+    "AISTUDIO — Google AI Studioがネイティブvibe codingで数分でAndroidアプリを生成（5月）",
   ],
   en: [
-    "RORKMAX — Rork Max generates native Swift apps for Vision Pro, Apple Watch and iMessage (2026)",
-    "NATIVE — Rork Max unlocks AR/LiDAR, Metal 3D, Dynamic Island, HealthKit and more (2026)",
-    "CLOUDSIM — Cloud iOS simulator tests apps in the browser — no Xcode or Mac required (2026)",
-    "PUBLISH — One- and two-click App Store publishing simplifies deployment (2026)",
-    "CROSSPLAT — Original Rork uses React Native + Expo for fast cross-platform builds (2026)",
-    "CHOICE — Use Rork for cross-platform, Rork Max for deep Apple-native features (2026)",
+    "RORKMAX — Rork Max generates native Swift apps for iPhone, iPad, Watch, TV and Vision Pro (2026)",
+    "SEED — Rork raises a $15M seed led by Left Lane Capital to reinvent App Store development (2026)",
+    "PAPERLINE — Rork acquires app builder Paperline to accelerate engineering hiring (2026)",
+    "SIMULATOR — A cloud iOS simulator offers a real Apple test environment with no Xcode or Mac (2026)",
+    "MIGRATION — Android Studio's Migration Assistant ports iOS, React Native and web apps to native (May)",
+    "AISTUDIO — Google AI Studio builds native Android apps in minutes via vibe coding (May)",
   ],
 };
 
