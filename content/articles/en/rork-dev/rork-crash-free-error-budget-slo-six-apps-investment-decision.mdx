@@ -1,0 +1,157 @@
+---
+title: "Running Crash-Free Rate as a Budget: An SLO Design Note for Deciding Where to Invest Across 6 Indie Apps"
+slug: "rork-crash-free-error-budget-slo-six-apps-investment-decision"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-05-31T04:45"
+author: "Rork Lab"
+description: "Notes from running 6 wallpaper apps in parallel and the shift from treating crash-free rate as a pass/fail threshold to treating it as an error budget. A working write-up on turning burn rate into investment and sunset decisions."
+tags: ["Rork", "SLO", "Crashlytics", "Cloudflare Workers", "Reliability", "AdMob"]
+highlights:
+  - "How to assign different SLOs per app by revenue contribution and DAU, with a concrete 3-tier target table for a 6-app portfolio"
+  - "A 90-line Cloudflare Workers implementation (copy-paste ready) that computes error-budget remaining and burn rate over a 28-day rolling window"
+  - "A decision gate that mechanically separates freeze, hotfix, and sunset-review from budget consumption, plus how to handle noise on low-DAU apps"
+---
+
+One of my apps dropped from 99.7% to 99.2% crash-free right after a release. Half a percentage point. And I genuinely could not decide whether to pause the next feature and dig into the cause, or treat it as ordinary noise and keep moving. I had no internal sense of whether 99.2% was "dangerous" or "fine."
+
+I have been building apps independently since 2014 — twelve years now — and somewhere after crossing 50 million cumulative downloads, this question of *how to judge fragility* started following me everywhere. With a single app, intuition is enough. But running 6 wallpaper and calming apps in parallel means deciding, almost weekly, where to spend my time: which app to grow, which to wind down. This post is about the moment I stopped looking at crash-free rate as a pass/fail number and started treating it as an **error budget** — and how I turned that number into investment and sunset decisions, with the actual figures and code behind it.
+
+## A pass/fail threshold makes your judgment wobble
+
+When I ran crash-free rate as "above 99% is fine, below means act," my decisions were shockingly inconsistent. The same 99.2% would feel "still okay" on a good morning and "we're in trouble" on a tired evening — so I'd freeze everything and start investigating. My judgment was tracking my mood, not the app.
+
+The real problem is that a threshold only ever looks at the instantaneous value. Crash-free rate jumps around daily. On a low-DAU app, a single user crashing repeatedly can swing it 0.3 points. Decide feature freezes off the instantaneous number and you either get whipsawed by noise or miss a slow, steady decline.
+
+This is exactly where the SRE idea of an **SLO (Service Level Objective) and error budget** earns its keep. Once you decide "I'm targeting 99.5% crash-free," the remaining 0.5% becomes a *budget of failures you are allowed to spend*. While budget remains, you keep shipping features. When you're burning through it fast, you act in proportion to that speed — the burn rate. Just by shifting what I was judging — from "the current value" to "the pace of consumption" — the wobble dropped dramatically.
+
+## Don't apply the same SLO to all 6 apps
+
+My first mistake was setting the same "99.5% crash-free" target on all 6. It did not work. A single crash means something completely different on a flagship wallpaper app than on a small calming app doing a few thousand downloads a month.
+
+Today I split the apps into 3 tiers along two axes — revenue contribution and DAU — and set a different SLO per tier.
+
+- **Tier 1 (core, DAU in the tens of thousands)**: 99.5% crash-free (user-based) / ANR under 0.47%. Carries most of the AdMob revenue, so the strictest target
+- **Tier 2 (growing, DAU in the thousands)**: 99.0% / ANR under 0.6%. Still being grown, so I balance quality against feature velocity
+- **Tier 3 (mature, DAU in the hundreds to a thousand)**: 98.5%. Apps I've decided not to invest in further. Breaching the budget mostly means "observe"; breaching it *repeatedly* becomes input for a sunset decision
+
+The key idea: **an SLO is not a quota to hit, it's a tool for deciding where your time goes.** When a Tier 3 app breaks its SLO I don't jump. Instead I read "Tier 3 keeps exhausting its budget" as a signal that it's no longer worth my hands, and feed that into the sunset call. The point of the SLO isn't perfect quality — it's mechanically deciding how to allocate finite time across 6 apps.
+
+## Computing error budget and burn rate
+
+I kept the implementation thin. Crashlytics data comes out through the BigQuery export as daily crash-free and total session counts, and a Cloudflare Workers Cron Trigger aggregates it every morning into KV. Eyeballing the Crashlytics console for 6 apps daily isn't realistic, so I automated the math entirely.
+
+The error-budget formula is simple. If the SLO is 99.5%, allowed failures are 0.5% of the total. The "consumed ratio" is how much of that 0.5% the actual failures used up.
+
+```typescript
+// Error budget over a 28-day rolling window
+interface DailyHealth {
+  date: string;
+  totalSessions: number;
+  crashedSessions: number;
+}
+
+interface BudgetResult {
+  slo: number;            // e.g. 0.995
+  budgetTotal: number;    // allowed failed sessions
+  budgetSpent: number;    // actual failed sessions
+  budgetRemaining: number;
+  consumedRatio: number;  // 0.0–1.0+ (over 1.0 means over budget)
+  crashFreeRate: number;
+}
+
+function computeErrorBudget(days: DailyHealth[], slo: number): BudgetResult {
+  const totalSessions = days.reduce((s, d) => s + d.totalSessions, 0);
+  const crashedSessions = days.reduce((s, d) => s + d.crashedSessions, 0);
+
+  // allowed failures = total sessions × (1 - SLO)
+  const budgetTotal = totalSessions * (1 - slo);
+  const budgetSpent = crashedSessions;
+  const consumedRatio = budgetTotal > 0 ? budgetSpent / budgetTotal : 0;
+
+  return {
+    slo,
+    budgetTotal,
+    budgetSpent,
+    budgetRemaining: Math.max(0, budgetTotal - budgetSpent),
+    consumedRatio,
+    crashFreeRate: totalSessions > 0 ? 1 - crashedSessions / totalSessions : 1,
+  };
+}
+```
+
+To watch pace rather than the instantaneous value, I compare consumption over the last 1 day and the last 7 days. It's a heavily simplified take on the "multi-window burn rate" from Google's SRE Workbook, scaled down for a solo developer.
+
+```typescript
+// burn rate = "how many times the daily budget did this window spend?"
+function burnRate(window: DailyHealth[], slo: number): number {
+  const totalSessions = window.reduce((s, d) => s + d.totalSessions, 0);
+  const crashed = window.reduce((s, d) => s + d.crashedSessions, 0);
+  const allowedFailRate = 1 - slo;          // allowed failure rate per day
+  const actualFailRate = totalSessions > 0 ? crashed / totalSessions : 0;
+  return allowedFailRate > 0 ? actualFailRate / allowedFailRate : 0;
+}
+
+// burnRate = 1.0 → exactly on budget pace
+// burnRate = 2.0 → spending at 2x (a 28-day budget gone in 14 days)
+// burnRate < 1.0 → budget is accumulating (safe to ship features)
+```
+
+What I couldn't get from the docs and only learned by running it: **it's serious only when both the short window (1 day) and the long window (7 days) are high.** A spike on a single day is usually a one-off incident or a single device, and it's gone by tomorrow. Only when the 7-day window stays elevated can you call it a structural regression. Act on one window alone and noise keeps stopping your feature work.
+
+## Turning budget consumption into a decision
+
+Once you have the numbers, you need a rule that turns them into action. I use the same decision gate across all 6 apps, specifically to remove the vague "this feels risky" judgment.
+
+```typescript
+type Action = "ship" | "freeze" | "hotfix" | "sunset-review";
+
+function decide(
+  budget: BudgetResult,
+  burn1d: number,
+  burn7d: number,
+  tier: 1 | 2 | 3,
+): Action {
+  // both 1d and 7d burning fast → structural regression. Hotfix now
+  if (burn1d >= 3 && burn7d >= 2) return "hotfix";
+
+  // budget exhausted → stop new features, focus on reliability
+  if (budget.consumedRatio >= 1) return "freeze";
+
+  // a Tier 3 app that keeps overrunning → re-evaluate whether to keep it
+  if (tier === 3 && budget.consumedRatio >= 0.8) return "sunset-review";
+
+  // budget comfortable (over half left) → keep shipping features
+  if (budget.consumedRatio < 0.5) return "ship";
+
+  // otherwise (0.5–1.0 consumed) → maintain, don't push hard
+  return "ship";
+}
+```
+
+Since adding this gate, my decisions got faster. In the morning aggregation I only open the apps that returned `hotfix`; the `ship` apps I push features on without a second thought. The time I used to spend vaguely staring at 6 apps and feeling anxious has nearly disappeared.
+
+One detail: for any app that returns `freeze`, I don't just halt the feature branch — I flip a `feature_freeze` flag in Remote Config to disable the riskier experiments (A/B tests on new ad formats, for example) from the server. Being able to retract just the "aggressive" parts without touching code lets me focus on recovery.
+
+## Three pitfalls that don't show up in the numbers
+
+After about six months of running 6 apps this way, a few practical problems surfaced that the introductory SLO articles never mention.
+
+First, **on low-DAU apps the burn rate is almost pure noise.** On a Tier 3 app with a few hundred DAU, one user's device-specific crash sends burnRate past 5.0 instantly. If I dutifully fired `hotfix` every time, I'd never have enough hours. My fix: **apps below a session floor (3,000 sessions in my 28-day window) are excluded from the gate entirely**, and I look only at the absolute crash count and the number of affected users. Applying a ratio where there's no statistically meaningful denominator gives you nothing to decide on.
+
+Second, **crash-free rate alone doesn't capture quality.** Failures where nothing crashes but the ad never serves, or the purchase dialog never opens, never appear in this metric. So I fold a second SLI into the budget judgment alongside crash-free rate: "the share of sessions where first paint took longer than 4 seconds." Users leave when an app is slow even if it doesn't crash, and it hits AdMob revenue directly.
+
+Third, **set the SLO too strict and feature work never starts.** I once set 99.9% on the flagship, and the rolling-window budget stayed essentially depleted, which meant I couldn't ship anything new. Relaxing it to 99.5% found the sweet spot — 2–3 new features a month while crash-free rate stayed stable. **A higher SLO isn't a better one; you're looking for the point that balances against feature velocity.** That's my conclusion after six months.
+
+## Recommended targets by situation
+
+For anyone about to run multiple apps as a solo developer, here are the figures I settled on. These are from the wallpaper/calming genre, which crashes relatively rarely, so for games I'd start looser.
+
+- **DAU 10k+, core revenue**: 99.5% crash-free / under 2% sessions with a 4-second white screen. Run on multi-window burn rate
+- **DAU 1k–10k, growing**: 99.0%. Use the 28-day consumed-ratio as the primary metric rather than burn rate — it's more robust to swings
+- **DAU under 1k, maintenance**: don't set a ratio-based SLO; watch "affected users per week" and absolute crash count. Just record the consumption trend as input for `sunset-review`
+
+Both of my grandfathers were temple carpenters, and I grew up with the sense that *working with your hands is a kind of devotion*. Working on app reliability isn't flashy, but it's the work that feels closest to that careful, keep-building instinct. Rather than stopping in pursuit of perfection, you accept a budget of allowable failures and keep your hands moving. The error-budget idea became, for me, the tool that makes that reconciliation possible.
+
+If you want to try it, start with your single highest-revenue app, set the SLO to 99.5%, and just record the 28-day consumed ratio every morning. Burn rate and the decision gate can come later. I hope you get to feel that shift — from "good or bad" to "how much more can I push" — at least once. Thanks for reading.
