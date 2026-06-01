@@ -42,7 +42,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/rork-ai/rork-companion-feature-guide", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/rork-companion-features-guide", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/rork-companion-guide", to: "/articles/rork-ai" },
-  { from: "/articles/rork-ai/rork-gemini-integration", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/rork-gemma4-on-device-ai-guide", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/rork-max-ai-capabilities-complete-guide", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/rork-max-swiftui-native-features-guide", to: "/articles/rork-ai" },
