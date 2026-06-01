@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORKMAX — Rork MaxがネイティブSwiftアプリを生成、iPhone/iPad/Watch/TV/Vision Proに対応（2026年）",
-    "SEED — Rorkが$15Mシードを調達、Left Lane CapitalがリードしApp Store開発の刷新を加速（2026年）",
-    "PAPERLINE — Rorkがアプリビルダー Paperline を買収、エンジニア採用を加速（2026年）",
-    "SIMULATOR — クラウドiOSシミュレータでXcodeやMac不要のテスト環境を提供（2026年）",
-    "MIGRATION — Android StudioのMigration AssistantがiOS/React Native/Webアプリのネイティブ移行を支援（5月）",
-    "AISTUDIO — Google AI Studioがネイティブvibe codingで数分でAndroidアプリを生成（5月）",
+    "RORKMAX — Rork MaxがネイティブSwiftアプリを生成、Claude Code + Claude Opus 4.6駆動（2026）",
+    "APPLE — AR/LiDAR・Metal 3D・Dynamic Island・HealthKit・NFC・Core MLまでネイティブ機能を解放（2026）",
+    "COMPANION — Rork Companionで有料Apple Developerなしでも実機iPhoneテストが可能（2026）",
+    "SEED — Left Lane CapitalがリードしRorkが$15Mシードを調達（2026）",
+    "GROWTH — 月間743,000訪問・成長率85%でApp Store事業の立ち上げを後押し（2026）",
+    "CHOICE — クロスプラットフォームは従来Rork、Apple深掘りはRork Maxの使い分けが定着（2026）",
   ],
   en: [
-    "RORKMAX — Rork Max generates native Swift apps for iPhone, iPad, Watch, TV and Vision Pro (2026)",
-    "SEED — Rork raises a $15M seed led by Left Lane Capital to reinvent App Store development (2026)",
-    "PAPERLINE — Rork acquires app builder Paperline to accelerate engineering hiring (2026)",
-    "SIMULATOR — A cloud iOS simulator offers a real Apple test environment with no Xcode or Mac (2026)",
-    "MIGRATION — Android Studio's Migration Assistant ports iOS, React Native and web apps to native (May)",
-    "AISTUDIO — Google AI Studio builds native Android apps in minutes via vibe coding (May)",
+    "RORKMAX — Rork Max generates native Swift apps, powered by Claude Code and Claude Opus 4.6 (2026)",
+    "APPLE — It unlocks AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, NFC and Core ML natively (2026)",
+    "COMPANION — Rork Companion enables real-iPhone testing without a paid Apple Developer account (2026)",
+    "SEED — Rork raises a $15M seed round led by Left Lane Capital (2026)",
+    "GROWTH — 743,000 monthly visits at 85% growth fuel new App Store ventures (2026)",
+    "CHOICE — Use original Rork for cross-platform, Rork Max for deep Apple-native features (2026)",
   ],
 };
 
