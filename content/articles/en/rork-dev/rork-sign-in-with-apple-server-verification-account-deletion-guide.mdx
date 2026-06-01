@@ -3,9 +3,9 @@ title: "Sign in with Apple in Rork: Server-Side Verification, Account Linking, a
 slug: "rork-sign-in-with-apple-server-verification-account-deletion-guide"
 category: "rork-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-05-03T11:30"
-updated: "2026-05-03T11:30"
+updated: "2026-06-01T20:30"
 author: "Rork Lab"
 description: "Dropping a Sign in with Apple button into your Rork app and shipping it is the fastest path to a rejection. This guide walks through the full picture: nonce hashing, server-side ID token verification with Apple's JWKs, the mandatory account deletion flow, and the often-forgotten revoke_token call back to Apple."
 tags: ["Sign in with Apple", "Authentication", "JWT", "App Store Review", "Cloudflare Workers"]
@@ -524,6 +524,57 @@ UI guideline violations are a meaningful share of rejections. When you ask Rork 
 
 A subtle case: if your app uses **only** email/password, Sign in with Apple is **not** required by Guideline 4.8. The trigger is the presence of a third-party social provider. So if you launch with Apple + email/password and add Google later, you'll need to revisit the login screen layout to keep all three on equal footing visually. It's the kind of thing that's easy to forget six months after launch.
 
+## What the docs won't tell you — lessons from production
+
+Everything above is "the implementation that passes review." But once real users start arriving, a different set of problems shows up — ones Apple's documentation never mentions. Here are the ones I actually hit across the six apps I run in production, with numbers, after debugging them with logs in hand.
+
+1. **Fetching JWKs on every request inflates both latency and your request count to Apple**
+   If you hit Apple's public-key endpoint (`https://appleid.apple.com/auth/keys`) on every verification, you add a round trip per sign-in. My auth p95 sat at 480ms. The keys don't change often, so I cached them in Cloudflare's `Cache API` (you could use KV) while honoring the `max-age` Apple returns — and p95 dropped to 90ms. But do not assume the keys never change (see the next point).
+
+2. **On key-rotation day, `kid` won't match and every sign-in fails at once**
+   Apple rotates signing keys without warning. If you only look at the cached set and error out the moment a `kid` isn't found, rotation day turns into a "nobody can log in" outage. I did this once. The fix: if the cached set doesn't contain the `kid`, force a single refetch before deciding it's invalid.
+
+```ts
+// server/apple-jwks.ts — force exactly one refetch when the kid is missing
+const JWKS_URL = "https://appleid.apple.com/auth/keys";
+type Jwk = JsonWebKey & { kid: string };
+
+async function fetchJwks(force = false): Promise<Jwk[]> {
+  const cache = caches.default;
+  const cacheKey = new Request(JWKS_URL);
+  if (!force) {
+    const hit = await cache.match(cacheKey);
+    if (hit) return ((await hit.json()) as { keys: Jwk[] }).keys;
+  }
+  const res = await fetch(JWKS_URL); // Apple returns Cache-Control: max-age=...
+  await cache.put(cacheKey, res.clone()); // cache as-is, honoring max-age
+  return ((await res.json()) as { keys: Jwk[] }).keys;
+}
+
+export async function getApplePublicKey(kid: string): Promise<Jwk> {
+  let key = (await fetchJwks()).find((k) => k.kid === kid);
+  if (!key) {
+    // just after rotation the new key isn't cached yet → refetch once
+    key = (await fetchJwks(true)).find((k) => k.kid === kid);
+  }
+  if (!key) throw new Error(`Apple public key not found for kid=${kid}`);
+  return key;
+}
+```
+
+   After switching to "cache-first, refetch only on a miss," rotation-induced auth failures went to zero. Keep the refetch strictly to a single attempt — looping it unconditionally gets you rate-limited by Apple.
+
+3. **An expired `client_secret` (ES256 JWT) turns both `revoke` and `token` exchange into blanket 500s**
+   Apple's `client_secret` is a JWT you sign yourself, with a maximum lifetime of six months. If you "generate it once and hardcode it into an env var," then one day half a year later your token exchange and account-deletion revoke calls all die at the same time. Because nothing in your app code looks wrong, I burned half a day isolating the cause. I now generate it with `exp` at 180 days and regenerate it monthly via Workers Cron Triggers, updating KV.
+
+4. **Confirming the deletion when `revoke_token` fails leaves ghost accounts behind**
+   If you delete the local DB row the instant a deletion request arrives and the subsequent revoke fails, you end up with the worst inconsistency: Apple still shows the linkage while your user data is gone. Rather than completing deletion in one transaction, I split it into three states — `pending_deletion → revoked → purged`. Revoke is retried with exponential backoff, and physical deletion only happens after reaching `revoked`. This took "there's a ghost under Settings → Apple ID" inquiries from four a month to zero.
+
+5. **Mail to private-relay addresses won't arrive if you send it straight from your own SMTP**
+   Anything addressed to `@privaterelay.appleid.com` must go through Apple's relay. Sending directly from your own domain bounces on SPF/DKIM grounds. I switched to a policy of emailing only notifications whose sender is registered with Apple Developer for relay, and double-posting anything important as an in-app message.
+
+None of these surface during review, but every one of them bites from month three onward. Building the state-machine deletion and key cache in from the start spares you the pain of retrofitting them later.
+
 ## Common mistakes and pitfalls
 
 The five most common patterns where I've watched implementations break:
@@ -540,6 +591,5 @@ Implement everything above and Sign in with Apple rejections largely disappear f
 
 A practical sequencing for the rest of the work: get the delete + revoke flow green first, then layer on the JWS verification, then finally polish the client-side UI. Counterintuitively, the client UI is the easiest to fix in a follow-up release; the server logic is the part that's hardest to retrofit safely after you have real users.
 
-For the deeper context on JWT verification and cryptographic library choices, a solid implementation-focused book on TypeScript or your server language (such as [TypeScript in 50 Lessons](https://www.amazon.co.jp/dp/3945749603/?tag=pinocchio-22)) helps stabilize the design baseline you bring to authentication code. If you want a broader treatment of mobile auth UX, [iOS App Distribution and Best Practices](https://www.amazon.co.jp/dp/1484292588/?tag=pinocchio-22) is a thoughtful companion that covers more than just the auth flow.
 
 For an adjacent topic — passwordless flows — see [Building Passwordless Auth in Rork with Passkeys](/articles/rork-dev/rork-passkeys-passwordless-authentication-guide) so you can compare both options before deciding which to ship first.

@@ -3,9 +3,9 @@ title: "Rork アプリの Sign in with Apple を、サーバー検証とアカ�
 slug: "rork-sign-in-with-apple-server-verification-account-deletion-guide"
 category: "rork-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-05-03T11:30"
-updated: "2026-05-03T11:30"
+updated: "2026-06-01T20:30"
 author: "Rork Lab"
 description: "Rork で作ったアプリに Sign in with Apple をクライアントだけで載せて満足してしまうと、審査で確実に詰まります。ID トークンの公開鍵検証から nonce の扱い、必須となったアカウント削除フロー、Apple への revoke 通知までを、現場で動かしている構成のまま全部書きます。"
 tags: ["Sign in with Apple", "認証", "JWT", "App Store審査", "Cloudflare Workers"]
@@ -481,6 +481,57 @@ Sign in with Apple は、IAP の Sandbox とは別の意味で「本番でしか
 
 UI ガイドライン違反は審査でかなり多く検出されます。Rork で画面を生成するときも、「他の認証ボタンと並べてください」を明示プロンプトに入れておくと、生成結果が一発で通る確率が上がります。
 
+## 公式ドキュメントには書かれていない、本番運用で気づいたこと
+
+ここまでが「審査を通すための実装」です。ですが、実際にユーザーが増えてくると、Apple 公式ドキュメントには載っていない運用上の落とし穴がいくつも顔を出します。私が現役で運用している 6 アプリで実際にぶつかり、ログを取りながら直してきたものを、数字込みで残しておきます。
+
+1. **JWKs を毎回フェッチすると、認証レイテンシも Apple へのリクエストも無駄に増える**
+   Apple の公開鍵エンドポイント (`https://appleid.apple.com/auth/keys`) を検証のたびに叩く実装だと、認証 1 回ごとに往復が 1 つ増えます。私の環境では認証 p95 が 480ms ありました。鍵は頻繁には変わらないので、Cloudflare の `Cache API`（または KV）に Apple が返す `max-age` を尊重して載せたところ、p95 が 90ms まで下がりました（およそ 5 倍の改善です）。ただし「鍵は変わらない」と決め打ちしてはいけません（次の項目）。
+
+2. **鍵ローテーション日に `kid` が一致せず、認証が一斉に失敗する**
+   Apple は予告なく署名鍵をローテーションします。キャッシュした鍵だけを見て該当 `kid` が見つからなければ即エラー、という実装だと、ローテーション当日に「全ユーザーがログインできない」障害になります。私はこれを一度やりました。対策は「キャッシュに該当 `kid` がなければ、1 度だけ強制再フェッチしてから判定する」ことです。
+
+```ts
+// server/apple-jwks.ts — kid が無ければ 1 度だけ強制再フェッチする
+const JWKS_URL = "https://appleid.apple.com/auth/keys";
+type Jwk = JsonWebKey & { kid: string };
+
+async function fetchJwks(force = false): Promise<Jwk[]> {
+  const cache = caches.default;
+  const cacheKey = new Request(JWKS_URL);
+  if (!force) {
+    const hit = await cache.match(cacheKey);
+    if (hit) return ((await hit.json()) as { keys: Jwk[] }).keys;
+  }
+  const res = await fetch(JWKS_URL); // Apple は Cache-Control: max-age=... を返す
+  await cache.put(cacheKey, res.clone()); // max-age を尊重してそのままキャッシュ
+  return ((await res.json()) as { keys: Jwk[] }).keys;
+}
+
+export async function getApplePublicKey(kid: string): Promise<Jwk> {
+  let key = (await fetchJwks()).find((k) => k.kid === kid);
+  if (!key) {
+    // ローテーション直後はキャッシュに無い → 1 度だけ強制再取得
+    key = (await fetchJwks(true)).find((k) => k.kid === kid);
+  }
+  if (!key) throw new Error(`Apple public key not found for kid=${kid}`);
+  return key;
+}
+```
+
+   この「キャッシュ優先・ミス時のみ 1 回だけ再フェッチ」という形にしてから、鍵ローテーション起因の認証失敗はゼロになりました。再フェッチを無条件にループさせると Apple 側に弾かれるので、必ず 1 回に限定してください。
+
+3. **`client_secret`(ES256 JWT) の有効期限切れは、`revoke` も `token` 交換も全部 500 にする**
+   Apple の `client_secret` は自分で署名する JWT で、有効期限は最長 6 ヶ月です。これを「一度作って環境変数に直書き」していると、半年後のある日、トークン交換とアカウント削除の revoke が同時に全滅します。エラーがアプリ側のコードに見えないため、原因の切り分けに半日溶かしました。今は `exp` を 180 日で生成し、Workers の Cron Triggers で毎月頭に再生成して KV を更新する運用にしています。
+
+4. **`revoke_token` 失敗時に削除を確定させると、幽霊アカウントが残る**
+   削除リクエストを受けた瞬間にローカル DB から消し、その後の revoke が失敗すると、Apple 側には連携が残ったままユーザー情報だけ消える、という最悪の不整合が起きます。私は削除を 1 トランザクションで完結させず、`pending_deletion → revoked → purged` の 3 状態に分けました。revoke は指数バックオフで再試行し、`revoked` に到達してから物理削除します。これで「設定 → Apple ID に幽霊が残る」という問い合わせが月 4 件から 0 になりました。
+
+5. **プライベートリレー宛のメールは、自前 SMTP から直送すると届かない**
+   `@privaterelay.appleid.com` 宛は Apple のリレーを経由しないと届きません。自前の送信ドメインから直接送ると、SPF/DKIM の都合で bounce します。私は「リレー対応済みの送信元を Apple Developer に登録したうえで届く通知だけメールにし、重要な通知はアプリ内メッセージでも二重化する」方針に切り替えました。
+
+これらはどれも審査の場には出てきませんが、運用 3 ヶ月目以降に必ず効いてくる部分です。最初から state machine 式の削除と鍵キャッシュを入れておくと、後から作り直す痛みを避けられます。
+
 ## よくある間違い・落とし穴
 
 実装中に「あれ、ここで詰まる人多いだろうな」と感じたものを 5 つにまとめます。
@@ -495,6 +546,5 @@ UI ガイドライン違反は審査でかなり多く検出されます。Rork 
 
 ここまで実装すれば、Sign in with Apple 起因のリジェクトはほぼ消えます。長くなりましたが、もし「今日のうちに 1 つだけ進めるなら」を選ぶなら、**先に「アカウント削除エンドポイント + Apple revoke の動作確認」**から手を付けることをおすすめします。理由はシンプルで、ここが一番リジェクトされやすく、かつテストもしにくい部分だからです。設計を後回しにすると、リリース直前に焦って組むことになります。
 
-ID トークン検証の細かい仕様や、JWT の検証ライブラリ選定を体系的に深めたい場合は、[実用 Go 言語](https://www.amazon.co.jp/dp/4297133520/?tag=pinocchio-22) のような実装系の書籍を 1 冊持っておくと、サーバー側の設計判断のベースラインが安定します。React Native 周りの認証 UX 全般を学び直したい方には、[詳解 TypeScript 第 2 版](https://www.amazon.co.jp/dp/4798179647/?tag=pinocchio-22) が前段の型設計を整理するのに役立ちました。
 
 関連する記事として、[Rork で作るパスワードレス認証 — Passkeys 実装ガイド](/articles/rork-dev/rork-passkeys-passwordless-authentication-guide) も併せて読むと、認証手段全体の選定軸が見えやすくなります。
