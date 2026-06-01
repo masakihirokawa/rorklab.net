@@ -42,11 +42,11 @@ const BOOKS: Record<string, Book[]> = {
       topics: ["ai", "agent", "dev"],
     },
     {
-      title: "生成AIプロンプトエンジニア検定 2026年度版",
-      author: "生成AIプロンプト研究所",
-      url: "https://www.amazon.co.jp/dp/4911384093/?tag=pinocchio-22",
-      tag: "資格",
-      topics: ["ai", "prompt", "beginner"],
+      title: "Claude Codeで学ぶ Agent Skills入門",
+      author: "佐藤亮",
+      url: "https://www.amazon.co.jp/dp/4297156989/?tag=pinocchio-22",
+      tag: "Agent Skills",
+      topics: ["ai", "agent", "dev", "claude"],
     },
     {
       title: "実践Claude Code入門",
