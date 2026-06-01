@@ -1,0 +1,194 @@
+---
+title: "Managing Startup Time as a Budget: How I Deferred SDK Init Across Six Apps"
+slug: "rork-startup-time-budget-deferred-sdk-init-six-apps"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-01T04:45"
+author: "Rork Lab"
+description: "Instead of optimizing startup ad hoc, I switched to allocating a per-phase time budget and defending it. Here's how I deferred SDK init across six Rork-built apps and added a CI gate that fails the build when the budget is exceeded."
+tags: ["React Native", "Startup Time", "Performance", "AdMob", "Architecture"]
+highlights:
+  - "A way to split startup into three phases and allocate a budget to each, plus the actual table I use across six apps (1,800ms total)"
+  - "Before/After code that defers AdMob and Crashlytics init past the first frame, with a measured TTI drop from 2,400ms to 1,500ms"
+  - "A CI threshold gate that stops startup regressions, and why I made over-budget builds actually fail rather than just warn"
+---
+
+It started with a review on my most-downloaded wallpaper app, one of six I run in parallel: "it feels sluggish to open lately." Not a crash. It doesn't fall over, the features work. But the time from tapping the icon to seeing the first wallpaper grid was clearly slow even to me. When I measured it, cold-start TTI (time to interactive) had drifted from 1,500ms six months ago to 2,400ms.
+
+Every feature I'd added had quietly grown the init path: the ad SDK, analytics, remote config, font preloading, restoring favorites. Each one passed review on its own because "it's only a few dozen milliseconds." Across eight years of solo development and over 50 million cumulative downloads, this is the mistake I've repeated most. Every individual decision is sound, but if no one sets a ceiling on startup as a shared resource, the total grows without limit. This is the record of how I turned startup time from something I "optimized" into something I "budgeted and defended."
+
+## Why I stopped optimizing and started budgeting
+
+There are plenty of techniques for faster startup. Use Hermes, split the bundle, lazy-load images. I tried them all. But applying techniques one at a time has a weakness: **it's fast right after you fix it, and slow again a few months later.**
+
+The reason is plain. Optimization removes the slowness you have today; it does nothing to prevent the slowness you add tomorrow. Every feature grows the init path, and within half a year you're back where you started. This happened on roughly the same cycle across all six of my apps.
+
+So I changed the framing. Startup time is a finite shared resource, like CPU time or memory. If that's true, then I should treat it like a household budget: decide a total, allocate how much each task may spend, and stop when something goes over. The moment I shifted from "make it faster" to "keep it within the envelope," operations got dramatically more stable.
+
+I think of my grandfathers, who were temple carpenters. I'm told that joinery isn't done by deciding "I'll spend X minutes shaving this beam," but by fixing the overall dimensions and joints first, then cutting each piece to fit. Startup time is the same: drawing the overall envelope first and then allocating to each task holds up far better over time, in my experience.
+
+## Split startup into three phases and allocate a budget
+
+The first thing I did was split startup into three meaningful phases. As long as "startup is slow" stays a single blob, you can't decide what to cut.
+
+The three boundaries I use across all six apps:
+
+1. **Native startup phase**: from process creation to the React root view being mounted. App-side JS has almost no control here.
+2. **First paint phase**: from JS starting to execute, to the first meaningful screen (the wallpaper-grid skeleton) being painted.
+3. **Interactive phase**: from the skeleton appearing, to actually responding to scroll and taps (TTI).
+
+Then I allocate a budget (a ceiling in ms) to each phase. Here's the allocation I currently use across six apps:
+
+- Native startup phase: ceiling 700ms
+- First paint phase: ceiling 600ms
+- Interactive phase: ceiling 500ms
+- Total budget: 1,800ms (TTI)
+
+I set 1,800ms as an empirical line — on mid-range physical devices (a Pixel 6a and an iPhone SE 3rd gen in my testing) — just before users start to feel they're waiting. Device performance varies widely, so the essence isn't the absolute number; it's putting a budget into your operations at all. What matters is the constraint it creates: anyone who wants to add new init work (my past self included) must find that time somewhere in this table.
+
+## You can't defend a budget you don't measure: add TTI markers
+
+A budget is meaningless if you can't see the measured value of each phase. Before adding any heavy external profiling tool, I instrumented lightweight markers of my own — phase boundaries recorded with `performance.now()`.
+
+```ts
+// src/perf/startupBudget.ts
+type Phase = 'native' | 'firstPaint' | 'interactive';
+
+const BUDGET_MS: Record<Phase, number> = {
+  native: 700,
+  firstPaint: 600,
+  interactive: 500,
+};
+
+const marks: Partial<Record<Phase, number>> = {};
+// Anchor on the time JS started evaluating
+const jsStart = performance.now();
+
+export function markPhase(phase: Phase) {
+  marks[phase] = performance.now() - jsStart;
+}
+
+export function reportStartup() {
+  // Native startup comes from a native module (see below)
+  const nativeMs = getNativeStartupMs();
+  const firstPaint = (marks.firstPaint ?? 0);
+  const interactive = (marks.interactive ?? 0);
+
+  const phases = {
+    native: nativeMs,
+    firstPaint: firstPaint,
+    interactive: interactive - firstPaint, // time spent in this phase alone
+  };
+
+  const over = (Object.keys(phases) as Phase[]).filter(
+    (p) => phases[p] > BUDGET_MS[p]
+  );
+
+  return {
+    phases,
+    tti: nativeMs + interactive,
+    over, // names of phases that exceeded budget
+  };
+}
+```
+
+I call `markPhase('firstPaint')` at the top of the `useEffect` in the component that paints the skeleton, and `markPhase('interactive')` once the grid data is ready and can accept interaction. The native portion (process creation to RN root) can't be measured from JS, so it's most accurate to pass it through a native module — `Process.getStartUptimeMillis()` on Android, the `ProcessInfo` start time on iOS.
+
+The important part is sending the result of `reportStartup()` as a Crashlytics custom key or an analytics event. I send `startup_tti` and `startup_over_phase` on every launch and watch the distribution per release. Measuring on one device in my hand gets jerked around by device variance; once I started judging by the real-user distribution (especially p75), I stopped being fooled by a false sense that "it feels faster now."
+
+## The single biggest win: defer SDK init past the first frame
+
+When I chased the budget offenders by real-user distribution, all six apps shared the same culprit: **third-party SDK initialization running at launch.**
+
+AdMob is the backbone of my revenue, so the ad SDK's init was wired into the startup path. Add Crashlytics, analytics, remote config on top. I'd been calling them synchronously at the top level of the root component, out of a naive wish to "make sure they're initialized at startup."
+
+The problem was that these inits **cut in before the first frame was painted.** What the user wants to see is the wallpaper grid, not whether the ad SDK is ready. So I deferred initialization to "after the first frame appears."
+
+```tsx
+// Before: synchronous init at the root (delays the first paint)
+export default function App() {
+  // These were directly blocking the startup path
+  initAdMob();
+  initCrashlytics();
+  initRemoteConfig();
+  return <Navigation />;
+}
+```
+
+```tsx
+// After: deferred init together, after the first frame
+import { InteractionManager } from 'react-native';
+
+export default function App() {
+  useEffect(() => {
+    // Initialize once paint and interactions have settled
+    const task = InteractionManager.runAfterInteractions(() => {
+      initCrashlytics();   // crash capture first, highest priority
+      initRemoteConfig();
+      initAdMob();         // ads can go last; there's time before first display
+    });
+    return () => task.cancel();
+  }, []);
+
+  return <Navigation />;
+}
+```
+
+This one move dropped my flagship app's TTI from 2,400ms to 1,500ms. By phase, the first-paint phase shrank from 1,100ms to 520ms, which did most of the work — the time the ad SDK init had been stealing from the first paint came back almost intact.
+
+But deferral needs an ordering design. I standardized these rules across all six apps:
+
+- **Initialize Crashlytics first.** If a crash happens during deferred init, you lose that report. Even when deferring, put it at the head of the deferred block.
+- **AdMob can go last.** There's reliably a gap before the user scrolls the grid down to an ad slot, so it doesn't need to compete with the first frame.
+- **Only pull forward the remote-config values that affect rendering.** If a value drives a UI branch, prefetch just that one lightly and defer the rest. Defer everything and you'll get a screen that paints with stale defaults on the very first launch.
+
+Many SDK docs only say "initialize at app startup," but that does not mean "before the first frame." Misread this and you block startup while believing you're being diligent. That's a piece of know-how the docs don't write down — something I only learned by running this in production.
+
+## Stop over-budget builds in CI: the threshold gate
+
+The final piece is the mechanism that *forces* the budget to be kept. Rely on human goodwill and it'll bloat again in six months. So I added a gate that checks the startup budget in CI before release.
+
+The idea is simple. Launch an instrumented build on a physical device (I use Firebase Test Lab physical devices), pull the p75 TTI out of `reportStartup()`, and fail the build if it's over budget.
+
+```js
+// scripts/startup-budget-gate.mjs
+import { readFileSync } from 'node:fs';
+
+const BUDGET_TTI_MS = 1800;
+const HARD_FAIL_MS = 2000; // budget + headroom; over this, always fail
+
+// Result of the instrumented launch (aggregated from analytics export or Test Lab logs)
+const { p75Tti, overPhases } = JSON.parse(
+  readFileSync(process.env.STARTUP_REPORT ?? 'startup-report.json', 'utf8')
+);
+
+console.log(`p75 TTI = ${p75Tti}ms (budget ${BUDGET_TTI_MS}ms)`);
+if (overPhases.length) {
+  console.log(`over-budget phases: ${overPhases.join(', ')}`);
+}
+
+if (p75Tti > HARD_FAIL_MS) {
+  console.error(`✗ Startup budget exceeded (${p75Tti}ms > ${HARD_FAIL_MS}ms). Aborting build.`);
+  process.exit(1);
+}
+if (p75Tti > BUDGET_TTI_MS) {
+  console.warn(`△ Over budget (warning). Please fix before the next release.`);
+}
+```
+
+What I agonized over was whether to make an overage a "warning" or a "failure." At first everything was a warning, but nobody reads warnings. Within about three releases the budget was hollowed out. So I went with a two-tier scheme: **over budget (1,800ms) is a warning; over budget-plus-headroom (2,000ms) fails the build.**
+
+Only after I added "fail if exceeded" did a conversation start appearing during feature review: "Okay, where in the startup budget does this come from?" It's less a technical check than a device for changing the team's decision-making (a team of basically one, in my case). Without the pain of a failed build, budgets don't get kept. That's the thing I feel most strongly after running six apps.
+
+## What I learned rolling this out to six apps
+
+A few things became clear after deploying this design across all six apps.
+
+The absolute budget was worth tuning slightly per app. A wallpaper app where images are the star and a text-centric calming app have different reasonable budgets for the first-paint phase. I use the shared allocation table as a starting point but adjust only the first-paint budget by about ±150ms to match each app's character.
+
+Deferring with `InteractionManager.runAfterInteractions` is powerful, but defer too much and a different problem appears. On one app I deferred analytics init deeply too, and lost the first few seconds of behavior logs right after launch. The ordering rule — **measurement systems (crash, analytics) at the head of the deferred block, revenue systems (ads) at the tail** — came out of that failure.
+
+The next time I hit this situation, there's one thing I'll do first: before talking about "faster/slower" from one device in my hand, line up the real-user p75 TTI per release and look at it. Once you start reading the distribution, it becomes startling how clearly you can see which feature ate into the budget. I now think of startup time as something to manage with a ledger, not a hunch.
+
+I hope this helps anyone else running several apps in parallel. Thank you for reading.
