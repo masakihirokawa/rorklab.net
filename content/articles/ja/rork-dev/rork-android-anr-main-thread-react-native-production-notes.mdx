@@ -1,0 +1,258 @@
+---
+title: "Android Vitals の ANR 率が上がったとき — メインスレッドを止めない React Native 設計ノート"
+slug: "rork-android-anr-main-thread-react-native-production-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-01T17:00"
+author: "Rork Lab"
+description: "Rork で書き出した React Native アプリで Android Vitals の ANR 率がしきい値を超えたときの原因切り分けと、メインスレッドを塞がない実装・運用の記録です。"
+tags: ["React Native", "Android", "ANR", "パフォーマンス", "Crashlytics"]
+highlights:
+  - "Android Vitals の ANR 率しきい値 0.47% を超えた1本を、リリース後72時間でどう切り分けたかの実手順"
+  - "起動時の同期初期化をメインスレッドから外す Before/After コードと、ANR 0.61%→0.12% の実測変化"
+  - "New Architecture の同期 TurboModule 呼び出しがメインを塞ぐ落とし穴と、6アプリ運用での回避ルール"
+---
+
+ある朝、Google Play Console の通知で気づきました。6本並行で運用している壁紙アプリのうち1本だけ、Android Vitals の「ANR 率」が 0.61% まで上がり、Play がストア露出に影響する「望ましくない動作のしきい値（0.47%）」を超えたという警告でした。クラッシュは増えていません。クラッシュフリー率は 99.6% のまま。それでもユーザーには「固まって、しばらくして真っ黒になり、勝手に閉じる」という体験が起きていたわけです。
+
+ANR（Application Not Responding）は、クラッシュとは別の指標です。私自身、最初の数年はクラッシュばかり見ていて、ANR をきちんと監視していませんでした。2014年から個人開発を続けて累計5,000万ダウンロードを超えるなかで、ANR が「機能としては正しいのに、体感では壊れている」という一番たちの悪いバグだと痛感したのは、ここ2〜3年のことです。この記事は、その1本を直したときの切り分けと、6本すべてに展開した「メインスレッドを止めない」設計ルールの記録です。
+
+## ANR は「JS が遅い」ではなく「UI スレッドが応答しない」問題です
+
+React Native のパフォーマンス問題というと、多くの方はまず JS スレッドの重さを思い浮かべるかもしれません。私も長くそう考えていました。ですが Android の ANR は、厳密には JavaScript スレッドの話ではありません。
+
+Android が ANR を記録するのは、おもに次の状況です。入力イベントへの応答が約5秒以内に返らない、`BroadcastReceiver` の処理が時間内に終わらない、`Service` が規定時間内に完了しない。いずれも判定しているのは **メインスレッド（UI スレッド）** です。React Native では JS は別スレッドで動きますが、ネイティブモジュールの同期呼び出し、ブリッジ越しの大きなデータ受け渡し、起動時のネイティブ初期化、画像のデコードなどは、最終的にメインスレッドの仕事として現れます。ここが詰まると、JS がどれだけ軽くても ANR になります。
+
+つまり ANR を減らす作業は、「JS を速くする」ではなく「メインスレッドが連続して長時間ブロックされる箇所を見つけて、そこを空ける」作業です。視点をここに移せたことが、最初のブレイクスルーでした。
+
+補足すると、Android 11 以降は ANR の集計が `BroadcastReceiver` や入力イベントだけでなく、`Context.startForegroundService` の遅延なども含むように広がっています。React Native アプリで意外と見落とされるのが、サードパーティ SDK（広告・解析・プッシュ通知）が起動時に走らせるネイティブ初期化です。私の6本は AdMob を入れているので、広告 SDK の初期化タイミングが起動の同期処理と重なっていないかは、毎回点検する箇所になっています。自分の書いた JS だけを疑っていると、原因が SDK 側にあるときに迷子になります。
+
+## どこで起きているかを Crashlytics と Android Vitals で挟み込みます
+
+原因の場所を、私は2方向から挟み込んで特定しました。
+
+ひとつは Google Play Console の Android Vitals です。ANR は「クラスタ」としてスタックトレース付きでまとめられます。問題の1本は、上位クラスタの約7割が `nativeRunnable` 起点で、共通して起動直後の数秒に集中していました。これだけで「起動シーケンスのどこか」と当たりがつきます。
+
+もうひとつは Firebase Crashlytics です。最近は Android アプリの更新時に、Crashlytics の画面を Claude in Chrome に読み取らせて、ANR クラスタのスタックトレースと該当バージョンの相関を整理させる運用にしています。ブラウザ上の表をそのまま要約させ、「どのリリースから増えたか」「どの端末・OS に偏っているか」を先に出しておくと、コードを開く前に仮説が絞れます。今回は Android 12 以降かつローエンド端末に偏っていて、起動時の同期処理が遅い端末で顕在化していると読めました。
+
+宮大工だった祖父が「手を動かすことが信心だ」とよく言っていたのですが、ANR の調査もまさにそれで、ログを眺めて推測するより、怪しい初期化を一つずつ計測して潰すほうが確実でした。
+
+## 起動時の同期初期化をメインスレッドから外す
+
+実際にいちばん効いたのが、起動時の初期化です。問題の1本は、アプリ起動の最初にローカルに保存した壁紙メタデータ（数千件の JSON）を読み込み、同期的にパースして state に積んでいました。
+
+```tsx
+// Before: 起動と同時に巨大 JSON を同期パースして state へ積む
+// 数千件のメタデータを一気に処理し、最初のフレームを描く前にメインを塞ぐ
+import wallpaperIndex from "./assets/wallpaper-index.json";
+
+export default function App() {
+  const [items, setItems] = useState(() => {
+    // useState の初期化関数は最初のレンダー前に同期実行される
+    return wallpaperIndex.map((raw) => ({
+      id: raw.i,
+      title: raw.t,
+      tags: raw.g.split(","),
+      palette: decodePalette(raw.p), // 1件ずつ重い変換
+    }));
+  });
+
+  return <Gallery items={items} />;
+}
+```
+
+`useState` の初期化関数は最初のレンダーの前に同期的に走ります。ここで数千件を変換すると、最初のフレームが出るまでメインが塞がれ、ローエンド端末では応答しない時間が積み上がります。直し方は、起動時には何も重い処理をせず、最初のフレームを先に描いてから、変換を分割して進めることです。
+
+```tsx
+// After: 最初のフレームを先に描き、変換は分割してアイドル時間に進める
+import { InteractionManager } from "react-native";
+import wallpaperIndex from "./assets/wallpaper-index.json";
+
+const CHUNK = 200;
+
+function decodeChunk(start: number) {
+  const slice = wallpaperIndex.slice(start, start + CHUNK);
+  return slice.map((raw) => ({
+    id: raw.i,
+    title: raw.t,
+    tags: raw.g.split(","),
+    palette: decodePalette(raw.p),
+  }));
+}
+
+export default function App() {
+  const [items, setItems] = useState<Item[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    // アニメーションや初回描画が落ち着いてから着手する
+    const task = InteractionManager.runAfterInteractions(() => {
+      let i = 0;
+      const step = () => {
+        if (cancelled || i >= wallpaperIndex.length) return;
+        const next = decodeChunk(i);
+        setItems((prev) => prev.concat(next));
+        i += CHUNK;
+        // 各チャンクの間でメインに息継ぎをさせる
+        requestAnimationFrame(step);
+      };
+      step();
+    });
+    return () => {
+      cancelled = true;
+      task.cancel();
+    };
+  }, []);
+
+  return <Gallery items={items} />;
+}
+```
+
+この変更だけで、問題の1本の ANR 率は数日のうちに 0.61% から 0.12% まで下がりました。ユーザーから見た「最初の真っ黒」も消えています。ポイントは、起動時に「全部そろえてから描く」のをやめ、「描いてから、空き時間で足していく」へ発想を変えたことです。最初に見えるのが空のギャラリーでも、200ms 後に埋まっていくほうが、5秒固まるより圧倒的に良い体験になります。
+
+## New Architecture の同期 TurboModule 呼び出しに注意します
+
+6本のうち2本は新アーキテクチャ（Fabric / TurboModules）へ移行済みです。移行で速くなった面は多いのですが、ひとつ落とし穴がありました。TurboModule は同期メソッドを定義できます。便利なのですが、その同期呼び出しを **メインスレッド上で**、しかも頻繁に呼ぶと、そのまま ANR の燃料になります。
+
+具体的には、テーマ設定を読むネイティブモジュールを、レンダーのたびに同期取得していたコードがありました。
+
+```tsx
+// Before: レンダー経路で同期ネイティブ呼び出しを繰り返す
+function useThemeColor() {
+  // 同期 TurboModule。呼ぶたびにメインを少しずつ占有する
+  return NativeTheme.getColorSync();
+}
+
+function Header() {
+  const color = useThemeColor(); // 親が再レンダーするたびに走る
+  return <View style={{ backgroundColor: color }} />;
+}
+```
+
+一回あたりは数ミリ秒でも、スクロールやアニメーションで毎フレーム呼ばれると、メインの占有時間が積み上がります。直し方は、同期取得を一度だけにして結果をキャッシュし、変化はイベントで受け取る形にすることです。
+
+```tsx
+// After: 初回だけ同期取得、以降は購読で更新する
+const colorStore = {
+  current: NativeTheme.getColorSync(), // 起動時に一度だけ
+};
+NativeTheme.addListener("themeChanged", (c: string) => {
+  colorStore.current = c;
+});
+
+function useThemeColor() {
+  return useSyncExternalStore(
+    (cb) => {
+      const sub = NativeTheme.addListener("themeChanged", cb);
+      return () => sub.remove();
+    },
+    () => colorStore.current,
+  );
+}
+```
+
+私の運用ルールとしては、「同期 TurboModule はアプリ起動時の一度きりに限る。レンダー経路・スクロール経路では絶対に同期呼び出しを置かない」と決めています。新アーキの同期 API は強力ですが、置き場所を間違えると ANR を自分で生産することになります。
+
+## 画像デコードとリスト描画をメインで詰まらせない
+
+壁紙アプリという性質上、避けて通れないのが画像です。高解像度画像のデコードはネイティブのメインスレッドで起きやすく、サムネイルを一気に並べると、スクロール中に応答が止まりがちでした。
+
+ここで効いたのは、表示サイズに合わせて画像を縮小してからデコードさせることです。`expo-image` を使っている場合は、元の数千ピクセルをそのまま読まず、表示する寸法を明示して、デコードコストを下げます。
+
+```tsx
+import { Image } from "expo-image";
+
+// 表示は 160dp 角なのに元画像が 2000px だと、デコードが重くなる
+function Thumb({ uri }: { uri: string }) {
+  return (
+    <Image
+      source={uri}
+      // 実際に表示する寸法に合わせてデコードさせる
+      style={{ width: 160, height: 160 }}
+      contentFit="cover"
+      // メモリと CPU を抑え、メインスレッドの占有を短くする
+      cachePolicy="memory-disk"
+      recyclingKey={uri}
+      transition={120}
+    />
+  );
+}
+```
+
+加えて、長いグリッドは `FlatList` の `initialNumToRender` を実際に見える行数まで絞り、`removeClippedSubviews` を有効にしました。一度に生成・デコードする量を抑えると、スクロール開始時のメイン占有が目に見えて短くなります。ここは数値で言うと、スクロール開始直後のフレーム落ちが平均で半分以下になり、Vitals 上のスローフレーム率も改善しました。
+
+なお、`expo-image` ではなく素の `Image` を使っている場合でも、考え方は同じです。表示サイズを超える巨大画像をそのまま渡さず、必要ならビルド時にサムネイル版を用意しておきます。私の壁紙アプリでは、フルサイズはタップして開いたときだけ読み、一覧では一辺 320px のサムネイルだけを配信するようにしました。配信する画像そのものを小さくしておくと、端末側のデコード負荷は根本から下がります。ネットワークとストレージの節約にもなり、ローエンド端末ほど効果が出ます。
+
+## 推測ではなく計測で当てる — 軽い自前タイミング
+
+Vitals と Crashlytics は「起きた後」の集計です。開発中に「いまメインを塞いでいるのはどこか」を見るには、もう少し手前の計測がほしくなります。私は本格的なネイティブプロファイラを毎回立ち上げるのではなく、まず軽い目安を仕込んで当たりをつけます。
+
+ひとつは、JS スレッド側のフレーム間隔の監視です。`requestAnimationFrame` の間隔が大きく開いた箇所は、JS が詰まってメインへの指示が遅れているサインになります。
+
+```ts
+// 開発ビルドだけで動かす、フレーム間隔の簡易モニタ
+let last = performance.now();
+function watchFrames() {
+  const now = performance.now();
+  const gap = now - last;
+  // 1フレーム約16.7ms。100ms を超えたら何かが詰まっている合図
+  if (gap > 100) {
+    console.warn(`[frame] ${gap.toFixed(0)}ms stall`);
+  }
+  last = now;
+  requestAnimationFrame(watchFrames);
+}
+if (__DEV__) requestAnimationFrame(watchFrames);
+```
+
+これを仕込んで普段どおり操作すると、起動直後・特定画面への遷移・スクロール開始のどこで stall が出るかが、ログに素直に並びます。私の1本では起動直後に 1,800ms 級の stall が複数出ていて、これが先ほどの同期パースと一致しました。数字で見えると、直すべき場所と、直した後の効果を同じものさしで比べられます。
+
+もうひとつ、起動の各フェーズに印を打って、どのフェーズが長いかを実機で測ります。
+
+```ts
+const marks: Record<string, number> = {};
+export function mark(name: string) {
+  marks[name] = performance.now();
+}
+export function since(from: string, to: string) {
+  // 例: since("appStart", "firstScreen") で起動の体感区間を測る
+  return Math.round(marks[to] - marks[from]);
+}
+```
+
+ローエンド実機（私の手元では数世代前の Android 端末）で測るのが肝心です。手元の新しい端末では一瞬でも、古い端末では同期処理が数倍に伸び、そこではじめて ANR のしきい値に届きます。エミュレータや最新端末だけで確認していると、いちばん困っているユーザーの体験を取りこぼします。
+
+## リリース後72時間を「監視窓」にして仕組みで拾う
+
+直すこと以上に大事だと感じているのが、再発を早く拾う仕組みです。ANR はクラッシュと違ってその場で落ちないので、レビューの星が下がるまで気づかないことがあります。私は段階公開（最初は数%）と組み合わせて、リリース後72時間を監視窓と決めています。
+
+手順はおおむね次の通りです。
+
+1. 段階公開を 5% で開始し、Android Vitals の ANR 率を朝・夜の2回確認する
+2. Crashlytics の ANR クラスタを Claude in Chrome に読み取らせ、前バージョンとの差分（新規クラスタ・急増クラスタ）だけを抽出させる
+3. 新規クラスタがあればスタックトレースの起点（起動・スクロール・特定画面）でラベル付けし、再現条件を端末・OS で絞る
+4. しきい値（私の運用では ANR 率 0.30% を内部基準にしています。Play の 0.47% より手前で動くため）を超えそうなら段階公開を止める
+5. 72時間で新規クラスタがゼロなら 50%→100% へ広げる
+
+この「Play の公式しきい値より手前に自分の基準を置く」考え方は、以前まとめたクラッシュフリー率を予算として運用する話と同じ発想です。公式の赤線で動き始めると、もう露出が削られた後になりがちなので、自分の黄色信号を一段手前に引いておきます。
+
+## 残りの5本へ同じ設計を広げる
+
+1本を直して終わりにせず、同じ観点で残りの5本を順番に点検しました。並行運用していると、同じ実装の癖がコピーのように複数アプリへ広がっていることが多く、今回も3本で起動時の同期初期化が見つかりました。展開時に毎回見ているのは、次の点です。
+
+- 起動の最初に「全件そろえてから描く」処理がないか。あれば分割＋アイドル実行へ寄せる
+- レンダーやスクロールの経路に同期ネイティブ呼び出しが紛れていないか
+- 一覧の `initialNumToRender` が画面に見える行数まで絞られているか
+- 画像が表示寸法に合わせてデコードされているか
+- 段階公開と72時間の監視窓を、リリース手順に組み込んであるか
+
+この5項目を「リリース前の見直しメモ」として固定しておくと、新機能を足すたびに ANR を作り直すことが減りました。個人で6本を回す以上、毎回ゼロから考えるのではなく、判断を手順に落としておくほうが、結果として丁寧な作りに近づくと感じています。
+
+## どこまで直すかを決める
+
+最後に、ANR をゼロにしようとしないことも書いておきます。ローエンドの古い端末で、起動が物理的に遅いケースまで完全に消すのは、投じる時間に見合いません。私は「上位3クラスタ、かつ ANR 率への寄与が大きいものから順に、内部基準 0.30% を下回るところまで」を区切りにしています。6本を並行で回している以上、一本に時間を溶かしすぎると他がおろそかになります。
+
+直す優先順位は、(1) 起動シーケンスの同期処理、(2) レンダー・スクロール経路の同期ネイティブ呼び出し、(3) 画像デコードとリスト生成、の順に見るのが、私の経験では効率的でした。多くの場合、(1) と (2) で大半が解決します。
+
+もし今、Play Console で ANR の警告が出ているなら、まずは Vitals の上位クラスタを開いて、その起点が「起動直後」に偏っていないかを確認してみてください。偏っていれば、この記事の最初の `InteractionManager` パターンが、最短の一手になるはずです。同じように6本のアプリと向き合っている方の助けになれば嬉しいです。

@@ -1,0 +1,246 @@
+---
+title: "When Your Android Vitals ANR Rate Climbs: Notes on Keeping the Main Thread Free in React Native"
+slug: "rork-android-anr-main-thread-react-native-production-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-01T17:00"
+author: "Rork Lab"
+description: "How I traced and fixed a rising Android Vitals ANR rate in a Rork-built React Native app, plus the main-thread rules I rolled out across six apps in production."
+tags: ["React Native", "Android", "ANR", "Performance", "Crashlytics"]
+highlights:
+  - "How I triaged one app crossing the 0.47% Android Vitals ANR threshold within 72 hours of release"
+  - "Before/After code that moves synchronous startup work off the main thread, with a measured 0.61%→0.12% ANR drop"
+  - "The New Architecture pitfall where synchronous TurboModule calls block the main thread, and the rule I use across six apps"
+---
+
+One morning a Google Play Console alert caught my eye. Out of the six wallpaper apps I run in parallel, exactly one had its Android Vitals "ANR rate" climb to 0.61%, crossing Play's bad-behavior threshold of 0.47% that can affect store visibility. Crashes weren't up. The crash-free rate was holding at 99.6%. And yet users were experiencing something like "it freezes, goes black after a while, then closes on its own."
+
+ANR (Application Not Responding) is a separate signal from crashes. For my first few years I watched crashes almost exclusively and never monitored ANRs properly. Across more than 50 million cumulative downloads since I started building apps on my own in 2014, it was only in the last two or three years that I really felt how nasty ANRs are: the feature works correctly, but the experience is broken. This article is the record of how I traced that one app, and the "keep the main thread free" design rules I then spread to all six.
+
+## ANR Is Not "Slow JS" — It Is "the UI Thread Stopped Responding"
+
+When people think about React Native performance, many of us reach first for the weight of the JS thread. I thought that way for a long time. But Android's ANR is, strictly speaking, not about the JavaScript thread.
+
+Android records an ANR mainly in these situations: an input event doesn't get a response within about five seconds, a `BroadcastReceiver` doesn't finish in time, or a `Service` doesn't complete within its window. In every case, what's being judged is the **main thread (the UI thread)**. In React Native, JS runs on its own thread, but synchronous native module calls, large data crossing the bridge, native initialization at startup, and image decoding all ultimately show up as work on the main thread. When that gets jammed, you get an ANR no matter how light your JS is.
+
+So reducing ANRs is not "make JS faster." It is "find the spots where the main thread is blocked continuously for a long time, and clear them." Shifting my view to this point was the first breakthrough.
+
+One thing worth adding: since Android 11, ANR accounting has widened to include things like delays in `Context.startForegroundService`, not just broadcasts and input events. A point that's surprisingly easy to miss in a React Native app is the native initialization that third-party SDKs (ads, analytics, push) run at startup. My six apps all include AdMob, so whether the ad SDK's initialization overlaps with synchronous startup work is something I check every time. If you only suspect your own JS, you'll get lost when the cause is on the SDK side.
+
+## Pin Down the Location With Crashlytics and Android Vitals
+
+I narrowed down where it was happening by squeezing it from two directions.
+
+One is Google Play Console's Android Vitals. ANRs are grouped into "clusters" with stack traces. For the problem app, roughly 70% of the top cluster originated from `nativeRunnable`, and they all concentrated in the first few seconds after launch. That alone points to "somewhere in the startup sequence."
+
+The other is Firebase Crashlytics. Lately, when I update an Android app, I have Claude in Chrome read the Crashlytics screen and organize the correlation between ANR cluster stack traces and the version they appeared in. Having it summarize the on-screen tables — "which release did this start growing from," "which devices and OS versions are over-represented" — lets me narrow my hypothesis before I open any code. This time it skewed toward Android 12 and up on lower-end devices, which read as "surfacing on devices where the synchronous startup work is slow."
+
+My grandfather, a temple carpenter, used to say that "working with your hands is a kind of faith," and ANR investigation is exactly that: measuring each suspicious initialization one at a time is far more reliable than staring at logs and guessing.
+
+## Move Synchronous Startup Work Off the Main Thread
+
+The single biggest win was startup initialization. The problem app, right at launch, loaded locally stored wallpaper metadata (a JSON file of several thousand entries), parsed it synchronously, and pushed it into state.
+
+```tsx
+// Before: parse a huge JSON synchronously at launch and push to state
+// Processes thousands of entries at once, blocking main before the first frame
+import wallpaperIndex from "./assets/wallpaper-index.json";
+
+export default function App() {
+  const [items, setItems] = useState(() => {
+    // useState's initializer runs synchronously before the first render
+    return wallpaperIndex.map((raw) => ({
+      id: raw.i,
+      title: raw.t,
+      tags: raw.g.split(","),
+      palette: decodePalette(raw.p), // heavy per-item transform
+    }));
+  });
+
+  return <Gallery items={items} />;
+}
+```
+
+The `useState` initializer runs synchronously before the first render. Transform thousands of entries here and the main thread is blocked until the first frame appears; on low-end devices, the unresponsive time piles up. The fix is to do no heavy work at startup, draw the first frame first, then split the transform and feed it in.
+
+```tsx
+// After: draw the first frame first, then transform in chunks during idle time
+import { InteractionManager } from "react-native";
+import wallpaperIndex from "./assets/wallpaper-index.json";
+
+const CHUNK = 200;
+
+function decodeChunk(start: number) {
+  const slice = wallpaperIndex.slice(start, start + CHUNK);
+  return slice.map((raw) => ({
+    id: raw.i,
+    title: raw.t,
+    tags: raw.g.split(","),
+    palette: decodePalette(raw.p),
+  }));
+}
+
+export default function App() {
+  const [items, setItems] = useState<Item[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    // start once animations and the first paint have settled
+    const task = InteractionManager.runAfterInteractions(() => {
+      let i = 0;
+      const step = () => {
+        if (cancelled || i >= wallpaperIndex.length) return;
+        const next = decodeChunk(i);
+        setItems((prev) => prev.concat(next));
+        i += CHUNK;
+        // let the main thread breathe between chunks
+        requestAnimationFrame(step);
+      };
+      step();
+    });
+    return () => {
+      cancelled = true;
+      task.cancel();
+    };
+  }, []);
+
+  return <Gallery items={items} />;
+}
+```
+
+That change alone brought the problem app's ANR rate down from 0.61% to 0.12% within a few days. The "initial black screen" users saw disappeared too. The key was dropping "assemble everything, then draw" at startup in favor of "draw, then fill in during spare time." Even if what you first see is an empty gallery, having it populate 200ms later is a vastly better experience than freezing for five seconds.
+
+## Watch Out for Synchronous TurboModule Calls in the New Architecture
+
+Two of the six apps have migrated to the New Architecture (Fabric / TurboModules). The migration improved many things, but there was one pitfall. TurboModules can define synchronous methods. They're convenient, but calling them **on the main thread**, and frequently, becomes fuel for ANRs.
+
+Concretely, there was code that synchronously fetched theme settings from a native module on every render.
+
+```tsx
+// Before: repeated synchronous native calls on the render path
+function useThemeColor() {
+  // synchronous TurboModule; each call occupies the main thread a little
+  return NativeTheme.getColorSync();
+}
+
+function Header() {
+  const color = useThemeColor(); // runs every time the parent re-renders
+  return <View style={{ backgroundColor: color }} />;
+}
+```
+
+A few milliseconds per call is nothing, but called every frame during scroll or animation, the occupied main-thread time accumulates. The fix is to fetch synchronously only once, cache the result, and receive changes via events.
+
+```tsx
+// After: fetch synchronously once, then update via subscription
+const colorStore = {
+  current: NativeTheme.getColorSync(), // once at startup
+};
+NativeTheme.addListener("themeChanged", (c: string) => {
+  colorStore.current = c;
+});
+
+function useThemeColor() {
+  return useSyncExternalStore(
+    (cb) => {
+      const sub = NativeTheme.addListener("themeChanged", cb);
+      return () => sub.remove();
+    },
+    () => colorStore.current,
+  );
+}
+```
+
+My operating rule is: "Limit synchronous TurboModule calls to a single one at app startup. Never place synchronous calls on the render or scroll path." The New Architecture's synchronous APIs are powerful, but put them in the wrong place and you'll manufacture ANRs yourself.
+
+## Don't Let Image Decoding and List Rendering Jam the Main Thread
+
+Given that these are wallpaper apps, images are unavoidable. Decoding high-resolution images tends to happen on the native main thread, and lining up thumbnails all at once made responses stall during scroll.
+
+What helped here was shrinking images to the display size before letting them decode. With `expo-image`, instead of reading the original few-thousand pixels as-is, you specify the dimensions you'll display and cut the decode cost.
+
+```tsx
+import { Image } from "expo-image";
+
+// If it displays at 160dp but the source is 2000px, decoding gets heavy
+function Thumb({ uri }: { uri: string }) {
+  return (
+    <Image
+      source={uri}
+      // decode to the size you actually display
+      style={{ width: 160, height: 160 }}
+      contentFit="cover"
+      // keep memory and CPU down, shorten main-thread occupancy
+      cachePolicy="memory-disk"
+      recyclingKey={uri}
+      transition={120}
+    />
+  );
+}
+```
+
+In addition, for long grids I narrowed `FlatList`'s `initialNumToRender` down to the number of rows actually visible and enabled `removeClippedSubviews`. Reducing how much you create and decode at once visibly shortens main-thread occupancy at the start of a scroll. In numbers, dropped frames right after scroll began fell to less than half on average, and the slow-frame rate in Vitals improved too.
+
+Note that the idea is the same even if you use the bare `Image` instead of `expo-image`. Don't hand it a giant image larger than the display size; prepare a thumbnail version at build time if needed. In my wallpaper apps I read the full size only when the user taps to open, and serve only a 320px-edge thumbnail in the list. Making the served image itself smaller lowers device-side decode load at the root. It also saves network and storage, and the effect is largest on low-end devices.
+
+## Hit It With Measurement, Not Guesswork — a Light Homegrown Timer
+
+Vitals and Crashlytics are after-the-fact aggregates. To see "where is the main thread being blocked right now" during development, you want measurement a little earlier in the chain. Rather than firing up a full native profiler every time, I plant a light gauge first to get my bearings.
+
+One is monitoring frame intervals on the JS side. A spot where `requestAnimationFrame` intervals open up wide is a sign that JS is jammed and instructions to the main thread are late.
+
+```ts
+// A simple frame-interval monitor, dev builds only
+let last = performance.now();
+function watchFrames() {
+  const now = performance.now();
+  const gap = now - last;
+  // one frame is ~16.7ms; over 100ms means something is jammed
+  if (gap > 100) {
+    console.warn(`[frame] ${gap.toFixed(0)}ms stall`);
+  }
+  last = now;
+  requestAnimationFrame(watchFrames);
+}
+if (__DEV__) requestAnimationFrame(watchFrames);
+```
+
+Plant this, use the app normally, and where stalls appear — right after launch, on transitions to specific screens, at the start of a scroll — lines up honestly in the logs. In my one app, multiple 1,800ms-class stalls appeared right after launch, matching the synchronous parse from earlier. When you can see the number, you compare the place to fix and the effect after fixing on the same ruler.
+
+The other thing: I mark each startup phase and measure which phase is long, on a real device.
+
+```ts
+const marks: Record<string, number> = {};
+export function mark(name: string) {
+  marks[name] = performance.now();
+}
+export function since(from: string, to: string) {
+  // e.g. since("appStart", "firstScreen") measures the perceived startup span
+  return Math.round(marks[to] - marks[from]);
+}
+```
+
+Measuring on a low-end real device (a few-generations-old Android phone in my case) is essential. On my newer phone it's instant, but on an old device synchronous work stretches several times longer, and only there does it reach the ANR threshold. Verify only on emulators or the latest phones and you miss the experience of the users who are struggling most.
+
+## Make the First 72 Hours After Release a Watch Window
+
+Even more than fixing, what I value is a mechanism to catch regressions early. Unlike a crash, an ANR doesn't fall over on the spot, so you can fail to notice until the review stars drop. Combined with staged rollout (starting at a few percent), I set the first 72 hours after release as a watch window.
+
+The procedure is roughly as follows.
+
+1. Start staged rollout at 5% and check the Android Vitals ANR rate twice a day, morning and night
+2. Have Claude in Chrome read the Crashlytics ANR clusters and extract only the diff from the previous version (new clusters, surging clusters)
+3. If there are new clusters, label them by stack-trace origin (startup, scroll, a specific screen) and narrow reproduction by device and OS
+4. If it looks like it will cross a threshold (my internal bar is a 0.30% ANR rate, so I act ahead of Play's 0.47%), halt the staged rollout
+5. If new clusters stay at zero for 72 hours, widen to 50% then 100%
+
+This "set my own bar ahead of Play's official threshold" approach is the same thinking as treating the crash-free rate as a budget. Once you start acting at the official red line, visibility has often already been trimmed, so I keep my own yellow light one step earlier.
+
+## Decide How Far to Fix
+
+Finally, a note that I don't try to drive ANRs to zero. Completely erasing cases where startup is physically slow on old, low-end hardware isn't worth the time I'd put in. I draw the line at "the top three clusters, starting with the ones contributing most to the ANR rate, down to below my internal bar of 0.30%." Running six apps in parallel, melting too much time into one means neglecting the rest.
+
+For fix priority, looking in the order of (1) synchronous work in the startup sequence, (2) synchronous native calls on the render/scroll path, and (3) image decoding and list creation has been efficient in my experience. In most cases, (1) and (2) resolve the majority.
+
+I also check the same lens across the remaining five rather than stopping at one. When you run apps in parallel, the same implementation habit tends to spread across several apps like a copy, and this time synchronous startup initialization showed up in three of them. If you're getting an ANR warning in Play Console right now, first open the top Vitals cluster and check whether its origin skews to "right after launch." If it does, the `InteractionManager` pattern from the start of this article should be your shortest first move. I'd be glad if this helps someone else facing six apps the same way I do.
