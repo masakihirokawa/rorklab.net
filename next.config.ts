@@ -34,7 +34,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/app-dev/rork-ai-wellness-app-complete-guide", to: "/articles/app-dev" },
   { from: "/articles/app-dev/rork-app-troubleshooting-guide", to: "/articles/app-dev" },
   { from: "/articles/app-dev/rork-max-real-time-collaboration", to: "/articles/app-dev" },
-  { from: "/articles/rork-ai/claude-opus-powers-rork-max", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/gemma-4-react-native-expo-integration", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/gpt-4o-rork-openai-app-development", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/rork-ai-full-app-build-showcase", to: "/articles/rork-ai" },
