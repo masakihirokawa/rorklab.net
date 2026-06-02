@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORKMAX — Rork MaxがネイティブSwiftアプリを生成、Claude Code + Claude Opus 4.6駆動（2026）",
-    "APPLE — AR/LiDAR・Metal 3D・Dynamic Island・HealthKit・NFC・Core MLまでネイティブ機能を解放（2026）",
-    "COMPANION — Rork Companionで有料Apple Developerなしでも実機iPhoneテストが可能（2026）",
-    "SEED — Left Lane CapitalがリードしRorkが$15Mシードを調達（2026）",
-    "GROWTH — 月間743,000訪問・成長率85%でApp Store事業の立ち上げを後押し（2026）",
-    "CHOICE — クロスプラットフォームは従来Rork、Apple深掘りはRork Maxの使い分けが定着（2026）",
+    "MAX — Rork MaxはReact NativeでなくネイティブSwiftを生成、iPhone/iPad/Watch/TV/Vision Pro/iMessage対応（5月）",
+    "NATIVE — AR/LiDAR・Metal 3D・Dynamic Island・HealthKit・NFC・Core MLなどネイティブApple機能を解放（5月）",
+    "SIM — ブラウザのクラウドiOSシミュレータでXcodeやMacなしに実機環境テストが可能（5月）",
+    "PUBLISH — ワンクリック/ツークリックのApp Store公開、ビルド・証明書・申請を自動化（5月）",
+    "ARR — Rorkは約$15M調達、Maxローンチから3日でARR $1.5Mに到達と報じられる（5月）",
+    "WWDC — WWDC 2026は6/8〜12開催、オンデバイスAIが中心でRork Maxのネイティブ路線に追い風（6月）",
   ],
   en: [
-    "RORKMAX — Rork Max generates native Swift apps, powered by Claude Code and Claude Opus 4.6 (2026)",
-    "APPLE — It unlocks AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, NFC and Core ML natively (2026)",
-    "COMPANION — Rork Companion enables real-iPhone testing without a paid Apple Developer account (2026)",
-    "SEED — Rork raises a $15M seed round led by Left Lane Capital (2026)",
-    "GROWTH — 743,000 monthly visits at 85% growth fuel new App Store ventures (2026)",
-    "CHOICE — Use original Rork for cross-platform, Rork Max for deep Apple-native features (2026)",
+    "MAX — Rork Max generates native Swift instead of React Native, covering iPhone/iPad/Watch/TV/Vision Pro/iMessage (May)",
+    "NATIVE — Rork Max unlocks native Apple features: AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, NFC, and Core ML (May)",
+    "SIM — A browser-based cloud iOS simulator lets you test on a real Apple environment without Xcode or a Mac (May)",
+    "PUBLISH — One- and two-click App Store publishing automates builds, certificates, and submission (May)",
+    "ARR — Rork has raised ~$15M and reportedly hit $1.5M ARR within three days of the Max launch (May)",
+    "WWDC — WWDC 2026 runs June 8-12, centered on on-device AI, a tailwind for Rork Max's native approach (Jun)",
   ],
 };
 
