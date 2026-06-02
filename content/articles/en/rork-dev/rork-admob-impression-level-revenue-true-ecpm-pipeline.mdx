@@ -1,0 +1,179 @@
+---
+title: "Measuring the Real eCPM Yourself: Piping Impression-Level Ad Revenue Into Your Own Analytics"
+slug: "rork-admob-impression-level-revenue-true-ecpm-pipeline"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-02T17:00"
+author: "Rork Lab"
+description: "The AdMob dashboard's average eCPM hides which regions and placements actually earn. Here is how I capture per-impression revenue with paidEventListener, normalize it, and pipe it into my own analytics to compute a real eCPM by network, placement, and country."
+tags: ["React Native", "AdMob", "Mediation", "Revenue Analytics", "Architecture"]
+highlights:
+  - "Why the dashboard's average eCPM misleads mediation decisions, and how to capture per-impression revenue with the paidEventListener in react-native-google-mobile-ads (working code)"
+  - "The micros-vs-currency mistake that put my revenue off by a factor of 1,000,000, plus the Before/After normalization that fixed it"
+  - "How to aggregate a true eCPM by network x placement x country and feed it back into bid floors and mediation priority"
+---
+
+This started when I opened the AdMob dashboard to retune the mediation setup for one of the six wallpaper apps I run in parallel — the one whose revenue had plateaued. The per-network average eCPMs were right there. AdMob high, AppLovin middling, Pangle low. So should I trust those numbers and lower Pangle's floor?
+
+I hesitated. What the dashboard shows is "each network's average across every country and every placement, all blended together." My users are about 60% in Japan, with the rest scattered across North America and Southeast Asia. An interstitial and an app-open ad earn wildly different prices. If I look at the blended average, conclude "Pangle is low," and cut it, I might be emptying out exactly the Southeast Asian banner inventory that only Pangle was filling.
+
+Across more than a decade of solo development since 2014, past fifty million cumulative downloads, ad revenue is the one area where I kept "staring at the dashboard and adjusting by gut." This article is the record of throwing that gut feeling away — of pulling per-impression revenue into my own analytics so I could compute a real eCPM by network, placement, and country.
+
+## Why the dashboard's average eCPM misleads you
+
+eCPM is "revenue per 1,000 impressions." The dashboard aggregates this per network, per day. That is convenient, but it is far too coarse for deciding mediation priority or floors (minimum accepted prices).
+
+There are three problems. First, regional differences disappear into the average. For the same banner slot, a North American impression often earns several times what a Japanese one does, and several times more than a Southeast Asian one. Second, placement differences disappear. An app-open ad and an article-footer banner command different prices because they capture different amounts of user attention. Third, only the mediation "winner" shows up in dashboard revenue, so the average can't tell you "if I cut this network, who picks up that inventory?"
+
+In other words, I was trying to make a decision that lives in three dimensions — placement x country x network — using the one dimension the dashboard shows me, the per-network average. That mismatch was the root of the bad calls. What I needed was to record how much each individual impression actually earned, inside my own app.
+
+## What Impression-Level Ad Revenue returns
+
+AdMob has a mechanism called Impression-Level Ad Revenue (ILRD). Every time an ad is shown, you receive an estimate of that single impression's revenue through an on-device callback. In `react-native-google-mobile-ads`, the `paidEventListener` on each ad object handles this.
+
+The callback mainly returns: `value` (the revenue, but in micros — an integer that is the real amount times one million), a currency code such as "USD" or "JPY", a `precision` field (`ESTIMATED` / `PUBLISHER_PROVIDED` / `PRECISE`), and the mediation adapter information telling you which network won.
+
+Here is the first trap. Because `value` is in micros, you only get the amount in currency units after dividing by `1,000,000`. And the currency code can come back as USD or as JPY depending on your account settings and the bidding network. Get either of these wrong and your revenue is off by orders of magnitude. I did exactly that, as you'll see below.
+
+## Capturing revenue per impression with paidEventListener
+
+First, the part that receives revenue events without dropping any. You register a `paidEventListener` each time you load an ad. Here is the interstitial case.
+
+```typescript
+import {
+  InterstitialAd,
+  AdEventType,
+  TestIds,
+} from 'react-native-google-mobile-ads';
+import { logAdRevenue } from './adRevenue';
+
+const adUnitId = __DEV__ ? TestIds.INTERSTITIAL : 'ca-app-pub-XXXXXXXX/YYYYYYYY';
+
+export function createInterstitial(placement: string) {
+  const ad = InterstitialAd.createForAdRequest(adUnitId);
+
+  // Receive revenue for each individual impression
+  const unsubscribePaid = ad.addAdEventListener(
+    AdEventType.PAID,
+    (payload) => {
+      // payload: { value, currency, precision } plus mediation info
+      logAdRevenue({
+        placement,            // a slot name you choose, e.g. 'interstitial_home'
+        format: 'interstitial',
+        valueMicros: payload.value,     // integer, in micros
+        currency: payload.currency,     // 'USD' / 'JPY' ...
+        precision: payload.precision,
+      });
+    },
+  );
+
+  const unsubscribeClosed = ad.addAdEventListener(AdEventType.CLOSED, () => {
+    unsubscribePaid();
+    unsubscribeClosed();
+  });
+
+  ad.load();
+  return ad;
+}
+```
+
+The key point is that I pass `placement` as "a slot name that means something inside my app." The AdMob ad unit ID is too mechanical; when I aggregate later, I can't tell which screen an ad belonged to. Always attaching a human-readable slot name like `interstitial_home`, `appopen_cold_start`, or `banner_article_footer` makes the later analysis dramatically easier.
+
+## The micros-and-currency mistake, and how I fixed it
+
+This is where I first tripped. In my first implementation, I logged revenue like this.
+
+```typescript
+// Before (broken)
+function logAdRevenue(e) {
+  analytics().logEvent('ad_revenue', {
+    placement: e.placement,
+    value: e.valueMicros,   // recorded in micros, never divided back
+    currency: e.currency,   // currencies left mixed before summing
+  });
+}
+```
+
+When I aggregated this, the revenue total came out at a million times the dashboard's real figure, because I had never divided the micros back. Worse, USD impressions and JPY impressions were being summed in the same `value` column. A USD 0.01 and a JPY 1.5 were simply added together, which is numerically meaningless.
+
+Here is the fix. Divide the micros back, and normalize everything to a base currency (JPY in my case) before recording it.
+
+```typescript
+// After (normalize before recording)
+import { getRate } from './fxRates'; // an FX table refreshed daily
+
+function logAdRevenue(e: {
+  placement: string;
+  format: string;
+  valueMicros: number;
+  currency: string;
+  precision: string;
+}) {
+  const amount = e.valueMicros / 1_000_000;        // micros -> currency units
+  const amountJpy = amount * getRate(e.currency);  // normalize to base (JPY)
+
+  analytics().logEvent('ad_revenue', {
+    placement: e.placement,
+    format: e.format,
+    value_jpy: Number(amountJpy.toFixed(4)),  // only the normalized amount in the aggregation column
+    src_currency: e.currency,                  // keep the source currency in a separate field for auditing
+    precision: e.precision,
+  });
+}
+```
+
+The FX rate does not need to be exact. I keep a daily approximate rate in Remote Config and fetch it at launch. What I want from ad-revenue analysis is "which slot earns more, relatively," not an accounting-grade conversion. What matters is keeping the aggregation column (`value_jpy`) in a single currency. I keep the source currency in a separate field so I can trace back when a number looks wrong.
+
+## Dedup, sampling, and PII — designing the event
+
+Before you start emitting events, deciding three things will save you pain later.
+
+First, duplicates. The `paidEventListener` fires once per impression in general, but if listener registration gets doubled up by an ad reload, you'll record the same impression twice. I attach the listener only when I create the ad object and reliably detach it on `CLOSED`, keeping registration and removal one-to-one. That is why the earlier code calls `unsubscribePaid()` inside `CLOSED`.
+
+Second, sampling. Revenue events are high volume, and some analytics services bill by usage. But thinning out `ad_revenue` obviously corrupts your revenue analysis. I never sample `ad_revenue` — I send all of it — and instead thin out the finer events like screen transitions to keep total volume down. The line I draw is: never sample events that map directly to money.
+
+Third, PII. There is no need to attach personally identifiable information (email, device-specific IDs) to a revenue event. A coarse country code from the store country or IP is enough; per-user identification is unnecessary. From a privacy-manifest and ATT standpoint too, accepting that revenue analysis only needs "an aggregatable granularity" keeps you on the safe side for both review and user disclosure.
+
+## Computing a true eCPM by network, placement, and country
+
+Once normalized events accumulate, the real eCPM is a simple division. You count impressions separately (the number of `paidEventListener` firings is your impression count), divide total revenue by impressions, and multiply by 1,000.
+
+```sql
+-- "Real eCPM" per slot x country (base currency JPY)
+SELECT
+  placement,
+  country,
+  COUNT(*)                      AS impressions,
+  SUM(value_jpy)                AS revenue_jpy,
+  SUM(value_jpy) / COUNT(*) * 1000 AS ecpm_jpy
+FROM ad_revenue_events
+WHERE event_date BETWEEN '2026-05-01' AND '2026-05-31'
+GROUP BY placement, country
+HAVING impressions >= 500       -- drop combinations too small to trust
+ORDER BY ecpm_jpy DESC;
+```
+
+I include `HAVING impressions >= 500` because the eCPM of a combination with only a few dozen impressions swings too wildly to act on. I decided not to trust a number until at least 500, preferably 1,000, impressions have accumulated.
+
+The first time I ran this aggregation, the dashboard's "Pangle is low" impression was completely reversed in one region. Pangle's eCPM was indeed low for Japanese interstitials, but for Southeast Asian banners Pangle was posting nearly twice the others. That is a fact the blended average could never have shown me.
+
+## Feeding the numbers back into floors and priority
+
+Once you have a real eCPM by slot and region, the actions become concrete. The operating rules I run today are these.
+
+First, for any slot x region x network combination whose eCPM falls well below baseline, I set a region-specific floor to refuse low-price wins. To avoid emptying inventory, I raise the floor in steps and check each time that fill rate doesn't drop sharply. Second, networks that clearly post a high eCPM get their mediation priority raised for that region. Third, I don't touch any combination with fewer than 500 impressions. Tinkering where the data is thin is the same as going back to guesswork.
+
+My grandfathers, both temple carpenters, used to say that working with your hands is a form of devotion. Until I produced these numbers, I think I had made ad tuning the one exception where I "decided by gut without working with my hands." Once I started measuring per impression, ads finally felt like the rest of my implementation work.
+
+## An operating note: semi-automating the dashboard with Claude in Chrome
+
+One last thing, still in progress. Even when the real eCPM is in hand, applying it to floors and mediation groups in the AdMob dashboard is a long string of browser clicks, and doing it across six apps quietly eats time. I've been semi-automating that "the number is ready but reflecting it on screen is tedious" part by letting Claude in Chrome operate the browser UI.
+
+Concretely, I hand it the list of "slot x region to raise the floor" straight out of the SQL above, and let it open the relevant AdMob mediation groups and enter the floor values. I always confirm the final values with my own eyes, but just removing the rote work of navigating screens and opening fields has brought a six-app review back into a realistic amount of time. Whether a solo developer can keep up optimization at this scale comes down, I think, to how much of this rote work you can cut.
+
+## Your next step
+
+If you are deciding mediation tuning purely from the dashboard's average eCPM right now, start by attaching `paidEventListener` to a single placement, dividing `value` back from micros, and piping a base-currency-normalized event into your analytics. Once aggregation starts running for that first slot, the regional differences the average hid will surface every time. Moving floors and priority comes after that.
+
+I hope this helps anyone wrestling with ad revenue across multiple apps the same way I am. Thank you for reading.
