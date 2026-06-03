@@ -8,16 +8,16 @@ const NEWS_ITEMS: Record<string, string[]> = {
     "NATIVE — AR/LiDAR・Metal 3D・Dynamic Island・HealthKit・NFC・Core MLなどネイティブApple機能を解放（5月）",
     "SIM — ブラウザのクラウドiOSシミュレータでXcodeやMacなしに実機環境テストが可能（5月）",
     "PUBLISH — ワンクリック/ツークリックのApp Store公開、ビルド・証明書・申請を自動化（5月）",
-    "ARR — Rorkは約$15M調達、Maxローンチから3日でARR $1.5Mに到達と報じられる（5月）",
-    "WWDC — WWDC 2026は6/8〜12開催、オンデバイスAIが中心でRork Maxのネイティブ路線に追い風（6月）",
+    "FUNDING — Rorkはa16zらから資金を調達、月間訪問は74万超で成長を継続（5月）",
+    "EXPO — 標準のRorkはExpo（React Native）でiOS/Androidをクロスプラットフォーム生成（5月）",
   ],
   en: [
     "MAX — Rork Max generates native Swift instead of React Native, covering iPhone/iPad/Watch/TV/Vision Pro/iMessage (May)",
     "NATIVE — Rork Max unlocks native Apple features: AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, NFC, and Core ML (May)",
     "SIM — A browser-based cloud iOS simulator lets you test on a real Apple environment without Xcode or a Mac (May)",
     "PUBLISH — One- and two-click App Store publishing automates builds, certificates, and submission (May)",
-    "ARR — Rork has raised ~$15M and reportedly hit $1.5M ARR within three days of the Max launch (May)",
-    "WWDC — WWDC 2026 runs June 8-12, centered on on-device AI, a tailwind for Rork Max's native approach (Jun)",
+    "FUNDING — Rork has raised funding from a16z and others, with monthly visits topping 743k and steady growth (May)",
+    "EXPO — Standard Rork builds cross-platform iOS and Android apps on Expo (React Native) from a description (May)",
   ],
 };
 
