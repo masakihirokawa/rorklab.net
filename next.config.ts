@@ -96,7 +96,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   { from: "/articles/rork-dev/rork-max-app-clips-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-max-ar-lidar-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-max-background-processing-bgtask", to: "/articles/rork-dev" },
-  { from: "/articles/rork-dev/rork-max-cloud-compile-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-max-core-ml-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-max-dynamic-island-live-activities-guide", to: "/articles/rork-dev" },
   { from: "/articles/rork-dev/rork-max-dynamic-island-live-activities", to: "/articles/rork-dev" },
