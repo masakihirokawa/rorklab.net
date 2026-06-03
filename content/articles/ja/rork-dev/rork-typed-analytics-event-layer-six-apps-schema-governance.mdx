@@ -1,0 +1,209 @@
+---
+title: "Rork製6アプリで分析イベントを型で守る — 共有イベント層の設計メモ"
+slug: "rork-typed-analytics-event-layer-six-apps-schema-governance"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-03T04:45"
+author: "Rork Lab"
+description: "6本のアプリでイベント名がバラつき分析が破綻した経験から、型付きイベントレジストリと薄いラッパーで送信を一元化し、CIで定義の差分を検出する設計を実装コード付きでまとめます。"
+tags: ["Rork", "analytics", "TypeScript", "Firebase", "architecture"]
+highlights:
+  - "イベント名のtypoや表記ゆれをコンパイル時に止める型付きレジストリの実装"
+  - "6アプリで送信処理を1枚のラッパーに集約し、共通プロパティの付け忘れを防ぐ設計"
+  - "CIでイベント定義の差分を検出し、ダッシュボードが静かに壊れるのを防ぐ仕組み"
+---
+
+壁紙アプリの一つで「保存ボタンのタップ数」を半年ぶりに見ようとしたとき、グラフがある日を境にゼロに落ちていました。障害ではありません。あるアップデートで `wallpaper_save` というイベント名を、別の開発作業のついでに `save_wallpaper` へ書き換えてしまっていたのです。アプリは何事もなく動き、クラッシュも出ず、ただ分析ダッシュボードだけが静かに死んでいました。誰も気づかないまま、二つの名前で半年分のデータが分断されていたわけです。
+
+私は2014年から個人でアプリを開発し、おかげさまで累計5,000万ダウンロードに届きました。現在はRorkを使って6本の壁紙アプリを並行して運用していますが、アプリの数が増えるほど、この「イベント名が静かに腐っていく」問題は深刻になります。同じ「壁紙を保存した」という行為に、アプリごとに少しずつ違う名前が付き、いつの間にか横断分析ができなくなる。ここでは、その問題を型で封じ込めるための共有イベント層の設計を、実際に使っているコードとともに残しておきます。同じように複数アプリを運用されている方に向けた、運用の手引きのつもりです。
+
+## なぜイベント名は静かに腐っていくのか
+
+分析イベントが厄介なのは、間違っていても何も壊れないからです。`save_btn_tap` でも `wallpaper_saved` でも `tap_save` でも、`logEvent(name, params)` に文字列として渡される限り、アプリは正常に動きます。型システムも、リンターも、テストも、文字列の中身までは見てくれません。エラーは半年後、ダッシュボードを開いた人間の目だけが検出します。
+
+6アプリ体制ではこれが指数関数的に悪化します。私の経験では、放置した結果として次の3種類の腐敗が同時に進行していました。第一に**表記ゆれ**で、同じ行為に `wallpaper_save` / `save_wallpaper` / `img_save` の3名が並立していました。第二に**プロパティの付け忘れ**で、あるアプリだけ `category` プロパティを送っておらず、カテゴリ別の保存数が出せませんでした。第三に**型の不一致**で、`is_premium` を文字列 `"true"` で送るアプリと真偽値 `true` で送るアプリが混在し、Firebase上で別物として集計されていました。
+
+これらはすべて「文字列とany型で送信できてしまう」ことが根本原因です。であれば、送信経路を型で塞いでしまえばよい、というのがこの設計の出発点です。
+
+## 型付きイベントレジストリを単一の真実とする
+
+まず、すべてのイベント定義を一つのファイルに集約します。イベント名とそのプロパティの形を型として宣言し、ここに無いイベントは送れないようにします。
+
+```typescript
+// packages/analytics/src/events.ts
+// 6アプリで共有する「イベント辞書」。ここが唯一の真実。
+
+export const EVENTS = {
+  wallpaper_save: {
+    category: "string",      // 壁紙のカテゴリID
+    wallpaper_id: "string",
+    source: "string",        // "detail" | "list" | "widget"
+  },
+  wallpaper_set_lockscreen: {
+    wallpaper_id: "string",
+  },
+  paywall_view: {
+    placement: "string",     // どの画面から来たか
+    variant: "string",       // A/Bテストの枝
+  },
+  subscribe_complete: {
+    plan: "string",          // "monthly" | "yearly"
+    price_jpy: "number",
+  },
+} as const;
+
+// 各イベントのプロパティ型を EVENTS から自動導出する
+type PropType<T> = T extends "string" ? string
+  : T extends "number" ? number
+  : T extends "boolean" ? boolean
+  : never;
+
+export type EventName = keyof typeof EVENTS;
+
+export type EventProps<E extends EventName> = {
+  [K in keyof typeof EVENTS[E]]: PropType<typeof EVENTS[E][K]>;
+};
+```
+
+この `EVENTS` オブジェクトが辞書であり、契約書です。新しいイベントを足したいときは必ずここに行を追加することになり、レビューで一覧として目に入ります。プロパティの型まで宣言してあるので、`price_jpy` に文字列を渡そうとすればコンパイルが通りません。
+
+宮大工だった私の祖父は、「寸法を最初に決めてしまえば、後はそれを守るだけだ」とよく言っていました。イベントスキーマもこれと同じで、寸法（型）を一箇所で決めておけば、各アプリの実装はそれを守るだけで済みます。
+
+## 送信は薄いラッパー1枚に集約する
+
+辞書を作っても、各アプリが直接 `logEvent("wallpaper_save", {...})` と書けるままでは意味がありません。生のSDK呼び出しを禁止し、必ず型付きの関数を通すようにします。
+
+```typescript
+// packages/analytics/src/track.ts
+import analytics from "@react-native-firebase/analytics";
+import { EVENTS, EventName, EventProps } from "./events";
+
+// 全イベントに自動で付く共通プロパティ
+let commonProps: Record<string, string | number> = {};
+
+export function setCommonProps(props: Record<string, string | number>) {
+  commonProps = { ...commonProps, ...props };
+}
+
+export async function track<E extends EventName>(
+  name: E,
+  props: EventProps<E>,
+): Promise<void> {
+  // 辞書に無い名前はそもそも E に入らないので、ここに来ない
+  const payload = { ...commonProps, ...props };
+
+  if (__DEV__) {
+    // 開発時は欠けているプロパティを警告
+    const expected = Object.keys(EVENTS[name]);
+    const missing = expected.filter((k) => !(k in props));
+    if (missing.length > 0) {
+      console.warn(`[analytics] ${name} に欠損プロパティ: ${missing.join(", ")}`);
+    }
+  }
+
+  await analytics().logEvent(name, payload);
+}
+```
+
+呼び出し側はこうなります。
+
+```typescript
+import { track } from "@dolice/analytics";
+
+// app_id や is_premium は setCommonProps で一度だけ設定しておく
+await track("wallpaper_save", {
+  category: "nature",
+  wallpaper_id: "nat_0421",
+  source: "detail",
+});
+```
+
+ここでの設計判断のうち、地味ですが効いたのが `commonProps` の存在です。`app_id`（どの壁紙アプリか）や `is_premium` のような「全イベントに付けたいが付け忘れやすい」プロパティを、アプリ起動時に一度 `setCommonProps` で登録しておけば、以降のすべてのイベントに自動で混ざります。先ほど挙げた「あるアプリだけ `category` が抜ける」という事故の半分は、この共通プロパティの仕組みで消えました。
+
+## 6アプリで共有する — パッケージ分割の判断
+
+この辞書とラッパーを6アプリで共有する方法は二つあります。各アプリにコピーするか、共有パッケージにするかです。私は最初コピーで始めて、3アプリ目で限界が来ました。一つのアプリで辞書を直すと、残りに手で反映する作業が発生し、結局ずれていくからです。
+
+そこで `packages/analytics` という内部パッケージに切り出し、各アプリからは `@dolice/analytics` として参照する形にしました。モノレポを組んでいれば workspace 参照で済みますし、組んでいなくてもGitHubの内部リポジトリを直接 `package.json` から参照できます。
+
+```json
+{
+  "dependencies": {
+    "@dolice/analytics": "github:masakihirokawa/dolice-analytics#v1.4.0"
+  }
+}
+```
+
+ここでの判断として、私はバージョンをタグで固定することを強く勧めます。`main` を直接参照すると、辞書を直した瞬間に6アプリ全部のビルドが同時に影響を受けます。タグ固定にしておけば、各アプリは自分の都合のよいタイミングで `v1.4.0` から `v1.5.0` へ上げられます。共有することと、同時に巻き込まれることは別の話だからです。
+
+## スキーマのバージョニングと後方互換
+
+イベント定義は必ず育ちます。問題は「育て方」です。私が踏んだ最大の失敗は、既存イベントの**プロパティ名を変えてしまった**ことでした。`source` を `entry_point` に改名したところ、新バージョンを入れたユーザーと旧バージョンのままのユーザーで、同じ行為が二つのプロパティに分かれて記録されました。
+
+そこから学んだルールは単純です。**既存のイベント名・プロパティ名は決して変えない。足すだけにする。** 改名したくなったら、新しい名前を足し、古い名前は非推奨マークを付けて一定期間並走させます。
+
+```typescript
+// 非推奨を型レベルで警告する
+export const EVENTS = {
+  /** @deprecated v1.5以降は wallpaper_set_lockscreen を使用 */
+  set_lockscreen: { wallpaper_id: "string" },
+  wallpaper_set_lockscreen: { wallpaper_id: "string" },
+} as const;
+```
+
+旧イベントを消すのは、その名前を含む全アプリのバージョンが市場からほぼ消えたあと、具体的にはアクティブユーザーの95%以上が新バージョンに移行したことをダッシュボードで確認してからにしています。アプリは一度配信すると、古いバージョンが何ヶ月も生き残るためです。
+
+## CIでイベント定義の差分を検出する
+
+型で守っても、辞書そのものを不用意に壊す変更は止められません。そこで、CIで辞書の差分を機械的に検査します。やることは、過去のスナップショットと現在の `EVENTS` を比較し、**削除・改名が起きていないか**を見るだけです。
+
+```typescript
+// scripts/check-event-schema.ts
+import { EVENTS } from "../packages/analytics/src/events";
+import snapshot from "./event-snapshot.json";
+
+const errors: string[] = [];
+
+for (const [name, props] of Object.entries(snapshot)) {
+  if (!(name in EVENTS)) {
+    errors.push(`イベント削除を検出: ${name}（消さずに @deprecated にしてください）`);
+    continue;
+  }
+  for (const key of Object.keys(props as object)) {
+    if (!(key in (EVENTS as any)[name])) {
+      errors.push(`プロパティ削除を検出: ${name}.${key}`);
+    }
+  }
+}
+
+if (errors.length > 0) {
+  console.error(errors.join("\n"));
+  process.exit(1); // CIを赤くする
+}
+
+console.log("イベントスキーマOK（追加のみ・破壊的変更なし）");
+```
+
+運用手順はこうです。
+
+1. `EVENTS` を変更したらPRを出す
+2. CIが `event-snapshot.json` と比較し、削除・改名があれば落とす
+3. レビューで意図的な追加であることを確認する
+4. マージ後、`EVENTS` を `event-snapshot.json` に書き出して次回の基準を更新する
+
+この4ステップを挟んでから、冒頭で書いたような「気づかないうちにダッシュボードが死ぬ」事故はゼロになりました。コードレビューは人間が見落とすことがありますが、スナップショット比較は見落としません。
+
+## 運用してわかった、ドキュメントに載っていないこと
+
+最後に、SDKのドキュメントには書かれていない、実運用で見えてきたことをいくつか残します。
+
+第一に、**Firebase Analyticsのイベント名は40文字・プロパティ名は40文字までという制限**があり、超えると無言で切り捨てられます。辞書を一箇所にまとめておくと、この制限チェックも `EVENTS` のキー長を見るだけでCIに組み込めます。私は `wallpaper_set_lockscreen_from_widget_shortcut` のような長い名前で一度これに当たりました。
+
+第二に、**カスタムイベントはFirebaseのダッシュボードに反映されるまで最大24時間かかる**ことがあります。新イベントを足した直後に「データが来ない」と慌てる必要はなく、DebugViewでリアルタイムに届いていれば正常です。私はこれを知らず、動いている実装を半日疑いました。
+
+第三に、共通プロパティの設計で `app_id` を入れておくと、6アプリのデータをBigQueryエクスポートで横断集計するときに圧倒的に楽になります。アプリごとにプロジェクトを分けるか統合するかは悩みどころですが、私は統合プロジェクト＋`app_id` 分割に落ち着きました。横断で「どの壁紙ジャンルが全アプリ通して保存されやすいか」を一度のクエリで出せる価値が、分離のシンプルさを上回ったためです。
+
+イベント設計は地味で、派手な機能のように達成感もありません。けれど、半年後に正しい数字が見られるかどうかは、今この瞬間に名前を一箇所で守れているかにかかっています。同じように複数アプリを運用されている方が、ダッシュボードの突然死を避ける一助になれば嬉しいです。次の一歩としては、まずお使いのアプリの送信箇所を `grep` で洗い出し、生のSDK呼び出しがいくつ残っているかを数えてみてください。そこが、型で守るべき入口の一覧です。
+
+お読みいただきありがとうございました。

@@ -1,0 +1,209 @@
+---
+title: "Guarding Analytics Events With Types Across Six Rork Apps — A Shared Event Layer"
+slug: "rork-typed-analytics-event-layer-six-apps-schema-governance"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-03T04:45"
+author: "Rork Lab"
+description: "After event names drifted across six apps and quietly broke my dashboards, I built a typed event registry and a thin wrapper to centralize tracking, plus a CI check that catches schema drift. Here is the design, with the code I actually use."
+tags: ["Rork", "analytics", "TypeScript", "Firebase", "architecture"]
+highlights:
+  - "A typed event registry that catches event-name typos and drift at compile time"
+  - "A single thin wrapper across six apps that prevents missing common properties"
+  - "A CI check that detects event-definition drift so dashboards never break silently"
+---
+
+When I tried to look at "save button taps" for one of my wallpaper apps after about six months, the chart had dropped to zero on a specific day. It was not an outage. In some update, while doing unrelated work, I had renamed the event `wallpaper_save` to `save_wallpaper`. The app ran fine, nothing crashed, and only the analytics dashboard quietly died. For half a year, the same action had been split across two names, and nobody noticed.
+
+I have been building apps on my own since 2014, and they have reached around 50 million downloads in total. These days I run six wallpaper apps in parallel using Rork, and the more apps you have, the worse this "event names rot in silence" problem gets. The same act of "saving a wallpaper" ends up with slightly different names in each app, and before long you can no longer analyze across them. This article records the design of a shared event layer that locks this problem down with types, along with the code I actually use.
+
+## Why Event Names Rot in Silence
+
+The insidious thing about analytics events is that nothing breaks when they are wrong. Whether you write `save_btn_tap`, `wallpaper_saved`, or `tap_save`, as long as it is passed as a string to `logEvent(name, params)`, the app behaves normally. The type system, the linter, and your tests never look inside the string. The error is detected six months later, by the human eyes of whoever opens the dashboard.
+
+With six apps, this gets exponentially worse. In my experience, leaving it unmanaged led to three kinds of rot progressing at once. First, **naming drift**: the same action had three coexisting names, `wallpaper_save` / `save_wallpaper` / `img_save`. Second, **missing properties**: one app was not sending the `category` property, so I could not break saves down by category. Third, **type mismatches**: some apps sent `is_premium` as the string `"true"` while others sent the boolean `true`, and Firebase counted them as separate things.
+
+The root cause of all of these is that "you can send anything as a string with an any type." So the starting point of this design is simple: close off the sending path with types.
+
+## A Typed Event Registry as the Single Source of Truth
+
+First, consolidate every event definition into a single file. Declare each event name and the shape of its properties as types, and make it impossible to send any event not listed here.
+
+```typescript
+// packages/analytics/src/events.ts
+// The "event dictionary" shared across six apps. This is the only truth.
+
+export const EVENTS = {
+  wallpaper_save: {
+    category: "string",      // wallpaper category ID
+    wallpaper_id: "string",
+    source: "string",        // "detail" | "list" | "widget"
+  },
+  wallpaper_set_lockscreen: {
+    wallpaper_id: "string",
+  },
+  paywall_view: {
+    placement: "string",     // which screen it came from
+    variant: "string",       // A/B test branch
+  },
+  subscribe_complete: {
+    plan: "string",          // "monthly" | "yearly"
+    price_jpy: "number",
+  },
+} as const;
+
+// Derive each event's property types automatically from EVENTS
+type PropType<T> = T extends "string" ? string
+  : T extends "number" ? number
+  : T extends "boolean" ? boolean
+  : never;
+
+export type EventName = keyof typeof EVENTS;
+
+export type EventProps<E extends EventName> = {
+  [K in keyof typeof EVENTS[E]]: PropType<typeof EVENTS[E][K]>;
+};
+```
+
+This `EVENTS` object is both a dictionary and a contract. Adding a new event means adding a line here, where it shows up as a list during review. Because the property types are declared too, passing a string to `price_jpy` simply will not compile.
+
+My grandfather, who was a temple carpenter, used to say: "Decide the dimensions first, and after that you only have to honor them." An event schema works the same way. Decide the dimensions (the types) in one place, and each app's implementation only has to honor them.
+
+## Centralize Tracking in One Thin Wrapper
+
+Building the dictionary is pointless if each app can still call `logEvent("wallpaper_save", {...})` directly. Forbid raw SDK calls and force everything through a typed function.
+
+```typescript
+// packages/analytics/src/track.ts
+import analytics from "@react-native-firebase/analytics";
+import { EVENTS, EventName, EventProps } from "./events";
+
+// Common properties automatically attached to every event
+let commonProps: Record<string, string | number> = {};
+
+export function setCommonProps(props: Record<string, string | number>) {
+  commonProps = { ...commonProps, ...props };
+}
+
+export async function track<E extends EventName>(
+  name: E,
+  props: EventProps<E>,
+): Promise<void> {
+  // A name not in the dictionary cannot be E, so it never reaches here
+  const payload = { ...commonProps, ...props };
+
+  if (__DEV__) {
+    // Warn about missing properties during development
+    const expected = Object.keys(EVENTS[name]);
+    const missing = expected.filter((k) => !(k in props));
+    if (missing.length > 0) {
+      console.warn(`[analytics] ${name} missing props: ${missing.join(", ")}`);
+    }
+  }
+
+  await analytics().logEvent(name, payload);
+}
+```
+
+The call site looks like this:
+
+```typescript
+import { track } from "@dolice/analytics";
+
+// Set app_id and is_premium once via setCommonProps
+await track("wallpaper_save", {
+  category: "nature",
+  wallpaper_id: "nat_0421",
+  source: "detail",
+});
+```
+
+Of the design choices here, the humble but effective one is `commonProps`. Properties like `app_id` (which wallpaper app this is) and `is_premium` are "things you want on every event but easily forget." Register them once at startup with `setCommonProps`, and they are automatically merged into every subsequent event. Half of the "one app is missing `category`" accidents I mentioned earlier disappeared thanks to this common-property mechanism.
+
+## Sharing Across Six Apps — The Package Boundary Decision
+
+There are two ways to share this dictionary and wrapper across six apps: copy it into each app, or make it a shared package. I started with copying and hit the wall at the third app. Fixing the dictionary in one app meant manually reflecting the change into the rest, which drifts anyway.
+
+So I extracted it into an internal package, `packages/analytics`, referenced from each app as `@dolice/analytics`. With a monorepo, a workspace reference is enough; without one, you can reference an internal GitHub repo directly from `package.json`.
+
+```json
+{
+  "dependencies": {
+    "@dolice/analytics": "github:masakihirokawa/dolice-analytics#v1.4.0"
+  }
+}
+```
+
+My strong recommendation here is to pin the version with a tag. Referencing `main` directly means the moment you touch the dictionary, all six app builds are affected at once. With a pinned tag, each app can move from `v1.4.0` to `v1.5.0` whenever it suits them. Sharing something and being dragged along simultaneously are two different things.
+
+## Schema Versioning and Backward Compatibility
+
+Event definitions always grow. The question is how you grow them. My biggest mistake was **renaming a property on an existing event**. When I renamed `source` to `entry_point`, users on the new version and users still on the old one recorded the same action under two different properties.
+
+The rule I learned from that is simple. **Never change an existing event name or property name. Only add.** If you want to rename, add the new name and let the old one run alongside, marked deprecated, for a while.
+
+```typescript
+// Warn about deprecation at the type level
+export const EVENTS = {
+  /** @deprecated Use wallpaper_set_lockscreen from v1.5 onward */
+  set_lockscreen: { wallpaper_id: "string" },
+  wallpaper_set_lockscreen: { wallpaper_id: "string" },
+} as const;
+```
+
+I only delete an old event after nearly every app version containing that name has left the market — concretely, after I confirm on the dashboard that 95% or more of active users have moved to a new version. Once you ship an app, old versions survive in the wild for months.
+
+## Detecting Event-Definition Drift in CI
+
+Even with type protection, you cannot stop a careless change that breaks the dictionary itself. So check the dictionary's diff mechanically in CI. All it does is compare a past snapshot with the current `EVENTS` and watch for **deletions and renames**.
+
+```typescript
+// scripts/check-event-schema.ts
+import { EVENTS } from "../packages/analytics/src/events";
+import snapshot from "./event-snapshot.json";
+
+const errors: string[] = [];
+
+for (const [name, props] of Object.entries(snapshot)) {
+  if (!(name in EVENTS)) {
+    errors.push(`Event deletion detected: ${name} (mark @deprecated instead of removing)`);
+    continue;
+  }
+  for (const key of Object.keys(props as object)) {
+    if (!(key in (EVENTS as any)[name])) {
+      errors.push(`Property deletion detected: ${name}.${key}`);
+    }
+  }
+}
+
+if (errors.length > 0) {
+  console.error(errors.join("\n"));
+  process.exit(1); // turn CI red
+}
+
+console.log("Event schema OK (additions only, no breaking changes)");
+```
+
+The workflow is:
+
+1. Change `EVENTS` and open a PR
+2. CI compares against `event-snapshot.json` and fails on deletions or renames
+3. Review confirms the addition is intentional
+4. After merge, write `EVENTS` out to `event-snapshot.json` to update the baseline
+
+Once I inserted these four steps, the "dashboard dies without anyone noticing" accident from the opening went to zero. Code review lets humans miss things; snapshot comparison does not.
+
+## What the Docs Do Not Tell You
+
+Finally, a few things I learned in production that are not in the SDK docs.
+
+First, **Firebase Analytics event names are limited to 40 characters and property names to 40 characters**, and anything longer is silently truncated. With the dictionary in one place, you can fold this length check into CI just by inspecting the lengths of the `EVENTS` keys. I once hit this with a long name like `wallpaper_set_lockscreen_from_widget_shortcut`.
+
+Second, **custom events can take up to 24 hours to appear in the Firebase dashboard**. You do not need to panic that "no data is coming" right after adding a new event; if it arrives in real time in DebugView, it is fine. Not knowing this, I doubted a perfectly working implementation for half a day.
+
+Third, putting `app_id` into your common properties makes cross-app aggregation in BigQuery export dramatically easier across six apps. Whether to split projects per app or unify them is a hard call, but I settled on a unified project plus an `app_id` split. The value of answering "which wallpaper genre saves best across all apps" in a single query outweighed the simplicity of separation.
+
+Event design is unglamorous and offers none of the satisfaction of a flashy feature. Yet whether you can see correct numbers six months from now depends on whether you are guarding names in one place right now. If you run multiple apps the way I do, I hope this helps you avoid the sudden death of your dashboards. As a next step, `grep` for the tracking calls in your app and count how many raw SDK calls remain. That count is your list of entry points to guard with types.
+
+Thank you for reading.
