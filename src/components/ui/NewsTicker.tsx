@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはReact NativeでなくネイティブSwiftを生成、iPhone/iPad/Watch/TV/Vision Pro/iMessage対応（5月）",
-    "NATIVE — AR/LiDAR・Metal 3D・Dynamic Island・HealthKit・NFC・Core MLなどネイティブApple機能を解放（5月）",
-    "SIM — ブラウザのクラウドiOSシミュレータでXcodeやMacなしに実機環境テストが可能（5月）",
-    "PUBLISH — ワンクリック/ツークリックのApp Store公開、ビルド・証明書・申請を自動化（5月）",
-    "FUNDING — Rorkはa16zらから資金を調達、月間訪問は74万超で成長を継続（5月）",
-    "EXPO — 標準のRorkはExpo（React Native）でiOS/Androidをクロスプラットフォーム生成（5月）",
+    "RORK-MAX — Rork MaxがネイティブSwiftアプリを生成、iPhone/iPad/Watch/TV/Vision Proを網羅（2026）",
+    "NATIVE — Rork MaxがAR・LiDAR、Core ML、HealthKit、Dynamic Island等のApple機能を解禁（2026）",
+    "CROSS — オリジナルRorkはReact Native(Expo)でiOS/Androidクロスプラットフォームに注力（2026）",
+    "PRICE — Rorkは無料開始・$25/月〜、Rork Maxは$200/月（2026）",
+    "MOBILE-ONLY — Web寄りのBolt/Lovableと違い、Rorkはモバイルアプリ専業（2026）",
+    "ENGLISH — アプリ要件を自然な英語で書くと、ストア配信できるコードが生成される（2026）",
   ],
   en: [
-    "MAX — Rork Max generates native Swift instead of React Native, covering iPhone/iPad/Watch/TV/Vision Pro/iMessage (May)",
-    "NATIVE — Rork Max unlocks native Apple features: AR/LiDAR, Metal 3D, Dynamic Island, HealthKit, NFC, and Core ML (May)",
-    "SIM — A browser-based cloud iOS simulator lets you test on a real Apple environment without Xcode or a Mac (May)",
-    "PUBLISH — One- and two-click App Store publishing automates builds, certificates, and submission (May)",
-    "FUNDING — Rork has raised funding from a16z and others, with monthly visits topping 743k and steady growth (May)",
-    "EXPO — Standard Rork builds cross-platform iOS and Android apps on Expo (React Native) from a description (May)",
+    "RORK-MAX — Rork Max generates native Swift apps spanning iPhone, iPad, Watch, TV, and Vision Pro (2026)",
+    "NATIVE — Rork Max unlocks Apple features like AR/LiDAR, Core ML, HealthKit, and Dynamic Island (2026)",
+    "CROSS — The original Rork focuses on cross-platform iOS/Android via React Native (Expo) (2026)",
+    "PRICE — Rork starts free at $25/mo, while Rork Max runs $200/mo (2026)",
+    "MOBILE-ONLY — Unlike web-first Bolt/Lovable, Rork is built exclusively for mobile apps (2026)",
+    "ENGLISH — Describe an app in plain English and Rork produces store-ready code (2026)",
   ],
 };
 
