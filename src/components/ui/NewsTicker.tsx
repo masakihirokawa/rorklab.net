@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "WWDC — WWDC 2026が6/8開幕、iOS 27でDynamic Island・Live Activities等のネイティブ機能が再注目、Rork Maxの守備範囲と直結",
-    "RORK-MAX — Rork MaxはReact NativeでなくネイティブSwiftを生成、クラウドMac fleetでXcodeもMacも不要、ブラウザでビルド→QRで実機→App Store申請まで",
-    "NATIVE-CAPS — Rork Maxの対応はAR/LiDAR・Metal 3D・ウィジェット・Dynamic Island・Live Activities・Siri Intents・HealthKit・NFC・Core MLなど",
-    "NOCODE — Gartnerは2026年末までに新規アプリの75%がローコード/ノーコードで作られると予測（2020年は25%未満）",
-    "BASE44 — Base44が2026年2月にApp Store/Google Play直接申請に対応、ReplitはAgent 4、FlutterFlowはAI生成とノーコード勢が加速",
-    "PRICING — Rorkは無料プランあり・有料は月額$25〜、Rork Maxは月額$200",
+    "WWDC — WWDC 2026が6/8開幕。iOS 27の新機能はRork Maxが狙うAppleネイティブ領域（Widgets・Live Activities・Core MLなど）に直結",
+    "MAX — Rork Maxはネイティブ Swiftコードを生成。AR/LiDAR・Metal 3D・Dynamic Island・NFC・App Clips・オンデバイスCore MLに対応",
+    "範囲 — iPhone/iPad/Apple Watch/Apple TV/Vision Pro/iMessageまで一気通貫。React Nativeでは届かないネイティブ能力を全開放",
+    "BUILD — クラウドMacフリートでネイティブコンパイル。XcodeもMac実機も不要で、ブラウザ上のクラウドiOSシミュレータで実機テスト",
+    "PUBLISH — 2クリックでApp Store公開。ノーコードAIアプリ開発が公開フローまで自動化",
+    "TREND — ノーコードAIアプリ開発は「クロスプラットフォームの最大公約数」から「ネイティブ能力の全開放」へ移行",
   ],
   en: [
-    "WWDC — WWDC 2026 opens Jun 8; iOS 27 puts native features like Dynamic Island and Live Activities back in focus, right in Rork Max's lane",
-    "RORK-MAX — Rork Max generates native Swift (not React Native) on a cloud Mac fleet, so you build in the browser and ship to the App Store without Xcode or a Mac",
-    "NATIVE-CAPS — It targets native Apple capabilities: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, Siri Intents, HealthKit, NFC, and Core ML",
-    "NOCODE — Gartner expects 75% of new apps to be built with low-code/no-code by the end of 2026, up from under 25% in 2020",
-    "BASE44 — Base44 added direct App Store and Google Play submission in Feb 2026, Replit shipped Agent 4, and FlutterFlow added AI generation",
-    "PRICING — Rork has a free plan with paid tiers from $25/mo, while Rork Max is $200/mo",
+    "WWDC — WWDC 2026 opens Jun 8; iOS 27 features map directly onto the native Apple areas Rork Max targets (Widgets, Live Activities, Core ML)",
+    "MAX — Rork Max generates native Swift code, unlocking AR/LiDAR, Metal 3D, Dynamic Island, NFC, App Clips, and on-device Core ML",
+    "REACH — One pipeline spans iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, opening up native power React Native can't reach",
+    "BUILD — A cloud Mac fleet handles native compilation, so you test on a browser-based cloud iOS simulator with no Xcode or Mac required",
+    "PUBLISH — Two-click App Store publishing brings no-code AI app building all the way through release",
+    "TREND — No-code AI app building is shifting from cross-platform lowest-common-denominator to fully unlocking native capabilities",
   ],
 };
 
