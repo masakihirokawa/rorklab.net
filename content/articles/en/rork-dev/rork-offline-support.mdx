@@ -5,80 +5,143 @@ category: "rork-dev"
 level: "intermediate"
 date: "2026-03-13T13:00"
 author: "Rork Lab"
-description: "Add offline capabilities to your Rork Max app using AsyncStorage and expo-sqlite for local data storage and sync."
+description: "Add offline support to your Rork Max app with AsyncStorage and expo-sqlite, plus an outbox queue that syncs changes made offline once the connection returns."
 tags: ["rork", "offline", "asyncstorage", "sqlite", "tutorial"]
 premium: false
 ---
-## Why Offline Support Matters
+## Making an App That Survives Going Offline
 
-Modern mobile apps need to work without a network connection — on subways, planes, and in areas with poor signal. Offline capability dramatically improves user experience.
+The scariest part of offline support is the moment the signal drops: the app freezes, or the data the user just typed disappears. Show someone a "save failed" toast on the subway with no way to recover what they wrote, and they quietly stop coming back.
 
-Rork Max apps are React Native-based, so native storage options are fully available.
+Rork Max generates React Native apps, so native storage is available out of the box. We'll build this in three stages that actually run: storing small state, a structured local database, and syncing changes you made while offline.
 
-## AsyncStorage — Lightweight Key-Value Storage
+## AsyncStorage — For Settings and Small State
 
-For settings, user profiles, and small data, `AsyncStorage` is the right tool.
+For lightweight state like theme, language, or the last tab opened, `AsyncStorage` is the right fit. Two things I always add to the generated code: wrap the `JSON.parse` on read in try/catch, and if you hit a corrupted value, drop it and fall back to defaults instead of crashing.
 
 ```javascript
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+const KEY = 'user_settings';
+
 export async function saveSettings(settings) {
-  await AsyncStorage.setItem('user_settings', JSON.stringify(settings));
+  try {
+    await AsyncStorage.setItem(KEY, JSON.stringify(settings));
+  } catch (e) {
+    console.warn('settings save failed:', e);
+  }
 }
 
 export async function loadSettings() {
-  const stored = await AsyncStorage.getItem('user_settings');
-  return stored ? JSON.parse(stored) : null;
+  try {
+    const raw = await AsyncStorage.getItem(KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    // A corrupted value from an older build: reset and fall back to defaults
+    await AsyncStorage.removeItem(KEY);
+    return null;
+  }
 }
 ```
 
-## expo-sqlite — Full Local Database
+Keep in mind AsyncStorage is not encrypted, and on Android the default size limit is small (around 6MB on some devices). Don't stuff secrets like tokens, or bulky data like images and article bodies, in here. That's what SQLite is for.
 
-For tasks, notes, or offline-readable articles, use `expo-sqlite`:
+## A Gotcha with expo-sqlite — openDatabase No Longer Works
+
+This is where letting an AI write the code bites you most often. Many articles and models still emit WebSQL-style code using `SQLite.openDatabase()`, but that API was removed in newer expo-sqlite (Expo SDK 51 and later). Run old code against a freshly installed version and it crashes on launch with `openDatabase is not a function`.
+
+The broken pattern (old API):
+
+```javascript
+// ❌ openDatabase does not exist on Expo SDK 51+
+const db = SQLite.openDatabase('myapp.db');
+db.transaction((tx) => {
+  tx.executeSql('SELECT * FROM tasks', [], (_, result) => { /* ... */ });
+});
+```
+
+The current pattern (async API):
 
 ```javascript
 import * as SQLite from 'expo-sqlite';
 
-const db = SQLite.openDatabase('myapp.db');
+let db;
 
-export function initDatabase() {
-  db.transaction((tx) => {
-    tx.executeSql(
-      `CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        completed INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-      )`
+export async function initDatabase() {
+  db = await SQLite.openDatabaseAsync('myapp.db');
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      completed INTEGER DEFAULT 0,
+      synced INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
-  });
+  `);
 }
 
-export function addTask(title, callback) {
-  db.transaction((tx) => {
-    tx.executeSql(
-      'INSERT INTO tasks (title) VALUES (?)',
-      [title],
-      (_, result) => callback(result.insertId)
-    );
-  });
+export async function addTask(title) {
+  const result = await db.runAsync('INSERT INTO tasks (title) VALUES (?)', title);
+  return result.lastInsertRowId;
+}
+
+export async function getTasks() {
+  return db.getAllAsync('SELECT * FROM tasks ORDER BY created_at DESC');
 }
 ```
 
-## Network Status Monitoring
+When you prompt Rork Max, add a line like "use the modern expo-sqlite API: openDatabaseAsync / execAsync / runAsync / getAllAsync" and it won't hand you the old style. That `synced` column is for the next step, so add it when you create the table.
 
-Show offline UI when there's no connection:
+## Syncing Changes You Made Offline
+
+Saving locally only solves half the problem if the data stays out of step with the server. Give the app a "send queue" (an outbox) that flushes tasks you added offline once the connection returns, and the whole thing feels far more solid.
+
+The idea is simple: commit every write to the local DB first, later pick up only the rows where `synced = 0`, send them, and mark them `synced = 1` on success. The user never waits for the network — actions return instantly, even offline.
+
+```javascript
+import NetInfo from '@react-native-community/netinfo';
+
+export async function flushPending() {
+  const net = await NetInfo.fetch();
+  if (!net.isConnected || !net.isInternetReachable) return;
+
+  const pending = await db.getAllAsync('SELECT * FROM tasks WHERE synced = 0');
+
+  for (const task of pending) {
+    try {
+      await fetch('https://api.example.com/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: task.title }),
+      });
+      await db.runAsync('UPDATE tasks SET synced = 1 WHERE id = ?', task.id);
+    } catch (e) {
+      // Stop on the first failure; the rest retry on the next flush
+      break;
+    }
+  }
+}
+```
+
+The key is the `break` when any single item fails. The rest stay at `synced = 0`, so they're re-sent naturally on the next flush when you're back online. Call `flush` both on app resume (`AppState` active) and on network recovery to avoid missed rows.
+
+## Network Monitoring and Its Traps
+
+To show an offline banner, watch the state with `NetInfo`. The trap here is that `isConnected` (are you on Wi-Fi) and `isInternetReachable` (can you actually reach the internet) are different things. To catch the "connected but not really online" case — café Wi-Fi stuck behind a login wall — you need both.
 
 ```javascript
 import NetInfo from '@react-native-community/netinfo';
 import { useState, useEffect } from 'react';
 
 export function useNetworkStatus() {
+  // Don't treat the app as offline before the check resolves
   const [isOnline, setIsOnline] = useState(true);
 
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener((state) => {
-      setIsOnline(state.isConnected && state.isInternetReachable);
+      const reachable = state.isInternetReachable;
+      // While reachable is null (still checking), trust isConnected
+      setIsOnline(state.isConnected && reachable !== false);
     });
     return unsubscribe;
   }, []);
@@ -87,12 +150,12 @@ export function useNetworkStatus() {
 }
 ```
 
-## Looking back
+`isInternetReachable` returns `null` (checking) for a moment right after launch. Treat that as false and the offline banner flickers on startup. Writing `reachable !== false` avoids showing the banner until the check actually resolves.
 
-For offline support in Rork Max:
+## Where to Draw the Local-vs-Server Line
 
-- **AsyncStorage**: Settings and simple key-value data
-- **expo-sqlite**: Structured data like tasks and notes
-- **NetInfo**: Network status monitoring for offline UI feedback
+One judgment call from the field. As an indie developer shipping apps since 2014 — I still run wallpaper and relaxation apps on AdMob revenue — I keep a clear line: image lists and favorites live locally so they're browsable offline, while purchase and entitlement state is owned by the server. Decide up front what is local-authoritative and what is server-authoritative, and your sync code gets remarkably simple.
 
-All three can be added to your Rork Max app via natural language prompts.
+Try to cache everything locally and sync both directions, and you fall into conflict resolution — a different swamp entirely. Start with the one-way outbox approach (write local-first, push to the server), and you'll have the most robust foundation for shipping to the App Store and Google Play.
+
+Offline support isn't a flashy feature, but on unstable commuter networks it maps directly to satisfaction. I hope this helps anyone building mobile apps along the same lines.
