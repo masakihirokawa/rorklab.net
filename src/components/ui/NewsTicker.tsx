@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "WWDC — WWDC 2026が6/8開幕。iOS 27の新機能はRork Maxが狙うAppleネイティブ領域（Widgets・Live Activities・Core MLなど）に直結",
-    "MAX — Rork Maxはネイティブ Swiftコードを生成。AR/LiDAR・Metal 3D・Dynamic Island・NFC・App Clips・オンデバイスCore MLに対応",
-    "範囲 — iPhone/iPad/Apple Watch/Apple TV/Vision Pro/iMessageまで一気通貫。React Nativeでは届かないネイティブ能力を全開放",
-    "BUILD — クラウドMacフリートでネイティブコンパイル。XcodeもMac実機も不要で、ブラウザ上のクラウドiOSシミュレータで実機テスト",
-    "PUBLISH — 2クリックでApp Store公開。ノーコードAIアプリ開発が公開フローまで自動化",
-    "TREND — ノーコードAIアプリ開発は「クロスプラットフォームの最大公約数」から「ネイティブ能力の全開放」へ移行",
+    "RORK-MAX — Rork MaxはネイティブSwiftアプリを生成（月$200）。iPhone・iPad・Watch・TV・Vision Pro・iMessageとAR/LiDAR・Live Activitiesに対応",
+    "CLOUD-MAC — Rork MaxはクラウドMacフリートでネイティブコンパイル。Xcode不要・Mac不要で2クリックApp Store公開が可能です",
+    "EXPO — 通常のRorkはExpo(React Native)でiOS/Android両対応の本番アプリを記述から生成。無料開始・有料は月$25〜",
+    "WWDC — WWDC 2026でiOS 27発表。iPhone 11以降が対象、写真70%高速化・AirDrop 80%高速化。秋にiPhone 18 Proと同時提供",
+    "ANDROID17 — Android 17が6月に安定版見込み。大画面リサイズ必須化で、折りたたみ・タブレット対応がモバイルアプリの前提に",
+    "SIRI-INTENTS — iOS 27のSiriはGeminiベースに刷新。App Intents連携を備えるネイティブアプリの設計が見直しどころです",
   ],
   en: [
-    "WWDC — WWDC 2026 opens Jun 8; iOS 27 features map directly onto the native Apple areas Rork Max targets (Widgets, Live Activities, Core ML)",
-    "MAX — Rork Max generates native Swift code, unlocking AR/LiDAR, Metal 3D, Dynamic Island, NFC, App Clips, and on-device Core ML",
-    "REACH — One pipeline spans iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, opening up native power React Native can't reach",
-    "BUILD — A cloud Mac fleet handles native compilation, so you test on a browser-based cloud iOS simulator with no Xcode or Mac required",
-    "PUBLISH — Two-click App Store publishing brings no-code AI app building all the way through release",
-    "TREND — No-code AI app building is shifting from cross-platform lowest-common-denominator to fully unlocking native capabilities",
+    "RORK-MAX — Rork Max builds native Swift apps ($200/mo) for iPhone, iPad, Watch, TV, Vision Pro, and iMessage, with AR/LiDAR and Live Activities",
+    "CLOUD-MAC — Rork Max compiles natively on a cloud Mac fleet, so you publish to the App Store in two clicks with no Xcode and no Mac",
+    "EXPO — The original Rork generates production iOS/Android apps from a description via Expo (React Native); free to start, paid from $25/mo",
+    "WWDC — WWDC 2026 unveils iOS 27 for iPhone 11 and later, with photos 70% faster and AirDrop 80% faster; it ships this fall with iPhone 18 Pro",
+    "ANDROID17 — Android 17 is expected stable in June; mandatory large-screen resizability makes foldable and tablet support a baseline for apps",
+    "SIRI-INTENTS — iOS 27's Siri is rebuilt on Gemini, making native apps with solid App Intents integration worth revisiting in your design",
   ],
 };
 
