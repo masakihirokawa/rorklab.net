@@ -33,6 +33,7 @@ export interface ArticleMeta {
   tags: string[];
   premium?: boolean;
   highlights?: string[];
+  noindex?: boolean;
 }
 
 export interface Article {

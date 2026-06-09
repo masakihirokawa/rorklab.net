@@ -144,6 +144,7 @@ async function generateArticleIndex() {
           premium: data.premium || false,
           ...(data.highlights ? { highlights: data.highlights } : {}),
           highlights: data.highlights || null,
+          noindex: data.noindex || false,
         });
       }
     }
