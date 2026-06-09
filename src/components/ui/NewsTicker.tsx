@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK-MAX — Rork MaxはネイティブSwiftアプリを生成（月$200）。iPhone・iPad・Watch・TV・Vision Pro・iMessageとAR/LiDAR・Live Activitiesに対応",
-    "CLOUD-MAC — Rork MaxはクラウドMacフリートでネイティブコンパイル。Xcode不要・Mac不要で2クリックApp Store公開が可能です",
-    "EXPO — 通常のRorkはExpo(React Native)でiOS/Android両対応の本番アプリを記述から生成。無料開始・有料は月$25〜",
-    "WWDC — WWDC 2026でiOS 27発表。iPhone 11以降が対象、写真70%高速化・AirDrop 80%高速化。秋にiPhone 18 Proと同時提供",
-    "ANDROID17 — Android 17が6月に安定版見込み。大画面リサイズ必須化で、折りたたみ・タブレット対応がモバイルアプリの前提に",
-    "SIRI-INTENTS — iOS 27のSiriはGeminiベースに刷新。App Intents連携を備えるネイティブアプリの設計が見直しどころです",
+    "RORK-VS-MAX — 通常のRorkはExpo(React Native)でiOS/Android両対応、Rork Maxはネイティブ SwiftでApple全域。用途で使い分けを",
+    "RORK-MAX — Rork Max（月$200）はiPhone・iPad・Watch・TV・Vision Pro・iMessageとAR/LiDAR・Metal・Live Activities・Core MLに対応",
+    "PUBLISH — RorkはクラウドMacでビルドし共有リンクのテストから両プラットフォーム公開まで一気通貫。無料開始・有料$25〜",
+    "ANDROID17 — Android 17はこの夏Pixelから先行配信見込み。大画面リサイズ対応が重要になります",
+    "IOS27 — iOS 27はこの秋提供見込み。Siriのモデル刷新を含むアップデートに向けアプリ側の確認を",
+    "WORKFLOW — 個人開発ではまずRorkで素早く検証し、Apple固有機能が必要になったらRork Maxを検討する流れが現実的",
   ],
   en: [
-    "RORK-MAX — Rork Max builds native Swift apps ($200/mo) for iPhone, iPad, Watch, TV, Vision Pro, and iMessage, with AR/LiDAR and Live Activities",
-    "CLOUD-MAC — Rork Max compiles natively on a cloud Mac fleet, so you publish to the App Store in two clicks with no Xcode and no Mac",
-    "EXPO — The original Rork generates production iOS/Android apps from a description via Expo (React Native); free to start, paid from $25/mo",
-    "WWDC — WWDC 2026 unveils iOS 27 for iPhone 11 and later, with photos 70% faster and AirDrop 80% faster; it ships this fall with iPhone 18 Pro",
-    "ANDROID17 — Android 17 is expected stable in June; mandatory large-screen resizability makes foldable and tablet support a baseline for apps",
-    "SIRI-INTENTS — iOS 27's Siri is rebuilt on Gemini, making native apps with solid App Intents integration worth revisiting in your design",
+    "RORK-VS-MAX — Standard Rork ships cross-platform iOS/Android via Expo (React Native); Rork Max builds native Swift across the Apple ecosystem",
+    "RORK-MAX — Rork Max ($200/mo) covers iPhone, iPad, Watch, TV, Vision Pro, and iMessage, plus AR/LiDAR, Metal, Live Activities, and Core ML",
+    "PUBLISH — Rork compiles on cloud Macs, taking you from a shareable test link to publishing on both stores; free to start, paid from $25",
+    "ANDROID17 — Android 17 is expected to reach Pixel first this summer; large-screen resizability is becoming important",
+    "IOS27 — iOS 27 is expected this fall; with Siri's model revamp ahead, it's worth checking your app now",
+    "WORKFLOW — For solo devs, validate fast with Rork first, then consider Rork Max when you need Apple-only native capabilities",
   ],
 };
 
