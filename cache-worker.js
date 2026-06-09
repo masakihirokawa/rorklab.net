@@ -10,7 +10,7 @@
 import nextHandler from "./.open-next/worker";
 
 // ── Config ──────────────────────────────────────────────────────
-const DEPLOY_VERSION = "2026-05-18-paywall-schema-fix";
+const DEPLOY_VERSION = "2026-06-10-prune-410";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 function injectPolyfill(response) {
