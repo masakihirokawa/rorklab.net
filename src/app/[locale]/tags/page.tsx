@@ -21,7 +21,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     robots: { index: false, follow: true },
     alternates: {
       canonical: locale === "ja" ? `${base}/tags` : `${base}/en/tags`,
-      languages: { ja: `${base}/tags`, en: `${base}/en/tags` },
+      languages: { ja: `${base}/tags`, en: `${base}/en/tags`, "x-default": `${base}/en/tags` },
     },
   };
 }
