@@ -1,0 +1,209 @@
+---
+title: "Keeping a wallpaper app's binary small: moving images out of the bundle"
+slug: "wallpaper-app-binary-size-remote-asset-delivery"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-09T15:00"
+author: "Rork Lab"
+description: "Wallpaper apps bloat every time you add images. Here is where I draw the line between bundled and remote assets, how I keep first paint fast with prefetching, and the format work that cut transfer size to a third — with real numbers."
+tags: ["app-size", "wallpaper-app", "asset-delivery", "Expo", "performance"]
+highlights:
+  - "A concrete rule for splitting bundled vs remote assets along two axes: launch experience and update cadence"
+  - "A manifest-plus-prefetch implementation that cut the IPA by over 60% without slowing first paint"
+  - "HEIC/WebP, Display P3 and downsampling steps that reduced per-image transfer to one third"
+---
+
+The first build of my wallpaper app shipped at about 16MB. Then I started adding new wallpapers every season, and six months later the bundle had crossed 90MB. Long before I hit the App Store's cellular download limit, a different problem showed up: the first launch got visibly slower, and reviews started mentioning that the app "felt heavy" — people were reacting to the size shown on the store page.
+
+I'm Masaki Hirokawa, an artist and indie developer. I have been building iOS and Android apps on my own since 2014, mostly wallpaper, relaxation and mindfulness apps, and they have added up to roughly 50 million downloads. I currently run six wallpaper apps in parallel, and every one of them lives on the same tension: the urge to add more images versus the need to keep the binary light. This article is how I resolved that tension in the architecture, shown with the code I actually run and the before/after numbers.
+
+## Why size suddenly becomes a problem for wallpaper apps
+
+In a typical productivity app, images are just the icon and a few illustrations. In a wallpaper app, the images *are* the product. A single high-resolution wallpaper (1290×2796 for an iPhone 15 Pro Max, in Display P3) can exceed 10MB uncompressed. Bundle a hundred of those and the binary alone approaches 1GB.
+
+When size grows, the pain shows up in three places. First, store conversion: the App Store product page shows the download size, and without Wi-Fi that number makes people hesitate. On one app, the version that dropped the binary from 90MB to 28MB saw install completion (store view to completed install) improve by about 14%. Second, first launch: a large bundle of images raises build time and runtime memory, especially when you stuff an asset catalog full on iOS. Third, update agility: pushing a 30MB+ re-download to every user just to add five wallpapers is far too heavy. Wallpapers are content; they update on a different rhythm than code.
+
+## Where to draw the bundled/remote line
+
+"Just make everything remote" would be easy to say, but then the grid is blank on first launch and the experience falls apart. I draw the line on two axes.
+
+The first is **contribution to the launch experience**. Anything on the very first screen — the onboarding background, the handful of thumbnails visible in the first grid — gets bundled, because a network wait there leads straight to drop-off. The second is **update frequency**: seasonal collections and new drops go remote, while things that never change (the logo, placeholders) stay bundled.
+
+In practice, my split looks like this:
+
+- App icon, splash, UI icons: bundled (a few hundred KB)
+- Only the *thumbnails* of the first 6–8 wallpapers visible in the opening grid (not full resolution): bundled
+- Full-resolution wallpapers, extra collections, seasonal sets: all remote
+
+With just this policy, the only thing bundled is thumbnails and UI assets, and the binary shrinks dramatically. On a real app I cut the IPA from 90MB to 28MB — about a 69% reduction.
+
+## Designing the remote image catalog
+
+The center of remote delivery is not the images themselves but the manifest. After launch the app fetches a JSON catalog that tells it which wallpaper lives at which URL. Give it a version number so you can re-fetch only when something changed.
+
+```ts
+// Served as wallpapers/manifest.v3.json on the CDN
+type WallpaperManifest = {
+  version: number;          // integer; bump it to invalidate device caches
+  updatedAt: string;        // ISO8601
+  items: WallpaperItem[];
+};
+
+type WallpaperItem = {
+  id: string;
+  thumb: string;            // e.g. "wallpapers/autumn/leaf-01_thumb.webp"
+  full: string;             // e.g. "wallpapers/autumn/leaf-01_2796.heic"
+  width: number;
+  height: number;
+  bytes: number;            // measured transfer size, used for prefetch decisions
+  collection: string;
+  premium: boolean;
+};
+```
+
+The client compares the locally stored manifest version and only updates when it has gone up.
+
+```ts
+import * as FileSystem from "expo-file-system";
+
+const MANIFEST_URL = `${process.env.EXPO_PUBLIC_CDN_BASE}/wallpapers/manifest.v3.json`;
+const CACHE = `${FileSystem.documentDirectory}manifest.json`;
+
+async function loadManifest(): Promise<WallpaperManifest> {
+  // 1. Return the local copy immediately (so the app launches offline too)
+  let local: WallpaperManifest | null = null;
+  const info = await FileSystem.getInfoAsync(CACHE);
+  if (info.exists) {
+    local = JSON.parse(await FileSystem.readAsStringAsync(CACHE));
+  }
+
+  // 2. Refresh in the background
+  try {
+    const res = await fetch(MANIFEST_URL, { cache: "no-cache" });
+    const remote: WallpaperManifest = await res.json();
+    if (!local || remote.version > local.version) {
+      await FileSystem.writeAsStringAsync(CACHE, JSON.stringify(remote));
+      return remote;
+    }
+  } catch {
+    // On a network failure, keep going with local. Not throwing here is the key.
+  }
+  return local ?? { version: 0, updatedAt: "", items: [] };
+}
+```
+
+The thing that matters most here is that **a failed network fetch must not block launch**. My first version `await`ed the manifest fetch and blocked on it, and I got reports of the app freezing on launch in places with weak signal, like the subway. Switching the order — return local first, refresh behind it — made that class of review almost disappear. A classic trap you only find in production.
+
+## Keeping first paint fast with prefetching
+
+The cost of going remote is that brief blank moment before an image appears. To erase it, combine thumbnail prefetching with placeholders: fill the grid instantly from the bundled leading thumbnails, and fetch only the full resolution that is actually visible.
+
+The naive version I wrote first looked like this:
+
+```tsx
+// Before: load full resolution for every grid item at once
+function Grid({ items }: { items: WallpaperItem[] }) {
+  return (
+    <FlatList
+      data={items}
+      numColumns={2}
+      renderItem={({ item }) => (
+        <Image source={{ uri: cdn(item.full) }} style={styles.cell} />
+      )}
+    />
+  );
+}
+```
+
+This fetches full resolution for dozens of off-screen items all at once, the initial transfer balloons, and you are back to a "heavy app." The improved version shows only thumbnails in the grid and fetches full resolution when the user enters the detail screen. It also uses `expo-image`'s memory/disk cache and a placeholder to fill the gap with a blurred thumbnail.
+
+```tsx
+// After: light thumbnails in the grid, full resolution on demand
+import { Image } from "expo-image";
+
+function Grid({ items }: { items: WallpaperItem[] }) {
+  return (
+    <FlatList
+      data={items}
+      numColumns={2}
+      windowSize={5}            // only render rows near the viewport
+      maxToRenderPerBatch={8}
+      renderItem={({ item }) => (
+        <Image
+          source={{ uri: cdn(item.thumb) }}
+          placeholder={{ blurhash: item.blurhash }}
+          contentFit="cover"
+          transition={180}
+          cachePolicy="memory-disk"
+          style={styles.cell}
+        />
+      )}
+    />
+  );
+}
+```
+
+Only when the user opens the detail screen do I `Image.prefetch` the `item.full`, so by the time they tap save it is almost certainly cached. In my experience, this separation alone made first-grid paint feel no slower than before I went remote. Thumbnails are a few tens of KB each, so bundling 6–8 of them is a rounding error.
+
+## Should you use On-Demand Resources or Play Asset Delivery?
+
+iOS has On-Demand Resources and Android has Play Asset Delivery — OS-level mechanisms for fetching assets after install while keeping the binary light. Same goal as what I built.
+
+I evaluated Play Asset Delivery (install-time / fast-follow) on Android for a while. My conclusion: **for wallpaper apps I chose a custom CDN + manifest approach.** Three reasons. First, I wanted one delivery mechanism shared across six apps; the OS mechanisms differ per platform in both API and operations, and keeping a single manifest is lighter to maintain. Second, dropping an image onto a CDN is far faster than rebuilding and re-reviewing an asset pack every time I swap a season. Third, with self-hosted delivery I naturally get to measure who viewed or saved which wallpaper.
+
+Conversely, the OS mechanisms suit large premium content you want to gate, or an initial pack you must guarantee offline. The dividing line is simple: things that update on the *code release* rhythm belong to the OS mechanism; things that update on the *content* rhythm belong on the CDN.
+
+## Cutting transfer size further with format and resolution
+
+Going remote does not help if each image is still huge — it just shifts the weight to bandwidth and cache. This part is unglamorous but effective.
+
+For format I default to HEIC for iOS delivery and WebP for Android and web. For the same perceived quality they are 30–50% lighter than JPEG. Thumbnails can lose quality without anyone noticing, so I fix them at WebP, 600px long edge, quality 70.
+
+For resolution, the key is to never ship an image larger than the device needs. I want to keep Display P3 wide gamut for the look, but anything bigger than necessary is waste. I derive the required size from the device's logical resolution and pixel density, and serve several variants from the CDN.
+
+```ts
+import { PixelRatio, Dimensions } from "react-native";
+
+// Compute the real pixel long edge the device needs, pick the smallest variant that covers it
+function pickVariant(item: WallpaperItem): string {
+  const { height } = Dimensions.get("window");
+  const needed = Math.ceil(height * PixelRatio.get());   // e.g. 932 * 3 = 2796
+  const variants = [1290, 1668, 2208, 2796, 3120];        // long edges prepared on the CDN
+  const target = variants.find((v) => v >= needed) ?? variants[variants.length - 1];
+  return item.full.replace(/_\d+\.(heic|webp)$/, `_${target}.$1`);
+}
+```
+
+Measured, this brought the average transfer per full-resolution image from 4.8MB to 1.6MB — roughly a third. That shortens the wait between tapping save and the export finishing, and it improved reviews from users who watch their data usage. Doing the downsampling on the server also lowers the device's peak memory, which visibly cut crashes on older phones.
+
+## What measuring revealed beyond size
+
+Size reduction is not a standalone metric; it cascaded into several numbers. Before and after, I tracked store install completion, the share of users who reach their first wallpaper save in the opening session, and the ad-revenue side: AdMob eCPM and ad impressions per session.
+
+The version that cut the binary by 69% improved install completion by about 14%, as noted. What mattered even more was that a lighter first launch raised the share of users who get all the way to saving one wallpaper in their first session. A light first experience reduces onboarding drop-off, and Day 1 retention improved by a few points as a result. In an ad-supported app, session quality feeds back into AdMob eCPM, so a seemingly dull metric like binary size reaches all the way down to revenue — that is the lived takeaway from running this.
+
+The flip side to watch is the added network dependency. So that the first experience does not degrade on weak signal, always ship the bundled thumbnails and the offline fallback (the local manifest) together. Skip that and you get the worst of both: a smaller app with worse ratings.
+
+## How I run the CDN and caching
+
+Once you move to remote delivery, the center of operations becomes how you cache and how you invalidate. I make the image files immutable — version and resolution are baked into the filename — and serve them with a long cache (`Cache-Control: public, max-age=31536000, immutable`). If you never change the contents of a file you already shipped, both devices and the CDN edge can cache it with confidence.
+
+When I want to swap something, I do not overwrite the file; I place a new name and rewrite that entry in the manifest. The only mutable thing is the manifest. I give it a near-zero cache so it re-validates on every launch.
+
+```
+# CDN cache policy (pseudo-config)
+# Image bodies: unique names, so cache forever
+/wallpapers/*.heic   Cache-Control: public, max-age=31536000, immutable
+/wallpapers/*.webp   Cache-Control: public, max-age=31536000, immutable
+# Manifest: re-validate on each launch
+/wallpapers/manifest.v3.json   Cache-Control: public, max-age=0, must-revalidate
+```
+
+The trap is forgetting to bump the manifest version after adding images. If the version stays flat, the launch comparison decides "no update" and keeps using the local copy, so the new drops never appear. I increment the version at the end of the script that writes the manifest, and log the diff in item count. Never hand-edit the JSON — another rule I hardened only after it bit me in production.
+
+## The next step
+
+If your own wallpaper app's binary is over a few tens of MB, there is only one thing to do first: **list every image in the current bundle and ask, one by one, whether it is truly needed on the very first screen of launch.** Almost all of them can go remote. From there, stand up a single manifest and narrow the bundle down to thumbnails and UI assets — in that order, you can cut the binary hugely without hurting the experience.
+
+Since unifying all six of my apps on this design, adding a new wallpaper has become "just drop it on the CDN," and I gained the lightness of updating content without going through review. If you are wrestling with the same pull between images and size, I hope this helps. Thank you for reading.
