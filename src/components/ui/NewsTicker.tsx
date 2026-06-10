@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK-VS-MAX — 通常のRorkはExpo(React Native)でiOS/Android両対応、Rork Maxはネイティブ SwiftでApple全域。用途で使い分けを",
-    "RORK-MAX — Rork Max（月$200）はiPhone・iPad・Watch・TV・Vision Pro・iMessageとAR/LiDAR・Metal・Live Activities・Core MLに対応",
-    "PUBLISH — RorkはクラウドMacでビルドし共有リンクのテストから両プラットフォーム公開まで一気通貫。無料開始・有料$25〜",
-    "ANDROID17 — Android 17はこの夏Pixelから先行配信見込み。大画面リサイズ対応が重要になります",
-    "IOS27 — iOS 27はこの秋提供見込み。Siriのモデル刷新を含むアップデートに向けアプリ側の確認を",
-    "WORKFLOW — 個人開発ではまずRorkで素早く検証し、Apple固有機能が必要になったらRork Maxを検討する流れが現実的",
+    "RORK-MAX — Rork MaxがReact Nativeでなく純粋なSwiftコードを生成。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでネイティブ対応",
+    "BROWSER-SIM — ブラウザ上のストリーミングiOSシミュレータで、XcodeやMac無しに実機相当の環境でアプリを検証",
+    "AUTO-PUBLISH — App Storeへの自動公開に対応。ビルド・証明書・申請を手動設定なしで処理",
+    "EXPO-RN — Rorkは説明文から本番品質のモバイルアプリをAIとExpo（React Native）で生成。モバイル特化が強みです",
+    "PRICING — 無料で開始でき、有料プランは月$25から。Rork Maxは月$200",
+    "NATIVE-FIRST — 2026年の新機能はAppleエコシステムのネイティブ強化が一貫テーマ",
   ],
   en: [
-    "RORK-VS-MAX — Standard Rork ships cross-platform iOS/Android via Expo (React Native); Rork Max builds native Swift across the Apple ecosystem",
-    "RORK-MAX — Rork Max ($200/mo) covers iPhone, iPad, Watch, TV, Vision Pro, and iMessage, plus AR/LiDAR, Metal, Live Activities, and Core ML",
-    "PUBLISH — Rork compiles on cloud Macs, taking you from a shareable test link to publishing on both stores; free to start, paid from $25",
-    "ANDROID17 — Android 17 is expected to reach Pixel first this summer; large-screen resizability is becoming important",
-    "IOS27 — iOS 27 is expected this fall; with Siri's model revamp ahead, it's worth checking your app now",
-    "WORKFLOW — For solo devs, validate fast with Rork first, then consider Rork Max when you need Apple-only native capabilities",
+    "RORK-MAX — Rork Max now generates pure Swift instead of React Native, enabling native apps across iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "BROWSER-SIM — A browser-based streaming iOS simulator tests apps in a real Apple environment without Xcode or a Mac",
+    "AUTO-PUBLISH — Rork adds automated App Store publishing, handling builds, certificates, and submission with no manual setup",
+    "EXPO-RN — Rork builds production-ready mobile apps from a description using AI and Expo (React Native), staying mobile-only by design",
+    "PRICING — Free to start, paid plans from $25/month, with Rork Max at $200/month",
+    "NATIVE-FIRST — Rork's 2026 features share a clear theme: deeper native empowerment of the Apple ecosystem",
   ],
 };
 
