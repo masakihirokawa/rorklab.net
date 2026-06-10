@@ -81,14 +81,33 @@ export default function sitemap(): MetadataRoute.Sitemap {
   // Article pages with actual dates and alternates
   const jaArticles = _jaArts;
 
+  // --- Deduplicate article lastmod (prevent batch-generation signal) ---
+  // Articles sharing the same frontmatter date get incremental minute offsets
+  // so no two different articles share the same <lastmod> in the sitemap.
+  const _artDateSlugs = new Map<string, string[]>();
+  for (const _a of jaArticles) {
+    const _dk = _a.updated || _a.date || "";
+    if (!_artDateSlugs.has(_dk)) _artDateSlugs.set(_dk, []);
+    _artDateSlugs.get(_dk)!.push(_a.slug);
+  }
+  for (const [, _sl] of _artDateSlugs) _sl.sort();
+  const _artSlugOffset = new Map<string, number>();
+  for (const [, _sl] of _artDateSlugs) {
+    if (_sl.length <= 1) continue;
+    _sl.forEach((_s, _i) => { if (_i > 0) _artSlugOffset.set(_s, _i); });
+  }
+
   for (const article of jaArticles) {
     const jaUrl = `${baseUrl}/articles/${article.category}/${article.slug}`;
     const enUrl = `${baseUrl}/en/articles/${article.category}/${article.slug}`;
     const date = article.updated || article.date;
+    const _artBase = date ? new Date(date) : SITE_LAUNCHED_FALLBACK;
+    const _artOff = _artSlugOffset.get(article.slug) || 0;
+    const _artLastMod = _artOff > 0 ? new Date(_artBase.getTime() + _artOff * 60000) : _artBase;
 
     entries.push({
       url: jaUrl,
-      lastModified: date ? new Date(date) : SITE_LAUNCHED_FALLBACK,
+      lastModified: _artLastMod,
       changeFrequency: "weekly",
       priority: 0.9,
       alternates: {
@@ -97,7 +116,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: date ? new Date(date) : SITE_LAUNCHED_FALLBACK,
+      lastModified: _artLastMod,
       changeFrequency: "weekly",
       priority: 0.8,
       alternates: {
@@ -109,13 +128,31 @@ export default function sitemap(): MetadataRoute.Sitemap {
   // Blog posts
   const jaBlog = _jaBlog;
 
+  // --- Deduplicate blog lastmod ---
+  const _blogDateSlugs = new Map<string, string[]>();
+  for (const _b of jaBlog) {
+    const _bk = _b.date || "";
+    if (!_blogDateSlugs.has(_bk)) _blogDateSlugs.set(_bk, []);
+    _blogDateSlugs.get(_bk)!.push(_b.slug);
+  }
+  for (const [, _sl] of _blogDateSlugs) _sl.sort();
+  const _blogSlugOffset = new Map<string, number>();
+  for (const [, _sl] of _blogDateSlugs) {
+    if (_sl.length <= 1) continue;
+    _sl.forEach((_s, _i) => { if (_i > 0) _blogSlugOffset.set(_s, _i); });
+  }
+
   for (const post of jaBlog) {
     const jaUrl = `${baseUrl}/blog/${post.slug}`;
     const enUrl = `${baseUrl}/en/blog/${post.slug}`;
 
+    const _blogBase = post.date ? new Date(post.date) : SITE_LAUNCHED_FALLBACK;
+    const _blogOff = _blogSlugOffset.get(post.slug) || 0;
+    const _blogLastMod = _blogOff > 0 ? new Date(_blogBase.getTime() + _blogOff * 60000) : _blogBase;
+
     entries.push({
       url: jaUrl,
-      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED_FALLBACK,
+      lastModified: _blogLastMod,
       changeFrequency: "monthly",
       priority: 0.7,
       alternates: {
@@ -124,7 +161,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     });
     entries.push({
       url: enUrl,
-      lastModified: post.date ? new Date(post.date) : SITE_LAUNCHED_FALLBACK,
+      lastModified: _blogLastMod,
       changeFrequency: "monthly",
       priority: 0.6,
       alternates: {
