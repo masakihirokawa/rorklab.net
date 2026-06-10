@@ -351,6 +351,7 @@ export default async function ArticlePage({ params }: Props) {
             dangerouslySetInnerHTML={{ __html: previewContent }}
           />
           <PremiumPaywall locale={locale} highlights={article.meta.highlights} />
+          <SingleArticleCTA locale={locale} slug={slug} category={category} />
           {/* Flexible Sampling: hidden content for Googlebot */}
           <div
             className="paywall-hidden-content"
