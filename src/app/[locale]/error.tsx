@@ -1,11 +1,32 @@
 "use client";
 
+import { useEffect } from "react";
+
 export default function Error({
+  error,
   reset,
 }: {
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  // Auto-reload once on first error (covers ChunkLoadError after deploys,
+  // hydration failures, and stale module references).
+  useEffect(() => {
+    // Log for debugging
+    console.error("[error.tsx]", error?.name, error?.message);
+
+    if (typeof window !== "undefined") {
+      const key = "locale-error-reload-attempted";
+      if (!sessionStorage.getItem(key)) {
+        sessionStorage.setItem(key, "1");
+        window.location.reload();
+        return;
+      }
+      // Clear flag so future navigations can retry once again
+      sessionStorage.removeItem(key);
+    }
+  }, [error]);
+
   return (
     <div
       style={{
@@ -21,25 +42,25 @@ export default function Error({
       <div
         style={{
           fontFamily: "'DM Mono', monospace",
-          fontSize: 80,
+          fontSize: 64,
           fontWeight: 300,
           color: "var(--accent-blue)",
           lineHeight: 1,
           marginBottom: 16,
-          opacity: 0.6,
+          opacity: 0.5,
         }}
       >
-        500
+        ⟳
       </div>
       <h1
         style={{
-          fontSize: 22,
+          fontSize: 20,
           fontWeight: 500,
           color: "var(--text-primary)",
           marginBottom: 12,
         }}
       >
-        Internal Server Error
+        読み込みエラーが発生しました
       </h1>
       <p
         style={{
@@ -50,11 +71,16 @@ export default function Error({
           marginBottom: 32,
         }}
       >
-        予期しないエラーが発生しました。しばらくしてからもう一度お試しください。
+        ページの表示中に一時的なエラーが発生しました。再読み込みで解決する場合があります。
       </p>
       <div style={{ display: "flex", gap: 12 }}>
         <button
-          onClick={reset}
+          onClick={() => {
+            if (typeof window !== "undefined") {
+              sessionStorage.removeItem("locale-error-reload-attempted");
+            }
+            window.location.reload();
+          }}
           style={{
             padding: "10px 24px",
             fontSize: 13,
@@ -68,12 +94,35 @@ export default function Error({
             transition: "all 0.3s",
           }}
         >
+          ページを再読み込み
+        </button>
+        <button
+          onClick={() => {
+            if (typeof window !== "undefined") {
+              sessionStorage.removeItem("locale-error-reload-attempted");
+            }
+            reset();
+          }}
+          style={{
+            padding: "10px 24px",
+            fontSize: 13,
+            fontFamily: "'DM Mono', monospace",
+            letterSpacing: "0.04em",
+            color: "var(--text-muted)",
+            border: "1px solid var(--border-subtle)",
+            background: "var(--bg-surface)",
+            borderRadius: 4,
+            cursor: "pointer",
+            transition: "all 0.3s",
+          }}
+        >
           もう一度試す
         </button>
         <a
           href="/"
           style={{
-            display: "inline-block",
+            display: "inline-flex",
+            alignItems: "center",
             padding: "10px 24px",
             fontSize: 13,
             fontFamily: "'DM Mono', monospace",
