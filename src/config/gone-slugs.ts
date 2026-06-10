@@ -193,4 +193,10 @@ export const GONE_ARTICLE_SLUGS: string[] = [
   "weekly-pickup-2026-0522",
   "weekly-pickup-2026-0526",
   "weekly-pickup-2026-0529",
-  "weekly-pickup-2026-0602",];
+  "weekly-pickup-2026-0602",
+// 2026-06-10 第2弾: WEAK剪定（薄い無料記事 ∩ 検索実績ゼロ(28日,日英合算) ∩ 公開45日超）
+  "rork-animations-guide",
+  "rork-offline-support",
+  "rork-supabase-chat-app",
+  "rork-useful-apps-ideas",
+];
