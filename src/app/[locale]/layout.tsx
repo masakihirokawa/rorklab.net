@@ -6,12 +6,15 @@ import { Header } from "@/components/layout/Header";
 import { Footer } from "@/components/layout/Footer";
 import { NewsTicker } from "@/components/ui/NewsTicker";
 import { ScrollToTop } from "@/components/ui/ScrollToTop";
-import { CookieBanner } from "@/components/layout/CookieBanner";
 
 import type { Metadata } from "next";
 
 // Blocking script to prevent FOUC (Flash of Unstyled Content) on theme change
 const themeScript = `(function(){try{var t=localStorage.getItem('rorklab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
+
+// Non-blocking Google Fonts loader
+const fontUrl = "https://fonts.googleapis.com/css2?family=DM+Mono:wght@400&family=DM+Sans:wght@300;400;500&family=Noto+Sans+JP:wght@300;400;500;700&display=swap";
+const fontScript = `(function(){var l=document.createElement('link');l.rel='stylesheet';l.href='${fontUrl}';document.head.appendChild(l)})()`;
 
 const LOCALE_TITLES: Record<string, string> = {
   ja: "Rork Lab — Rork Max 日本語ナレッジベース",
@@ -67,14 +70,21 @@ export default async function LocaleLayout({
         <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
         <link rel="icon" href="/favicon-48.png" type="image/png" sizes="48x48" />
         <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-        {/* Google Analytics is loaded via CookieBanner after consent */}
+        {/* Google Analytics — loaded directly without consent gate (not required under Japanese law) */}
+        <script async src="https://www.googletagmanager.com/gtag/js?id=G-H9JTCV49KJ" />
+        <script dangerouslySetInnerHTML={{ __html: `window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','G-H9JTCV49KJ')` }} />
         <link rel="alternate" type="application/rss+xml" title="Rork Lab RSS" href={locale === "ja" ? "/feed.xml" : "/en/feed.xml"} />
+        {/* Font loading: preconnect + async load (non-render-blocking) */}
+        <link rel="dns-prefetch" href="https://fonts.googleapis.com" />
+        <link rel="dns-prefetch" href="https://fonts.gstatic.com" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link
-          href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400&family=DM+Sans:wght@300;400;500&family=Noto+Sans+JP:wght@300;400;500;700&display=swap"
-          rel="stylesheet"
-        />
+        <link rel="preload" as="style" href={fontUrl} />
+        <script dangerouslySetInnerHTML={{ __html: fontScript }} />
+        <noscript>
+          {/* eslint-disable-next-line @next/next/no-page-custom-font */}
+          <link href={fontUrl} rel="stylesheet" />
+        </noscript>
       </head>
       <body>
         <ThemeProvider>
@@ -84,12 +94,6 @@ export default async function LocaleLayout({
             <main style={{ paddingTop: 99 }}>{children}</main>
             <Footer />
             <ScrollToTop />
-            <CookieBanner
-              gaId="G-H9JTCV49KJ"
-              privacyHref={locale === "ja" ? "/privacy" : "/en/privacy"}
-              locale={locale}
-              storageKey="rorklab-cookie-consent"
-            />
           </NextIntlClientProvider>
         </ThemeProvider>
       </body>
