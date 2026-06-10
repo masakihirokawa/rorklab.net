@@ -69,7 +69,7 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
     return () => observer.disconnect();
   }, [initialItems]);
 
-  if (items.length < 3) return null;
+  if (items.length < 2) return null;
 
   return (
     <nav

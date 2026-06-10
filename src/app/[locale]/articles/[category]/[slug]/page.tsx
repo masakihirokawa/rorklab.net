@@ -100,17 +100,29 @@ const CATEGORY_LABELS: Record<string, Record<string, string>> = {
 // Extract headings from compiled HTML for SSR-safe TableOfContents (no CLS)
 function extractTocItems(html: string): { id: string; text: string; level: number }[] {
   const items: { id: string; text: string; level: number }[] = [];
-  const regex = /<h([23])[^>]*>([\s\S]*?)<\/h[23]>/gi;
+  const regex = /<h([23])([^>]*)>([\s\S]*?)<\/h[23]>/gi;
   let i = 0;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(html)) !== null) {
+    const attrs = match[2];
+    const idMatch = attrs.match(/\bid="([^"]*)"/);
     items.push({
-      id: `section-${i++}`,
-      text: match[2].replace(/<[^>]+>/g, "").trim(),
+      id: idMatch ? idMatch[1] : `section-${i}`,
+      text: match[3].replace(/<[^>]+>/g, "").trim(),
       level: parseInt(match[1]),
     });
+    i++;
   }
   return items;
+}
+
+// Add id="section-N" to <h2>/<h3> tags for SSR anchor links (Google Passage Ranking)
+function addHeadingIds(html: string): string {
+  let i = 0;
+  return html.replace(/<h([23])([^>]*)>/gi, (_match: string, level: string, attrs: string) => {
+    if (/\bid=/.test(attrs)) return _match;
+    return `<h${level}${attrs} id="section-${i++}">`;
+  });
 }
 export default async function ArticlePage({ params }: Props) {
   const { locale, category, slug } = await params;
@@ -122,7 +134,7 @@ export default async function ArticlePage({ params }: Props) {
     notFound();
   }
 
-  const content = await getArticleContent(locale, category, slug);
+  const content = addHeadingIds(await getArticleContent(locale, category, slug));
 
   const catInfo = CATEGORIES.find((c) => c.id === category);
   const prefix = locale === "ja" ? "" : `/${locale}`;

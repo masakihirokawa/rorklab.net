@@ -59,6 +59,18 @@ function processCallouts(content) {
   );
 }
 
+/**
+ * Add id="section-N" to <h2> and <h3> tags for TOC anchor links.
+ * This ensures heading IDs are present in SSR HTML for Google Passage Ranking.
+ */
+function addHeadingIds(html) {
+  let i = 0;
+  return html.replace(/<h([23])([^>]*)>/gi, (match, level, attrs) => {
+    if (/\bid=/.test(attrs)) return match;
+    return `<h${level}${attrs} id="section-${i++}">`;
+  });
+}
+
 async function compileMarkdown(content) {
   // Process custom components first
   const processed = processCallouts(content);
@@ -116,7 +128,7 @@ async function generateArticleIndex() {
         }
 
         // Compile MDX/markdown to HTML at build time
-        const html = await compileMarkdown(cleanedContent);
+        const html = addHeadingIds(await compileMarkdown(cleanedContent));
 
         // Validate: warn if compiled HTML still has hardcoded locale-prefixed article links
         if (/href="\/articles\/(ja|en)\//.test(html)) {
@@ -239,7 +251,7 @@ async function generateBlogIndex() {
       const { data, content } = matter(raw);
       const slug = file.replace(/\.mdx$/, "");
 
-      const html = await compileMarkdown(content);
+      const html = addHeadingIds(await compileMarkdown(content));
 
       // Write individual HTML content to public/content/blog/{locale}/{slug}.html
       const htmlDir = path.join(CONTENT_HTML_DIR, "blog", locale);
