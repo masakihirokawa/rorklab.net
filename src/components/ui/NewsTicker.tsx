@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK-MAX — Rork MaxがReact Nativeでなく純粋なSwiftコードを生成。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでネイティブ対応",
-    "BROWSER-SIM — ブラウザ上のストリーミングiOSシミュレータで、XcodeやMac無しに実機相当の環境でアプリを検証",
-    "AUTO-PUBLISH — App Storeへの自動公開に対応。ビルド・証明書・申請を手動設定なしで処理",
-    "EXPO-RN — Rorkは説明文から本番品質のモバイルアプリをAIとExpo（React Native）で生成。モバイル特化が強みです",
-    "PRICING — 無料で開始でき、有料プランは月$25から。Rork Maxは月$200",
-    "NATIVE-FIRST — 2026年の新機能はAppleエコシステムのネイティブ強化が一貫テーマ",
+    "APPLE-AI — Appleが初回DL 200万未満の開発者にFoundation Modelsを無償開放。個人開発アプリへのAI組み込みコストが大幅に低下",
+    "SWIFT-API — Foundation Modelsのサーバーサイド統合で、ClaudeやGeminiを同一Swift APIから呼び出し可能に。画像入力にも対応",
+    "KOTLIN-MIGRATION — Android Studioの移行エージェントがReact Native製アプリをネイティブKotlinへ自動移行。Rork生成アプリの将来の選択肢に",
+    "RORK-MAX — Rork MaxはネイティブSwiftコードを生成（月$200）。iPhone・iPad・Watch・TV・Vision Pro・iMessageまで対応",
+    "SIMULATOR — ブラウザベースのストリーミングiOSシミュレータで、XcodeやMacなしに実機相当のApple環境で検証可能",
+    "SWIFTUI — WWDC 2026でSwiftUIが進化。並べ替え可能コンテナ・任意コンテナのスワイプアクション・最大2倍速のレイアウト",
   ],
   en: [
-    "RORK-MAX — Rork Max now generates pure Swift instead of React Native, enabling native apps across iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "BROWSER-SIM — A browser-based streaming iOS simulator tests apps in a real Apple environment without Xcode or a Mac",
-    "AUTO-PUBLISH — Rork adds automated App Store publishing, handling builds, certificates, and submission with no manual setup",
-    "EXPO-RN — Rork builds production-ready mobile apps from a description using AI and Expo (React Native), staying mobile-only by design",
-    "PRICING — Free to start, paid plans from $25/month, with Rork Max at $200/month",
-    "NATIVE-FIRST — Rork's 2026 features share a clear theme: deeper native empowerment of the Apple ecosystem",
+    "APPLE-AI — Apple opens Foundation Models free to developers under 2M first-time downloads, slashing the cost of adding AI to indie apps",
+    "SWIFT-API — Foundation Models server-side integration lets you call Claude and Gemini through the same Swift API, now with image input",
+    "KOTLIN-MIGRATION — Android Studio's migration agent converts React Native apps into native Kotlin automatically — a future path for Rork-built apps",
+    "RORK-MAX — Rork Max generates native Swift code ($200/mo), covering iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
+    "SIMULATOR — A browser-based streaming iOS simulator lets you test on a real Apple environment without Xcode or Mac hardware",
+    "SWIFTUI — SwiftUI evolves at WWDC 2026 with reorderable containers, swipe actions for any container, and layouts up to 2x faster",
   ],
 };
 
