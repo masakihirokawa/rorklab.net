@@ -335,4 +335,5 @@ export const GONE_ARTICLE_SLUGS: string[] = [
   "voice-mode",
   "whats-new-2026",
   "why-ai-should-replace-tax-officials",
+  "fix-now-auto-debug",
 ];

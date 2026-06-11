@@ -26,7 +26,6 @@ const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
   // 2026-05-15 GSC崩壊対応: TMPL_TITLE違反+他違反の記事を一括削除（Helpful Content System対応）
   { from: "/articles/rork-ai/rork-companion-feature-guide", to: "/articles/rork-ai" },
   { from: "/articles/rork-ai/rork-max-ai-capabilities-complete-guide", to: "/articles/rork-ai" },
-  { from: "/articles/rork-basics/fix-now-auto-debug", to: "/articles/rork-basics" },
   { from: "/articles/rork-basics/rork-max-app-publishing-complete-guide", to: "/articles/rork-basics" },
   { from: "/articles/rork-business/ai-side-business-rork-app-monetization-guide", to: "/articles/rork-business" },
   { from: "/articles/rork-business/rork-max-funding-launch-guide-2026", to: "/articles/rork-business" },
