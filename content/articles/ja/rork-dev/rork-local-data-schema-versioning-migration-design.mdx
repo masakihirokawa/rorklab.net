@@ -1,0 +1,214 @@
+---
+title: "アップデートでお気に入りを消さないために — Rork 製アプリのローカルデータ・マイグレーション設計"
+slug: "rork-local-data-schema-versioning-migration-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-12T11:00"
+author: "Rork Lab"
+description: "「アップデートしたらお気に入りが消えた」という星1レビューを受け取らないための設計です。封筒形式とスキーマバージョン、マイグレーションランナーの実装、EAS Update をスキーマ中立に保つ運用ルールまでを実体験から整理しました。"
+tags: ["Rork", "AsyncStorage", "データ移行", "EAS Update", "長期運用"]
+highlights:
+  - "AsyncStorage を封筒形式＋整数バージョンで守るマイグレーションランナーの完全な TypeScript 実装"
+  - "EAS Update（OTA）にスキーマ変更を載せない運用境界と、その根拠になったロールバック事故のシナリオ"
+  - "退避データの保持期間・旧マイグレーション関数の削除時期をデータで決める計測手法"
+---
+
+去年の冬、運用中の壁紙アプリをアップデートした翌朝、星1のレビューが2件届いていました。文面はどちらもほぼ同じです。「お気に入りが全部消えた」。
+
+原因は、保存形式の変更でした。お気に入りを AsyncStorage に壁紙 ID の配列（string[]）として保存していたものを、追加日時を持たせたオブジェクトの配列に変えたのです。新しいコードは新しい形しか読めず、旧形式のデータを初期値で上書きしました。ユーザーが何ヶ月もかけて集めたお気に入りは、私が書いた10行ほどの変更で消えたことになります。
+
+サーバーのデータベースなら、こうはなりません。マイグレーションを書き、デプロイ前に流し、失敗したらロールバックする。その規律が当たり前のものとして共有されています。ところが端末の中のローカルデータには、同じ規律を持ち込まないまま運用してしまっているアプリが意外なほど多いのです。私自身のアプリも、そうでした。
+
+この出来事のあと、私は Rork で作るアプリすべてに共通のマイグレーション層を入れる設計へ切り替えました。ここに書くのは、その実装の全文と、複数アプリを長く運用する中で固まった運用ルールです。
+
+## ローカルデータがサーバー DB より壊れやすい理由
+
+サーバー DB のマイグレーションは「1つのデータベース」に「1回」適用すれば終わります。ローカルデータは違います。ユーザーの端末の数だけデータベースがあり、それぞれが別々のタイミングで、別々のバージョンから移行してきます。3世代前のバージョンから一気に最新へ上げる端末も、珍しくありません。
+
+しかも、こちらからは触れません。SSH できる本番サーバーは存在せず、壊れたデータを直す手段は「次のアップデートに修復コードを同梱する」ことだけです。修復コードが届く頃には、ユーザーはとっくにアプリを消しているかもしれません。個人開発では、その問い合わせを受ける窓口も自分です。
+
+Expo 基盤の Rork 製アプリには、もう1つ固有の事情があります。EAS Update による OTA 配信です。ストア審査を通さずに JS だけを差し替えられるのは大きな利点ですが、「コードは新しく、データは古い」という状態が発生する頻度も上がります。さらに OTA はロールバックも一瞬なので、「コードは古く、データは新しい」という逆向きの不整合まで起こり得ます。
+
+そして Rork のような AI ビルダーで開発していると、状態の形そのものが頻繁に変わります。「お気に入りに追加日時を持たせてください」と一言頼めば、Rork は型も UI も一気に書き換えてくれます。ただし、端末に既に保存されている旧形式のデータのことは、こちらが言わなければ考慮してくれません。コードを変える速度が上がるほど、データとコードの形がずれる機会は増えます。ローカルデータの規律を最初に整えておくべき理由は、ここにあります。
+
+## 設計の核は整数1つ — 封筒形式とスキーマバージョン
+
+私が全アプリで採用しているのは、保存する JSON を必ず「封筒」に入れるという単純な決まりです。
+
+```json
+{ "v": 3, "data": [{ "id": "w_201", "addedAt": 1749690000000 }] }
+```
+
+中身（data）の形は何度でも変わって構いません。その代わり、形を変えるときは封筒のバージョン番号 v を1つ上げ、「v2 の data を v3 の data に変換する関数」を必ず1本書きます。読み込み時は、保存されていた v から現在の v まで変換関数を順番に適用する。設計はこれだけです。
+
+ポイントは、バージョンをキー名に埋め込まないことです。favorites_v2 のようなキーを切り始めると、古いキーの掃除と移行の管理が二重になり、どのキーが正なのかを誰も言えなくなります。キーは1つに固定し、封筒の中の整数だけを進める。この形がいちばん事故が起きにくいと感じています。
+
+なお、AsyncStorage・MMKV・SQLite のどれを選ぶかという手前の話は[ローカルストレージ3種の使い分けを整理した記事](/articles/rork-dev/rork-local-storage-asyncstorage-mmkv-sqlite-guide)に書きましたので、ここでは「選んだ後」にデータをどう守るかに集中します。
+
+## マイグレーションランナーの実装 — 順次適用・退避・将来スキーマの拒否
+
+次のコードが、この設計の中心になるモジュールです。旧バージョンの封筒を現在の形まで順次変換し、変換前の原本を退避し、知らない未来のバージョンには手を触れずに読み込みます。
+
+```typescript
+// storage/migrations.ts — スキーママイグレーションランナー
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+export const SCHEMA_VERSION = 3;
+
+type Envelope = { v: number; data: unknown };
+
+type Migration = {
+  from: number; // 適用前バージョン。from → from+1 への一段変換のみ
+  migrate: (data: unknown) => unknown;
+};
+
+const migrations: Migration[] = [
+  {
+    // v1: 壁紙IDの生配列 → v2: 追加日時つきオブジェクト配列
+    from: 1,
+    migrate: (data) =>
+      (data as string[]).map((id) => ({ id, addedAt: 0 })),
+  },
+  {
+    // v2 → v3: addedAt 未設定に現在時刻を補い、重複IDを除去
+    from: 2,
+    migrate: (data) => {
+      const seen = new Set<string>();
+      return (data as { id: string; addedAt: number }[])
+        .filter((f) => (seen.has(f.id) ? false : (seen.add(f.id), true)))
+        .map((f) => ({ ...f, addedAt: f.addedAt || Date.now() }));
+    },
+  },
+];
+
+export async function readWithMigration<T>(
+  key: string,
+  fallback: T,
+): Promise<T> {
+  const raw = await AsyncStorage.getItem(key);
+  if (raw === null) return fallback;
+
+  let envelope: Envelope;
+  try {
+    const parsed = JSON.parse(raw);
+    // 封筒形式の導入以前（生の配列など）は v1 とみなして拾う
+    envelope =
+      parsed && typeof parsed === 'object' && 'v' in parsed && 'data' in parsed
+        ? (parsed as Envelope)
+        : { v: 1, data: parsed };
+  } catch {
+    return fallback; // 壊れた JSON への対処は、触らず初期値で起動（ログは別途送る）
+  }
+
+  if (envelope.v === SCHEMA_VERSION) return envelope.data as T;
+
+  // 未来のスキーマは読まない・書かない。
+  // OTA ロールバック後の旧コードが新データを上書きする事故を防ぐ
+  if (envelope.v > SCHEMA_VERSION) return fallback;
+
+  // 移行前に原本を退避（後述の掃除ルールで1世代だけ保持）
+  await AsyncStorage.setItem(`${key}.backup.v${envelope.v}`, raw);
+
+  let { v, data } = envelope;
+  while (v < SCHEMA_VERSION) {
+    const step = migrations.find((m) => m.from === v);
+    if (!step) return fallback; // 欠番は設計ミス。データを壊すより初期値で守る
+    data = step.migrate(data);
+    v += 1;
+  }
+
+  await AsyncStorage.setItem(key, JSON.stringify({ v, data }));
+  return data as T;
+}
+```
+
+実装にはいくつか判断が埋まっていますので、理由を添えておきます。
+
+まず、移行は from → from+1 の一段変換だけに限定しています。「v1 から v3 へ直行する関数」を書き始めると、バージョンが増えるたびに組み合わせが膨らみ、テストしきれなくなります。一段ずつなら、新しいバージョンを足すときに書くのは常に1本です。
+
+次に、変換の前に原本を退避しています。本番運用でいちばんの落とし穴は、移行コードのバグに「移行が終わった後」でしか気づけないことです。原本さえ残っていれば、修正版のアップデートで退避キーから復元するという対処が取れます。あの星1レビューの日、私にはこの打ち手がありませんでした。
+
+そして、保存されている v が現在の SCHEMA_VERSION より大きい場合は、読みもせず書きもしません。後述しますが、これは OTA ロールバックとの組み合わせで実際に起こる状況です。ここで初期値を書き戻してしまうと、ロールバックのたびにユーザーのデータが消えます。
+
+画面側からは、このランナーを直接は使わず、データ種別ごとの薄いモジュールを経由させます。
+
+```typescript
+// storage/favorites.ts — 画面からはこのモジュールだけを使う
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { readWithMigration, SCHEMA_VERSION } from './migrations';
+
+export type Favorite = { id: string; addedAt: number };
+const KEY = 'favorites';
+
+export async function loadFavorites(): Promise<Favorite[]> {
+  return readWithMigration<Favorite[]>(KEY, []);
+}
+
+export async function saveFavorites(list: Favorite[]): Promise<void> {
+  await AsyncStorage.setItem(
+    KEY,
+    JSON.stringify({ v: SCHEMA_VERSION, data: list }),
+  );
+}
+```
+
+## Rork に生成させるときの境界線 — ストレージ直書きをさせない
+
+Rork に画面を作らせると、既定では各コンポーネントの中に AsyncStorage.getItem が直接書かれがちです。読み書きが画面に散ってしまうと、封筒形式を全箇所で守らせるのは現実的ではありません。
+
+そこで私は、機能を頼むプロンプトに毎回次の一文を足しています。
+
+「AsyncStorage への読み書きは storage/ 配下のモジュール（loadFavorites / saveFavorites）だけを経由してください。画面コンポーネントから AsyncStorage を直接 import しないでください。保存形式は { v, data } の封筒形式を維持してください」
+
+これだけで、生成されるコードはリポジトリパターンに寄ります。仕上げに次の一行を流し、storage/ 以外に import が残っていないかを機械的に確認します。
+
+```bash
+grep -rn "from '@react-native-async-storage" app/ components/ | grep -v storage/
+```
+
+何も出力されなければ合格です。AI に設計を守らせるいちばん確実な方法は、守れたかどうかを機械的に検査できる形へ落としておくことだと、運用の中で学びました。
+
+## 運用して決めた3つのルール
+
+実装よりも効いているのが、運用側の決まりです。複数の壁紙アプリを並行運用しながら、最終的に次の3つに落ち着きました。
+
+### ルール1: スキーマ変更を OTA で配らない
+
+EAS Update は JS の差し替えなので、マイグレーション入りのコードもつい流したくなります。しかし OTA は適用の立ち上がりが速い一方、ロールバックも一瞬です。スキーマ v3 への移行を OTA で配り、別の不具合で巻き戻したとします。端末に残るのは「v3 のデータ＋ v2 しか知らないコード」です。先ほどのランナーは初期値で守ってくれますが、ユーザーから見れば「データが消えた」ことに変わりはありません。
+
+以来、データ形状の変更はストア審査を通る本体リリースにだけ載せ、OTA はスキーマ中立な修正（文言・スタイル・ロジックの修正）に限定しています。runtimeVersion の境界とあわせて、これを破らないことをリリースチェックリストの先頭に置いています。EAS Update を使っている構成のアプリには、この線引きをそのまま推奨します。
+
+### ルール2: 退避キーは「次のストア版が出てから30日」残す
+
+backup キーを永遠に残すと、AsyncStorage の容量（Android では既定およそ 6MB）を静かに圧迫します。かといってすぐ消すと、移行バグに気づいたときの復旧手段を失います。私は「次のストアリリースの配信開始から30日後に削除する」掃除コードを起動時に走らせています。経験上、移行絡みの不具合報告はリリースから2週間以内にほぼ出揃うためです。
+
+### ルール3: スキーマ版数の分布を計測する
+
+読み込み時に「保存されていた v」をアナリティクスイベントへ1つ載せておくと、ユーザーの端末にどの世代のデータが残っているかが分布として見えます。直近のリリースでは、4週間後の時点で旧スキーマからの移行読込は全セッションの 0.6% でした。この数字が見えていれば、「v1 からの移行関数をいつ消してよいか」を感覚ではなくデータで決められます。
+
+ちなみに私は、1% を切ってもさらに半年は移行関数を残す運用にしています。消しても誰の体験も良くならない一方、消した直後に限って長期休眠ユーザーが戻ってくるものだからです。
+
+## 次のアクション — いちばん大事なキーを今日、封筒に入れる
+
+すべてのキーを一度に移行する必要はありません。まず、消えたら星1がつくデータを1つ選んでください。お気に入り、学習の進捗、書きかけの下書き。それを封筒形式に包んで v を振れば、次の形状変更が来たときに移行関数を1本書くだけで済む土台が整います。
+
+あわせて、旧形式の実データを JSON フィクスチャとしてリポジトリに残し、移行チェーンのテストを1本書いておくと、この層は以後ほとんど手がかかりません。
+
+```typescript
+// __tests__/favorites-migration.test.ts
+// jest 設定で @react-native-async-storage/async-storage/jest/async-storage-mock を指定しておきます
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { loadFavorites } from '../storage/favorites';
+
+const V1_FIXTURE = JSON.stringify(['w_001', 'w_002', 'w_001']);
+
+it('v1 の生配列が現行スキーマまで移行され、重複が除かれます', async () => {
+  await AsyncStorage.setItem('favorites', V1_FIXTURE);
+  const result = await loadFavorites();
+  expect(result.map((f) => f.id)).toEqual(['w_001', 'w_002']);
+  expect(result.every((f) => f.addedAt > 0)).toBe(true);
+});
+```
+
+あの朝の星1レビューに、私は返信する手段を持っていません。同じ一行を受け取る方が一人でも減れば、これを書いた甲斐があります。

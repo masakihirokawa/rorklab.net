@@ -1,0 +1,214 @@
+---
+title: "Schema Versioning for Local Data in Rork Apps — Shipping Updates Without Wiping a Single Favorite"
+slug: "rork-local-data-schema-versioning-migration-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-12T11:00"
+author: "Rork Lab"
+description: "How I stopped losing users' locally stored data when shipping updates to Rork apps. A complete TypeScript migration runner with envelope versioning, backup keys, fixture tests, and the rule that keeps EAS Update schema-neutral."
+tags: ["Rork", "AsyncStorage", "Data Migration", "EAS Update", "Long-term Maintenance"]
+highlights:
+  - "A complete TypeScript migration runner that wraps AsyncStorage values in a versioned envelope"
+  - "The operational boundary that keeps EAS Update (OTA) schema-neutral, and the rollback failure scenario behind it"
+  - "A measurement recipe for deciding how long to keep backups and when old migration functions can be retired"
+---
+
+Last winter, the morning after I shipped an update to one of my wallpaper apps, two one-star reviews were waiting for me. Both said essentially the same thing: "All my favorites are gone."
+
+The cause was a change in storage format. I had been saving favorites in AsyncStorage as a plain array of wallpaper IDs (string[]), and the update switched to an array of objects carrying a timestamp. The new code could only read the new shape, so it overwrote the old data with an empty default. Favorites that users had collected over months disappeared because of roughly ten lines I changed.
+
+A server database would never fail this way. You write a migration, run it before deploy, and roll back if it breaks. That discipline is taken for granted on the backend. Yet a surprising number of apps — mine included, at the time — operate local on-device data with no such discipline at all.
+
+After that morning, I moved every app I build with Rork onto a shared migration layer. What follows is the full implementation, plus the operational rules that settled into place while running several apps in parallel over the long term.
+
+## Why Local Data Breaks More Easily Than a Server Database
+
+A server migration runs once, against one database. Local data is different. There are as many databases as there are devices, and each one migrates at its own moment, from its own starting version. Devices jumping three versions at once are not rare at all.
+
+And you cannot reach any of them. There is no production server to SSH into. The only repair tool you have is "ship fix-up code in the next update" — and by the time it arrives, the user may have already deleted your app. As an indie developer, you are also the support desk that receives the complaint.
+
+Rork apps, being Expo-based, add one more wrinkle: OTA delivery through EAS Update. Replacing only the JavaScript without store review is a real advantage, but it also raises the frequency of the "new code, old data" state. Because OTA rollbacks are instant too, you can even get the reverse mismatch: "old code, new data."
+
+Building with an AI tool amplifies all of this. Ask Rork to "add a saved-at timestamp to favorites" and it will happily rewrite the types and the UI in one pass. What it will not consider — unless you tell it — is the old-format data already sitting on users' devices. The faster you can change code, the more often code and data drift apart. That is exactly why the discipline around local data needs to be in place first.
+
+## The Core of the Design Is a Single Integer — Envelopes and Schema Versions
+
+The rule I apply across all my apps is simple: every JSON value goes into an "envelope" before it is stored.
+
+```json
+{ "v": 3, "data": [{ "id": "w_201", "addedAt": 1749690000000 }] }
+```
+
+The shape of the payload (data) is free to change as often as it needs to. In exchange, every shape change bumps the envelope version v by one and comes with exactly one function that converts v2 data into v3 data. At read time, you apply the conversion functions in order, from the stored version up to the current one. That is the whole design.
+
+One detail matters: do not encode the version into the key name. Once you start creating keys like favorites_v2, you end up managing migrations and stale-key cleanup as two separate problems, and soon nobody can say which key is authoritative. Keep one key, and let only the integer inside the envelope move forward. In my experience this is the shape least likely to produce accidents.
+
+The earlier question — whether to use AsyncStorage, MMKV, or SQLite in the first place — is covered in [my comparison of the three local storage options](/articles/rork-dev/rork-local-storage-asyncstorage-mmkv-sqlite-guide), so here I will stay focused on protecting the data after you have chosen.
+
+## Implementing the Migration Runner — Sequential Steps, Backups, and Refusing Future Schemas
+
+The module below is the heart of the design. It converts old envelopes up to the current shape step by step, stashes the original before touching it, and refuses to touch versions it does not know.
+
+```typescript
+// storage/migrations.ts — schema migration runner
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+export const SCHEMA_VERSION = 3;
+
+type Envelope = { v: number; data: unknown };
+
+type Migration = {
+  from: number; // version before migration; only from → from+1 steps allowed
+  migrate: (data: unknown) => unknown;
+};
+
+const migrations: Migration[] = [
+  {
+    // v1: raw array of wallpaper IDs → v2: objects with a timestamp
+    from: 1,
+    migrate: (data) =>
+      (data as string[]).map((id) => ({ id, addedAt: 0 })),
+  },
+  {
+    // v2 → v3: fill missing addedAt with the current time, drop duplicate IDs
+    from: 2,
+    migrate: (data) => {
+      const seen = new Set<string>();
+      return (data as { id: string; addedAt: number }[])
+        .filter((f) => (seen.has(f.id) ? false : (seen.add(f.id), true)))
+        .map((f) => ({ ...f, addedAt: f.addedAt || Date.now() }));
+    },
+  },
+];
+
+export async function readWithMigration<T>(
+  key: string,
+  fallback: T,
+): Promise<T> {
+  const raw = await AsyncStorage.getItem(key);
+  if (raw === null) return fallback;
+
+  let envelope: Envelope;
+  try {
+    const parsed = JSON.parse(raw);
+    // Data saved before envelopes existed (a raw array, say) counts as v1
+    envelope =
+      parsed && typeof parsed === 'object' && 'v' in parsed && 'data' in parsed
+        ? (parsed as Envelope)
+        : { v: 1, data: parsed };
+  } catch {
+    return fallback; // corrupted JSON: start from defaults, log it elsewhere
+  }
+
+  if (envelope.v === SCHEMA_VERSION) return envelope.data as T;
+
+  // Never read or write a future schema.
+  // This protects against old code clobbering new data after an OTA rollback.
+  if (envelope.v > SCHEMA_VERSION) return fallback;
+
+  // Stash the original before migrating (kept for one generation; see below)
+  await AsyncStorage.setItem(`${key}.backup.v${envelope.v}`, raw);
+
+  let { v, data } = envelope;
+  while (v < SCHEMA_VERSION) {
+    const step = migrations.find((m) => m.from === v);
+    if (!step) return fallback; // a gap is a design bug; defaults beat data loss
+    data = step.migrate(data);
+    v += 1;
+  }
+
+  await AsyncStorage.setItem(key, JSON.stringify({ v, data }));
+  return data as T;
+}
+```
+
+Several judgment calls are baked into this code, so let me spell out the reasons.
+
+First, migrations are restricted to single from → from+1 steps. The moment you allow a "v1 straight to v3" express function, the number of combinations grows with every release and becomes untestable. With single steps, adding a new version always means writing exactly one new function.
+
+Second, the original value is stashed before conversion. Migration bugs are discovered after the migration has run — that is their nature. As long as the original survives, a follow-up update can restore from the backup key. On the morning of those one-star reviews, I had no such option.
+
+Third, if the stored v is greater than the current SCHEMA_VERSION, the runner neither reads nor writes. As described below, this situation genuinely occurs when OTA rollbacks are involved. If you wrote defaults back here, every rollback would erase user data.
+
+Screens never call the runner directly. They go through a thin module per data type:
+
+```typescript
+// storage/favorites.ts — screens use this module and nothing else
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { readWithMigration, SCHEMA_VERSION } from './migrations';
+
+export type Favorite = { id: string; addedAt: number };
+const KEY = 'favorites';
+
+export async function loadFavorites(): Promise<Favorite[]> {
+  return readWithMigration<Favorite[]>(KEY, []);
+}
+
+export async function saveFavorites(list: Favorite[]): Promise<void> {
+  await AsyncStorage.setItem(
+    KEY,
+    JSON.stringify({ v: SCHEMA_VERSION, data: list }),
+  );
+}
+```
+
+## Where to Draw the Line with Rork — No Direct Storage Access in Screens
+
+When Rork generates screens, its default habit is to write AsyncStorage.getItem directly inside components. Once reads and writes are scattered across screens, enforcing the envelope format everywhere stops being realistic.
+
+So I add one sentence to every feature prompt:
+
+"All AsyncStorage reads and writes must go through the modules under storage/ (loadFavorites / saveFavorites). Do not import AsyncStorage directly from screen components. Keep the { v, data } envelope format for everything stored."
+
+That alone pulls the generated code toward a repository pattern. As a final check, I run one line to confirm no stray imports remain outside storage/:
+
+```bash
+grep -rn "from '@react-native-async-storage" app/ components/ | grep -v storage/
+```
+
+Empty output means it passed. The most reliable way to make an AI respect a design rule, I have found, is to phrase the rule so that compliance can be checked mechanically.
+
+## Three Rules That Came Out of Actually Operating This
+
+The operational rules have mattered even more than the implementation. Running several wallpaper apps in parallel, I eventually settled on these three.
+
+### Rule 1: Never ship a schema change over OTA
+
+EAS Update swaps JavaScript, so it is tempting to push migration-carrying code through it. But while OTA adoption ramps up fast, OTA rollbacks are instant too. Suppose you deliver the v3 migration over the air, then roll back because of an unrelated bug. Devices are now left with "v3 data plus code that only knows v2." The runner above protects them by falling back to defaults — but from the user's point of view, their data is still gone.
+
+Since then, data-shape changes ride only on store-reviewed binary releases, and OTA is reserved for schema-neutral fixes: copy, styling, logic. Together with respecting runtimeVersion boundaries, this rule sits at the top of my release checklist.
+
+### Rule 2: Keep backup keys for 30 days after the next store release
+
+Backup keys kept forever quietly eat into AsyncStorage capacity (about 6MB by default on Android). Deleting them immediately, though, throws away your only recovery path when a migration bug surfaces. My cleanup code, run at launch, deletes a backup 30 days after the next store release starts rolling out. In my experience, migration-related bug reports have almost all arrived within two weeks of a release.
+
+### Rule 3: Measure the distribution of stored schema versions
+
+Attach the stored v to one analytics event at read time, and you get a live histogram of which data generations still exist on user devices. In my most recent release, four weeks out, reads that required migration from an old schema were down to 0.6% of all sessions. With that number visible, "when can the v1 migration be deleted" becomes a data question rather than a gut feeling.
+
+For what it is worth, I keep migration functions for another six months even after the number drops below 1%. Deleting them improves nobody's experience — and it is precisely after you delete them that a long-dormant user comes back.
+
+## Your Next Action — Put Your Most Important Key in an Envelope Today
+
+There is no need to migrate every key at once. Pick the one piece of data whose loss would earn you a one-star review — favorites, learning progress, an unfinished draft. Wrap it in the envelope format and assign it a version. That gives you a foundation where the next shape change costs exactly one migration function.
+
+While you are at it, keep real old-format data in the repository as JSON fixtures and write one test for the migration chain. After that, this layer needs almost no attention.
+
+```typescript
+// __tests__/favorites-migration.test.ts
+// Point jest at @react-native-async-storage/async-storage/jest/async-storage-mock
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { loadFavorites } from '../storage/favorites';
+
+const V1_FIXTURE = JSON.stringify(['w_001', 'w_002', 'w_001']);
+
+it('migrates a raw v1 array to the current schema and removes duplicates', async () => {
+  await AsyncStorage.setItem('favorites', V1_FIXTURE);
+  const result = await loadFavorites();
+  expect(result.map((f) => f.id)).toEqual(['w_001', 'w_002']);
+  expect(result.every((f) => f.addedAt > 0)).toBe(true);
+});
+```
+
+I still have no way to reply to those one-star reviews from that morning. If this spares even one developer from receiving the same single-line review, it was worth writing down.
