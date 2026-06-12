@@ -1,0 +1,103 @@
+---
+title: "Adding a Home Screen Widget to a Rork App — Making WidgetKit Work Within Expo's Constraints"
+slug: "rork-expo-home-screen-widget-implementation"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-06-12T09:55"
+updated: "2026-06-12T09:55"
+author: "Rork Lab"
+description: "Rork generates Expo apps, and home screen widgets can't be written in React Native. Here's how to wire up WidgetKit with a config plugin and App Groups — including the parts that tripped me up."
+tags: ["Rork", "WidgetKit", "Expo", "iOS", "widgets"]
+---
+
+The moment you ask Rork's AI to "add a home screen widget" to your published app is the moment you first hit the real boundary of the Expo platform. The chat happily generates something — but what comes back is a widget-styled card *inside* your app, not an actual widget you can place on the iOS home screen. When I first tried this, I spent a confused half hour rewriting prompts before accepting that no prompt was going to fix it.
+
+The reason is structural, not a limitation of the AI. And the good news is that there is a workable path to a real widget without abandoning your Rork-generated Expo app. I went through this while prototyping a "wallpaper of the day" widget for one of my image apps, and as an indie developer who has shipped apps since 2014 — including a wallpaper portfolio that has grown past 50 million cumulative downloads on the native side — the Expo route turned out to be surprisingly different from what I was used to in UIKit land. Here is the route that worked, including the two places where I lost real time.
+
+## Why widgets can't be generated: they run outside your app
+
+An iOS home screen widget is not a view in your app. It's an **App Extension** — a separate binary that runs in a system-managed process, completely outside your app's runtime. Inside that process there is no JavaScript engine at all. The only thing WidgetKit will render is SwiftUI.
+
+That means no amount of React Native code — however polished — can become a home screen widget. Rork's chat AI generates Expo (React Native) code, so when you ask for a widget, an in-app imitation is genuinely the best it can do. Understanding this early saves you the prompt-rewriting spiral: the widget layer must be written in Swift, full stop.
+
+## Three implementation routes — and why I picked the config plugin
+
+For a Rork-generated Expo app, your realistic options come down to three:
+
+- **① Inject an extension target with a config plugin** (such as `@bacons/apple-targets`): keeps the managed workflow intact and generates the widget's Xcode target at build time
+- **② Run `npx expo prebuild` and drop to the bare workflow**: maximum freedom, but from then on every UI change you make through Rork's chat has to be reconciled with your local native project by hand
+- **③ Rebuild the app with Rork Max's native SwiftUI generation**: the friendliest path to WidgetKit, but it means rebuilding an app you've already shipped
+
+For adding a widget to an app that's already live, I'd choose ① every time, for one reason: **it doesn't break Rork's code generation loop**. Once you prebuild, you own the merge problem between chat-driven changes and your native edits forever. Running several apps in parallel as a solo developer, that ongoing reconciliation cost is the one I most want to avoid.
+
+A side benefit: the build still runs on EAS Build in the cloud, so you never have to open Xcode locally. The workflow I described in [Rork Max Cloud Compile — Building Native Apps Without a Mac](/articles/rork-dev/rork-max-cloud-compile-guide) applies unchanged.
+
+## App Groups: the bridge between your JS code and the widget
+
+The first thing to design is data flow. Your app (JavaScript) and your widget (Swift) are separate processes that share no memory and no storage. The standard bridge is an **App Group**: register an identifier like `group.com.example.myapp` on both targets, and both sides can read and write a shared `UserDefaults` suite.
+
+On the React Native side you write to it through a shared-preferences module or a tiny custom Expo Module. For my wallpaper widget prototype, the JS side writes "today's image URL and title" into the App Group, and the Swift widget only reads. I deliberately kept it one-directional — treating the widget as a read-only view avoids a whole class of synchronization headaches.
+
+```typescript
+// JS side: publish today's content to the App Group UserDefaults
+// (via a small native module built with expo-modules-core)
+import { setWidgetData } from "./modules/widget-bridge";
+
+export async function publishTodayToWidget(item: WallpaperItem) {
+  // Keep everything the widget reads in one JSON value (avoids key sprawl)
+  await setWidgetData("group.net.example.wallpaper", {
+    title: item.title,            // e.g. "Shinjuku Gyoen After the Rain"
+    imageUrl: item.thumbnailUrl,  // a thumbnail is plenty for a widget
+    updatedAt: new Date().toISOString(),
+  });
+  // Expected behavior: the widget picks this up on its next timeline refresh
+}
+```
+
+One warning about images: the widget process has a hard memory ceiling (roughly 30 MB in practice). Load a full-resolution wallpaper and the widget simply fails to render. Pass a thumbnail URL, or pre-shrink the image and drop it as a file into the App Group's shared container.
+
+## The WidgetKit side is short — once "timelines" click
+
+The Swift code lives inside the target your config plugin generates. WidgetKit's model is that you hand the OS an array of future snapshots — a *timeline* — and the OS decides when to render them. Once that clicks, there isn't much code to write.
+
+```swift
+// Widget side: read the daily data from the App Group and display it
+struct DailyEntry: TimelineEntry {
+    let date: Date
+    let title: String
+}
+
+struct DailyProvider: TimelineProvider {
+    func getTimeline(in context: Context,
+                     completion: @escaping (Timeline<DailyEntry>) -> Void) {
+        // Read the UserDefaults suite the main app wrote to
+        let store = UserDefaults(suiteName: "group.net.example.wallpaper")
+        let title = store?.string(forKey: "title") ?? "Today's Pick"
+        let entry = DailyEntry(date: Date(), title: title)
+        // Ask for exactly one refresh at 6 AM tomorrow (saves refresh budget)
+        let next = Calendar.current.nextDate(after: Date(),
+                     matching: DateComponents(hour: 6), matchingPolicy: .nextTime)!
+        completion(Timeline(entries: [entry], policy: .after(next)))
+    }
+    // placeholder / getSnapshot omitted — both are a few lines
+}
+// Expected behavior: the home screen widget shows today's title and
+// rolls over to new content at the 6 AM timeline refresh each morning
+```
+
+The thing the official docs underplay is the **refresh budget**. Timeline reloads are scheduled by the OS, and each widget gets a limited number per day — in my testing, somewhere in the 40–70 range depending on how often the user actually views it. Build a "refresh every 15 minutes" timeline and your widget will silently stop updating by mid-afternoon. For daily content, a single `.after` refresh per day is all you need; for the rare action that must reflect immediately, call `WidgetCenter.shared.reloadAllTimelines()` from the app side.
+
+## The two places I actually got stuck
+
+The implementation itself was the easy half. The build pipeline cost me more time, in two specific spots.
+
+First, **provisioning**. The widget is its own target with its own bundle ID (for example `net.example.wallpaper.widget`), which needs its own provisioning profile. EAS Build generates these automatically — but when I added the App Group entitlement *after* the first build, a stale profile stuck around and produced signing errors. Deleting the profile via `eas credentials` and letting it regenerate fixed it. If you switch between development, preview, and production profiles, the failure modes in [Switching EAS Build Profiles Broke My Rork App — development / preview / production Pitfalls](/articles/rork-dev/rork-eas-build-profile-switching-troubleshooting) are worth a read before you start.
+
+Second, **device testing**. Widgets do run in the simulator, but the refresh-budget behavior is completely different from a real device. My daily-refresh logic only proved trustworthy after running on a physical iPhone for two or three days. For getting builds onto a device, the steps in [Testing on a Real iPhone with Rork Companion — QR Code Setup Without a Developer Account](/articles/rork-basics/rork-companion-ios-real-device-test-guide) still apply — with one caveat: a build that includes a widget extension can't be previewed through Companion, so you'll be going through EAS Build and TestFlight.
+
+## Start with a read-only widget that shows one string
+
+Every feature you add to a widget pushes against the memory ceiling and the refresh budget, so make your first widget almost embarrassingly small: read one string from the App Group and display it. Once that pipeline works end to end — JS write, App Group, timeline, TestFlight — images and deep links are incremental additions rather than new battles. From years of running content apps, I can say the daily glance a widget earns you moves retention more than its size suggests. Expo makes you work for it, but it's worth the detour.
+
+Thanks for reading, and good luck with your first widget build.
