@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "APPLE-AI — Appleが初回DL 200万未満の開発者にFoundation Modelsを無償開放。個人開発アプリへのAI組み込みコストが大幅に低下",
-    "SWIFT-API — Foundation Modelsのサーバーサイド統合で、ClaudeやGeminiを同一Swift APIから呼び出し可能に。画像入力にも対応",
-    "KOTLIN-MIGRATION — Android Studioの移行エージェントがReact Native製アプリをネイティブKotlinへ自動移行。Rork生成アプリの将来の選択肢に",
-    "RORK-MAX — Rork MaxはネイティブSwiftコードを生成（月$200）。iPhone・iPad・Watch・TV・Vision Pro・iMessageまで対応",
-    "SIMULATOR — ブラウザベースのストリーミングiOSシミュレータで、XcodeやMacなしに実機相当のApple環境で検証可能",
-    "SWIFTUI — WWDC 2026でSwiftUIが進化。並べ替え可能コンテナ・任意コンテナのスワイプアクション・最大2倍速のレイアウト",
+    "FUNDING — Rorkが$15Mを調達。モバイル特化のノーコードAIという立ち位置に投資家の評価が集まっています",
+    "MAX-NATIVE — Rork MaxはAR/LiDAR・Metal 3D・ウィジェット・Dynamic Island・Live Activities・HealthKit・Core MLなど、React Nativeでは届かないネイティブ領域に対応",
+    "MOBILE-FIRST — BoltやLovableがWebアプリ中心なのに対し、Rorkはモバイルアプリ専業。説明文から本番品質のアプリを生成します",
+    "WWDC — WWDC26が閉幕。AIがOSのコア機能となり、iOS 27世代へ。ウィジェットやLive Activitiesの価値がさらに上がる局面です",
+    "PRICING — Rorkは無料で開始でき有料$25/月〜、Rork Maxは$200/月。Expoで素早く検証し、必要に応じてMaxでネイティブ化する多段戦略が現実的",
+    "ALL-APPLE — Rork MaxのSwift直接生成はiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでカバーします",
   ],
   en: [
-    "APPLE-AI — Apple opens Foundation Models free to developers under 2M first-time downloads, slashing the cost of adding AI to indie apps",
-    "SWIFT-API — Foundation Models server-side integration lets you call Claude and Gemini through the same Swift API, now with image input",
-    "KOTLIN-MIGRATION — Android Studio's migration agent converts React Native apps into native Kotlin automatically — a future path for Rork-built apps",
-    "RORK-MAX — Rork Max generates native Swift code ($200/mo), covering iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
-    "SIMULATOR — A browser-based streaming iOS simulator lets you test on a real Apple environment without Xcode or Mac hardware",
-    "SWIFTUI — SwiftUI evolves at WWDC 2026 with reorderable containers, swipe actions for any container, and layouts up to 2x faster",
+    "FUNDING — Rork raises $15M, drawing fresh attention to its mobile-first no-code AI positioning",
+    "MAX-NATIVE — Rork Max reaches native territory React Native can't: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, and on-device Core ML",
+    "MOBILE-FIRST — While Bolt and Lovable focus on web apps, Rork builds mobile apps — production-ready from a plain-language description",
+    "WWDC — WWDC26 wraps with AI becoming a core OS capability; the iOS 27 generation raises the value of widgets and Live Activities",
+    "PRICING — Free to start, paid plans from $25/mo, Rork Max at $200/mo — ship fast on Expo, then go native with Max where it pays off",
+    "ALL-APPLE — Rork Max generates pure Swift covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
   ],
 };
 
