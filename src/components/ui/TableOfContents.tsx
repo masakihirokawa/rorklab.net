@@ -45,7 +45,7 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
     } else {
       // Fallback: build list from DOM (non-premium articles or no initialItems)
       const tocItems: TocItem[] = [];
-      headings.forEach((heading, i) => {
+      headings.forEach((heading) => {
         const el = heading as HTMLElement;
         tocItems.push({
           id: el.id,
@@ -71,6 +71,19 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
 
   if (items.length < 2) return null;
 
+  // Hierarchical numbering: H2 → "1." / H3 → "1.1" (follows heading order)
+  let h2Count = 0;
+  let h3Count = 0;
+  const numberedItems = items.map((item) => {
+    if (item.level === 2) {
+      h2Count += 1;
+      h3Count = 0;
+      return { ...item, number: `${h2Count}.` };
+    }
+    h3Count += 1;
+    return { ...item, number: `${Math.max(h2Count, 1)}.${h3Count}` };
+  });
+
   return (
     <nav
       style={{
@@ -95,7 +108,7 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
         {label}
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-        {items.map((item) => (
+        {numberedItems.map((item) => (
           <a
             key={item.id}
             href={`#${item.id}`}
@@ -108,7 +121,9 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
               }
             }}
             style={{
-              display: "block",
+              display: "flex",
+              alignItems: "baseline",
+              gap: 8,
               fontSize: 13,
               lineHeight: 1.6,
               padding: "4px 0",
@@ -119,7 +134,19 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
               borderLeft: item.level === 3 ? "1px solid var(--border-subtle)" : "none",
             }}
           >
-            {item.text}
+            <span
+              style={{
+                fontFamily: "'DM Mono', monospace",
+                fontSize: 11,
+                lineHeight: 1.6,
+                color: activeId === item.id ? "var(--accent-coral)" : "var(--text-dim)",
+                minWidth: item.level === 3 ? 26 : 20,
+                flexShrink: 0,
+              }}
+            >
+              {item.number}
+            </span>
+            <span>{item.text}</span>
           </a>
         ))}
       </div>
