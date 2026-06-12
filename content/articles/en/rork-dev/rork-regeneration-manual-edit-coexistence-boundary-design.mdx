@@ -1,0 +1,188 @@
+---
+title: "Keeping Manual Fixes Alive Across Rork Regenerations — Boundary Design for AI-Owned Code"
+slug: "rork-regeneration-manual-edit-coexistence-boundary-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-12T16:00"
+author: "Rork Lab"
+description: "A tiny copy-change request quietly reverted my week-old ATT fix. Here is the boundary architecture I use now: a guarded directory, one-line adapters, patch assets, and scoped prompts — with measured blast-radius numbers."
+tags: ["Rork", "Regeneration", "Code Management", "Git", "Long-term Operations"]
+highlights:
+  - "Measured blast radius: a one-line copy change request rewrote 7 files — and the boundary principles that assume this will happen"
+  - "A complete TypeScript adapter-layer pattern that isolates hand-written ad, billing, and analytics logic from AI-owned screens"
+  - "A git format-patch workflow that turns manual fixes into assets you can mechanically re-apply after every export"
+---
+
+In early June, a pre-release diff review stopped me cold. A fix I had written by hand the week before — a guard that kept the ads SDK from initializing while the ATT consent dialog was still on screen — was gone. Not commented out, not moved. Gone.
+
+The trigger was my own doing. I had asked Rork for a small change to some settings-screen copy, then exported the project as usual. Rork made the change I asked for, and along the way it also restored everything else to what it considered the correct generated state. From the model's point of view, my manual fix was just a deviation to be smoothed over.
+
+Regeneration is the core strength of Rork, and giving it up is not an option. At the same time, the longer you operate an app, the more reasons you accumulate to touch the exported code by hand: ad initialization order, billing event edge cases, emergency crash mitigations. So the real requirement is structural — keep regenerating, and keep manual fixes alive, at the same time.
+
+That incident pushed me to redraw my projects around an explicit split between land the AI owns and land a human protects. What follows is the whole approach: the measurements that motivated it, the implementation, and the day-to-day sync procedure.
+
+## First, measure how regeneration destroys manual edits
+
+A request in the Rork chat is not a file-level edit instruction. It is a statement about how the app should be, and the generator reorganizes whichever files it deems relevant to that state. The size of your request tells you almost nothing about the size of the rewrite.
+
+I wanted numbers rather than impressions, so I took a copy of a production project and issued three deliberately small requests, counting rewritten files with git diff --stat each time.
+
+```text
+Request                                          Files rewritten
+Change one button label on the settings screen        7
+Change home-screen card corner radius 8 -> 12          4
+Add one toggle to the settings screen                 11
+```
+
+Seven files for a single label change. Looking inside the diff, the target file was there as expected — alongside shared hooks and utilities that had been reformatted back into the generator's preferred shape. Most of that churn is harmless. The problem is that one or two lines of reverted manual work hide inside hundreds of lines of harmless churn, and no human reviews that reliably, release after release.
+
+The conclusion is not "avoid regeneration." It is: put manual fixes where regeneration cannot reach them.
+
+## The boundary principles — land that may be overwritten, land that may not
+
+I run on three rules, and only three.
+
+First, everything Rork generates — app/, components/, hooks/ — is treated as disposable. Any of it may be overwritten by the next regeneration, so no manual fix lives there directly.
+
+Second, hand-written code is quarantined in an independent directory I call guarded/. The name is irrelevant. What matters is that Rork never generates that path, and that the sync procedure can protect it mechanically.
+
+Third, generated code may touch guarded/ through exactly one import and one function call. The thinner the connection point, the cheaper the recovery: when regeneration wipes it, you restore one line, not a subsystem.
+
+The layout looks like this:
+
+```text
+project/
+├── app/              # Rork's land (may be overwritten at any time)
+├── components/       # same
+├── hooks/            # same
+├── guarded/          # human land (regeneration never reaches it)
+│   ├── ads/
+│   │   └── initializeAds.ts
+│   ├── analytics/
+│   │   └── track.ts
+│   └── billing/
+│       └── listeners.ts
+└── patches/          # patches for fixes that cannot move (see below)
+```
+
+## The adapter layer — screens call one thin entry point
+
+Take the ATT guard that vanished and pull it out of the AI's land. Before, the initialization logic sat directly inside app/_layout.tsx — a file that gets rewritten on every regeneration, which means any fix placed there is guaranteed to die eventually.
+
+The logic moves to guarded/ads/initializeAds.ts:
+
+```typescript
+// guarded/ads/initializeAds.ts
+// Guarantees ATT -> consent -> SDK init order. Safe to call twice.
+import { Platform } from "react-native";
+import mobileAds from "react-native-google-mobile-ads";
+import {
+  getTrackingPermissionsAsync,
+  requestTrackingPermissionsAsync,
+} from "expo-tracking-transparency";
+
+let started = false;
+
+export async function initializeAdsOnce(): Promise<void> {
+  if (started) return;
+  started = true;
+
+  try {
+    if (Platform.OS === "ios") {
+      const current = await getTrackingPermissionsAsync();
+      if (current.status === "undetermined") {
+        // Do not start the SDK while the dialog is up (this was the lost fix)
+        await requestTrackingPermissionsAsync();
+      }
+    }
+    await mobileAds().initialize();
+  } catch (e) {
+    // Never let ad init failure take the app down; log and allow retry
+    console.warn("[ads] initialize failed", e);
+    started = false;
+  }
+}
+```
+
+What stays on the screen side is a single entry point:
+
+```typescript
+// app/_layout.tsx (the only connection point in Rork's land)
+import { initializeAdsOnce } from "../guarded/ads/initializeAds";
+
+useEffect(() => {
+  void initializeAdsOnce();
+}, []);
+```
+
+When regeneration rewrites _layout.tsx, the loss is exactly one line. Recovery means restoring the import and the call. The body of the fix — the ATT ordering, the error handling — survives untouched.
+
+The same shape transfers directly to an analytics facade, billing event listeners, and Remote Config defaults. What these share is a failure mode: when they break, the screen looks fine, and the damage compounds quietly until it shows up in your numbers.
+
+## The sync procedure — receive regenerations on a branch, protect guarded/ mechanically
+
+Once the boundary exists, every export follows the same fixed procedure. I keep main as the store-facing source of truth and rork-sync as the landing branch for exports.
+
+```bash
+# 1. Land the export wholesale on the receiving branch
+git checkout rork-sync
+rsync -a --delete --exclude .git --exclude guarded --exclude patches \
+  ~/Downloads/rork-export/ ./
+git add -A && git commit -m "sync: rork export $(date +%Y%m%d)"
+
+# 2. Look at the blast radius as numbers, before reading any code
+git diff main...rork-sync --stat | tail -5
+
+# 3. Verify guarded/ has zero diff (anything else is a design violation)
+git diff main...rork-sync --stat -- guarded/ | wc -l   # must be 0
+
+# 4. Merge into main
+git checkout main
+git merge rork-sync
+
+# 5. Confirm the connection points survived
+grep -rn "initializeAdsOnce" app/ | wc -l   # must be >= 1
+```
+
+The order matters: steps 2 and 3 happen before the merge. Reading the stat line first means an anomaly — "a copy change that touched 30 files" — surfaces before you start reading diffs.
+
+Step 3 failed exactly once for me. The cause was instructive: I had pasted guarded code into the Rork chat while asking a question, and that content found its way into the generated output. The boundary is not something the AI remembers for you. It is something your procedure enforces.
+
+## Fixes that cannot move become patch assets
+
+Not every manual fix can migrate into guarded/. Some are one- or two-line edits inside generated files: adding removeClippedSubviews to a list screen's FlatList, adding a timeout to a generated fetch call.
+
+These live in patches/, one fix per patch:
+
+```bash
+# Squash the fix into one commit, then export it under a descriptive name
+git format-patch -1 HEAD -o patches/
+mv patches/0001-*.patch patches/flatlist-remove-clipped-subviews.patch
+
+# After every sync, re-apply the whole set mechanically
+git am --3way patches/*.patch
+# Only the patches that no longer apply will stop — review just those
+```
+
+Measured over five regenerations, 4 of my 9 patches kept applying cleanly; the other 5 were invalidated by structural drift in the generated code. I do not treat that as failure. A patch that stops applying is a precise signal that the fix should either be promoted into guarded/ or converted into a standing instruction in the Rork project notes.
+
+## Narrow the blast radius with prompts — but never use them as the boundary
+
+How you phrase requests does shrink the rewrite. I reran the one-label change with explicit constraints attached.
+
+Unconstrained, the request rewrote 7 files. With "change only the display copy on the settings screen; do not touch navigation, hooks, utilities, or any other screen" attached, it rewrote 2. Writing a standing instruction like "never modify anything under guarded/" into the project description helps as well.
+
+The effect is real, and I use it on every request. But prompts are not the boundary. Compliance is probabilistic and varies between generations. The structure — guarded/ plus patches — is the seawall; prompts just make the waves smaller. Keeping that hierarchy straight is what pays off over months of operation.
+
+## The division of labor that operation settled on
+
+After about half a year of running this way, the split between what Rork owns and what I protect has stabilized.
+
+Layout, navigation, copy, colors, icons — anything that breaks visibly the moment the app launches — belongs entirely to Rork. That is also where regeneration delivers the most value.
+
+Ad and billing initialization order, data persistence, and analytics dispatch live in guarded/. The yardstick is simple: the longer it takes to notice a breakage, the more it belongs in human land. A dropped purchase event or a broken init sequence shows nothing on screen and only surfaces in your numbers days later. As an indie developer, those days come straight out of revenue and user trust.
+
+On time spent: the diff review I used to do at every sync took around 30 minutes; with the boundary in place it fits in 5 to 10, because the review has collapsed into "confirm guarded/ has zero diff" plus "judge the patches that stopped applying."
+
+If you adopt one thing, start by creating guarded/ and moving a single piece of ad or billing initialization into it. The calm of seeing your connection point shrink to one line shows up immediately — in how lightly your finger rests on the regenerate button. I hope this gives you solid footing for a long relationship with regeneration.
