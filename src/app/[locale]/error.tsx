@@ -29,6 +29,7 @@ export default function Error({
 
   return (
     <div
+      data-error-boundary="true"
       style={{
         display: "flex",
         flexDirection: "column",

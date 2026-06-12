@@ -8,17 +8,23 @@ import blogData from "@/generated/blog.json";
  * internal binding directly.
  */
 async function readStaticAsset(path: string): Promise<string> {
-  try {
-    const { env } = getCloudflareContext();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const assets = (env as any).ASSETS;
-    if (!assets?.fetch) return "";
-    const res = await assets.fetch(new URL(path, "https://assets.local"));
-    if (!res.ok) return "";
-    return await res.text();
-  } catch {
-    return "";
+  // Retry once: ASSETS fetch can transiently fail during deploy transitions.
+  // Returning "" renders an empty article body, which must never be cached
+  // at the edge (see cache-worker.js broken-HTML guard).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const { env } = getCloudflareContext();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const assets = (env as any).ASSETS;
+      if (!assets?.fetch) return "";
+      const res = await assets.fetch(new URL(path, "https://assets.local"));
+      if (res.ok) return await res.text();
+    } catch {
+      // fall through to retry
+    }
+    if (attempt === 0) await new Promise((r) => setTimeout(r, 150));
   }
+  return "";
 }
 
 export interface ArticleMeta {

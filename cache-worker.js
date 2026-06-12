@@ -10,7 +10,7 @@
 import nextHandler from "./.open-next/worker";
 
 // ── Config ──────────────────────────────────────────────────────
-const DEPLOY_VERSION = "2026-06-12-toc-numbering";
+const DEPLOY_VERSION = "2026-06-12-error-nocache";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 function injectPolyfill(response) {
@@ -135,6 +135,18 @@ export default {
             (async () => {
               try {
                 const body = await forCache.arrayBuffer();
+                // Guard (2026-06-12): never cache broken HTML — error-boundary
+                // pages, truncated streams, or article pages with an empty body.
+                // SSR errors stream with HTTP 200, so status alone is not enough.
+                const text = new TextDecoder("utf-8").decode(body);
+                const isArticlePath = /\/articles\/[^/]+\/[^/]+/.test(url.pathname);
+                if (
+                  text.includes("data-error-boundary") ||
+                  !text.includes("</html>") ||
+                  (isArticlePath && text.includes('<div class="article-content"></div>'))
+                ) {
+                  return; // skip caching; next request gets fresh SSR
+                }
                 const h = new Headers(forCache.headers);
                 h.set("Cache-Control", `public, s-maxage=${CACHE_TTL}, stale-while-revalidate=86400`);
                 h.set("X-Cache", "MISS");
@@ -158,6 +170,18 @@ export default {
     // ── Non-200 / non-HTML passthrough ────────────────────────
     const ct = response.headers.get("content-type") || "";
     if (ct.includes("text/html")) {
+      // 5xx HTML must never be cached by any layer (browser / zone / tiered)
+      if (response.status >= 500) {
+        const h = new Headers(response.headers);
+        h.set("Cache-Control", "no-store");
+        return injectPolyfill(
+          new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: h,
+          })
+        );
+      }
       return injectPolyfill(response);
     }
     return response;
