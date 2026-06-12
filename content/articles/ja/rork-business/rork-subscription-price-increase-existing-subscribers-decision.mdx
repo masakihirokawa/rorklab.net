@@ -1,0 +1,214 @@
+---
+title: "サブスクの値上げで既存ユーザーの価格をどうするか — App Store と Google Play の価格改定実務"
+slug: "rork-subscription-price-increase-existing-subscribers-decision"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-13T08:10"
+updated: "2026-06-13T08:10"
+author: "Rork Lab"
+description: "サブスク値上げの最初の関門は既存購読者の扱いです。増収になる追加解約率の上限の試算、App Store と Google Play の同意フローの違い、PRICE_INCREASE・EXPIRED 通知の処理、改定後のコホート計測までを個人開発の視点で整理します。"
+tags: ["Rork", "サブスクリプション", "価格改定", "App Store", "Google Play", "収益化"]
+highlights:
+  - "月額480円を600円にするような値上げで、追加解約が何%までなら増収かを損益分岐の式と TypeScript の試算コードで判断できるようになる"
+  - "App Store と Google Play で大きく異なる価格改定フローを把握し、PRICE_INCREASE・EXPIRED 通知のサーバー処理を実装できるようになる"
+  - "ペイウォールの価格ハードコードの罠を localizedPrice の動的取得で回避し、EXPIRED の理由付き記録で改定後の解約率をコホート計測できるようになる"
+---
+
+今年の春、運営しているサイトの有料メンバーシップの月額を改定しました。Stripe の管理画面で新しい Price を作る作業自体は 30 分ほどで終わったのですが、その手前で一番時間を使ったのは「すでに購読してくださっている方の価格をどうするか」という判断でした。
+
+結論として私は既存の方の価格を据え置きましたが、アプリのサブスクで同じことをやろうとすると、判断も実装も Stripe よりずっと複雑になります。App Store と Google Play では価格改定の仕組みがまったく違い、既存購読者の扱いを一歩間違えると、増収のつもりの値上げが解約の波に変わるからです。AI 機能を組み込んだアプリが増えた 2026 年は、API 原価の変動で価格を見直す場面がどのアプリにも回ってきます。個人開発の視点で、価格改定を増収で終わらせるための判断と実装を順に見ていきます。
+
+## 値上げの前に「増収になる追加解約率の上限」を計算する
+
+値上げの議論は「いくら上げるか」から始まりがちですが、先に決めるべきは「既存購読者を新価格に移すか、据え置くか」です。そしてこの判断は感覚ではなく、損益分岐の式で出せます。
+
+既存購読者にも新価格を適用する場合、値上げによる単価増と、値上げをきっかけにした追加解約はトレードオフになります。月額 p 円のプランを Δp 円値上げするとき、値上げ起因の追加解約率 x が次の値を超えると減収です。
+
+x = Δp ÷ (p + Δp)
+
+たとえば月額 480 円を 600 円に改定する場合、120 ÷ 600 = 0.2 なので、追加解約が 20% 未満なら増収、超えれば減収になります。言い換えると、25% の値上げは「購読者の 5 人に 1 人が離脱しても元が取れる」変更です。手元の数字で確かめられるよう、簡単なシミュレーターを用意しました。
+
+```typescript
+// 値上げの損益分岐シミュレーター
+// 「既存にも新価格を適用」した場合に許容できる追加解約率の上限を出します
+type PriceChangePlan = {
+  currentPrice: number;   // 現在の月額（円）
+  newPrice: number;       // 改定後の月額（円）
+  subscribers: number;    // 現在の購読者数
+  baselineChurn: number;  // 平時の月次解約率（例: 0.04 = 4%）
+};
+
+function breakEvenExtraChurn(plan: PriceChangePlan): number {
+  const delta = plan.newPrice - plan.currentPrice;
+  return delta / plan.newPrice; // 追加解約率がこの値を超えると減収
+}
+
+function monthlyRevenueAfter(plan: PriceChangePlan, extraChurn: number): number {
+  const retained = plan.subscribers * (1 - plan.baselineChurn - extraChurn);
+  return Math.round(retained * plan.newPrice);
+}
+
+const plan: PriceChangePlan = {
+  currentPrice: 480,
+  newPrice: 600,
+  subscribers: 800,
+  baselineChurn: 0.04,
+};
+
+console.log(`損益分岐の追加解約率: ${(breakEvenExtraChurn(plan) * 100).toFixed(1)}%`);
+console.log(`追加解約 8% の場合の月次収益: ${monthlyRevenueAfter(plan, 0.08)}円`);
+// 出力:
+// 損益分岐の追加解約率: 20.0%
+// 追加解約 8% の場合の月次収益: 422400円
+```
+
+注意したいのは、この式が教えてくれるのはあくまで上限だということです。実際の追加解約率は、値上げ幅だけでなく通知の伝え方や同意フローの設計でも動きます。一方の「新規のみ値上げ・既存は据え置き」は追加解約リスクがほぼゼロの安全策ですが、増収は新規流入のペースに依存するため効果が出るまで時間がかかります。私が自分のメンバーシップで据え置きを選んだのも、リスクを取らない代わりに増収を急がないという判断でした。どちらを選ぶにしても、ここから先のストア側の仕組みを知らないままでは選べません。
+
+## App Store の価格改定 — 同意が要るケースと要らないケース
+
+App Store Connect でサブスクリプションの価格を変更するとき、最初に問われるのが「既存購読者の価格を維持するか」です。
+
+- **既存購読者の価格を維持する**: 新規購読者だけが新価格になります。既存の方は現在の価格のまま更新が続き、同意フローは発生しません
+- **既存購読者にも新価格を適用する**: Apple がメール・プッシュ通知・アプリ内表示で購読者に知らせます。値上げの幅と地域によって「通知のみで自動適用」と「明示的な同意が必要」に分かれます
+
+同意なしで適用できるのは、目安として「値上げが年 1 回まで・月額換算で 5 ドルかつ 50% 以内（年額プランは 50 ドルかつ 50% 以内）・現地の法令が許容している」場合とされています。この枠を超える値上げや、同意が法的に必須となる地域では、購読者が同意シートで承諾しない限り新価格は適用されず、**同意しないまま更新日を迎えるとサブスクリプションは自動的に終了します**。
+
+ここが Stripe との一番の違いです。Web のサブスクなら値上げの適用は基本的に事業者の裁量ですが、App Store では「同意の取れない値上げ」が解約という不可逆のイベントに直結します。値上げ幅を同意不要の範囲に収めるのか、同意必須でも踏み込むのかは、前節の損益分岐と合わせて決める必要があります。
+
+なお、同意の要否を分ける実際の閾値や地域の扱いは、改定操作のときに App Store Connect 上に表示される条件が正です。実行前に必ず画面側で確認してください。
+
+## 同意の行方は ASSN v2 の PRICE_INCREASE と EXPIRED で追う
+
+既存購読者への適用を選んだ瞬間から、サーバーには App Store Server Notifications V2 で「同意の行方」が流れてきます。見るべきイベントは 3 つです。
+
+- **PRICE_INCREASE + subtype PENDING**: 同意が必要な値上げで、購読者がまだ応答していない状態
+- **PRICE_INCREASE + subtype ACCEPTED**: 購読者が同意した、または同意不要の値上げの通知が完了した状態
+- **EXPIRED + subtype PRICE_INCREASE**: 同意が得られないまま期限を迎え、サブスクリプションが終了した状態
+
+```typescript
+// ASSN v2 Webhook での価格改定イベント処理（Cloudflare Workers + Hono）
+// decodeNotification は JWS の署名検証とデコードを行う自前のユーティリティです
+app.post("/webhooks/app-store", async (c) => {
+  const payload = await decodeNotification(await c.req.text());
+  const { notificationType, subtype } = payload;
+  const tx = payload.transactionInfo; // デコード済みの signedTransactionInfo
+
+  switch (notificationType) {
+    case "PRICE_INCREASE":
+      if (subtype === "PENDING") {
+        // 同意待ち: アプリ内バナーやメールで再案内する対象に積む
+        await db.markPriceConsentPending(tx.originalTransactionId);
+      } else if (subtype === "ACCEPTED") {
+        await db.markPriceConsentAccepted(tx.originalTransactionId);
+      }
+      break;
+
+    case "EXPIRED":
+      if (subtype === "PRICE_INCREASE") {
+        // 値上げ不同意による解約: 通常解約と区別して記録するのが肝心です
+        await db.recordChurn(tx.originalTransactionId, "price_increase_declined");
+      } else {
+        await db.recordChurn(tx.originalTransactionId, "other");
+      }
+      await db.revokeEntitlement(tx.originalTransactionId);
+      break;
+  }
+  return c.json({ ok: true }); // 200 を返さないと Apple 側がリトライを続けます
+});
+// 期待される動き: PENDING で再案内キューに載り、ACCEPTED で消し込まれ、
+// EXPIRED(PRICE_INCREASE) は解約理由 "price_increase_declined" として集計に乗る
+```
+
+要点は、**EXPIRED を理由付きで記録する**ことです。値上げ不同意の解約を通常解約と混ぜてしまうと、後から「この値上げで何人を失ったのか」が永久に分からなくなります。Webhook の受け口と権限失効の基盤をまだ持っていない場合は、[サブスクの返金にアプリが気づかない — REFUND 通知と Voided Purchases で権限を失効させる実装メモ](/articles/rork-dev/rork-subscription-refund-detection-entitlement-revocation)で組んだ構成がそのまま流用できます。PRICE_INCREASE への対応は、あのとき作った switch 文に case を足すだけです。
+
+## Google Play の価格改定 — 通知のみか同意必須かは地域で決まる
+
+Google Play では Play Console の定期購入の基本プランから価格を変更しますが、考え方が App Store と少し違います。
+
+- 既存購読者を新価格へ移行するかどうかは改定時に選択します。移行しない場合、既存の方は旧価格のコホートに残り続けます
+- 移行する場合は Google が既存購読者へ通知します。地域によって、**通知のみで適用されるオプトアウト型**と、**法令上明示的な同意が必須のオプトイン型**に分かれます
+- オプトイン型の地域で同意が得られないまま更新日を迎えると、その購読は終了します
+
+サーバー側では Real-time Developer Notifications（RTDN）の SubscriptionNotification を監視します。歴史的には、ユーザーが価格変更に同意したことを示す SUBSCRIPTION_PRICE_CHANGE_CONFIRMED（notificationType: 8）が使われてきました。ただし Play の価格改定まわりはこの数年でコンソールのフローごと作り替えられている領域なので、**実装の最終確認はその時点の公式ドキュメントと必ず突き合わせる**ことをお勧めします。挙動が変わりやすい前提で「価格変更イベントは 1 箇所のハンドラに集約しておく」と、仕様変更時に直す場所も 1 箇所で済みます。
+
+私が個人開発で運用するなら、まず両ストアとも「既存は据え置き・新規のみ新価格」で改定し、既存購読者を巻き込む同意フローは、為替や API 原価で本当に追い込まれたときの第二段として温存します。同意フローは一度走らせると途中で止められず、不同意解約という不可逆の結果を伴うからです。
+
+## アプリ側の実装 — 価格のハードコードが改定を事故にする
+
+ストア側の操作だけで完結すると思われがちな価格改定ですが、アプリ側にも地雷があります。代表が、**ペイウォールに価格を文字列で直書きしているケース**です。
+
+Rork に「月額 480 円のプレミアムプランのペイウォールを作って」と指示すると、生成された UI に「¥480/月」という固定文字列がそのまま埋まることがあります。気づかずにストア側だけ価格を改定すると、ペイウォールには旧価格、購入シートには新価格が表示され、ユーザーから見れば請求金額の食い違いです。レビュー欄が荒れる原因になるだけでなく、価格表示の不一致は審査で指摘される理由にもなり得ます。
+
+```tsx
+// Before: 生成されたままの直書き価格（改定時に事故のもと）
+<Text style={styles.price}>¥480/月</Text>
+
+// After: ストアから取得した localizedPrice を常に表示する
+import { useEffect, useState } from "react";
+import * as RNIap from "react-native-iap";
+
+function PriceLabel({ sku }: { sku: string }) {
+  const [price, setPrice] = useState<string | null>(null);
+
+  useEffect(() => {
+    RNIap.getSubscriptions({ skus: [sku] }).then((subs) => {
+      // localizedPrice は通貨記号と地域別価格を含む表示用文字列です
+      if (subs[0]) setPrice(subs[0].localizedPrice);
+    });
+  }, [sku]);
+
+  return <Text style={styles.price}>{price ?? "…"}/月</Text>;
+}
+// 期待される表示: 日本のストアなら「¥600/月」、米国なら「$3.99/月」のように
+// 改定後の価格がアプリ更新なしで自動反映される
+```
+
+RevenueCat を使っている場合も同じで、Offerings から取得した priceString を表示します。価格を動的取得に変えておけば、改定そのものはアプリのアップデートなしで完了します。逆に直書きが 1 箇所でも残っていると、改定のたびに審査を通す必要が生まれ、ストアの反映とアプリ表示がずれる時間帯が必ず発生します。改定を考え始めた日に、まず grep でコードベースから「¥」「$」「円」を検索してみてください。私はこの検索で、デバッグ用に仮置きした価格文字列が本番のオンボーディング画面に残っているのを見つけたことがあります。
+
+## 既存ユーザーへの予告は同意シートより先に出す
+
+ストアからの通知メールや同意シートは、ユーザーにとって唐突です。文脈のないまま「価格が上がります。同意しますか」と問われれば、防御的に「いいえ」を選ぶ人が増えるのは自然なことです。私なら、ストアの通知が飛ぶ前にアプリ内で予告を出します。
+
+```tsx
+// 改定日より前からの購読者にだけ、値上げ予告バナーを出す
+import Purchases from "react-native-purchases";
+
+const PRICE_CHANGE_DATE = new Date("2026-08-01T00:00:00+09:00");
+
+async function shouldShowPriceNotice(): Promise<boolean> {
+  const info = await Purchases.getCustomerInfo();
+  const ent = info.entitlements.active["premium"];
+  if (!ent) return false; // 非購読者には出さない
+
+  const since = new Date(ent.originalPurchaseDate);
+  return since < PRICE_CHANGE_DATE; // 改定前からの購読者だけが対象
+}
+// 期待される動き: 8/1 以降に購読した人には何も表示されず、
+// 既存購読者にだけ「9月の更新分から新価格になります」という予告が出る
+```
+
+バナーの文面で大切なのは、値上げの理由を一文で正直に書くことです。私のアプリ群は AdMob の広告収益と課金を組み合わせて成り立たせていますが、AI 機能の API 原価が乗るアプリでは「この機能を維持するための改定です」という説明が一番伝わると感じています。あわせて、長く使ってくださっている方にはオファーコードで一定期間実質据え置きにする移行オファーを用意すると、不同意解約の角が取れます。オファーコードの実装と配布の流れは[Rork Max でリリースしたアプリの収益化フロー設計 — オファーコード・ウィンバック・プッシュ通知連動の実装](/articles/rork-business/rork-max-released-app-revenue-flow-offercode-winback-push-implementation)に書いたものがそのまま使えます。
+
+## 改定後に見る数字 — 解約率は理由付きコホートで比べる
+
+改定を実行したら、最低でも更新サイクルが 2 回まわるまで次の 3 つを定点観測します。
+
+- **同意率**: PENDING のまま残っている購読者の割合です。更新日が近いのに PENDING が減らないなら、アプリ内とメールでの再案内を打ちます
+- **値上げ起因の解約率**: EXPIRED + PRICE_INCREASE（App Store）や同意期限切れ（Play）で終了した購読の割合です。最初に計算した損益分岐の上限と比べ、超えそうなら次回以降の改定計画を見直します
+- **新価格での転換率**: 値上げは既存だけでなく新規の入り口も狭めます。ペイウォールの表示から購読までの転換率を改定前後で比較します
+
+この 3 つが揃って初めて「あの値上げは成功だったのか」に答えられます。解約理由を記録していないと、平時の解約と値上げ起因の解約が混ざって答えが出せません。購読状態の管理を 1 箇所に寄せた構成にしてあれば、理由の記録は数行の追加で済みます。状態管理が画面のあちこちに散っている場合は、先に[サブスクの『今・誰が・どの権利を持つか』を取り違えない — Rork で実装するエンタイトルメント状態機械の設計](/articles/rork-dev/rork-subscription-entitlement-state-machine-design-guide)の整理から入るのが結局の近道です。
+
+## よくある落とし穴
+
+- **同意期限を忘れて謎の解約増に見える**: 同意フローの結末は数週間から数十日遅れて解約として現れます。改定の 1〜2 ヶ月後に解約が跳ねたとき、不具合を疑って調査を始める前に EXPIRED の subtype を確認してください。理由付きで記録していれば 5 分で答えが出ます
+- **Stripe の感覚で Play を操作する**: Web のサブスクは値上げを事業者主導で適用できますが、ストアのサブスクには「同意が取れなければ解約」という結末があり得ます。同じ価格変更でも不可逆性の度合いがまったく違います
+- **小さな値上げを年に何度も重ねる**: App Store の同意不要枠には「年 1 回まで」という条件が含まれます。四半期ごとに小刻みに上げる戦略は Web では選べても、ストアでは同意必須フローに落ちて逆効果になります
+- **改定直後にレビュー依頼を出す**: 値上げ通知を見た直後のユーザーにレビュー促進を重ねると、低評価を自分から集めに行く形になります。改定の前後 2〜3 週間はレビュー依頼の表示条件を止めておくのが安全です
+
+## まとめ — 最初の一歩は試算シートに自分の数字を入れること
+
+価格改定の手順は「試算 → 既存の扱いを決める → ストア操作 → 通知ハンドリング → 計測」の一本道です。ただ、順番を飛ばしてストア操作から入ると、既存購読者の扱いという一番重い判断を勢いで決めることになります。まずは冒頭のシミュレーターに自分のアプリの単価・購読者数・平時の解約率を入れて、損益分岐の追加解約率を眺めるところから始めてみてください。その数字が見えれば、据え置きで行くか同意フローまで踏み込むか、自分のアプリにとっての答えは案外はっきりします。
+
+私自身、次の改定で既存適用まで踏み込むかはまだ迷っているところです。同じ判断に向き合っている方の参考になれば幸いです。
