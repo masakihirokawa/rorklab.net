@@ -1,0 +1,189 @@
+---
+title: "Your App Won't Notice the Refund — Revoking Entitlements with REFUND Notifications and the Voided Purchases API"
+slug: "rork-subscription-refund-detection-entitlement-revocation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-12T05:30"
+author: "Rork Lab"
+description: "A refund doesn't reach your app on its own — a cached premium flag survives it. Implementation notes on revoking access via App Store Server Notifications V2, Google Play's Voided Purchases API, and RevenueCat."
+tags: ["RevenueCat", "App Store", "Google Play", "subscriptions", "in-app purchases"]
+highlights:
+  - "A Node.js webhook that verifies App Store Server Notifications V2 signatures and revokes access on REFUND, using @apple/app-store-server-library"
+  - "How refunds propagate through RevenueCat, and how to stop a cached premium flag from outliving the refund"
+  - "Android-side revocation with SUBSCRIPTION_REVOKED and the Voided Purchases API, plus practices that keep my refund rate around 0.5%"
+---
+
+I was going through the monthly report for one of my wallpaper apps when I noticed a few small negative rows in the sales list. App Store refunds. The amounts were trivial — what bothered me was something else entirely. I realized the refunded users' devices were almost certainly still running with the lifetime Premium unlock fully active.
+
+I checked, and I was right. At the time, my app set a local "premium" flag on a successful purchase and simply read that flag on launch. When a refund goes through, neither Apple nor Google reaches out to your app on its own. Unless you receive the server notification and revoke the entitlement yourself, the refunded user keeps the feature indefinitely.
+
+For an indie developer, refunds are a handful of cases per month at most, so this is easy to postpone. But the higher your one-time or subscription price, the harder it becomes to ignore. These are my notes from wiring refund detection into my own apps, including the parts where I stumbled.
+
+## Why refunds never reach your app
+
+An App Store refund is settled entirely between the user and Apple. The user files a request through "Report a Problem," Apple approves it, and the refund is done — nothing is pushed to your app at that moment. StoreKit 2 does record a revocationDate on the affected transaction, but that's information your app only sees if it actively reconciles transactions.
+
+Google Play behaves the same way. If a refund issued through the Play Console or the API includes "revoke entitlement," the purchase is voided — but the client only finds out the next time the Billing Library reconciles purchase state.
+
+The trouble is that many apps, mine included at the time, treat purchase handling as "set a local flag on success and move on." Under that design, the flag stays up after the refund, and the user keeps Premium. Across my wallpaper apps, refunds sit around 0.5% of sales — small, but the highest-priced lifetime tiers are exactly where each case hurts most, and left alone it quietly becomes a known loophole: refund first, keep using it anyway.
+
+## Decide the path to revocation first — three architectures
+
+Before writing any code, decide which route refund information takes into your system. There are effectively three options.
+
+### Option A: centralize on RevenueCat
+
+Pairing a Rork-generated app with RevenueCat is the standard setup for in-app purchases, and it's also a strong choice for refund detection. RevenueCat receives server notifications from both Apple and Google, and when it detects a refund it expires the entitlement automatically. Your app's only job is to reconcile CustomerInfo.
+
+### Option B: receive server notifications yourself
+
+If you run your own subscription backend, consume App Store Server Notifications V2 and Google Play's Real-time Developer Notifications (RTDN) directly. It's more work, but you also get first-party access to everything else — billing retries, cancellation intent, offer redemptions.
+
+### Option C: client-side reconciliation only
+
+For a small app with no backend, you can reconcile StoreKit 2's currentEntitlements (queryPurchasesAsync on Android) at launch and drop revoked transactions. Detection slips to "next launch," but that's still a major improvement over an unattended local flag.
+
+Since most of my apps already route purchases through RevenueCat, I default to Option A and add Option B only where I need purchases tied to my own user IDs.
+
+## Implementing Option A — a listener plus launch-time reconciliation
+
+Here's the sync hook I actually ship. What it solves: making sure an entitlement expired by a refund is reflected locally the moment the user next opens the app.
+
+```tsx
+// Reconcile entitlements with the store at launch and on foreground
+import { useEffect } from 'react';
+import { AppState } from 'react-native';
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+import { useEntitlementStore } from '@/stores/entitlement';
+
+function applyCustomerInfo(info: CustomerInfo) {
+  const isPremium = info.entitlements.active['premium'] !== undefined;
+  // Always overwrite the cache — whether the result is true or false
+  useEntitlementStore.getState().setPremium(isPremium);
+}
+
+export function useEntitlementSync() {
+  useEffect(() => {
+    // 1. Right after launch: overwrite with the store's latest state
+    Purchases.getCustomerInfo().then(applyCustomerInfo).catch(() => {});
+
+    // 2. Catch changes while running (refunds, expiry, other devices)
+    Purchases.addCustomerInfoUpdateListener(applyCustomerInfo);
+
+    // 3. Reconcile again when returning to the foreground
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        Purchases.getCustomerInfo().then(applyCustomerInfo).catch(() => {});
+      }
+    });
+    return () => sub.remove();
+  }, []);
+}
+```
+
+Three things matter in how this is written.
+
+First, the launch-time reconciliation overwrites the cache whether the answer is true or false. Refund detection is fundamentally about syncing in the false direction — the moment you add an "optimization" that skips updates while the cache says true, the whole thing stops working.
+
+Second, addCustomerInfoUpdateListener only fires while the app is alive in the foreground. Refunds happen while your app is closed, so in practice the change lands at the next launch. That's exactly why the launch and foreground reconciliation steps can't be skipped.
+
+Third, an isPremium flag persisted in Zustand or AsyncStorage is a cache, not the source of truth. The truth always lives on the store side. Break that separation and you lose more than refund handling — restores on a second device and Family Sharing changes stop tracking too.
+
+## Implementing Option B — consuming REFUND and revoking access
+
+App Store Server Notifications V2 delivers JWS-signed notifications to an endpoint you host. Apple's official @apple/app-store-server-library handles signature verification and decoding safely. The webhook below is the minimal shape that revokes access in your own database on REFUND.
+
+```ts
+// Receive App Store Server Notifications V2 and revoke on REFUND
+import express from 'express';
+import {
+  SignedDataVerifier,
+  Environment,
+} from '@apple/app-store-server-library';
+import { readFileSync } from 'node:fs';
+import { revokeEntitlement } from './entitlement-store';
+
+const appleRootCAs = [readFileSync('certs/AppleRootCA-G3.cer')];
+
+const verifier = new SignedDataVerifier(
+  appleRootCAs,
+  true, // enable online certificate revocation checks
+  Environment.PRODUCTION,
+  'com.example.wallpaper', // replace with your bundleId
+);
+
+const app = express();
+app.use(express.json());
+
+app.post('/webhooks/app-store', async (req, res) => {
+  try {
+    const payload = await verifier.verifyAndDecodeNotification(
+      req.body.signedPayload,
+    );
+    if (payload.notificationType === 'REFUND') {
+      const tx = await verifier.verifyAndDecodeTransaction(
+        payload.data?.signedTransactionInfo ?? '',
+      );
+      // appAccountToken is the user ID your app attached at purchase
+      await revokeEntitlement(tx.appAccountToken, tx.productId);
+    }
+    res.sendStatus(200);
+  } catch {
+    // A request that fails verification may be forged — reject it
+    res.sendStatus(401);
+  }
+});
+```
+
+Two places where I stumbled are worth recording. The first is signature verification. You'll find sample code that merely decodes the signedPayload JWT without verifying it — but if your endpoint URL ever leaks, anyone can send you a fake REFUND. Don't skip verification. The second is appAccountToken. Unless your app passes a UUID at purchase time, there is no way to map the transaction in the notification back to one of your users — you'll want to revoke and have no idea whose access to revoke. It's a value worth wiring in on day one of your billing integration.
+
+One related notification deserves attention: CONSUMPTION_REQUEST. When a user files a refund request, Apple asks you how much of the content this user has already consumed; if you answer within 12 hours via the Send Consumption Information API, your answer feeds into the refund decision. Since I started responding to these honestly, refunds filed after heavy, obvious usage have noticeably been declined more often.
+
+## The Android side — SUBSCRIPTION_REVOKED and the Voided Purchases API
+
+On Google Play, when access is revoked together with a refund, subscriptions produce an RTDN message of type SUBSCRIPTION_REVOKED (notificationType 12). One-time purchases, however, can slip through RTDN, so I pair it with reconciliation against the Voided Purchases API.
+
+```ts
+// Google Play: reconcile refund-voided purchases in a daily batch
+import { google } from 'googleapis';
+
+const androidpublisher = google.androidpublisher('v3');
+
+export async function syncVoidedPurchases(packageName: string) {
+  const auth = new google.auth.GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+  });
+  const res = await androidpublisher.purchases.voidedpurchases.list({
+    auth,
+    packageName,
+  });
+  for (const voided of res.data.voidedPurchases ?? []) {
+    // voidedReason: 1 = refund, 2 = chargeback (0 = other)
+    await revokeByPurchaseToken(voided.purchaseToken);
+  }
+}
+```
+
+This doesn't need to be real-time; a daily batch is plenty. In my setup, Cloud Scheduler triggers it once a day and the voided purchaseTokens are matched against the entitlement table in my own database. Since voidedReason distinguishes refunds from chargebacks, the same data doubles as a way to flag accounts with repeated chargebacks.
+
+## The last line of defense on the client — deny by default
+
+No matter how solid the server side is, a sloppy client cache lets refunds slip through anyway. I apply two rules across all of my apps.
+
+1. The source of truth for entitlements is the store (or my own server); local storage is only a cache that makes rendering fast
+2. In ambiguous states — offline, reconciliation failed — deny by default, but give the most recent successful reconciliation a short grace window
+
+I set the offline grace window to 72 hours. I don't want Premium features dying instantly in airplane mode, but an unlimited offline grace period is itself the post-refund loophole. Tune the length to the nature of your app: longer for a lifetime-unlock wallpaper app, shorter for a subscription whose value is the monthly refresh.
+
+## Reducing refunds at the source
+
+With detection and revocation in place, there's still room to reduce refunds themselves. From iOS 15, presentRefundRequestSheet opens Apple's refund request sheet from inside your app. It may sound counterintuitive, but I deliberately place this in my settings screen. Owning the refund entry point inside the app means an unhappy user flows into that path instead of the App Store review section.
+
+Along the same lines: never hide the cancellation path. A user who can't figure out how to cancel heads straight for a refund request. Linking plainly from settings to the store's subscription management screen lowers the refund rate over the long run — that has been my experience.
+
+## A first step — reproduce a refund locally
+
+The first move isn't waiting for a production refund; it's reproducing one on your desk. With Xcode's StoreKit Testing, the Transaction Manager lets you refund any purchase and watch revocationDate appear and your app react, all locally. On Android, run a purchase-then-refund (with entitlement revocation) on a Play Console test track and trace how it surfaces in the Voided Purchases API.
+
+Refunds are rare in count, but selling a high-priced tier on top of a design that never notices them is a quiet, steady leak. Set aside one weekend slot and walk a refund through your own app end to end. Thank you for reading — I hope this saves you the surprise I had.

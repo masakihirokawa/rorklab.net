@@ -1,0 +1,189 @@
+---
+title: "サブスクの返金にアプリが気づかない — REFUND 通知と Voided Purchases で権限を失効させる実装メモ"
+slug: "rork-subscription-refund-detection-entitlement-revocation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-12T05:30"
+author: "Rork Lab"
+description: "返金が成立してもアプリ側のフラグは立ったままで、Premium 機能は使われ続けます。App Store Server Notifications V2 の REFUND、Google Play の Voided Purchases、RevenueCat の照合で権限を確実に失効させる実装を記録しました。"
+tags: ["RevenueCat", "App Store", "Google Play", "サブスクリプション", "アプリ内課金"]
+highlights:
+  - "App Store Server Notifications V2 の REFUND を署名検証して権限を失効させる Node.js 実装（@apple/app-store-server-library 使用）"
+  - "RevenueCat 構成で返金がクライアントに届くまでの経路と、キャッシュした Premium フラグが生き残る落とし穴の塞ぎ方"
+  - "Google Play の SUBSCRIPTION_REVOKED と Voided Purchases API による失効処理、返金率 0.5% 前後を保つ運用の工夫"
+---
+
+壁紙アプリの月次レポートを確認していたとき、売上の一覧に小さなマイナスの行が並んでいることに気づきました。App Store の返金です。金額そのものは大きくありませんでしたが、引っかかったのはそこではありません。返金したユーザーの端末で、買い切りの Premium 解除がそのまま有効になっている可能性に思い当たったのです。
+
+調べてみると、案の定でした。当時の私のアプリは購入成功時に「Premium 済み」のフラグをローカルに保存し、起動時はそれを参照するだけの設計になっていました。返金が成立しても、Apple や Google からアプリへ自動で連絡が来るわけではありません。サーバー側で通知を受け取り、自分で権限を失効させない限り、返金後も機能は使われ続けます。
+
+個人開発では返金は月に数件あるかないかの世界なので、後回しにしがちな領域です。ただ、買い切りやサブスクの単価が上がるほど無視しにくくなります。ここでは、私が自分のアプリ群に返金検知を組み込んだときの実装と、その過程でつまずいた点を記録としてまとめておきます。
+
+## 返金がアプリに伝わらない構造
+
+App Store の返金は、ユーザーと Apple の間で完結します。ユーザーが「問題を報告する」から申請し、Apple が承認すれば返金は成立しますが、その瞬間にアプリへ何かが届くわけではありません。StoreKit 2 では該当トランザクションに revocationDate が記録されますが、これはアプリが能動的にトランザクションを照合して初めて分かる情報です。
+
+Google Play も同様です。Play Console や API 経由の返金で「アクセス権の取り消し」を選ぶと購入は無効化されますが、クライアントに反映されるのは Billing Library が次に購入状態を照合したタイミングになります。
+
+問題は、購入成功時にローカルフラグを立てて終わり、という設計のアプリが少なくないことです。私のアプリもかつてそうでした。この設計では返金が成立してもフラグは立ったままで、ユーザーは Premium 機能を使い続けられます。私の壁紙アプリ群では返金は売上件数の 0.5% 前後と少ないものの、買い切り型の上位プランほど単価が高く、放置すれば「返金してから使い続ける」抜け道として定着しかねません。
+
+## 失効までの経路を先に決める — 3つの構成
+
+実装に入る前に、返金情報がどの経路で自分のシステムへ届くのかを決めておくと、後の作業で迷いません。選択肢は実質3つです。
+
+### 構成A: RevenueCat に集約する
+
+Rork で生成したアプリに RevenueCat を組み込む構成は課金実装の定番ですが、返金検知の観点でも有力です。RevenueCat は Apple と Google の両ストアからサーバー通知を受け取り、返金を検知すると entitlement を自動で失効させてくれます。アプリ側の仕事は CustomerInfo の照合だけになります。
+
+### 構成B: 自前サーバーで Server Notifications を受ける
+
+サブスク管理を自前で持っている場合は、App Store Server Notifications V2 と Google Play の Real-time Developer Notifications（RTDN）を直接受けます。実装量は増えますが、返金以外の通知（請求リトライ・解約予約・オファー利用）も一次情報として扱えるようになります。
+
+### 構成C: サーバーなしでクライアント照合だけにする
+
+バックエンドを持たない小規模アプリなら、起動時に StoreKit 2 の currentEntitlements（Android は queryPurchasesAsync）を照合し、取り消し済みトランザクションを除外する方法もあります。検知は「次回起動時」までずれ込みますが、ローカルフラグ放置と比べれば大きな前進です。
+
+私は課金実装を RevenueCat に寄せているアプリが多いこともあり、構成Aを基本にして、自社ユーザーIDと購入を紐づけたいアプリにだけ構成Bを足しています。
+
+## RevenueCat 構成の実装 — リスナーと起動時照合
+
+構成Aで実際に組んでいる同期フックです。何を解決するコードかというと、「返金で失効した entitlement を、次にアプリを開いた瞬間に確実にローカルへ反映する」処理です。
+
+```tsx
+// 起動時とフォアグラウンド復帰時に entitlement をストアの正と照合する
+import { useEffect } from 'react';
+import { AppState } from 'react-native';
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+import { useEntitlementStore } from '@/stores/entitlement';
+
+function applyCustomerInfo(info: CustomerInfo) {
+  const isPremium = info.entitlements.active['premium'] !== undefined;
+  // キャッシュは true でも false でも必ず上書きする
+  useEntitlementStore.getState().setPremium(isPremium);
+}
+
+export function useEntitlementSync() {
+  useEffect(() => {
+    // 1. 起動直後: キャッシュではなくストア側の最新状態で上書き
+    Purchases.getCustomerInfo().then(applyCustomerInfo).catch(() => {});
+
+    // 2. 起動中の変化（返金・期限切れ・別端末での購入）を受け取る
+    Purchases.addCustomerInfoUpdateListener(applyCustomerInfo);
+
+    // 3. フォアグラウンド復帰時にも照合する
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        Purchases.getCustomerInfo().then(applyCustomerInfo).catch(() => {});
+      }
+    });
+    return () => sub.remove();
+  }, []);
+}
+```
+
+なぜこう書くのか、ポイントは3つあります。
+
+第一に、起動直後の照合は true でも false でも必ず上書きします。返金検知の本質は false 側への同期なので、「キャッシュが true のときは更新をスキップする」ような最適化を入れた時点で意味を失います。
+
+第二に、addCustomerInfoUpdateListener はアプリがフォアグラウンドにいる間しか発火しません。返金はアプリを開いていない時間に成立するものなので、実際の反映タイミングは「次にアプリを開いた瞬間」です。だからこそ起動時とフォアグラウンド復帰時の照合を省略しないでください。
+
+第三に、Zustand や AsyncStorage に永続化した isPremium フラグは「キャッシュ」であって「正」ではありません。正は常にストア側にあります。この役割分担を崩すと、返金に限らず、別端末での購入復元やファミリー共有の変化にも追従できなくなります。
+
+## 自前構成の実装 — REFUND 通知を受けて失効させる
+
+App Store Server Notifications V2 は、JWS 形式で署名された通知を自分のエンドポイントで受ける仕組みです。Apple 公式の @apple/app-store-server-library を使うと、署名検証とデコードを安全に書けます。次のコードは、REFUND 通知を受けて自社DBの権限を失効させる webhook の最小構成です。
+
+```ts
+// App Store Server Notifications V2 を受けて REFUND で権限を失効させる
+import express from 'express';
+import {
+  SignedDataVerifier,
+  Environment,
+} from '@apple/app-store-server-library';
+import { readFileSync } from 'node:fs';
+import { revokeEntitlement } from './entitlement-store';
+
+const appleRootCAs = [readFileSync('certs/AppleRootCA-G3.cer')];
+
+const verifier = new SignedDataVerifier(
+  appleRootCAs,
+  true, // オンラインの証明書失効確認を有効化
+  Environment.PRODUCTION,
+  'com.example.wallpaper', // 自分の bundleId に置き換える
+);
+
+const app = express();
+app.use(express.json());
+
+app.post('/webhooks/app-store', async (req, res) => {
+  try {
+    const payload = await verifier.verifyAndDecodeNotification(
+      req.body.signedPayload,
+    );
+    if (payload.notificationType === 'REFUND') {
+      const tx = await verifier.verifyAndDecodeTransaction(
+        payload.data?.signedTransactionInfo ?? '',
+      );
+      // appAccountToken は購入時にアプリ側から渡した自社ユーザーID
+      await revokeEntitlement(tx.appAccountToken, tx.productId);
+    }
+    res.sendStatus(200);
+  } catch {
+    // 署名検証に失敗したリクエストは偽装の可能性があるため拒否する
+    res.sendStatus(401);
+  }
+});
+```
+
+つまずいた点を2つ記録しておきます。ひとつは署名検証です。signedPayload を decode だけで読む実装例を見かけますが、エンドポイントの URL が漏れれば誰でも偽の REFUND を送れてしまいます。検証は省略しないでください。もうひとつは appAccountToken です。購入時にアプリから UUID を渡しておかないと、通知に含まれるトランザクションを自社ユーザーへ紐づける手段がなく、失効させたくても「誰の権限か」が分かりません。課金導入の最初期に仕込んでおくべき値です。
+
+なお、返金に関連して CONSUMPTION_REQUEST という通知も届きます。ユーザーが返金申請したときに「このユーザーはコンテンツをどの程度消費したか」を Apple が尋ねてくるもので、12時間以内に Send Consumption Information API で回答すると返金判断の材料になります。誠実に回答する運用へ切り替えてから、明らかに使い込んだ後の返金は通りにくくなった実感があります。
+
+## Android 側 — SUBSCRIPTION_REVOKED と Voided Purchases API
+
+Google Play では、返金とともにアクセス権が取り消されると、サブスクの場合は RTDN で SUBSCRIPTION_REVOKED（notificationType 12）が届きます。一方、買い切りアイテムの返金は RTDN だけでは取りこぼす場合があるため、Voided Purchases API での照合を併用しています。
+
+```ts
+// Google Play: 返金で無効化された購入を日次バッチで照合する
+import { google } from 'googleapis';
+
+const androidpublisher = google.androidpublisher('v3');
+
+export async function syncVoidedPurchases(packageName: string) {
+  const auth = new google.auth.GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+  });
+  const res = await androidpublisher.purchases.voidedpurchases.list({
+    auth,
+    packageName,
+  });
+  for (const voided of res.data.voidedPurchases ?? []) {
+    // voidedReason: 1=返金 2=チャージバック（0はその他）
+    await revokeByPurchaseToken(voided.purchaseToken);
+  }
+}
+```
+
+リアルタイム性は必要ないので、日次のバッチで十分です。私の運用では Cloud Scheduler から1日1回実行し、無効化された purchaseToken を自社DBの権限テーブルと突き合わせています。voidedReason には返金とチャージバックが区別されて入るため、チャージバックが続くアカウントを別途マークする用途にも使えます。
+
+## クライアント側の最後の砦 — deny by default
+
+サーバー側をどれだけ整えても、クライアントのキャッシュ設計が甘いと結局すり抜けられます。私が全アプリで統一している原則は2つです。
+
+1. 権限の「正」はストアまたは自社サーバーにあり、ローカルは描画を速くするための一時キャッシュとして扱う
+2. 判定に迷う状態（ネットワーク不通・照合失敗）では deny by default を基本にしつつ、直近の照合結果には短い猶予を持たせる
+
+オフライン猶予は 72時間に設定しています。機内モードで Premium 機能が即座に使えなくなる体験は避けたい一方、無期限のオフライン猶予は返金後の抜け道そのものだからです。この長さはアプリの性質に合わせて調整してください。壁紙のような買い切り中心のアプリなら長め、毎月の更新が価値の中心になるサブスクなら短めが妥当だと考えています。
+
+## 返金そのものを減らす側の工夫
+
+検知と失効を整えたうえで、返金の件数を減らす余地も残っています。iOS 15 以降は presentRefundRequestSheet を呼ぶと、アプリ内から Apple の返金申請シートを開けます。意外に思われるかもしれませんが、私はこの導線を設定画面に置いています。返金の入口をアプリ内に持つと、不満を抱えたユーザーが App Store のレビュー欄ではなくこちらの導線へ流れてくれるからです。
+
+あわせて、解約導線を隠さないこと。解約方法が分からないユーザーは返金申請へ向かいます。設定画面からストアの購読管理へ素直にリンクするほうが、長期的には返金率を下げる方向に働くというのが私の実感です。
+
+## 次の一歩 — まず手元で返金を再現する
+
+最初の一歩は、本番で返金が起きるのを待つことではなく、手元で返金を再現することです。Xcode の StoreKit Testing なら Transaction Manager から任意の購入を Refund でき、revocationDate の立ち方とアプリ側の挙動をその場で確認できます。Android は Play Console のテストトラックで購入から返金（アクセス権の取り消し）までを実行すると、Voided Purchases API に載ってくる流れを追えます。
+
+返金は件数こそ少ないものの、「気づかない設計」のまま単価の高いプランを売り続けるのは静かな損失です。週末のひと枠で、まずご自身のアプリの返金経路を一度通してみてください。最後までお付き合いいただき、ありがとうございました。
