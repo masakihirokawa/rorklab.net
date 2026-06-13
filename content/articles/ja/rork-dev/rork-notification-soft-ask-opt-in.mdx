@@ -1,0 +1,296 @@
+---
+title: "通知の許可は一度しか聞けない — Rork アプリにソフトアスク（事前確認）を実装して opt-in を底上げする"
+slug: "rork-notification-soft-ask-opt-in"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-06-13T15:00"
+updated: "2026-06-13T15:00"
+author: "Rork Lab"
+description: "iOS の通知許可は一度拒否されると二度とダイアログを出せません。Rork（Expo）アプリで、起動直後に system prompt を撃つのではなく自前のソフトアスク画面を一枚挟み、価値が伝わった瞬間に許可を求める実装を expo-notifications で組みます。Android 13 の POST_NOTIFICATIONS、拒否後の設定誘導、opt-in 計測まで通します。"
+tags: ["Rork", "Expo", "プッシュ通知", "expo-notifications", "オンボーディング", "リテンション"]
+highlights:
+  - "起動直後に system prompt を撃つと iOS では一度の拒否で永久に再表示できなくなる仕組みを理解し、ソフトアスクで「自前ダイアログ → 同意した人だけに system prompt」という二段構えを expo-notifications で実装できるようになる"
+  - "通知の価値が伝わった瞬間（保存・完了・3 回目の起動など）まで許可を遅延させる『きっかけ』判定を TypeScript の状態管理で組み、許可率を計測する 3 つのイベント（提示・同意・OS 許可）を設計できるようになる"
+  - "拒否されたユーザーを Linking.openSettings() で設定アプリへ誘導する復帰導線と、Android 13 の POST_NOTIFICATIONS ランタイム権限の差分を、本番運用の落とし穴込みで実装できるようになる"
+---
+
+運用しているアプリのプッシュ通知の opt-in 率を並べて眺めていたとき、ある 1 本だけが極端に低いことに気づきました。中身はほぼ同じ構成の壁紙アプリなのに、通知を許可してくれた人の割合が他の半分以下だったのです。
+
+原因はすぐに分かりました。その 1 本だけ、起動して最初の画面が出るより前に通知の許可ダイアログを出していたのです。ユーザーから見れば「何のアプリかまだ分からないのに、いきなり通知を求められた」状態でした。
+
+iOS の通知許可には、個人開発者が必ず一度はぶつかる残酷な仕様があります。`UNUserNotificationCenter` の許可ダイアログは、アプリの生涯で一度しか自動表示できません。ユーザーが一度「許可しない」を押すと、コードから何度 `requestPermissions()` を呼んでも、もうダイアログは出ません。残された道は「設定アプリを自分で開いてもらう」だけになります。
+
+つまり通知の opt-in は「いつ・どう聞くか」で決まります。起動直後に system prompt を撃つのをやめ、自前のソフトアスク（事前確認）画面を一枚挟む設計を、Rork（Expo）アプリに実装していきます。私自身が複数のアプリ運用で効果を確かめた構成です。
+
+## なぜ「一度しか聞けない」が opt-in を左右するのか
+
+iOS では通知許可は三つの状態を持ちます。`notDetermined`（まだ聞いていない）、`authorized`（許可済み）、`denied`（拒否済み）です。重要なのは `notDetermined` のときだけ system prompt が表示でき、それ以外では `requestPermissions()` が即座に現在の状態を返すだけで、何も表示されないという点です。
+
+`notDetermined` は、アプリの生涯でたった一回のチャンスです。ここで雑に消費してしまうと、二度と取り戻せません。
+
+一方ソフトアスクは、私たちが自由に何度でも出せる「自前の UI」です。ここで断られても iOS の状態は `notDetermined` のまま保たれます。だから「自前ダイアログで一旦聞いて、同意してくれた人にだけ system prompt を出す」という二段構えが成立します。system prompt の前に一段クッションを置くことで、貴重な一回を本気で許可してくれそうな人にだけ使えるのです。
+
+私の手元の運用では、起動直後に system prompt を撃っていたアプリと、ソフトアスクを挟んで価値が伝わった後に聞くアプリとで、最終的な OS 許可率に 2 倍以上の差が出ていました。通知は再訪のきっかけそのものなので、この差はそのまま AdMob やサブスクの収益にも効いてきます。
+
+## 全体の流れを先に決める
+
+実装に入る前に、判断の順序を固めておきます。コードはこの順序をそのまま写したものになります。
+
+1. アプリ起動時に現在の許可状態を読む。`authorized` ならもう何もしない
+2. `denied` なら自前ダイアログは出さず、必要な場面で「設定で通知をオンにできます」という導線だけ出す
+3. `notDetermined` のときだけ、ソフトアスクを出す「きっかけ」が来たかを判定する
+4. きっかけが来たらソフトアスク画面を表示する
+5. ソフトアスクで「オンにする」が押されたら、初めて system prompt（`requestPermissions()`）を撃つ
+6. 「あとで」が押されたら状態は触らず、次のきっかけまで待つ
+
+この 6 ステップのうち、多くのアプリが 3 と 4 を飛ばして起動直後に 5 をやってしまっています。クッションを置く価値はここにあります。
+
+## 許可状態を一元管理するフックを作る
+
+まず `expo-notifications` で現在の状態を読み書きするフックを用意します。状態をコンポーネントに散らさず、一箇所に集約するのが後々の計測でも効いてきます。
+
+```typescript
+// hooks/useNotificationPermission.ts
+import { useCallback, useEffect, useState } from "react";
+import * as Notifications from "expo-notifications";
+
+type PermState = "loading" | "notDetermined" | "authorized" | "denied";
+
+export function useNotificationPermission() {
+  const [state, setState] = useState<PermState>("loading");
+
+  const refresh = useCallback(async () => {
+    const settings = await Notifications.getPermissionsAsync();
+    if (settings.granted) {
+      setState("authorized");
+    } else if (settings.canAskAgain) {
+      // canAskAgain が true = まだ system prompt を出せる
+      setState("notDetermined");
+    } else {
+      setState("denied");
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  // 実際に system prompt を撃つのはここだけ
+  const requestSystemPrompt = useCallback(async () => {
+    const result = await Notifications.requestPermissionsAsync();
+    await refresh();
+    return result.granted;
+  }, [refresh]);
+
+  return { state, refresh, requestSystemPrompt };
+}
+```
+
+ここでの肝は `canAskAgain` です。iOS の `denied` を `getPermissionsAsync()` の `granted` だけで判定すると、`notDetermined` と `denied` が両方 `false` になって区別できません。`canAskAgain` が `false` なら「もうダイアログは出せない＝拒否済み」と確定できます。この一行を見落とすと、二度と出ないダイアログを出そうとして無言で失敗する状態に陥ります。
+
+## ソフトアスク画面を作る
+
+ソフトアスクは「通知で何が良くなるか」を一文で伝える、軽いモーダルにします。長い説明文は読まれません。アプリ固有の便益を具体的に書くのが効きます。壁紙アプリなら「新しい壁紙が追加されたらお知らせします」、習慣アプリなら「続けやすいよう、決めた時間にそっと声をかけます」のように、ユーザーの得になる言い方にします。
+
+```typescript
+// components/SoftAskModal.tsx
+import { Modal, View, Text, Pressable, StyleSheet } from "react-native";
+
+type Props = {
+  visible: boolean;
+  onAllow: () => void;
+  onDefer: () => void;
+};
+
+export function SoftAskModal({ visible, onAllow, onDefer }: Props) {
+  return (
+    <Modal visible={visible} transparent animationType="fade">
+      <View style={styles.backdrop}>
+        <View style={styles.card}>
+          <Text style={styles.title}>新しい壁紙をお届けします</Text>
+          <Text style={styles.body}>
+            お気に入りに近いテイストの壁紙が追加されたとき、
+            さっとお知らせします。頻度は控えめ、いつでもオフにできます。
+          </Text>
+          <Pressable style={styles.primary} onPress={onAllow}>
+            <Text style={styles.primaryText}>通知をオンにする</Text>
+          </Pressable>
+          <Pressable style={styles.secondary} onPress={onDefer}>
+            <Text style={styles.secondaryText}>あとで</Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+const styles = StyleSheet.create({
+  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "center", padding: 24 },
+  card: { backgroundColor: "#fff", borderRadius: 20, padding: 24 },
+  title: { fontSize: 20, fontWeight: "700", marginBottom: 8 },
+  body: { fontSize: 15, lineHeight: 22, color: "#444", marginBottom: 20 },
+  primary: { backgroundColor: "#111", borderRadius: 14, paddingVertical: 14, alignItems: "center" },
+  primaryText: { color: "#fff", fontSize: 16, fontWeight: "600" },
+  secondary: { paddingVertical: 12, alignItems: "center", marginTop: 4 },
+  secondaryText: { color: "#888", fontSize: 15 },
+});
+```
+
+「あとで」を必ず用意してください。逃げ道のないモーダルは、断りたいユーザーをアンインストールに追い込みます。断られても iOS の状態は `notDetermined` のままなので、次のきっかけでまた聞けます。急がないことが、結果的に opt-in を上げます。
+
+## 「いつ聞くか」を判定する — きっかけ設計
+
+ソフトアスクを出す最適なタイミングは、ユーザーが通知の価値を体感した直後です。具体的には次のような瞬間が候補になります。
+
+- 壁紙やコンテンツを 1 つ目を保存・お気に入りした直後
+- 何かのタスクや設定を完了した直後
+- 3 回目以降の起動で、まだ未許可のとき
+
+私の運用では「最初の保存の直後」が最も素直に効きました。保存という行為は「また使いたい」という気持ちの表れなので、その勢いのまま通知に同意してもらいやすいのです。逆に、起動回数だけを条件にすると、まだ何も体験していない人に出てしまい、断られやすくなります。
+
+きっかけ判定は小さな状態として持ちます。`AsyncStorage` で「もう聞いたか」「あとで何回押されたか」を覚えておき、しつこくならないようにします。
+
+```typescript
+// lib/softAskTrigger.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const KEY = "softask.v1";
+
+type SoftAskRecord = { deferred: number; lastShownAt: number | null };
+
+export async function shouldShowSoftAsk(): Promise<boolean> {
+  const raw = await AsyncStorage.getItem(KEY);
+  const rec: SoftAskRecord = raw ? JSON.parse(raw) : { deferred: 0, lastShownAt: null };
+
+  // 「あとで」を 2 回押されたら、もう自動では出さない（うるさくしない）
+  if (rec.deferred >= 2) return false;
+
+  // 直近 3 日以内に出していたら間隔を空ける
+  if (rec.lastShownAt && Date.now() - rec.lastShownAt < 3 * 24 * 60 * 60 * 1000) {
+    return false;
+  }
+  return true;
+}
+
+export async function recordShown() {
+  const raw = await AsyncStorage.getItem(KEY);
+  const rec: SoftAskRecord = raw ? JSON.parse(raw) : { deferred: 0, lastShownAt: null };
+  rec.lastShownAt = Date.now();
+  await AsyncStorage.setItem(KEY, JSON.stringify(rec));
+}
+
+export async function recordDeferred() {
+  const raw = await AsyncStorage.getItem(KEY);
+  const rec: SoftAskRecord = raw ? JSON.parse(raw) : { deferred: 0, lastShownAt: null };
+  rec.deferred += 1;
+  await AsyncStorage.setItem(KEY, JSON.stringify(rec));
+}
+```
+
+上限と間隔を入れているのは、断られても再挑戦できる仕様を逆手に取って何度も出すと、それ自体がうるさいアプリの印象を作るからです。「2 回断られたら引き下がる」くらいの遠慮が、長く使ってもらううえでちょうど良いと感じています。
+
+## 保存アクションに組み込む
+
+ここまでの部品を、実際の「保存」処理に差し込みます。保存が成功したら、きっかけ条件を見てソフトアスクを出します。
+
+```typescript
+// 保存ボタンのハンドラ内
+import { shouldShowSoftAsk, recordShown, recordDeferred } from "../lib/softAskTrigger";
+
+function WallpaperDetail() {
+  const { state, requestSystemPrompt } = useNotificationPermission();
+  const [askVisible, setAskVisible] = useState(false);
+
+  const handleSave = async () => {
+    await saveWallpaper(); // 本来の保存処理
+
+    // 未許可で、きっかけ条件を満たすときだけ提示
+    if (state === "notDetermined" && (await shouldShowSoftAsk())) {
+      await recordShown();
+      track("softask_shown");       // ← 計測イベント①
+      setAskVisible(true);
+    }
+  };
+
+  const handleAllow = async () => {
+    setAskVisible(false);
+    track("softask_accepted");      // ← 計測イベント②
+    const granted = await requestSystemPrompt();
+    track(granted ? "os_permission_granted" : "os_permission_denied"); // ← ③
+  };
+
+  const handleDefer = async () => {
+    setAskVisible(false);
+    await recordDeferred();
+    track("softask_deferred");
+  };
+
+  return (
+    <>
+      {/* 画面本体は省略 */}
+      <SoftAskModal visible={askVisible} onAllow={handleAllow} onDefer={handleDefer} />
+    </>
+  );
+}
+```
+
+`handleAllow` の中でしか `requestSystemPrompt()` を呼んでいない点が設計の核です。system prompt は「自前ダイアログで同意した人」にしか届きません。これで `notDetermined` という一度きりのチャンスを、本当に前向きな人に絞って使えます。
+
+## opt-in を計測する 3 つのイベント
+
+ソフトアスクを入れたら、必ず計測します。改善できるのは測れるものだけです。最低限、次の 3 イベントを記録してください。
+
+- `softask_shown` — 自前ダイアログを見せた回数
+- `softask_accepted` — 「オンにする」を押した回数
+- `os_permission_granted` — OS が実際に許可した回数
+
+ここから二つの率を出します。ソフトアスクの説得力を表す「accepted ÷ shown」と、最終的な成果である「granted ÷ shown」です。前者が低ければ文言や見せる場所、後者だけ低ければ system prompt 直前の体験を疑います。私の場合、文言を「機能の説明」から「ユーザーの得」に書き換えただけで accepted 率が目に見えて上がりました。
+
+PostHog や Mixpanel を入れているなら、この 3 イベントをファネルとして並べるだけで、どこで落ちているかが一目で分かります。
+
+## 拒否されたユーザーをどう扱うか
+
+それでも一定数は最終的に `denied` になります。ここで諦めて沈黙するのではなく、通知が本当に効く場面でだけ、設定への導線を一度だけ出します。
+
+```typescript
+import * as Linking from "expo-linking";
+import { Alert } from "react-native";
+
+function promptOpenSettings() {
+  Alert.alert(
+    "通知はオフになっています",
+    "設定アプリから通知をオンにすると、新着をお知らせできます。",
+    [
+      { text: "閉じる", style: "cancel" },
+      { text: "設定を開く", onPress: () => Linking.openSettings() },
+    ]
+  );
+}
+```
+
+`Linking.openSettings()` は iOS でも Android でも、自アプリの設定画面を直接開きます。注意点として、この導線も乱発は禁物です。`denied` になった全画面で出すのではなく、「通知が前提の機能をユーザーが自分から開いたとき」に限定します。求めていない場所で設定を促されるのは、ソフトアスクの乱発と同じく不快だからです。
+
+## Android 13 以降の差分を忘れない
+
+iOS だけ見ていると本番でつまずきます。Android は 13（API 33）から、通知が `POST_NOTIFICATIONS` というランタイム権限になりました。それ以前の Android は通知が既定でオンなので許可は不要ですが、13 以降は iOS と同じく明示的な許可が要ります。
+
+`expo-notifications` は `requestPermissionsAsync()` がこの差を吸収してくれますが、`app.json` 側の設定は自分で入れる必要があります。
+
+```json
+{
+  "expo": {
+    "android": {
+      "permissions": ["POST_NOTIFICATIONS"]
+    }
+  }
+}
+```
+
+Android は iOS と違い、拒否されても一定回数まで再度ダイアログを出せます。ただし二回続けて拒否されると、iOS と同じく `canAskAgain` が `false` になり、以降は設定誘導しかなくなります。つまり「うるさく聞かない」という設計思想は、結局どちらの OS でも同じく効いてくるということです。Rork が生成する Expo プロジェクトはこの両 OS の差を一つのコードで扱えるので、分岐を増やさずに済みます。
+
+## 仕上げに一つだけ
+
+ソフトアスクの実装そのものは半日もかからない小さな仕事です。けれど通知は、アプリにもう一度戻ってきてもらうための数少ない正規ルートです。一度きりのダイアログを起動直後に消費してしまうか、価値が伝わった瞬間まで取っておくか——その判断だけで、リテンションの土台が変わります。
+
+次の一歩として、まずは運用中のアプリで system prompt をどこで撃っているかを確認してみてください。起動直後に呼んでいるなら、そこに `softask_shown` のような計測イベントを一つ足すところから始めると、改善の効果がそのまま数字で見えるようになります。
