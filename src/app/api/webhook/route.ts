@@ -52,6 +52,29 @@ export async function POST(request: NextRequest) {
       switch (event.type) {
         case "checkout.session.completed": {
           const checkoutSession = event.data.object as Stripe.Checkout.Session;
+          // Tip / single-article purchases must never grant site-wide membership.
+          // plan_type metadata is set by /api/checkout (tip / article / pro / premium).
+          const planTypeMeta = checkoutSession.metadata?.plan_type;
+          if (planTypeMeta === "tip") break;
+          if (planTypeMeta === "article") {
+            const articleSlugMeta = checkoutSession.metadata?.article_slug;
+            const articleEmail = checkoutSession.customer_details?.email?.trim().toLowerCase();
+            if (articleSlugMeta && articleEmail) {
+              const ARTICLE_TTL = 10 * 365 * 24 * 3600; // 10 years
+              const articleKey = `site:rorklab:article:${articleEmail}:${articleSlugMeta}`;
+              const existingArticle = await kv.get(articleKey);
+              if (!existingArticle) {
+                await kv.put(articleKey, JSON.stringify({
+                  type: "article",
+                  slug: articleSlugMeta,
+                  stripe_session_id: checkoutSession.id,
+                  purchased_at: new Date().toISOString(),
+                  expires_at: new Date(Date.now() + ARTICLE_TTL * 1000).toISOString(),
+                }), { expirationTtl: ARTICLE_TTL });
+              }
+            }
+            break;
+          }
           const rawEmail = checkoutSession.customer_details?.email;
           if (!rawEmail) break;
           const email = rawEmail.trim().toLowerCase();
