@@ -22,6 +22,8 @@ const PLAN_NAMES: Record<string, string> = {
   // Article
   "price_1TJL6UEGB5g6A54oGAcqSCqR": "Rork Lab — 記事単体購入（¥250）",
   "price_1TJL6VEGB5g6A54o9xwzriXD": "Rork Lab — Single Article Purchase ($1.75)",
+  "price_1TLBHOEGB5g6A54oYhH0GXnq": "Rork Lab — 記事単体購入（¥200）",
+  "price_1TLBHOEGB5g6A54ocKsUFynB": "Rork Lab — Single Article Purchase ($1.50)",
 
   // New Pro (¥580/$5)
   "price_1TJLvmEGB5g6A54oSPEqrpEc": "Rork Lab メンバーシップ — Pro（月額プラン）",
@@ -39,6 +41,8 @@ const TIP_PRICE_IDS = new Set([
 
 // Article price IDs — per-article purchases
 const ARTICLE_PRICE_IDS = new Set([
+  "price_1TLBHOEGB5g6A54oYhH0GXnq",  // ¥200 JPY (current)
+  "price_1TLBHOEGB5g6A54ocKsUFynB",  // $1.50 USD (current)
   "price_1TJL6UEGB5g6A54oGAcqSCqR",  // ¥250 JPY
   "price_1TJL6VEGB5g6A54o9xwzriXD",  // $1.75 USD
 ]);
@@ -89,7 +93,7 @@ export async function POST(request: NextRequest) {
       ...(mode === "payment" && {
         payment_intent_data: { description: planName },
       }),
-      success_url: `${baseUrl}/${prefix}api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
+      success_url: `${baseUrl}/api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
       cancel_url: cancelUrl || fallbackCancel,
       locale: locale === "en" ? "en" : "ja",
     });
