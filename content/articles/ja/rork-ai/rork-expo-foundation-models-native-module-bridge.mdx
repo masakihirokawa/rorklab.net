@@ -1,0 +1,181 @@
+---
+title: "Rork（Expo）製アプリから Apple Foundation Models を呼ぶ — オンデバイスAIをネイティブモジュールで橋渡しする"
+slug: "rork-expo-foundation-models-native-module-bridge"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-14T11:30"
+updated: "2026-06-14T11:30"
+author: "Rork Lab"
+description: "Rork が生成する Expo（React Native）アプリから iOS のオンデバイスAI、Apple Foundation Models を呼ぶには、Swift 側のネイティブモジュールを挟む必要があります。Expo Modules API で橋渡しを書き、未対応端末ではクラウドへ逃がす構成を実装します。"
+tags: ["Rork", "Expo", "Foundation Models", "オンデバイスAI", "ネイティブモジュール", "React Native"]
+highlights:
+  - "Expo で出したアプリに『オンデバイスAIを入れたいが Swift の framework を JS から触れない』で止まっていた状態から、自分で書いた Expo Module 経由で呼べる構成を手に入れられる"
+  - "iOS 26 未満や非対応端末で落ちる素朴な実装を、availability ゲートとクラウドフォールバックで全ユーザーに配信できる形へ作り替えられる"
+  - "EAS Build で system framework を弱リンクさせ、審査と段階公開まで通すまでの実装判断を、5,000万DL運用の端末分布の感覚込みで判断できる"
+---
+
+Rork で説明文からアプリを生成すると、出てくるのは Expo（React Native）のプロジェクトです。一方で iOS のオンデバイスAI、Apple Foundation Models は Swift の framework として提供されます。つまり「Rork で作ったアプリにオンデバイスLLMを入れたい」と思った瞬間、JavaScript からは直接触れない壁に当たります。
+
+私自身、壁紙アプリや癒し系アプリを個人開発で長く運用してきましたが、新しい OS の機能を「全ユーザーに配ること」と「最新端末だけで動かすこと」は別物だと何度も痛感してきました。Foundation Models は iOS 26 以降のオンデバイス機能なので、素朴に呼ぶと古い端末を使う読者を切り捨ててしまいます。そこで Expo Modules API で Swift の Foundation Models を橋渡しし、未対応の環境では静かにクラウドへ逃がす——という実運用に耐える構成を、配線の一本ずつまで具体的に組み立てていきます。
+
+オンデバイス推論を一次経路にしてクラウドへ逃がす「ルーター」の設計思想そのものは[オンデバイスAI推論ルーターの設計](/articles/rork-ai/rork-ai-inference-router-on-device-first-cloud-fallback-2026)で、Foundation Models を Swift ネイティブから使う前提知識は[Apple FoundationModels 実装ガイド](/articles/rork-ai/rork-foundation-models-on-device-llm-offline-ai-guide)で扱っています。本稿はその二つの間にある「Expo アプリから、どうやって実際にこの framework を呼ぶのか」という配線の話に絞ります。
+
+## なぜ Expo の JS からは直接呼べないのか
+
+Foundation Models は `import FoundationModels` で使う Swift 専用の API です。React Native のブリッジは JavaScript と Objective-C/Swift の間で JSON 相当の値しかやり取りできないので、`LanguageModelSession` のような Swift の型をそのまま JS へ渡すことはできません。
+
+ここで多くの人が `expo-apple-intelligence` のような既製パッケージを探しますが、Foundation Models は登場が新しく、純粋な Expo アプリ向けの薄いラッパーは安定したものがまだ揃っていません。私は「他人のラッパーがブラックボックスでバージョン追従に振り回されるくらいなら、自分で 100 行のモジュールを書いて握っておく」判断をすることが多く、ここでもその方針を採ります。やることは三つです。プロンプトを文字列で受け取り、Swift 側で Foundation Models を呼び、結果の文字列を Promise で返す。これだけなら自作モジュールの方が読みやすく、壊れたときに自分で直せます。
+
+## Swift 側：Expo Module で Foundation Models を包む
+
+Expo Modules API では、`Module` を継承したクラスに `AsyncFunction` を定義するだけで JS から `await` できる関数が生えます。ローカルモジュールを作るなら `npx create-expo-module --local on-device-ai` が出発点です。生成された `ios/OnDeviceAIModule.swift` を次のように書き換えます。
+
+```swift
+import ExpoModulesCore
+import FoundationModels
+
+public class OnDeviceAIModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("OnDeviceAI")
+
+    // 端末がオンデバイスLLMを使えるかを JS に返す。
+    // "available" 以外を返したら、JS 側はクラウドへ切り替える。
+    AsyncFunction("availability") { () -> String in
+      if #available(iOS 26.0, *) {
+        switch SystemLanguageModel.default.availability {
+        case .available:
+          return "available"
+        case .unavailable(.deviceNotEligible):
+          return "device_not_eligible"
+        case .unavailable(.appleIntelligenceNotEnabled):
+          return "not_enabled"
+        case .unavailable(.modelNotReady):
+          return "model_not_ready"
+        case .unavailable:
+          return "unavailable"
+        }
+      } else {
+        return "os_too_old"   // iOS 26 未満
+      }
+    }
+
+    // プロンプトを受け取り、生成テキストを返す。
+    // promise を使うことで Swift の async/throws をそのまま JS の例外に橋渡しできる。
+    AsyncFunction("generate") { (prompt: String, promise: Promise) in
+      guard #available(iOS 26.0, *) else {
+        promise.reject("UNSUPPORTED", "iOS 26 未満ではオンデバイス生成を利用できません")
+        return
+      }
+      Task {
+        do {
+          let session = LanguageModelSession()
+          let response = try await session.respond(to: prompt)
+          promise.resolve(response.content)
+        } catch {
+          promise.reject("GENERATION_FAILED", error.localizedDescription)
+        }
+      }
+    }
+  }
+}
+```
+
+ここで一番大事なのは `if #available(iOS 26.0, *)` のガードです。`FoundationModels` を `import` したコードでも、ガードの外側に Foundation Models 固有の型を置かなければ、framework は弱リンク（weak link）され、iOS 26 未満の端末でもアプリ自体は起動します。`availability` を関数として独立させ、`generate` の冒頭でも必ずガードしているのは、JS 側が「呼ぶ前に availability で分岐する」と「うっかり古い端末で generate を叩いてしまう」の両方に耐えるためです。実運用では後者が必ず起きるので、二重に守ります。
+
+## TypeScript 側：型付きラッパーとフォールバック
+
+ネイティブモジュールは `requireNativeModule` で取得します。ここに薄い TypeScript ラッパーをかぶせ、availability の判定とクラウドフォールバックを 1 か所に閉じ込めます。
+
+```typescript
+// modules/on-device-ai/index.ts
+import { requireNativeModule } from "expo-modules-core";
+import { Platform } from "react-native";
+
+type Availability =
+  | "available"
+  | "device_not_eligible"
+  | "not_enabled"
+  | "model_not_ready"
+  | "os_too_old"
+  | "unavailable";
+
+const Native = requireNativeModule<{
+  availability(): Promise<Availability>;
+  generate(prompt: string): Promise<string>;
+}>("OnDeviceAI");
+
+// Android やシミュレータでは Native が存在しないので、まず安全側に倒す。
+export async function getAvailability(): Promise<Availability> {
+  if (Platform.OS !== "ios") return "unavailable";
+  try {
+    return await Native.availability();
+  } catch {
+    return "unavailable";
+  }
+}
+
+// オンデバイスを一次経路にし、使えなければ cloudGenerate へ逃がす。
+export async function generate(
+  prompt: string,
+  cloudGenerate: (p: string) => Promise<string>,
+): Promise<{ text: string; source: "on_device" | "cloud" }> {
+  if ((await getAvailability()) === "available") {
+    try {
+      const text = await Native.generate(prompt);
+      return { text, source: "on_device" };
+    } catch {
+      // モデルが途中で落ちても、クラウドへ静かに切り替える。
+    }
+  }
+  return { text: await cloudGenerate(prompt), source: "cloud" };
+}
+```
+
+この `generate` は、呼び出し側に「どの経路で生成したか」を `source` で返します。私は壁紙アプリでオンデバイス生成を試したとき、最初これを返していませんでした。すると後から「オンデバイスとクラウドのどちらが遅いのか」「無償枠の Private Cloud Compute にどれだけ逃げているのか」をログから切り分けられず、計測に丸一日無駄にしました。`source` を最初から返すだけで、後の運用判断がまるごと楽になります。
+
+呼び出し側はこう書けます。`cloudGenerate` には既存の Gemini や Claude 呼び出しをそのまま渡します。
+
+```typescript
+const { text, source } = await generate(
+  "この壁紙に合う2語の日本語タイトルを提案して",
+  (p) => callGeminiFlash(p),   // 既存のクラウド呼び出しを注入する
+);
+console.log(source); // "on_device" か "cloud" がログに残る
+```
+
+## よくある落とし穴：ビルドは通るのに実機で何も返らない
+
+ここで多くの人がつまずきます。Expo Go ではカスタムネイティブモジュールは動きません。`npx expo run:ios` か EAS Build で「開発ビルド（dev client）」を作る必要があります。Expo Go のまま `generate` を呼ぶと、モジュールが見つからずに例外になります。Dev Client の導入でつまずいたら[Expo Dev Client 導入手順](/articles/rork-dev/rork-expo-dev-client-native-module-setup-guide)を先に通してください。
+
+もう一つの罠は iOS の deployment target です。`#available` で守っていても、ビルドターゲットが古すぎると Foundation Models の SDK そのものが見えません。`app.json` で最低ラインを上げます。
+
+```json
+{
+  "expo": {
+    "ios": { "deploymentTarget": "26.0" }
+  }
+}
+```
+
+ただし deployment target を 26.0 に上げると、それ未満の端末にはそもそもアプリを配信できなくなります。これは「オンデバイスAIを入れる」という機能追加が「古い端末の読者を切り捨てる」という事業判断に直結する瞬間です。私は deployment target は据え置き（たとえば 16.0）にしたまま、Foundation Models のコードだけを `#available` で囲み、framework を弱リンクさせる構成を推奨します。個人的には、新機能のために配信対象を狭めるのは最後の手段だと考えています。こうすれば iOS 16 の端末でもアプリは起動し、オンデバイスAIだけが静かに無効化され、クラウドフォールバックが受け止めます。累計 5,000万DL の端末分布を見ていると、最新 OS への移行は思うより遅く、「最新機能を全員に出す」より「最新機能を出せる人にだけ出す」設計の方が、結局ダウンロードと評価を守れると考えています。
+
+弱リンクを成立させるには、`OnDeviceAIModule.swift` のうち Foundation Models 固有の型（`SystemLanguageModel` や `LanguageModelSession`）を、すべて `#available` ブロックの内側に置くことが条件です。一つでも外に漏れると、起動時に dyld がシンボルを解決できず、iOS 26 未満の端末でクラッシュします。ここは「ビルドが通った」では検証になりません。必ず iOS 26 未満の実機かシミュレータで起動確認をしてください。
+
+## 無償枠を「どのアプリから載せるか」という配分の話
+
+WWDC 2026 で、初回 App Store ダウンロードが 200 万未満の開発者向けに、Private Cloud Compute 上の Foundation Models が無償で開放される方針が示されました。Rork 自体は無料で始められ有料プランは月 $25、ネイティブ Swift を生成する Rork Max は月 $200 という価格帯ですが、オンデバイス推論と無償枠を併用すれば、生成系の機能を載せても AI 側のランニングコストはこの規模ではほぼゼロに抑えられます。オンデバイスで足りない処理をサーバーサイドモデルへ逃がしても、一定規模までは課金されない——という線引きは、まさに個人開発者の規模を意識した設計です。コスト設計そのものは[Foundation Models の無償枠を三層に組み直す](/articles/rork-ai/rork-foundation-models-pcc-free-tier-cost-design)で詳しく扱っています。
+
+実装の立場から一つだけ補足すると、無償枠があるからといって全アプリに一斉導入するのは得策ではありません。私が複数アプリを運用してきた感覚では、新しい API は「最もアクティブで、フィードバックが早く返ってくる 1 アプリ」に先に載せ、`source` ログでオンデバイス／クラウドの比率と体感速度を 2〜3 週間観察してから横展開する方が、事故が圧倒的に少なくなります。`generate` が `source` を返す設計が、この観察を支えます。最初に握っておくべき配線は、派手な生成機能そのものより、むしろこの計測の足場の方なのだと感じています。
+
+## 最短で動かすための3ステップ
+
+迷ったら、次の順番だけ守れば事故りません。
+
+1. まず `availability` だけを実装して dev client に出し、自分の実機が `"available"` を返すかを目で確認します。ここを飛ばすと、後段の不具合が「コードのバグ」なのか「端末が非対応」なのか切り分けられなくなります。
+2. 次に `generate` を足し、`#available` ガードが二重にかかっていること、Foundation Models 固有の型がすべてガードの内側にあることを確認します。iOS 26 未満の端末での起動確認はこの段階で必ず行います。
+3. 最後に TypeScript ラッパーで `source` を返し、クラウドフォールバックを注入します。ここまで来て初めて、全ユーザーへ配信できる状態になります。
+
+この順番は、私が複数アプリに新しいネイティブ機能を入れるときに毎回たどる手順でもあります。逆順でやると、必ずどこかで「ビルドは通るのに動かない」に飲み込まれます。
+
+まず手を動かすなら、`npx create-expo-module --local on-device-ai` で空のモジュールを作り、上の `availability` だけを実装して `npx expo run:ios` で実機に出してみてください。端末が `"available"` を返すかどうかを自分の目で確認するところから始めると、その先の生成実装で迷いがなくなります。

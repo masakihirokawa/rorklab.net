@@ -1,0 +1,181 @@
+---
+title: "Calling Apple Foundation Models from a Rork (Expo) App: Bridging On-Device AI Through a Native Module"
+slug: "rork-expo-foundation-models-native-module-bridge"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-14T11:30"
+updated: "2026-06-14T11:30"
+author: "Rork Lab"
+description: "Rork generates Expo (React Native) apps, but Apple Foundation Models ships as a Swift framework you can't touch from JavaScript. Here's how to write an Expo Modules API bridge, gate it by availability, and fall back to the cloud on unsupported devices."
+tags: ["Rork", "Expo", "Foundation Models", "On-Device AI", "Native Module", "React Native"]
+highlights:
+  - "If you were stuck wanting on-device AI in your Expo app but couldn't reach the Swift framework from JS, you'll now have a working bridge you wrote and control yourself"
+  - "You can turn a naive call that crashes on pre-iOS-26 or ineligible devices into something you can ship to every user, guarded by an availability check and a cloud fallback"
+  - "You'll be able to weak-link the system framework through EAS Build and decide, with a real sense of device distribution, how to pass review and staged rollout"
+---
+
+Generate an app from a prompt in Rork and what you get is an Expo (React Native) project. Apple's on-device AI, Foundation Models, ships as a Swift framework. So the moment you decide you want an on-device LLM inside a Rork-built app, you hit a wall: JavaScript can't reach it directly.
+
+I've run wallpaper and wellness apps as an indie developer for years, and one thing has been hammered into me repeatedly: "shipping a new OS feature to every user" and "running it on the latest devices only" are two completely different things. Foundation Models is an iOS 26+ on-device capability, so calling it naively quietly abandons readers on older hardware. In this article we build a production-grade setup that bridges Swift's Foundation Models through the Expo Modules API and silently routes to the cloud when the environment can't support it.
+
+The design philosophy of using on-device inference as the primary path and escaping heavy work to the cloud is covered in [the on-device-first inference router](/articles/rork-ai/rork-ai-inference-router-on-device-first-cloud-fallback-2026), and the prerequisite of using Foundation Models from native Swift is covered in [the Apple FoundationModels implementation guide](/articles/rork-ai/rork-foundation-models-on-device-llm-offline-ai-guide). This piece narrows in on the wiring that sits between those two: how you actually call that framework from an Expo app.
+
+## Why JavaScript Can't Call It Directly
+
+Foundation Models is a Swift-only API you reach via `import FoundationModels`. The React Native bridge only passes JSON-equivalent values between JavaScript and Objective-C/Swift, so a Swift type like `LanguageModelSession` can't cross over to JS as-is.
+
+This is where many people go hunting for an off-the-shelf package like `expo-apple-intelligence`. But Foundation Models is recent, and thin wrappers aimed purely at Expo apps aren't yet stable. I tend to decide that rather than being dragged around by someone else's black-box wrapper and its version churn, I'd rather write and own a hundred-line module myself — and I'll take that approach here too. There are only three things to do: receive a prompt as a string, call Foundation Models on the Swift side, and return the result string through a Promise. For that scope, a hand-written module reads more clearly and you can fix it yourself when it breaks.
+
+## The Swift Side: Wrapping Foundation Models in an Expo Module
+
+In the Expo Modules API, you just define `AsyncFunction`s on a class that extends `Module`, and you get functions JS can `await`. To build a local module, start from `npx create-expo-module --local on-device-ai`, then rewrite the generated `ios/OnDeviceAIModule.swift` like this.
+
+```swift
+import ExpoModulesCore
+import FoundationModels
+
+public class OnDeviceAIModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("OnDeviceAI")
+
+    // Tell JS whether this device can run the on-device LLM.
+    // Anything other than "available" means JS should switch to the cloud.
+    AsyncFunction("availability") { () -> String in
+      if #available(iOS 26.0, *) {
+        switch SystemLanguageModel.default.availability {
+        case .available:
+          return "available"
+        case .unavailable(.deviceNotEligible):
+          return "device_not_eligible"
+        case .unavailable(.appleIntelligenceNotEnabled):
+          return "not_enabled"
+        case .unavailable(.modelNotReady):
+          return "model_not_ready"
+        case .unavailable:
+          return "unavailable"
+        }
+      } else {
+        return "os_too_old"   // below iOS 26
+      }
+    }
+
+    // Take a prompt, return generated text.
+    // Using a promise bridges Swift's async/throws straight into a JS exception.
+    AsyncFunction("generate") { (prompt: String, promise: Promise) in
+      guard #available(iOS 26.0, *) else {
+        promise.reject("UNSUPPORTED", "On-device generation is unavailable below iOS 26")
+        return
+      }
+      Task {
+        do {
+          let session = LanguageModelSession()
+          let response = try await session.respond(to: prompt)
+          promise.resolve(response.content)
+        } catch {
+          promise.reject("GENERATION_FAILED", error.localizedDescription)
+        }
+      }
+    }
+  }
+}
+```
+
+The single most important thing here is the `if #available(iOS 26.0, *)` guard. Even in code that `import`s `FoundationModels`, as long as you keep Foundation Models-specific types out of anything outside the guard, the framework is weak-linked and the app still launches on pre-iOS-26 devices. I keep `availability` as its own function and guard again at the top of `generate` because that lets the JS side survive both "branch on availability before calling" and "accidentally call generate on an old device." In production the latter always happens eventually, so I defend twice.
+
+## The TypeScript Side: A Typed Wrapper and Fallback
+
+You retrieve the native module with `requireNativeModule`. Put a thin TypeScript wrapper over it and confine the availability decision and the cloud fallback to a single place.
+
+```typescript
+// modules/on-device-ai/index.ts
+import { requireNativeModule } from "expo-modules-core";
+import { Platform } from "react-native";
+
+type Availability =
+  | "available"
+  | "device_not_eligible"
+  | "not_enabled"
+  | "model_not_ready"
+  | "os_too_old"
+  | "unavailable";
+
+const Native = requireNativeModule<{
+  availability(): Promise<Availability>;
+  generate(prompt: string): Promise<string>;
+}>("OnDeviceAI");
+
+// On Android and the simulator the native module won't exist, so fail safe first.
+export async function getAvailability(): Promise<Availability> {
+  if (Platform.OS !== "ios") return "unavailable";
+  try {
+    return await Native.availability();
+  } catch {
+    return "unavailable";
+  }
+}
+
+// Make on-device the primary path; escape to cloudGenerate when it can't run.
+export async function generate(
+  prompt: string,
+  cloudGenerate: (p: string) => Promise<string>,
+): Promise<{ text: string; source: "on_device" | "cloud" }> {
+  if ((await getAvailability()) === "available") {
+    try {
+      const text = await Native.generate(prompt);
+      return { text, source: "on_device" };
+    } catch {
+      // Even if the model fails mid-run, switch quietly to the cloud.
+    }
+  }
+  return { text: await cloudGenerate(prompt), source: "cloud" };
+}
+```
+
+This `generate` returns `source` to tell the caller which path produced the text. When I first tried on-device generation in a wallpaper app, I didn't return this. As a result I couldn't separate "is on-device or cloud slower" or "how much am I falling back to free-tier Private Cloud Compute" from the logs, and I burned a full day on measurement. Just returning `source` from the start makes every later operational decision easier.
+
+The caller looks like this. Pass your existing Gemini or Claude call straight into `cloudGenerate`.
+
+```typescript
+const { text, source } = await generate(
+  "Suggest a two-word English title that fits this wallpaper",
+  (p) => callGeminiFlash(p),   // inject your existing cloud call
+);
+console.log(source); // "on_device" or "cloud" lands in the logs
+```
+
+## A Common Trap: It Builds, but Nothing Comes Back on Device
+
+This is where many people get stuck. Custom native modules don't run in Expo Go. You need a development build (dev client) via `npx expo run:ios` or EAS Build. Call `generate` while still on Expo Go and the module isn't found, so it throws. If the dev client setup trips you up, work through [the Expo Dev Client setup steps](/articles/rork-dev/rork-expo-dev-client-native-module-setup-guide) first.
+
+The other trap is the iOS deployment target. Even guarded with `#available`, if your build target is too old the Foundation Models SDK itself isn't visible. Raise the floor in `app.json`.
+
+```json
+{
+  "expo": {
+    "ios": { "deploymentTarget": "26.0" }
+  }
+}
+```
+
+But raising the deployment target to 26.0 means you can no longer ship the app to any device below it. This is the exact moment a feature addition ("add on-device AI") turns into a business decision ("abandon readers on older devices"). I prefer to leave the deployment target where it is (say, 16.0), wrap only the Foundation Models code in `#available`, and weak-link the framework. That way the app still launches on an iOS 16 device, only the on-device AI is quietly disabled, and the cloud fallback catches it. Watching device distribution across tens of millions of downloads, OS adoption is slower than you'd think, and I've come to believe that "ship the newest feature only to those who can run it" protects downloads and ratings better than "ship it to everyone."
+
+For weak-linking to hold, every Foundation Models-specific type in `OnDeviceAIModule.swift` (`SystemLanguageModel`, `LanguageModelSession`) must live inside an `#available` block. Let even one leak outside and dyld can't resolve the symbol at launch, crashing on pre-iOS-26 devices. "It built" is not verification here. Always confirm launch on a real pre-iOS-26 device or simulator.
+
+## Which App Should Carry the Free Tier First
+
+At WWDC 2026, Apple signaled that developers under two million first-time App Store downloads get free access to Foundation Models running on Private Cloud Compute. Rork itself starts free with paid plans from $25/month, and Rork Max — which generates native Swift — runs $200/month; but pairing on-device inference with the free tier keeps your AI-side running cost effectively near zero at this scale even after you ship generative features. Escaping work that on-device can't handle to a server-side model stays unbilled up to a certain scale — a line drawn squarely with the indie developer's scale in mind. The cost design itself is covered in detail in [restructuring Foundation Models' free tier into three layers](/articles/rork-ai/rork-foundation-models-pcc-free-tier-cost-design).
+
+From an implementation standpoint, one caveat: a free tier is not a reason to roll this out across every app at once. In my experience running multiple apps, putting a new API into your single most active app — the one where feedback comes back fastest — first, then watching the on-device/cloud ratio and perceived latency through `source` logs for two or three weeks before expanding, causes dramatically fewer incidents. The `source`-returning design is what supports that observation. The wiring worth owning first isn't the flashy generation feature itself, but rather this measurement scaffold beneath it.
+
+## The Shortest Path to Something Running
+
+When in doubt, keep this order and you won't trip:
+
+1. Implement only `availability` first, push it to a dev client, and confirm with your own eyes that your device returns `"available"`. Skip this and you can't later tell whether a problem is "a code bug" or "an unsupported device."
+2. Add `generate` next, and confirm the `#available` guard is doubled and every Foundation Models-specific type lives inside the guard. Do your pre-iOS-26 launch check at this stage, without exception.
+3. Finally, return `source` from the TypeScript wrapper and inject the cloud fallback. Only here are you in a state you can ship to every user.
+
+This is the same order I follow every time I add a new native capability across multiple apps. Do it in reverse and you'll always get swallowed somewhere by "it builds but doesn't run."
+
+To start moving, scaffold an empty module with `npx create-expo-module --local on-device-ai`, implement just the `availability` function above, and push it to a device with `npx expo run:ios`. Beginning by confirming with your own eyes whether the device returns `"available"` removes all the guesswork from the generation work that follows.
