@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — Rorkが$15Mを調達。モバイル特化のノーコードAIという立ち位置に投資家の評価が集まっています",
-    "MAX-NATIVE — Rork MaxはAR/LiDAR・Metal 3D・ウィジェット・Dynamic Island・Live Activities・HealthKit・Core MLなど、React Nativeでは届かないネイティブ領域に対応",
-    "MOBILE-FIRST — BoltやLovableがWebアプリ中心なのに対し、Rorkはモバイルアプリ専業。説明文から本番品質のアプリを生成します",
-    "WWDC — WWDC26が閉幕。AIがOSのコア機能となり、iOS 27世代へ。ウィジェットやLive Activitiesの価値がさらに上がる局面です",
-    "PRICING — Rorkは無料で開始でき有料$25/月〜、Rork Maxは$200/月。Expoで素早く検証し、必要に応じてMaxでネイティブ化する多段戦略が現実的",
-    "ALL-APPLE — Rork MaxのSwift直接生成はiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでカバーします",
+    "MAX — Rork MaxはWeb上でSwiftアプリを開発・公開できる初のビルダーをうたい、Xcode不要・2クリックでApp Store公開まで到達できます",
+    "APPLE — iPhone・iPad・Apple Watch・Apple TV・Vision Pro向けのネイティブSwiftアプリを生成します",
+    "EXPO — 通常版はReact Native（Expo）基盤。自然言語の要件記述からネイティブiOS/Androidアプリを生成します",
+    "FUNDING — Rorkがa16zから$2.8Mを調達。AIノーコードのモバイル領域で存在感を強めています",
+    "PRICE — 無料で開始でき、有料プランは$25/月から。個人開発者が試しやすい価格帯です",
+    "WWDC — WWDC 2026でApple Intelligenceが前進。ネイティブ機能の価値が上がり、ノーコード生成アプリのAI統合の選択肢も広がります",
   ],
   en: [
-    "FUNDING — Rork raises $15M, drawing fresh attention to its mobile-first no-code AI positioning",
-    "MAX-NATIVE — Rork Max reaches native territory React Native can't: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, and on-device Core ML",
-    "MOBILE-FIRST — While Bolt and Lovable focus on web apps, Rork builds mobile apps — production-ready from a plain-language description",
-    "WWDC — WWDC26 wraps with AI becoming a core OS capability; the iOS 27 generation raises the value of widgets and Live Activities",
-    "PRICING — Free to start, paid plans from $25/mo, Rork Max at $200/mo — ship fast on Expo, then go native with Max where it pays off",
-    "ALL-APPLE — Rork Max generates pure Swift covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "MAX — Rork Max bills itself as the first web Swift app builder, publishing to the App Store in two clicks with no Xcode required",
+    "APPLE — It generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, and Vision Pro",
+    "EXPO — The standard tier builds native iOS and Android apps on React Native (Expo) from a plain-English description",
+    "FUNDING — Rork raised $2.8M from a16z, strengthening its position in AI no-code mobile development",
+    "PRICE — Free to start, with paid plans from $25/month — an accessible entry point for solo developers",
+    "WWDC — WWDC 2026 pushes Apple Intelligence forward, raising the value of native features and widening AI integration options for no-code apps",
   ],
 };
 
