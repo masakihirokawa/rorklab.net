@@ -1,0 +1,121 @@
+---
+title: "Getting to the Real Revenue Number — A Pipeline that Reconciles AdMob, App Store, Google Play, and Stripe"
+slug: "rork-revenue-reconciliation-admob-appstore-play-stripe-six-apps"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-13T21:00"
+author: "Rork Lab"
+description: "Dashboard revenue and the money that actually lands in your account do not match. Here is an aggregation pipeline that absorbs currency, timezone, and the gap between estimated and finalized figures across four revenue sources — with the implementation and operating judgment from running six apps."
+tags: ["revenue ops", "AdMob", "App Store Connect", "Stripe", "data design"]
+highlights:
+  - "Why estimates and finalized payouts diverge, broken down per source, and how to reconcile them"
+  - "A normalization schema that absorbs currency, timezone, and refunds, plus a daily aggregation skeleton"
+  - "A monthly routine that balances payouts against the books instead of trusting the dashboard at face value"
+---
+
+One month AdMob's dashboard showed a 12% gain over the prior month, yet the actual payout was flat. I suspected a bug at first, but the cause was simple: the dashboard's "estimated revenue" and the finalized payout are different things. The moment FX settles, post-hoc invalid-traffic adjustments, reaching the payment threshold — several factors make the number on screen diverge from the number in the bank.
+
+Running six apps as an indie developer, revenue arrives from four sources: AdMob, App Store, Google Play, and Stripe. Each has its own currency, its own timezone, its own notion of "estimated versus finalized." Add them up naively and the numbers stop matching somewhere every month. Here is the aggregation pipeline I built to reach the real number by reconciling all four — with the normalization schema, the daily aggregation, and the monthly balancing routine.
+
+## Why the numbers diverge — the character of each source
+
+Before designing reconciliation, I had to understand how each of the four sources lies.
+
+AdMob's screen shows estimated revenue. Invalid-traffic deductions and FX settlement pull the month-end finalized figure down by a few percent. In my own records, the gap between estimate and finalized stayed roughly in the 2–6% range. App Store Connect and Google Play have three layers that each differ: the on-screen "sales," the finalized figure in financial reports, and the actual payout net of fees. Stripe is comparatively honest, but refunds and chargebacks arrive later as negatives, so you have to keep occurrence date and settlement date separate or things stop matching across month boundaries.
+
+In other words, no source tells you unambiguously "how much you earned right now." I decided from the start that the foundation of the design is keeping estimated and finalized as separate columns.
+
+## A normalization schema — reshape everything into one form
+
+The four data formats are all different, so I normalize them into a common shape first. The schema I use is this.
+
+```sql
+CREATE TABLE revenue_events (
+  app_id        TEXT NOT NULL,        -- one of the six
+  source        TEXT NOT NULL,        -- admob / appstore / googleplay / stripe
+  kind          TEXT NOT NULL,        -- ad / iap / subscription / refund
+  occurred_on   DATE NOT NULL,        -- occurrence date (unified to UTC)
+  amount_minor  INTEGER NOT NULL,     -- minor currency units (1 = 1 yen, or 1 cent)
+  currency      TEXT NOT NULL,        -- JPY / USD etc.
+  status        TEXT NOT NULL,        -- estimated / finalized
+  fx_to_jpy     REAL,                 -- FX rate at finalization (NULL allowed for estimated)
+  PRIMARY KEY (app_id, source, kind, occurred_on, status)
+);
+```
+
+Three things matter. Storing amounts as integers in minor currency units (`amount_minor`) instead of floats prevents rounding error from accumulating. The `status` field cleanly separates estimated from finalized, and the primary key prevents duplicate rows for the same day and source. And the FX rate is saved as "the rate at finalization" in `fx_to_jpy`, not "the rate at aggregation time," so past numbers do not shift when you re-aggregate later.
+
+If you convert currency at the aggregation-time rate by accident, the number you saw at the start of the month differs from the one at the end, and the dashboard becomes untrustworthy. I learned that the hard way once.
+
+## Ingest daily — idempotency above all
+
+Each source's data is ingested at a fixed time every day. What matters is an idempotent design where ingesting the same day repeatedly yields the same result. Network retries and delayed updates on the source side happen routinely, so build for overwrite.
+
+```typescript
+type RevenueEvent = {
+  appId: string; source: string; kind: string;
+  occurredOn: string; amountMinor: number;
+  currency: string; status: 'estimated' | 'finalized'; fxToJpy: number | null;
+};
+
+// UPSERT by primary key. The same (app, source, kind, day, status) is always overwritten with the latest
+async function upsertEvents(db: D1Database, events: RevenueEvent[]) {
+  const stmt = db.prepare(`
+    INSERT INTO revenue_events
+      (app_id, source, kind, occurred_on, amount_minor, currency, status, fx_to_jpy)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(app_id, source, kind, occurred_on, status)
+    DO UPDATE SET amount_minor = excluded.amount_minor,
+                  fx_to_jpy   = excluded.fx_to_jpy
+  `);
+  const batch = events.map(e => stmt.bind(
+    e.appId, e.source, e.kind, e.occurredOn,
+    e.amountMinor, e.currency, e.status, e.fxToJpy,
+  ));
+  await db.batch(batch);
+}
+```
+
+I run this once each morning on a Cloudflare Workers scheduled trigger and accumulate the results in D1. Rather than replacing the `estimated` rows with `finalized` ones the next month, I let them coexist as a separate `status`. That lets me verify after the fact how far last month's estimate diverged from finalized, and use it to correct next month's estimate.
+
+I pull the yen-converted daily total like this.
+
+```sql
+SELECT app_id, source,
+       SUM(amount_minor * COALESCE(fx_to_jpy, 1.0)) / 100.0 AS jpy_approx
+FROM revenue_events
+WHERE status = 'estimated' AND occurred_on >= date('now', '-30 day')
+GROUP BY app_id, source
+ORDER BY jpy_approx DESC;
+```
+
+## Monthly balancing — do not over-trust the dashboard
+
+Daily estimates are plenty for watching trends. But a number you use for business decisions only earns trust once you reconcile it monthly against finalized figures. What I always do at the start of the month is line up last month's `estimated` totals against the `finalized` totals from each source's financial report and look at the difference as a percentage.
+
+If the gap sits within the expected range (2–6% for AdMob, a roughly fixed ratio net of store fees), it is healthy. Outside the range, there is a missed pickup or a double count somewhere. This reconciliation once surfaced an ingestion bug where one app's Stripe refunds were being deducted twice. Watching only the daily dashboard, I would never have caught it.
+
+I set investment priorities from this finalized-based number. For example, "which app gets the next feature" is decided not by descending estimated revenue, but by descending finalized profit (revenue minus fees and ad cost). Even a few percent of divergence between estimate and finalized routinely reshuffles the ranking of the six.
+
+## Build a way to notice the gaps
+
+Leave reconciliation as a manual monthly task and you will skip it in a busy month. I added a simple health check at the end of the daily ingest. It alerts when it detects an anomaly — a source's amount dropping to zero versus the prior day, or falling below half of the same weekday last week.
+
+```typescript
+function anomalies(today: number, lastWeekSameDay: number): string | null {
+  if (today === 0 && lastWeekSameDay > 0) return 'source is zero (likely ingest gap)';
+  if (lastWeekSameDay > 0 && today < lastWeekSameDay * 0.5) {
+    return `dropped to ${Math.round((today / lastWeekSameDay) * 100)}% week over week`;
+  }
+  return null;
+}
+```
+
+It is not fancy. But this plain check has saved me several times from the worst pattern — a source's ingestion having quietly stopped, only to notice two weeks of missing data. The earlier and smaller you catch an anomaly, the easier it is to isolate the cause.
+
+## Where to start
+
+Trying to integrate four sources at once will defeat you. I recommend accumulating just the largest source first (for most indie developers that is AdMob), with estimated and finalized kept separate, for one month. Simply learning what the estimate-to-finalized gap is in percent for your own business changes how you relate to the dashboard number.
+
+I accumulated only AdMob for two months to get a feel for the gap, then added the remaining sources. The real revenue number does not appear on any single screen. It only takes shape once you reconcile multiple sources. I hope this gives a starting point to anyone juggling several revenue streams of their own.

@@ -1,0 +1,126 @@
+---
+title: "Before Your Feature Flags Turn Into a Junkyard — Governing Naming, Staged Rollout, and Kill Switches Across Six Apps"
+slug: "rork-feature-flag-governance-naming-rollout-killswitch-six-apps"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-13T16:00"
+author: "Rork Lab"
+description: "Keep adding remote-config flags and within six months you have keys nobody remembers the meaning of. Here is a governance system — naming conventions, safe defaults, staged rollout, kill switches, and monthly cleanup — with the implementation from running six apps in parallel."
+tags: ["feature flags", "remote config", "operations", "Firebase", "governance"]
+highlights:
+  - "A naming convention you can still read six months later, plus a rule that sorts flags into three lifespans"
+  - "A default design that always fails to the safe side, and a staged rollout you can run in 5% increments"
+  - "A kill switch that stops a feature in production within 30 seconds, and a monthly routine to retire dead flags"
+---
+
+I remember the day I added the first flag to remote config. It was a key called `new_onboarding` for showing a new onboarding screen to a slice of users. It was convenient. So convenient that six months later nearly thirty flags sat there, including ones like `test2` and `enable_v3_real` whose meaning nobody could explain anymore.
+
+Feature flags themselves are powerful. The problem is an asymmetry: adding one is easy, removing one is tedious. When the same thing happens across six apps at once, the config screen quickly turns into a wasteland. Here is the governance system I settled on to avoid that, along with the actual naming convention and the rollout and kill-switch implementation.
+
+## A naming convention your future self can read
+
+The first thing I decided was the naming convention. A flag name should tell you which app, what it controls, and how long it is meant to live.
+
+```
+<scope>.<domain>.<name>.<kind>
+
+examples:
+  wallpaper.onboarding.skip_tutorial.release   # all apps, permanent
+  fortune.paywall.intro_offer_v2.experiment    # fortune apps only, experiment
+  all.admob.interstitial_enabled.ops           # all apps, operational switch
+```
+
+The trailing `kind` is the crux. It sorts flags into three lifespans. A `release` flag is temporary, used to roll a new feature out in stages; an `experiment` flag is for A/B tests and dies when the test ends; an `ops` flag is a permanent operational switch like a kill switch. With this classification, the monthly cleanup below becomes a mechanical "is this safe to delete?" decision.
+
+I made `scope` able to target a group of apps because settings I wanted to apply only to the three fortune apps came up constantly. `all` means every app; anything else filters by an app group ID.
+
+## Defaults must fail to the safe side
+
+The biggest trap in remote config is behavior on a failed fetch. Right after launch or while offline, the flag value has not arrived yet. If you treat "value not fetched = feature ON," an unverified feature leaks to every user.
+
+As a rule, when a flag cannot be fetched, behavior falls back to the previous safe state. For a new-feature flag the default is OFF; for an operational kill switch the default is ON (do not stop).
+
+```typescript
+import remoteConfig from '@react-native-firebase/remote-config';
+
+// State the fallback per flag explicitly
+const DEFAULTS = {
+  'wallpaper.onboarding.skip_tutorial.release': false, // new feature -> default OFF
+  'all.admob.interstitial_enabled.ops': true,          // ops -> default do-not-stop
+} as const;
+
+export async function initFlags(): Promise<void> {
+  await remoteConfig().setDefaults(DEFAULTS);
+  await remoteConfig().setConfigSettings({
+    minimumFetchIntervalMillis: 60 * 60 * 1000, // 1-hour cache normally
+  });
+  // DEFAULTS still apply on failure, so do not swallow it — just record it
+  try {
+    await remoteConfig().fetchAndActivate();
+  } catch (e) {
+    logFlagFetchError(e);
+  }
+}
+
+export function flag(key: keyof typeof DEFAULTS): boolean {
+  return remoteConfig().getValue(key).asBoolean();
+}
+```
+
+Declaring every flag's safe value in `setDefaults` is the point. With it, even a device that has never reached the server gets defined, safe behavior. I treat this list of defaults as the single source of truth in code, and I keep a strict order: add the default here first, then create the flag on the server side.
+
+## Running staged rollout in 5% increments
+
+Opening a new-feature flag straight to 100% means any problem hits every user. I hash the device's install ID into a bucket from 0 to 99 and control "what percentage is ON" with a numeric remote-config value.
+
+```typescript
+import remoteConfig from '@react-native-firebase/remote-config';
+
+// Assign each device to a stable bucket 0..99
+function bucketOf(installId: string): number {
+  let h = 0;
+  for (let i = 0; i < installId.length; i++) {
+    h = (h * 31 + installId.charCodeAt(i)) >>> 0;
+  }
+  return h % 100;
+}
+
+export function rolloutEnabled(key: string, installId: string): boolean {
+  const pct = remoteConfig().getValue(`${key}.rollout_pct`).asNumber(); // 0..100
+  return bucketOf(installId) < pct;
+}
+```
+
+The operation is simple. Set `rollout_pct` to 5 to reach 5% of users, then watch the Crashlytics crash rate and key metrics for a day. If nothing breaks, raise it to 25, 50, 100. Because the bucket is stable per device, a user who turned ON does not flicker back to OFF the next day. For an experiment flag, the same mechanism doubles as a 50/50 A/B split.
+
+One caution: do not use an advertising identifier or any value that can track a user for `installId`. I use an anonymous install identifier generated inside the app so it never becomes a privacy-tracking signal.
+
+## Kill switches — the comfort of stopping in 30 seconds
+
+An `ops` flag exists to stop a feature instantly when something goes wrong. The first one I built was a switch that disables ad display entirely. Wanting to kill ads urgently after an AdMob policy warning is a situation that actually happens.
+
+To make a kill switch effective, you have to design the cache interval. The normal cache is one hour, but an `ops` flag needs to take effect in an emergency, so I shorten the minimum interval and refetch on launch and on returning to the foreground.
+
+```typescript
+export async function refreshOpsFlags(): Promise<void> {
+  // Emergency switches prioritize immediacy: nearly disable cache and refetch
+  await remoteConfig().setConfigSettings({ minimumFetchIntervalMillis: 0 });
+  await remoteConfig().fetchAndActivate();
+  await remoteConfig().setConfigSettings({ minimumFetchIntervalMillis: 60 * 60 * 1000 });
+}
+```
+
+In practice, changing the value on the server takes effect on the app's next return to the foreground, and an active restart stops it within 30 seconds. That sense of "I can definitely stop it if I have to" became psychological support for shipping bolder features to production.
+
+## Retire dead flags every month
+
+The hardest part of governance is not adding flags but removing them. At the start of each month I spend five minutes on a flag inventory. Anything `experiment` whose test has ended, and anything `release` that reached 100% and became permanent, gets its branch deleted from code and removed from remote config.
+
+This is where the `kind` classification pays off. Keep `ops`, delete `release` after it reaches 100%, delete `experiment` when its test ends — the call is visible from the name alone. Since I started this cleanup, the total flag count across six apps stabilized from near forty to a steady fifteen or so. Fewer flags also lowers the cognitive load on anyone new looking at the config screen.
+
+## Build the pattern on one app first
+
+If you are just introducing this, you do not need to align the system across six apps at once. Run one full loop — naming, safe defaults, staged rollout, cleanup — on a single app, and expand only after the operational pattern feels natural in your hands.
+
+I operated the first app for two months before widening to the rest. Just placing the obvious truth — flags are harder to remove than to add — at the foundation of the design prevents much of the six-month wasteland. I hope this helps anyone else wrestling with settings across multiple apps.

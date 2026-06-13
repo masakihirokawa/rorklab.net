@@ -1,0 +1,121 @@
+---
+title: "収益の「本当の数字」を掴む — AdMob・App Store・Google Play・Stripe を突き合わせる集計設計"
+slug: "rork-revenue-reconciliation-admob-appstore-play-stripe-six-apps"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-13T21:00"
+author: "Rork Lab"
+description: "ダッシュボードの売上と実際の入金額は一致しません。通貨・タイムゾーン・推定値と確定値のズレを吸収し、4つの収益ソースを突き合わせる集計パイプラインを、6本並行運用の実装と運用判断とともに整理しました。"
+tags: ["収益管理", "AdMob", "App Store Connect", "Stripe", "データ設計"]
+highlights:
+  - "推定値と確定入金額がなぜズレるのかを4ソース別に切り分け、突き合わせる集計の考え方"
+  - "通貨・タイムゾーン・返金を吸収する正規化スキーマと、日次で集計する実装の骨格"
+  - "ダッシュボードの数字を鵜呑みにせず、月次で入金と帳尻を合わせる運用手順"
+---
+
+ある月、AdMob のダッシュボードは前月比 12% 増を示していたのに、実際の入金は横ばいでした。最初はバグを疑いましたが、原因は単純で、ダッシュボードの「推定収益」と確定した入金額は別物だったのです。為替の確定タイミング、無効トラフィックの事後調整、支払いの最低額への到達——いくつもの要因で、画面の数字と銀行口座の数字はずれます。
+
+個人開発でアプリを6本運用していると、収益は AdMob・App Store・Google Play・Stripe の4つから入ってきます。それぞれが別の通貨、別のタイムゾーン、別の「推定と確定」の概念を持っています。これらを素朴に足し算すると、毎月どこかで数字が合わなくなります。ここでは、4ソースを突き合わせて「本当の数字」を掴むために組んだ集計パイプラインを、正規化のスキーマと日次集計の実装、そして月次の帳尻合わせの手順とともに共有します。
+
+## なぜ数字がずれるのか — ソース別の性格
+
+突き合わせを設計する前に、4つのソースがそれぞれどう嘘をつくかを理解する必要がありました。
+
+AdMob の画面に出るのは推定収益です。無効トラフィックの控除や為替の確定により、月末に確定する金額は数%下振れします。私の実績では、推定と確定の差はおおむね 2〜6% の範囲に収まっていました。App Store Connect と Google Play は、画面の「販売」と、財務レポートの確定額、さらに実際の入金額（手数料控除後）の3層がそれぞれ違います。Stripe は比較的素直ですが、返金やチャージバックが後日マイナスで入るため、発生日と確定日を分けて持たないと月をまたいだときに合わなくなります。
+
+つまり、どのソースも「今いくら稼いだか」を一意には教えてくれません。設計の出発点は、推定値と確定値を別の列として持つことだと最初に決めました。
+
+## 正規化スキーマ — すべてを同じ形に直す
+
+4ソースのデータ形式はバラバラなので、いったん共通の形に正規化します。私が使っているスキーマはこうです。
+
+```sql
+CREATE TABLE revenue_events (
+  app_id        TEXT NOT NULL,        -- 6本のどれか
+  source        TEXT NOT NULL,        -- admob / appstore / googleplay / stripe
+  kind          TEXT NOT NULL,        -- ad / iap / subscription / refund
+  occurred_on   DATE NOT NULL,        -- 発生日（UTC基準に統一）
+  amount_minor  INTEGER NOT NULL,     -- 最小通貨単位（円なら1=1円, ドルなら1=1セント）
+  currency      TEXT NOT NULL,        -- JPY / USD など
+  status        TEXT NOT NULL,        -- estimated / finalized
+  fx_to_jpy     REAL,                 -- 確定時の対円レート（estimated は NULL 可）
+  PRIMARY KEY (app_id, source, kind, occurred_on, status)
+);
+```
+
+肝は3つです。金額を浮動小数ではなく最小通貨単位の整数（`amount_minor`）で持つことで、丸め誤差が積み上がるのを防ぎます。`status` で推定と確定を明確に分け、同じ日・同じソースの行が二重に立つのを主キーで防ぎます。そして為替は「集計時の今のレート」ではなく「確定時のレート」を `fx_to_jpy` に保存し、後から再集計しても過去の数字が動かないようにします。
+
+通貨換算をうっかり集計時のレートでやると、月初に見た数字と月末に見た数字が変わってしまい、信頼できないダッシュボードになります。これは一度やって痛い目を見ました。
+
+## 日次で取り込む — 冪等性を最優先に
+
+各ソースのデータは、毎日決まった時刻に取り込みます。重要なのは、同じ日のデータを何度取り込んでも結果が変わらない冪等な設計にすることです。ネットワークの再試行やソース側の遅延更新は日常的に起きるので、上書き前提で作ります。
+
+```typescript
+type RevenueEvent = {
+  appId: string; source: string; kind: string;
+  occurredOn: string; amountMinor: number;
+  currency: string; status: 'estimated' | 'finalized'; fxToJpy: number | null;
+};
+
+// 主キーで UPSERT。同じ (app, source, kind, day, status) は常に最新値で上書き
+async function upsertEvents(db: D1Database, events: RevenueEvent[]) {
+  const stmt = db.prepare(`
+    INSERT INTO revenue_events
+      (app_id, source, kind, occurred_on, amount_minor, currency, status, fx_to_jpy)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(app_id, source, kind, occurred_on, status)
+    DO UPDATE SET amount_minor = excluded.amount_minor,
+                  fx_to_jpy   = excluded.fx_to_jpy
+  `);
+  const batch = events.map(e => stmt.bind(
+    e.appId, e.source, e.kind, e.occurredOn,
+    e.amountMinor, e.currency, e.status, e.fxToJpy,
+  ));
+  await db.batch(batch);
+}
+```
+
+私はこれを Cloudflare Workers の定時実行で毎朝1回走らせ、結果を D1 に貯めています。`estimated` の行は翌月に `finalized` の行へ置き換わるのではなく、別 `status` として共存させます。こうしておくと「先月の推定と確定がどれだけずれたか」を後から検証でき、来月の推定の補正に使えます。
+
+円換算した日次の合計は、こう取り出します。
+
+```sql
+SELECT app_id, source,
+       SUM(amount_minor * COALESCE(fx_to_jpy, 1.0)) / 100.0 AS jpy_approx
+FROM revenue_events
+WHERE status = 'estimated' AND occurred_on >= date('now', '-30 day')
+GROUP BY app_id, source
+ORDER BY jpy_approx DESC;
+```
+
+## 月次の帳尻合わせ — ダッシュボードを信じすぎない
+
+日次の推定値は、傾向を見るには十分です。けれど事業判断に使う数字は、月次で確定値と突き合わせて初めて信用できるものになります。私が月初に必ずやるのは、前月の `estimated` 合計と、各ソースの財務レポートに出る `finalized` 合計を並べて、差分を率で見ることです。
+
+差が想定範囲（AdMob なら 2〜6%、ストアの手数料控除後ならほぼ固定の比率）に収まっていれば健全です。範囲を外れたら、どこかに取りこぼしか二重計上があります。実際にこの突き合わせで、あるアプリの Stripe の返金が二重に引かれていた取り込みバグを見つけたことがあります。日次のダッシュボードだけ見ていたら気づけませんでした。
+
+事業判断の優先度は、この確定ベースの数字で決めます。たとえば「どのアプリに次の機能を投資するか」は、推定収益の高い順ではなく、確定した利益（収益から手数料と広告原価を引いたもの）の順で並べ直してから考えます。推定と確定が数%ずれるだけでも、6本の順位が入れ替わることは珍しくありません。
+
+## ズレに気づける仕組みにしておく
+
+突き合わせを手作業の月次タスクにしておくと、忙しい月に飛ばしてしまいます。私は日次の取り込みの最後に、簡単な健全性チェックを挟むようにしました。前日と比べてあるソースの金額がゼロになった、あるいは前週同曜日比で半分以下に落ちた、といった異常を検知したら通知を出します。
+
+```typescript
+function anomalies(today: number, lastWeekSameDay: number): string | null {
+  if (today === 0 && lastWeekSameDay > 0) return 'ソースがゼロ（取り込み欠落の疑い）';
+  if (lastWeekSameDay > 0 && today < lastWeekSameDay * 0.5) {
+    return `前週比 ${Math.round((today / lastWeekSameDay) * 100)}% に急減`;
+  }
+  return null;
+}
+```
+
+派手なものではありません。けれど「ソースの取り込みが静かに止まっていた」という最悪のパターン——気づいたら2週間データが欠けていた——を、この素朴なチェックが何度か防いでくれました。異常は早く小さいうちに見つけるほど、原因の切り分けが楽になります。
+
+## どこから始めるか
+
+4ソースを一度に統合しようとすると挫折します。まずは最も金額の大きい1ソース（多くの個人開発では AdMob でしょう）だけを、推定と確定を分けて1か月貯めてみるのをお勧めします。推定と確定のズレ幅が自分の事業で何%なのかを掴むだけでも、ダッシュボードの数字との付き合い方が変わります。
+
+私自身、最初は AdMob だけを2か月分貯めてズレの感覚を掴み、それから残りのソースを足していきました。収益の「本当の数字」は、ひとつの画面には映りません。複数のソースを突き合わせて初めて像を結ぶものだと考えています。同じように複数の収益源を抱える方の集計設計の足がかりになれば幸いです。

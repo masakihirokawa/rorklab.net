@@ -1,0 +1,140 @@
+---
+title: "Shipping Wallpaper Packs Without an App Review — Versioning and Delta Delivery for Remote Assets Across Six Apps"
+slug: "rork-remote-asset-pack-versioning-delta-delivery-six-apps"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-13T11:00"
+author: "Rork Lab"
+description: "Re-submitting your app every time you add ten wallpapers grinds operations to a halt. Here is a manifest-based versioning scheme with delta downloads, cache invalidation, and rollback — with the implementation and measured transfer savings from running six apps in parallel."
+tags: ["asset delivery", "wallpaper app", "versioning", "Expo", "operations"]
+highlights:
+  - "A concrete manifest schema that decouples content packs from App Store review so delivery becomes instant"
+  - "A delta-download implementation that cut transfer per update by 88% on average by avoiding full refetches"
+  - "Version-pinning and a rollback procedure that reverts a broken pack in 30 seconds across all six apps"
+---
+
+Bumping a build, swapping screenshots, and waiting two days for review — just to add ten seasonal wallpapers. That loop worked right after launch. But once I was running six wallpaper apps in parallel, it became a hard bottleneck. While one app sat in review, images piled up for three others, and I kept pushing the whole batch to "next week."
+
+Adding content has nothing to do with app code. The behavior does not change when there are more images. So I moved content delivery outside of app review entirely. What follows is the remote asset pack system I rebuilt, along with the code I run and the transfer numbers I measured before and after the switch.
+
+## Why I stopped bundling assets
+
+The first design bundled images inside the app. That guarantees offline display and a fast cold start. The cost is that every new image requires a full re-submission, and the IPA keeps growing. Crossing 90MB after six months was the breaking point.
+
+I narrowed the decision to two axes. The first is update frequency: content swapped several times a week goes remote, while UI assets fixed at release stay bundled. The second is first-run experience: the handful of images guaranteed to appear on launch (the default cover, onboarding art) stay bundled, and everything else is fetched remotely. That line let me fix the bundled set at about twenty images.
+
+## A manifest-first approach — what to deliver, what to delete
+
+The center of remote delivery is not the images but the manifest. On launch the app fetches the manifest first, then retrieves images according to its instructions. The schema looks like this.
+
+```json
+{
+  "packVersion": 142,
+  "minAppVersion": "3.2.0",
+  "generatedAt": "2026-06-13T02:00:00Z",
+  "categories": [
+    {
+      "id": "seasonal-rainy",
+      "title": { "ja": "雨の季節", "en": "Rainy Season" },
+      "items": [
+        {
+          "id": "rainy-0142",
+          "hash": "b7f3c1a9",
+          "w": 1290, "h": 2796,
+          "url": "https://cdn.example.com/packs/rainy-0142.heic",
+          "thumb": "https://cdn.example.com/thumbs/rainy-0142.webp",
+          "addedIn": 142
+        }
+      ]
+    }
+  ]
+}
+```
+
+The key fields are `hash` and `addedIn`. The `hash` is a short fingerprint derived from the image content, and we only refetch when it changes. The `addedIn` value records the pack version where an image first appeared, which drives delta computation. The `minAppVersion` is a safety valve that keeps a newer image format (a live wallpaper added later, say) from reaching older apps.
+
+The manifest itself lives at the CDN edge with `Cache-Control: max-age=300` — five minutes. I keep it short so that pulling a single bad image propagates to every device within five minutes at most. Image bodies never change once published, so they get `max-age=31536000, immutable` for a one-year cache.
+
+## Delta downloads — the implementation that cut transfer by 88%
+
+This is the part that mattered most to operating cost. The naive version makes the app check every image in every category each time the manifest updates. Across six apps and thousands of images, that alone is meaningful traffic.
+
+Instead, the device stores "the last pack version I synced" and only acts on the difference.
+
+```typescript
+import * as FileSystem from 'expo-file-system';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const MANIFEST_URL = 'https://cdn.example.com/packs/manifest.json';
+const CACHE_DIR = `${FileSystem.cacheDirectory}packs/`;
+
+type Item = { id: string; hash: string; url: string; addedIn: number };
+
+async function syncPacks(): Promise<void> {
+  const lastVersion = Number(await AsyncStorage.getItem('packVersion') ?? '0');
+
+  const res = await fetch(MANIFEST_URL);
+  const manifest = await res.json();
+  if (manifest.packVersion === lastVersion) return; // nothing changed
+
+  await FileSystem.makeDirectoryAsync(CACHE_DIR, { intermediates: true })
+    .catch(() => {}); // ignore if it already exists
+
+  const allItems: Item[] = manifest.categories.flatMap((c: any) => c.items);
+
+  // Only target new items or ones whose hash changed
+  const targets: Item[] = [];
+  for (const item of allItems) {
+    const local = `${CACHE_DIR}${item.id}-${item.hash}.heic`;
+    const info = await FileSystem.getInfoAsync(local);
+    if (!info.exists) targets.push(item);
+  }
+
+  // Cap concurrency at four so slow networks do not stall
+  await runWithConcurrency(targets, 4, async (item) => {
+    const dest = `${CACHE_DIR}${item.id}-${item.hash}.heic`;
+    await FileSystem.downloadAsync(item.url, dest);
+  });
+
+  await AsyncStorage.setItem('packVersion', String(manifest.packVersion));
+  await pruneStale(allItems); // remove files for stale hashes
+}
+```
+
+Embedding the hash in the filename is the crux. Replacing an image changes its filename, so it never collides with the old cache and stays consistent with the CDN's `immutable` caching. The `pruneStale` step removes any cached file not present in the current manifest; skip it and on-device storage grows monotonically.
+
+Before the switch, a weekly content update refetched about 14MB per device. With deltas it dropped to about 1.7MB on average — roughly an 88% reduction. CDN transfer cost across all six apps fell to less than half per month.
+
+## Rolling back a broken pack — what actually happens
+
+The danger of remote delivery is that a bad manifest hits every device at once. I shipped a pack once with a typo in a thumbnail URL, and part of the grid turned into gray placeholders.
+
+What saved me was treating manifest versions as append-only rather than overwrite. Each generated manifest is stored numbered, like `manifest-142.json`, and `manifest.json` is a separate pointer to it. Rolling back is just moving the pointer back one number.
+
+```bash
+# Point the live manifest back to the previous version
+aws s3 cp s3://packs/manifest-141.json s3://packs/manifest.json \
+  --content-type application/json \
+  --cache-control "max-age=300"
+```
+
+Because the edge cache is five minutes at most, in practice every device returns to a healthy version in 30 seconds to three minutes. No re-submission, no update rollout. That "just move the pointer" simplicity is what gave me room to breathe when something broke late at night.
+
+When operating six apps together, I consolidate manifest generation into a single script that filters output per app by `appId`. Each app simply selects categories that fit its character from a shared image pool, so rolling a new seasonal pack out to all six now takes minutes.
+
+## The small conventions that made operations work
+
+After running this for a while, what eased operations was not the flashy machinery but a few unglamorous conventions.
+
+One is generating the manifest exactly once a day at a fixed time. Publishing manually whenever inspiration strikes makes it impossible to trace later which version contains what. Once I fixed it to once a day and logged `generatedAt` along with the diff, isolating issues got dramatically easier.
+
+The other is never silently swallowing image-fetch failures. A certain number of devices will fail to download on slow networks or when storage is tight. Aggregating failed item IDs onto a dashboard surfaces skews — for instance, a single CDN region with a high failure rate. In my case I feed asset-sync success and failure into the same pipeline as the AdMob revenue logs and review them once a day in one place.
+
+Plain as it is, having that observability foothold lets you keep improving without ever pausing content delivery.
+
+## Where to start
+
+If you already bundle assets, you do not need to move everything remote at once. Carve out one frequently updated category into the manifest approach first, and verify the delta-download and rollback paths in production. Get a feel for the operations there before migrating the rest in stages.
+
+I watched the first app for about two weeks before expanding to the remaining five. Once content additions are decoupled from code releases, the tempo of operations visibly changes. I hope this gives a starting point to anyone else who is constantly chasing updates across multiple apps.

@@ -1,0 +1,126 @@
+---
+title: "フィーチャーフラグが散らかる前に — 命名・段階公開・キルスイッチを6本横断で統治する設計"
+slug: "rork-feature-flag-governance-naming-rollout-killswitch-six-apps"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-13T16:00"
+author: "Rork Lab"
+description: "リモート設定でフラグを増やしていくと、半年後には誰も意味を覚えていないキーが並びます。命名規約・デフォルトの安全側・段階公開・キルスイッチ・棚卸しを、6本並行運用の実装とともに統治の仕組みとして整理しました。"
+tags: ["フィーチャーフラグ", "リモート設定", "運用設計", "Firebase", "ガバナンス"]
+highlights:
+  - "半年後も意味が追える命名規約と、フラグの寿命を3種類に分ける分類の具体的なルール"
+  - "通信失敗時に必ず安全側へ倒れるデフォルト設計と、段階公開を5%刻みで回す実装"
+  - "本番で30秒以内に機能を止めるキルスイッチと、死んだフラグを毎月棚卸しする運用手順"
+---
+
+リモート設定に最初のフラグを入れた日のことは、よく覚えています。新しいオンボーディング画面を一部のユーザーにだけ出すための `new_onboarding` というキーでした。便利でした。あまりに便利だったので、半年後には30個近いフラグが並び、`test2` や `enable_v3_real` のような、もう誰も意味を説明できないキーがいくつも残っていました。
+
+フィーチャーフラグそのものは強力です。問題は、増やすのが簡単で消すのが面倒という非対称性にあります。6本のアプリで同じことが同時に起きると、設定画面はあっという間に荒れ地になりました。ここでは、その荒れ地を作らないために決めた統治の仕組みを、実際の命名規約と段階公開・キルスイッチの実装とともに共有します。
+
+## 命名規約 — 半年後の自分が読める形に
+
+最初に決めたのは命名規約です。フラグ名から「どのアプリの」「何の」「いつまでの」フラグかが読めるようにしました。
+
+```
+<scope>.<domain>.<name>.<kind>
+
+例:
+  wallpaper.onboarding.skip_tutorial.release   # 全アプリ共通・恒久
+  fortune.paywall.intro_offer_v2.experiment    # 占い系のみ・実験
+  all.admob.interstitial_enabled.ops           # 全アプリ・運用スイッチ
+```
+
+末尾の `kind` が肝です。フラグの寿命を3種類に分けています。`release` は新機能を段階的に出すための一時的なもの、`experiment` はA/Bテスト用でテスト終了とともに消すもの、`ops` はキルスイッチのように恒久的に残す運用スイッチです。この分類があると、後述する棚卸しのときに「これは消していいのか」を機械的に判断できます。
+
+`scope` でアプリ群を指定できるようにしたのは、6本のうち占い系3本にだけ効かせたい設定が頻繁にあったからです。`all` は全アプリ、それ以外はアプリグループIDで絞ります。
+
+## デフォルトは必ず安全側へ
+
+リモート設定の最大の落とし穴は、通信に失敗したときの挙動です。起動直後やオフラインでは、フラグの値がまだ取れていません。ここで「フラグが取れていない＝機能ON」と書いてしまうと、まだ検証中の機能が全ユーザーに漏れます。
+
+原則として、フラグが取れないときは「これまでどおりの安全な状態」に倒れるようにします。新機能のフラグなら既定はOFF、機能を止めるための運用スイッチなら既定はON（＝止めない）です。
+
+```typescript
+import remoteConfig from '@react-native-firebase/remote-config';
+
+// 取得できないときに倒す先を、フラグごとに明示する
+const DEFAULTS = {
+  'wallpaper.onboarding.skip_tutorial.release': false, // 新機能 → 既定OFF
+  'all.admob.interstitial_enabled.ops': true,          // 運用 → 既定は止めない
+} as const;
+
+export async function initFlags(): Promise<void> {
+  await remoteConfig().setDefaults(DEFAULTS);
+  await remoteConfig().setConfigSettings({
+    minimumFetchIntervalMillis: 60 * 60 * 1000, // 通常は1時間キャッシュ
+  });
+  // 失敗しても DEFAULTS が効くので、ここでは握りつぶさず記録だけ残す
+  try {
+    await remoteConfig().fetchAndActivate();
+  } catch (e) {
+    logFlagFetchError(e);
+  }
+}
+
+export function flag(key: keyof typeof DEFAULTS): boolean {
+  return remoteConfig().getValue(key).asBoolean();
+}
+```
+
+`setDefaults` にすべてのフラグの安全側の値を明示しておくのが要点です。これを書いておけば、サーバーに一度も到達できていない端末でも、必ず定義済みの安全な挙動になります。私はこの「既定値の一覧」をコードのなかで唯一の真実として扱い、新しいフラグを足すときは必ずここに既定を書いてからリモート側に作る、という順番を守っています。
+
+## 段階公開を5%刻みで回す
+
+新機能のフラグを一気に100%へ開くと、問題が起きたとき被害が全ユーザーに及びます。私は端末のインストールIDをハッシュ化して0〜99のバケットに割り当て、「何%までONにするか」をリモート設定の数値で制御しています。
+
+```typescript
+import remoteConfig from '@react-native-firebase/remote-config';
+
+// 端末を 0..99 の安定したバケットに割り当てる
+function bucketOf(installId: string): number {
+  let h = 0;
+  for (let i = 0; i < installId.length; i++) {
+    h = (h * 31 + installId.charCodeAt(i)) >>> 0;
+  }
+  return h % 100;
+}
+
+export function rolloutEnabled(key: string, installId: string): boolean {
+  const pct = remoteConfig().getValue(`${key}.rollout_pct`).asNumber(); // 0..100
+  return bucketOf(installId) < pct;
+}
+```
+
+運用は単純です。まず `rollout_pct` を5にして全体の5%に出し、Crashlytics のクラッシュ率と主要指標を1日見ます。問題がなければ 25、50、100 と上げていきます。バケットが端末ごとに安定しているので、いったんONになったユーザーが翌日OFFに戻る、というちらつきが起きません。実験用フラグの場合は、この仕組みでそのまま50%対50%のA/Bにも使えます。
+
+ひとつ注意点があります。`installId` には広告識別子やユーザーを追跡できる値を使わないことです。アプリ内で生成した匿名のインストール識別子を使い、プライバシー上の追跡につながらないようにしています。
+
+## キルスイッチ — 30秒で止められる安心
+
+`ops` 種別のフラグは、何かが起きたときに機能を即座に止めるためのものです。私が最初に用意したのは、広告表示そのものを止めるスイッチでした。AdMob のポリシー警告を受けて緊急で広告を止めたい、というのは実際に起きる場面です。
+
+キルスイッチを実効性のあるものにするには、キャッシュ間隔の設計が要ります。通常は1時間キャッシュですが、`ops` フラグは緊急時に効いてほしいので、起動時とフォアグラウンド復帰時には最小間隔を短くして取り直すようにしています。
+
+```typescript
+export async function refreshOpsFlags(): Promise<void> {
+  // 緊急スイッチは即時性を優先し、キャッシュをほぼ無効化して取り直す
+  await remoteConfig().setConfigSettings({ minimumFetchIntervalMillis: 0 });
+  await remoteConfig().fetchAndActivate();
+  await remoteConfig().setConfigSettings({ minimumFetchIntervalMillis: 60 * 60 * 1000 });
+}
+```
+
+実測では、リモート側で値を変えてからアプリの次回フォアグラウンド復帰時に反映され、能動的に再起動すれば30秒以内に止まります。この「いざとなれば確実に止められる」という感覚は、攻めた機能を本番に出すときの心理的な支えになりました。
+
+## 死んだフラグを毎月棚卸しする
+
+統治のいちばん難しい部分は、増やすことではなく減らすことです。私は月初に5分だけ、フラグの棚卸しをします。`experiment` 種別でテストが終わっているもの、`release` 種別で100%に到達して定着したものは、コードから分岐を消し、リモート設定からも削除します。
+
+このとき `kind` の分類が効きます。`ops` は残す、`release` は100%到達後に消す、`experiment` はテスト終了で消す、という判断が名前を見るだけで付きます。実際にこの棚卸しを始めてから、6本合計のフラグ数は40個近くから常時15個前後で安定するようになりました。フラグが少ないと、新しい人が設定画面を見たときの認知負荷も下がります。
+
+## まず1本で型を作る
+
+これから導入するなら、いきなり6本で仕組みを揃える必要はありません。まず1本のアプリで命名規約・既定の安全側・段階公開・棚卸しのひと回しを経験し、運用の型が手に馴染んでから横展開するのをお勧めします。
+
+私自身、最初の1本で2か月運用してから残りに広げました。フラグは増やすより減らすほうが難しい、という当たり前のことを設計の前提に置くだけで、半年後の荒れ地はかなり防げます。同じように複数アプリの設定に頭を悩ませている方の助けになれば嬉しいです。
