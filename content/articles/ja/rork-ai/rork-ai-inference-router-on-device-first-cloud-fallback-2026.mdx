@@ -1,0 +1,340 @@
+---
+title: "オンデバイスAIを一次経路にして、重い処理だけクラウドへ逃がす推論ルーターをRorkアプリに組む"
+slug: "rork-ai-inference-router-on-device-first-cloud-fallback-2026"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-13T20:15"
+updated: "2026-06-13T20:15"
+author: "Rork Lab"
+description: "Rork（Expo）で生成したアプリに、オンデバイス→Private Cloud Compute→外部API（Claude/Gemini）の順で推論を流す段階フォールバック型ルーターを実装します。予算管理・タイムアウト・キャッシュ・画像入力の振り分けまで、動くTypeScriptで解説します。"
+tags: ["Rork", "オンデバイスAI", "Foundation Models", "React Native", "推論ルーター", "コスト設計"]
+highlights:
+  - "AI機能のAPI費用が読めずに導入をためらっていた人が、月のAIコストを実質ゼロ付近に抑える段階フォールバックの実装を手に入れられる"
+  - "オンデバイス・PCC・外部APIのどれに何を流すかを、タスクの種類と予算で自動判定する型付きルーターを今日コピーして組み込める"
+  - "リトライ時の二重課金やアプリ復帰時の競合といった、本番でだけ起きる落とし穴を踏む前に避けられる"
+---
+
+WWDC26 が終わった週、私は個人開発で運用しているアプリの「AIで一言コメントを生成する」機能のクラウド費用を見直していました。月数百円とはいえ、ユーザーが増えるほど線形に積み上がる構造で、無料アプリにとっては地味に重い固定費です。
+
+そこへ Apple が「初回ダウンロード200万未満の開発者は、Private Cloud Compute 上の Foundation Models を無償で使える」と State of the Union で示しました。さらに同じ Swift API から画像入力やサーバーサイドの外部モデル（Claude や Gemini）も呼べる方向に拡張されます。これは「軽い推論はオンデバイスで無料、重い推論だけ課金経路へ」という振り分けが、初めて現実的なコスト設計として組めるようになったことを意味します。
+
+ただし、Rork が生成するのは Expo（React Native）の本番アプリです。React Native から Apple のオンデバイスモデルへ直接は届きません。そこで必要になるのが、**どの推論をどの経路に流すかを一箇所で決める「推論ルーター」**です。以下では、その設計と動くコードを順に置いていきます。
+
+## なぜ「単一API直叩き」が本番で破綻するのか
+
+最初に私がやってしまった素朴な実装は、機能ごとに `fetch` で外部 API を直接呼ぶものでした。動くには動きます。けれど、運用に乗せた途端に次の問題が同時に噴き出しました。
+
+- オフライン時に機能が完全に死ぬ（地下鉄でアプリを開いた瞬間にエラー）
+- 同じ入力に対して毎回課金される（要約のような決定的なタスクでも）
+- 軽いタスクも重いタスクも同じ高価なモデルに流れる
+- リトライを雑に書いたら、タイムアウト後の再送で二重に課金された
+
+これらはモデルを賢くしても解決しません。**経路選択（ルーティング）がアプリのロジックに散らばっていること**が原因です。ルーターという一枚の層に集約すると、フォールバックも予算管理もキャッシュも、その層の中だけで完結します。
+
+## 段階フォールバックの考え方
+
+私が採用しているのは、安くて速い経路から順に試し、扱えなければ次の段へ落とす「はしご（ladder）」構造です。
+
+1. **Tier 0 — キャッシュ**: 決定的なタスク（同じ入力なら同じ出力でよいもの）は、まずローカルキャッシュを見る。ヒットすれば課金もネットワークもゼロ
+2. **Tier 1 — オンデバイス**: 短い分類・要約・整形などは、Foundation Models をネイティブモジュール経由で呼ぶ。無料・低遅延・オフライン可
+3. **Tier 2 — Private Cloud Compute**: オンデバイスでは精度が足りないが、外部に課金したくない処理。無償枠の範囲で使う
+4. **Tier 3 — 外部API（Claude / Gemini）**: 画像入力を伴うマルチモーダルや、長文の高品質生成など、どうしても重いものだけ
+
+オンデバイス段をネイティブモジュールとして実装する具体的な手順は、[Rork で Apple FoundationModels を使う実装ガイド](/articles/rork-ai/rork-foundation-models-on-device-llm-offline-ai-guide)で別途まとめています。無償枠（PCC）をコスト設計として三層に組む観点は、[Foundation Models の無償開放で AI コストを三層に組み直す](/articles/rork-ai/rork-foundation-models-pcc-free-tier-cost-design)が参考になります。
+
+この順序の肝は、**「下の段ほど高価」という前提でタスクを上の段から当てていく**ことです。各タスクには「最低限ここまでの段が要る」という下限を持たせ、ルーターはその下限以上で最も安い段から試します。
+
+## タスクを型で表現する
+
+まず、ルーターに渡すリクエストを型で定義します。ここを曖昧にすると、後段の判定が全部 `if` の山になります。
+
+```typescript
+// ai/types.ts
+export type Tier = 'cache' | 'on-device' | 'pcc' | 'remote';
+
+// タスクの性質。ルーターはこれを見て最低限必要なTierを決める
+export interface InferenceTask {
+  // 機能の識別子（テレメトリ・キャッシュキーの一部に使う）
+  kind: 'summarize' | 'classify' | 'rewrite' | 'caption' | 'chat';
+  // 入力本文
+  input: string;
+  // 画像を伴うか（伴うなら remote まで上げる）
+  image?: { uri: string; mime: string };
+  // 同じ入力なら同じ出力でよいか（true ならキャッシュ可）
+  deterministic: boolean;
+  // この機能が許容する最大レイテンシ（ms）。超えそうなら段を上げる/諦める
+  latencyBudgetMs: number;
+}
+
+export interface InferenceResult {
+  text: string;
+  servedBy: Tier;     // どの段が応答したか（観測用）
+  costUsd: number;    // 概算課金額（予算管理に使う）
+  cached: boolean;
+}
+```
+
+`servedBy` と `costUsd` を結果に必ず含めるのがポイントです。これがないと「実際どの段が効いているのか」を後から計測できず、チューニングが勘になります。
+
+## 各Tierを共通インターフェースに揃える
+
+次に、4つの経路を「同じ顔」に揃えます。ルーターは個々の経路の中身を知らなくてよくなります。
+
+```typescript
+// ai/engine.ts
+import type { InferenceTask, InferenceResult, Tier } from './types';
+
+export interface Engine {
+  tier: Tier;
+  // このエンジンがこのタスクを扱えるか（端末性能・画像対応など）
+  canHandle(task: InferenceTask): Promise<boolean>;
+  // 1回あたりの概算コスト（予算判定に使う。0なら無料）
+  estimateCost(task: InferenceTask): number;
+  run(task: InferenceTask): Promise<InferenceResult>;
+}
+```
+
+オンデバイス経路は、Expo のネイティブモジュールとして薄く橋渡しします。ここでは「呼べるかどうか」を実行時に確認する点が重要です。古い端末や非対応OSでは `canHandle` が `false` を返し、ルーターは自動的に次の段へ落とします。
+
+```typescript
+// ai/onDeviceEngine.ts
+import { NativeModulesProxy } from 'expo-modules-core';
+import type { Engine, InferenceTask, InferenceResult } from './types';
+
+// expo-modules で実装したネイティブ側（iOSはFoundation Models）への薄い橋
+const Native = NativeModulesProxy.OnDeviceAI as
+  | { isAvailable(): Promise<boolean>; generate(prompt: string): Promise<string> }
+  | undefined;
+
+export const onDeviceEngine: Engine = {
+  tier: 'on-device',
+
+  async canHandle(task: InferenceTask) {
+    // ネイティブモジュール未搭載・画像入力・長文は扱わない
+    if (!Native) return false;
+    if (task.image) return false;
+    if (task.input.length > 4000) return false;
+    return Native.isAvailable();
+  },
+
+  estimateCost() {
+    return 0; // オンデバイスは無料
+  },
+
+  async run(task: InferenceTask): Promise<InferenceResult> {
+    const text = await Native!.generate(buildPrompt(task));
+    return { text, servedBy: 'on-device', costUsd: 0, cached: false };
+  },
+};
+
+function buildPrompt(task: InferenceTask): string {
+  // タスク種別ごとに最小限の指示を付ける（オンデバイスは短い指示が安定する）
+  const lead: Record<InferenceTask['kind'], string> = {
+    summarize: '次の文章を3文以内で要約してください。',
+    classify: '次の文章の主題を1語で答えてください。',
+    rewrite: '次の文章を丁寧な日本語に整えてください。',
+    caption: '内容に合う短い見出しを付けてください。',
+    chat: '',
+  };
+  return `${lead[task.kind]}\n\n${task.input}`;
+}
+```
+
+外部API経路（Tier 3）は、画像入力や高品質生成を担います。ここはサーバー側のプロキシ経由にして、APIキーを端末に置かないのが鉄則です。
+
+```typescript
+// ai/remoteEngine.ts
+import type { Engine, InferenceTask, InferenceResult } from './types';
+
+const PROXY_URL = 'https://your-worker.example.com/infer';
+
+export const remoteEngine: Engine = {
+  tier: 'remote',
+
+  async canHandle(task: InferenceTask) {
+    // 外部は最後の砦。画像も長文も受ける。ネット接続だけ確認
+    return true;
+  },
+
+  estimateCost(task: InferenceTask) {
+    // 入力トークン概算 × 単価（モデル選択は server 側で行う前提のざっくり値）
+    const approxTokens = Math.ceil(task.input.length / 3);
+    return (approxTokens / 1000) * 0.003; // 概算 USD
+  },
+
+  async run(task: InferenceTask): Promise<InferenceResult> {
+    const res = await fetch(PROXY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: task.kind,
+        input: task.input,
+        image: task.image ?? null,
+      }),
+    });
+    if (!res.ok) throw new Error(`remote ${res.status}`);
+    const json = (await res.json()) as { text: string; costUsd?: number };
+    return {
+      text: json.text,
+      servedBy: 'remote',
+      costUsd: json.costUsd ?? this.estimateCost(task),
+      cached: false,
+    };
+  },
+};
+```
+
+## ルーター本体 — 下限・予算・タイムアウトを一箇所に
+
+ここが心臓部です。タスクごとの「最低Tier」を決め、そこから上（安い順）に `canHandle` を満たすエンジンを探し、予算とタイムアウトを見ながら実行します。
+
+```typescript
+// ai/router.ts
+import type { Engine, InferenceTask, InferenceResult, Tier } from './types';
+
+const TIER_ORDER: Tier[] = ['cache', 'on-device', 'pcc', 'remote'];
+
+// タスク種別ごとの「最低限ここまでの段が必要」という下限
+function minTierFor(task: InferenceTask): Tier {
+  if (task.image) return 'remote';            // 画像はオンデバイスでは扱わない
+  if (task.kind === 'chat') return 'pcc';      // 対話は精度優先で最低PCC
+  return 'on-device';                          // 分類・要約・整形はオンデバイス起点
+}
+
+export class AIRouter {
+  private spentTodayUsd = 0;
+
+  constructor(
+    private engines: Engine[],
+    private dailyBudgetUsd: number,
+  ) {}
+
+  private orderedEngines(min: Tier): Engine[] {
+    const minIdx = TIER_ORDER.indexOf(min);
+    return this.engines
+      .filter((e) => TIER_ORDER.indexOf(e.tier) >= minIdx)
+      .sort((a, b) => TIER_ORDER.indexOf(a.tier) - TIER_ORDER.indexOf(b.tier));
+  }
+
+  async route(task: InferenceTask): Promise<InferenceResult> {
+    const min = minTierFor(task);
+    const candidates = this.orderedEngines(min);
+    let lastError: unknown;
+
+    for (const engine of candidates) {
+      // 予算オーバーする有料段はスキップ（無料段は常に許可）
+      const cost = engine.estimateCost(task);
+      if (cost > 0 && this.spentTodayUsd + cost > this.dailyBudgetUsd) {
+        continue;
+      }
+      if (!(await engine.canHandle(task))) continue;
+
+      try {
+        const result = await withTimeout(engine.run(task), task.latencyBudgetMs);
+        this.spentTodayUsd += result.costUsd;
+        return result;
+      } catch (err) {
+        // この段が失敗したら次の段へ落とす（フォールバック）
+        lastError = err;
+        continue;
+      }
+    }
+    throw new Error(`all tiers failed: ${String(lastError)}`);
+  }
+}
+
+// タイムアウト付き実行。超えたら reject してルーターが次段へ
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error('timeout')), ms);
+    p.then(
+      (v) => { clearTimeout(id); resolve(v); },
+      (e) => { clearTimeout(id); reject(e); },
+    );
+  });
+}
+```
+
+`route` の中で「予算チェック → 取り扱い可否 → タイムアウト付き実行 → 失敗なら次段」という一連が完結しているのが狙いです。呼び出し側は `router.route(task)` だけを意識すればよく、経路の存在すら知りません。
+
+## キャッシュ段を最前段に差し込む
+
+決定的なタスクの課金とネットワークを丸ごと消すために、キャッシュをエンジンとして実装し、最前段に置きます。`expo-sqlite` でも `AsyncStorage` でも構いませんが、私は件数が増える前提で SQLite を選びます。
+
+```typescript
+// ai/cacheEngine.ts
+import * as Crypto from 'expo-crypto';
+import type { Engine, InferenceTask, InferenceResult } from './types';
+
+type Store = {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+};
+
+export function createCacheEngine(store: Store): Engine {
+  return {
+    tier: 'cache',
+
+    async canHandle(task: InferenceTask) {
+      // 非決定的タスク・画像入りはキャッシュ対象外
+      return task.deterministic && !task.image;
+    },
+
+    estimateCost() {
+      return 0;
+    },
+
+    async run(task: InferenceTask): Promise<InferenceResult> {
+      const key = await keyFor(task);
+      const hit = await store.get(key);
+      if (hit === null) {
+        // キャッシュミスは「失敗」として投げ、ルーターに次段へ落とさせる
+        throw new Error('cache miss');
+      }
+      return { text: hit, servedBy: 'cache', costUsd: 0, cached: true };
+    },
+  };
+}
+
+async function keyFor(task: InferenceTask): Promise<string> {
+  return Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    `${task.kind}:${task.input}`,
+  );
+}
+```
+
+ここで「キャッシュミスを例外として投げる」のは意図的です。ルーターのフォールバック機構をそのまま再利用でき、ミス時は自動的にオンデバイス段へ落ちます。**そして書き込みは、実際に応答を返した段の側で行います**。具体的には `route` の成功直後に、決定的タスクならキャッシュへ保存する一行を足すだけです。
+
+```typescript
+// router.route() 内、return 直前に挿入する保存処理の例
+if (task.deterministic && result.servedBy !== 'cache') {
+  const key = await keyFor(task);        // cacheEngine と同じキー関数を共有
+  await cacheStore.set(key, result.text);
+}
+```
+
+## 本番でだけ踏む3つの落とし穴
+
+設計が綺麗でも、実機の運用で初めて見える罠があります。私が実際に踏んだものを挙げます。
+
+**1. リトライ後の二重課金。** タイムアウトで次段へ落とすと、前段の処理がバックグラウンドで生き残り、結果的に2回課金されることがあります。対策は、各 `run` を `AbortController` でキャンセル可能にして、`withTimeout` がタイムアウトした瞬間に前段を確実に中断することです。外部APIの `fetch` には `signal` を必ず渡します。
+
+**2. アプリ復帰時の競合。** バックグラウンド復帰の瞬間に同じ推論が複数発火し、同じキャッシュキーに同時書き込みが走ることがあります。`AppState` の `active` 遷移をトリガーにする画面では、進行中のリクエストを `Map<string, Promise>` で de-dupe し、同一キーの呼び出しは既存の Promise を共有させます。
+
+**3. 予算の単位を取り違える。** 私は最初 `dailyBudgetUsd` を「1日」のつもりで持っていたのに、リセット処理を書き忘れて「インストール以来ずっと加算」していました。`spentTodayUsd` は端末ローカルの日付が変わったらゼロに戻す処理を必ず添えます。無料段（オンデバイス・キャッシュ）は予算に関係なく常に通すので、予算が尽きてもアプリのコア体験は死にません。この「無料段は常に生きている」という性質が、コスト上限を設けても UX を守れる理由です。
+
+## どこまでオンデバイスに寄せるかは「機能の許容誤差」で決める
+
+技術的に段を増やすほど安くなりますが、闇雲にオンデバイスへ寄せると品質が落ちます。私の判断軸はシンプルで、**「その機能はどれだけ外しても許されるか」**です。
+
+タグ付けの候補提示や下書きの整形のような「外れても軽く直せる」機能は、積極的にオンデバイス段へ寄せます。逆に、ユーザーが結果をそのまま外部に共有する文章生成や、画像を読んで答える機能は、最初から Tier 3 を下限にします。AdMob のような広告収益で回している無料アプリでは、AIコストが利益を食わない範囲に収めることそのものが事業判断なので、この下限設定は機能ごとに意識的に決めています。
+
+段階フォールバックの良いところは、この判断を**タスクの `minTier` 一箇所で表現できる**点です。後から「やっぱりこの機能はオンデバイスで十分だった」と分かれば、下限を1段下げるだけで全体のコスト構造が変わります。
+
+## まず試すべき一歩
+
+もし既存の Rork アプリで AI 機能を `fetch` 直叩きで実装しているなら、最初の一歩は「キャッシュ段とルーターだけ」を入れることです。オンデバイス段のネイティブモジュールは後回しでも構いません。決定的なタスク（要約・整形）をキャッシュに通すだけで、課金とネットワークの相当部分がその日のうちに消えます。そこで `servedBy` の分布を1週間眺めてから、どの機能をオンデバイスへ寄せるかを決めると、勘ではなく実データで段を設計できます。
+
+実装の参考になれば幸いです。私自身もまだ無償枠の使いどころを手探りしている最中なので、より良い振り分けが見つかったら、また書き残していきます。

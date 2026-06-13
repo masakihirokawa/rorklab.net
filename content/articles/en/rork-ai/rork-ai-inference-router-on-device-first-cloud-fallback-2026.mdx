@@ -1,0 +1,339 @@
+---
+title: "Routing inference on-device first and escaping to the cloud only when it's worth it, in a Rork app"
+slug: "rork-ai-inference-router-on-device-first-cloud-fallback-2026"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-13T20:15"
+updated: "2026-06-13T20:15"
+author: "Rork Lab"
+description: "Build a tiered, fallback-based inference router in a Rork (Expo) app: cache to on-device to Private Cloud Compute to a remote API (Claude/Gemini). Working TypeScript covering budgets, timeouts, caching, and image routing."
+tags: ["Rork", "On-device AI", "Foundation Models", "React Native", "Inference router", "Cost design"]
+highlights:
+  - "If you've held off on adding an AI feature because the API bill was unpredictable, you'll get a fallback design that keeps your monthly AI cost close to zero"
+  - "You can paste in a typed router that decides what goes on-device, to PCC, or to a remote API based on task type and budget"
+  - "You'll dodge the production-only traps — double billing on retries and races on app resume — before you hit them"
+---
+
+The week WWDC26 wrapped, I was looking again at the cloud bill for a small "generate a one-line comment" feature in an app I run as an indie developer. A few hundred yen a month sounds trivial, but it scales linearly with users, and for a free app that's a quietly heavy fixed cost.
+
+Then Apple's State of the Union landed: developers with fewer than two million first-time downloads can use Foundation Models on Private Cloud Compute for free, and the same Swift API is moving toward image input and server-side third-party models (Claude, Gemini). For the first time, "cheap things on-device for free, expensive things on a paid path" becomes a cost design you can actually build, not just talk about.
+
+There's a catch: Rork generates production Expo (React Native) apps, and React Native can't reach Apple's on-device model directly. What you need is a single place that decides which inference goes down which path — an **inference router**. This article lays out that design with code you can run.
+
+## Why hitting a single API directly falls apart in production
+
+My first naive version called a remote API with `fetch` per feature. It worked. The moment it hit real usage, several problems erupted at once.
+
+- The feature died completely offline (open the app on the subway, get an error)
+- The same input was billed every time (even for deterministic tasks like summaries)
+- Light and heavy tasks both flowed to the same expensive model
+- A sloppy retry double-billed me when a request re-fired after a timeout
+
+A smarter model fixes none of this. The root cause is that **route selection is scattered across your app logic**. Pull it into one layer — the router — and fallback, budgeting, and caching all live inside that layer.
+
+## The fallback ladder
+
+The structure I use is a ladder: try the cheap, fast path first and drop to the next rung when a path can't handle the task.
+
+1. **Tier 0 — Cache**: deterministic tasks (same input, same acceptable output) check a local cache first. A hit costs nothing and touches no network
+2. **Tier 1 — On-device**: short classification, summarization, and cleanup go to Foundation Models via a native module. Free, low latency, works offline
+3. **Tier 2 — Private Cloud Compute**: when on-device accuracy isn't enough but you don't want to pay a third party. Used within the free allowance
+4. **Tier 3 — Remote API (Claude / Gemini)**: only the genuinely heavy work — multimodal with image input, or long high-quality generation
+
+The concrete steps for implementing the on-device rung as a native module are covered separately in [Using Apple FoundationModels in a Rork app](/articles/rork-ai/rork-foundation-models-on-device-llm-offline-ai-guide). For framing the free allowance (PCC) as a three-tier cost design, see [Rebuilding Rork AI cost as three tiers with the free Foundation Models](/articles/rork-ai/rork-foundation-models-pcc-free-tier-cost-design).
+
+The key is the assumption that **each rung down is more expensive**, so you try tasks from the top. Each task carries a floor — "this needs at least this rung" — and the router tries the cheapest rung at or above that floor.
+
+## Express the task as a type
+
+Start by typing the request you hand the router. Leave this vague and every downstream decision becomes a pile of `if`s.
+
+```typescript
+// ai/types.ts
+export type Tier = 'cache' | 'on-device' | 'pcc' | 'remote';
+
+// The nature of the task. The router reads this to pick the minimum required Tier.
+export interface InferenceTask {
+  // Feature id (used in telemetry and as part of the cache key)
+  kind: 'summarize' | 'classify' | 'rewrite' | 'caption' | 'chat';
+  input: string;
+  // Does it carry an image? (if so, escalate to remote)
+  image?: { uri: string; mime: string };
+  // Same input, same acceptable output? (if true, cacheable)
+  deterministic: boolean;
+  // Max latency this feature tolerates (ms). If we'd exceed it, escalate or give up.
+  latencyBudgetMs: number;
+}
+
+export interface InferenceResult {
+  text: string;
+  servedBy: Tier;     // which rung answered (for observation)
+  costUsd: number;    // estimated charge (for budgeting)
+  cached: boolean;
+}
+```
+
+Always include `servedBy` and `costUsd` in the result. Without them you can't measure which rung is actually doing the work, and tuning becomes guesswork.
+
+## Give every Tier the same shape
+
+Next, give all four paths the same face so the router never needs to know what's inside any of them.
+
+```typescript
+// ai/engine.ts
+import type { InferenceTask, InferenceResult, Tier } from './types';
+
+export interface Engine {
+  tier: Tier;
+  // Can this engine handle this task? (device capability, image support, etc.)
+  canHandle(task: InferenceTask): Promise<boolean>;
+  // Rough cost per call (used for budget decisions; 0 means free)
+  estimateCost(task: InferenceTask): number;
+  run(task: InferenceTask): Promise<InferenceResult>;
+}
+```
+
+The on-device path is a thin Expo native module bridge. The important part is checking availability at runtime. On old devices or unsupported OS versions, `canHandle` returns `false` and the router automatically drops to the next rung.
+
+```typescript
+// ai/onDeviceEngine.ts
+import { NativeModulesProxy } from 'expo-modules-core';
+import type { Engine, InferenceTask, InferenceResult } from './types';
+
+// Thin bridge to the native side (Foundation Models on iOS) built with expo-modules
+const Native = NativeModulesProxy.OnDeviceAI as
+  | { isAvailable(): Promise<boolean>; generate(prompt: string): Promise<string> }
+  | undefined;
+
+export const onDeviceEngine: Engine = {
+  tier: 'on-device',
+
+  async canHandle(task: InferenceTask) {
+    // No native module, image input, or long text here
+    if (!Native) return false;
+    if (task.image) return false;
+    if (task.input.length > 4000) return false;
+    return Native.isAvailable();
+  },
+
+  estimateCost() {
+    return 0; // on-device is free
+  },
+
+  async run(task: InferenceTask): Promise<InferenceResult> {
+    const text = await Native!.generate(buildPrompt(task));
+    return { text, servedBy: 'on-device', costUsd: 0, cached: false };
+  },
+};
+
+function buildPrompt(task: InferenceTask): string {
+  // Minimal instruction per task kind (short instructions are more stable on-device)
+  const lead: Record<InferenceTask['kind'], string> = {
+    summarize: 'Summarize the following in three sentences or fewer.',
+    classify: 'Answer the main topic of the following in one word.',
+    rewrite: 'Rewrite the following in clean, polite prose.',
+    caption: 'Write a short headline that fits the content.',
+    chat: '',
+  };
+  return `${lead[task.kind]}\n\n${task.input}`;
+}
+```
+
+The remote path (Tier 3) handles image input and high-quality generation. Route it through a server-side proxy so the API key never lives on the device.
+
+```typescript
+// ai/remoteEngine.ts
+import type { Engine, InferenceTask, InferenceResult } from './types';
+
+const PROXY_URL = 'https://your-worker.example.com/infer';
+
+export const remoteEngine: Engine = {
+  tier: 'remote',
+
+  async canHandle() {
+    // The last resort. Takes images and long text. Just needs a connection.
+    return true;
+  },
+
+  estimateCost(task: InferenceTask) {
+    // Approx input tokens x unit price (model choice happens server-side)
+    const approxTokens = Math.ceil(task.input.length / 3);
+    return (approxTokens / 1000) * 0.003; // rough USD
+  },
+
+  async run(task: InferenceTask): Promise<InferenceResult> {
+    const res = await fetch(PROXY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: task.kind,
+        input: task.input,
+        image: task.image ?? null,
+      }),
+    });
+    if (!res.ok) throw new Error(`remote ${res.status}`);
+    const json = (await res.json()) as { text: string; costUsd?: number };
+    return {
+      text: json.text,
+      servedBy: 'remote',
+      costUsd: json.costUsd ?? this.estimateCost(task),
+      cached: false,
+    };
+  },
+};
+```
+
+## The router itself — floor, budget, and timeout in one place
+
+This is the heart of it. Decide each task's minimum Tier, then from there walk up (cheapest first) looking for an engine that passes `canHandle`, executing while watching budget and timeout.
+
+```typescript
+// ai/router.ts
+import type { Engine, InferenceTask, InferenceResult, Tier } from './types';
+
+const TIER_ORDER: Tier[] = ['cache', 'on-device', 'pcc', 'remote'];
+
+// The floor: "this task needs at least this rung"
+function minTierFor(task: InferenceTask): Tier {
+  if (task.image) return 'remote';        // images aren't handled on-device
+  if (task.kind === 'chat') return 'pcc';  // chat favors accuracy: PCC floor
+  return 'on-device';                      // classify/summarize/rewrite start on-device
+}
+
+export class AIRouter {
+  private spentTodayUsd = 0;
+
+  constructor(
+    private engines: Engine[],
+    private dailyBudgetUsd: number,
+  ) {}
+
+  private orderedEngines(min: Tier): Engine[] {
+    const minIdx = TIER_ORDER.indexOf(min);
+    return this.engines
+      .filter((e) => TIER_ORDER.indexOf(e.tier) >= minIdx)
+      .sort((a, b) => TIER_ORDER.indexOf(a.tier) - TIER_ORDER.indexOf(b.tier));
+  }
+
+  async route(task: InferenceTask): Promise<InferenceResult> {
+    const min = minTierFor(task);
+    const candidates = this.orderedEngines(min);
+    let lastError: unknown;
+
+    for (const engine of candidates) {
+      // Skip paid rungs that would blow the budget (free rungs always allowed)
+      const cost = engine.estimateCost(task);
+      if (cost > 0 && this.spentTodayUsd + cost > this.dailyBudgetUsd) {
+        continue;
+      }
+      if (!(await engine.canHandle(task))) continue;
+
+      try {
+        const result = await withTimeout(engine.run(task), task.latencyBudgetMs);
+        this.spentTodayUsd += result.costUsd;
+        return result;
+      } catch (err) {
+        // This rung failed; drop to the next (fallback)
+        lastError = err;
+        continue;
+      }
+    }
+    throw new Error(`all tiers failed: ${String(lastError)}`);
+  }
+}
+
+// Timeout-bounded execution. On timeout, reject so the router drops a rung.
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error('timeout')), ms);
+    p.then(
+      (v) => { clearTimeout(id); resolve(v); },
+      (e) => { clearTimeout(id); reject(e); },
+    );
+  });
+}
+```
+
+Inside `route`, the whole sequence — budget check, capability check, timeout-bounded run, drop on failure — is self-contained. Callers only think about `router.route(task)`; they don't even know the paths exist.
+
+## Slot the cache rung in at the front
+
+To wipe out billing and network for deterministic tasks entirely, implement the cache as an engine and put it first. `AsyncStorage` works, but I pick SQLite (via `expo-sqlite`) since the row count grows.
+
+```typescript
+// ai/cacheEngine.ts
+import * as Crypto from 'expo-crypto';
+import type { Engine, InferenceTask, InferenceResult } from './types';
+
+type Store = {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+};
+
+export function createCacheEngine(store: Store): Engine {
+  return {
+    tier: 'cache',
+
+    async canHandle(task: InferenceTask) {
+      // Non-deterministic or image tasks aren't cacheable
+      return task.deterministic && !task.image;
+    },
+
+    estimateCost() {
+      return 0;
+    },
+
+    async run(task: InferenceTask): Promise<InferenceResult> {
+      const key = await keyFor(task);
+      const hit = await store.get(key);
+      if (hit === null) {
+        // Treat a miss as a failure so the router drops to the next rung
+        throw new Error('cache miss');
+      }
+      return { text: hit, servedBy: 'cache', costUsd: 0, cached: true };
+    },
+  };
+}
+
+async function keyFor(task: InferenceTask): Promise<string> {
+  return Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    `${task.kind}:${task.input}`,
+  );
+}
+```
+
+Throwing on a cache miss is deliberate: it reuses the router's fallback machinery so a miss drops to the on-device rung automatically. **And the write happens on the rung that actually answered** — concretely, add one line right after a successful `route` to store the result for deterministic tasks.
+
+```typescript
+// Inside router.route(), just before return
+if (task.deterministic && result.servedBy !== 'cache') {
+  const key = await keyFor(task);        // share the key function with cacheEngine
+  await cacheStore.set(key, result.text);
+}
+```
+
+## Three traps you only hit in production
+
+Even with a clean design, some traps only surface on a real device. Here are the ones I actually hit.
+
+**1. Double billing after a retry.** When a timeout drops you to the next rung, the previous rung's work can survive in the background and end up billed twice. The fix is to make each `run` cancelable with an `AbortController` and abort the prior rung the instant `withTimeout` fires. Always pass a `signal` to the remote `fetch`.
+
+**2. Races on app resume.** When the app returns from the background, the same inference can fire several times and write the same cache key concurrently. On screens triggered by the `AppState` transition to `active`, de-dupe in-flight requests with a `Map<string, Promise>` so calls with the same key share the existing Promise.
+
+**3. Getting the budget unit wrong.** I first held `dailyBudgetUsd` thinking "per day," but forgot the reset and accumulated "since install." Always reset `spentTodayUsd` to zero when the device-local date rolls over. The free rungs (on-device, cache) bypass the budget entirely, so even when funds run out the core experience doesn't die. That "free rungs stay alive" property is exactly why a cost ceiling can coexist with a protected UX.
+
+## How far to push on-device: decide by the feature's tolerance for error
+
+Technically, more rungs means cheaper — but pushing blindly on-device drops quality. My rule of thumb is simple: **how wrong can this feature be and still be fine?**
+
+Features where being off is cheap to fix — suggesting tag candidates, tidying a draft — I push hard onto the on-device rung. Conversely, generation a user shares verbatim, or anything that reads an image to answer, gets Tier 3 as its floor from the start. In a free app running on ad revenue through something like AdMob, keeping AI cost from eating the margin is itself a business decision, so I set that floor deliberately per feature.
+
+The nice thing about the ladder is that this judgment lives in **one place: the task's `minTier`**. If you later learn a feature was fine on-device after all, dropping its floor by one rung changes the whole cost structure.
+
+## The first step to try
+
+If your existing Rork app implements AI features by hitting a remote API directly, the first step is to add just the cache rung and the router. The on-device native module can wait. Simply routing deterministic tasks (summaries, cleanup) through the cache erases a real chunk of billing and network within the day. Watch the `servedBy` distribution for a week, then decide which features to push on-device — that way you design the rungs from data, not a hunch.
+
+I hope it helps your implementation. I'm still feeling out where the free allowance fits best myself, so if I find a better split, I'll write it down again.
