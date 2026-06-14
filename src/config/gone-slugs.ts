@@ -336,4 +336,32 @@ export const GONE_ARTICLE_SLUGS: string[] = [
   "whats-new-2026",
   "why-ai-should-replace-tax-officials",
   "fix-now-auto-debug",
+  // 2026-06-14: legacy redirect→category を 410 化（GSC「ページにリダイレクトがあります」対応）
+  "ai-side-business-rork-app-monetization-guide",
+  "indie-app-developer-revenue-economics-blueprint",
+  "rork-advanced-state-management-patterns",
+  "rork-app-monetization-implementation-complete-guide",
+  "rork-companion-feature-guide",
+  "rork-kindle-app-dev-book-publishing",
+  "rork-max-accessibility",
+  "rork-max-ai-capabilities-complete-guide",
+  "rork-max-ai-chatbot-gemini-streaming",
+  "rork-max-app-publishing-complete-guide",
+  "rork-max-funding-launch-guide-2026",
+  "rork-max-marketplace-app-tutorial",
+  "rork-max-storekit-2-in-app-purchase",
+  "rork-monetization-complete-guide",
+  "rork-multiplatform-ios-android-complete-guide",
+  "rork-push-notification-expo-backend-complete-guide",
+  "rork-stripe-monetization-complete-guide",
+];
+
+// 2026-06-14: 恒久削除した blog 記事（税務YMYL等）を 410 化
+export const GONE_BLOG_SLUGS: string[] = [
+  "ai-tax-filing-and-fighting-injustice",
+  "tax-battle-complete-chronicle",
+  "toyama-darkness-uozu-tax-office-kura-ai-reform",
+  "toyama-tax-office-darkness-systemic-injustice",
+  "toyama-tax-office-kura-recording-refusal-health-crisis",
+  "uozu-tax-office-update-fighting-systemic-injustice",
 ];

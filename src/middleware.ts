@@ -1,16 +1,25 @@
 import createMiddleware from "next-intl/middleware";
 import type { NextRequest } from "next/server";
 import { routing } from "./i18n/routing";
-import { GONE_ARTICLE_SLUGS } from "./config/gone-slugs";
+import { GONE_ARTICLE_SLUGS, GONE_BLOG_SLUGS } from "./config/gone-slugs";
 
 const intlMiddleware = createMiddleware(routing);
 const GONE = new Set(GONE_ARTICLE_SLUGS);
+const GONE_BLOG = new Set(GONE_BLOG_SLUGS);
 
 export default function middleware(request: NextRequest) {
   // 410 Gone — 恒久削除した記事は Google に明示する（リダイレクトや404ではなく）
   const { pathname } = request.nextUrl;
   const m = pathname.match(/^\/(?:(?:en|ja)\/)?articles\/[^/]+\/([^/]+)\/?$/);
   if (m && GONE.has(decodeURIComponent(m[1]))) {
+    return new Response("Gone", {
+      status: 410,
+      headers: { "content-type": "text/plain; charset=utf-8", "x-robots-tag": "noindex" },
+    });
+  }
+  // 410 Gone — 恒久削除した blog 記事
+  const mb = pathname.match(/^\/(?:(?:en|ja)\/)?blog\/([^/]+)\/?$/);
+  if (mb && GONE_BLOG.has(decodeURIComponent(mb[1]))) {
     return new Response("Gone", {
       status: 410,
       headers: { "content-type": "text/plain; charset=utf-8", "x-robots-tag": "noindex" },
