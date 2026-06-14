@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはWeb上でSwiftアプリを開発・公開できる初のビルダーをうたい、Xcode不要・2クリックでApp Store公開まで到達できます",
-    "APPLE — iPhone・iPad・Apple Watch・Apple TV・Vision Pro向けのネイティブSwiftアプリを生成します",
-    "EXPO — 通常版はReact Native（Expo）基盤。自然言語の要件記述からネイティブiOS/Androidアプリを生成します",
-    "FUNDING — Rorkがa16zから$2.8Mを調達。AIノーコードのモバイル領域で存在感を強めています",
-    "PRICE — 無料で開始でき、有料プランは$25/月から。個人開発者が試しやすい価格帯です",
-    "WWDC — WWDC 2026でApple Intelligenceが前進。ネイティブ機能の価値が上がり、ノーコード生成アプリのAI統合の選択肢も広がります",
+    "RORK MAX — Rork MaxがiPhone・iPad・Apple Watch・Apple TV・Vision Pro向けのネイティブSwiftアプリを生成できるようになりました",
+    "PUBLISH — Rork Maxは Xcode不要の「2クリックApp Store公開」に対応。申請・公開までの摩擦を大きく減らします",
+    "EXPO — 標準のRorkはReact Native（Expo）ベースで、プレーンな英語の説明からiOS／Androidネイティブアプリを生成します",
+    "PRICING — Rorkは無料で始められ、有料プランは月額$25から。個人開発で試しやすい価格帯です",
+    "FUNDING — Rorkがa16z（Andreessen Horowitz）から$2.8Mを調達。AIアプリビルダー領域への資金流入が続いています",
+    "REVIEW — 実運用では生成コードの可読性・保守性、Expo由来の制約、課金・プッシュ・広告SDKの組み込みやすさが評価の鍵になります",
   ],
   en: [
-    "MAX — Rork Max bills itself as the first web Swift app builder, publishing to the App Store in two clicks with no Xcode required",
-    "APPLE — It generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, and Vision Pro",
-    "EXPO — The standard tier builds native iOS and Android apps on React Native (Expo) from a plain-English description",
-    "FUNDING — Rork raised $2.8M from a16z, strengthening its position in AI no-code mobile development",
-    "PRICE — Free to start, with paid plans from $25/month — an accessible entry point for solo developers",
-    "WWDC — WWDC 2026 pushes Apple Intelligence forward, raising the value of native features and widening AI integration options for no-code apps",
+    "RORK MAX — Rork Max can now build native Swift apps for iPhone, iPad, Apple Watch, Apple TV, and Vision Pro",
+    "PUBLISH — Rork Max offers two-click App Store publishing with no Xcode required, cutting the friction of getting an app shipped",
+    "EXPO — The standard Rork is built on React Native (Expo), generating native iOS and Android apps from plain-English descriptions",
+    "PRICING — Rork is free to start, with paid plans beginning at $25/month, an accessible tier for solo developers",
+    "FUNDING — Rork raised $2.8M from a16z (Andreessen Horowitz) as investment keeps flowing into AI app builders",
+    "REVIEW — In real use the keys are generated-code readability and maintainability, Expo-related constraints, and how easily billing, push, and ad SDKs slot in",
   ],
 };
 
