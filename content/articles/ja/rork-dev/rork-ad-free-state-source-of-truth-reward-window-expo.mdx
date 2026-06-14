@@ -1,0 +1,284 @@
+---
+title: "「広告を消す理由」が3つに増えた日 — Rork アプリの広告非表示判定を1か所に畳む設計"
+slug: "rork-ad-free-state-source-of-truth-reward-window-expo"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T05:30"
+author: "Rork Lab"
+description: "課金していないはずの画面だけ広告が出る、あるいは課金済みの読者に広告が出てしまう。原因の多くは「広告を消す条件」がコードのあちこちに散らばっていることでした。サブスク・買い切り・リワード時限解除の3つを1つの状態に畳み、すべての広告表示を同じフックに通す設計を、個人開発で6本のアプリを運用してきた実装メモとしてまとめます。"
+tags: ["Rork", "Expo", "AdMob", "RevenueCat", "状態管理", "Zustand", "収益化"]
+highlights:
+  - "サブスク・買い切り・リワード時限解除の3つを優先順位つきで合成する useAdFree セレクタの完全な実装コード"
+  - "時限解除の期限切れを画面に追従させる、1秒間隔ではなく『次の期限ちょうど』に発火させるタイマー設計"
+  - "端末時刻を巻き戻すと広告が無限に消える不具合を、サーバ時刻の単調増加チェックで塞いだ実測手順"
+---
+
+課金しているのに広告が出る、という問い合わせを App Store のレビューで受けたことがあります。調べてみると、課金状態そのものは正しく取れていて、ホーム画面では広告がきちんと消えていました。広告が残っていたのは、後から追加した「お気に入り一覧」という新しい画面だけでした。
+
+原因はすぐに分かりました。その画面を実装したとき、私は広告を出すかどうかを `if (!isSubscribed)` という1行で判定していたのです。ところが私のアプリには、その時点で「広告を消す理由」がサブスクだけでなく、買い切りの広告解除と、リワード広告を見ると一定時間広告が消える時限解除の、合計3つありました。新しい画面はサブスクしか見ていなかったので、買い切りユーザにだけ広告が出ていたわけです。
+
+判定条件が1つのうちは `if (!isSubscribed)` で困りません。問題は、収益化の都合で「広告を消す理由」が静かに増えていったときに、過去に書いた判定が置き去りになることです。この記事は、その散らばりを根本から断つために、広告非表示の判定を1つの状態に畳んで全画面から同じ入口を通す設計を、Rork で生成した Expo アプリを前提に書いていきます。
+
+## 「広告を消す理由」は気づくと増えている
+
+最初にリリースしたとき、私のアプリには広告解除の手段が買い切りの1つしかありませんでした。半年後にサブスクを足し、さらにリテンション施策としてリワード広告による時限解除を入れました。それぞれは別の時期に、別の収益化の判断で追加したものです。
+
+ここで起きるのが、判定ロジックの分散です。サブスクを足したときに広告まわりのコードを直し、リワードを足したときにまた直す。直す範囲は毎回「広告を出している場所」全部のはずなのに、人間の記憶は当てになりません。画面が10を超えたあたりから、どこかが必ず取りこぼされます。
+
+しかもこの取りこぼしは2方向に効きます。広告を消し忘れれば、お金を払った読者に広告を見せてしまい、返金やレビュー低下に直結します。逆に消しすぎれば、無料ユーザにも広告が出ず、収益がそのぶん消えます。どちらも静かに進行するので、気づくのはたいてい数字が動いてからです。
+
+つまり本当の問題は「判定が間違っている」ことではなく、「同じ判定が複数箇所に書かれていて、片方だけ更新される」ことにあります。直すべきは個々の `if` ではなく、判定を1か所に集める構造のほうです。
+
+## 3つの理由を1つの状態に畳む
+
+まず、広告を消す理由を型として明示します。Rork が吐き出すコードは画面ごとにロジックが閉じがちなので、ここを共有モジュールに切り出すことが第一歩です。
+
+```typescript
+// lib/adFree/types.ts
+export type AdFreeReason =
+  | 'subscription'   // 有効なサブスクリプション
+  | 'lifetime'       // 買い切りの広告解除
+  | 'reward'         // リワード広告による時限解除（期限あり）
+  | null;            // 広告を出す（解除なし）
+
+export interface AdFreeState {
+  reason: AdFreeReason;
+  // reward の場合のみ意味を持つ。エポックミリ秒。
+  rewardExpiresAt: number | null;
+}
+```
+
+ポイントは、`isAdFree: boolean` という真偽値を最初から持たせないことです。真偽値だけにしてしまうと、「なぜ広告が消えているのか」が後から分からなくなり、リワードの期限が来たのに消えたままといった不具合の原因追跡ができません。理由を保持しておくと、ログにそのまま流せますし、UI 側で「あと32分は広告が消えています」のような表示にも使えます。
+
+3つの理由には優先順位があります。私は次の順で評価しています。
+
+1. `lifetime`（買い切り）— 一度解除したら恒久。最優先で、他の状態が何であっても広告は出さない
+2. `subscription`（サブスク）— 有効期間中は広告を出さない
+3. `reward`（時限解除）— 期限内のときだけ広告を出さない
+
+この順序が効くのは、たとえば「買い切り済みのユーザがうっかりリワード広告を見てしまった」ような場合です。買い切りが最優先なので、リワードの期限管理に引きずられて挙動が変わることがありません。判定を1か所に集める価値は、こうした優先順位を1回だけ正しく書けば済む点にもあります。
+
+## 単一の真実を返すストア
+
+合成した状態を1つのストアに集約します。Expo アプリでの状態共有は Zustand が扱いやすいので、ここでは Zustand を使います。サブスクと買い切りは RevenueCat の `customerInfo` から、リワードの期限は端末ローカル（後述の理由で `expo-secure-store` ではなく検証付きの保存）から読み取り、合成して返します。
+
+```typescript
+// lib/adFree/store.ts
+import { create } from 'zustand';
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+import type { AdFreeState, AdFreeReason } from './types';
+import { loadRewardWindow } from './rewardWindow';
+
+interface AdFreeStore extends AdFreeState {
+  // RevenueCat の customerInfo を受け取って再計算する
+  applyCustomerInfo: (info: CustomerInfo) => void;
+  // リワード解除を保存して再計算する
+  grantRewardWindow: (durationMs: number) => Promise<void>;
+  // 期限切れ等で「いま」基準に再評価する
+  reevaluate: () => void;
+}
+
+// RevenueCat のエンタイトルメント名（ダッシュボードで定義したもの）
+const ENT_LIFETIME = 'lifetime_adfree';
+const ENT_SUBSCRIPTION = 'pro';
+
+function computeReason(
+  hasLifetime: boolean,
+  hasSubscription: boolean,
+  rewardExpiresAt: number | null,
+  now: number,
+): { reason: AdFreeReason; rewardExpiresAt: number | null } {
+  if (hasLifetime) return { reason: 'lifetime', rewardExpiresAt: null };
+  if (hasSubscription) return { reason: 'subscription', rewardExpiresAt: null };
+  if (rewardExpiresAt && rewardExpiresAt > now) {
+    return { reason: 'reward', rewardExpiresAt };
+  }
+  return { reason: null, rewardExpiresAt: null };
+}
+
+export const useAdFreeStore = create<AdFreeStore>((set, get) => ({
+  reason: null,
+  rewardExpiresAt: null,
+
+  applyCustomerInfo: (info) => {
+    const active = info.entitlements.active;
+    const hasLifetime = ENT_LIFETIME in active;
+    const hasSubscription = ENT_SUBSCRIPTION in active;
+    const { rewardExpiresAt } = get();
+    set(computeReason(hasLifetime, hasSubscription, rewardExpiresAt, Date.now()));
+  },
+
+  grantRewardWindow: async (durationMs) => {
+    const expiresAt = await saveRewardWindow(durationMs); // 後述（検証付き保存）
+    // 買い切り・サブスクが優先なので、現在の reason がそれらなら期限だけ覚えておく
+    const info = await Purchases.getCustomerInfo();
+    const active = info.entitlements.active;
+    set(computeReason(
+      ENT_LIFETIME in active,
+      ENT_SUBSCRIPTION in active,
+      expiresAt,
+      Date.now(),
+    ));
+  },
+
+  reevaluate: () => {
+    const { rewardExpiresAt, reason } = get();
+    // lifetime / subscription は時間で変わらないので、reward のときだけ再評価でよい
+    if (reason === 'reward') {
+      set(computeReason(false, false, rewardExpiresAt, Date.now()));
+    }
+  },
+}));
+```
+
+アプリ起動時に一度 `customerInfo` を流し込み、RevenueCat の更新リスナーでも同じ関数を呼びます。こうしておくと、購入・復元・サブスクの失効といったあらゆる変化が `applyCustomerInfo` という単一の入口に集まります。
+
+```typescript
+// app/_layout.tsx などの初期化箇所
+useEffect(() => {
+  Purchases.getCustomerInfo().then(useAdFreeStore.getState().applyCustomerInfo);
+  const sub = Purchases.addCustomerInfoUpdateListener(
+    useAdFreeStore.getState().applyCustomerInfo,
+  );
+  // リワードの保存値も起動時に反映
+  loadRewardWindow().then(() => useAdFreeStore.getState().reevaluate());
+  return () => sub.remove();
+}, []);
+```
+
+## 時限解除は「次の期限ちょうど」に発火させる
+
+リワードの時限解除でいちばん厄介なのは、期限が来た瞬間に画面へ反映することです。素朴に実装すると `setInterval` で1秒ごとに `reevaluate()` を呼びたくなりますが、これは無駄が多く、バッテリーにもよくありません。広告が消えているのはせいぜい数十分なので、その間ずっと毎秒走らせる必要はありません。
+
+私が採っているのは、「次に期限が来る時刻ちょうどに1回だけタイマーを張る」方式です。期限が更新されるたびにタイマーを引き直します。
+
+```typescript
+// lib/adFree/useRewardExpiryTimer.ts
+import { useEffect } from 'react';
+import { AppState } from 'react-native';
+import { useAdFreeStore } from './store';
+
+export function useRewardExpiryTimer() {
+  const reason = useAdFreeStore((s) => s.reason);
+  const expiresAt = useAdFreeStore((s) => s.rewardExpiresAt);
+  const reevaluate = useAdFreeStore((s) => s.reevaluate);
+
+  useEffect(() => {
+    if (reason !== 'reward' || !expiresAt) return;
+
+    const fire = () => reevaluate();
+    const msUntilExpiry = expiresAt - Date.now();
+    if (msUntilExpiry <= 0) {
+      fire();
+      return;
+    }
+    // 期限ちょうどに1回だけ発火
+    const timer = setTimeout(fire, msUntilExpiry);
+
+    // バックグラウンドから戻ったときは即再評価（setTimeout は停止しうる）
+    const appSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') reevaluate();
+    });
+
+    return () => {
+      clearTimeout(timer);
+      appSub.remove();
+    };
+  }, [reason, expiresAt, reevaluate]);
+}
+```
+
+`AppState` のリスナーを併せて張っているのには理由があります。`setTimeout` はアプリがバックグラウンドにいる間は発火が保証されません。リワードで2時間広告を消している間にユーザがアプリを閉じ、3時間後に戻ってくると、`setTimeout` は約束の時刻に動かないことがあります。フォアグラウンド復帰のたびに `reevaluate()` を呼べば、戻った瞬間に必ず正しい状態へ収束します。実際、私のアプリのセッションは大半が数分で、バックグラウンド往復が頻繁に起きるので、この復帰時の再評価がないと期限切れが画面に反映されないことがありました。
+
+## すべての広告表示を1つのフックに通す
+
+ここまでで状態は1つに畳まれました。最後に、広告を出すすべての場所を必ずこのフック経由にします。冒頭の不具合は、これを徹底していなかったために起きました。
+
+```typescript
+// lib/adFree/useAdFree.ts
+import { useAdFreeStore } from './store';
+
+export function useAdFree() {
+  const reason = useAdFreeStore((s) => s.reason);
+  const expiresAt = useAdFreeStore((s) => s.rewardExpiresAt);
+  return {
+    isAdFree: reason !== null,
+    reason,
+    rewardRemainingMs: reason === 'reward' && expiresAt ? expiresAt - Date.now() : 0,
+  };
+}
+```
+
+そして、画面に直接 `BannerAd` を置くことを禁止し、必ず次のラッパー経由にします。
+
+```tsx
+// components/AdSlot.tsx
+import { BannerAd, BannerAdSize } from 'react-native-google-mobile-ads';
+import { useAdFree } from '../lib/adFree/useAdFree';
+
+export function AdSlot({ unitId }: { unitId: string }) {
+  const { isAdFree } = useAdFree();
+  if (isAdFree) return null; // 広告を消す理由が1つでもあれば描画しない
+  return <BannerAd unitId={unitId} size={BannerAdSize.ADAPTIVE_BANNER} />;
+}
+```
+
+インタースティシャルやリワード以外の全画面広告も同様で、表示の直前に `useAdFreeStore.getState().reason !== null` を確認してから `show()` を呼びます。私は運用ルールとして「`BannerAd` と `InterstitialAd` を直接 import してよいのは `AdSlot.tsx` と広告マネージャの2ファイルだけ」と決め、それ以外のファイルからの直接 import を CI の簡単な grep で弾くようにしています。新しい画面を足すたびに判定を書き直す必要がなくなり、冒頭のような取りこぼしが構造的に起きなくなりました。
+
+## 端末時刻を巻き戻すと広告が消え続ける問題
+
+ここからは本番で踏んだ落とし穴です。リワードの期限を `Date.now()` だけで管理していると、端末の時計を手で巻き戻すユーザに対して無防備になります。広告を1回見て2時間の解除を得たあと、端末の日時を未来に進めてからアプリを開くと期限が切れた判定になりますが、逆に巻き戻されると、保存した「未来の期限」がさらに遠い未来として残り、広告が延々と消えたままになります。
+
+数としては多くありませんが、リワード解除の保存に検証を入れていないと、ごく一部のユーザで eCPM がゼロのまま張り付くセッションが現れます。私は保存時に「最後に確認した時刻」を一緒に記録し、読み出し時に時刻が単調増加しているかを確認する方式で塞ぎました。
+
+```typescript
+// lib/adFree/rewardWindow.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const KEY = 'reward_window_v1';
+
+interface Stored {
+  expiresAt: number;   // 解除の期限（エポックms）
+  savedAt: number;     // 保存時刻（巻き戻し検知用）
+}
+
+export async function saveRewardWindow(durationMs: number): Promise<number> {
+  const now = Date.now();
+  const expiresAt = now + durationMs;
+  const payload: Stored = { expiresAt, savedAt: now };
+  await AsyncStorage.setItem(KEY, JSON.stringify(payload));
+  return expiresAt;
+}
+
+export async function loadRewardWindow(): Promise<number | null> {
+  const raw = await AsyncStorage.getItem(KEY);
+  if (!raw) return null;
+  const { expiresAt, savedAt } = JSON.parse(raw) as Stored;
+  const now = Date.now();
+  // 端末時刻が savedAt より前に戻っている＝巻き戻された疑い。解除を無効化する
+  if (now < savedAt) {
+    await AsyncStorage.removeItem(KEY);
+    return null;
+  }
+  if (expiresAt <= now) {
+    await AsyncStorage.removeItem(KEY);
+    return null;
+  }
+  return expiresAt;
+}
+```
+
+厳密さを突き詰めるなら期限はサーバ側で管理すべきですが、リワード解除のためだけにバックエンドを増やすのは、個人開発の費用対効果としては過剰だと私は考えています。端末内の単調増加チェックだけでも、悪意のない巻き戻し（旅行先での時刻自動設定など）と、ごく軽い不正の大半は塞げます。守りたいのは収益のうち数パーセントの漏れであって、要塞ではありません。バックエンドの保守コストと天秤にかけて、まずローカル検証から始めるのが現実的だと感じています。
+
+## 本番で効いた小さな判断
+
+3つほど、地味ですが効いた判断を書いておきます。
+
+ひとつは、リワード解除の残り時間を UI に出すことです。「あと28分は広告が消えています」と見せると、解除がちゃんと効いていることが読者に伝わり、リワード広告の視聴完了率が私のアプリで体感1.3倍ほどに上がりました。状態に理由と期限を持たせておいた設計が、ここでそのまま活きます。
+
+ふたつめは、`applyCustomerInfo` を起動時とリスナーの両方から呼んでも問題ないよう、計算を純粋関数 `computeReason` に寄せたことです。何度呼んでも同じ入力からは同じ結果になるので、復元購入の直後やサブスク失効の通知が二重に来ても状態が壊れません。
+
+みっつめは、広告を出さない理由をそのまま AdMob 側のログに添えたことです。表示できなかったインプレッションを「サブスクで意図的に消した」のか「ロード失敗で出せなかった」のかを後から切り分けられるようになり、Google Play と App Store の両方で収益のブレを追いやすくなりました。
+
+まずは自分のアプリで `BannerAd` を直接 import している箇所を `grep` で数えてみてください。1か所でも `AdSlot` を経由していない画面があれば、それが次に広告判定を取りこぼす候補です。判定を1か所に畳むだけで、収益化の手段を増やすたびに過去のコードへ戻る作業から解放されます。お読みいただきありがとうございました。
