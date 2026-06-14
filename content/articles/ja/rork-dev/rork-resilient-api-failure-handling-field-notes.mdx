@@ -1,0 +1,366 @@
+---
+title: "Rork アプリの API 通信を障害に強くする — Circuit Breaker・指数バックオフ・タイムアウトを実装で固める"
+slug: "rork-resilient-api-failure-handling-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-14T17:00"
+updated: "2026-06-14T17:00"
+author: "Rork Lab"
+description: "Rork で生成したアプリの API 通信を本番品質に引き上げる実装メモ。タイムアウト・指数バックオフ・Circuit Breaker を段階的に組み込み、依存 API が不安定でも自動回復する通信層を設計します。"
+tags: ["Rork", "API通信", "Circuit Breaker", "指数バックオフ", "タイムアウト", "React Native", "本番運用"]
+highlights:
+  - "タイムアウト→リトライ→Circuit Breaker を段階導入する実装順序と、それぞれの具体的なしきい値の決め方"
+  - "AbortSignal.timeout() と指数バックオフ＋ジッターを組み合わせた、コピーして動く通信クライアントの全コード"
+  - "Circuit Breaker の状態をスナップショットで観測し、TanStack Query と二重リトライさせない統合パターン"
+---
+リリース直後のアプリで、API のエラー率が一晩で 5% を超えたことがあります。
+
+依存していた外部 API が応答を遅延させ始め、タイムアウトを持たない fetch がそのまま詰まっていく。画面にはスピナーが回り続け、ユーザーには何が起きているのか伝わらない。ログを追って原因にたどり着いた頃には、すでに数百件のエラーレポートが積み上がっていました。あのとき通信層に最低限の防御があれば、被害は十分の一で済んだはずです。
+
+個人開発でアプリを回していると、こうした通信の防御は後回しになりがちです。Rork でアプリを組むと、生成される API 呼び出しは素直な fetch です。開発中はそれで困りません。問題は、本番のネットワークが開発環境とはまるで別物だという点にあります。地下鉄で電波が切れ、Wi-Fi と 5G を行き来し、依存サービスが数分だけ不調になる——こうした揺らぎを前提にした通信層を、後付けではなく設計として持っておきたいところです。
+
+ここでは Rork アプリの通信を本番品質へ引き上げる過程を、実際に動くコードとともに実装メモとして残します。派手な仕組みではありません。タイムアウト、指数バックオフ付きのリトライ、Circuit Breaker。この三つを正しい順序で重ねるだけで、依存 API が傾いてもアプリが巻き添えにならない通信層になります。
+
+## 素の fetch が本番で崩れる三つの瞬間
+
+最初に、何から守るのかをはっきりさせておきます。Rork が吐く典型的な呼び出しはこの形です。
+
+```typescript
+const fetchUser = async (userId: string) => {
+  const res = await fetch(`https://api.example.com/users/${userId}`);
+  if (!res.ok) throw new Error("Failed to fetch user");
+  return res.json();
+};
+```
+
+このコードが本番で崩れる瞬間は、経験上ほぼ三つに集約されます。
+
+一つ目は一時的な切断です。モバイル回線は一瞬で復活することが多く、本来なら一度リトライすれば通る通信を、そのままエラーとしてユーザーに見せてしまいます。二つ目は無限待機です。fetch にはタイムアウトがないため、応答しないサーバーを待ち続け、スピナーが何十秒も回ります。三つ目が連鎖障害です。遅い API を待つリクエストが積み上がり、すでに壊れている相手へ送り続けることで、自分側の状態まで悪化させます。
+
+この三つに、それぞれタイムアウト・リトライ・Circuit Breaker が対応します。導入する順序もこの通りが現実的です。効果が出るのが早く、実装コストが低いものから入れていきます。
+
+## まずタイムアウト — 今日入れて一番効く一手
+
+無限待機を断つだけで、ユーザー体感のエラーの大半は消えます。2026 年時点では `AbortSignal.timeout()` が React Native でも使えるようになり、`AbortController` を手で組む必要が薄れました。ただし「どのエラーがタイムアウト由来か」を呼び出し側で判別できるよう、独自のエラー型に正規化しておきます。
+
+```typescript
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+    public readonly body?: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+interface TimedFetchOptions extends RequestInit {
+  timeoutMs: number;
+}
+
+export async function fetchWithTimeout(
+  url: string,
+  { timeoutMs, signal, ...init }: TimedFetchOptions,
+): Promise<Response> {
+  // 呼び出し側の signal（アンマウント等）と timeout を合成する
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const merged = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+
+  try {
+    const res = await fetch(url, { ...init, signal: merged });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new ApiError(`HTTP ${res.status} ${res.statusText}`, res.status, body);
+    }
+    return res;
+  } catch (err) {
+    // timeout 由来の中断を 408 に正規化し、呼び出し側で扱いやすくする
+    if (err instanceof DOMException && err.name === "TimeoutError") {
+      throw new ApiError(`Request timed out after ${timeoutMs}ms`, 408);
+    }
+    throw err;
+  }
+}
+```
+
+タイムアウト値は一律にしないほうが扱いやすいです。私は用途で三段階に分けています。一覧取得のような軽い GET は 5〜8 秒、ユーザー操作に紐づく詳細取得は 8〜12 秒、アップロードや重い処理は 30〜60 秒。短すぎると低速回線のユーザーに不要なエラーを見せ、長すぎると無限待機の問題が戻ってきます。`AbortSignal.any()` で画面側の中断シグナルと合成しておくと、コンポーネントがアンマウントされた瞬間に通信も確実に止まります。
+
+## 指数バックオフ付きリトライ — リトライしてよい失敗だけを選ぶ
+
+タイムアウトの外側にリトライを巻きます。ここで最も大事な判断は「何を実装するか」ではなく「何をリトライしないか」です。`400` や `401` を何度叩いても結果は変わらず、認証エラーのリトライはログイン誘導を数秒遅らせるだけの悪化です。リトライが効くのは `408` `429` `500` `502` `503` `504` のような一時的・サーバー側の失敗に限ります。
+
+待機時間は指数関数的に伸ばし、さらにジッター（ランダムな揺らぎ）を加えます。サーバー復旧の瞬間に全クライアントが同時刻に再送して再び潰す「サンダリングハード」を避けるためです。
+
+```typescript
+interface RetryOptions {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitter: number; // 0..1
+  retryableStatus: number[];
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  maxRetries: 3,
+  baseDelayMs: 500,
+  maxDelayMs: 15000,
+  jitter: 0.3,
+  retryableStatus: [408, 429, 500, 502, 503, 504],
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  options: Partial<RetryOptions> = {},
+): Promise<T> {
+  const o = { ...DEFAULT_RETRY, ...options };
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= o.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+
+      // リトライ対象外のステータスは即座に投げ返す
+      if (err instanceof ApiError && !o.retryableStatus.includes(err.statusCode)) {
+        throw err;
+      }
+      if (attempt === o.maxRetries) break;
+
+      // 429 の Retry-After を尊重し、無ければ指数バックオフ
+      const retryAfter =
+        err instanceof ApiError && err.statusCode === 429
+          ? readRetryAfter(err)
+          : undefined;
+      const backoff = Math.min(o.baseDelayMs * 2 ** attempt, o.maxDelayMs);
+      const jittered = backoff * (1 + o.jitter * (Math.random() * 2 - 1));
+      const delay = retryAfter ?? Math.max(0, jittered);
+
+      await sleep(delay);
+    }
+  }
+  throw lastError ?? new Error("retry exhausted");
+}
+
+function readRetryAfter(err: ApiError): number | undefined {
+  const header = (err.body as { retryAfter?: number })?.retryAfter;
+  return typeof header === "number" ? header * 1000 : undefined;
+}
+```
+
+元のコードに対して一点だけ手を入れているのが、`429 Too Many Requests` の扱いです。レート制限を返すサーバーは多くの場合 `Retry-After` を添えてきます。これを無視して自前のバックオフで叩き続けると、制限が解けるのをかえって遅らせます。サーバーが待ってほしいと言っている時間を、こちらが尊重するのが筋だと考えています。
+
+## Circuit Breaker — 壊れた相手に送り続けない
+
+最後に Circuit Breaker を被せます。これは電気の回路遮断器と同じ発想で、失敗が一定数を超えたら「回路を開いて」しばらく送信そのものを止め、時間をおいて自動的に復旧を試みます。状態は三つです。通常運転の Closed、遮断中の Open、復旧を一件だけ試す Half-Open。
+
+```typescript
+type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
+
+interface BreakerOptions {
+  failureThreshold: number; // 連続失敗でOPEN
+  recoveryMs: number;       // OPEN維持時間
+  successThreshold: number; // HALF_OPENで連続成功してCLOSED復帰
+}
+
+export class CircuitOpenError extends Error {
+  constructor(public readonly retryInMs: number) {
+    super(`circuit open, retry in ${Math.ceil(retryInMs / 1000)}s`);
+    this.name = "CircuitOpenError";
+  }
+}
+
+export class CircuitBreaker {
+  private state: CircuitState = "CLOSED";
+  private failures = 0;
+  private successes = 0;
+  private openedAt = 0;
+
+  constructor(private readonly o: BreakerOptions) {}
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "OPEN") {
+      const elapsed = Date.now() - this.openedAt;
+      if (elapsed < this.o.recoveryMs) {
+        throw new CircuitOpenError(this.o.recoveryMs - elapsed);
+      }
+      this.state = "HALF_OPEN";
+      this.successes = 0;
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    if (this.state === "HALF_OPEN") {
+      if (++this.successes >= this.o.successThreshold) this.reset();
+    } else {
+      this.failures = 0;
+    }
+  }
+
+  private onFailure() {
+    // 復旧試行中の失敗は即OPENへ戻す
+    if (this.state === "HALF_OPEN") {
+      this.trip();
+      return;
+    }
+    if (++this.failures >= this.o.failureThreshold) this.trip();
+  }
+
+  private trip() {
+    this.state = "OPEN";
+    this.openedAt = Date.now();
+    this.successes = 0;
+  }
+
+  private reset() {
+    this.state = "CLOSED";
+    this.failures = 0;
+    this.successes = 0;
+  }
+
+  snapshot(): { state: CircuitState; failures: number } {
+    return { state: this.state, failures: this.failures };
+  }
+}
+```
+
+しきい値で最初に迷うはずなので、出発点を書いておきます。`failureThreshold: 5`、`recoveryMs: 30000`、`successThreshold: 2`。ここから実際のエラーログを見て調整します。閾値を絞りすぎると、回線の一瞬の揺れだけで回路が開き、健全な API まで使えなくなります。逆に緩すぎると遮断が遅れ、連鎖障害を止めきれません。一週間運用してログを眺めるまでは、上の値をそのまま使うのが無難です。
+
+実装上の肝は、Half-Open での失敗を一件でも即座に Open へ戻す点です。復旧を試した最初の一件が失敗するということは、まだサーバーが直っていない証拠ですから、追加で何件も送る理由はありません。
+
+## 三つを一つのクライアントに束ねる
+
+部品が揃ったので、エンドポイントごとに独立した Circuit Breaker を持つ通信クライアントにまとめます。ユーザー API が傾いても、投稿一覧 API は巻き込まれない——この独立性が連鎖障害を防ぐ要です。
+
+```typescript
+interface ClientOptions {
+  baseUrl: string;
+  defaultTimeoutMs: number;
+  breaker: BreakerOptions;
+  retry?: Partial<RetryOptions>;
+}
+
+export class ResilientApiClient {
+  private breakers = new Map<string, CircuitBreaker>();
+
+  constructor(private readonly o: ClientOptions) {}
+
+  private breakerFor(key: string): CircuitBreaker {
+    let b = this.breakers.get(key);
+    if (!b) {
+      b = new CircuitBreaker(this.o.breaker);
+      this.breakers.set(key, b);
+    }
+    return b;
+  }
+
+  async request<T>(
+    path: string,
+    init: Omit<TimedFetchOptions, "timeoutMs"> & { timeoutMs?: number } = {},
+  ): Promise<T> {
+    const url = `${this.o.baseUrl}${path}`;
+    const timeoutMs = init.timeoutMs ?? this.o.defaultTimeoutMs;
+    // パスの先頭セグメントを Breaker のキーにする（/users/123 → users）
+    const key = path.split("/").filter(Boolean)[0] ?? path;
+
+    // 適用順: Breaker → Retry → Timeout（内側ほど低レイヤ）
+    return this.breakerFor(key).execute(() =>
+      withRetry(
+        () => fetchWithTimeout(url, { ...init, timeoutMs }).then((r) => r.json() as Promise<T>),
+        this.o.retry,
+      ),
+    );
+  }
+
+  states(): Record<string, ReturnType<CircuitBreaker["snapshot"]>> {
+    const out: Record<string, ReturnType<CircuitBreaker["snapshot"]>> = {};
+    this.breakers.forEach((b, key) => (out[key] = b.snapshot()));
+    return out;
+  }
+}
+
+// アプリ全体で共有する単一インスタンス
+export const apiClient = new ResilientApiClient({
+  baseUrl: "https://api.yourapp.com",
+  defaultTimeoutMs: 8000,
+  breaker: { failureThreshold: 5, recoveryMs: 30000, successThreshold: 2 },
+  retry: { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 15000 },
+});
+```
+
+適用順序には意味があります。一番内側にタイムアウトを置き、その外側でリトライし、さらに外側で Circuit Breaker が全体を監督する。こうすると、各リトライにきちんとタイムアウトが効き、リトライを使い切った失敗だけが Breaker の失敗カウントに乗ります。順序を逆にすると、Breaker がリトライ前の一過性の失敗まで数えてしまい、回路が必要以上に開きます。
+
+## TanStack Query と二重リトライさせない
+
+Rork で生成されるアプリは TanStack Query を使っていることが多いはずです。そのまま組み合わせると、TanStack Query 側のリトライとクライアント側のリトライが二重にかかり、一回の失敗で最大九回（3×3）のリクエストが飛びます。リトライの責務はクライアント側に集約し、TanStack Query 側は原則として無効、あるいは一回までに抑えます。
+
+```typescript
+import { useQuery } from "@tanstack/react-query";
+
+export function useUser(userId: string) {
+  return useQuery({
+    queryKey: ["user", userId],
+    queryFn: () => apiClient.request<User>(`/users/${userId}`),
+    retry: (count, error) => {
+      // 回路が開いている間は TanStack Query 側でリトライしない
+      if (error instanceof CircuitOpenError) return false;
+      return count < 1;
+    },
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+  });
+}
+```
+
+`CircuitOpenError` を型で判別できるようにしておくと、画面側の出し分けも素直になります。回路が開いているときは「混雑しているので少し待ってほしい」と伝え、再試行ボタンはあえて隠す。まだ開いている回路に、ユーザーの手で追い打ちをかけさせない配慮です。バックエンド側の API 設計とあわせて読むなら、[Rork × Hono + Cloudflare Workers で型安全な REST API を作る](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide)が地続きになります。
+
+## 状態を観測できるようにしておく
+
+防御機構は、入れて終わりではありません。実際に働いているかを見られないと、しきい値が妥当なのかも判断できません。`states()` で全エンドポイントの回路状態をスナップショットできるので、これを開発ビルドのデバッグ画面に出すか、状態が Open に遷移した瞬間だけ監視ツールへ送ります。
+
+```typescript
+// Open への遷移だけを監視ツールへ通知する薄いラッパ
+function reportIfOpened(prev: CircuitState, next: CircuitState, key: string) {
+  if (prev !== "OPEN" && next === "OPEN") {
+    // 例: Sentry.captureMessage(`circuit opened: ${key}`, "warning")
+    console.warn(`[circuit] ${key} opened`);
+  }
+}
+```
+
+全リクエストをログに流す必要はありません。むしろノイズになります。見たいのは「いつ、どのエンドポイントの回路が開いたか」だけで、それさえ追えれば、どの依存先が不安定なのか、しきい値が厳しすぎないかが数日で見えてきます。
+
+## つまずきやすい三点
+
+最後に、実装で繰り返し見かける失敗を挙げておきます。
+
+一つ目は、Circuit Breaker をコンポーネント内で `new` してしまうことです。画面が再描画やアンマウントのたびにインスタンスが作り直され、「五回失敗で開く」というカウントが永遠にリセットされ続けます。Breaker は必ずモジュールレベルの単一インスタンスで持ちます。
+
+二つ目は、全失敗をリトライ対象にしてしまうことです。先に書いた通り、リトライしてよいのは一時的・サーバー側の失敗だけです。クライアント起因の `4xx` を巻き込むと、無駄な再送とユーザー体験の悪化を招きます。
+
+三つ目は、中断後の後始末を忘れることです。画面を離れたあとも進行中の通信が走り続けると、不要なエラーや状態更新が遅れて飛んできます。`AbortSignal.any()` で画面側のシグナルを通信に合成しておけば、アンマウントと同時に確実に止まります。
+
+## 段階導入のための小さな順序
+
+全部を一度に入れる必要はありません。効果の出る順に積むのを推奨します。私自身もこの順序で導入しました。
+
+1. 今日: タイムアウトを最重要の API 一本に入れて、無限スピナーを断つ。
+2. 今週中: リトライを巻いて、一時的な切断を吸収する。
+3. 今月中: Circuit Breaker を共有クライアントに組み込み、既存の fetch を順に置き換えていく。
+
+ここまで揃えば、依存 API の一時的な不調がそのままアプリの障害になることはなくなります。まずは `fetchWithTimeout` を一箇所、最も呼ばれる通信に当ててみてください。最小の一歩ですが、本番で一番効く一歩でもあります。

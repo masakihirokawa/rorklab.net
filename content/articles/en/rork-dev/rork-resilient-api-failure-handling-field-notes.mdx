@@ -1,0 +1,354 @@
+---
+title: "Making Rork App API Calls Survive Failure — Timeouts, Exponential Backoff, and Circuit Breakers That Actually Hold"
+slug: "rork-resilient-api-failure-handling-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-14T17:00"
+updated: "2026-06-14T17:00"
+author: "Rork Lab"
+description: "A hands-on implementation log for hardening the API layer of a Rork-generated app. Add timeouts, exponential backoff, and a circuit breaker step by step so your app keeps working even when a dependency goes wobbly."
+tags: ["Rork", "API resilience", "Circuit Breaker", "Exponential Backoff", "Timeout", "React Native", "Production"]
+highlights:
+  - "The order to introduce timeout → retry → circuit breaker, and how to actually pick each threshold"
+  - "A complete, copy-and-run client built on AbortSignal.timeout() plus exponential backoff with jitter"
+  - "Snapshotting circuit state for observability, and stopping TanStack Query from double-retrying"
+---
+One night, right after a release, the API error rate on one of my apps crossed five percent.
+
+A dependency had started lagging, and a `fetch` with no timeout simply piled up behind it. The spinner kept turning while users had no idea what was happening. By the time I traced the cause, a few hundred error reports had already stacked up. With even a minimal defense in the network layer, the damage would have been a tenth of that.
+
+Building solo as an indie developer, this kind of network hardening is easy to defer. When you build with Rork, the generated API calls are plain `fetch`. That is fine during development. The problem is that the production network is nothing like your dev machine. People drop into subway tunnels, hop between Wi-Fi and 5G, and your dependencies have bad minutes. You want a network layer that assumes all of this by design, not one bolted on after the first incident.
+
+What follows is an implementation log for taking a Rork app's networking to production quality, with code you can run. Nothing flashy: a timeout, a retry with exponential backoff, and a circuit breaker. Layer those three in the right order and a leaning dependency stops dragging your whole app down with it.
+
+## The three moments plain fetch falls apart
+
+First, let's be clear about what we're defending against. Here is the shape Rork typically emits:
+
+```typescript
+const fetchUser = async (userId: string) => {
+  const res = await fetch(`https://api.example.com/users/${userId}`);
+  if (!res.ok) throw new Error("Failed to fetch user");
+  return res.json();
+};
+```
+
+In production this breaks in roughly three ways. **Transient drops:** mobile connections often recover in an instant, so a call that would have succeeded on one retry gets surfaced to the user as a hard error. **Infinite waits:** `fetch` has no timeout, so an unresponsive server keeps the spinner going for tens of seconds. **Cascading failure:** requests waiting on a slow API pile up, and you keep hammering something that is already down, making your own state worse.
+
+Timeout, retry, and circuit breaker map onto those three, in that order. That is also the realistic order to ship them: cheapest to implement and fastest to pay off first.
+
+## Timeout first — the highest-leverage line you can ship today
+
+Cutting infinite waits alone removes most of the perceived errors. As of 2026, `AbortSignal.timeout()` is available in React Native, so you no longer need to hand-roll an `AbortController`. Still, normalize the error so callers can tell a timeout apart from anything else.
+
+```typescript
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+    public readonly body?: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+interface TimedFetchOptions extends RequestInit {
+  timeoutMs: number;
+}
+
+export async function fetchWithTimeout(
+  url: string,
+  { timeoutMs, signal, ...init }: TimedFetchOptions,
+): Promise<Response> {
+  // Merge the caller's signal (unmount, etc.) with the timeout signal
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const merged = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+
+  try {
+    const res = await fetch(url, { ...init, signal: merged });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new ApiError(`HTTP ${res.status} ${res.statusText}`, res.status, body);
+    }
+    return res;
+  } catch (err) {
+    // Normalize a timeout abort to 408 so callers can handle it cleanly
+    if (err instanceof DOMException && err.name === "TimeoutError") {
+      throw new ApiError(`Request timed out after ${timeoutMs}ms`, 408);
+    }
+    throw err;
+  }
+}
+```
+
+Don't use one timeout for everything. I split mine into three tiers: light GETs around 5-8s, user-driven detail fetches 8-12s, and uploads or heavy work 30-60s. Too short and you punish users on slow connections; too long and the infinite-wait problem comes back. Composing the screen's abort signal with `AbortSignal.any()` means the request stops the moment the component unmounts.
+
+## Retry with exponential backoff — only retry the failures worth retrying
+
+Wrap retry around the timeout. The most important decision here isn't what to implement, it's what *not* to retry. Hitting a `400` or `401` again changes nothing, and retrying an auth error just delays the login redirect by a few seconds. Retry pays off only for transient, server-side failures: `408`, `429`, `500`, `502`, `503`, `504`.
+
+Grow the wait exponentially and add jitter, so clients don't all re-fire at the same instant the server recovers and knock it over again — the thundering-herd problem.
+
+```typescript
+interface RetryOptions {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitter: number; // 0..1
+  retryableStatus: number[];
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  maxRetries: 3,
+  baseDelayMs: 500,
+  maxDelayMs: 15000,
+  jitter: 0.3,
+  retryableStatus: [408, 429, 500, 502, 503, 504],
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  options: Partial<RetryOptions> = {},
+): Promise<T> {
+  const o = { ...DEFAULT_RETRY, ...options };
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= o.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+
+      // Throw non-retryable statuses back immediately
+      if (err instanceof ApiError && !o.retryableStatus.includes(err.statusCode)) {
+        throw err;
+      }
+      if (attempt === o.maxRetries) break;
+
+      // Honor Retry-After on 429, otherwise exponential backoff
+      const retryAfter =
+        err instanceof ApiError && err.statusCode === 429
+          ? readRetryAfter(err)
+          : undefined;
+      const backoff = Math.min(o.baseDelayMs * 2 ** attempt, o.maxDelayMs);
+      const jittered = backoff * (1 + o.jitter * (Math.random() * 2 - 1));
+      const delay = retryAfter ?? Math.max(0, jittered);
+
+      await sleep(delay);
+    }
+  }
+  throw lastError ?? new Error("retry exhausted");
+}
+
+function readRetryAfter(err: ApiError): number | undefined {
+  const header = (err.body as { retryAfter?: number })?.retryAfter;
+  return typeof header === "number" ? header * 1000 : undefined;
+}
+```
+
+The one change worth calling out is the `429 Too Many Requests` handling. Rate-limited servers usually send a `Retry-After`. Ignore it and keep pounding with your own backoff and you only delay the moment the limit clears. If the server tells you how long to wait, it's only right to respect it.
+
+## Circuit breaker — stop sending to something that's broken
+
+Last, wrap a circuit breaker around it. Same idea as an electrical breaker: once failures cross a threshold, "open the circuit" and stop sending for a while, then automatically probe for recovery. Three states: Closed (normal), Open (blocked), Half-Open (probing with a single request).
+
+```typescript
+type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
+
+interface BreakerOptions {
+  failureThreshold: number; // consecutive failures to OPEN
+  recoveryMs: number;       // how long to stay OPEN
+  successThreshold: number; // consecutive successes in HALF_OPEN to CLOSE
+}
+
+export class CircuitOpenError extends Error {
+  constructor(public readonly retryInMs: number) {
+    super(`circuit open, retry in ${Math.ceil(retryInMs / 1000)}s`);
+    this.name = "CircuitOpenError";
+  }
+}
+
+export class CircuitBreaker {
+  private state: CircuitState = "CLOSED";
+  private failures = 0;
+  private successes = 0;
+  private openedAt = 0;
+
+  constructor(private readonly o: BreakerOptions) {}
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "OPEN") {
+      const elapsed = Date.now() - this.openedAt;
+      if (elapsed < this.o.recoveryMs) {
+        throw new CircuitOpenError(this.o.recoveryMs - elapsed);
+      }
+      this.state = "HALF_OPEN";
+      this.successes = 0;
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    if (this.state === "HALF_OPEN") {
+      if (++this.successes >= this.o.successThreshold) this.reset();
+    } else {
+      this.failures = 0;
+    }
+  }
+
+  private onFailure() {
+    // A failure while probing snaps straight back to OPEN
+    if (this.state === "HALF_OPEN") {
+      this.trip();
+      return;
+    }
+    if (++this.failures >= this.o.failureThreshold) this.trip();
+  }
+
+  private trip() {
+    this.state = "OPEN";
+    this.openedAt = Date.now();
+    this.successes = 0;
+  }
+
+  private reset() {
+    this.state = "CLOSED";
+    this.failures = 0;
+    this.successes = 0;
+  }
+
+  snapshot(): { state: CircuitState; failures: number } {
+    return { state: this.state, failures: this.failures };
+  }
+}
+```
+
+You'll want a starting point for the thresholds: `failureThreshold: 5`, `recoveryMs: 30000`, `successThreshold: 2`, then tune from real logs. Too tight and a momentary network wobble opens the circuit and locks out a healthy API; too loose and tripping comes too late to stop a cascade. Until you've watched a week of logs, just run the values above.
+
+The detail that matters is snapping back to Open on a single Half-Open failure. If the first probe fails, the server clearly isn't healthy yet, so there's no reason to send more.
+
+## Folding all three into one client
+
+With the parts in place, wrap them in a client that keeps a separate circuit breaker per endpoint. If the user API leans, the posts API shouldn't go down with it — that independence is what stops a cascade.
+
+```typescript
+interface ClientOptions {
+  baseUrl: string;
+  defaultTimeoutMs: number;
+  breaker: BreakerOptions;
+  retry?: Partial<RetryOptions>;
+}
+
+export class ResilientApiClient {
+  private breakers = new Map<string, CircuitBreaker>();
+
+  constructor(private readonly o: ClientOptions) {}
+
+  private breakerFor(key: string): CircuitBreaker {
+    let b = this.breakers.get(key);
+    if (!b) {
+      b = new CircuitBreaker(this.o.breaker);
+      this.breakers.set(key, b);
+    }
+    return b;
+  }
+
+  async request<T>(
+    path: string,
+    init: Omit<TimedFetchOptions, "timeoutMs"> & { timeoutMs?: number } = {},
+  ): Promise<T> {
+    const url = `${this.o.baseUrl}${path}`;
+    const timeoutMs = init.timeoutMs ?? this.o.defaultTimeoutMs;
+    // Use the first path segment as the breaker key (/users/123 -> users)
+    const key = path.split("/").filter(Boolean)[0] ?? path;
+
+    // Order: Breaker -> Retry -> Timeout (lower layers nested inside)
+    return this.breakerFor(key).execute(() =>
+      withRetry(
+        () => fetchWithTimeout(url, { ...init, timeoutMs }).then((r) => r.json() as Promise<T>),
+        this.o.retry,
+      ),
+    );
+  }
+
+  states(): Record<string, ReturnType<CircuitBreaker["snapshot"]>> {
+    const out: Record<string, ReturnType<CircuitBreaker["snapshot"]>> = {};
+    this.breakers.forEach((b, key) => (out[key] = b.snapshot()));
+    return out;
+  }
+}
+
+// One shared instance for the whole app
+export const apiClient = new ResilientApiClient({
+  baseUrl: "https://api.yourapp.com",
+  defaultTimeoutMs: 8000,
+  breaker: { failureThreshold: 5, recoveryMs: 30000, successThreshold: 2 },
+  retry: { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 15000 },
+});
+```
+
+The nesting order is deliberate. Timeout is innermost, retry wraps it, and the circuit breaker oversees the whole thing. That way each retry gets its own timeout, and only a fully exhausted failure counts toward the breaker. Reverse it and the breaker counts transient pre-retry failures, opening the circuit far more often than it should.
+
+## Don't let TanStack Query double-retry
+
+Rork-generated apps usually use TanStack Query. Combine it naively and its retry stacks on top of the client's retry — up to nine requests (3×3) per failure. Keep retry as the client's responsibility and set TanStack Query to none, or at most one.
+
+```typescript
+import { useQuery } from "@tanstack/react-query";
+
+export function useUser(userId: string) {
+  return useQuery({
+    queryKey: ["user", userId],
+    queryFn: () => apiClient.request<User>(`/users/${userId}`),
+    retry: (count, error) => {
+      // Don't retry on the query side while the circuit is open
+      if (error instanceof CircuitOpenError) return false;
+      return count < 1;
+    },
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+  });
+}
+```
+
+Because `CircuitOpenError` is its own type, the UI branch stays clean: when the circuit is open, tell the user it's busy and hide the retry button so they can't pile onto an already-open circuit. If you want to read this alongside the backend design, [Building a type-safe REST API with Rork × Hono + Cloudflare Workers](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) follows on naturally.
+
+## Make the state observable
+
+A defense mechanism isn't done when you ship it. If you can't see it working, you can't judge whether the thresholds are right. `states()` snapshots every endpoint's circuit, so surface it on a debug screen in dev builds, or push to monitoring only when a circuit transitions to Open.
+
+```typescript
+// Thin wrapper that only reports transitions into Open
+function reportIfOpened(prev: CircuitState, next: CircuitState, key: string) {
+  if (prev !== "OPEN" && next === "OPEN") {
+    // e.g. Sentry.captureMessage(`circuit opened: ${key}`, "warning")
+    console.warn(`[circuit] ${key} opened`);
+  }
+}
+```
+
+You don't need every request in your logs — that's just noise. All you want is *when* and *which* circuit opened. With that alone, within a few days you can see which dependency is shaky and whether your thresholds are too strict.
+
+## Three things people trip on
+
+A few failures I keep seeing. First, calling `new CircuitBreaker(...)` inside a component: every re-render or unmount rebuilds it, so the "five failures to open" count resets forever. Keep the breaker as a single module-level instance. Second, retrying every failure: as above, only transient, server-side failures qualify; pulling in client-side `4xx` just wastes requests and worsens UX. Third, forgetting cleanup after a cancel: compose the screen's signal with `AbortSignal.any()` so the request stops the instant the view unmounts.
+
+## A small order for rolling it out
+
+You don't need all of it at once. Stack it in order of payoff. Today, put a timeout on your single most important API call and kill the infinite spinner. This week, wrap it in retry to absorb transient drops. This month, fold the circuit breaker into the shared client and swap out your existing `fetch` calls one by one.
+
+Once that's in place, a dependency's temporary hiccup no longer becomes your app's outage. Start by pointing `fetchWithTimeout` at your busiest call. It's the smallest step, and the one that pays off most in production.
