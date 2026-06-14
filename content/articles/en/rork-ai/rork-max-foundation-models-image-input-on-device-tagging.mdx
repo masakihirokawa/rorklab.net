@@ -1,0 +1,256 @@
+---
+title: "On-Device Image Tagging in Rork Max Swift Apps with Foundation Models Image Input"
+slug: "rork-max-foundation-models-image-input-on-device-tagging"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-14T20:15"
+updated: "2026-06-14T20:15"
+author: "Rork Lab"
+description: "WWDC26 gave the on-device Foundation Models model image input. Here is how to add image tagging and captioning to a Rork Max Swift app entirely on-device, including the availability gate, structured output, and Vision interop."
+tags: ["Rork Max", "Foundation Models", "Image Input", "On-Device AI", "SwiftUI"]
+highlights:
+  - "If you've been sending images to a cloud multimodal API for tagging or captioning, you'll be able to switch to a fully on-device implementation inside your Rork Max Swift app"
+  - "You'll walk away with copy-and-run Swift code covering @Generable structured output, Vision interop via tool calling, and the availability gate"
+  - "Understanding the 4K on-device vs 32K cloud token budget, you'll be able to ship image understanding to production without a monthly API bill"
+---
+
+When you build a feature that takes a single photo and answers "what is this?" or "what tags belong on it?", the default for years has been to ship the image off to a cloud multimodal API. In the wallpaper app I run as an indie developer, I have repeatedly wanted to auto-assign categories and keywords to newly added images, and each time I ran into the same question: is it really acceptable to send a picture sitting on the user's own device up to my server or a cloud LLM?
+
+WWDC26 changed that calculus. The on-device Foundation Models in iOS 27 can now read images: you drop a picture into the prompt next to the text and ask the model about it. Apple frames this not as a new pipeline but as "a natural extension of the existing prompt builders." Everything you learned in iOS 26 — `LanguageModelSession`, `@Generable` — keeps working unchanged. The prompt simply grew a picture.
+
+Built on a Rork Max Swift app, this walkthrough assembles an image tagging and captioning feature that runs entirely on-device, including availability checks and Vision interop. Because Rork Max generates native Swift rather than React Native, it lines up cleanly with Apple-native frameworks like Foundation Models.
+
+## Why "keep the image off the cloud" pays off
+
+Hand image understanding to a cloud LLM and three costs arrive at once: money (per-image inference billing), latency (the network round trip), and a privacy story you have to explain. For apps that handle personal images that live on the device — wallpapers, health, photos — that third cost weighs the most.
+
+The on-device Foundation Models model lightens all three. Inference stays on the device, so for an indie app under a couple million downloads you can add image understanding at effectively zero marginal cost. The round trip disappears, so it works offline, and because the image never leaves the device, the privacy explanation gets short.
+
+It is not a free lunch, though. The on-device context is 4K; the Private Cloud Compute (PCC) server model is 32K, and an image spends from that token budget. Apple says it plainly: larger images consume more tokens and add latency. The design starting point is "measure on-device first, escalate to the server only when you have to."
+
+## The shape of the feature: three layers
+
+It helps to think of the implementation in three layers.
+
+1. **Availability gate**: confirm the device can run Apple Intelligence (the on-device model) and hide or fall back when it cannot.
+2. **Structured tag generation**: attach the image to the prompt and receive a fixed shape — tag array, category, one-line caption — via `@Generable`.
+3. **Vision interop and staged escalation**: let Vision handle fast, fixed tasks, let on-device Foundation Models do the descriptive language, and push only long or multi-image batches to PCC.
+
+Let's build them in order.
+
+## Step 1: Always gate on availability
+
+Image input rides the same on-device model, so it will not run where the model is absent. Devices without Apple Intelligence, or with the model still downloading or temporarily unavailable, are all possible. Swallow this and the feature silently breaks for users on older hardware.
+
+```swift
+import FoundationModels
+import SwiftUI
+
+/// A single source of truth for whether the on-device model is usable.
+/// Views read this state to show, hide, or fall back from the feature.
+@Observable
+final class ModelGate {
+    enum State {
+        case ready
+        case unavailable(reason: String)
+    }
+
+    private(set) var state: State = .unavailable(reason: "not checked")
+
+    func refresh() {
+        let model = SystemLanguageModel.default
+        switch model.availability {
+        case .available:
+            state = .ready
+        case .unavailable(.deviceNotEligible):
+            state = .unavailable(reason: "This device does not support Apple Intelligence")
+        case .unavailable(.appleIntelligenceNotEnabled):
+            state = .unavailable(reason: "Enable Apple Intelligence in Settings")
+        case .unavailable(.modelNotReady):
+            state = .unavailable(reason: "The model is still preparing — try again shortly")
+        case .unavailable(let other):
+            state = .unavailable(reason: "Unavailable: \(other)")
+        }
+    }
+
+    var isReady: Bool {
+        if case .ready = state { return true }
+        return false
+    }
+}
+```
+
+The mistake I made in production was checking availability exactly once, at launch. The model can finish downloading after launch, so if you read the state only at startup and latch `unavailable`, the feature never appears on a device that would have worked a minute later. Calling `refresh()` again from `onAppear` or whenever the feature opens makes the real-device experience noticeably more reliable.
+
+## Step 2: Receive a fixed shape with @Generable
+
+Ask an LLM to "add some tags" in free text and the shape comes back different every time. Sometimes it is `["mountain", "sunset"]`, sometimes a sentence — and you burn time on parsing. Foundation Models' `@Generable` constrains the output to a Swift type, and it works the same when the prompt is multimodal.
+
+```swift
+import FoundationModels
+
+/// The structured result we ask the model to produce.
+/// @Guide tells the model the intent of each field and stabilizes output.
+@Generable
+struct ImageTagResult {
+    @Guide(description: "Tags describing the image content. 3 to 6 items. Prefer common nouns over proper nouns.")
+    let tags: [String]
+
+    @Guide(description: "Exactly one of: landscape, person, animal, food, architecture, abstract, other")
+    let category: String
+
+    @Guide(description: "A one-sentence caption of the image, roughly 8 to 16 words.")
+    let caption: String
+
+    @Guide(description: "Whether the image is suitable as a wallpaper.")
+    let suitableAsWallpaper: Bool
+}
+```
+
+`@Guide` is not a comment; it is a constraint passed to the model through guided generation. Pinning the category to a seven-way choice stops the model from inventing its own labels. In my experience, fixing the options here prevents far more incidents than normalizing free-form categories after the fact.
+
+## Step 3: Attach the image to the prompt and call
+
+Now the image itself. What Apple has published is the list of input types — an image attachment can be made from `UIImage`, `NSImage`, `CGImage`, Core Image types, a `CVPixelBuffer`, or a file URL — while the exact initializer name is left to the SDK. Treat the type list as the contract and let the iOS 27 SDK autocomplete fill in the call site.
+
+```swift
+import FoundationModels
+import UIKit
+
+enum TaggingError: Error {
+    case modelUnavailable
+}
+
+/// Generate a tag result from a single image.
+/// - Parameter image: a UIImage from PhotosPicker or the camera
+/// - Returns: a structured ImageTagResult
+func generateTags(for image: UIImage, gate: ModelGate) async throws -> ImageTagResult {
+    gate.refresh()
+    guard gate.isReady else { throw TaggingError.modelUnavailable }
+
+    // System instructions pin the model's role and the output language.
+    let session = LanguageModelSession(
+        instructions: """
+        You assign metadata to images.
+        Answer strictly in the given schema. Do not invent details
+        that are not visible in the image.
+        """
+    )
+
+    // Any size and aspect ratio is accepted, but bigger images cost more
+    // tokens and latency, so downscale the long edge to 1024px first.
+    let downscaled = image.downscaled(maxDimension: 1024)
+
+    let response = try await session.respond(
+        to: Prompt {
+            "Generate suitable tags, a category, and a caption for this image."
+            downscaled   // image attachment, accepted by the prompt builder
+        },
+        generating: ImageTagResult.self
+    )
+
+    return response.content
+}
+```
+
+The downscaling matters. Apple says any size and aspect ratio is accepted, but that means "you don't need to crop or pad to a shape," not "throwing a big image is free." Pass a 48-megapixel photo as-is and the image alone crowds out the 4K context. For a "what is this?" task, dropping the long edge to around 1024px barely touches accuracy while visibly cutting latency. Treat resolution as a budget knob, not a quality dial.
+
+The helper can be plain.
+
+```swift
+import UIKit
+
+extension UIImage {
+    /// Proportionally downscales only when the long edge exceeds maxDimension.
+    func downscaled(maxDimension: CGFloat) -> UIImage {
+        let longSide = max(size.width, size.height)
+        guard longSide > maxDimension else { return self }
+        let scale = maxDimension / longSide
+        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let renderer = UIGraphicsImageRenderer(size: newSize)
+        return renderer.image { _ in
+            draw(in: CGRect(origin: .zero, size: newSize))
+        }
+    }
+}
+```
+
+## Step 4: Don't pit Vision against Foundation Models — combine them
+
+The question many people get stuck on: if Vision exists, why read images with Foundation Models at all? Apple's own framing is clear. Vision is the specialist that runs a fixed set of computer-vision tasks fast, often at video frame rates. The Foundation Models LLM is the generalist you can ask almost anything, and it shines at descriptive work — captions, suggestions, explanations.
+
+That gives you a routing rule. Fixed, speed-critical work — face detection, rectangle detection, barcode reading, saliency — goes to Vision. Open-ended, language-out questions — "suggest a redecoration for this room," "make a recipe from this fridge" — go to Foundation Models. And when you want both, Apple recommends calling Vision from inside a Foundation Models tool.
+
+In iOS 27, tool calling supports image arguments: you pass not the image itself but an `ImageReference` to an image in the current session. So when you want the on-device LLM to do the tagging but a Vision classifier to handle hard object identification, you can plug Vision in as a `Tool`.
+
+```swift
+import FoundationModels
+import Vision
+
+/// Expose Vision image classification as a tool the model can call.
+struct VisionClassifyTool: Tool {
+    let name = "classifyImage"
+    let description = "Quickly classify the main objects in an image with Vision and return top labels."
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "A reference to the image in the current session to classify")
+        let image: ImageReference
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        // Resolve the ImageReference back to a real image via session history.
+        let cgImage = try arguments.image.resolvedCGImage()
+
+        let request = VNClassifyImageRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+
+        let top = (request.results ?? [])
+            .filter { $0.confidence > 0.1 }
+            .prefix(5)
+            .map { "\($0.identifier) (\(String(format: "%.2f", $0.confidence)))" }
+
+        return top.isEmpty ? "no confident labels" : top.joined(separator: ", ")
+    }
+}
+```
+
+Give the session this tool and the model calls Vision only when it cannot identify an object itself, then folds the result into its tags and caption. The LLM is the generalist that thinks; Vision is the specialist that runs — and that division of labor becomes the structure of your code.
+
+## Step 5: Escalate to PCC only when 4K isn't enough
+
+When you want to process several images at once, or pass long instructions and an image together, the on-device 4K runs short. Because Foundation Models is a unified Swift API, you switch to the PCC server model (32K) with, as Apple puts it, a one-line change. `@Generable` and tool calling behave exactly as they do on-device.
+
+```swift
+// On-device (default):
+let onDevice = LanguageModelSession(instructions: systemPrompt)
+
+// Switch to the PCC server model (context 4K -> 32K).
+// Send multi-image batches and long prompts here.
+let server = LanguageModelSession(
+    model: .serverPrivateCloudCompute,
+    instructions: systemPrompt
+)
+```
+
+PCC is not unconditionally better, though. The server model can reason, but reasoning is extra text the model generates, and it too spends context. Pair several full-resolution images with deep reasoning and you burn the 32K from both ends. Apple's advice is to choose "based on data, not just vibes." In my own operation, I settled on a rule: process on-device first, measure quality and latency, and switch to PCC only when it clearly falls short. For plain tagging or a "what is this?" question, this year's updated on-device model is often enough.
+
+## Pitfalls I hit putting this into production
+
+Wiring this into the wallpaper app's auto-tagging surfaced a few production-specific traps.
+
+First, how you latch availability. As noted, a single check at launch that pins `unavailable` keeps the feature hidden forever on a device that is still preparing the model. Making the state `@Observable` and re-checking each time the feature opens visibly cut my support inquiries.
+
+Second, missing the token budget. Before adding downscaling, full-resolution photos exhausted the on-device context and output was truncated mid-stream. A single downscale to a 1024px long edge fixed it.
+
+Third, leaving the `@Generable` category as free text. I started by vaguely asking the model to "guess a category," which mass-produced near-duplicates like "landscape," "scenery," and "nature scene" that broke the filter UI. Pinning it to seven choices via `@Guide` removed the need for downstream normalization entirely.
+
+Underlying all of it is the availability gate and fallback design. On-device AI is a feature that is "fast and free where it runs, and absent where it doesn't." If you want to deliver value to users on devices without Apple Intelligence, you should always keep a Vision-only simple tagger or a manual-entry fallback ready.
+
+## Your next step
+
+Start by adding just the availability gate and a minimal `@Generable` implementation to an existing Swift app you generated with Rork Max. `print` the result of `SystemLanguageModel.default.availability` and see which state your own device returns — that alone sharpens your design judgment quickly. Layer image input and tool calling on top once that foundation exists, and you'll have far less rework.
+
+The design decisions around on-device image understanding connect directly to the [guide on integrating a custom Core ML model for on-device inference in Rork](/en/articles/rork-ai/rork-core-ml-custom-model-on-device-ai-guide) and to [designing an on-device-first, cloud-fallback inference router](/en/articles/rork-ai/rork-ai-inference-router-on-device-first-cloud-fallback-2026). Read alongside them and the line between what stays on the device and what reaches for the cloud comes into clearer relief.

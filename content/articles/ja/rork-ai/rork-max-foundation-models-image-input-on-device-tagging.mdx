@@ -1,0 +1,256 @@
+---
+title: "Rork Max の Swift アプリに Foundation Models の画像入力でオンデバイス・タグ付けを実装する"
+slug: "rork-max-foundation-models-image-input-on-device-tagging"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-14T20:15"
+updated: "2026-06-14T20:15"
+author: "Rork Lab"
+description: "WWDC26 で Foundation Models のオンデバイスモデルに画像入力が加わりました。Rork Max が生成する Swift アプリに、画像のタグ付け・説明生成をクラウドに出さず実装する具体的な手順を、可用性ゲートとVision併用まで含めて解説します。"
+tags: ["Rork Max", "Foundation Models", "画像入力", "オンデバイスAI", "SwiftUI"]
+highlights:
+  - "画像のタグ付けや説明文生成に外部APIを使っていた人が、Rork Max のSwiftアプリ内でオンデバイス完結の実装に切り替えられる"
+  - "@Generable による構造化出力・Vision併用・可用性ゲートまで、コピーして動かせる Swift コードを手に入れられる"
+  - "オンデバイス4Kとクラウド32Kのトークン予算を踏まえ、月のAPI費用をかけずに画像理解機能を本番投入できる"
+---
+
+写真を1枚渡して「これは何の写真か」「どんなタグを付けるべきか」を返す機能を作るとき、これまでは画像を外部のマルチモーダルAPIに送るのが当たり前でした。私が個人開発で運用している壁紙アプリでも、新しく追加した画像にカテゴリやキーワードを自動で付けたい場面が何度もあり、そのたびに「ユーザーの端末にある画像を、わざわざ自社サーバーやクラウドLLMに送ってよいのか」という線引きに悩んできました。
+
+WWDC26 で、その前提が変わりました。iOS 27 のオンデバイス Foundation Models が画像を読めるようになり、プロンプトに画像を添えて「この写真について答えて」と聞けるようになったのです。Apple は新しい専用パイプラインではなく「既存のプロンプトビルダーの自然な拡張」だと説明しています。つまり iOS 26 で覚えた `LanguageModelSession` や `@Generable` の作法はそのまま使えて、プロンプトに画像が1枚増えるだけです。
+
+ここからは、Rork Max が生成する Swift アプリを土台に、画像のタグ付け・説明生成をオンデバイスで完結させる実装を、可用性チェックと Vision 併用まで含めて組み立てます。Rork Max は React Native ではなくネイティブ Swift を生成する製品なので、Foundation Models のような Apple ネイティブのフレームワークと素直に噛み合うのが利点です。
+
+## なぜ「画像をクラウドに出さない」が効くのか
+
+画像理解をクラウドLLMに任せると、3つのコストが同時に乗ります。1つ目は金銭的なコスト（1画像あたりの推論料金）、2つ目はレイテンシ（往復のネットワーク待ち）、3つ目はプライバシー上の説明責任です。とくに壁紙やヘルスケアのように「端末内の個人的な画像」を扱うアプリでは、3つ目が最も重くのしかかります。
+
+Foundation Models のオンデバイスモデルは、これらをまとめて軽くします。推論は端末内で完結するため、初回ダウンロードが一定規模未満の個人開発アプリにとっては実質的に追加費用ゼロで画像理解を載せられます。ネットワーク往復が消えるのでオフラインでも動き、画像が端末の外に出ないので説明も簡潔になります。
+
+ただし万能ではありません。オンデバイスモデルのコンテキストは4K、Private Cloud Compute（PCC）のサーバーモデルは32Kで、画像はそのトークン予算を消費します。Apple 自身が「大きな画像ほど多くのトークンを消費し、レイテンシも増える」と明言しています。設計の出発点は「まずオンデバイスで測り、足りないときだけサーバーへ逃がす」です。
+
+## 全体像 — タグ付け機能の3層構造
+
+実装は次の3層で考えると整理できます。
+
+1. **可用性ゲート**: そのデバイスで Apple Intelligence（＝オンデバイスモデル）が使えるかを確認し、使えない端末では機能自体を隠すかフォールバックする。
+2. **構造化されたタグ生成**: 画像をプロンプトに添え、`@Generable` で「タグ配列・カテゴリ・1行説明」という決まった形のデータを受け取る。
+3. **Vision 併用と段階的エスカレーション**: 高速・定型の処理は Vision に任せ、言語的な説明はオンデバイス Foundation Models、長文や複数画像のバッチだけ PCC に逃がす。
+
+順に作っていきます。
+
+## ステップ1: 可用性を必ずゲートする
+
+画像入力は同じオンデバイスモデルに乗っているため、モデルが使えない端末では当然動きません。Apple Intelligence 非対応端末や、ダウンロード未完了・低電力モードなどでモデルが一時的に使えない状態もあり得ます。ここを握りつぶすと、古い端末のユーザーで機能が無言で壊れます。
+
+```swift
+import FoundationModels
+import SwiftUI
+
+/// オンデバイスモデルの利用可否を一元管理する観測可能オブジェクト。
+/// View はこの状態を見て、機能の表示／非表示やフォールバックを決める。
+@Observable
+final class ModelGate {
+    enum State {
+        case ready
+        case unavailable(reason: String)
+    }
+
+    private(set) var state: State = .unavailable(reason: "未確認")
+
+    func refresh() {
+        let model = SystemLanguageModel.default
+        switch model.availability {
+        case .available:
+            state = .ready
+        case .unavailable(.deviceNotEligible):
+            state = .unavailable(reason: "この端末は Apple Intelligence に対応していません")
+        case .unavailable(.appleIntelligenceNotEnabled):
+            state = .unavailable(reason: "設定で Apple Intelligence を有効にしてください")
+        case .unavailable(.modelNotReady):
+            state = .unavailable(reason: "モデルの準備中です。しばらくお待ちください")
+        case .unavailable(let other):
+            state = .unavailable(reason: "利用できません: \(other)")
+        }
+    }
+
+    var isReady: Bool {
+        if case .ready = state { return true }
+        return false
+    }
+}
+```
+
+ここで私が個人開発の現場で痛い目を見たのは、可用性チェックを「アプリ起動時に一度だけ」やってしまったことでした。モデルのダウンロードは起動後に完了することがあり、起動直後だけ見て `unavailable` を握ると、しばらく待てば使えたはずの端末で機能が出てきません。`onAppear` や機能を開くタイミングで `refresh()` を呼び直す方が、実機での体感は確実に良くなります。
+
+## ステップ2: @Generable で「形の決まったタグ」を受け取る
+
+LLM に「タグを付けて」と自由文で頼むと、返ってくる形が毎回ぶれます。`["山", "夕焼け"]` のときもあれば「この写真には山と夕焼けが写っています」と文章で返ることもあり、パースで消耗します。Foundation Models の `@Generable` は、出力を Swift の型に縛り込むための仕組みです。画像入力でもこの仕組みはそのまま効きます。
+
+```swift
+import FoundationModels
+
+/// 生成結果を受け取る構造化型。
+/// @Guide でモデルに各フィールドの意図を伝え、出力の質を安定させる。
+@Generable
+struct ImageTagResult {
+    @Guide(description: "画像の内容を表す日本語のタグ。3〜6個。固有名詞より一般名詞を優先する。")
+    let tags: [String]
+
+    @Guide(description: "次のいずれか1つ: 風景, 人物, 動物, 食べ物, 建築, 抽象, その他")
+    let category: String
+
+    @Guide(description: "画像を一文で説明する。20〜40文字程度の日本語。")
+    let caption: String
+
+    @Guide(description: "画像が壁紙として適しているかの真偽値。")
+    let suitableAsWallpaper: Bool
+}
+```
+
+`@Guide` は単なるコメントではなく、ガイド付き生成（guided generation）でモデルへ渡される制約です。「カテゴリは7択から1つ」と書いておくと、モデルが勝手な分類名を作るのを抑えられます。私の経験では、自由記述のカテゴリを後から正規化するより、ここで選択肢を固定する方がはるかに事故が減りました。
+
+## ステップ3: 画像をプロンプトに添えて呼び出す
+
+いよいよ画像を渡す部分です。Apple が公開しているのは「画像アタッチメントは `UIImage` / `NSImage` / `CGImage` / Core Image 型 / `CVPixelBuffer` / ファイルURL から作れる」という入力型の一覧で、正確なイニシャライザ名はSDKに委ねられています。ここでは入力型の一覧を契約と捉え、呼び出しの骨格を示します（実際の添付APIの綴りは iOS 27 SDK の補完に従ってください）。
+
+```swift
+import FoundationModels
+import UIKit
+
+enum TaggingError: Error {
+    case modelUnavailable
+}
+
+/// 1枚の画像からタグ結果を生成する。
+/// - Parameter image: PhotosPicker やカメラから受け取った UIImage
+/// - Returns: 構造化された ImageTagResult
+func generateTags(for image: UIImage, gate: ModelGate) async throws -> ImageTagResult {
+    gate.refresh()
+    guard gate.isReady else { throw TaggingError.modelUnavailable }
+
+    // システム指示でモデルの役割を固定する。出力言語もここで縛る。
+    let session = LanguageModelSession(
+        instructions: """
+        あなたは画像にメタデータを付与するアシスタントです。
+        必ず日本語で、与えられたスキーマの形式に厳密に従って答えてください。
+        画像に写っていないものを推測で足さないでください。
+        """
+    )
+
+    // プロンプトに画像を添える。画像は任意のサイズ・アスペクト比を受け付けるが、
+    // 大きいほどトークンとレイテンシを食うため、ここで長辺を1024pxに縮小しておく。
+    let downscaled = image.downscaled(maxDimension: 1024)
+
+    let response = try await session.respond(
+        to: Prompt {
+            "この画像にふさわしいタグ・カテゴリ・説明を生成してください。"
+            downscaled   // 画像アタッチメント（プロンプトビルダーが受け取る）
+        },
+        generating: ImageTagResult.self
+    )
+
+    return response.content
+}
+```
+
+ポイントは縮小処理です。Apple は「どんなサイズ・アスペクト比でも受け付ける」と言っていますが、それは「クロップやパディングで形を整える必要がない」という意味であって、「大きい画像を投げても無料」という意味ではありません。48メガピクセルの写真をそのまま渡すと、4Kのコンテキストを画像だけで圧迫します。「この写真は何か」を判定する程度のタスクなら、長辺1024px前後に落としても精度はほとんど変わらず、レイテンシだけが目に見えて下がります。解像度はトークン予算のノブだと捉えてください。
+
+縮小ヘルパーは素朴で構いません。
+
+```swift
+import UIKit
+
+extension UIImage {
+    /// 長辺が maxDimension を超える場合のみ等比縮小する。
+    func downscaled(maxDimension: CGFloat) -> UIImage {
+        let longSide = max(size.width, size.height)
+        guard longSide > maxDimension else { return self }
+        let scale = maxDimension / longSide
+        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let renderer = UIGraphicsImageRenderer(size: newSize)
+        return renderer.image { _ in
+            draw(in: CGRect(origin: .zero, size: newSize))
+        }
+    }
+}
+```
+
+## ステップ4: Vision と競合させず、組み合わせる
+
+ここで多くの人が迷うのが「Vision フレームワークがあるのに、なぜ Foundation Models で画像を読むのか」です。Apple のセッションでの整理が明快でした。Vision は「決まったタスクを、速く、しばしば動画のフレームレートで」こなす専門家。Foundation Models の LLM は「ほぼ何でも聞ける」汎用家で、とくに記述的なタスク（説明・キャプション・提案）に強い、という棲み分けです。
+
+判断のルールはこうなります。顔検出・矩形検出・バーコード読み取り・サリエンシーのような定型で速度が要る処理は Vision。「この部屋の模様替え案を出して」「冷蔵庫の中身からレシピを作って」のような言語で返す開放的な問いは Foundation Models。そして両方欲しいときは、Foundation Models のツール呼び出しから Vision を呼ぶ、というのが Apple の推奨です。
+
+iOS 27 ではツール呼び出しが画像引数に対応し、画像そのものではなく現在のセッションにある画像への参照（`ImageReference`）を渡せます。たとえば「タグ付けはオンデバイスLLMに任せるが、実物の物体識別だけは Vision の分類器に任せたい」というとき、次のように Vision を `Tool` として差し込めます。
+
+```swift
+import FoundationModels
+import Vision
+
+/// Vision の画像分類を、Foundation Models から呼べるツールとして公開する。
+struct VisionClassifyTool: Tool {
+    let name = "classifyImage"
+    let description = "画像内の主要な物体を、Vision の分類器で高速に判定して上位ラベルを返す。"
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "分類対象の、現在のセッション内の画像への参照")
+        let image: ImageReference
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        // ImageReference をセッション履歴から実画像に解決する想定。
+        let cgImage = try arguments.image.resolvedCGImage()
+
+        let request = VNClassifyImageRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+
+        let top = (request.results ?? [])
+            .filter { $0.confidence > 0.1 }
+            .prefix(5)
+            .map { "\($0.identifier) (\(String(format: "%.2f", $0.confidence)))" }
+
+        return top.isEmpty ? "確度の高いラベルなし" : top.joined(separator: ", ")
+    }
+}
+```
+
+このツールをセッションに渡しておくと、モデルは自力で答えられない物体識別の場面でだけ Vision を呼び、その結果を踏まえてタグや説明を組み立てます。LLM は「考える汎用家」、Vision は「走る専門家」という役割分担が、そのままコードの構造になります。
+
+## ステップ5: 4Kで足りないときだけ PCC へ逃がす
+
+複数画像をまとめて処理したい、あるいは長い指示文と画像を同時に渡したい、というときオンデバイスの4Kでは足りなくなります。Foundation Models は統一されたSwift APIなので、Apple の言う通り「1行の変更」でモデルを PCC のサーバーモデル（32K）へ切り替えられます。`@Generable` もツール呼び出しも、オンデバイスと同じように動きます。
+
+```swift
+// オンデバイス（既定）:
+let onDevice = LanguageModelSession(instructions: systemPrompt)
+
+// PCC のサーバーモデルへ切り替え（コンテキスト 4K → 32K）。
+// 複数画像のバッチや長文プロンプトはこちらに逃がす。
+let server = LanguageModelSession(
+    model: .serverPrivateCloudCompute,
+    instructions: systemPrompt
+)
+```
+
+ただし PCC は無条件に強いわけではありません。サーバーモデルは推論（reasoning）が使えますが、推論はモデルが内部で生成する追加のテキストであり、これもコンテキストを消費します。フル解像度の画像を複数枚と深い推論を同時に積むと、32Kの両端から予算が削られます。Apple の助言は「雰囲気ではなくデータで選べ」。私の運用では、まずオンデバイスで処理して結果の質とレイテンシを実測し、明確に足りない場合だけ PCC に切り替える、という基準に落ち着いています。実際、単純なタグ付けや「これは何か」程度の問いなら、今年更新されたオンデバイスモデルで十分なことが多いです。
+
+## 本番投入で気をつけた落とし穴
+
+実際に App Store で配信している壁紙アプリの自動タグ付けに組み込む過程で、いくつか本番運用特有の罠に当たりました。
+
+1つ目は、可用性の握り方です。前述の通り、起動直後の1回チェックで `unavailable` を固定すると、モデル準備中の端末で機能が永久に出ません。状態を `@Observable` にして、機能を開くたびに見直す設計にしたところ、サポート問い合わせが目に見えて減りました。
+
+2つ目は、トークン予算の見落としです。縮小を入れる前は、高解像度の写真をそのまま渡してオンデバイスのコンテキストを使い切り、出力が途中で切れる事象が出ました。長辺1024pxへの縮小を1か所入れただけで出力切れは解消し、平均レイテンシも体感で30%ほど下がりました。
+
+3つ目は、`@Generable` のカテゴリを自由文にしてしまったことです。最初は「カテゴリを推測して」と曖昧に頼んでいたため、「風景」「景色」「自然風景」といった表記ゆれが量産され、絞り込みUIが破綻しました。`@Guide` で7択に固定してからは、後段の正規化処理そのものが不要になりました。
+
+そして全体に通底するのは、可用性ゲートとフォールバックの設計です。オンデバイスAIは「使える端末では速くて無料、使えない端末では存在しない」機能です。Apple Intelligence 非対応端末のユーザーにも価値を届けるなら、Vision だけの簡易タグ付けや、ユーザー手動入力への退避を、私自身は必ず用意しておくべきだと考えています。
+
+## 次の一歩
+
+まずは可用性ゲートと `@Generable` の最小実装だけを、Rork Max で生成した既存の Swift アプリに足してみてください。`SystemLanguageModel.default.availability` を `print` して、自分の実機がどの状態を返すかを確かめるところから始めると、設計判断の解像度が一気に上がります。画像入力やツール呼び出しの細部は、その土台ができてから積み増す方が、確実に手戻りが減ります。
+
+オンデバイスで画像理解を扱う設計判断は、関連する[Rork で Core ML のカスタムモデルをオンデバイス推論に組み込む実装ガイド](/articles/rork-ai/rork-core-ml-custom-model-on-device-ai-guide)や、[オンデバイス優先・クラウドフォールバックの推論ルーター設計](/articles/rork-ai/rork-ai-inference-router-on-device-first-cloud-fallback-2026)とも地続きです。あわせて読むと、どこまで端末内で完結させ、どこからクラウドに頼るかの線引きがより立体的に見えてくるはずです。
