@@ -1,0 +1,227 @@
+---
+title: "Building Rork Subscriptions Around RevenueCat Entitlements — Access Checks, Offering-Driven Paywalls, and Restore"
+slug: "rork-revenuecat-entitlements-paywall-build-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-14T11:00"
+author: "Rork Lab"
+description: "Implementation notes for adding subscriptions to a Rork (Expo) app with RevenueCat. Make Entitlements the single source of truth for access, drive the paywall from Offerings so you can change prices remotely, wire up restore and the customer-info listener, and avoid the sandbox traps — all with working code."
+tags: ["Rork", "RevenueCat", "Subscriptions", "Expo", "Monetization"]
+highlights:
+  - "Use a single Entitlement as the only access check so price changes and platform differences don't break gating"
+  - "An Offering-driven paywall that reads packages remotely instead of hardcoding prices"
+  - "The restore flow, the CustomerInfo listener, and the sandbox issues that actually cost you time"
+---
+
+When you finally have a working app out of Rork and decide to add payments, the first place most people stall isn't the SDK call — it's the question of *where, and based on what, do I decide whether someone is a paying member?* Do you check the purchased product ID, store a receipt, write a "purchased" flag on the device? Leave that vague and you'll pay for it later: change a price and the check breaks, or a user who switched phones writes in saying "I paid and it's gone."
+
+The real value of dropping in RevenueCat isn't that "subscriptions take a few lines." It's that you can anchor your access check to an **Entitlement** rather than to product IDs. This article assumes the Expo (React Native) app that regular Rork generates, and walks through an Entitlement-centered design, an Offering-driven paywall, restore, and the sandbox issues I actually hit — with working code. I'll spend less time on the product-setup screens and more on the structure that pays off down the road.
+
+## Why "check the product ID" falls apart later
+
+The common first move is to use the purchased product ID (`com.example.app.pro_monthly`) directly as the access check. It works — until operations begin. Start selling monthly *and* annual and now you `if` against both. Raise prices by cutting a new product ID and you add code to keep grandfathered subscribers. Name your iOS and Android product IDs differently and the platform branching doubles. Before long, the function that answers "may I unlock Pro?" is a growing list of product-ID comparisons.
+
+RevenueCat's Entitlement abstracts that list away. In the dashboard you create one Entitlement — say `pro` — and attach "which products grant `pro`" to it. The app never knows a single product ID; it only asks whether `pro` is active. Add products or change prices and the attachment is dashboard work; your app code doesn't move. Whether you nail this down first determines, in my experience, how much the next six months of maintenance costs.
+
+Pin the access axis to exactly one thing. **"Is the Entitlement active" is the only truth for access**; any device flag or product ID is at most a hint. Build the whole codebase on that premise.
+
+## Write the service layer around the Entitlement
+
+Install the SDK first. Because billing pulls in native modules, it does **not** run in Expo Go — you need a development build (`expo-dev-client`) or EAS Build. Testing in Expo Go and wondering why the purchase call never fires is the very first trap, so I'm putting it up front.
+
+```bash
+npx expo install react-native-purchases
+# Make a dev build — billing does not work in Expo Go
+npx expo prebuild
+eas build --profile development --platform ios
+```
+
+The package is `react-native-purchases` (you'll see an older scoped spelling around; this is the current one). Write the service layer as a thin window that returns Entitlement state, so the rest of the app never thinks about "products" or "receipts."
+
+```typescript
+// src/services/purchases.ts
+import Purchases, {
+  CustomerInfo,
+  LOG_LEVEL,
+} from 'react-native-purchases';
+import { Platform } from 'react-native';
+
+// Decide on ONE entitlement for gating. No product IDs appear here.
+export const ENTITLEMENT_ID = 'pro';
+
+const API_KEY = Platform.select({
+  ios: process.env.EXPO_PUBLIC_RC_IOS_KEY ?? '',
+  android: process.env.EXPO_PUBLIC_RC_ANDROID_KEY ?? '',
+}) as string;
+
+export async function configurePurchases() {
+  if (__DEV__) Purchases.setLogLevel(LOG_LEVEL.DEBUG);
+  // Without an appUserID, RevenueCat assigns an anonymous one.
+  // If you have your own auth, the right move is logIn() AFTER sign-in,
+  // not passing an ID to configure() — that double-runs the anon→known alias.
+  await Purchases.configure({ apiKey: API_KEY });
+}
+
+// The single access check. Nothing else decides premium access.
+export function isPro(info: CustomerInfo): boolean {
+  return info.entitlements.active[ENTITLEMENT_ID] !== undefined;
+}
+
+export async function getCustomerInfo(): Promise<CustomerInfo> {
+  return Purchases.getCustomerInfo();
+}
+```
+
+The key is that `isPro` takes a `CustomerInfo` and holds no internal state — it's a pure function. If your check depends on some global variable, the value drifts between "just purchased," "just restored," and "just launched." Always phrase it as "ask, passing the freshest `CustomerInfo` I have," and it lines up cleanly with the listener below.
+
+## Drive the paywall from Offerings to keep prices out of code
+
+It's tempting to write "$9.99 / mo" straight into the paywall, but that's the product-ID problem again: every price change means resubmitting the app, and you can't do regional pricing. An Offering keeps the set and order of displayed products on the dashboard side; the app just fetches "the packages to show right now" and renders them.
+
+```typescript
+// src/services/offerings.ts
+import Purchases, { PurchasesPackage } from 'react-native-purchases';
+
+export async function getCurrentPackages(): Promise<PurchasesPackage[]> {
+  const offerings = await Purchases.getOfferings();
+  // `current` is whatever you set as the active Offering in the dashboard.
+  return offerings.current?.availablePackages ?? [];
+}
+
+export async function purchase(pkg: PurchasesPackage) {
+  try {
+    const { customerInfo } = await Purchases.purchasePackage(pkg);
+    return { ok: true as const, customerInfo };
+  } catch (e: any) {
+    // The user just dismissing the sheet is a "cancel," not a failure.
+    // Treat it as an error and you flash a red toast on every dismiss.
+    if (e.userCancelled) return { ok: false as const, cancelled: true };
+    return { ok: false as const, error: e };
+  }
+}
+```
+
+The paywall UI displays `product.priceString` directly. RevenueCat returns a string already formatted for the device locale and regional price, so you never assemble currency symbols or thousands separators yourself. Format it by hand and it will break the moment yen and dollars mix across regions.
+
+```tsx
+// src/components/Paywall.tsx
+import { useEffect, useState } from 'react';
+import { View, Text, Pressable, ActivityIndicator } from 'react-native';
+import { PurchasesPackage } from 'react-native-purchases';
+import { getCurrentPackages, purchase } from '../services/offerings';
+
+export function Paywall({ onPurchased }: { onPurchased: () => void }) {
+  const [packages, setPackages] = useState<PurchasesPackage[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    getCurrentPackages().then(setPackages).catch(() => setPackages([]));
+  }, []);
+
+  if (!packages) return <ActivityIndicator />;
+  if (packages.length === 0) {
+    // Zero packages is a sign of a setup gap. In sandbox, products that are
+    // "waiting for review" come back empty — surface a message, don't hide it.
+    return <Text>No plans are available right now. Please try again later.</Text>;
+  }
+
+  async function onTap(pkg: PurchasesPackage) {
+    setBusy(true);
+    const res = await purchase(pkg);
+    setBusy(false);
+    if (res.ok) onPurchased();
+  }
+
+  return (
+    <View>
+      {packages.map((pkg) => (
+        <Pressable key={pkg.identifier} disabled={busy} onPress={() => onTap(pkg)}>
+          <Text>{pkg.product.title}</Text>
+          {/* Use priceString as-is. Never format the price yourself. */}
+          <Text>{pkg.product.priceString}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+```
+
+With this structure, a year-end change like "push a 3-day-trial annual to the front" is just a dashboard Offering switch — no resubmission. In production, that swap speed is what you feel.
+
+## A listener that distributes state across the app
+
+Purchases and restores change state on screens other than the paywall. Calling `getCustomerInfo` per screen makes the timing inconsistent, so receive "CustomerInfo updated" in one place via RevenueCat's listener and hand it out through Context.
+
+```tsx
+// src/providers/EntitlementProvider.tsx
+import { createContext, useContext, useEffect, useState } from 'react';
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+import { isPro, getCustomerInfo } from '../services/purchases';
+
+const Ctx = createContext<{ pro: boolean; ready: boolean }>({ pro: false, ready: false });
+
+export function EntitlementProvider({ children }: { children: React.ReactNode }) {
+  const [pro, setPro] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const apply = (info: CustomerInfo) => mounted && setPro(isPro(info));
+
+    // Fetch once on launch, then subscribe to updates. Funneling everything
+    // through this one path — rather than setPro from each call's return —
+    // keeps you from losing track of where state changes.
+    getCustomerInfo().then((info) => { apply(info); setReady(true); }).catch(() => setReady(true));
+    Purchases.addCustomerInfoUpdateListener(apply);
+    return () => { mounted = false; Purchases.removeCustomerInfoUpdateListener(apply); };
+  }, []);
+
+  return <Ctx.Provider value={{ pro, ready }}>{children}</Ctx.Provider>;
+}
+
+export const useEntitlement = () => useContext(Ctx);
+```
+
+The gating side knows nothing about products or RevenueCat; it reads only `useEntitlement().pro`. `ready` is separate so you don't confuse the launch-moment "not fetched yet" state with `false` (non-member). Confuse them and the paywall flickers for an instant on launch, and members read it as "I paid and it still shows up every time."
+
+## Restore isn't a feature, it's an obligation
+
+Restore isn't a nice-to-have. The App Store review guidelines require it for non-consumables and subscriptions; if there's no "already purchased? tap here," you get rejected. The implementation itself is short.
+
+```typescript
+// src/services/purchases.ts (continued)
+export async function restore(): Promise<boolean> {
+  const info = await Purchases.restorePurchases();
+  return isPro(info);
+}
+```
+
+Watch the result handling. `restorePurchases` can succeed yet leave `pro` as `false` if that user has no purchase history. Assume "restore succeeded = membership back" and pop a success toast, and you'll tell a never-purchased user "restored." Read the returned `isPro` and split the message.
+
+```tsx
+async function onRestore() {
+  const restored = await restore();
+  Alert.alert(restored ? 'Your purchase has been restored' : 'No restorable purchase was found');
+}
+```
+
+If your app has its own auth, tying purchases to the account with `Purchases.logIn(yourUserId)` is sturdier than restore — the Entitlement follows the user across devices once they sign in. Decide up front: anonymous → restore button, account-based → login sync. Pin one policy so you don't end up with both half-implemented and tangled later.
+
+## What actually bit me in the sandbox
+
+These are the time sinks that the setup docs don't make obvious.
+
+**Offerings come back empty.** Right after you create products, while App Store Connect shows "ready to submit / waiting for review," `getOfferings().availablePackages` returns an empty array. The code is correct, the UI shows nothing, and you go hunting in the SDK and lose a day. That's why the paywall above shows a message on an empty array — so this state isn't swallowed silently. First check that the Packages show green under "Offerings" in the RevenueCat dashboard.
+
+**Sandbox subscriptions renew absurdly fast.** A production monthly renews and expires every few minutes in sandbox. It's by design and handy for checking renewal behavior, but it's easy to think "I just bought this and it already expired." During tests, watch the active/inactive *transition* of the Entitlement, not the absolute expiry timestamp.
+
+**A StoreKit Configuration File never reaches the server.** Xcode's local StoreKit testing is convenient, but purchases don't route through Apple's sandbox, so they don't sync to RevenueCat's servers. To actually validate an Entitlement-based design, test on a real device with a sandbox Apple ID, not local StoreKit. I once chased "the listener isn't firing" here — the cause wasn't the code; the purchase never reached the server.
+
+**Android assumes license testers and an internal test track.** On Google Play, sandbox purchases only work with an account registered as a license tester *and* a build promoted to the internal test track. A debug APK sideloaded directly won't process billing — that's almost always the cause.
+
+## One last thing to verify
+
+Once it works, confirm exactly one thing. **Grep every place that decides "may I show this premium feature" and make sure nothing gates membership except `isPro` or `useEntitlement`.** If even one leftover checks a product ID directly, or a device flag set at purchase time, that spot alone will diverge on a price change or a device switch. Have you narrowed the access axis to a single Entitlement? How maintainable your billing stays comes down, in the end, to that.
+
+I hope this helps anyone moving from a no-code base into app monetization lay a solid foundation.

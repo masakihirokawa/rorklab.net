@@ -1,0 +1,230 @@
+---
+title: "Rork のサブスクを RevenueCat の Entitlement で組む — アクセス判定・Offering 駆動のペイウォール・復元の実装メモ"
+slug: "rork-revenuecat-entitlements-paywall-build-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-14T11:00"
+author: "Rork Lab"
+description: "Rork（Expo）アプリの課金を RevenueCat で実装する際の設計メモです。Entitlement を唯一の真実とするアクセス判定、Offering 駆動でハードコードを避けるペイウォール、購入復元とリスナーの実装、サンドボックスで詰まりやすい点まで動くコードで整理します。"
+tags: ["Rork", "RevenueCat", "サブスクリプション", "Expo", "課金"]
+highlights:
+  - "Entitlement を唯一の判定軸にし、商品 ID 直書きを排して価格改定・プラットフォーム差に強くする実装"
+  - "react-native-purchases の Offering / Package と priceString で価格を遠隔差し替えするペイウォール"
+  - "restorePurchases と CustomerInfo リスナー、サンドボックスで詰まる4つの箇所と回避策"
+---
+
+Rork で形になったアプリに課金を載せようとして、最初に手が止まるのは「会員かどうかをアプリのどこで、何を根拠に判定するか」という一点ではないでしょうか。商品 ID を直接見るのか、レシートを保存するのか、購入済みフラグを端末に書くのか。ここを曖昧にしたまま実装を進めると、価格を変えた途端に判定が崩れたり、機種変更したユーザーから「課金したのに使えない」という問い合わせが届いたりします。
+
+RevenueCat を入れる本当の利点は「数十行で課金が書ける」ことよりも、**判定の根拠を商品 ID ではなく Entitlement（権利）に寄せられること**にあります。Rork が生成する Expo（React Native）アプリを前提に、`react-native-purchases` を使った Entitlement 中心の設計と、Offering 駆動のペイウォール、購入復元、そしてサンドボックスで実際に詰まった箇所を、動くコードと一緒に整理していきます。商品設定の画面手順そのものより、後から効いてくる構造のほうを厚めに書きます。
+
+## なぜ「商品 ID で判定」が後で崩れるのか
+
+課金実装でよくある初手は、購入した商品 ID（`com.example.app.pro_monthly` など）をそのまま判定に使うやり方です。動くことは動きます。ただ、運用に入ると次のような場面で必ず引っかかります。
+
+月額と年額を両方売り始めたら、`pro_monthly` と `pro_annual` の両方を `if` で見る必要が出ます。値上げのために新しい商品 ID を切ったら、旧 ID 加入者を救うコードを足すことになります。iOS と Android で商品 ID の命名規則を変えてしまっていたら、プラットフォーム分岐が二重に増えます。気づくと「Pro 機能を解放してよいか」を判定する関数が、商品 ID の羅列で膨らんでいきます。
+
+RevenueCat の Entitlement は、この羅列を一段抽象化する仕組みです。ダッシュボードで `pro` という Entitlement を一つ作り、そこに「どの商品を買えば `pro` が有効になるか」を紐づけます。アプリ側は商品 ID を一切知らずに「`pro` が active かどうか」だけを見ます。商品を増やそうが値上げしようが、紐づけはダッシュボード側の作業になり、アプリのコードは変わりません。私はここを最初に固めるかどうかで、その後半年の保守コストが変わると考えています。
+
+判定軸はひとつに絞ります。**「Entitlement が active か」だけがアクセスの真実**で、端末に書いた購入フラグや商品 ID は参考情報にすぎない、という前提でコード全体を組みます。
+
+## サービス層を Entitlement 中心に書く
+
+まず SDK を入れます。Rork（Expo）の場合、課金はネイティブモジュールを含むため Expo Go では動かず、開発ビルド（`expo-dev-client`）か EAS Build が必要です。ここを知らずに Expo Go で試して「購入が呼べない」と悩むのが最初の落とし穴なので先に書いておきます。
+
+```bash
+npx expo install react-native-purchases
+# 開発ビルドを作る（Expo Go では課金は動かない）
+npx expo prebuild
+eas build --profile development --platform ios
+```
+
+パッケージ名は `react-native-purchases` です（スコープ付きの古い表記を見かけますが、現行はこちらです）。サービス層は、アプリの他の部分が「商品」や「レシート」を意識せずに済むよう、Entitlement を返す薄い窓口として書きます。
+
+```typescript
+// src/services/purchases.ts
+import Purchases, {
+  CustomerInfo,
+  PurchasesPackage,
+  LOG_LEVEL,
+} from 'react-native-purchases';
+import { Platform } from 'react-native';
+
+// 判定に使う Entitlement は「ひとつ」に決める。商品 ID はここに出てこない
+export const ENTITLEMENT_ID = 'pro';
+
+const API_KEY = Platform.select({
+  ios: process.env.EXPO_PUBLIC_RC_IOS_KEY ?? '',
+  android: process.env.EXPO_PUBLIC_RC_ANDROID_KEY ?? '',
+}) as string;
+
+export async function configurePurchases(appUserId?: string) {
+  if (__DEV__) Purchases.setLogLevel(LOG_LEVEL.DEBUG);
+  // appUserId を渡さなければ RevenueCat が匿名 ID を自動採番する。
+  // 自前の認証がある場合のみ「ログイン後に logIn() で紐づけ」が正解で、
+  // configure に最初から渡すと匿名→既知の付け替えが二重に走りやすい
+  await Purchases.configure({ apiKey: API_KEY });
+}
+
+// 唯一のアクセス判定。これ以外でプレミアム可否を判断しない
+export function isPro(info: CustomerInfo): boolean {
+  return info.entitlements.active[ENTITLEMENT_ID] !== undefined;
+}
+
+export async function getCustomerInfo(): Promise<CustomerInfo> {
+  return Purchases.getCustomerInfo();
+}
+```
+
+`isPro` が `CustomerInfo` を引数に取り、内部状態を持たない純粋な関数になっている点が肝心です。判定がどこか一箇所のグローバル変数に依存していると、購入直後・復元直後・起動直後で値がずれます。常に「いま手元にある最新の `CustomerInfo` を渡して聞く」形にしておくと、後述のリスナーと素直につながります。
+
+## Offering 駆動でペイウォールから価格を追い出す
+
+ペイウォールに「¥980 / 月」と直接書きたくなりますが、これも商品 ID 直書きと同じ問題を抱えます。価格を変えるたびにアプリを再申請することになり、地域別価格にも対応できません。RevenueCat の Offering は、表示する商品の組み合わせと並び順をダッシュボード側に持たせ、アプリは「いま出すべき Package 一覧」を取得して描くだけにする仕組みです。
+
+```typescript
+// src/services/offerings.ts
+import Purchases, { PurchasesPackage } from 'react-native-purchases';
+
+export async function getCurrentPackages(): Promise<PurchasesPackage[]> {
+  const offerings = await Purchases.getOfferings();
+  // current は RevenueCat ダッシュボードで「現在出す Offering」に設定したもの
+  return offerings.current?.availablePackages ?? [];
+}
+
+export async function purchase(pkg: PurchasesPackage) {
+  try {
+    const { customerInfo } = await Purchases.purchasePackage(pkg);
+    return { ok: true as const, customerInfo };
+  } catch (e: any) {
+    // ユーザーが課金シートを閉じただけの「キャンセル」は失敗ではない。
+    // ここをエラー扱いするとキャンセルのたびに赤いトーストが出て体験が悪い
+    if (e.userCancelled) return { ok: false as const, cancelled: true };
+    return { ok: false as const, error: e };
+  }
+}
+```
+
+ペイウォール UI は、取得した Package から `product.priceString` をそのまま表示します。`priceString` は RevenueCat が端末のロケールと地域価格を反映して整形済みの文字列を返すので、自前で通貨記号や桁区切りを組み立てる必要はありません。ここを自前整形すると、円とドルが混ざる地域で必ず崩れます。
+
+```tsx
+// src/components/Paywall.tsx
+import { useEffect, useState } from 'react';
+import { View, Text, Pressable, ActivityIndicator } from 'react-native';
+import { PurchasesPackage } from 'react-native-purchases';
+import { getCurrentPackages, purchase } from '../services/offerings';
+
+export function Paywall({ onPurchased }: { onPurchased: () => void }) {
+  const [packages, setPackages] = useState<PurchasesPackage[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    getCurrentPackages().then(setPackages).catch(() => setPackages([]));
+  }, []);
+
+  if (!packages) return <ActivityIndicator />;
+  if (packages.length === 0) {
+    // 取得ゼロは「設定漏れ」のサイン。サンドボックスでは商品が
+    // 「承認待ち」だと空配列になりがちなので、無言で消さず案内を出す
+    return <Text>現在ご利用いただけるプランがありません。時間をおいてお試しください。</Text>;
+  }
+
+  async function onTap(pkg: PurchasesPackage) {
+    setBusy(true);
+    const res = await purchase(pkg);
+    setBusy(false);
+    if (res.ok) onPurchased();
+  }
+
+  return (
+    <View>
+      {packages.map((pkg) => (
+        <Pressable key={pkg.identifier} disabled={busy} onPress={() => onTap(pkg)}>
+          <Text>{pkg.product.title}</Text>
+          {/* 価格は priceString をそのまま使う。自前整形しない */}
+          <Text>{pkg.product.priceString}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+```
+
+この構造にしておくと、年末に「3 日間トライアル付きの年額を前に出す」といった訴求変更が、アプリの再申請なしにダッシュボードの Offering 切り替えだけで完結します。実運用ではこの差し替えの速さが効いてきます。
+
+## 状態をアプリ全体に配るリスナー
+
+購入や復元は、ペイウォール以外の画面でも状態が変わります。`getCustomerInfo` を画面ごとに呼ぶと取得タイミングがばらつくので、RevenueCat のリスナーで「`CustomerInfo` が更新されたら一箇所で受ける」形にし、それを Context で配ります。
+
+```tsx
+// src/providers/EntitlementProvider.tsx
+import { createContext, useContext, useEffect, useState } from 'react';
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+import { isPro, getCustomerInfo } from '../services/purchases';
+
+const Ctx = createContext<{ pro: boolean; ready: boolean }>({ pro: false, ready: false });
+
+export function EntitlementProvider({ children }: { children: React.ReactNode }) {
+  const [pro, setPro] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const apply = (info: CustomerInfo) => mounted && setPro(isPro(info));
+
+    // 起動時に一度取得し、以後は更新を購読する。
+    // purchasePackage や restorePurchases の戻り値で setPro するより、
+    // この一本に集約したほうが「どこで状態が変わるか」を見失わない
+    getCustomerInfo().then((info) => { apply(info); setReady(true); }).catch(() => setReady(true));
+    Purchases.addCustomerInfoUpdateListener(apply);
+    return () => { mounted = false; Purchases.removeCustomerInfoUpdateListener(apply); };
+  }, []);
+
+  return <Ctx.Provider value={{ pro, ready }}>{children}</Ctx.Provider>;
+}
+
+export const useEntitlement = () => useContext(Ctx);
+```
+
+機能をゲートする側は、商品も RevenueCat も知らず、`useEntitlement().pro` だけを見ます。`ready` を分けているのは、起動直後の「まだ取得していない」状態を `false`（=非会員）と混同しないためです。ここを混同すると、起動の一瞬だけペイウォールがちらつき、会員から「金を払ったのに毎回出る」と受け取られます。
+
+## 購入復元は「機能」ではなく「義務」
+
+購入復元は付け足しの機能ではなく、App Store のレビューガイドラインで非消費型・サブスクに対して実装が求められる項目です。「以前購入した方はこちら」のボタンが見当たらないとリジェクトされます。実装自体は短いです。
+
+```typescript
+// src/services/purchases.ts（続き）
+export async function restore(): Promise<boolean> {
+  const info = await Purchases.restorePurchases();
+  return isPro(info);
+}
+```
+
+注意したいのは復元の結果ハンドリングです。`restorePurchases` は失敗しなくても、そのユーザーに購入履歴がなければ `pro` は `false` のままです。これを「復元成功 = 会員復活」と決めつけて成功トーストを出すと、未購入のユーザーに「復元しました」と表示してしまいます。戻り値の `isPro` を見て、メッセージを分けます。
+
+```tsx
+async function onRestore() {
+  const restored = await restore();
+  Alert.alert(restored ? '購入を復元しました' : '復元できる購入が見つかりませんでした');
+}
+```
+
+自前の認証を持つアプリでは、復元の代わりに `Purchases.logIn(yourUserId)` でアカウントに購入を紐づける設計のほうが堅牢です。端末をまたいでも、ログインすれば Entitlement がついてきます。匿名運用なら復元ボタン、アカウント制ならログイン同期、と方針を最初に一本化しておくと、後から両方が中途半端に混ざる事故を避けられます。
+
+## サンドボックスで実際に詰まった箇所
+
+ここからは設定手順では見えにくい、テストで時間を溶かしやすい点です。
+
+**Offering が空で返る。** 商品を作ったばかりだと、App Store Connect 側で「提出準備中／承認待ち」のうちは `getOfferings` の `availablePackages` が空配列になります。コードは正しいのに UI に何も出ず、原因を SDK 側に探しに行って一日溶かす、というのが典型です。先のペイウォールで空配列時に案内文を出しているのは、この状況を黙って握りつぶさないためです。RevenueCat ダッシュボードの「Offerings」で Package が緑表示になっているか、まず確認します。
+
+**サンドボックスのサブスクは異常に速く更新される。** 本番の月額が、サンドボックスでは数分で更新・期限切れを繰り返します。これは仕様で、更新挙動の確認には便利な反面、「さっき買ったのにもう失効した」と勘違いしやすい点です。テスト中は期限の絶対値ではなく、Entitlement の active/inactive の遷移そのものを見ます。
+
+**StoreKit Configuration File を使うとサーバーに届かない。** Xcode のローカル StoreKit テストは手軽ですが、購入が Apple のサンドボックスを経由しないため RevenueCat のサーバーに同期されません。Entitlement で判定する設計を本当に検証したいなら、ローカル StoreKit ではなくサンドボックス Apple ID で実機テストします。私はここを混同して「リスナーが発火しない」と悩んだことがあります。原因はコードではなく、購入がそもそもサーバーまで到達していないことでした。
+
+**Android はライセンステスターと内部テスト配信が前提。** Google Play 側は、ライセンステスターに登録したアカウントで、かつ内部テストトラックに上げたビルドでないとサンドボックス購入ができません。デバッグ APK を直接入れて課金が通らない、というのはほぼこのパターンです。
+
+## 仕上げに確認すること
+
+実装が動いたら、次の一点だけ最後に確かめてください。**アプリ内で「プレミアム機能を出してよいか」を判定している箇所を grep して、`isPro` か `useEntitlement` 以外で会員判定していないこと**を確認します。商品 ID を直接見ている残骸や、購入時に立てた端末フラグでの判定が一つでも残っていると、値上げや機種変更のときにそこだけ挙動が割れます。判定軸を Entitlement ひとつに絞り切れているか——課金まわりの保守しやすさは、最終的にここに集約されます。
+
+同じようにノーコード基盤からアプリの収益化に踏み込もうとしている方の、土台づくりの参考になれば幸いです。
