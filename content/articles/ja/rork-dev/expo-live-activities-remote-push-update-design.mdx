@@ -1,0 +1,138 @@
+---
+title: "Live Activities をリモートから更新する設計 — Rork 製アプリにロック画面の生きた情報を載せるまで"
+slug: "expo-live-activities-remote-push-update-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-14T11:00"
+author: "Rork Lab"
+description: "ロック画面と Dynamic Island に「いま動いている情報」を出す Live Activities を、APNs プッシュでリモート更新する設計をまとめました。push-to-start トークンの取得、content-state ペイロード、stale-date と更新予算の扱い、Expo からのネイティブ橋渡しまで、本番で詰まった点を実コードつきで共有します。"
+tags: ["Live Activities", "ActivityKit", "APNs", "Expo", "Rork Max", "iOS"]
+highlights:
+  - "push-to-start トークンと update トークンの2種類をどの順で取得し、どこでサーバーへ送るかを、動く Swift と TypeScript の実例で追える"
+  - "stale-date・dismissal-date・relevance-score を含む APNs ペイロード設計を、更新予算を使い切らないための数値感覚つきで持ち帰れる"
+  - "ロック画面が固まる・Dynamic Island が崩れる・トークンが失効するという本番の3つの落とし穴と、それぞれの回避手順がわかる"
+---
+壁紙アプリのダウンロード進捗をロック画面に出してみようと考えたとき、最初に手こずったのが「アプリを閉じている間、誰がこの表示を更新するのか」という一点でした。Live Activities はアプリが前面にいなくても動き続ける表示ですが、その更新をアプリ自身がやろうとすると、バックグラウンド実行の制約にすぐぶつかります。
+
+答えは、サーバーから APNs 経由で直接 Live Activity を更新する経路を用意することでした。ここを設計でつまずくと、ロック画面に古い数字が貼りついたまま動かなくなります。Rork が生成する Expo アプリでも、Rork Max が生成するネイティブ Swift アプリでも、リモート更新の考え方は共通です。本番運用で詰まった順に整理します。
+
+## 更新には2つの経路がある
+Live Activity の更新には、ローカル更新とリモート更新の2系統があります。ローカル更新はアプリが前面にいる短い間だけ `Activity.update(...)` を呼ぶ方式で、即時性はありますが、アプリが眠ると止まります。
+
+リモート更新は APNs にプッシュを投げ、システムが受け取って表示を書き換える方式です。アプリが閉じていても更新が届くため、進捗・スコア・配車位置のように「アプリの外で進んでいく情報」にはこちらが必須になります。
+
+個人開発で複数のアプリを運用している私の場合、開始直後の数秒だけローカルで初期表示を整え、その後の継続更新はすべてリモートに寄せる形に落ち着きました。両方を中途半端に混ぜると、どちらの値が正かが追えなくなります。
+
+## push-to-start と update、2種類のトークン
+リモート更新でまず理解しておきたいのが、トークンが2種類あることです。ひとつは「まだ存在しない Live Activity をサーバー側から開始する」ための push-to-start トークン、もうひとつは「すでに動いている特定の Activity を更新する」ための update トークンです。
+
+push-to-start トークンはアプリ全体に1つで、起動時に購読しておきます。update トークンは Activity ごとに発行され、Activity を開始した直後に非同期で流れてきます。この順番を取り違えると、開始はできても以後の更新が一切届かない、という状態になります。
+
+```swift
+import ActivityKit
+
+@available(iOS 17.2, *)
+func registerPushToStart() {
+    Task {
+        for await data in Activity<DownloadAttributes>.pushToStartTokenUpdates {
+            let token = data.map { String(format: "%02x", $0) }.joined()
+            // アプリ全体で1つ。サーバーに「このユーザーは新規開始を受け付けられる」と登録
+            await sendToServer(kind: "start", token: token, activityId: nil)
+        }
+    }
+}
+
+@available(iOS 16.1, *)
+func observeUpdateToken(for activity: Activity<DownloadAttributes>) {
+    Task {
+        for await tokenData in activity.pushTokenUpdates {
+            let token = tokenData.map { String(format: "%02x", $0) }.joined()
+            // Activity ごとに発行される。失効するので毎回サーバーへ上書き送信
+            await sendToServer(kind: "update", token: token, activityId: activity.id)
+        }
+    }
+}
+```
+
+ここで大事なのは、`pushTokenUpdates` は1回きりの取得ではなく、ストリームとして複数回流れてくる点です。トークンはローテーションするため、最初に受け取った1個を保存して終わりにすると、数時間後に更新が止まります。流れてくるたびにサーバー側を上書きする設計にしてください。
+
+## content-state ペイロードの設計
+更新の中身は APNs ペイロードの `content-state` に載せます。ここに入れる値は、Activity の `ContentState` と一対一で対応させる必要があります。型が合わないと、プッシュは届いているのに表示が更新されない、という最も気づきにくい不具合になります。
+
+```json
+{
+  "aps": {
+    "timestamp": 1749866400,
+    "event": "update",
+    "content-state": {
+      "downloaded": 128,
+      "total": 256,
+      "status": "downloading"
+    },
+    "stale-date": 1749866700,
+    "relevance-score": 75,
+    "alert": {
+      "title": "ダウンロード中",
+      "body": "あと半分です"
+    }
+  }
+}
+```
+
+`timestamp` は秒単位の Unix 時刻で、システムが新旧のプッシュを並べ替える基準になります。これを固定値や過去の値で送ると、後から来たはずの更新が「古い」と判定されて無視されます。毎回 `Date().timeIntervalSince1970` 相当の現在時刻を入れてください。
+
+`event` は `update` か `end` のいずれかです。`end` を送ると Live Activity を終了でき、同時に `dismissal-date` を添えると、終了後にロック画面へ残す時間を制御できます。
+
+## stale-date と更新予算という2つの制約
+リモート更新でいちばん設計判断が必要なのが、更新頻度の扱いです。iOS は高頻度の Live Activity 更新に予算を設けており、無制限に投げると後続のプッシュが配信されなくなります。
+
+私が採用している目安は、平常時は最低でも数十秒の間隔を空け、進捗の変化が小さいときは送信そのものを間引く、というものです。1%刻みで100回送るより、5%以上動いたときだけ送るほうが、予算も消費電力も持ちます。
+
+`stale-date` は「この時刻を過ぎたら表示を古いものとして扱ってよい」という宣言です。これを設定しておくと、サーバーが沈黙したときに「あと半分」という表示が永遠に残るのを防げます。次の更新が来る想定時刻より少し先、たとえば想定間隔の2倍程度に置くのが扱いやすい設定でした。設定漏れが、ロック画面が固まる一番ありがちな原因です。
+
+`relevance-score` は 0 から 100 の値で、Dynamic Island に複数の Activity が並んだときの表示優先度に効きます。重要な進捗ほど高く設定すると、ユーザーの視界に残りやすくなります。
+
+## Expo からネイティブへ橋渡しする
+Rork が生成する Expo アプリの場合、ActivityKit は JavaScript からは直接触れないため、薄いネイティブモジュールを1枚かませます。JS 側がやることは「開始の指示」と「サーバーへ送るためのトークン受け取り」の2つだけに絞ると、責務がきれいに分かれます。
+
+```typescript
+import { NativeModules, NativeEventEmitter } from "react-native";
+
+const { LiveActivityBridge } = NativeModules;
+const emitter = new NativeEventEmitter(LiveActivityBridge);
+
+export async function startDownloadActivity(total: number) {
+  // ネイティブ側で Activity.request を実行し、update トークンの購読を開始する
+  await LiveActivityBridge.start({ total });
+}
+
+export function subscribeTokens(onToken: (kind: string, token: string, id?: string) => void) {
+  // ネイティブから流れてくるトークンを受け取り、自前のサーバーへ送る
+  const sub = emitter.addListener("liveActivityToken", (e) => {
+    onToken(e.kind, e.token, e.activityId);
+    fetch("https://api.example.com/live-activity/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(e),
+    });
+  });
+  return () => sub.remove();
+}
+```
+
+この構成にしておくと、表示レイアウト（Widget Extension 側の SwiftUI）とビジネスロジック（JS 側）が分離され、片方を直してももう片方が壊れにくくなります。Rork Max へ移したときも、JS の指示部分を Swift の呼び出しに置き換えるだけで、サーバー側の送信ロジックはそのまま使えました。
+
+## 本番で踏んだ3つの落とし穴
+ひとつ目は、トークン失効です。前述の通り update トークンはローテーションします。最初の1個を握って離さない実装だと、数時間で更新が無言で止まります。ストリームを購読し続け、毎回サーバーを上書きしてください。
+
+ふたつ目は、`content-state` の型不一致です。Swift 側の `ContentState` に `Int` で定義したフィールドへ、サーバーから文字列の `"128"` を送ると、プッシュは200で受理されているのに表示は動きません。送信側でも型を固定し、数値は数値のまま載せます。
+
+みっつ目は、終了処理の取りこぼしです。`end` イベントを送り忘れると、完了済みのダウンロードがロック画面に居座ります。私はサーバー側で「進捗100%を観測したら必ず `end` を `dismissal-date` 付きで送る」という後処理を明示的に組み込み、これで残留表示が消えました。
+
+## いつ Live Activities を採用すべきか
+最後に判断軸です。Live Activities は「ユーザーがアプリの外にいる間に、明確に進んでいく1つの事象」がある場合にだけ効果を発揮します。ダウンロード進捗、タイマー、配送状況などがこれにあたります。
+
+逆に、状態の変化が乏しい情報や、更新が不定期すぎる情報には向きません。私は App Store に出している自分のアプリでも、この基準で採用可否を判断することを推奨します。予算と実装コストに見合わないからです。私自身は、進捗が数分以内に完了し、かつユーザーがその完了を待っている場面に限って採用するようにしています。常時表示の通知代わりに使うと、更新予算を食い潰した割に誰も見ない表示になりがちです。
+
+リモート更新まで含めて設計すると Live Activities は一気に実用域に入りますが、トークン管理と更新予算という2つの制約を最初から織り込むかどうかで、運用の安定度が大きく変わります。同じところで止まった方の参考になれば幸いです。

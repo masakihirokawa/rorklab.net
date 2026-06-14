@@ -1,0 +1,136 @@
+---
+title: "StoreKit 2 のサブスクをサーバー側で検証する — 端末を信じない権利付与の設計"
+slug: "storekit2-subscription-server-receipt-entitlement-design"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-14T21:00"
+author: "Rork Lab"
+description: "サブスクの「課金したのに機能が開かない」「解約後も使えてしまう」を防ぐには、端末の判定を信じず、サーバー側で権利を確定させる設計が要ります。StoreKit 2 の署名付きトランザクション、App Store Server API での検証、App Store Server Notifications V2 による状態同期まで、個人開発の収益化で詰めた実装を共有します。"
+tags: ["StoreKit 2", "サブスクリプション", "収益化", "App Store Server API", "Rork", "iOS"]
+highlights:
+  - "署名付きトランザクションをサーバーで検証し、ユーザーに権利を付与する一連の流れを、動く Swift と Node.js の実コードで追える"
+  - "App Store Server Notifications V2 を受けて DID_RENEW・EXPIRED・REFUND を権利状態へ反映する、状態同期テーブルの設計を持ち帰れる"
+  - "「解約後も Pro が開く」「返金されたのに使える」という収益にも信頼にも響く2つの抜け穴の塞ぎ方がわかる"
+---
+個人開発でサブスク課金を入れたとき、最初に作ったのは「購入が成功したら端末側で Pro フラグを立てる」という素朴な実装でした。これは課金直後はうまく動きますが、解約・返金・別端末でのログインといった現実の運用に入った途端に崩れます。端末の中だけで権利を判断していると、解約したユーザーの端末がいつまでも「Pro です」と言い張ってしまうからです。
+
+収益に直結する部分だからこそ、判定の正本はサーバーに置く。これが StoreKit 2 時代のサブスク設計の出発点でした。AdMob の広告収益と違い、サブスクは「いま権利があるか」を毎回正しく言い当てる必要があります。ここを甘く作ると、課金率を上げても解約後の使い逃げで実質 LTV が削られます。
+
+## なぜ端末の判定を信じないのか
+StoreKit 2 は端末側で `Transaction.currentEntitlements` を見れば、いまの権利を取得できます。手元で完結するので手軽ですが、これだけに頼ると2つの穴が空きます。
+
+ひとつは、別端末や再インストール時の同期です。ユーザーが機種変更すると、新しい端末は購入履歴を復元するまで権利を知りません。もうひとつは、改ざんとオフライン継続です。端末のローカルフラグだけで開錠していると、解約後もアプリを開かずにいれば権利が残り続けます。
+
+サーバーに正本を置けば、どの端末からでも同じ答えを返せますし、解約・返金をサーバー主導で即座に反映できます。私は収益に関わる権利判定は、必ずサーバーの応答を最終判断とする方針にしています。
+
+## 署名付きトランザクションをサーバーへ送る
+StoreKit 2 のトランザクションは JWS（JSON Web Signature）で署名されています。端末はこの署名済みの文字列をそのままサーバーへ送り、サーバーは Apple の公開鍵で署名を検証してから中身を信用します。生の購入情報を JSON で送って信じるのではなく、署名を検証する点が肝心です。
+
+```swift
+import StoreKit
+
+func syncPurchases() async {
+    for await result in Transaction.currentEntitlements {
+        guard case .verified(let transaction) = result else { continue }
+        // jwsRepresentation は署名付き文字列。これをそのままサーバーへ
+        await postToServer(signedTransaction: result.jwsRepresentation,
+                           productID: transaction.productID)
+    }
+}
+
+func purchase(_ product: Product) async throws {
+    let result = try await product.purchase()
+    if case .success(let verification) = result,
+       case .verified(let transaction) = verification {
+        await postToServer(signedTransaction: verification.jwsRepresentation,
+                           productID: transaction.productID)
+        await transaction.finish()
+    }
+}
+```
+
+ここで `transaction.finish()` を呼ぶのは、サーバーへ送って権利を確定させた後にしてください。送信前に `finish` すると、ネットワークが落ちたときにトランザクションが失われ、ユーザーは課金したのに権利が付かない状態になります。
+
+## サーバーで署名を検証して権利を付与する
+サーバー側では、受け取った JWS の署名を Apple のルート証明書チェーンで検証し、改ざんされていないことを確かめます。検証が通って初めて、その購入をユーザーの権利として保存します。
+
+```javascript
+import { SignedDataVerifier } from "@apple/app-store-server-library";
+
+const verifier = new SignedDataVerifier(
+  appleRootCerts,        // Apple のルート証明書（複数）
+  true,                  // 本番なら true
+  "com.example.app",     // bundle id
+  appAppleId
+);
+
+export async function handlePurchase(req, res) {
+  const { signedTransaction, userId } = req.body;
+  try {
+    const payload = await verifier.verifyAndDecodeTransaction(signedTransaction);
+    // 署名検証済みの中身だけを信用する
+    await upsertEntitlement({
+      userId,
+      productId: payload.productId,
+      originalTransactionId: payload.originalTransactionId,
+      expiresAt: new Date(payload.expiresDate),
+      status: "active",
+    });
+    res.json({ ok: true, expiresAt: payload.expiresDate });
+  } catch (e) {
+    // 署名が不正なら権利を付与しない
+    res.status(400).json({ ok: false });
+  }
+}
+```
+
+権利テーブルの主キーには `originalTransactionId` を使うのが扱いやすい設計でした。更新（リニューアル）のたびに `transactionId` は変わりますが、`originalTransactionId` はサブスクの一生を通じて不変なので、これを軸にユーザーと権利を結びつけると更新の取りこぼしが減ります。
+
+## サーバー通知で状態を追い続ける
+購入時の検証だけでは、その後の解約・更新・返金を追えません。ここで効くのが App Store Server Notifications V2 です。Apple がサブスクの状態変化を、署名付きの通知としてサーバーの Webhook へ送ってくれます。
+
+主要な通知タイプと、権利状態への反映は次のように整理できます。
+
+1. `DID_RENEW` を受けたら、`expiresAt` を新しい期限へ延ばし、状態を active のままにします。
+2. `EXPIRED` を受けたら、状態を expired にして権利を閉じます。
+3. `DID_CHANGE_RENEWAL_STATUS` で自動更新オフを受けても、期限内は active のままにし、解約予定としてだけ記録します。
+4. `REFUND` を受けたら、即座に状態を revoked にして権利を取り消します。
+
+```javascript
+export async function handleServerNotification(req, res) {
+  const payload = await verifier.verifyAndDecodeNotification(req.body.signedPayload);
+  const { notificationType, data } = payload;
+  const tx = await verifier.verifyAndDecodeTransaction(data.signedTransactionInfo);
+
+  switch (notificationType) {
+    case "DID_RENEW":
+      await setEntitlement(tx.originalTransactionId, "active", tx.expiresDate);
+      break;
+    case "EXPIRED":
+      await setEntitlement(tx.originalTransactionId, "expired", tx.expiresDate);
+      break;
+    case "REFUND":
+      await setEntitlement(tx.originalTransactionId, "revoked", Date.now());
+      break;
+  }
+  res.sendStatus(200);
+}
+```
+
+この Webhook を受けておくと、ユーザーがアプリを開かなくてもサーバー側の権利が最新化されます。解約や返金が起きた瞬間に状態が変わるため、次にアプリが権利を問い合わせたときには正しい答えが返ります。
+
+## 端末は「サーバーの答えを表示する」だけにする
+権利の正本がサーバーにあるなら、端末の役割は「サーバーに今の権利を尋ね、その答えで UI を出し分ける」ことに絞れます。Rork が生成する Expo アプリでも考え方は同じで、購入処理はネイティブの StoreKit に任せ、開錠の判断は自前 API の応答で行います。
+
+私の運用では、アプリ起動時とフォアグラウンド復帰時にサーバーへ権利を問い合わせ、短時間だけクライアントにキャッシュする形にしています。毎画面で問い合わせると無駄が多く、まったくキャッシュしないと解約反映が遅れるため、数分程度の鮮度を保つのが現実的でした。
+
+## 収益と信頼に響いた2つの抜け穴
+ひとつ目は、解約後の使い逃げです。端末フラグだけで開錠していた頃は、自動更新をオフにしたユーザーの一部が、その後もアプリを開かずに機能を使い続けていました。サーバー権利と `EXPIRED` 通知を入れてから、期限が来た瞬間に確実に閉じられるようになりました。
+
+ふたつ目は、返金後の継続利用です。`REFUND` 通知を扱っていないと、返金されて手元に課金が残っていないユーザーが、権利だけ持ち続けます。これは収益の二重損失になるため、返金は最優先で revoked に倒す設計にしました。サブスクの実質 LTV を守るうえで、この2点は効きます。
+
+## どこから手をつけるべきか
+最初から完璧な状態同期を組む必要はありません。私が勧める順序は、まず購入時の署名検証とサーバー権利付与を入れること、次に `EXPIRED` と `REFUND` の2つだけでも Webhook を受けること、最後に起動時の権利問い合わせを足すことです。この3段だけで、端末を信じる実装で空いていた穴の大半は塞がります。
+
+サブスクは課金を取った後の運用がすべてです。AdMob のように一度組めば回るものではなく、解約・返金・更新という状態を取りこぼさず追い続けられるかで、収益の堅さが決まります。同じく端末フラグから始めて壁にぶつかった方の、設計を一段引き上げる助けになれば幸いです。

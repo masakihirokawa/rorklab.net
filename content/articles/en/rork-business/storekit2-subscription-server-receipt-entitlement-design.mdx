@@ -1,0 +1,136 @@
+---
+title: "Validating StoreKit 2 Subscriptions Server-Side: Granting Access Without Trusting the Device"
+slug: "storekit2-subscription-server-receipt-entitlement-design"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-14T21:00"
+author: "Rork Lab"
+description: "To stop 'I paid but the feature won't unlock' and 'still usable after canceling,' you need a design that does not trust the device's verdict and settles entitlements on the server. Covers StoreKit 2 signed transactions, verification with the App Store Server API, and state sync via App Store Server Notifications V2, from real indie monetization."
+tags: ["StoreKit 2", "Subscriptions", "Monetization", "App Store Server API", "Rork", "iOS"]
+highlights:
+  - "Follow the full flow of verifying a signed transaction on the server and granting the user access, in working Swift and Node.js"
+  - "Take home a state-sync table design that reflects DID_RENEW, EXPIRED and REFUND from App Store Server Notifications V2 into entitlement state"
+  - "Learn to close two gaps that hit both revenue and trust: 'Pro still opens after canceling' and 'still usable after a refund'"
+---
+When I first added subscriptions as an indie developer, the first thing I built was the naive version: "when a purchase succeeds, set a Pro flag on the device." It works fine right after purchase, but it falls apart the moment you enter the real world of cancellations, refunds, and signing in on another device. If you judge entitlement only inside the device, the device of a user who has canceled keeps insisting "I'm Pro."
+
+Precisely because this part drives revenue, the source of truth for the verdict belongs on the server. That was the starting point of subscription design in the StoreKit 2 era. Unlike AdMob ad revenue, a subscription has to correctly answer "do you have access right now" every single time. Build this loosely and even if you raise the conversion rate, post-cancel freeloading quietly eats into your real LTV.
+
+## Why not trust the device's verdict
+StoreKit 2 lets you read current access on the device via `Transaction.currentEntitlements`. It is self-contained and convenient, but relying on it alone leaves two holes.
+
+One is sync across devices and reinstalls. When a user switches phones, the new device does not know the entitlement until it restores purchase history. The other is tampering and offline continuation. If you unlock from a local flag alone, a canceled user keeps access as long as they simply never reopen the app.
+
+Put the source of truth on the server and you can return the same answer from any device, and reflect cancellations and refunds instantly, server-driven. I make the server's response the final word for any revenue-related entitlement decision.
+
+## Send the signed transaction to the server
+StoreKit 2 transactions are signed as a JWS (JSON Web Signature). The device sends that signed string as-is to the server, and the server trusts the contents only after verifying the signature with Apple's public key. The crux is verifying the signature, not trusting raw purchase JSON.
+
+```swift
+import StoreKit
+
+func syncPurchases() async {
+    for await result in Transaction.currentEntitlements {
+        guard case .verified(let transaction) = result else { continue }
+        // jwsRepresentation is the signed string. Send it as-is to the server
+        await postToServer(signedTransaction: result.jwsRepresentation,
+                           productID: transaction.productID)
+    }
+}
+
+func purchase(_ product: Product) async throws {
+    let result = try await product.purchase()
+    if case .success(let verification) = result,
+       case .verified(let transaction) = verification {
+        await postToServer(signedTransaction: verification.jwsRepresentation,
+                           productID: transaction.productID)
+        await transaction.finish()
+    }
+}
+```
+
+Call `transaction.finish()` only after you have sent it to the server and confirmed the entitlement. Finish before sending and a dropped network connection loses the transaction, leaving the user paid but without access.
+
+## Verify the signature and grant access on the server
+On the server, verify the received JWS against Apple's root certificate chain to confirm it has not been tampered with. Only once verification passes do you save that purchase as the user's entitlement.
+
+```javascript
+import { SignedDataVerifier } from "@apple/app-store-server-library";
+
+const verifier = new SignedDataVerifier(
+  appleRootCerts,        // Apple root certificates (multiple)
+  true,                  // true for production
+  "com.example.app",     // bundle id
+  appAppleId
+);
+
+export async function handlePurchase(req, res) {
+  const { signedTransaction, userId } = req.body;
+  try {
+    const payload = await verifier.verifyAndDecodeTransaction(signedTransaction);
+    // Trust only the signature-verified contents
+    await upsertEntitlement({
+      userId,
+      productId: payload.productId,
+      originalTransactionId: payload.originalTransactionId,
+      expiresAt: new Date(payload.expiresDate),
+      status: "active",
+    });
+    res.json({ ok: true, expiresAt: payload.expiresDate });
+  } catch (e) {
+    // Grant nothing if the signature is invalid
+    res.status(400).json({ ok: false });
+  }
+}
+```
+
+Using `originalTransactionId` as the entitlement table's primary key was an easy design to work with. The `transactionId` changes on each renewal, but `originalTransactionId` stays constant for the subscription's whole life, so keying users to entitlements on it reduces missed renewals.
+
+## Keep tracking state with server notifications
+Verification at purchase time alone cannot follow the later cancellations, renewals, and refunds. This is where App Store Server Notifications V2 helps: Apple sends subscription state changes as signed notifications to your server's webhook.
+
+The main notification types and how they map to entitlement state break down like this:
+
+1. On `DID_RENEW`, extend `expiresAt` to the new expiry and keep the state active.
+2. On `EXPIRED`, set the state to expired and close access.
+3. On `DID_CHANGE_RENEWAL_STATUS` with auto-renew off, keep it active until expiry and only record it as pending cancellation.
+4. On `REFUND`, immediately set the state to revoked and remove access.
+
+```javascript
+export async function handleServerNotification(req, res) {
+  const payload = await verifier.verifyAndDecodeNotification(req.body.signedPayload);
+  const { notificationType, data } = payload;
+  const tx = await verifier.verifyAndDecodeTransaction(data.signedTransactionInfo);
+
+  switch (notificationType) {
+    case "DID_RENEW":
+      await setEntitlement(tx.originalTransactionId, "active", tx.expiresDate);
+      break;
+    case "EXPIRED":
+      await setEntitlement(tx.originalTransactionId, "expired", tx.expiresDate);
+      break;
+    case "REFUND":
+      await setEntitlement(tx.originalTransactionId, "revoked", Date.now());
+      break;
+  }
+  res.sendStatus(200);
+}
+```
+
+With this webhook in place, server-side entitlements stay current even when the user never opens the app. Because state changes the instant a cancellation or refund happens, the next time the app asks about access it gets the correct answer.
+
+## Let the device only "display the server's answer"
+If the source of truth lives on the server, the device's role narrows to "ask the server for current access and branch the UI on the answer." The thinking is the same for an Expo app generated by Rork: leave the purchase flow to native StoreKit, and make the unlock decision from your own API's response.
+
+In my setup I query the server for entitlement at app launch and on returning to the foreground, and cache it on the client for only a short time. Querying on every screen is wasteful, and never caching delays cancellation reflection, so keeping a freshness of a few minutes was the practical middle.
+
+## Two gaps that hit revenue and trust
+The first is post-cancel freeloading. Back when I unlocked from a device flag alone, some users who turned off auto-renew kept using features afterward by simply not reopening the app. After adding server entitlements and the `EXPIRED` notification, I could reliably close access the moment expiry arrived.
+
+The second is continued use after a refund. Without handling the `REFUND` notification, a user who was refunded and no longer holds the charge keeps the entitlement. That is a double loss of revenue, so I designed refunds to flip to revoked at top priority. For protecting a subscription's real LTV, these two points matter.
+
+## Where to start
+You do not need perfect state sync from day one. The order I recommend is: first add signature verification at purchase and server-side granting; next, receive the webhook for just `EXPIRED` and `REFUND`; finally, add the entitlement query at launch. These three stages alone close most of the holes left open by a device-trusting implementation.
+
+A subscription is all about operation after you win the charge. Unlike AdMob, which keeps running once you wire it up, the robustness of your revenue is decided by whether you can track the states of cancellation, refund, and renewal without dropping any. I hope this helps anyone who, like me, started from a device flag and ran into the wall, to raise their design a level.
