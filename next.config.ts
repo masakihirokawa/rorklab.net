@@ -5,7 +5,7 @@ const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
 // 削除済み記事の 301 redirect（2026-05-09 品質監査により撤去 — _documents/_quality_audit/cross_site/2026-05-09_cross_site_report.md 参照）
 // localePrefix: "as-needed" のため、ja は prefix なし、en は /en/ prefix
-const REMOVED_ARTICLE_REDIRECTS_2026_05_09 = [
+const REMOVED_ARTICLE_REDIRECTS_2026_05_09: { from: string; to: string }[] = [
   // 2026-05-15 Tax-related article removal (YMYL compliance for GSC崩壊 recovery)
 
   // 2026-05-15 GSC崩壊対応: TMPL_TITLE違反+他違反の記事を一括削除（Helpful Content System対応）
