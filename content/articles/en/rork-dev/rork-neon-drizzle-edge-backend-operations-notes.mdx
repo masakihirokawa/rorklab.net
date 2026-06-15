@@ -1,0 +1,161 @@
+---
+title: "Running a Neon + Drizzle Backend for Your Rork App in Production — Notes on Edge Connections, Zero-Downtime Migrations, and Type-Safe Queries"
+slug: "rork-neon-drizzle-edge-backend-operations-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T17:20"
+updated: "2026-06-15T17:20"
+author: "Rork Lab"
+description: "After wiring Neon Serverless Postgres and Drizzle ORM into a Rork app's backend, the friction shows up in production. These are implementation notes on choosing an edge connection model, migrating without locking tables, and designing type-safe queries that don't balloon into N+1."
+tags: ["rork", "neon", "drizzle-orm", "cloudflare-workers", "postgres", "serverless", "backend-operations"]
+highlights:
+  - "A concrete rule for choosing between neon-http and the WebSocket Pool, based on transaction needs and geographic latency"
+  - "An expand / contract procedure for changing columns without locking live tables, and how to land it in Drizzle Kit"
+  - "How to fetch related data without N+1, and where to place query-count observability in a scale-to-zero environment"
+---
+
+I built a Rork app's backend on Neon and Drizzle, and locally it felt great. A few days into production, one screen would occasionally spike in latency. The cause was mundane: from the edge I was sending each query as its own HTTP round trip, and that one screen fired several small queries in a row.
+
+Local Postgres lives on the same machine, so the round trips are invisible. Move to the edge and the number of times you touch the database in a single request becomes your felt speed. There's plenty written about getting Neon and Drizzle to the "first working query." What matters in production is the decisions that come after. As an indie developer running several apps at once, the "after it works" handling is exactly where my time went. Here are the places I actually had to revisit.
+
+## Decide the connection model first — neon-http or the WebSocket Pool
+
+`@neondatabase/serverless` gives you two doors: the HTTP driver returned by `neon()`, and the WebSocket driver built on `Pool`. Most tutorials only show the first, but in production this is the decision to make up front.
+
+The HTTP driver sends each query as a single fetch. It fits edge runtimes like Cloudflare Workers, where you can't hold a connection open, and it shrugs off cold starts. The trade-off: it can't run interactive transactions that group several statements into one atomic unit.
+
+```typescript
+// src/db/http.ts — the path for single, standalone queries
+import { drizzle } from "drizzle-orm/neon-http";
+import { neon } from "@neondatabase/serverless";
+import * as schema from "./schema";
+
+export function createHttpDb(databaseUrl: string) {
+  const sql = neon(databaseUrl);
+  return drizzle(sql, { schema });
+}
+```
+
+When you need a Stripe payment confirmation and a purchase-history insert to "both succeed or both fail," you open a transaction over the WebSocket Pool. Half-finished writes around payments are expensive to clean up, so this is the one place I never compromise on a transaction.
+
+```typescript
+// src/db/pool.ts — the path for code that needs a transaction
+import { drizzle } from "drizzle-orm/neon-serverless";
+import { Pool } from "@neondatabase/serverless";
+import * as schema from "./schema";
+
+export function createPoolDb(databaseUrl: string) {
+  const pool = new Pool({ connectionString: databaseUrl });
+  return drizzle(pool, { schema });
+}
+```
+
+In my case I recommend splitting into two paths: reads and single writes over HTTP, and only the endpoints that must keep several rows consistent over the Pool. Route everything through the Pool and the WebSocket handshake makes the first call slower; route everything through HTTP and you end up reimplementing consistency outside the ORM. The deciding question is: does this endpoint need multiple writes to land as a single result? If not, HTTP stays lighter and faster — that's what the measurements showed.
+
+Geography matters too. If the Neon region and your main users are far apart, every HTTP round trip carries a fixed delay. If your users are concentrated in one region, put Neon near them. A fast edge doesn't shorten the physical distance to the database.
+
+## Count how many times one request touches the database
+
+The spiky latency almost always traces back to queries per screen. Because Drizzle's query builder reads so plainly, it's tempting to fetch a list and then pull related rows inside a loop. That's N+1.
+
+```typescript
+// Anti-pattern: fetch the author N times for N posts
+const posts = await db.select().from(postsTable).limit(20);
+for (const p of posts) {
+  // this one line becomes 20 round trips
+  p.author = await db.select().from(users).where(eq(users.id, p.userId));
+}
+```
+
+At the edge, those 20 round trips turn into hundreds of milliseconds of felt delay. In my measurements, collapsing that same screen into a single join made responses roughly 3x faster. Drizzle's relational queries let you pull the joins you need in one shot.
+
+```typescript
+// Better: declare the relation and fetch it once
+const posts = await db.query.postsTable.findMany({
+  limit: 20,
+  orderBy: (p, { desc }) => [desc(p.createdAt)],
+  with: {
+    author: {
+      columns: { id: true, displayName: true, avatarUrl: true },
+    },
+  },
+});
+```
+
+Narrowing `columns` here isn't cosmetic. Pulling the full body and internal flags you never render adds up in transfer size and serialization cost. Edge functions cap CPU time, so trimming returned columns to what you actually use pays off.
+
+Aggregates are the same. For a value where you only want the number — a post count, say — don't fetch all the rows and read `length`; let the database count with `$count`.
+
+```typescript
+const postCount = await db.$count(postsTable, eq(postsTable.userId, userId));
+```
+
+What helped most in practice was making query counts visible during development. Turn on Drizzle's logger and print queries-per-request, and every time you build a screen you can eyeball "did this list quietly become N+1?" That's far cheaper than discovering it in production.
+
+```typescript
+const db = drizzle(sql, { schema, logger: env.ENVIRONMENT !== "production" });
+```
+
+## Change schema without stopping a live table
+
+Migrations aren't scary locally — if data disappears, you rebuild it. Production is different. Change a column's type or add `NOT NULL` while users are mid-session and you invite locks and a wave of errors.
+
+What I hold to is expand / contract: a two-step move. Instead of flipping "old shape" to "new shape" in one migration, you pass through an intermediate state where both shapes hold at once. Say you want `display_name` to become required. Don't slap on `NOT NULL` right away.
+
+### Step one: add the column without the constraint (expand)
+
+Add the column without the constraint, so the app can write either old or new.
+
+```sql
+-- 0001_add_display_name.sql
+ALTER TABLE "users" ADD COLUMN "display_name" text;
+```
+
+Deploy here, then run a backfill to populate existing rows. Neon lets you branch, so I run it first on a copy of the production branch to measure duration and impact before touching production.
+
+### Step two: enforce the constraint after every row is filled (contract)
+
+Only after confirming every row has a value do you add the constraint.
+
+```sql
+-- 0002_enforce_display_name.sql
+ALTER TABLE "users" ALTER COLUMN "display_name" SET NOT NULL;
+```
+
+### Landing it in Drizzle Kit
+
+In Drizzle Kit, edit the schema and run `drizzle-kit generate` twice, stacking each as its own migration file. The point is to never co-locate "add column" and "make it NOT NULL" in one file. And against production, in most cases I use `migrate` to apply generated SQL in order rather than `drizzle-kit push` (direct schema sync). Push is handy for local trial and error, but in production a migration trail of "what landed in what order" is something you can trace later.
+
+```bash
+# Always eyeball the generated SQL before applying it
+npx drizzle-kit generate
+cat src/db/migrations/0001_add_display_name.sql
+npx drizzle-kit migrate
+```
+
+Never hand-edit an already-applied migration file, either. Rewriting applied history lets environments drift apart silently. When you need a fix, add a new migration and move forward.
+
+## What scale-to-zero actually costs
+
+Neon can suspend compute while nothing is using it. That lowers cost, but the first query into a suspended database carries the wake-up delay. Apps with constant traffic never notice; a hobby app barely touched overnight shows it as a slow first request in the morning.
+
+Two ways to handle it. First, sort endpoints by whether they can tolerate a wake-up delay — a non-interactive path like background sync won't hurt the experience if it waits. Second, if your access pattern is predictable, tune the auto-suspend timeout so the database stays awake through peak hours.
+
+Branches shine for preview environments. A Neon branch makes an instant copy of production data, so you can branch per feature, test migrations there, and verify behavior against production-like data before merging. Nothing reaches production if you break it, which dropped the cost of validating schema changes considerably.
+
+Keep the connection string out of code and in Workers secrets: `.dev.vars` locally, `wrangler secret put` in production.
+
+```bash
+npx wrangler secret put DATABASE_URL
+```
+
+## Which metrics to keep in production
+
+Once you're live, the numbers worth watching aren't average latency but "queries per request" and "wake-ups from scale-to-zero." If the former climbs, N+1 has crept back in somewhere. If the latter is high, your auto-suspend threshold isn't matching real traffic. I put those two at the top of the dashboard and check after every feature that they haven't gotten worse. When query count had doubled against my expectation, suspecting that screen's relational query was the fastest path back — that's been the operational lesson.
+
+## Where to start
+
+If you're already running on Neon and Drizzle, pick one screen, turn on the logger, and look at queries-per-request. There's often a hidden round trip count higher than you expected, and swapping in a relational query alone changes the feel. If a schema change is coming, the safest start is splitting that one change into the two steps of expand / contract.
+
+Edge backends make two things felt that local development hides: the number of round trips, and the time it takes for something suspended to wake. Design with those two in mind and serverless lightness becomes production speed. I hope these notes help with your own build.

@@ -1,0 +1,161 @@
+---
+title: "Rork アプリの Neon × Drizzle バックエンドを本番で運用する — エッジ接続・無停止マイグレーション・型安全クエリの実装メモ"
+slug: "rork-neon-drizzle-edge-backend-operations-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T17:20"
+updated: "2026-06-15T17:20"
+author: "Rork Lab"
+description: "Rork で生成したアプリのバックエンドに Neon Serverless Postgres と Drizzle ORM を据えたあと、本番で詰まる箇所を実装ベースで整理しました。エッジでの接続モデルの選択、無停止マイグレーション、型安全クエリの設計までをまとめています。"
+tags: ["rork", "neon", "drizzle-orm", "cloudflare-workers", "postgres", "serverless", "バックエンド運用"]
+highlights:
+  - "neon-http と WebSocket Pool をどちらに振るかを、トランザクション要件と地理的レイテンシから判断する基準"
+  - "本番テーブルをロックせずにカラムを変える expand / contract の手順と、Drizzle Kit での落とし込み方"
+  - "N+1 を生まない関連データ取得と、scale-to-zero 環境でクエリ数を測る実務的な観測の置き方"
+---
+
+Rork で出したアプリのバックエンドを Neon と Drizzle で組み、ローカルでは気持ちよく動いていました。本番に出して数日、特定の画面だけ時々レイテンシが跳ねる。原因は単純で、エッジから一回ごとに HTTP でクエリを投げていたのに、その画面だけ小さなクエリを連続で打っていたためでした。
+
+ローカルの Postgres は同一マシン内なので往復が見えません。エッジに移すと、一回のリクエストで何回データベースに触れたかがそのまま体感速度になります。Neon と Drizzle の「最初の動くところ」までは記事も多いのですが、本番で効いてくるのはその先の判断です。個人開発で複数のアプリを運用していると、この「動いた後」の手当てこそが時間を食う部分でした。ここでは、実際に運用してみて手を入れた箇所を順に書いていきます。
+
+## まず決めるのは接続モデル — neon-http か WebSocket Pool か
+
+`@neondatabase/serverless` には二つの入口があります。`neon()` が返す HTTP ドライバーと、`Pool` を使う WebSocket ドライバーです。チュートリアルの多くは前者だけを紹介しますが、本番ではここを最初に意思決定したほうがよいです。
+
+HTTP ドライバーは一回のクエリを一回の fetch として送ります。コネクションを張りっぱなしにできない Cloudflare Workers のようなエッジ環境と相性がよく、コールドスタートの影響も受けにくい。半面、複数のクエリを一つのトランザクションとしてまとめる「対話的トランザクション」は扱えません。
+
+```typescript
+// src/db/http.ts — 単発クエリ中心の経路はこちら
+import { drizzle } from "drizzle-orm/neon-http";
+import { neon } from "@neondatabase/serverless";
+import * as schema from "./schema";
+
+export function createHttpDb(databaseUrl: string) {
+  const sql = neon(databaseUrl);
+  return drizzle(sql, { schema });
+}
+```
+
+一方で、Stripe の決済確定と購入履歴レコードの作成を「どちらも成功するか、どちらも失敗するか」で縛りたい場面では、WebSocket の Pool を使ってトランザクションを開きます。決済まわりは中途半端な書き込みが残ると後始末が重いので、ここだけはトランザクションを妥協しません。
+
+```typescript
+// src/db/pool.ts — トランザクションが要る経路はこちら
+import { drizzle } from "drizzle-orm/neon-serverless";
+import { Pool } from "@neondatabase/serverless";
+import * as schema from "./schema";
+
+export function createPoolDb(databaseUrl: string) {
+  const pool = new Pool({ connectionString: databaseUrl });
+  return drizzle(pool, { schema });
+}
+```
+
+私の場合は、読み取りと単発の書き込みは HTTP、複数行をまとめて整合させたいエンドポイントだけ Pool、という二経路に分けることを推奨します。全部を Pool にしてしまうと WebSocket のハンドシェイク分だけ初回が遅くなり、全部を HTTP にすると整合性を ORM の外で手当てすることになります。判断軸は「このエンドポイントは複数の書き込みを一つの結果として成立させる必要があるか」です。必要がなければ HTTP のままが軽くて速い、というのが実際に測ってみての結論でした。
+
+地理も無視できません。Neon のリージョンとアプリの主要ユーザーが離れていると、HTTP の一往復ごとに固定の遅延が乗ります。日本のユーザーが中心なら Neon 側も近いリージョンに寄せる。エッジが速くても、データベースまでの物理距離は縮みません。
+
+## 一回のリクエストで何回 DB に触れているかを数える
+
+跳ねるレイテンシの正体は、たいてい一画面あたりのクエリ本数です。Drizzle はクエリビルダーが素直なぶん、つい一覧を取ってからループの中で関連データを引きたくなります。これがそのまま N+1 になります。
+
+```typescript
+// アンチパターン: 投稿N件に対して著者をN回引く
+const posts = await db.select().from(postsTable).limit(20);
+for (const p of posts) {
+  // ← この1行が20回の往復になる
+  p.author = await db.select().from(users).where(eq(users.id, p.userId));
+}
+```
+
+エッジでは、この20往復が体感の数百ミリ秒になります。私の計測では、同じ画面を一回の結合に置き換えただけで応答が約3倍速くなりました。Drizzle の関連クエリ（relational query）にまとめると、必要な結合を一回で取りに行けます。
+
+```typescript
+// 改善: 関連を宣言して一回で取る
+const posts = await db.query.postsTable.findMany({
+  limit: 20,
+  orderBy: (p, { desc }) => [desc(p.createdAt)],
+  with: {
+    author: {
+      columns: { id: true, displayName: true, avatarUrl: true },
+    },
+  },
+});
+```
+
+ここで `columns` を絞っているのは見栄えの問題ではありません。一覧に出さない本文や内部フラグまで毎回引くと、転送量とシリアライズのコストが積み上がります。エッジは CPU 時間にも上限があるので、返すカラムを必要分に削るのは実利があります。
+
+集計も同様です。投稿数のような数だけ欲しい値は、行を全部取ってから `length` を数えるのではなく、`$count` でデータベース側に数えさせます。
+
+```typescript
+const postCount = await db.$count(postsTable, eq(postsTable.userId, userId));
+```
+
+運用で効いたのは、開発時にクエリ本数を可視化しておくことでした。Drizzle のロガーを有効にして、一リクエストあたりのクエリ数を出力に出しておくと、画面を一つ作るたびに「この一覧、いつのまにか N+1 になっていないか」を目で確認できます。本番に出してから気づくより、はるかに安いコストで直せます。
+
+```typescript
+const db = drizzle(sql, { schema, logger: env.ENVIRONMENT !== "production" });
+```
+
+## 本番テーブルを止めずにスキーマを変える
+
+ローカルではマイグレーションは怖くありません。データが消えても作り直せばよいからです。本番は別です。ユーザーが使っている最中にカラムの型を変えたり `NOT NULL` を足したりすると、ロックや一斉エラーを引き起こします。
+
+私が守っているのは expand / contract（拡張してから縮約する）という二段構えです。一度のマイグレーションで「古い形」と「新しい形」を切り替えるのではなく、両方が同時に成立する中間状態を一度はさみます。たとえば `display_name` を必須にしたい場合、いきなり `NOT NULL` を付けません。
+
+### 第一段：制約なしでカラムを足す（expand）
+
+新しい制約なしでカラムを追加し、アプリは新旧どちらでも書けるようにします。
+
+```sql
+-- 0001_add_display_name.sql
+ALTER TABLE "users" ADD COLUMN "display_name" text;
+```
+
+ここでデプロイし、既存行に値を埋めるバックフィルを走らせます。Neon はブランチを切れるので、本番ブランチのコピーで先に流して所要時間と影響を測ってから本番に当てます。
+
+### 第二段：全行が埋まってから制約を足す（contract）
+
+全行に値が入ったことを確認してから、ようやく制約を足します。
+
+```sql
+-- 0002_enforce_display_name.sql
+ALTER TABLE "users" ALTER COLUMN "display_name" SET NOT NULL;
+```
+
+### Drizzle Kit への落とし込み
+
+Drizzle Kit ではスキーマを編集して `drizzle-kit generate` を二回に分け、それぞれを別のマイグレーションファイルとして積みます。一つのファイルに「カラム追加」と「NOT NULL 化」を同居させないことが要点です。そして本番に対しては `drizzle-kit push`（スキーマ直接反映）ではなく、生成済み SQL を順に当てる `migrate` を採用する場合がほとんどです。push は手元の試行錯誤には便利ですが、本番では「何がどの順で当たったか」が残るマイグレーション方式のほうが、後から追えます。
+
+```bash
+# 生成された SQL を必ず目視してから当てる
+npx drizzle-kit generate
+cat src/db/migrations/0001_add_display_name.sql
+npx drizzle-kit migrate
+```
+
+既存のマイグレーションファイルを後から手で書き換えないことも鉄則です。適用済みの履歴を書き換えると、別環境との差分が静かにずれていきます。直したいときは新しいマイグレーションを足して前に進めます。
+
+## scale-to-zero とコストの実際
+
+Neon は使われていない間コンピュートを止められます。これがコストを下げる一方、止まっていたところに最初のクエリが来ると、起き上がるぶんの遅延が乗ります。常時アクセスのあるアプリでは問題になりませんが、夜間にほとんど触られないような個人開発アプリでは、朝一番のリクエストだけ遅い、という形で現れます。
+
+対処は二つあります。一つは、起床の遅延が許せる種類のエンドポイントかどうかを切り分けること。バックグラウンド同期のような非対話的な経路なら、多少待っても体験を損ねません。もう一つは、アクセスパターンが読めるなら自動停止までの時間を調整し、ピーク帯は起きたままにすることです。
+
+プレビュー環境にはブランチが効きます。Neon のブランチは本番データのコピーを瞬時に作れるので、機能ごとにブランチを切ってマイグレーションを試し、マージ前に本番相当のデータで挙動を確認できます。壊しても本番には届かないので、スキーマ変更の検証コストが大きく下がりました。
+
+接続文字列はコードに置かず、Workers の Secret として持たせます。ローカルは `.dev.vars`、本番は `wrangler secret put` です。
+
+```bash
+npx wrangler secret put DATABASE_URL
+```
+
+## 何を本番のメトリクスとして残すか
+
+運用に乗せたあとで見るべき数字は、平均レイテンシより「一リクエストあたりのクエリ数」と「scale-to-zero からの起床頻度」です。前者が増えていれば、どこかで N+1 が再発しています。後者が多ければ、自動停止の閾値が実アクセスと噛み合っていません。私はこの二つをダッシュボードの先頭に置き、機能追加のたびに悪化していないかを確認しています。クエリ数が想定の倍に膨らんでいたら、その画面の関連クエリを疑うのが一番早い、というのが運用の手応えでした。
+
+## どこから手をつけるか
+
+すでに Neon と Drizzle で動いているなら、まず一画面だけ選んでロガーを有効にし、一リクエストあたりのクエリ本数を見てください。そこに想定より多い往復が隠れていることが多く、関連クエリへの置き換えだけで体感が変わります。スキーマ変更を控えているなら、その一回を expand / contract の二段に割るところから始めるのが安全です。
+
+エッジのバックエンドは、ローカルでは見えなかった「往復の回数」と「止まっていたものが起きる時間」が素直に効いてきます。逆に言えば、その二つを意識して設計すれば、サーバーレスの軽さをそのまま本番の速さにできます。実装の参考になれば幸いです。
