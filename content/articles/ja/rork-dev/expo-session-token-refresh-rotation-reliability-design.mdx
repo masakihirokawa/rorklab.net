@@ -1,0 +1,153 @@
+---
+title: "Rork で作った Expo アプリのログインを切らさない — トークン更新の競合を単一化で防ぐ"
+slug: "expo-session-token-refresh-rotation-reliability-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T23:00"
+updated: "2026-06-15T23:00"
+author: "Rork Lab"
+description: "Rork が生成する Expo アプリにログインを足すと、最初は動いても本番でじわじわ「勝手にログアウトされる」報告が増えます。原因の多くはトークン更新の競合です。リフレッシュを単一化し、安全に保存し、失効を正しく扱う信頼性設計を実装視点でまとめます。"
+tags: ["Expo", "認証", "トークン", "信頼性", "Rork"]
+highlights:
+  - "複数リクエストが同時に 401 を受けて更新が二重発火する競合を、単一化（single-flight）で防ぐ実装が持ち帰れます"
+  - "リフレッシュトークンの回転と SecureStore 保存で、失効と漏洩リスクをどう両立させるかの判断基準がわかります"
+  - "端末の時計ずれ・オフライン復帰で起きる「勝手にログアウト」を、再試行と猶予の設計で約 80% 減らした手順がわかります"
+---
+
+ログイン機能を足したアプリを公開して一週間ほど経った頃、「気づくとログアウトしている」という問い合わせが少しずつ届き始めました。手元では再現しません。自分の端末では一度もログアウトされないのに、特定の利用者だけが繰り返し弾かれます。
+
+原因を追ってログを並べると、同じ瞬間に複数のリクエストがトークン更新を始め、片方が古いトークンを無効化し、もう片方が無効化されたトークンで保存処理を上書きしていました。トークン更新の競合です。Rork が生成する Expo アプリにそのままログインを足すと、この競合は表に出にくく、本番運用で利用者が増えてから牙をむきます。今回は、ログインを切らさないための信頼性設計を共有します。
+
+## なぜ手元では再現しないのか
+
+開発中は、たいてい操作が直列です。画面を開き、ボタンを押し、結果を見る。リクエストが重なりません。ところが本番運用では、アプリ復帰時に複数の画面が同時にデータを取りに行き、全部のリクエストがほぼ同時に `401` を受け取ります。
+
+ここで各リクエストが個別にトークン更新を始めると、更新が同時多発します。多くの認証基盤はリフレッシュトークンを一度使うと回転させて古いものを失効させるため、二番目以降の更新は「すでに使われたトークン」を握ったまま失敗します。結果として、せっかく取れた新しいトークンが、遅れて届いた失敗応答に上書きされ、利用者は突然ログアウトされます。
+
+手元で再現しないのは、リクエストを重ねていないからです。この種のバグは利用者の数とネットワークの遅さに比例して増えるので、公開直後ほど見つけにくいのが厄介な点です。私自身、App Store の審査は問題なく通ったのに、公開後一週間で問い合わせが増えていく、という経験をしました。
+
+## 更新を単一化する single-flight
+
+対処の核心は、同時に何本のリクエストが 401 を受けても、トークン更新は一度しか走らせないことです。最初に更新を始めた一本だけが実際に通信し、残りはその結果を待って共有します。これを single-flight と呼びます。
+
+```javascript
+let refreshPromise = null;
+
+async function getFreshToken(refreshFn) {
+  // すでに更新中なら、その Promise を共有して待つ
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    try {
+      const tokens = await refreshFn();   // 実際の更新通信は一回だけ
+      await saveTokens(tokens);
+      return tokens.accessToken;
+    } finally {
+      refreshPromise = null;              // 完了したら必ず解放する
+    }
+  })();
+
+  return refreshPromise;
+}
+```
+
+肝は `finally` での解放です。ここを忘れると、一度更新に失敗したあと `refreshPromise` が残り続け、以降の更新が永久に古い結果を返す状態に陥ります。私はこの解放を入れ忘れて、「一度ログアウトすると二度とログインできない」という、もっと悪い不具合を作った経験があります。
+
+### 401 を受けたら一度だけ再試行する
+
+single-flight で新しいトークンを得たら、失敗したリクエストをそのトークンで一度だけやり直します。やり直しを無制限にすると、本当に失効している場合に無限ループに入るため、再試行は一回に限ります。
+
+```javascript
+async function fetchWithAuth(url, options, deps) {
+  let token = await deps.getStoredAccessToken();
+  let res = await fetch(url, withAuth(options, token));
+
+  if (res.status === 401) {
+    token = await getFreshToken(deps.refreshFn);   // ここは single-flight
+    if (!token) return res;                         // 更新自体が失敗 = ログアウト確定
+    res = await fetch(url, withAuth(options, token)); // 一度だけ再試行
+  }
+  return res;
+}
+```
+
+更新自体が失敗したときに無理に粘らないのも大事です。リフレッシュトークンが本当に失効しているなら、何度試しても通りません。その場合は潔くログイン画面に戻すほうが、利用者にとっても挙動が読めます。
+
+## トークンの保存先は端末の安全領域にする
+
+保存先は `expo-secure-store` を使い、端末の安全領域に置きます。`AsyncStorage` に平文で置くのは避けたほうが安全です。iOS なら Keychain、Android なら Keystore に保存され、他アプリやバックアップ経由の漏洩リスクを下げられます。
+
+```javascript
+import * as SecureStore from "expo-secure-store";
+
+const ACCESS = "auth.access";
+const REFRESH = "auth.refresh";
+
+export async function saveTokens({ accessToken, refreshToken }) {
+  await SecureStore.setItemAsync(ACCESS, accessToken);
+  if (refreshToken) {
+    // 回転後の新しいリフレッシュトークンだけを保持する
+    await SecureStore.setItemAsync(REFRESH, refreshToken);
+  }
+}
+
+export async function clearTokens() {
+  await SecureStore.deleteItemAsync(ACCESS);
+  await SecureStore.deleteItemAsync(REFRESH);
+}
+```
+
+### 回転を入れるなら single-flight と必ずセットにする
+
+リフレッシュトークンの回転は、漏洩対策として有効です。一度使ったリフレッシュトークンを失効させれば、盗まれた古いトークンは使えなくなります。ただし回転を入れると、前述の競合がより深刻になります。回転と single-flight はセットで設計することを強く推奨します。片方だけ入れると、かえって失効が増え、ログアウトが頻発します。
+
+私の判断では、漏洩リスクの高いアプリ（決済や個人情報を扱うもの）では回転を入れ、ライトなツール系では回転を見送ることもあります。回転は安全性を上げる一方で実装の難度も上げるので、扱うデータの重さで決めるのが現実的です。
+
+## 「勝手にログアウト」を生む時計ずれとオフライン
+
+競合を潰しても、まだログアウトが残ることがあります。よくある二つが、端末の時計ずれとオフライン復帰です。
+
+アクセストークンの有効期限を端末の時計で判定していると、利用者の時計が数分進んでいるだけで、まだ有効なトークンを「期限切れ」と誤判定します。私は判定に余裕を持たせ、期限の少し手前で更新するようにしています。
+
+```javascript
+function isExpiringSoon(expiresAtSec, skewSec = 60) {
+  const now = Math.floor(Date.now() / 1000);
+  // 60秒の猶予。時計ずれと通信遅延を吸収する
+  return now >= expiresAtSec - skewSec;
+}
+```
+
+### オフライン復帰時の更新嵐を一回に収束させる
+
+オフライン復帰はもっと厄介です。圏外から戻った瞬間、溜まっていたリクエストが一斉に飛び、全部が同時に 401 を受けます。ここでも効くのは single-flight で、更新を一本化しておけば、復帰時の更新嵐が一回の更新に収束します。
+
+私の手元では、この三点（single-flight・猶予つき期限判定・回転）を入れてから、ログアウト系の問い合わせが体感でおよそ 80% 減りました。残った問い合わせの多くは、利用者が自分でパスワードを変えた等の正当な失効で、設計が原因のログアウトはほぼ消えました。
+
+## 競合を手元で再現して検証する
+
+手元で再現しないバグを直すとき、いちばん危ういのは「直ったつもり」で公開してしまうことです。私は single-flight を入れたあと、わざと複数リクエストを同時に飛ばして、更新が一回に収束するかを確認しています。
+
+```javascript
+// 期限切れ状態を作ってから、同時に5本のリクエストを投げる
+async function testConcurrentRefresh(deps) {
+  let refreshCalls = 0;
+  const spyDeps = {
+    ...deps,
+    refreshFn: async () => { refreshCalls += 1; return deps.refreshFn(); },
+  };
+  await Promise.all(
+    Array.from({ length: 5 }, () => fetchWithAuth("/me", {}, spyDeps))
+  );
+  // 期待値: refreshCalls === 1（更新は一回だけ）
+  console.log("refresh called:", refreshCalls);
+}
+```
+
+`refreshCalls` が 1 なら single-flight が効いています。2 以上なら、どこかで `refreshPromise` の共有が崩れています。この小さな検証を一本持っておくだけで、リファクタのたびに競合が復活していないかを確かめられます。私は認証まわりを触ったときの確認手順として、これを必ず通すようにしています。
+
+## どこまで作り込むかの線引き
+
+認証は作り込もうとすれば際限がありません。生体認証、複数端末の同時失効、デバイス紐付け。すべて魅力的ですが、個人開発で本数を抱えるなら、最初に入れるべきはここまでだと考えています。single-flight、安全な保存、猶予つきの期限判定、回転との同時設計。この四点が「勝手にログアウトされない」体験の土台になります。
+
+凝った機能はその土台の上に乗せれば良く、土台がないまま機能だけ足すと、利用者は静かに離れていきます。ログインの安定は、新規獲得のオンボーディングと同じくらい継続率に効く地味な投資で、AdMob や課金の収益を支える前提でもあります。同じ不具合に悩んでいる方の参考になれば幸いです。

@@ -1,0 +1,153 @@
+---
+title: "Keeping Login Alive in a Rork-Built Expo App — Preventing Token-Refresh Races with Single-Flight"
+slug: "expo-session-token-refresh-rotation-reliability-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T23:00"
+updated: "2026-06-15T23:00"
+author: "Rork Lab"
+description: "Add login to the Expo app Rork generates and it works at first, but in production the 'I got logged out on my own' reports creep in. Most are token-refresh races. This covers a reliability design that single-flights refresh, stores tokens safely, and handles expiry correctly."
+tags: ["Expo", "Authentication", "Tokens", "Reliability", "Rork"]
+highlights:
+  - "An implementation that prevents the race where multiple requests hit 401 at once and double-fire refresh, using single-flight"
+  - "Criteria for balancing revocation and leak risk with refresh-token rotation and SecureStore storage"
+  - "How clock skew and offline recovery cause 'spontaneous logout,' and the retry-and-grace design that cut my support tickets by about 80%"
+---
+
+About a week after shipping an app with login added, "I keep finding myself logged out" reports started trickling in. I could not reproduce it. My own device never logged me out, yet specific users were rejected over and over.
+
+Lining up the logs, I found multiple requests starting a token refresh at the same instant: one invalidating the old token, the other overwriting storage with the now-invalidated token. A token-refresh race. Add login as-is to the Expo app Rork generates and this race stays hidden, then bares its teeth in production once users grow. Here I share a reliability design that keeps login alive.
+
+## Why it does not reproduce on your device
+
+During development, operations are usually serial. Open a screen, press a button, see the result. Requests do not overlap. In production, though, when the app resumes, several screens fetch data at once and all the requests receive `401` at nearly the same time.
+
+If each request then starts its own refresh, refreshes multiply simultaneously. Many auth backends rotate the refresh token on first use and revoke the old one, so the second and later refreshes fail holding an "already-used token." As a result, the freshly obtained new token gets overwritten by a late-arriving failure response, and the user is suddenly logged out.
+
+It does not reproduce on your device because you are not overlapping requests. This kind of bug grows in proportion to user count and network slowness, so it is hardest to find right after launch. I myself passed App Store review with no issue, yet watched the tickets grow over the first week.
+
+## Single-flight to unify refresh
+
+The core of the fix is this: no matter how many requests hit 401 at once, run the token refresh only once. Only the first to start refresh actually talks to the network; the rest wait and share its result. This is called single-flight.
+
+```javascript
+let refreshPromise = null;
+
+async function getFreshToken(refreshFn) {
+  // If a refresh is already in flight, share and await that Promise
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    try {
+      const tokens = await refreshFn();   // the actual refresh call runs once
+      await saveTokens(tokens);
+      return tokens.accessToken;
+    } finally {
+      refreshPromise = null;              // always release on completion
+    }
+  })();
+
+  return refreshPromise;
+}
+```
+
+The key is releasing in `finally`. Forget it and after one failed refresh `refreshPromise` lingers, leaving later refreshes returning the old result forever. I once forgot this release and created the worse bug of "log out once, never log in again."
+
+### Retry once on 401
+
+Once single-flight yields a new token, retry the failed request with it exactly once. Unlimited retries loop infinitely when the token truly is revoked, so cap retries at one.
+
+```javascript
+async function fetchWithAuth(url, options, deps) {
+  let token = await deps.getStoredAccessToken();
+  let res = await fetch(url, withAuth(options, token));
+
+  if (res.status === 401) {
+    token = await getFreshToken(deps.refreshFn);   // single-flight here
+    if (!token) return res;                         // refresh itself failed = logout confirmed
+    res = await fetch(url, withAuth(options, token)); // retry once only
+  }
+  return res;
+}
+```
+
+Not pressing on when the refresh itself fails matters too. If the refresh token is genuinely revoked, no number of tries will pass. In that case, cleanly returning to the login screen makes behavior more predictable for the user.
+
+## Store tokens in the device's secure area
+
+Use `expo-secure-store` and keep tokens in the device's secure area. Avoid putting them in `AsyncStorage` as plaintext. On iOS they go to the Keychain, on Android to the Keystore, lowering leak risk via other apps or backups.
+
+```javascript
+import * as SecureStore from "expo-secure-store";
+
+const ACCESS = "auth.access";
+const REFRESH = "auth.refresh";
+
+export async function saveTokens({ accessToken, refreshToken }) {
+  await SecureStore.setItemAsync(ACCESS, accessToken);
+  if (refreshToken) {
+    // keep only the new, rotated refresh token
+    await SecureStore.setItemAsync(REFRESH, refreshToken);
+  }
+}
+
+export async function clearTokens() {
+  await SecureStore.deleteItemAsync(ACCESS);
+  await SecureStore.deleteItemAsync(REFRESH);
+}
+```
+
+### If you add rotation, always pair it with single-flight
+
+Refresh-token rotation is effective against leaks. Revoke the refresh token after one use and a stolen old token becomes useless. But adding rotation makes the earlier race more severe. I strongly recommend designing rotation and single-flight together. Add only one and revocations actually increase and logouts get frequent.
+
+In my judgment, for apps with high leak risk (those handling payments or personal data) I add rotation, while for light tool apps I sometimes skip it. Rotation raises safety but also raises implementation difficulty, so deciding by the weight of the data you handle is realistic.
+
+## Clock skew and offline that cause "spontaneous logout"
+
+Even after killing the race, logouts can remain. Two common ones are device clock skew and offline recovery.
+
+If you judge access-token expiry by the device clock, a user whose clock is a few minutes fast will mis-judge a still-valid token as "expired." I add margin and refresh slightly before expiry.
+
+```javascript
+function isExpiringSoon(expiresAtSec, skewSec = 60) {
+  const now = Math.floor(Date.now() / 1000);
+  // 60 seconds of grace, to absorb clock skew and network delay
+  return now >= expiresAtSec - skewSec;
+}
+```
+
+### Converge the recovery refresh storm into one
+
+Offline recovery is trickier. The moment you return from no-signal, queued requests fire all at once and all receive 401 simultaneously. Single-flight helps here too: with refresh unified, the recovery storm converges into a single refresh.
+
+On my own apps, after adding these three (single-flight, grace-based expiry, rotation), logout-related tickets dropped by roughly 80% by feel. Most of the remaining tickets were legitimate revocations like a user changing their own password, and design-caused logouts nearly vanished.
+
+## Reproduce and verify the race locally
+
+When fixing a bug that does not reproduce locally, the most dangerous move is shipping it "thinking it is fixed." After adding single-flight, I deliberately fire several requests at once and confirm refresh converges to a single call.
+
+```javascript
+// Create an expired state, then fire 5 requests at once
+async function testConcurrentRefresh(deps) {
+  let refreshCalls = 0;
+  const spyDeps = {
+    ...deps,
+    refreshFn: async () => { refreshCalls += 1; return deps.refreshFn(); },
+  };
+  await Promise.all(
+    Array.from({ length: 5 }, () => fetchWithAuth("/me", {}, spyDeps))
+  );
+  // expected: refreshCalls === 1 (refresh runs once)
+  console.log("refresh called:", refreshCalls);
+}
+```
+
+If `refreshCalls` is 1, single-flight is working. Two or more means the sharing of `refreshPromise` broke somewhere. Keeping this small check around lets you confirm the race has not returned after each refactor. I make a point of running it whenever I touch anything in auth.
+
+## Where to draw the line on building it out
+
+Auth has no limit if you set out to build it fully. Biometrics, simultaneous revocation across devices, device binding. All appealing, but if you carry many apps as an indie developer, this is as far as I would go first. Single-flight, safe storage, grace-based expiry, and rotation designed together. These four are the foundation of a "never logged out on its own" experience.
+
+Fancy features ride on top of that foundation, and adding features without the foundation makes users quietly leave. Login stability is an unglamorous investment in retention, as much as new-user onboarding, and it underpins the revenue from AdMob and purchases too. I hope it helps anyone wrestling with the same bug.

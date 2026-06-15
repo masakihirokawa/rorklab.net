@@ -1,0 +1,171 @@
+---
+title: "Building a Room-Measuring App with Rork Max and RoomPlan — Absorbing Scan Variance by Design"
+slug: "rork-max-roomplan-lidar-floor-scan-export-design"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-15T22:00"
+updated: "2026-06-15T22:00"
+author: "Rork Lab"
+description: "Now that Rork Max generates native Swift, a LiDAR-based RoomPlan scanning app is a realistic project for an indie developer. Scan results drift depending on device and how you hold it. This walks through how to absorb that drift in your app design and export stable dimensions."
+tags: ["Rork Max", "RoomPlan", "LiDAR", "Swift", "Architecture"]
+highlights:
+  - "A rounding and snapping design that assumes RoomPlan results drift 5-10cm by device, lighting, and hand motion, so you can lock in trustworthy dimensions"
+  - "How to add a minimal shared-contract layer that exports dimensions to JSON on top of the Swift code Rork Max generates"
+  - "Judgment criteria for a LiDAR-absent fallback that survives App Store review instead of getting rejected"
+---
+
+The first time I used RoomPlan, I scanned the same small room three times and got three different wall lengths: 3.62m, 3.57m, 3.64m. A few centimeters of difference, but if you are building an app that draws a floor plan, you cannot expose that drift to the user. People do not trust a tool whose numbers change every time they measure.
+
+Now that Rork Max can generate native Swift, a LiDAR-based measuring app suddenly came within reach for indie developers. But ship the generated code as-is and that drift lands directly in the user's hands. Here I share how I learned to absorb scan variance by design, working through a small measuring app of my own.
+
+## Why RoomPlan numbers drift
+
+RoomPlan sits on top of ARKit. It combines the LiDAR point cloud with planes estimated from the camera image to reconstruct the room's structure. In other words, the final dimensions are not a measurement but an estimate. Because it is an estimate, the result moves with the input conditions.
+
+There are three main sources of drift. Lighting: against backlight or in the dark, feature points are scarce and plane estimation gets loose. Motion speed: sweep too fast and the point cloud thins out, delaying how edges are resolved. And the device itself: iPhone and iPad Pro differ in LiDAR resolution and field of view, so the same room reconstructs slightly differently.
+
+The important thing is to not try to crush these as bugs. Estimation drift is the spec, and designing your app to absorb it produces a more stable result in the end.
+
+## A three-layer design that absorbs drift
+
+I treat measurement data in three layers: raw, confirmed, and display.
+
+The raw layer keeps the `CapturedRoom` that RoomPlan returns, untouched. Nothing is rounded here. The confirmed layer applies rounding and snapping to turn raw data into "dimensions the app takes responsibility for." The display layer shows the user only the confirmed values.
+
+With this separation, when you later want to change the rounding rules, you can redo it without throwing away the raw data. Scanning is an effort for the user, so a design that reduces re-scans directly improves the experience.
+
+### Rounding and snapping in the confirmed layer
+
+The confirmed layer has two core operations. One is rounding to 5cm units. The other is snapping toward right angles and parallels. Real room walls are made almost entirely of right angles and parallels, so if the estimate returns 88 or 92 degrees, nudging it to 90 produces a more natural drawing.
+
+```swift
+import RoomPlan
+import simd
+
+struct ConfirmedDimension {
+    let widthMeters: Double
+    let lengthMeters: Double
+    let cornerAngles: [Double]   // each corner angle, in degrees
+}
+
+enum DimensionResolver {
+    // Round to 5cm so users see a granularity they can trust
+    static func snapLength(_ raw: Double) -> Double {
+        let grid = 0.05
+        return (raw / grid).rounded() * grid
+    }
+
+    // Snap toward right angles. Within +/-4 degrees, pull to a multiple of 90
+    static func snapAngle(_ rawDeg: Double) -> Double {
+        let nearest = (rawDeg / 90.0).rounded() * 90.0
+        return abs(rawDeg - nearest) <= 4.0 ? nearest : rawDeg
+    }
+
+    static func resolve(from room: CapturedRoom) -> ConfirmedDimension {
+        let walls = room.walls
+        let lengths = walls.map { Double($0.dimensions.x) }.sorted(by: >)
+        let width = snapLength(lengths.first ?? 0)
+        let length = snapLength(lengths.dropFirst().first ?? 0)
+
+        let angles = walls.map { wall -> Double in
+            let yaw = atan2(wall.transform.columns.0.z, wall.transform.columns.0.x)
+            return snapAngle(yaw * 180 / .pi)
+        }
+        return ConfirmedDimension(widthMeters: width, lengthMeters: length, cornerAngles: angles)
+    }
+}
+```
+
+The `+/-4 degrees` threshold is a value I settled on after scanning a few times on my own devices. Snap across too wide an angle and rooms with genuinely diagonal walls break. Too narrow and you fail to absorb the drift. Carry this as a number you will tune for the kinds of rooms your app handles.
+
+### Carry a confidence value alongside
+
+If you hand over only the rounded numbers, the display layer cannot judge how much to trust them. I attach a confidence score to the confirmed value. Even a rough calculation from point-cloud density and scan time is enough to drive what the display shows.
+
+```swift
+struct DimensionWithConfidence {
+    let dimension: ConfirmedDimension
+    let confidence: Double   // 0.0 to 1.0
+
+    var needsRescanHint: Bool { confidence < 0.6 }
+}
+```
+
+When `needsRescanHint` is set, the display layer adds "scanning again slowly will improve accuracy." Rather than hiding the numbers, honestly conveying their certainty is what earns the user's trust in the tool.
+
+## A shared-contract layer that exports to JSON
+
+What Rork Max generates is the Swift app itself, but a measuring app's job runs all the way to "handing the measured result somewhere": cloud storage, drawing export, integration with other apps. To stabilize these exits, I place a shared-contract layer at the boundary of the generated code. It is a thin layer that only converts a Swift struct into the JSON schema you have promised the outside world.
+
+```swift
+import Foundation
+
+struct FloorPlanExport: Codable {
+    let schemaVersion: Int
+    let widthCm: Int
+    let lengthCm: Int
+    let areaSquareMeters: Double
+    let confidence: Double
+    let capturedAt: String   // ISO8601
+
+    init(_ d: DimensionWithConfidence, capturedAt: Date) {
+        self.schemaVersion = 2
+        self.widthCm = Int((d.dimension.widthMeters * 100).rounded())
+        self.lengthCm = Int((d.dimension.lengthMeters * 100).rounded())
+        self.areaSquareMeters = (d.dimension.widthMeters * d.dimension.lengthMeters * 100).rounded() / 100
+        self.confidence = d.confidence
+        let fmt = ISO8601DateFormatter()
+        self.capturedAt = fmt.string(from: capturedAt)
+    }
+}
+
+func encodeExport(_ export: FloorPlanExport) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return try encoder.encode(export)
+}
+```
+
+Always including `schemaVersion` is your insurance for changing the export format later. It alone prevents the accident where a user who saved version-1 data can no longer read it after an app update. Holding dimensions as `Int` centimeters is also deliberate: pass floating point straight through and the receiving side gets displays like `3.6200000001`. Pin to integers at the exit and life gets simpler.
+
+With this layer in place, even when Rork Max rewrites the main code on regeneration, the only file you must keep honoring the external promise is this one. In development with generative AI, where you draw the line between generated and hand-written code decides your maintenance time. Putting the exit contract on the hand-written side is my call.
+
+## LiDAR-absent devices and review
+
+Take this lightly and App Store review will reject you. RoomPlan only runs on LiDAR-equipped devices. Many plain iPhones have no LiDAR, so an app that "does nothing after install" tends to get rejected in review and earns low ratings.
+
+Handle it in two stages. First, branch on the device and offer a manual-entry fallback to unsupported devices. Second, even on supported devices, provide a retry path for when a scan fails.
+
+```swift
+import RoomPlan
+
+enum ScanAvailability {
+    case supported
+    case unsupportedDevice
+    case temporarilyUnavailable
+
+    static func current() -> ScanAvailability {
+        guard RoomCaptureSession.isSupported else {
+            return .unsupportedDevice
+        }
+        return .supported
+    }
+}
+```
+
+For `unsupportedDevice`, fall back to a screen where the user types in numbers measured with a tape. I myself forgot this fallback on my first submission and got rejected once. Reviewers sometimes test on LiDAR-absent devices, and a blank screen reads as "the feature does not work." If you want to require a supported device, you can also declare it in `UIRequiredDeviceCapabilities` in `Info.plist` so unsupported devices cannot install at all. Which to take depends on your audience's device mix. For a general audience I recommend the manual fallback; for a business app on fixed devices, requiring the capability.
+
+## Designing the scan experience itself
+
+Accuracy is the substance, but what the user touches is the scanning act. If that is sloppy, no matter how good your confirmed layer is, you only collect raw data with large drift.
+
+Three things mattered in implementation. Show one line before the scan: "walk around slowly." Overlay the walls being captured in real time so the user notices uncaptured faces. And state a time estimate up front, "about 30 seconds." An operation with no visible end gets abandoned partway, and an incomplete point cloud reaches the confirmed layer.
+
+Before and after adding these three, my re-scan rate dropped by roughly half by feel. The honest truth is that the most effective investment in accuracy was the operation flow, not the algorithm.
+
+## The minimal build to start with
+
+If you are about to take on a RoomPlan app, the first step of "separating the raw and confirmed layers" is enough. Rounding and snapping, attaching confidence, and the JSON exit contract. With those three, you have a foundation that is not thrown around by drift. The AR polish and 3D display can be added later on top of that foundation.
+
+Reverse the order and you tend to end up with a good-looking scan screen but an app whose exported numbers no one trusts. Building from the foundation up, even if it looks like the long way, is what I recommend. I hope it helps your implementation.
