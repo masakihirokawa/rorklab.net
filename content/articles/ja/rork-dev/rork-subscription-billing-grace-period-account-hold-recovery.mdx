@@ -1,0 +1,279 @@
+---
+title: "解約だと思って権限を切ったユーザーは、まだ払う気だった — 支払い猶予期間と権限維持の実装"
+slug: "rork-subscription-billing-grace-period-account-hold-recovery"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T20:30"
+updated: "2026-06-15T20:30"
+author: "Rork Lab"
+description: "購読の支払いが失敗しても、それは解約ではありません。猶予期間中に権限を切ると復帰可能な売上を自分で捨てます。Rork(Expo)アプリで猶予・課金リトライ・アカウントホールドを取り違えず、権限維持と復帰導線を出す実装をまとめます。"
+tags: ["サブスクリプション", "RevenueCat", "課金", "Expo", "収益化"]
+highlights:
+  - "支払い失敗ユーザーを『解約済み』として権限を切り、復帰できたはずの売上を取りこぼしていた人が、猶予期間を維持する実装を今日手に入れられる"
+  - "RevenueCat の customerInfo と App Store Server Notifications V2 / Google RTDN を突き合わせ、猶予・リトライ・ホールド・解約を区別する動くコードを習得できる"
+  - "猶予中はソフトに、ホールド突入で明確に、という二段階の復帰導線を実装し、失敗課金からの回収率を計測できる状態になれる"
+---
+
+購読アプリを運用していて、ある月の解約数が妙に多い、と感じたことがあります。調べてみると、その「解約」の半分以上は本人が解約ボタンを押したわけではなく、クレジットカードの期限切れや限度額超過で自動更新の決済が失敗していただけでした。問題は、私のアプリがその状態を「解約」と同じ扱いにして、即座に有料機能を閉じていたことです。
+
+支払いが一度失敗しただけのユーザーは、まだ払う気があります。Apple も Google も、決済が失敗した購読をすぐには切らず、数日から数週間かけて自動でリトライする仕組みを用意しています。この期間に権限を維持して「カードを更新してください」と促せるかどうかで、回収できる売上が変わります。私の場合、ここを直しただけで失敗課金からの復帰がはっきりと増えました。
+
+ここからは Rork で生成した Expo アプリを前提に、支払い失敗の4つの状態を取り違えずに扱い、猶予期間は権限を維持し、本当に回収不能になったタイミングで初めて権限を切る実装をまとめます。決済の状態管理そのものに関心がある方は、先に[サブスク権限のエンタイトルメント状態機械の設計](/articles/rork-dev/rork-subscription-entitlement-state-machine-design-guide)を読んでおくと、本記事の state machine が頭に入りやすいはずです。
+
+## 「支払い失敗」は1つの状態ではない
+
+### 失敗から失効までに挟まる4つの中間状態
+
+最初の落とし穴は、`isActive === false` を見て「解約」と判断してしまうことです。実際には、自動更新の決済が失敗してから購読が完全に消えるまでに、いくつもの中間状態があります。
+
+- **課金リトライ（Billing Retry）**: 決済が失敗し、ストアが自動でリトライしている期間。この間も多くの場合は権限を維持すべきです。
+- **支払い猶予期間（Billing Grace Period）**: 開発者が明示的に有効化する猶予。期間中はユーザーが有料機能を使い続けられます。Apple は購読周期に応じて最大16日、Google は週次で最大7日・月次以上で最大30日が目安です。
+- **アカウントホールド（Account Hold）**: 猶予もリトライも尽きた状態。ここで初めて権限を停止します。ただしユーザーがカードを直せば購読は復活します。
+- **解約・失効（Cancelled / Expired）**: 本人が解約した、またはリトライ期間も終わって購読が完全に終了した状態。
+
+重要なのは、リトライと猶予の段階では「まだ顧客である」と見なすことです。ここで権限を切ると、ユーザーは「金は払ったのに使えなくなった」と感じ、復帰どころか低評価レビューに直行します。
+
+### ストア固有の状態を1つの列挙型に正規化する
+
+私はこの4状態を、アプリ全体で1つの列挙型に正規化してから扱うようにしています。ストアごとの細かい通知タイプを画面側まで持ち込まないことが、バグを減らす最大のコツです。
+
+```typescript
+// subscription/types.ts
+// ストア固有の状態を、アプリ内では必ずこの5値に正規化する
+export type EntitlementState =
+  | 'active'        // 正常に課金中
+  | 'grace'         // 決済失敗だが猶予/リトライ中（=権限は維持する）
+  | 'hold'          // アカウントホールド（=権限は停止するが復帰可能）
+  | 'expired'       // 完全に失効（解約・期限切れ）
+  | 'never';        // 一度も購読していない
+
+export interface EntitlementSnapshot {
+  state: EntitlementState;
+  // grace のときに「いつまで使えるか」を画面に出すために保持する
+  graceUntil: string | null;   // ISO8601、なければ null
+  willRenew: boolean;          // 次回自動更新が予定されているか
+  productId: string | null;
+}
+```
+
+## RevenueCat の customerInfo から状態を読む
+
+RevenueCat を使っている場合、`customerInfo` に支払い失敗の手がかりが入っています。多くの実装が `entitlements.active` の有無だけを見ていますが、それだと猶予期間を取りこぼします。猶予中は `isActive` が `true` のまま `willRenew` が `false` になり、`billingIssueDetectedAt` に失敗検知時刻が入る、という組み合わせを読む必要があります。
+
+```typescript
+// subscription/fromRevenueCat.ts
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+import { EntitlementSnapshot } from './types';
+
+const ENTITLEMENT_ID = 'premium'; // RevenueCat で設定した Entitlement 識別子
+
+export function toSnapshot(info: CustomerInfo): EntitlementSnapshot {
+  const ent = info.entitlements.active[ENTITLEMENT_ID]
+    ?? info.entitlements.all[ENTITLEMENT_ID];
+
+  if (!ent) {
+    return { state: 'never', graceUntil: null, willRenew: false, productId: null };
+  }
+
+  const hasBillingIssue = ent.billingIssueDetectedAt != null;
+
+  // isActive が true なら、まだ使わせてよい期間（正常 or 猶予）
+  if (ent.isActive) {
+    if (hasBillingIssue && !ent.willRenew) {
+      // 決済は失敗したが、有効期限までは猶予として使える
+      return {
+        state: 'grace',
+        graceUntil: ent.expirationDate ?? null,
+        willRenew: false,
+        productId: ent.productIdentifier,
+      };
+    }
+    return {
+      state: 'active',
+      graceUntil: null,
+      willRenew: ent.willRenew,
+      productId: ent.productIdentifier,
+    };
+  }
+
+  // isActive が false。ここで hold と expired を分けるのが肝心
+  // RevenueCat 単体では両者の区別が曖昧なため、サーバー側の通知で補強する（後述）
+  return {
+    state: hasBillingIssue ? 'hold' : 'expired',
+    graceUntil: null,
+    willRenew: false,
+    productId: ent.productIdentifier,
+  };
+}
+```
+
+ここで `billingIssueDetectedAt` が `null` でないかどうかが、解約とホールドを分ける最初の判断材料になります。本人が解約した場合は課金問題が立っていないため `expired`、決済失敗起因で失効した場合は課金問題が立っているため `hold` に倒せます。
+
+ただしクライアントの `customerInfo` だけでは取りこぼしが出ます。アプリが起動していない間に状態が変わるからです。そこでサーバー側の通知を一次情報として併用します。
+
+## サーバー側でストア通知を正規化する
+
+App Store Server Notifications V2（ASSN V2）と Google Play の Realtime Developer Notifications（RTDN）は、決済失敗や復活をリアルタイムで送ってきます。これを受けて自前の権限テーブルを更新しておけば、アプリ起動時に最新状態を取りに行けます。私は Rork(Expo) アプリのバックエンドを Cloudflare Workers に置いているので、Worker で受ける例を示します。
+
+```typescript
+// worker/notifications.ts (Cloudflare Workers)
+// ストアごとの通知タイプを EntitlementState に写像する
+type Store = 'apple' | 'google';
+
+function mapApple(notificationType: string, subtype?: string): EntitlementState {
+  switch (notificationType) {
+    case 'DID_RENEW':
+    case 'SUBSCRIBED':
+      return 'active';
+    case 'DID_FAIL_TO_RENEW':
+      // subtype が GRACE_PERIOD なら猶予中、なければホールドへ
+      return subtype === 'GRACE_PERIOD' ? 'grace' : 'hold';
+    case 'EXPIRED':
+      return 'expired';
+    default:
+      return 'active'; // 不明な型は権限を維持側に倒す（誤って締め出さない）
+  }
+}
+
+function mapGoogle(notificationType: number): EntitlementState {
+  // Google Play RTDN の subscriptionNotificationType
+  switch (notificationType) {
+    case 2:  // SUBSCRIPTION_RENEWED
+    case 4:  // SUBSCRIPTION_PURCHASED
+    case 7:  // SUBSCRIPTION_RESTARTED（ホールドから復帰）
+      return 'active';
+    case 6:  // SUBSCRIPTION_IN_GRACE_PERIOD
+      return 'grace';
+    case 5:  // SUBSCRIPTION_ON_HOLD
+      return 'hold';
+    case 3:  // SUBSCRIPTION_CANCELED
+    case 13: // SUBSCRIPTION_EXPIRED
+      return 'expired';
+    default:
+      return 'active';
+  }
+}
+```
+
+`default` を `active`（=権限維持側）に倒している点に注目してください。未知の通知タイプで誤って締め出すより、維持しておいて次の確実な通知で締める方が、ユーザー体験も売上も守れます。締め出しは「確実に解約・失効した」と分かったときだけ行う、という原則です。
+
+ストアからの通知は必ず署名を検証してから処理します。ASSN V2 は JWS、Google RTDN は Pub/Sub のメッセージとして届くので、検証を省くと偽の通知で権限を操作される恐れがあります。署名検証と冪等性（同じ通知が二度届いても二重処理しない）の作法は、[App Store Server Notifications V2 を自前運用するガイド](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription)に詳しくまとめてあります。
+
+## 権限を「猶予は維持、ホールドで停止」に倒す
+
+正規化した状態をアプリで使う段になって、もう1つ判断が要ります。`grace` と `hold` で機能の見せ方を変えることです。私は次のルールに落ち着きました。
+
+- `active` / `grace`: 有料機能はすべて使える。`grace` のときだけ控えめなバナーを出す。
+- `hold`: 有料機能はロックするが、データは消さず「カードを更新すれば即復帰します」と明示する。
+- `expired`: 通常の非会員導線に戻す。
+
+```typescript
+// subscription/access.ts
+import { EntitlementSnapshot } from './types';
+
+export function canUsePremium(snap: EntitlementSnapshot): boolean {
+  // grace は権限維持。hold/expired/never は不可
+  return snap.state === 'active' || snap.state === 'grace';
+}
+
+// 画面に出す案内の種別を決める
+export type RecoveryPrompt = 'none' | 'soft' | 'hard';
+
+export function recoveryPrompt(snap: EntitlementSnapshot): RecoveryPrompt {
+  if (snap.state === 'grace') return 'soft'; // まだ使えるが、そっと知らせる
+  if (snap.state === 'hold') return 'hard';  // 使えない。明確に復帰を促す
+  return 'none';
+}
+```
+
+`canUsePremium` が `grace` を `true` に含めている点が、この記事の核心です。多くの実装はここを `state === 'active'` だけにしてしまい、猶予期間という回収のチャンスを自ら潰しています。
+
+## アプリ内の復帰導線をソフト／ハードで出し分ける
+
+UI 側は `recoveryPrompt` の戻り値で出し分けます。猶予中（soft）は機能を止めず、画面上部に小さく知らせるだけにします。ホールド（hard）は有料画面の手前で止め、ストアの購読管理ページへ直接誘導します。
+
+```tsx
+// components/RecoveryBanner.tsx
+import { Linking, Platform, Pressable, Text, View } from 'react-native';
+import { recoveryPrompt } from '../subscription/access';
+import { EntitlementSnapshot } from '../subscription/types';
+
+// ストアの購読管理画面を開く（カード更新はここで行ってもらう）
+function openManageSubscription() {
+  const url = Platform.OS === 'ios'
+    ? 'https://apps.apple.com/account/subscriptions'
+    : 'https://play.google.com/store/account/subscriptions';
+  Linking.openURL(url);
+}
+
+export function RecoveryBanner({ snap }: { snap: EntitlementSnapshot }) {
+  const kind = recoveryPrompt(snap);
+  if (kind === 'none') return null;
+
+  const soft = kind === 'soft';
+  return (
+    <View style={{
+      padding: 12,
+      backgroundColor: soft ? '#FFF7E6' : '#FDECEC',
+    }}>
+      <Text style={{ fontWeight: '600', marginBottom: 4 }}>
+        {soft ? 'お支払いの確認が必要です' : 'プレミアムが一時停止中です'}
+      </Text>
+      <Text style={{ marginBottom: 8 }}>
+        {soft
+          ? `カード情報の更新までは引き続きご利用いただけます${
+              snap.graceUntil ? `（${formatDate(snap.graceUntil)}まで）` : ''
+            }。`
+          : 'お支払い方法を更新すると、すぐに元の状態に戻ります。データはそのまま残っています。'}
+      </Text>
+      <Pressable onPress={openManageSubscription}>
+        <Text style={{ color: '#2563EB', fontWeight: '600' }}>
+          購読を管理する
+        </Text>
+      </Pressable>
+    </View>
+  );
+}
+
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
+}
+```
+
+### 文言の出し分けが回収率を左右する
+
+soft のときに「データはそのまま残っています」と書かないのは意図的です。猶予中はまだ使えているので、データ保持を強調すると逆に不安を煽ります。hard のときにだけデータ保持を明示し、「直せば戻る」という安心感を前面に出します。文言一つで復帰率は変わるので、ここは A/B で検証する価値があります。
+
+## つまずきやすい3つの落とし穴
+
+本番運用のなかで私が実際に踏んだ罠と、その対処を挙げます。いずれも一度は注意点として頭に入れておくことを推奨します。
+
+まず、**有効期限の計算をローカルタイムでやってしまう**こと。`graceUntil` は必ず UTC の ISO8601 で保持し、表示の瞬間だけ端末のタイムゾーンに変換します。サーバーとクライアントで日付がずれると、猶予が切れていないのに権限を切る、あるいはその逆が起きます。
+
+次に、**hold からの復帰通知を取りこぼす**こと。ユーザーがカードを直すと Apple は `DID_RENEW`、Google は `SUBSCRIPTION_RESTARTED`（type 7）を送ってきます。この復帰系の通知をハンドリングし忘れると、本人は払い直したのに権限が戻らず、最悪のサポート問い合わせになります。`active` への遷移は必ず受け切ってください。
+
+最後に、**Sandbox での検証が難しい**こと。猶予期間やホールドは本番でしか自然には起きません。Apple の Sandbox は購読周期が分単位に圧縮されるため、決済失敗を意図的に起こすには Sandbox アカウントの支払い方法を無効にするなどの操作が要ります。Google は Play Console のライセンステスターで猶予・ホールドを擬似的に発生させられます。テスト計画には「失敗系の通知が実際に飛んでくるか」を必ず含めてください。返金まわりの失効も取り違えやすいので、[返金検知と権限失効の実装](/articles/rork-dev/rork-subscription-refund-detection-entitlement-revocation)も合わせて検証しておくと安全です。
+
+## 回収率を計測して、文言を磨く
+
+実装したら、効果を1つの数字で追います。私は「猶予/ホールドに入ったユーザーのうち、30日以内に `active` へ戻った割合」を回収率として見ています。これが分かると、バナーの文言やバナーを出すタイミングを改善する根拠になります。
+
+計測のために、状態遷移をイベントとして記録しておきます。
+
+```typescript
+// 状態が変わった瞬間にイベントを送る（分析基盤は任意）
+function onEntitlementChange(prev: EntitlementState, next: EntitlementState) {
+  if (prev === 'active' && (next === 'grace' || next === 'hold')) {
+    track('billing_issue_entered', { from: prev, to: next });
+  }
+  if ((prev === 'grace' || prev === 'hold') && next === 'active') {
+    track('billing_issue_recovered', { from: prev });
+  }
+}
+```
+
+`billing_issue_entered` と `billing_issue_recovered` の比を取れば回収率が出ます。たとえば猶予に入った100人のうち40人が `active` に戻れば回収率は40%です。この数字を基準に、文言や通知タイミングの改善が効いたかどうかを判断できます。ホールドからの回収はグレース期間からの回収より難しいので、両者を分けて見ると、猶予期間の存在価値がはっきり数字に表れます。
+
+支払い失敗は「失われた顧客」ではなく「まだ回収できる顧客」です。まずは自分のアプリで、決済失敗ユーザーを `state === 'active'` だけで締め出していないかを確認してみてください。一行 `canUsePremium` に `grace` を足すだけで、今まで取りこぼしていた売上に手が届くようになります。

@@ -1,0 +1,273 @@
+---
+title: "The Users You Cut Off as Churned Were Still Willing to Pay — Implementing Grace Periods That Keep Access Alive"
+slug: "rork-subscription-billing-grace-period-account-hold-recovery"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-15T20:30"
+updated: "2026-06-15T20:30"
+author: "Rork Lab"
+description: "A failed renewal is not a cancellation. If you revoke access during the grace period, you throw away recoverable revenue. Here is how to tell grace, billing retry, account hold, and real churn apart in a Rork (Expo) app, keep access during grace, and guide users back."
+tags: ["subscriptions", "RevenueCat", "billing", "Expo", "monetization"]
+highlights:
+  - "If you have been treating failed-payment users as churned and locking them out, you'll walk away with working code that keeps access alive through the grace period and recovers revenue you were losing"
+  - "You'll learn to reconcile RevenueCat's customerInfo with App Store Server Notifications V2 and Google RTDN to cleanly separate grace, retry, hold, and cancellation"
+  - "You'll ship a two-tier recovery flow — soft during grace, firm at account hold — and measure how much failed-payment revenue you win back"
+---
+
+While running subscription apps, I once noticed that one month's churn looked oddly high. When I dug in, more than half of those "cancellations" were not people tapping a cancel button. They were renewals that had simply failed at the payment step — an expired card, a hit credit limit. The real problem was on my side: my app treated that state exactly like a cancellation and locked the premium features immediately.
+
+A user whose payment failed once is still willing to pay. Both Apple and Google avoid cutting off a subscription the moment a charge fails; they automatically retry for days or weeks. Whether you keep access alive during that window and prompt the user to update their card directly determines how much revenue you recover. In my case, fixing only this clearly increased the share of failed payments that recovered.
+
+This article assumes a Rork-generated Expo app and walks through handling the four states of a failed payment without confusing them: keep access during the grace period, and revoke it only when the payment is truly unrecoverable. If you care about the state management itself, read [Designing an entitlement state machine for subscriptions in Rork](/articles/rork-dev/rork-subscription-entitlement-state-machine-design-guide) first; it makes the state machine here much easier to follow.
+
+## "Payment failed" is not a single state
+
+The first trap is looking at `isActive === false` and concluding "churned." In reality, several intermediate states exist between a failed auto-renewal and a subscription disappearing for good.
+
+- **Billing retry**: The charge failed and the store is retrying automatically. In most cases you should keep access during this window.
+- **Billing grace period**: A grace window you explicitly enable. The user keeps using premium features during it. Apple grants up to about 16 days depending on the subscription period; Google grants up to 7 days for weekly and up to 30 days for monthly-and-longer plans.
+- **Account hold**: Both retry and grace are exhausted. Only here do you suspend access — but the subscription revives if the user fixes their card.
+- **Cancelled / expired**: The user actively cancelled, or the retry window ran out and the subscription ended completely.
+
+The key point: during retry and grace, you should still treat the person as a customer. Cutting access here makes the user feel "I paid and you locked me out," which leads straight to a one-star review rather than recovery.
+
+I normalize these four states into a single enum across the whole app before doing anything else. The biggest way to reduce bugs is to never let store-specific notification types leak up to the UI.
+
+```typescript
+// subscription/types.ts
+// Normalize every store-specific state down to these five values
+export type EntitlementState =
+  | 'active'        // charging normally
+  | 'grace'         // payment failed but in grace/retry (= keep access)
+  | 'hold'          // account hold (= suspend access, but recoverable)
+  | 'expired'       // fully lapsed (cancelled or expired)
+  | 'never';        // never subscribed
+
+export interface EntitlementSnapshot {
+  state: EntitlementState;
+  // Held so the UI can show "you can use it until..." during grace
+  graceUntil: string | null;   // ISO8601, or null
+  willRenew: boolean;          // is the next auto-renewal scheduled?
+  productId: string | null;
+}
+```
+
+## Reading the state from RevenueCat's customerInfo
+
+If you use RevenueCat, `customerInfo` carries the clues about a failed payment. Many implementations only check whether `entitlements.active` is present, which misses the grace period. During grace, `isActive` stays `true` while `willRenew` becomes `false`, and `billingIssueDetectedAt` holds the time the failure was detected. You need to read that combination.
+
+```typescript
+// subscription/fromRevenueCat.ts
+import Purchases, { CustomerInfo } from 'react-native-purchases';
+import { EntitlementSnapshot } from './types';
+
+const ENTITLEMENT_ID = 'premium'; // the Entitlement identifier you set in RevenueCat
+
+export function toSnapshot(info: CustomerInfo): EntitlementSnapshot {
+  const ent = info.entitlements.active[ENTITLEMENT_ID]
+    ?? info.entitlements.all[ENTITLEMENT_ID];
+
+  if (!ent) {
+    return { state: 'never', graceUntil: null, willRenew: false, productId: null };
+  }
+
+  const hasBillingIssue = ent.billingIssueDetectedAt != null;
+
+  // If isActive is true, the user may still use it (normal or grace)
+  if (ent.isActive) {
+    if (hasBillingIssue && !ent.willRenew) {
+      // Payment failed, but access is granted as grace until expiration
+      return {
+        state: 'grace',
+        graceUntil: ent.expirationDate ?? null,
+        willRenew: false,
+        productId: ent.productIdentifier,
+      };
+    }
+    return {
+      state: 'active',
+      graceUntil: null,
+      willRenew: ent.willRenew,
+      productId: ent.productIdentifier,
+    };
+  }
+
+  // isActive is false. Separating hold from expired matters here.
+  // RevenueCat alone is ambiguous about the two, so reinforce with server notifications (below).
+  return {
+    state: hasBillingIssue ? 'hold' : 'expired',
+    graceUntil: null,
+    willRenew: false,
+    productId: ent.productIdentifier,
+  };
+}
+```
+
+Whether `billingIssueDetectedAt` is non-null is the first signal that separates a cancellation from a hold. If the user cancelled, there is no billing issue, so we lean `expired`; if the lapse was caused by a failed charge, a billing issue is present, so we lean `hold`.
+
+But the client's `customerInfo` alone leaves gaps, because the state changes while the app isn't running. So we use server-side notifications as the source of truth alongside it.
+
+## Normalizing store notifications on the server
+
+App Store Server Notifications V2 (ASSN V2) and Google Play's Realtime Developer Notifications (RTDN) push payment failures and recoveries in real time. If you update your own entitlement table from them, the app can fetch the latest state on launch. I host my Rork (Expo) backends on Cloudflare Workers, so here is an example of receiving them in a Worker.
+
+```typescript
+// worker/notifications.ts (Cloudflare Workers)
+// Map each store's notification types to EntitlementState
+type Store = 'apple' | 'google';
+
+function mapApple(notificationType: string, subtype?: string): EntitlementState {
+  switch (notificationType) {
+    case 'DID_RENEW':
+    case 'SUBSCRIBED':
+      return 'active';
+    case 'DID_FAIL_TO_RENEW':
+      // subtype GRACE_PERIOD means grace; otherwise move to hold
+      return subtype === 'GRACE_PERIOD' ? 'grace' : 'hold';
+    case 'EXPIRED':
+      return 'expired';
+    default:
+      return 'active'; // unknown types lean toward keeping access (never lock out by mistake)
+  }
+}
+
+function mapGoogle(notificationType: number): EntitlementState {
+  // Google Play RTDN subscriptionNotificationType
+  switch (notificationType) {
+    case 2:  // SUBSCRIPTION_RENEWED
+    case 4:  // SUBSCRIPTION_PURCHASED
+    case 7:  // SUBSCRIPTION_RESTARTED (recovered from hold)
+      return 'active';
+    case 6:  // SUBSCRIPTION_IN_GRACE_PERIOD
+      return 'grace';
+    case 5:  // SUBSCRIPTION_ON_HOLD
+      return 'hold';
+    case 3:  // SUBSCRIPTION_CANCELED
+    case 13: // SUBSCRIPTION_EXPIRED
+      return 'expired';
+    default:
+      return 'active';
+  }
+}
+```
+
+Notice that `default` leans toward `active` (keeping access). Rather than locking someone out on an unknown notification type, it is safer for both the user experience and revenue to keep access and revoke on the next definitive notification. The principle: only lock out when you positively know the subscription cancelled or expired.
+
+Always verify the signature before processing a store notification. ASSN V2 arrives as a JWS and Google RTDN as a Pub/Sub message; skipping verification lets a forged notification manipulate entitlements. I cover signature verification and idempotency (not double-processing the same notification) in detail in [the guide to running App Store Server Notifications V2 yourself](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription).
+
+## Leaning access toward "keep during grace, suspend at hold"
+
+When it comes time to use the normalized state in the app, one more decision remains: present features differently for `grace` versus `hold`. I settled on these rules.
+
+- `active` / `grace`: all premium features work. Show a subtle banner only during `grace`.
+- `hold`: lock premium features, but keep the data and state clearly that "update your card and you're back instantly."
+- `expired`: return to the normal non-member flow.
+
+```typescript
+// subscription/access.ts
+import { EntitlementSnapshot } from './types';
+
+export function canUsePremium(snap: EntitlementSnapshot): boolean {
+  // grace keeps access. hold/expired/never do not.
+  return snap.state === 'active' || snap.state === 'grace';
+}
+
+// Decide which kind of message to show
+export type RecoveryPrompt = 'none' | 'soft' | 'hard';
+
+export function recoveryPrompt(snap: EntitlementSnapshot): RecoveryPrompt {
+  if (snap.state === 'grace') return 'soft'; // still usable; nudge quietly
+  if (snap.state === 'hold') return 'hard';  // not usable; prompt clearly
+  return 'none';
+}
+```
+
+That `canUsePremium` includes `grace` as `true` is the heart of this article. Many implementations restrict it to `state === 'active'` only, killing the recovery opportunity that the grace period represents.
+
+## Splitting the in-app recovery flow into soft and hard
+
+The UI branches on the return value of `recoveryPrompt`. During grace (soft), don't stop any features — just show a small notice at the top of the screen. At hold (hard), block before the premium screen and send the user directly to the store's subscription management page.
+
+```tsx
+// components/RecoveryBanner.tsx
+import { Linking, Platform, Pressable, Text, View } from 'react-native';
+import { recoveryPrompt } from '../subscription/access';
+import { EntitlementSnapshot } from '../subscription/types';
+
+// Open the store's subscription management screen (the user updates their card here)
+function openManageSubscription() {
+  const url = Platform.OS === 'ios'
+    ? 'https://apps.apple.com/account/subscriptions'
+    : 'https://play.google.com/store/account/subscriptions';
+  Linking.openURL(url);
+}
+
+export function RecoveryBanner({ snap }: { snap: EntitlementSnapshot }) {
+  const kind = recoveryPrompt(snap);
+  if (kind === 'none') return null;
+
+  const soft = kind === 'soft';
+  return (
+    <View style={{
+      padding: 12,
+      backgroundColor: soft ? '#FFF7E6' : '#FDECEC',
+    }}>
+      <Text style={{ fontWeight: '600', marginBottom: 4 }}>
+        {soft ? 'We need to verify your payment' : 'Premium is paused'}
+      </Text>
+      <Text style={{ marginBottom: 8 }}>
+        {soft
+          ? `You can keep using everything until you update your card${
+              snap.graceUntil ? ` (through ${formatDate(snap.graceUntil)})` : ''
+            }.`
+          : 'Update your payment method and you are back instantly. Your data is still here.'}
+      </Text>
+      <Pressable onPress={openManageSubscription}>
+        <Text style={{ color: '#2563EB', fontWeight: '600' }}>
+          Manage subscription
+        </Text>
+      </Pressable>
+    </View>
+  );
+}
+
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+```
+
+Not writing "your data is still here" during the soft state is intentional. The user can still use the app during grace, so emphasizing data retention only stirs up anxiety. I surface data retention only in the hard state, where "fix it and you're back" is the reassuring message to lead with. A single line moves the recovery rate, so this is worth A/B testing.
+
+## Three pitfalls that trip people up
+
+Here are traps I actually hit while running this in production.
+
+First, **computing the expiration in local time**. Always store `graceUntil` as UTC ISO8601 and convert to the device timezone only at the moment of display. If the date drifts between server and client, you'll cut access while the grace hasn't expired, or the reverse.
+
+Second, **missing the recovery notification out of hold**. When a user fixes their card, Apple sends `DID_RENEW` and Google sends `SUBSCRIPTION_RESTARTED` (type 7). Forget to handle these recovery notifications and the user has paid again but access doesn't return — the worst kind of support ticket. Always handle the transition back to `active`.
+
+Third, **the difficulty of testing in Sandbox**. Grace and hold rarely occur naturally outside production. Apple's Sandbox compresses the subscription period to minutes, so triggering a failure deliberately requires steps like disabling the payment method on the Sandbox account. Google lets you simulate grace and hold through license testers in the Play Console. Make sure your test plan includes "do the failure notifications actually arrive." Refund-driven lapses are also easy to confuse, so validate them alongside [the implementation for detecting refunds and revoking entitlements](/articles/rork-dev/rork-subscription-refund-detection-entitlement-revocation).
+
+## Measure the recovery rate and refine the copy
+
+Once it's shipped, track the impact with a single number. I watch the recovery rate: of users who entered grace or hold, the share that returned to `active` within 30 days. Knowing this gives you a basis for improving the banner copy and timing.
+
+To measure it, record state transitions as events.
+
+```typescript
+// Emit an event the moment the state changes (analytics backend is up to you)
+function onEntitlementChange(prev: EntitlementState, next: EntitlementState) {
+  if (prev === 'active' && (next === 'grace' || next === 'hold')) {
+    track('billing_issue_entered', { from: prev, to: next });
+  }
+  if ((prev === 'grace' || prev === 'hold') && next === 'active') {
+    track('billing_issue_recovered', { from: prev });
+  }
+}
+```
+
+Take the ratio of `billing_issue_entered` to `billing_issue_recovered` and you get the recovery rate. Recovery from hold is harder than from grace, so viewing them separately makes the value of the grace period show up clearly in the numbers.
+
+A failed payment is not a lost customer — it's a recoverable one. Start by checking your own app: are you locking out failed-payment users on `state === 'active'` alone? Adding `grace` to that one line in `canUsePremium` is enough to reach revenue you have been quietly leaving on the table.
