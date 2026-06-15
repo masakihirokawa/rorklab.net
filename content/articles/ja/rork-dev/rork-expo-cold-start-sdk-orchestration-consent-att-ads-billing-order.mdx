@@ -1,0 +1,215 @@
+---
+title: "課金復元より先に広告を初期化したら、有料ユーザに一瞬広告が出た — Rork(Expo)アプリの起動順序設計"
+slug: "rork-expo-cold-start-sdk-orchestration-consent-att-ads-billing-order"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T11:15"
+updated: "2026-06-16T11:15"
+author: "Rork Lab"
+description: "同意取得・ATT・広告初期化・課金復元・リモート設定を、起動の数百ミリ秒のあいだにどの順番で走らせるか。順序を1つ間違えるだけで、有料ユーザに広告が一瞬出たり、EEA で同意なしの計測が走ったりします。Rork で生成した Expo アプリの起動処理を1つのオーケストレータに畳み、競合を設計で潰す手順を実装メモとしてまとめます。"
+tags: ["Rork", "Expo", "AdMob", "ATT", "起動シーケンス", "RevenueCat", "状態管理"]
+highlights:
+  - "同意 → ATT → 広告初期化 → 課金復元 の順序を1つの bootstrap 関数に畳んだ、コピーして動かせる完全な実装コードを手に入れられる"
+  - "「並列化してよい段」と「絶対に直列でなければならない段」を見分ける判断基準が分かり、起動時間を伸ばさずに順序事故を消せる"
+  - "有料ユーザに広告が一瞬出る／EEA で同意前に計測が走る、という気づきにくい順序ミスを、再現条件つきで事前に塞げる"
+---
+
+Rork で生成した Expo アプリに広告と課金を入れたあと、TestFlight のレビュアーから「起動直後に一瞬だけバナーが出て、すぐ消える」という報告をもらったことがあります。課金済みのアカウントでした。再現は難しく、コールドスタート、つまりアプリを完全に終了してから初めて開いたときだけ起きます。
+
+原因は機能のバグではなく、起動処理の順番でした。広告 SDK の初期化が先に終わり、最初のバナーが描画を始めたあとで、課金状態の復元が完了して「このユーザは広告非表示」と判定された。だから一瞬出てから消えたのです。
+
+起動の数百ミリ秒のあいだには、同意取得・ATT の許可ダイアログ・広告 SDK の初期化・課金の復元・リモート設定の取得が同時に走ろうとします。それぞれは正しく実装されていても、走る順番が噛み合っていないと、お金を払った読者に広告を見せたり、EEA の読者に同意前の計測を走らせたりします。この記事は、その起動シーケンスを1つのオーケストレータに畳んで、順序の事故を設計で潰すための実装メモです。個人開発で6本のアプリを並行運用してきたなかで、ここを直列に整理し直したことが、起動まわりの不具合がいちばん減った転換点でした。
+
+## 起動の数百ミリ秒で、何と何が競合するのか
+
+コールドスタートで走らせたい初期化を並べると、だいたい次の5つになります。
+
+- ユーザ同意の取得（EEA なら UMP、GDPR/UMP の詳しい設定は別記事に譲ります）
+- ATT（App Tracking Transparency）の許可ダイアログ
+- 広告 SDK（AdMob / メディエーション）の初期化
+- 課金状態の復元（サブスク・買い切り・リワード時限解除）
+- リモート設定とフィーチャーフラグの取得
+
+問題は、これらを `useEffect` のなかでそれぞれ独立に発火させると、終わる順番が実行ごとにばらつくことです。ネットワークが速い日は課金復元が先に終わり、遅い日は広告初期化が先に終わる。再現しないバグの典型で、私自身もしばらく「たまに起きる」で片付けていました。
+
+順番がばらつくと困るのは、段と段のあいだに「依存」があるからです。広告は同意の後でなければ出してはいけない。広告を出すかどうかは課金状態が確定していなければ決められない。この依存を無視して並列に走らせると、依存先がまだ終わっていない一瞬に、依存元が動いてしまいます。冒頭のバナーちらつきは、まさにこの「課金復元が広告初期化に間に合わなかった一瞬」でした。
+
+## なぜ「同意 → ATT → 広告初期化」は崩せないのか
+
+まず外せない直列の鎖が、同意と ATT と広告初期化の3つです。
+
+EEA の読者に対しては、同意を取る前に計測（App Measurement）を走らせてはいけません。`react-native-google-mobile-ads` では、設定で `delay_app_measurement_init` を `true` にして、最初の広告リクエストまで計測の初期化を遅らせます。これをしないと、同意ダイアログを出しているそばから計測が始まってしまいます。
+
+ATT は iOS のトラッキング許可です。AdMob の管理画面で ATT メッセージを設定しておくと、UMP の同意フローが ATT ダイアログも続けて出してくれるので、自前で順番を組まなくてもこの2つは1つの流れにまとまります。重要なのは、この同意・ATT の流れが完了してから `MobileAds().initialize()` を呼ぶことです。順番が逆だと、同意の結果を読む前に SDK が初期化され、パーソナライズの可否が正しく反映されません。
+
+最初に同意と ATT をまとめて取り、それが解決してから広告 SDK を初期化する。この鎖は短いですが、絶対に並列化してはいけない部分です。コードにすると次のようになります。
+
+```typescript
+import mobileAds from "react-native-google-mobile-ads";
+import {
+  AdsConsent,
+  AdsConsentStatus,
+} from "react-native-google-mobile-ads";
+
+// 同意 + ATT を1つの流れで解決する。
+// AdMob 側に ATT メッセージを設定しておくと、UMP が ATT ダイアログも続けて出す。
+async function gatherConsentThenInitAds(): Promise<void> {
+  try {
+    // 1) 同意情報を更新し、必要なら同意フォーム（と ATT）を提示する
+    const consentInfo = await AdsConsent.requestInfoUpdate();
+    if (
+      consentInfo.isConsentFormAvailable &&
+      consentInfo.status === AdsConsentStatus.REQUIRED
+    ) {
+      await AdsConsent.showForm();
+    }
+  } catch (e) {
+    // 同意フローが失敗しても起動は止めない。
+    // 広告はパーソナライズなし扱いで続行する。
+    console.warn("[bootstrap] consent flow failed, continuing non-personalized", e);
+  }
+
+  // 2) 同意・ATT が解決してから、初めて広告 SDK を初期化する
+  await mobileAds().initialize();
+}
+```
+
+ここで `try/catch` を広く取っているのは意図的です。同意フローはユーザのネットワークや地域に依存して失敗しうるので、失敗しても起動そのものは止めず、広告を「パーソナライズなし」で続行させます。起動シーケンスでは、各段の失敗が全体を巻き込まないように、段ごとに握りつぶす範囲を決めておくのが要点です。
+
+## 課金復元を、広告初期化より前に終わらせる
+
+冒頭のちらつきを根本から消すには、広告 SDK の初期化より前に課金状態を確定させます。正確には「広告を表示しはじめる前に、このユーザが広告非表示かどうかが分かっている」状態を作ります。
+
+課金復元はネットワークを伴うので速くはありません。そこで、まずローカルに保存しておいた前回の判定（買い切り済み・サブスク有効・リワード時限解除中か）を同期的に読み、それを初期値として広告の出し分けを始めます。サーバ確認は背後で走らせ、結果が変わったときだけ状態を更新します。こうすると、コールドスタートでも「最後に分かっていた課金状態」を即座に反映でき、有料ユーザに広告が出る瞬間が生まれません。
+
+```typescript
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+type AdFreeSnapshot = {
+  purchasedRemoveAds: boolean;   // 買い切りで広告解除
+  subscriptionActive: boolean;   // サブスク有効
+  rewardFreeUntil: number;       // リワード時限解除の期限（epoch ms, 0 = なし）
+};
+
+const SNAPSHOT_KEY = "adfree.snapshot.v1";
+
+// 起動直後に同期的な初期値として使う、ローカルの最終既知状態。
+async function readAdFreeSnapshot(): Promise<AdFreeSnapshot> {
+  try {
+    const raw = await AsyncStorage.getItem(SNAPSHOT_KEY);
+    if (!raw) return { purchasedRemoveAds: false, subscriptionActive: false, rewardFreeUntil: 0 };
+    return JSON.parse(raw) as AdFreeSnapshot;
+  } catch {
+    return { purchasedRemoveAds: false, subscriptionActive: false, rewardFreeUntil: 0 };
+  }
+}
+
+// スナップショットから「いま広告を消すべきか」を1つに畳む。
+function isAdFree(s: AdFreeSnapshot): boolean {
+  return s.purchasedRemoveAds || s.subscriptionActive || s.rewardFreeUntil > Date.now();
+}
+```
+
+広告を消す理由が複数あるときに、それを1か所に畳む設計そのものは[広告非表示の判定を1か所に集約する設計](/articles/rork-dev/rork-ad-free-state-source-of-truth-reward-window-expo)で詳しく書きました。起動順序の観点で大事なのは、この `isAdFree` が「サーバ確認の完了を待たずに、ローカルの最終既知状態で即答できる」ことです。サーバ確認を待ってから広告を出すと、待っているあいだ広告が出てしまうか、あるいは全ユーザの広告表示が数百ミリ秒遅れて収益を削ります。
+
+## 起動シーケンスを1つの bootstrap に畳む
+
+ここまでの順序を、画面の `useEffect` に散らさず、1つの非同期関数にまとめます。順序が一目で読めること自体が、いちばんの再発防止です。
+
+```typescript
+import mobileAds from "react-native-google-mobile-ads";
+
+type BootstrapResult = {
+  adFree: boolean;
+  remoteConfig: Record<string, unknown>;
+};
+
+// コールドスタートの初期化を、依存順に直列・並列を組み合わせて実行する。
+export async function bootstrap(): Promise<BootstrapResult> {
+  // --- 段0: ネットワーク不要で即座に読めるもの（同期的初期値）---
+  const snapshot = await readAdFreeSnapshot();
+  let adFree = isAdFree(snapshot);
+
+  // --- 段1: 並列でよいもの（互いに依存しない）---
+  //   リモート設定の取得と、課金のサーバ復元は同時に走らせてよい。
+  const remoteConfigP = fetchRemoteConfig();      // 自前実装（後述）
+  const entitlementsP = restoreEntitlements();    // RevenueCat 等のサーバ確認
+
+  // --- 段2: 同意 → ATT → 広告初期化（この鎖だけは直列・不可分）---
+  await gatherConsentThenInitAds();
+
+  // --- 段3: 課金復元の結果が出たら、広告非表示判定を確定する ---
+  try {
+    const fresh = await entitlementsP;
+    adFree = isAdFree(fresh);
+    await persistAdFreeSnapshot(fresh);  // 次回の同期的初期値として保存
+  } catch (e) {
+    // 復元に失敗してもローカルの最終既知状態で続行する
+    console.warn("[bootstrap] entitlement restore failed, using snapshot", e);
+  }
+
+  const remoteConfig = await remoteConfigP.catch(() => ({}));
+  return { adFree, remoteConfig };
+}
+```
+
+ここで効いているのは、段1の課金復元とリモート設定取得を**並列**にし、段2の同意・広告初期化を**直列**にしている点です。課金復元と同意フローは互いに依存しないので、待ち時間を重ねる必要はありません。広告 SDK の初期化が終わる頃には、たいてい課金復元も終わっていて、最初のバナーを出す前に `adFree` が確定しています。
+
+スプラッシュ画面は、この `bootstrap()` の Promise が解決するまで表示し続けます。`bootstrap()` が返ってから最初の広告ユニットを描画する、という1本道にすることで、「課金復元が間に合わなかった一瞬」という穴がそもそも生まれません。
+
+## リモート設定とフィーチャーフラグは、どの段に置くか
+
+リモート設定を最初に取りたくなる気持ちは分かります。広告のフロア値や配信オン・オフをサーバ側で握りたいからです。しかし、リモート設定の取得を起動の先頭で `await` してしまうと、ネットワークが遅い読者の起動全体がそこで止まります。
+
+私は、リモート設定を段1の並列グループに置き、**取得できなければ安全側のデフォルトで続行する**設計にしています。広告のフロア値や新機能のフラグは「取れたら反映、取れなければ既定値」で困りません。起動を止めてまで待つ価値があるリモート値は、実際にはほとんどありません。
+
+```typescript
+const REMOTE_DEFAULTS = {
+  adsEnabled: true,
+  interstitialMinIntervalSec: 60,
+};
+
+// 失敗しても起動を止めない。タイムアウトでデフォルトに倒す。
+async function fetchRemoteConfig(): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  try {
+    const res = await fetch("https://config.example.com/v1/app", {
+      signal: controller.signal,
+    });
+    if (!res.ok) return REMOTE_DEFAULTS;
+    return { ...REMOTE_DEFAULTS, ...(await res.json()) };
+  } catch {
+    return REMOTE_DEFAULTS;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+`AbortController` で 2.5 秒の上限を切っているのは、起動を人質に取らせないためです。リモート設定は「起動を速くしたまま、運用の自由度を持つ」ための道具であって、起動を遅くする理由にしてはいけない、というのが6本を運用してきての結論です。起動時間そのものの削り方は[起動時間の予算化と SDK 初期化の遅延設計](/articles/rork-dev/rork-startup-time-budget-deferred-sdk-init-six-apps)に分けて書いています。
+
+## よくある順序ミスと、そのときアプリに何が起きるか
+
+順序の事故は、クラッシュしないぶん見つけにくいのが厄介です。本番運用で踏んだ落とし穴と、レビューで指摘された注意点を、症状と回避策のセットで挙げます。どれも単体のコードは正しく動くので、原因の切り分けに時間を取られがちな部分です。
+
+**広告初期化を課金復元より先に置く。** 冒頭のちらつきが起きます。有料ユーザにコールドスタートの一瞬だけバナーが出て消える。再現条件は「アプリ完全終了 → 初回起動 → ネットワークが遅い」です。対策は、ローカルの最終既知状態で `adFree` を即答し、広告描画を `bootstrap()` 完了後に一本化することです。
+
+**同意取得より先に MobileAds を初期化する。** EEA の読者で、同意の可否が広告のパーソナライズに正しく反映されません。`delay_app_measurement_init` を入れていないと、同意前に計測まで走ります。対策は、同意・ATT を解決してから初期化する直列の鎖を守ることです。
+
+**ATT を MobileAds 初期化の後に出す。** iOS で、トラッキング許可の結果を読む前に広告が初期化され、許可した読者でも非パーソナライズ広告になりやすくなります。eCPM が想定より伸びない、という形で数字に出ます。ATT の出し方とタイミングそのものは[ATT 許可ダイアログの設計](/articles/rork-dev/rork-app-tracking-transparency-att-prompt-guide)に詳しく書きました。
+
+**リモート設定を起動の先頭で `await` する。** 機内モードや電波の弱い場所で、スプラッシュが何秒も明けません。ストアレビューに「起動が遅い」と書かれるのはたいていこれです。対策は、リモート設定をタイムアウトつきの並列段に移し、デフォルトで続行することです。
+
+これらに共通するのは、どれも「単体では正しく動く実装」だということです。壊れているのは順序だけで、だからこそ起動処理を1つの関数に集めて、順序を目で追える状態にしておく価値があります。
+
+## 並列化してよい段と、直列でなければならない段の見分け方
+
+最後に、順序を設計するときの判断基準を1つにまとめます。問いはシンプルで、「この段の結果を、次の段が読むか」です。
+
+読むなら直列にします。広告初期化は同意の結果を読むので直列。広告表示は課金状態を読むので、課金確定が先。読まないなら並列にしてよい。課金のサーバ復元とリモート設定の取得は互いの結果を参照しないので、同時に走らせて待ち時間を重ねません。
+
+この基準で並べ直すと、起動シーケンスは「同期で読める初期値 → 互いに独立な並列群 → 結果を参照し合う直列の鎖 → 確定」という4層に自然と整理されます。新しい SDK を足すときも、「これは誰かの結果を読むか／誰かに読まれるか」を1問だけ自分に聞けば、どの層に置くべきかが決まります。順序の判断を毎回ゼロから悩まずに済むのが、この畳み方のいちばんの利点だと感じています。
+
+起動まわりに不可解な「たまに出る」不具合を抱えているなら、まず今日できるのは、散らばった初期化を1つの `bootstrap()` に集めて、上から順に読めるようにすることです。順序を可視化するだけで、競合のほとんどは設計の段階で見えるようになります。

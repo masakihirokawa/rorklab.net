@@ -1,0 +1,215 @@
+---
+title: "I Initialized Ads Before Restoring Purchases, and Paying Users Saw a Banner Flash — Cold-Start Ordering for Rork (Expo) Apps"
+slug: "rork-expo-cold-start-sdk-orchestration-consent-att-ads-billing-order"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T11:15"
+updated: "2026-06-16T11:15"
+author: "Rork Lab"
+description: "Consent, ATT, ad SDK init, purchase restore, and remote config all try to run in the same few hundred milliseconds at launch. Get the order wrong and a paying user sees a banner flash, or measurement fires before consent in the EEA. Here is how I fold a Rork-generated Expo app's startup into a single orchestrator and kill the races by design."
+tags: ["Rork", "Expo", "AdMob", "ATT", "startup-sequence", "RevenueCat", "state-management"]
+highlights:
+  - "You will get a complete, copy-and-run bootstrap function that folds consent, ATT, ad init, and purchase restore into one ordered sequence"
+  - "You will learn how to tell a stage that must run serially from one that can run in parallel, so you remove ordering bugs without inflating launch time"
+  - "You will be able to pre-empt the easy-to-miss ordering mistakes (a banner flashing for paying users, measurement firing before consent in the EEA) with exact repro conditions"
+---
+
+After adding ads and in-app purchases to a Rork-generated Expo app, a TestFlight reviewer told me that "a banner flashes for a split second at launch, then disappears." The account was a paying one. It was hard to reproduce: it only happened on a cold start, meaning the very first open after fully quitting the app.
+
+The cause was not a feature bug. It was the order of the startup work. The ad SDK finished initializing first, the first banner began to draw, and only then did the purchase restore complete and decide "this user should not see ads." So the banner appeared for an instant and was pulled.
+
+In those few hundred milliseconds at launch, consent gathering, the ATT permission dialog, ad SDK initialization, purchase restoration, and remote config fetching all try to run at once. Each can be implemented correctly and still, if the order does not line up, you show ads to people who paid, or run measurement before consent for readers in the EEA. This is an implementation note on folding that startup sequence into a single orchestrator so the ordering accidents are designed out. Running six apps in parallel as a solo developer, rewriting this part into one explicit serial flow was the turning point where launch-time bugs dropped the most.
+
+## What Actually Competes in the First Few Hundred Milliseconds
+
+List the initialization you want on a cold start and it usually comes down to five things.
+
+- Gathering user consent (UMP in the EEA; I leave the detailed GDPR/UMP setup to a separate article)
+- The ATT (App Tracking Transparency) permission dialog
+- Ad SDK (AdMob / mediation) initialization
+- Restoring purchase state (subscription, one-time remove-ads, reward-based timed unlock)
+- Fetching remote config and feature flags
+
+The problem is that if you fire each of these independently inside its own `useEffect`, the order in which they finish varies from run to run. On a fast network the purchase restore finishes first; on a slow one the ad init finishes first. It is the classic non-reproducible bug, and for a while I, too, filed it under "happens sometimes."
+
+The reason the varying order hurts is that there are dependencies between the stages. Ads must not run before consent. Whether to show ads cannot be decided until purchase state is settled. Ignore these dependencies and run everything in parallel, and the dependent stage acts during the brief moment its dependency has not finished. That banner flash at the top was exactly the instant when "purchase restore did not make it in time for ad init."
+
+## Why "Consent → ATT → Ad Init" Cannot Be Broken Apart
+
+The first unbreakable serial chain is the three of consent, ATT, and ad initialization.
+
+For readers in the EEA, you must not run measurement (App Measurement) before consent is obtained. In `react-native-google-mobile-ads` you set `delay_app_measurement_init` to `true` in the config so that measurement initialization is delayed until the first ad request. Without this, measurement starts the moment you are still presenting the consent dialog.
+
+ATT is iOS's tracking permission. If you configure an ATT message in your AdMob console, the UMP consent flow will present the ATT dialog right after, so you do not have to sequence those two yourself. The important part is to call `MobileAds().initialize()` only after that consent-and-ATT flow completes. Reverse the order and the SDK initializes before you can read the consent result, so personalization eligibility is not reflected correctly.
+
+Gather consent and ATT first, and initialize the ad SDK only once that resolves. The chain is short, but it is the part you must never parallelize. In code:
+
+```typescript
+import mobileAds from "react-native-google-mobile-ads";
+import {
+  AdsConsent,
+  AdsConsentStatus,
+} from "react-native-google-mobile-ads";
+
+// Resolve consent + ATT in one flow.
+// With an ATT message configured in AdMob, UMP also presents the ATT dialog.
+async function gatherConsentThenInitAds(): Promise<void> {
+  try {
+    // 1) Refresh consent info; show the form (and ATT) if required
+    const consentInfo = await AdsConsent.requestInfoUpdate();
+    if (
+      consentInfo.isConsentFormAvailable &&
+      consentInfo.status === AdsConsentStatus.REQUIRED
+    ) {
+      await AdsConsent.showForm();
+    }
+  } catch (e) {
+    // If the consent flow fails, do not block launch.
+    // Continue with ads treated as non-personalized.
+    console.warn("[bootstrap] consent flow failed, continuing non-personalized", e);
+  }
+
+  // 2) Only after consent/ATT resolves do we initialize the ad SDK
+  await mobileAds().initialize();
+}
+```
+
+The wide `try/catch` here is deliberate. The consent flow can fail depending on the user's network or region, so on failure we do not stop the launch itself; we let ads continue as "non-personalized." In a startup sequence, the trick is to decide per stage how far a failure is allowed to be swallowed, so one stage's failure does not take the whole launch down.
+
+## Settle Purchase State Before Ad Initialization
+
+To remove the flash at its root, settle purchase state before the ad SDK initializes. More precisely, create a state where "before ads begin to display, we already know whether this user is ad-free."
+
+Purchase restoration involves the network, so it is not fast. So first read, synchronously, last time's locally-saved verdict (whether remove-ads was purchased, the subscription is active, or a reward timed-unlock is in effect), and use that as the initial value to start gating ads. The server check runs in the background, and you update state only when the result changes. This way, even on a cold start, you can immediately reflect the "last known purchase state," and there is no moment where a paying user sees an ad.
+
+```typescript
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+type AdFreeSnapshot = {
+  purchasedRemoveAds: boolean;   // one-time remove-ads
+  subscriptionActive: boolean;   // subscription active
+  rewardFreeUntil: number;       // reward timed-unlock expiry (epoch ms, 0 = none)
+};
+
+const SNAPSHOT_KEY = "adfree.snapshot.v1";
+
+// The last-known local state, used as a synchronous initial value at launch.
+async function readAdFreeSnapshot(): Promise<AdFreeSnapshot> {
+  try {
+    const raw = await AsyncStorage.getItem(SNAPSHOT_KEY);
+    if (!raw) return { purchasedRemoveAds: false, subscriptionActive: false, rewardFreeUntil: 0 };
+    return JSON.parse(raw) as AdFreeSnapshot;
+  } catch {
+    return { purchasedRemoveAds: false, subscriptionActive: false, rewardFreeUntil: 0 };
+  }
+}
+
+// Fold the snapshot into a single "should we hide ads right now?"
+function isAdFree(s: AdFreeSnapshot): boolean {
+  return s.purchasedRemoveAds || s.subscriptionActive || s.rewardFreeUntil > Date.now();
+}
+```
+
+When there are several reasons to hide ads, the design of folding them into one place is covered in detail in [consolidating the ad-free decision into a single source of truth](/articles/rork-dev/rork-ad-free-state-source-of-truth-reward-window-expo). From the ordering angle, what matters is that this `isAdFree` can answer immediately from the last-known local state, without waiting for the server check to finish. If you wait for the server check before showing ads, then either ads show while you wait, or every user's ad display is delayed by hundreds of milliseconds, shaving revenue.
+
+## Fold the Startup Sequence Into One bootstrap
+
+Take the order so far and, instead of scattering it across each screen's `useEffect`, gather it into one async function. The fact that the order can be read at a glance is itself the strongest prevention against regressions.
+
+```typescript
+import mobileAds from "react-native-google-mobile-ads";
+
+type BootstrapResult = {
+  adFree: boolean;
+  remoteConfig: Record<string, unknown>;
+};
+
+// Run cold-start initialization with serial and parallel mixed by dependency order.
+export async function bootstrap(): Promise<BootstrapResult> {
+  // --- Stage 0: readable without the network (synchronous initial value) ---
+  const snapshot = await readAdFreeSnapshot();
+  let adFree = isAdFree(snapshot);
+
+  // --- Stage 1: things that may run in parallel (no mutual dependency) ---
+  //   Remote config fetch and the server-side purchase restore can run together.
+  const remoteConfigP = fetchRemoteConfig();      // custom (below)
+  const entitlementsP = restoreEntitlements();    // server check, e.g. RevenueCat
+
+  // --- Stage 2: consent -> ATT -> ad init (this chain alone is serial & atomic) ---
+  await gatherConsentThenInitAds();
+
+  // --- Stage 3: once purchase restore returns, finalize the ad-free decision ---
+  try {
+    const fresh = await entitlementsP;
+    adFree = isAdFree(fresh);
+    await persistAdFreeSnapshot(fresh);  // save as the next synchronous initial value
+  } catch (e) {
+    // If restore fails, continue with the last-known local state
+    console.warn("[bootstrap] entitlement restore failed, using snapshot", e);
+  }
+
+  const remoteConfig = await remoteConfigP.catch(() => ({}));
+  return { adFree, remoteConfig };
+}
+```
+
+What does the work here is that Stage 1's purchase restore and remote config fetch run in **parallel**, while Stage 2's consent and ad init run **serially**. Purchase restore and the consent flow do not depend on each other, so there is no need to stack their wait times. By the time ad SDK initialization finishes, purchase restore is usually done too, and `adFree` is settled before the first banner appears.
+
+Keep the splash screen up until this `bootstrap()` Promise resolves. By making it a single path — render the first ad unit only after `bootstrap()` returns — the hole of "purchase restore did not make it in time" never opens in the first place.
+
+## Where Do Remote Config and Feature Flags Belong?
+
+The urge to fetch remote config first is understandable. You want to hold ad floor values and delivery on/off on the server. But if you `await` the remote config fetch at the very head of launch, the entire launch for a reader on a slow network stalls there.
+
+I place remote config in Stage 1's parallel group and design it to **continue with safe defaults if it cannot be fetched**. Ad floor values and feature flags are fine as "apply if fetched, default if not." There are, in practice, almost no remote values worth halting launch to wait for.
+
+```typescript
+const REMOTE_DEFAULTS = {
+  adsEnabled: true,
+  interstitialMinIntervalSec: 60,
+};
+
+// Do not block launch on failure. Fall back to defaults on timeout.
+async function fetchRemoteConfig(): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  try {
+    const res = await fetch("https://config.example.com/v1/app", {
+      signal: controller.signal,
+    });
+    if (!res.ok) return REMOTE_DEFAULTS;
+    return { ...REMOTE_DEFAULTS, ...(await res.json()) };
+  } catch {
+    return REMOTE_DEFAULTS;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+The 2.5-second ceiling via `AbortController` is there to stop launch from being held hostage. Remote config is a tool for keeping operational flexibility while launch stays fast; it must not become a reason for launch to be slow. That is my conclusion from running six apps. How to trim launch time itself I split into [budgeting launch time and deferring SDK initialization](/articles/rork-dev/rork-startup-time-budget-deferred-sdk-init-six-apps).
+
+## Common Ordering Mistakes, and What Each Does to the App
+
+Ordering accidents are nasty precisely because they do not crash. Here are the ones I actually stepped on or had flagged in review, paired with their symptoms.
+
+**Putting ad init before purchase restore.** The flash at the top. A paying user sees a banner for an instant on cold start and it disappears. Repro conditions: "full quit -> first launch -> slow network." The fix is to answer `adFree` immediately from the last-known local state and unify ad rendering to after `bootstrap()` completes.
+
+**Initializing MobileAds before gathering consent.** For EEA readers, the consent verdict is not reflected correctly in ad personalization. Without `delay_app_measurement_init`, measurement runs before consent. The fix is to keep the serial chain that initializes only after consent and ATT resolve.
+
+**Showing ATT after MobileAds init.** On iOS, ads are initialized before the tracking permission result can be read, so even readers who allowed tracking tend to get non-personalized ads. It surfaces in the numbers as eCPM not rising as expected. The how and when of presenting ATT itself I wrote up in [designing the ATT permission dialog](/articles/rork-dev/rork-app-tracking-transparency-att-prompt-guide).
+
+**`await`-ing remote config at the head of launch.** In airplane mode or a weak-signal spot, the splash does not clear for several seconds. "Slow to launch" in store reviews is usually this. The fix is to move remote config into a timed-out parallel stage and continue with defaults.
+
+What these share is that each is "an implementation that works correctly on its own." Only the order is broken — which is exactly why it is worth gathering startup work into one function so the order can be followed by eye.
+
+## How to Tell a Parallel Stage From a Serial One
+
+Finally, one criterion for designing the order. The question is simple: "Does the next stage read this stage's result?"
+
+If it reads it, make it serial. Ad init reads the consent result, so it is serial. Ad display reads purchase state, so purchase settlement comes first. If it does not read it, you may parallelize. The server-side purchase restore and the remote config fetch do not reference each other's results, so run them together and do not stack the wait.
+
+Re-order by this criterion and the startup sequence naturally settles into four layers: "synchronously-readable initial values -> mutually-independent parallel group -> the serial chain that reads each other's results -> settled." When you add a new SDK, ask yourself just one question — "does this read someone's result, or is it read by someone?" — and which layer it belongs to is decided. Not having to agonize over the ordering from scratch every time is, I feel, the biggest benefit of folding it this way.
+
+If you are carrying an inexplicable "happens sometimes" bug around launch, the thing you can do today is gather the scattered initialization into one `bootstrap()` and make it readable top to bottom. Just by making the order visible, most of the races become something you can see at the design stage.
