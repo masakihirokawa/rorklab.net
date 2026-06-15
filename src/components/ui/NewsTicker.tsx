@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORK MAX — Rork MaxがiPhone・iPad・Apple Watch・Apple TV・Vision Pro向けのネイティブSwiftアプリを生成できるようになりました",
-    "PUBLISH — Rork Maxは Xcode不要の「2クリックApp Store公開」に対応。申請・公開までの摩擦を大きく減らします",
-    "EXPO — 標準のRorkはReact Native（Expo）ベースで、プレーンな英語の説明からiOS／Androidネイティブアプリを生成します",
-    "PRICING — Rorkは無料で始められ、有料プランは月額$25から。個人開発で試しやすい価格帯です",
-    "FUNDING — Rorkがa16z（Andreessen Horowitz）から$2.8Mを調達。AIアプリビルダー領域への資金流入が続いています",
-    "REVIEW — 実運用では生成コードの可読性・保守性、Expo由来の制約、課金・プッシュ・広告SDKの組み込みやすさが評価の鍵になります",
+    "FUNDING — Rorkが$15Mを調達。「次世代のApp Store起業家を支える」ラウンドで、1年足らずでWebトラフィック上モバイルアプリ構築AIとして世界最大規模に成長しました",
+    "MAX — Rork MaxはClaude CodeとOpus 4.6を動力に、React NativeではなくネイティブSwiftアプリを生成。Appleエコシステム全体をネイティブ性能で狙います",
+    "APPLE — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応。Live Activities・Dynamic Island・HealthKit・HomeKit・NFC・Core MLなども解放されます",
+    "AR — Rork MaxはAR/LiDARスキャンやMetalによる3Dゲームなど、React Nativeでは届きにくいネイティブ領域までカバーします",
+    "TRACTION — Rork Maxの発表はXで800万回超のインプレッションを集め、2週間で年間収益が倍増したと報じられています",
+    "SWIFT — AIがどこまで実用水準のネイティブSwiftを出力できるか、小さなアプリで実際に検証する価値が高まっています",
   ],
   en: [
-    "RORK MAX — Rork Max can now build native Swift apps for iPhone, iPad, Apple Watch, Apple TV, and Vision Pro",
-    "PUBLISH — Rork Max offers two-click App Store publishing with no Xcode required, cutting the friction of getting an app shipped",
-    "EXPO — The standard Rork is built on React Native (Expo), generating native iOS and Android apps from plain-English descriptions",
-    "PRICING — Rork is free to start, with paid plans beginning at $25/month, an accessible tier for solo developers",
-    "FUNDING — Rork raised $2.8M from a16z (Andreessen Horowitz) as investment keeps flowing into AI app builders",
-    "REVIEW — In real use the keys are generated-code readability and maintainability, Expo-related constraints, and how easily billing, push, and ad SDKs slot in",
+    "FUNDING — Rork raised $15M to power the next generation of App Store entrepreneurs, having grown in under a year into the largest AI mobile-app builder by web traffic",
+    "MAX — Rork Max, powered by Claude Code and Opus 4.6, generates native Swift apps instead of React Native, targeting the full Apple ecosystem at native performance",
+    "APPLE — It supports iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, unlocking Live Activities, Dynamic Island, HealthKit, HomeKit, NFC, and Core ML",
+    "AR — Rork Max reaches native territory React Native struggles with, including AR/LiDAR scanning and 3D games rendered with Metal",
+    "TRACTION — The Rork Max launch drew over 8M impressions on X and reportedly doubled annual revenue within two weeks",
+    "SWIFT — How far AI can produce production-grade native Swift is worth testing firsthand on a small app",
   ],
 };
 
