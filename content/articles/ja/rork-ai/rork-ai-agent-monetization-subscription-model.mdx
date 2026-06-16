@@ -3,16 +3,22 @@ title: "Rork で AI エージェントを SaaS 化する — サブスクリプ�
 slug: "rork-ai-agent-monetization-subscription-model"
 category: "rork-ai"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-04-28T11:00"
 author: "Rork Lab"
-description: "Rork で構築した AI エージェントを完全な SaaS プロダクトに変える方法を解説します。Stripe + RevenueCat を使った複数の収益化チャネルを実装し、月額 $100K の売上を目指す実装ガイドです。"
+description: "Rork で作った AI エージェントを SaaS として運用するための実装ノートです。Stripe と RevenueCat の二重課金源をどう突合するか、Webhook の冪等化、解約手前の自動リカバリまで、実運用で詰まった箇所を中心に整理しました。"
 tags: ["Rork", "AI-agent", "SaaS", "monetization", "Stripe", "RevenueCat", "subscription", "API-billing", "affiliate"]
+highlights:
+  - "Stripe と RevenueCat という2つの課金源を、サーバー側でどう1つのエンタイトルメントに突合するかの設計"
+  - "Webhook を冪等にして二重課金・権限の取りこぼしを防ぐ実装パターン"
+  - "支払い失敗から解約までの猶予期間を自動制御し、Win-back につなげる運用フロー"
 
 ---
-「SaaS になりたかったら、エージェントを SaaS にしろ」というのが 2026 年の流れです。Rork でエージェントを作るのは簡単です。でも、それをお金に変えるのは別問題。料金体系、請求エンジン、顧客管理、API キーローテーション……。やることが多い。
+個人開発でアプリを公開してきて、いちばん神経を使うのは「お金が正しく動いているか」を保証する部分でした。機能を足すのは楽しいのですが、課金まわりは静かに壊れます。ある月、サブスクの解約をユーザーが行ったのに権限がしばらく残り続けていたことがありました。原因は Webhook の取りこぼしでした。
 
-Rork で構築したエージェントを、完全な SaaS プロダクトに変える方法を順を追って整理していきます。実装するのは、三層の収益化モデルです。
+Rork でエージェントを組み立てるところまでは、本当にあっという間です。難しいのはその先、「動くものを、お金が絡んでも安心して回せるサービスにする」ところです。料金体系、請求エンジン、顧客管理、API キーのローテーション。どれも地味ですが、ここを雑に作ると後でユーザーの信頼を失います。
+
+以下では、Rork で作ったエージェントを SaaS として運用するために私が実際に組んだ構成を、つまずいた箇所を中心に整理していきます。土台になるのは三層の収益化モデルです。
 
 1. **サブスクリプション層** — 月額プラン（Free / Pro / Enterprise）
 2. **API 課金層** — 使用量ベースの従量課金
@@ -652,20 +658,140 @@ export default function Dashboard() {
 }
 ```
 
-## 結び：三層モデルの威力
+## Webhook を冪等にする — 二重課金と取りこぼしを防ぐ
 
-このアーキテクチャを実装すれば、1 つの Rork エージェントから複数の収益ストリームを生み出せます。
+課金の本番運用で最初に痛い目を見たのが、ここでした。Stripe は Webhook の配信を保証するために、同じイベントを何度も再送します。ネットワークが一瞬切れただけでも再送が来ます。受け取る側が「同じイベントを2回処理しても1回分の結果になる」ように作っておかないと、権限の付与が重複したり、逆に順序が入れ替わって古い状態で上書きしたりします。
 
-- **サブスク層**: 中核の安定収入
-- **従量課金層**: エンタープライズユーザーからの追加収入
-- **Affiliate 層**: パッシブ収入 & マーケティング
+私は、処理済みイベントを記録するテーブルを一枚挟むだけで、この大半を防げると学びました。
 
-月額 $100K を目指すなら、この三層が必須です。1 層だけに頼るのではなく、複数の収益化チャネルを持つことで、一つの下降に強いビジネスモデルが完成します。
+```typescript
+// app/api/webhooks/stripe/route.ts（冪等化版）
+import Stripe from 'stripe';
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
 
-## 12年の個人開発で見えてきたこと
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 
-### リリース直後にチェックしているもの
+export async function POST(req: NextRequest) {
+  const body = await req.text();
+  const sig = req.headers.get('stripe-signature')!;
 
-- クラッシュレポートの上位エラーを24時間ごとに確認しているか
-- AdMob/StoreKit の収益ダッシュボードに異常検知が出ていないか
-- ユーザーレビューに技術的な指摘が含まれていないか
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      body, sig, process.env.STRIPE_WEBHOOK_SECRET!
+    );
+  } catch {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+
+  // 1) event.id を主キーにして「初回だけ INSERT が通る」状態を作る
+  const firstTime = await db.processedEvents
+    .create({ data: { id: event.id, type: event.type } })
+    .then(() => true)
+    .catch(() => false); // 一意制約違反 = すでに処理済み
+
+  if (!firstTime) {
+    // 再送。200 を返して Stripe に「もう要らない」と伝える
+    return NextResponse.json({ received: true, duplicate: true });
+  }
+
+  if (event.type === 'customer.subscription.updated') {
+    const sub = event.data.object as Stripe.Subscription;
+    const customerId = sub.customer as string;
+    const planId = getPlanIdFromPriceId(sub.items.data[0].price.id);
+
+    // 2) 順序逆転対策：current_period_end が現在値より新しい時だけ更新
+    await db.$transaction(async (tx) => {
+      const cur = await tx.subscriptions.findUnique({ where: { customerId } });
+      const incomingEnd = sub.current_period_end;
+      if (cur && cur.periodEnd && cur.periodEnd > incomingEnd) {
+        return; // 古いイベントなので無視
+      }
+      await tx.subscriptions.update({
+        where: { customerId },
+        data: { plan: planId, status: sub.status, periodEnd: incomingEnd },
+      });
+    });
+  }
+
+  return NextResponse.json({ received: true });
+}
+```
+
+ポイントは2つです。`event.id` の一意制約を「ロック代わり」に使うこと、そして `current_period_end` を比較して古いイベントを捨てること。再送と順序逆転は別々の問題なので、片方だけでは足りません。私はここを片方しか作っておらず、テスト環境では問題なく、本番の負荷で初めて顕在化しました。
+
+## エンタイトルメントの真実を1か所に持つ — Stripe と RevenueCat の突合
+
+サブスクを Web（Stripe）とアプリ内課金（RevenueCat 経由の App Store / Google Play）の両方で売り始めると、「この人は今どのプランなのか」を答える場所が2つに割れます。Stripe を見ると Pro、RevenueCat を見ると Free、という食い違いが普通に起きます。同じユーザーが両方で課金したり、片方で解約したりするからです。
+
+私の結論は、課金源は複数あっていいが、エンタイトルメント（権限）の正本は必ず1つにする、ということでした。各 Webhook はそれぞれ「自分の源での状態」を書き込むだけにして、最終的な権限は読み取り時にサーバー側で1回だけ解決します。
+
+```typescript
+// lib/entitlement.ts
+type Source = 'stripe' | 'revenuecat';
+
+interface SourceState {
+  source: Source;
+  plan: 'free' | 'pro' | 'enterprise';
+  active: boolean;
+  periodEnd: number; // unix秒
+}
+
+// 各 Webhook はこのテーブルに「自分の源の状態」だけを upsert する
+async function readSourceStates(userId: string): Promise<SourceState[]> {
+  return db.entitlementSources.findMany({ where: { userId } });
+}
+
+const PLAN_RANK = { free: 0, pro: 1, enterprise: 2 } as const;
+
+// 真実は読み取り時に1回だけ計算する
+export async function resolveEntitlement(userId: string) {
+  const states = await readSourceStates(userId);
+  const now = Math.floor(Date.now() / 1000);
+
+  // アクティブで期限内のものだけ採用し、最上位プランを正とする
+  const valid = states.filter((s) => s.active && s.periodEnd > now);
+  if (valid.length === 0) return { plan: 'free' as const, source: null };
+
+  const top = valid.reduce((a, b) =>
+    PLAN_RANK[b.plan] > PLAN_RANK[a.plan] ? b : a
+  );
+  return { plan: top.plan, source: top.source };
+}
+```
+
+「最上位プランを正にする」のは、二重課金しているユーザーに不利益を与えないためです。返金や解約の調整は別途行うとして、まず権限の見え方で損をさせない。これは収益最大化よりユーザーの信頼を優先した判断で、長く運用するほどこちらが効いてくると感じています。
+
+突合のずれを検知したいときは、日次バッチで `entitlementSources` を走査し、同一ユーザーで源ごとにプランが食い違うレコードを抽出してダッシュボードに出すだけでも十分でした。完全自動で直そうとせず、まず「見える化」してから手当てする方が事故が少なかったです。
+
+## 解約の手前で止める — Dunning と Win-back を自動化する
+
+解約の多くは「やめたい」ではなく「カードの期限切れ」でした。`invoice.payment_failed` を放置すると、本当は使い続けたかったユーザーまで失います。Stripe の Smart Retries に任せつつ、猶予期間（グレースピリオド）を設けて、その間は権限を即座には落とさない設計にしています。
+
+```typescript
+// 支払い失敗時：即解約にせず、猶予付きの past_due として扱う
+if (event.type === 'invoice.payment_failed') {
+  const invoice = event.data.object as Stripe.Invoice;
+  const customerId = invoice.customer as string;
+
+  await db.subscriptions.update({
+    where: { customerId },
+    data: {
+      status: 'past_due',
+      // 3日間は権限を維持。Stripe の再試行が成功すれば自動で active に戻る
+      graceUntil: Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60,
+    },
+  });
+
+  await sendDunningEmail(customerId); // 「カード情報の更新をお願いします」
+}
+```
+
+権限チェック側は、`active` に加えて「`past_due` かつ `graceUntil` 内」も有効とみなします。こうするだけで、カード更新による自然復帰が目に見えて増えました。完全に解約された後の Win-back は、`customer.subscription.deleted` を受けて期間限定のオファーコードを送る程度に留めています。しつこい引き止めは、かえって戻ってこなくなるというのが個人的な実感です。
+
+## 次の一歩
+
+三層モデルそのものより、課金が静かに壊れないための土台のほうが、運用では効いてきます。もし1つだけ今日から始めるなら、Webhook の冪等化をおすすめします。`event.id` を主キーにした処理済みテーブルを足すだけで、本番で最も起きやすい「二重付与」と「順序逆転」の両方に効きます。
+
+ここまでお読みいただき、ありがとうございました。同じように個人で課金まわりを抱えている方の、回り道を1つでも減らせたら嬉しいです。

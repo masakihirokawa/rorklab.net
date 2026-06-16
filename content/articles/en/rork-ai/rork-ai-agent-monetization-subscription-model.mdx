@@ -3,23 +3,27 @@ title: "Monetize Rork AI Agents as SaaS — Three-Layer Revenue Model (Subscript
 slug: "rork-ai-agent-monetization-subscription-model"
 category: "rork-ai"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-04-28T11:00"
 author: "Rork Lab"
-description: "Turn your Rork-built AI agent into a production SaaS with Stripe + RevenueCat integration. Implement subscriptions, metered billing, and affiliate payouts to reach $100K MRR."
+description: "Field notes on running a Rork-built AI agent as a SaaS: how to reconcile two billing sources (Stripe and RevenueCat) into one entitlement, make webhooks idempotent, and automate recovery before a cancellation lands."
 tags: ["Rork", "AI-agent", "SaaS", "monetization", "Stripe", "RevenueCat", "subscription", "API-billing", "affiliate"]
+highlights:
+  - "How to reconcile two billing sources (Stripe and RevenueCat) into a single server-side entitlement"
+  - "An idempotent webhook pattern that prevents double-charges and dropped entitlement state"
+  - "An automated grace-period and win-back flow that turns failed payments into recoveries"
 
 ---
 
-The path from "I built an AI agent" to "I make money from an AI agent" is longer than most realize. You've got the agent working in Rork. You've got users. But how do you actually collect payment?
+Shipping apps solo, the part that takes the most care isn't adding features — it's guaranteeing that money moves correctly. Features are fun; billing breaks quietly. One month a user cancelled their subscription but kept their access for a while afterward. The cause was a dropped webhook.
 
-This guide walks you through a proven three-layer revenue model:
+Getting an agent assembled in Rork is genuinely quick. The hard part comes after: turning a working thing into a service you can run confidently once money is involved. Pricing, the billing engine, customer management, API key rotation — all unglamorous, and all places where sloppiness costs you a user's trust later.
+
+This article walks through the setup I actually built to run a Rork agent as a SaaS, focused on the places I got stuck. The foundation is a three-layer revenue model:
 
 1. **Subscription Layer** — Recurring monthly revenue (Free / Pro / Enterprise)
 2. **Metered Billing Layer** — Per-request overages for power users
 3. **Affiliate Layer** — Partner resale with automatic commission payouts
-
-Together, these unlock $100K+ MRR. Let's build it.
 
 ## The SaaS Agent Architecture
 
@@ -530,9 +534,136 @@ export default function Dashboard() {
 }
 ```
 
-## Why Three Layers Win
+## Make Webhooks Idempotent — Stop Double-Charging and Dropped State
 
-Relying on one revenue model is risky. Subscriptions provide stability. Metered billing captures upside. Affiliate creates distribution.
+This is where billing first bit me in production. Stripe re-sends the same webhook event to guarantee delivery — a brief network hiccup is enough to trigger a retry. If your handler isn't built so that "processing the same event twice yields the same result as once," you'll either grant entitlements twice or, worse, overwrite fresh state with a stale, out-of-order event.
 
-Together, they get you to $100K MRR faster than any single approach. Build all three from day one.
+I learned that a single "processed events" table prevents most of this.
 
+```typescript
+// app/api/webhooks/stripe/route.ts (idempotent version)
+import Stripe from 'stripe';
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+export async function POST(req: NextRequest) {
+  const body = await req.text();
+  const sig = req.headers.get('stripe-signature')!;
+
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      body, sig, process.env.STRIPE_WEBHOOK_SECRET!
+    );
+  } catch {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 400 });
+  }
+
+  // 1) Use event.id's unique constraint as a lock: only the first INSERT wins
+  const firstTime = await db.processedEvents
+    .create({ data: { id: event.id, type: event.type } })
+    .then(() => true)
+    .catch(() => false); // unique violation = already processed
+
+  if (!firstTime) {
+    return NextResponse.json({ received: true, duplicate: true });
+  }
+
+  if (event.type === 'customer.subscription.updated') {
+    const sub = event.data.object as Stripe.Subscription;
+    const customerId = sub.customer as string;
+    const planId = getPlanIdFromPriceId(sub.items.data[0].price.id);
+
+    // 2) Guard against reordering: only apply if newer than current state
+    await db.$transaction(async (tx) => {
+      const cur = await tx.subscriptions.findUnique({ where: { customerId } });
+      if (cur && cur.periodEnd && cur.periodEnd > sub.current_period_end) {
+        return; // stale event, ignore
+      }
+      await tx.subscriptions.update({
+        where: { customerId },
+        data: { plan: planId, status: sub.status, periodEnd: sub.current_period_end },
+      });
+    });
+  }
+
+  return NextResponse.json({ received: true });
+}
+```
+
+Two ideas matter here: use `event.id` as a de-facto lock, and compare `current_period_end` to drop stale events. Retries and reordering are separate problems — solving one isn't enough. I had only built the first guard; it passed every test and only surfaced under real production load.
+
+## Keep One Source of Truth for Entitlements — Reconciling Stripe and RevenueCat
+
+Once you sell subscriptions through both the web (Stripe) and in-app purchases (App Store / Google Play via RevenueCat), the answer to "what plan is this user on right now?" lives in two places. Stripe says Pro, RevenueCat says Free — that mismatch happens routinely, because the same user can subscribe in both or cancel in one.
+
+My conclusion: you can have multiple billing sources, but entitlements must have exactly one source of truth. Each webhook writes only "the state at its own source." The final entitlement is resolved server-side, once, at read time.
+
+```typescript
+// lib/entitlement.ts
+type Source = 'stripe' | 'revenuecat';
+
+interface SourceState {
+  source: Source;
+  plan: 'free' | 'pro' | 'enterprise';
+  active: boolean;
+  periodEnd: number; // unix seconds
+}
+
+async function readSourceStates(userId: string): Promise<SourceState[]> {
+  return db.entitlementSources.findMany({ where: { userId } });
+}
+
+const PLAN_RANK = { free: 0, pro: 1, enterprise: 2 } as const;
+
+// Truth is computed once, at read time
+export async function resolveEntitlement(userId: string) {
+  const states = await readSourceStates(userId);
+  const now = Math.floor(Date.now() / 1000);
+
+  const valid = states.filter((s) => s.active && s.periodEnd > now);
+  if (valid.length === 0) return { plan: 'free' as const, source: null };
+
+  const top = valid.reduce((a, b) =>
+    PLAN_RANK[b.plan] > PLAN_RANK[a.plan] ? b : a
+  );
+  return { plan: top.plan, source: top.source };
+}
+```
+
+Picking the highest plan as the winner is deliberate: a user who happens to be billed in two places should never be under-served. Refund and cancellation cleanup happen separately — but the user's access should never suffer first. That's a trust-over-revenue call, and the longer you run a product, the more it pays off.
+
+To catch drift, a daily job that scans `entitlementSources` for users whose plans disagree across sources — and surfaces them on a dashboard — was enough. Don't try to auto-correct everything; make it visible first, then fix by hand. That caused far fewer accidents.
+
+## Stop Churn Before It Starts — Automating Dunning and Win-back
+
+Most cancellations weren't "I want to quit" — they were expired cards. Ignore `invoice.payment_failed` and you'll lose users who actually wanted to stay. I lean on Stripe Smart Retries, but add a grace period so access doesn't drop the instant a charge fails.
+
+```typescript
+// On payment failure: don't cancel — treat as past_due with grace
+if (event.type === 'invoice.payment_failed') {
+  const invoice = event.data.object as Stripe.Invoice;
+  const customerId = invoice.customer as string;
+
+  await db.subscriptions.update({
+    where: { customerId },
+    data: {
+      status: 'past_due',
+      // Keep access for 3 days; if Stripe's retry succeeds, it returns to active
+      graceUntil: Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60,
+    },
+  });
+
+  await sendDunningEmail(customerId); // "Please update your card"
+}
+```
+
+Your access check then treats both `active` and "`past_due` within `graceUntil`" as valid. That one change visibly increased natural recoveries from card updates. For genuinely cancelled users, I keep win-back minimal: a time-limited offer code on `customer.subscription.deleted`. In my experience, aggressive retention nags make people less likely to return.
+
+## Your Next Step
+
+The three-layer model matters less, day to day, than the plumbing that keeps billing from quietly breaking. If you do one thing today, make your webhooks idempotent. Adding a processed-events table keyed on `event.id` defends against the two most common production failures at once: double-grants and reordering.
+
+Thanks for reading. If this saved one detour for someone else wiring up billing solo, that's a good outcome.
