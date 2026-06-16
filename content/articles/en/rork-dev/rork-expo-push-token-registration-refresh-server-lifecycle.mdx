@@ -1,0 +1,133 @@
+---
+title: "Keeping Expo Push Tokens from Slipping Through the Cracks in Production"
+slug: "rork-expo-push-token-registration-refresh-server-lifecycle"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-06-16T10:30"
+author: "Rork Lab"
+description: "After adding re-engagement push to a Rork-generated Expo app, the delivered count came in well below the active install count. The cause was missed token updates and stale tokens left to pile up. Here is the lifecycle I settled on, with code: registration, refresh, server storage, and pruning."
+tags: ["Expo", "Push Notifications", "expo-notifications", "Rork", "Operations"]
+---
+
+When I sent a re-engagement notification to let wallpaper app users know about new themes, the number that actually got delivered was visibly smaller than the number of active devices.
+
+My first instinct was to blame the server-side send. But the real cause sat one step earlier: I was fetching the push token once on first launch, storing it, and never tracking what happened to it afterward.
+
+As an indie developer running several apps in parallel, this kind of quiet loss accumulates. "I sent it" does not mean "it arrived," and the gap rarely shows up in your dashboards until your return rate has already taken the hit. Here is the registration-to-expiry lifecycle I rebuilt.
+
+## A push token is not a fetch-once value
+
+The first thing to internalize is that a push token is a per-device value that can change.
+
+Tokens rotate on OS reinstalls, data restores, app reinstalls, and occasionally for backend reasons. Fetching one at first launch and saving it means your stored token drifts further from the actually-valid token as time passes.
+
+My original implementation was exactly this fetch-once shape. New users received notifications while long-time users did not — an inversion that made sense once I realized older installs simply had more chances for their token to rotate.
+
+The whole approach starts from treating the token not as a fixed value, but as something that can change at any time and should be re-confirmed on every run.
+
+## A minimal registration: permissions, projectId, Android channel
+
+Here is the fetch path in its smallest useful form, including the device check and permission request, using `expo-notifications` and `expo-device`.
+
+```tsx
+import * as Notifications from 'expo-notifications';
+import * as Device from 'expo-device';
+import { Platform } from 'react-native';
+import Constants from 'expo-constants';
+
+export async function registerPushToken(): Promise<string | null> {
+  // Simulators and emulators cannot return a token
+  if (!Device.isDevice) return null;
+
+  // Android requires a channel. Without it, notifications drop silently
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('default', {
+      name: 'default',
+      importance: Notifications.AndroidImportance.DEFAULT,
+    });
+  }
+
+  const current = await Notifications.getPermissionsAsync();
+  let status = current.status;
+  if (status !== 'granted') {
+    status = (await Notifications.requestPermissionsAsync()).status;
+  }
+  if (status !== 'granted') return null;
+
+  const projectId = Constants.expoConfig?.extra?.eas?.projectId;
+  const token = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  return token;
+}
+```
+
+The one place I stumbled was `projectId`. EAS builds often resolve it implicitly, but in development builds or certain configurations, leaving it unspecified makes the fetch fail. Passing it explicitly from `Constants.expoConfig?.extra?.eas?.projectId` avoids tokens silently failing to register across environments.
+
+Forget the Android channel and you land in the hardest state to diagnose: the token registers fine, but the notification never arrives. Always run the channel setup alongside the fetch.
+
+## Designing for token changes so nothing slips
+
+Once you can fetch a token, the next layer follows the changes. There are two parts: re-fetch and send on every launch, and subscribe to change events.
+
+```tsx
+import * as Notifications from 'expo-notifications';
+import { registerPushToken } from './registerPushToken';
+
+// Call on every app launch; the server dedupes by token
+export async function syncPushTokenOnLaunch(deviceId: string) {
+  const token = await registerPushToken();
+  if (token) {
+    await upsertToken({ deviceId, token, platform: Platform.OS });
+  }
+}
+
+// Catch the moment a token is swapped on the device
+export function listenTokenChanges(deviceId: string) {
+  return Notifications.addPushTokenListener(({ data }) => {
+    upsertToken({ deviceId, token: data, platform: Platform.OS });
+  });
+}
+```
+
+On the server, upsert the token using it as the unique key. Storing the device identifier and a last-updated timestamp alongside it means that even when an old and a new token both arrive from the same device, you can reconcile them last-write-wins.
+
+Sending on every launch looks wasteful, but it is your insurance against a missed change event. `addPushTokenListener` only works while the app is running, so pairing it with a launch-time re-fetch makes gaps far less likely.
+
+After moving to this two-layer approach, delivery to long-time users stabilized and re-engagement pushes started reaching the audience size I expected.
+
+## Don't hoard dead tokens: prune from send receipts
+
+Even with registration and refresh in order, tokens for uninstalled devices linger on the server. Leave them and you keep throwing every send at invalid destinations, while your delivery counts drift from reality.
+
+Expo's push send returns receipts, so use them to prune expired destinations.
+
+```js
+// After sending, query the receiptIds in batches (server-side Node)
+const receipts = await expo.getPushNotificationReceiptsAsync(receiptIds);
+
+for (const [receiptId, receipt] of Object.entries(receipts)) {
+  if (receipt.status === 'error') {
+    const code = receipt.details?.error;
+    if (code === 'DeviceNotRegistered') {
+      // This destination no longer exists; delete the token
+      await deleteTokenByReceipt(receiptId);
+    }
+  }
+}
+```
+
+The key is to read the receipts fetched a little after the send, not the immediate tickets. Deleting only the destinations that return `DeviceNotRegistered` prevents you from pruning live tokens over a transient error.
+
+Fold this cleanup into a weekly job and your destination list stays close to reality, which in turn makes your delivery numbers trustworthy.
+
+## Small judgments from running this across apps
+
+A few decisions hardened after running the same machinery across several apps.
+
+Requesting the permission right after onboarding gave worse opt-in rates than asking once the user had touched the app's value first. For a wallpaper app, the natural moment is right after they set their first image.
+
+I keyed server storage on the device rather than the user account. In apps where most people stay anonymous, a device-centric model keeps destination management simpler.
+
+And I started measuring delivery by "valid destinations" rather than "messages sent." The same way I read AdMob revenue — judging by what actually reached people, not by the surface number, tells you whether a change was good.
+
+Push is not a flashy feature. But closing these gaps one at a time quietly lifts the unglamorous number that is your return rate. I hope it helps anyone wrestling with the same thing.

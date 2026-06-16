@@ -1,0 +1,133 @@
+---
+title: "Expo のプッシュ通知トークンを本番で取りこぼさないために整えたこと"
+slug: "rork-expo-push-token-registration-refresh-server-lifecycle"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-06-16T10:30"
+author: "Rork Lab"
+description: "Rork で生成した Expo アプリに再訪促進のプッシュ通知を入れたところ、配信数がアクティブ数より明らかに少ない事態に直面しました。原因はトークンの取りこぼしと失効放置でした。取得から更新、サーバー保存、失効掃除までの運用設計を実装コード付きで記録します。"
+tags: ["Expo", "プッシュ通知", "expo-notifications", "Rork", "運用設計"]
+---
+
+壁紙アプリの利用者に新しいテーマの追加を知らせる再訪促進の通知を送ったとき、配信できた数がアクティブ端末の数より目に見えて少ないことに気づきました。
+
+最初はサーバー側の送信処理を疑ったのですが、調べていくと原因はもっと手前にありました。プッシュ通知トークンを「初回に一度だけ」取得して保存し、その後の変化を追っていなかったのです。
+
+個人開発でいくつかのアプリを並行して運用していると、こうした取りこぼしは静かに積み重なります。送ったつもりが届いていない、という状態は数字に表れにくく、気づいたときには再訪率に響いています。ここでは私自身が整え直した、トークンの取得から失効までの運用を共有します。
+
+## プッシュトークンは「一度取れば終わり」ではありません
+
+最初に押さえておきたいのは、プッシュ通知トークンが端末ごとに発行される、変化しうる値だという点です。
+
+トークンは OS の再インストール、データ復元、アプリの再インストール、まれにバックエンド側の事情で更新されます。つまり初回起動時に取得して保存しただけでは、時間が経つほど手元のトークンと実際に有効なトークンがずれていきます。
+
+私が最初に書いた実装は、まさにこの「初回一度だけ」型でした。新規利用者には届くのに、長く使ってくれている人ほど届かない、という逆転が起きていたのは、古い利用者ほどトークンが入れ替わる機会が多かったからです。
+
+運用の出発点は、トークンを固定値ではなく「いつでも変わりうる、毎回確認すべき値」として扱うことに尽きます。
+
+## 取得の最小実装 — 権限・projectId・Android チャンネル
+
+まず取得部分を、実機判定と権限取得を含めた最小の形で示します。Expo の `expo-notifications` と `expo-device` を使います。
+
+```tsx
+import * as Notifications from 'expo-notifications';
+import * as Device from 'expo-device';
+import { Platform } from 'react-native';
+import Constants from 'expo-constants';
+
+export async function registerPushToken(): Promise<string | null> {
+  // シミュレータ/エミュレータではトークンを取得できない
+  if (!Device.isDevice) return null;
+
+  // Android はチャンネル登録が前提。未登録だと通知が黙って落ちる
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('default', {
+      name: 'default',
+      importance: Notifications.AndroidImportance.DEFAULT,
+    });
+  }
+
+  const current = await Notifications.getPermissionsAsync();
+  let status = current.status;
+  if (status !== 'granted') {
+    status = (await Notifications.requestPermissionsAsync()).status;
+  }
+  if (status !== 'granted') return null;
+
+  const projectId = Constants.expoConfig?.extra?.eas?.projectId;
+  const token = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  return token;
+}
+```
+
+ここで一度つまずいたのが `projectId` です。EAS のビルドでは明示しなくても解決されることがありますが、開発ビルドや構成によっては未指定だと取得に失敗します。`Constants.expoConfig?.extra?.eas?.projectId` から明示的に渡しておくと、環境差で取得が落ちる事故を避けられます。
+
+Android のチャンネル登録を忘れると、トークンは取れているのに通知だけが届かない、という切り分けの難しい状態になります。取得処理とセットで必ず通しておくのが安全です。
+
+## トークンが変わったときに取りこぼさない設計
+
+取得できたら、次は「変化に追従する」仕組みを足します。要点は二つです。毎回の起動時に取り直してサーバーへ送ること、そして変更イベントを購読することです。
+
+```tsx
+import * as Notifications from 'expo-notifications';
+import { registerPushToken } from './registerPushToken';
+
+// アプリ起動時に毎回呼ぶ。サーバー側はトークンで重複排除する
+export async function syncPushTokenOnLaunch(deviceId: string) {
+  const token = await registerPushToken();
+  if (token) {
+    await upsertToken({ deviceId, token, platform: Platform.OS });
+  }
+}
+
+// 端末側でトークンが差し替わった瞬間を拾う
+export function listenTokenChanges(deviceId: string) {
+  return Notifications.addPushTokenListener(({ data }) => {
+    upsertToken({ deviceId, token: data, platform: Platform.OS });
+  });
+}
+```
+
+サーバー側はトークンを一意キーとして upsert します。端末識別子と最終更新時刻を一緒に持たせておくと、同じ端末から古いトークンと新しいトークンが両方届いても、後勝ちで整理できます。
+
+毎回の起動で送るのは一見無駄に見えますが、変更イベントを取りこぼした場合の保険になります。`addPushTokenListener` はアプリが動いている間しか働かないため、起動時の取り直しと二段構えにすることで、抜けが起きにくくなります。
+
+私はこの二段構えに変えてから、長期利用者への配信が安定し、再訪促進の通知が想定どおりの規模で届くようになりました。
+
+## 失効したトークンをためこまない — 送信レシートからの掃除
+
+取得と更新を整えても、アンインストールされた端末のトークンはサーバーに残り続けます。これを放置すると、送信のたびに無効な宛先へ投げ続け、配信数の集計も実態とずれていきます。
+
+Expo のプッシュ送信ではレシートが返るので、ここから失効した宛先を掃除します。
+
+```js
+// 送信後、receiptId をまとめて問い合わせる（サーバー側 Node）
+const receipts = await expo.getPushNotificationReceiptsAsync(receiptIds);
+
+for (const [receiptId, receipt] of Object.entries(receipts)) {
+  if (receipt.status === 'error') {
+    const code = receipt.details?.error;
+    if (code === 'DeviceNotRegistered') {
+      // この宛先はもう存在しない。トークンを削除する
+      await deleteTokenByReceipt(receiptId);
+    }
+  }
+}
+```
+
+ポイントは、送信直後のチケットではなく、少し時間を置いて取得するレシートを見ることです。`DeviceNotRegistered` が返った宛先だけを消すようにすると、一時的なエラーで生きているトークンまで削ってしまう事故を防げます。
+
+この掃除を週次の処理に組み込んでおくと、宛先リストが実態に近い状態で保たれ、配信数の数字も信頼できるものになります。
+
+## 複数アプリを運用して見えてきた小さな判断
+
+最後に、いくつかのアプリで同じ仕組みを回してみて固まった判断をいくつか残しておきます。
+
+トークンの取得は、初回オンボーディングの直後ではなく、利用者が一度アプリの価値に触れたあとに権限を求めるほうが許諾率が安定しました。壁紙アプリであれば、最初の一枚を設定し終えた直後が自然な頃合いです。
+
+サーバー側の保存は、利用者アカウントではなく端末単位を基本に置きました。匿名のまま使う人が多いアプリでは、端末を軸にしたほうが宛先の管理が素直になります。
+
+そして配信の集計は「送った数」ではなく「有効な宛先の数」を基準に見るようにしました。AdMob の収益と同じで、見かけの数字ではなく実際に届いた規模で判断するほうが、施策の良し悪しを正しく測れます。
+
+プッシュ通知は派手な機能ではありませんが、取りこぼしを一つずつ潰していくと、再訪という地味な数字が静かに底上げされていきます。同じところで困っている方の手がかりになれば幸いです。
