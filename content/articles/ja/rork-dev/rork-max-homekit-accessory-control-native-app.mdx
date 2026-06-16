@@ -1,0 +1,116 @@
+---
+title: "Rork Max のネイティブアプリから HomeKit のアクセサリを操作する — 個人開発で踏んだ権限と状態同期の勘所"
+slug: "rork-max-homekit-accessory-control-native-app"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T11:00"
+author: "Rork Lab"
+description: "Rork Max が生成するネイティブ Swift アプリに HomeKit を組み込み、自宅のアクセサリを一覧・操作する実装を、権限ダイアログの設計から状態同期の落とし穴まで通しで整理しました。React Native では届きにくい領域を、個人開発の実運用目線で押さえます。"
+tags: ["Rork Max", "HomeKit", "Swift", "スマートホーム", "権限設計", "状態同期"]
+highlights:
+  - "HMHomeManager の初期化タイミングと NSHomeKitUsageDescription の書き方を、審査で差し戻されない具体的な Info.plist と Swift コードで把握できます"
+  - "「アクセサリが一覧に出てこない」という HomeKit 特有の本番症状を、デリゲートの登録順序という原因まで切り分けられるようになります"
+  - "照明のオン・オフを実機で確実に反映させるための状態同期パターンと、私自身が個人開発で採用した判断基準が得られます"
+---
+スマートホーム連携の要望は、壁紙アプリのような小さな個人開発プロダクトにも意外な形で届きます。「寝室の照明と連動して、夜は画面も暗いテーマに切り替わってほしい」。そう言われたとき、自前でデバイスと通信するのではなく、iPhone がすでに束ねている HomeKit のアクセサリを借りる方が、ユーザーにとっても自然だと感じました。
+
+ところが HomeKit は、React Native のブリッジ越しに扱おうとすると途端に手が重くなる領域です。Rork Max はブラウザ上でネイティブ Swift アプリを生成できるため、`HomeKit` を import すればアクセサリの一覧取得から操作まで、Apple が公開している型へ素直に手が届きます。ここでは生成コードに HomeKit を足していく過程を、権限まわりと状態同期という二つの難所を中心に整理します。
+
+## React Native ではなくネイティブで触りたい理由
+HomeKit は Swift / Objective-C から直接呼ぶことを前提に設計されたフレームワークです。Expo（React Native）からでもコミュニティ製ブリッジで触れなくはありませんが、アクセサリの種類が増えるたびにブリッジの対応状況に振り回されます。私自身、検証用の Expo アプリで調光対応の照明を扱おうとして、ブリッジが明るさ特性（characteristic）の書き込みを公開しておらず、結局ネイティブ側に逃がした経験があります。
+
+Rork Max が出力するのは素のネイティブアプリなので、`HMCharacteristicTypePowerState` のような特性に最初から触れます。ただしネイティブだからこそ、権限ダイアログの出し方と HomeKit 特有の非同期な状態反映を正しく踏まないと、審査でも本番でも静かに失敗します。そこを順に押さえていきましょう。
+
+## Step 1: Capability と使用目的を最小限で宣言する
+最初に行うのは権限の宣言です。Rork Max のプロジェクト設定で HomeKit の Capability を有効化したうえで、使用目的を `Info.plist` に書きます。ここで抽象的な文面にすると、App Store の審査で「なぜこのアプリに必要なのか」を問われ、差し戻しの原因になります。
+
+```xml
+<key>NSHomeKitUsageDescription</key>
+<string>ご自宅の照明のオン・オフと連動して、画面テーマを自動で切り替えるために使用します。</string>
+```
+
+ポイントは、許可ダイアログにそのまま表示される文章なので、「何を」「何のために」操作するのかを具体的に書くことです。私の場合、初回提出で文面が曖昧だという指摘を受けて差し戻されました。誠実に書くことが、結果としてユーザーの信頼にもつながります。
+
+## Step 2: HMHomeManager をデリゲート登録してから待つ
+HomeKit でつまずく人が最も多いのが、ここです。`HMHomeManager` を生成した直後は `homes` が空配列で返ります。これは「自宅が無い」のではなく、まだ iCloud と同期して家の構成を読み込んでいる途中だからです。
+
+正しくは、マネージャを生成して **デリゲートを登録してから**、`homeManagerDidUpdateHomes(_:)` が呼ばれるのを待ちます。
+
+```swift
+import HomeKit
+
+final class HomeController: NSObject, HMHomeManagerDelegate {
+    private let manager = HMHomeManager()
+    private(set) var primaryHome: HMHome?
+    var onReady: (() -> Void)?
+
+    override init() {
+        super.init()
+        // delegate 登録より先に homes を読むと必ず空になる
+        manager.delegate = self
+    }
+
+    func homeManagerDidUpdateHomes(_ mgr: HMHomeManager) {
+        // ここで初めて家の構成が確定する
+        primaryHome = mgr.primaryHome ?? mgr.homes.first
+        onReady?()
+    }
+}
+```
+
+`init` の直後に `manager.homes.first` を読んで「アクセサリが一覧に出てこない」と悩むのは、ほぼこのパターンです。私も最初の実装で同じ罠にはまり、デリゲートの到着を待つ設計に直して解消しました。
+
+## Step 3: 照明アクセサリを探して特性を取り出す
+家の構成が確定したら、アクセサリの中から操作したいサービス（照明）と、その明るさ・電源を表す特性を取り出します。
+
+```swift
+func powerCharacteristic(in home: HMHome) -> HMCharacteristic? {
+    for accessory in home.accessories {
+        for service in accessory.services where service.serviceType == HMServiceTypeLightbulb {
+            for ch in service.characteristics where ch.characteristicType == HMCharacteristicTypePowerState {
+                return ch
+            }
+        }
+    }
+    return nil   // 照明が一つも見つからない場合に備える
+}
+```
+
+ここで `serviceType` と `characteristicType` を取り違えると、書き込みは成功扱いでも実機の照明が反応しない、という分かりにくい失敗になります。電源は `PowerState`、明るさは `Brightness` と、特性の種類を一つずつ確認するのが確実です。
+
+## Step 4: オン・オフを書き込み、結果を待って UI に反映する
+特性への書き込みは非同期です。ここで `writeValue` を投げっぱなしにすると、UI のトグルだけ先に動いて実機は変わらない、という状態のズレが起きます。書き込みの完了を待ってから UI を更新する流れにします。
+
+```swift
+func setPower(_ on: Bool, _ ch: HMCharacteristic) async throws {
+    try await ch.writeValue(on)          // 完了するまで待つ
+    // 成功した場合のみ UI 状態を確定させる
+    await MainActor.run { self.isOn = on }
+}
+```
+
+私は当初、トグルを押した瞬間にローカル状態を変えていました。すると書き込みが失敗した場面で「画面ではオンなのに照明は消えたまま」という不整合が残ります。完了を待つ実装に変えてから、この種の問い合わせが目に見えて減りました。
+
+## Step 5: 外部からの変化を購読してズレを防ぐ
+照明は、このアプリ以外（HomeKit の純正アプリや音声操作）からも変わります。アプリを開いている間に外で状態が変わったとき、それを取り込まないと表示が古いままになります。`HMAccessoryDelegate` で特性の更新を購読し、外からの変化を反映します。
+
+```swift
+extension HomeController: HMAccessoryDelegate {
+    func accessory(_ accessory: HMAccessory,
+                   service: HMService,
+                   didUpdateValueFor ch: HMCharacteristic) {
+        guard ch.characteristicType == HMCharacteristicTypePowerState else { return }
+        if let value = ch.value as? Bool {
+            Task { @MainActor in self.isOn = value }
+        }
+    }
+}
+```
+
+購読を始めるには `accessory.delegate = self` の登録に加えて、`enableNotification(true, for:)` を特性ごとに呼ぶ必要があります。ここを忘れると、外部の変化が一切流れてこないまま「同期されない」と悩むことになります。
+
+## 個人開発でどこまで作り込むかの判断
+ここまでの実装で、照明のオン・オフと外部変化の取り込みは安定します。一方で、すべてのアクセサリ種別を網羅しようとすると保守の負担が一気に増えます。私が個人開発で採った方針は、自分のアプリが本当に連動させたい一種類（この場合は照明の電源）に絞り、それ以外は無理に対応しないことでした。HomeKit は対応範囲を欲張った瞬間に審査の説明責任も増えるため、AdMob 中心の小さなアプリでは費用対効果が合わなくなりやすいからです。
+
+スマートホーム連携は派手に見えますが、本質はユーザーの生活の文脈にアプリをそっと寄り添わせることだと考えています。Rork Max でネイティブの入口が開いた今こそ、機能の多さではなく、一つの連動を丁寧に仕上げる姿勢が効いてくるはずです。同じ課題に取り組んでいる方の参考になれば幸いです。
