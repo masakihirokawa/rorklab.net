@@ -1,0 +1,225 @@
+---
+title: "Rork Max が生成した SwiftUI アプリに SwiftData を後付けする"
+slug: "rork-max-swiftdata-persistence-layer-migration-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T05:00"
+author: "Rork Lab"
+description: "Rork Max が出力した SwiftUI コードは画面は作れても永続化が @State 止まりになりがちです。SwiftData を後付けする際のモデル設計、ContainerとViewの接続、スキーマ移行の実装パターンを手を動かしながら整理しました。"
+tags: ["Rork Max", "SwiftData", "SwiftUI", "永続化", "マイグレーション"]
+highlights:
+  - "生成コードの @State 依存を SwiftData の @Model へ段階的に移し替える具体手順"
+  - "アプリを壊さずスキーマを育てるための VersionedSchema と MigrationPlan の実装"
+  - "起動時クラッシュを避けるための ModelContainer フォールバック設計"
+---
+
+ある夜、Rork Max に「習慣トラッカーを作って」と頼んで出てきた SwiftUI のコードを眺めていて、ふと手が止まりました。画面の作りは想像以上に丁寧で、リストもチェックボックスも整っている。けれど、アプリを再起動すると入力した習慣がすべて消えるのです。
+
+理由はコードを開いてすぐに分かりました。データは `@State private var habits: [Habit] = []` に置かれているだけで、ディスクには一切書かれていません。Rork Max は「動いて見える画面」を最短で出すことに長けていますが、永続化レイヤーまで自分で設計してくれるわけではない、というのがこの夜の実感でした。
+
+ここからは、その生成コードを土台にしながら、SwiftData を後付けして「再起動しても消えないアプリ」に育てるまでの工程を、実際に書いたコードと一緒に残しておきます。個人開発で何度もこの壁にぶつかってきた経験から、つまずきやすい順に並べました。対象は iOS 17 以降、Rork Max が吐く SwiftUI を Xcode あるいはクラウドビルドで触れる方を想定しています。
+
+## なぜ @State のままでは破綻するのか
+
+生成直後のコードは、たいてい次のような形をしています。
+
+```swift
+struct Habit: Identifiable {
+    let id = UUID()
+    var name: String
+    var doneToday: Bool
+}
+
+struct ContentView: View {
+    @State private var habits: [Habit] = [
+        Habit(name: "朝の散歩", doneToday: false),
+        Habit(name: "読書", doneToday: false)
+    ]
+
+    var body: some View {
+        List($habits) { $habit in
+            Toggle(habit.name, isOn: $habit.doneToday)
+        }
+    }
+}
+```
+
+このコードは画面としては完成しています。けれど `@State` はビューの生存期間にだけ紐づくメモリ上の状態なので、プロセスが終われば消えます。デモとしては十分でも、ユーザーに毎日使ってもらうアプリとしては成立しません。
+
+ここで多くの方が `UserDefaults` に `Codable` を JSON 化して詰める方法に飛びつきます。私自身、初期のアプリではそうしていました。ただ、項目が増えてリレーションや検索条件が出てくると、JSON 全体を読み書きする方式はすぐに苦しくなります。SwiftData はこの「育っていくデータ」を前提に設計されているので、個人的には最初に少し手間をかけて移しておくことを推奨します。後の運用が驚くほど楽になります。
+
+## ステップ1: モデルを @Model に置き換える
+
+最初の一手は、構造体を `@Model` クラスへ変えることです。`struct` ではなく `final class` になる点が要注意で、ここを見落とすとコンパイルが通りません。
+
+```swift
+import SwiftData
+
+@Model
+final class Habit {
+    var name: String
+    var doneToday: Bool
+    var createdAt: Date
+
+    init(name: String, doneToday: Bool = false, createdAt: Date = .now) {
+        self.name = name
+        self.doneToday = doneToday
+        self.createdAt = createdAt
+    }
+}
+```
+
+`@Model` を付けると、SwiftData がプロパティの変更を自動で追跡し、保存対象として扱ってくれます。`id` を手で持たなくても、SwiftData が内部の永続 ID を管理します。
+
+ここで一つ判断が要ります。生成コードに `let id = UUID()` が残っている場合、表示やアニメーションが `id` に依存していなければ削っても構いません。ただし `ForEach` の `id:` 指定で参照しているなら、安定した識別子として `UUID` 型のプロパティを明示的に残す方を私は好みます。Rork Max の出力はこのあたりが曖昧なことが多いので、`ForEach` の使われ方を一度確認してから決めるのが安全です。
+
+## ステップ2: ModelContainer をアプリに接続する
+
+モデルを定義したら、アプリのエントリポイントで `ModelContainer` を渡します。Rork Max が生成する `App` 構造体に対して、`.modelContainer(for:)` を一行足すイメージです。
+
+```swift
+import SwiftUI
+import SwiftData
+
+@main
+struct HabitApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+        .modelContainer(for: Habit.self)
+    }
+}
+```
+
+そして `ContentView` 側は、`@State` の配列を `@Query` に置き換えます。これがこの記事でいちばん効く一行です。
+
+```swift
+struct ContentView: View {
+    @Environment(\.modelContext) private var context
+    @Query(sort: \Habit.createdAt) private var habits: [Habit]
+
+    var body: some View {
+        List {
+            ForEach(habits) { habit in
+                Toggle(habit.name, isOn: Bindable(habit).doneToday)
+            }
+            .onDelete { offsets in
+                for index in offsets { context.delete(habits[index]) }
+            }
+        }
+        .toolbar {
+            Button("追加") {
+                context.insert(Habit(name: "新しい習慣"))
+            }
+        }
+    }
+}
+```
+
+`@Query` はデータベースの内容を直接ビューに流し込み、変更があれば自動で再描画します。`context.insert` や `context.delete` を呼ぶだけで保存が走るので、明示的な `save()` を毎回書く必要はありません。`Toggle` のバインディングに `Bindable(habit)` を使っている点も、`@Model` オブジェクトを編集する際の定石です。
+
+ここまでで、再起動してもデータが残るアプリになりました。ただし本当の難所はこの先、「リリース後にモデルを変えたくなったとき」にあります。
+
+## ステップ3: スキーマ移行を最初から設計しておく
+
+リリースしたアプリのモデルにプロパティを足すと、既存ユーザーの端末には旧スキーマのデータが残っています。何も対策をしないと、起動時に SwiftData がスキーマの不一致を検知してクラッシュすることがあります。私は一度、`createdAt` を後から非オプショナルで追加してこの罠に落ちました。テスト端末は新規インストールなので気づかず、アップデートを受け取った既存ユーザーだけが起動直後に落ちる、という最悪のパターンです。
+
+これを防ぐのが `VersionedSchema` と `SchemaMigrationPlan` です。バージョンごとにモデルの形を固定し、移行の道筋を明示します。
+
+```swift
+import SwiftData
+
+enum HabitSchemaV1: VersionedSchema {
+    static var versionIdentifier = Schema.Version(1, 0, 0)
+    static var models: [any PersistentModel.Type] { [Habit.self] }
+
+    @Model final class Habit {
+        var name: String
+        var doneToday: Bool
+        init(name: String, doneToday: Bool = false) {
+            self.name = name
+            self.doneToday = doneToday
+        }
+    }
+}
+
+enum HabitSchemaV2: VersionedSchema {
+    static var versionIdentifier = Schema.Version(2, 0, 0)
+    static var models: [any PersistentModel.Type] { [Habit.self] }
+
+    @Model final class Habit {
+        var name: String
+        var doneToday: Bool
+        var createdAt: Date = Date.now   // 追加プロパティはデフォルト値を持たせる
+        init(name: String, doneToday: Bool = false, createdAt: Date = .now) {
+            self.name = name
+            self.doneToday = doneToday
+            self.createdAt = createdAt
+        }
+    }
+}
+
+enum HabitMigrationPlan: SchemaMigrationPlan {
+    static var schemas: [any VersionedSchema.Type] { [HabitSchemaV1.self, HabitSchemaV2.self] }
+    static var stages: [MigrationStage] {
+        [.lightweight(fromVersion: HabitSchemaV1.self, toVersion: HabitSchemaV2.self)]
+    }
+}
+```
+
+ポイントは二つあります。新しく足すプロパティには必ずデフォルト値を与えること。そして、デフォルト値で埋められる単純な追加なら `.lightweight` で済むこと。フィールド名の変更やデータ変換が必要なら `.custom` ステージで `willMigrate` / `didMigrate` クロージャを書きますが、まずは lightweight で吸収できる設計にしておくと運用が圧倒的に楽です。
+
+移行プランは `ModelContainer` の初期化時に渡します。
+
+```swift
+let container = try ModelContainer(
+    for: HabitSchemaV2.Habit.self,
+    migrationPlan: HabitMigrationPlan.self
+)
+```
+
+最初のリリースから V1 を切っておくと、二回目の変更で慌てずに済みます。私は今は、どんなに小さなアプリでも初回から `VersionedSchema` で包む運用にしています。後から「最初のスキーマ」を遡って定義し直すのは、想像よりずっと面倒だからです。
+
+## ステップ4: 起動を絶対に止めないフォールバック
+
+移行を組んでも、ディスクの破損や想定外のスキーマ不整合で `ModelContainer` の生成が失敗する可能性はゼロにはなりません。`try!` で初期化すると、その瞬間にアプリは起動すらしなくなります。生成コードはしばしば `try!` を使うので、本番環境ではこの一行が起動を止める落とし穴になります。必ず手で回避しておきたい箇所です。
+
+私が実際に入れているのは、失敗時にインメモリのコンテナへ退避する二段構えです。
+
+```swift
+@main
+struct HabitApp: App {
+    let container: ModelContainer
+
+    init() {
+        do {
+            container = try ModelContainer(
+                for: HabitSchemaV2.Habit.self,
+                migrationPlan: HabitMigrationPlan.self
+            )
+        } catch {
+            // 永続化に失敗してもアプリ自体は起動させる
+            let fallback = ModelConfiguration(isStoredInMemoryOnly: true)
+            container = try! ModelContainer(for: HabitSchemaV2.Habit.self, configurations: fallback)
+            // ここでクラッシュレポートに記録しておくと原因追跡が早い
+        }
+    }
+
+    var body: some Scene {
+        WindowGroup { ContentView() }
+            .modelContainer(container)
+    }
+}
+```
+
+インメモリへ退避するとデータは保存されませんが、少なくとも「起動した瞬間に落ちる」最悪の体験は避けられます。そのうえで失敗をクラッシュレポート基盤に送っておけば、どの端末・どのバージョンで移行が転んだのかを後から追えます。ユーザーから見れば「一時的に履歴が消えた」ですが、「アプリが二度と開けない」よりはるかにましだと考えています。
+
+## 生成コードと向き合うときの順序
+
+ここまでの工程を振り返ると、Rork Max が出した画面コードを「まず動く土台」として受け取り、永続化・接続・移行・フォールバックの順で自分の手を入れていく流れになります。AI が生成するのは速度の出る出発点であって、ユーザーが毎日触るアプリにするための判断は、依然として作り手側に残されている、というのが今の私の整理です。
+
+次に手を動かすなら、いま開発中のアプリの `@State` を一つだけ選んで `@Model` に置き換え、再起動してデータが残るかを確かめてみてください。その小さな一歩が、生成コードを「デモ」から「プロダクト」へ近づける最初のスイッチになります。
+
+同じように Rork Max の出力を育てている方の参考になれば幸いです。お読みいただきありがとうございました。
