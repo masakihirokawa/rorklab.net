@@ -1,0 +1,123 @@
+---
+title: "Rork Max のネイティブアプリで CloudKit 同期を設計する — 競合と削除をどう扱うか"
+slug: "rork-max-cloudkit-cross-device-sync-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T16:00"
+author: "Rork Lab"
+description: "iPhone と iPad で同じデータを同期させたい——Rork Max が生成した Swift アプリに CloudKit を入れる際、本当に難しいのは保存ではなく『競合』と『削除』の扱いでした。実装で固めた設計判断を整理します。"
+tags: ["Rork Max", "CloudKit", "Swift", "同期", "アーキテクチャ"]
+highlights:
+  - "NSUbiquitousKeyValueStore と CloudKit(CKRecord)の境界を理解し、どちらを使うべきか判断できるようになる"
+  - "二台の端末で同じレコードを編集したときの競合を、サーバー変更トークンと changeTag で解決するコードを習得できる"
+  - "削除の同期に伴う『ゾンビ復活』を防ぐ tombstone(墓標)パターンを再現できる"
+---
+
+## 同期は「保存できた」では終わりません
+
+お気に入りを iPhone で追加したのに、iPad では消えている。あるいは、iPad で消したはずのものが、しばらくすると iPhone から復活してくる。Rork Max が生成したネイティブ Swift アプリに同期機能を入れたとき、最初に直面したのはこの種の不整合でした。
+
+レコードを CloudKit に保存するコード自体は素直です。難しいのは、複数の端末が同時に書き込んだときの競合と、削除をどう全端末に伝播させるか、という設計の部分でした。ここを曖昧にしたまま公開すると、ユーザーには「データが勝手に増えたり消えたりするアプリ」に見えてしまいます。個人開発で長くアプリを運用してきた経験から言うと、信頼を損なうのはクラッシュよりもむしろこの種の静かな不整合です。実装で固めた判断を残しておきます。
+
+## まず KV ストアと CloudKit の境界を引く
+
+iCloud 同期には複数の選択肢があります。設定値のような小さなデータなら `NSUbiquitousKeyValueStore` で十分で、これは Key-Value だけを同期する軽量な仕組みです。容量は1MBほどで、構造化されたレコードの集合には向きません。
+
+一方、ユーザーが作る項目(メモ、お気に入り、コレクション)のように件数が増えていくデータは、`CKRecord` を使った CloudKit に載せます。私の線引きはこうです。
+
+1. 件数が固定で、キーで直接引ければ KV ストア（設定・フラグ・最後に開いたタブなど）
+2. 件数が可変で、後からクエリ・並べ替えしたくなるなら CloudKit（ユーザー生成のレコード群）
+3. 1MB を超えそう、または端末間で部分的に差分同期したいなら迷わず CloudKit
+
+この判断を最初に下しておかないと、後から KV ストアに無理やりレコードを詰め込んで破綻します。私自身、初期に横着して KV ストアへ寄せた結果、容量上限に当たって作り直した経験があります。
+
+CloudKit のレコード保存は次の形になります。
+
+```swift
+import CloudKit
+
+struct FavoriteRecord {
+    let id: CKRecord.ID
+    var title: String
+    var updatedAt: Date
+}
+
+func save(_ favorite: FavoriteRecord) async throws {
+    let db = CKContainer.default().privateCloudDatabase
+    let record = CKRecord(recordType: "Favorite", recordID: favorite.id)
+    record["title"] = favorite.title
+    record["updatedAt"] = favorite.updatedAt
+    _ = try await db.save(record)
+}
+```
+
+ここまでは簡単です。問題はこの先です。
+
+## 競合は changeTag で検出する
+
+二台の端末が同じレコードを別々に編集すると、後から保存したほうが先の変更を黙って上書きします。これを防ぐ鍵が、各 `CKRecord` が持つ `recordChangeTag` です。CloudKit はサーバー側のタグと送信側のタグが食い違うと `serverRecordChanged` エラーを返します。このエラーを握りつぶさず、解決ロジックへ回すのが要点です。エラーを単に再送でリトライすると、今度は逆方向の上書きが起きて堂々巡りになります。
+
+```swift
+func saveWithConflictResolution(_ favorite: FavoriteRecord) async throws {
+    let db = CKContainer.default().privateCloudDatabase
+    do {
+        let record = CKRecord(recordType: "Favorite", recordID: favorite.id)
+        record["title"] = favorite.title
+        record["updatedAt"] = favorite.updatedAt
+        _ = try await db.save(record)
+    } catch let error as CKError where error.code == .serverRecordChanged {
+        // サーバー側が新しい。両者の updatedAt を比べて勝者を決める
+        guard let server = error.serverRecord,
+              let client = error.clientRecord else { throw error }
+        let serverDate = server["updatedAt"] as? Date ?? .distantPast
+        let clientDate = client["updatedAt"] as? Date ?? .distantPast
+        if clientDate > serverDate {
+            server["title"] = client["title"]
+            server["updatedAt"] = clientDate
+            _ = try await db.save(server)  // 解決済みレコードを再保存
+        }
+        // サーバーが新しければ何もしない(サーバーを正とする)
+    }
+}
+```
+
+ここで「最後の書き込みを勝ちにする(last-write-wins)」のは、お気に入りのような単純な値だからこそ成り立つ割り切りです。もし共同編集される文書のように一文字単位でマージしたいなら、この戦略では不十分で、フィールド単位の差分やバージョンベクトルが必要になります。アプリのデータの性質に合わせて、どこまで厳密にやるかを決めるのが設計者の仕事だと考えています。私は、単純な値には last-write-wins を推奨し、構造が複雑なデータにだけコストの高いマージを採用する、という二段構えをお勧めします。
+
+## 削除の「ゾンビ復活」を tombstone で止める
+
+最も厄介だったのが削除でした。iPad でレコードを削除しても、まだ同期していない iPhone はそのレコードをローカルに持っています。次に iPhone が同期すると、自分のローカルにある「生きているレコード」をサーバーへ再アップロードし、削除したはずの項目が全端末に復活します。これがゾンビ復活で、ユーザーから見れば「消したのに戻ってくる」という最も不気味な挙動です。
+
+解決策は、削除を「レコードの物理削除」ではなく「削除フラグの記録(tombstone)」として扱うことです。
+
+```swift
+// 物理削除の代わりに、削除済みとしてマークして同期する
+func softDelete(_ id: CKRecord.ID) async throws {
+    let db = CKContainer.default().privateCloudDatabase
+    let record = try await db.record(for: id)
+    record["isDeleted"] = true
+    record["updatedAt"] = Date()
+    _ = try await db.save(record)
+}
+```
+
+各端末は同期時に `isDeleted == true` のレコードを画面から外します。tombstone は一定期間(私は30日にしました)残してから、サーバー側のバッチ処理で物理削除します。30日あれば、どの端末も一度は同期してフラグを受け取れるという見積もりです。短すぎると、長期間オフラインだった端末で復活が起きます。この期間は、対象アプリの利用頻度を見て調整するのが本番運用での勘所でした。
+
+## 変更トークンで差分だけ取る
+
+全レコードを毎回取得していては通信量も時間も無駄です。CloudKit の `CKServerChangeToken` を保存しておき、前回以降の差分だけを `CKFetchRecordZoneChangesOperation` で取得します。
+
+```swift
+let config = CKFetchRecordZoneChangesOperation.ZoneConfiguration()
+config.previousServerChangeToken = savedToken  // 前回のトークン
+let op = CKFetchRecordZoneChangesOperation(
+    recordZoneIDs: [zoneID],
+    configurationsByRecordZoneID: [zoneID: config]
+)
+```
+
+このトークンを端末ごとにローカル保存しておくのが肝心です。トークンを失うと全件取得に戻り、レコードが数千件あるユーザーで初回同期がおおよそ3倍ほど遅くなります。私は最初これをうっかり消してしまい、同期のたびに全件を引いていて、データ量の多いユーザーで体感数秒の待ちが出ていました。差分取得に切り替えてからは、通信量を約80%ほど抑えられ、待ち時間も気にならなくなりました。
+
+## 公開前に試してほしいこと
+
+CloudKit を入れたら、二台の実機で同じ項目を機内モードのまま別々に編集し、両方をオンラインに戻してください。競合解決と削除の伝播が想定どおりに動くか、これが一番効く確認です。同期は「保存できた」ではなく「二台が矛盾なく一致した」で初めて完成します。地味ですが、ここを通すとアプリへの信頼が静かに変わります。

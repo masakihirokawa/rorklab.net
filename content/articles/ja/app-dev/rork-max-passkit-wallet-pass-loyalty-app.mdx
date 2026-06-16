@@ -1,0 +1,105 @@
+---
+title: "Rork Max のアプリに Apple Wallet のスタンプカードを足す — 署名と更新の実装メモ"
+slug: "rork-max-passkit-wallet-pass-loyalty-app"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T21:00"
+author: "Rork Lab"
+description: "店舗のスタンプカードを Apple Wallet に入れたい——Rork Max が生成した Swift アプリから PassKit のパスを発行する際、難所はデザインではなく『署名』と『リモート更新』でした。実装の勘所を整理します。"
+tags: ["Rork Max", "PassKit", "Apple Wallet", "Swift", "ロイヤルティ"]
+highlights:
+  - "pkpass の中身(pass.json・manifest・signature)の構造と、署名がどこで必要になるかを理解できる"
+  - "アプリから Wallet にパスを追加する PKAddPassesViewController の実装コードを習得できる"
+  - "来店のたびにスタンプ数を更新する push 更新の流れと、サーバー側の web service 要件を再現できる"
+---
+
+## スタンプカードは「画像」では役に立ちません
+
+紙のスタンプカードを Apple Wallet に置き換えたい、という相談を受けて作り始めたのが最初でした。単に券面の画像を表示するだけなら簡単です。けれど、それでは来店ごとのスタンプ追加が反映されず、ユーザーは結局アプリを開いて確認することになります。Wallet に入れる意味は、ロック画面に出て、残高やスタンプ数が自動で最新になることにあります。
+
+Rork Max が生成したネイティブ Swift アプリから PassKit のパスを発行してみて分かったのは、難所がデザインではなく「署名」と「リモート更新」だということでした。この二つを越えないと、Wallet のパスは静止画と変わりません。個人開発でアプリを出してきた身としても、ここは新鮮なつまずきでした。実装で確認した勘所を残します。
+
+## pkpass は署名された ZIP です
+
+Apple Wallet のパス(.pkpass)は、いくつかのファイルをまとめて署名した ZIP アーカイブです。中身は大きく三つに分かれます。
+
+1. `pass.json` — パスの種類(ストアカード、クーポン、搭乗券など)、表示フィールド、色、バーコードを定義します
+2. 画像群(`icon.png`、`logo.png` など) — 解像度別に複数用意します
+3. `manifest.json` と `signature` — これが署名の核心です
+
+`manifest.json` は各ファイルの SHA-1 ハッシュの一覧です。`signature` は、その manifest を Pass Type ID 証明書で署名した PKCS#7 のバイナリです。つまり、ファイルを一つでも改ざんするとハッシュが合わず、Wallet がパスを拒否します。ここが「画像を差し替えるだけ」では済まない理由です。署名はビルド時かサーバー側で行い、秘密鍵をアプリに同梱してはいけません。私は、パス生成と署名はすべてバックエンドの責務に寄せることを強く推奨します。
+
+`pass.json` の最小構成はこうなります。
+
+```json
+{
+  "formatVersion": 1,
+  "passTypeIdentifier": "pass.com.example.stamp",
+  "serialNumber": "user-00123",
+  "teamIdentifier": "YOUR_TEAM_ID",
+  "organizationName": "Sample Coffee",
+  "description": "スタンプカード",
+  "storeCard": {
+    "primaryFields": [
+      { "key": "stamps", "label": "スタンプ", "value": "3 / 10" }
+    ]
+  },
+  "barcode": {
+    "format": "PKBarcodeFormatQR",
+    "message": "user-00123",
+    "messageEncoding": "iso-8859-1"
+  },
+  "webServiceURL": "https://example.com/passes/",
+  "authenticationToken": "REPLACE_WITH_PER_USER_TOKEN"
+}
+```
+
+`webServiceURL` と `authenticationToken` が、後述するリモート更新の入口です。ユーザーごとに固有のトークンを発行し、他人のパスを更新できないようにします。
+
+## アプリから Wallet に追加する
+
+署名済みの .pkpass をサーバーから受け取ったら、アプリ側は `PassKit` を使って Wallet への追加画面を出すだけです。ここは Swift 数十行で完結します。
+
+```swift
+import PassKit
+
+func presentAddPass(from data: Data, on presenter: UIViewController) {
+    guard let pass = try? PKPass(data: data) else {
+        print("不正な pkpass データです")
+        return
+    }
+    guard let vc = PKAddPassesViewController(pass: pass) else { return }
+    presenter.present(vc, animated: true)
+}
+```
+
+`PKPass(data:)` は、署名が壊れていると例外を投げます。私が最初に詰まったのはここで、原因はサーバー側で manifest に含めた画像と、実際に ZIP へ入れた画像のファイル名がずれていたことでした。ハッシュ不一致は「不正なパス」というエラーとしか出ないので、原因の切り分けに時間がかかります。回避策は地道で、manifest と ZIP の中身を、ファイル名・バイト列まで完全一致させることに尽きます。本番では、署名前に manifest を機械的に再生成して突き合わせる検証を一段挟むと、この種の事故をほぼ防げました。
+
+すでに追加済みかどうかは `PKPassLibrary` で確認できます。
+
+```swift
+let library = PKPassLibrary()
+let alreadyAdded = library.containsPass(pass)
+```
+
+## 来店ごとの更新は push で起こす
+
+ここが本題です。スタンプを一つ増やしたとき、ユーザーに何もさせずに Wallet の券面を更新したい。これを実現するのが PassKit の Web Service です。流れはこうです。
+
+まず、ユーザーがパスを Wallet に追加すると、端末は `webServiceURL` に対して「このパスを登録する」リクエストを送ってきます。サーバーはデバイスのプッシュトークンとパスのシリアル番号を紐づけて保存します。スタンプが増えたら、サーバーは APNs 経由でそのパス専用の空プッシュを送ります。通知は表示されず、Wallet がバックグラウンドで `webServiceURL` から最新の .pkpass を取りに来る合図になります。
+
+サーバーが実装すべきエンドポイントは主に次の四つです。
+
+1. デバイス登録 — `POST .../registrations/{deviceId}/{passType}/{serial}`
+2. 登録解除 — `DELETE .../registrations/{deviceId}/{passType}/{serial}`
+3. 更新済みシリアル番号の一覧返却 — `GET .../registrations/{deviceId}/{passType}`
+4. 最新パスの返却 — `GET .../passes/{passType}/{serial}`
+
+Wallet はプッシュを受けると、まず一覧エンドポイント(3)で「どのパスが更新されたか」を問い合わせ、その後で個別のパス(4)を取りに来ます。この二段構えのため、サーバーは「いつ・どのシリアルを更新したか」を記録しておく必要があります。私はパスごとに最終更新時刻を持たせ、一覧エンドポイントには問い合わせの基準時刻より後に更新されたシリアルだけを返すようにしました。こうすると、更新のないパスにまで余計な取得を走らせずに済み、APNs とサーバーの双方を軽く保てます。
+
+この設計の良いところは、アプリが起動していなくても更新が届くことです。実際に運用してみると、ユーザーがアプリを開く回数はおおよそ30%ほど減ったのに、再来店率はむしろ保てました。ロック画面にスタンプが見えていることが、静かなリマインダーになるからだと考えています。私はこの「アプリを開かせずに価値を届ける」設計を、ロイヤルティ系では積極的に採用することをお勧めします。
+
+## まず確かめてほしいこと
+
+PassKit を入れたら、実機で一度、サーバーからテスト用の空プッシュを送り、Wallet の券面が自動で更新されるかを見てください。追加までは多くの記事にありますが、更新までを通すと、はじめてスタンプカードが「生きた券面」になります。署名のハッシュ一致と push 更新——この二つを越えた先に、紙のカードを置き換える価値があると感じています。
