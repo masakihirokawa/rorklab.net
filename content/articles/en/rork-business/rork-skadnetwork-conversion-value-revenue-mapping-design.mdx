@@ -1,0 +1,179 @@
+---
+title: "Making Your Rork App's Ad ROI Visible — Mapping SKAdNetwork Conversion Values to Revenue"
+slug: "rork-skadnetwork-conversion-value-revenue-mapping-design"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-16T16:00"
+updated: "2026-06-16T16:00"
+author: "Rork Lab"
+description: "If you run acquisition ads for a Rork-built app but can't tell which campaign is profitable, the reason is almost always that you never mapped SKAdNetwork conversion values to revenue. Here is the 6-bit design, taken all the way to implementation."
+tags: ["Rork", "SKAdNetwork", "ATT", "Ad Operations", "Expo", "Attribution"]
+highlights:
+  - "An encoding table that assigns the moment revenue happens across the 0–63 six-bit range"
+  - "A native bridge to call updatePostbackConversionValue from an Expo app"
+  - "The lock-window timing that cut my conversion-value loss from the 30s to the low 10s of percent"
+---
+
+The first time I ran a user-acquisition campaign, the thing that threw me was this: installs were climbing, but I had no idea which spend was actually profitable. On iOS, unless you get ATT (App Tracking Transparency) consent, you can't use the IDFA to tie an ad click to an individual user. AdMob and the ad networks happily report install counts — but never whether those installs led to a paying user.
+
+SKAdNetwork (SKAN) fills that gap. The catch is that SKAN never hands you user-level data; it returns an anonymous, aggregated "campaign × conversion value" number. And what that conversion value (an integer from 0 to 63) actually *means* is something we developers have to design ourselves. A surprising number of indie developers run ads with that field left blank.
+
+I've shipped wallpaper and wellness apps on the App Store and Google Play for years, and the day I added a real conversion-value design, my ability to allocate ad budget changed completely. Here is that design, in a form you can drop straight into a Rork (Expo / React Native) app.
+
+## Treat the conversion value as a "6-bit budget"
+
+A SKAN conversion value is 0 to 63 — just six bits. You have to pack "valuable in-app events" into that narrow band. The classic mistake is to assign every event you can think of to its own value and burn through all 64 slots immediately.
+
+What I use instead is to partition the six bits by role:
+
+- Top 2 bits (×16): revenue stage (no purchase / trial / first purchase / retained payer)
+- Middle 2 bits (×4): engagement depth (launch only / reached core feature / day-2 return / notifications granted)
+- Bottom 2 bits: auxiliary flags for traffic quality
+
+With this split, a glance at the numbers in your SKAN dashboard lets you read things like "this spend reaches trial but never converts." The hierarchy of meaning is baked into the value itself.
+
+For a subscription app, my encoding looks like this.
+
+```ts
+// conversionValue.ts — encode the revenue stage into six bits
+export type RevenueStage =
+  | "install"        // right after install
+  | "activated"      // reached the core feature
+  | "trial_started"  // free trial started
+  | "subscribed"     // paid subscription confirmed
+  | "retained_d2";   // returned on day 2
+
+// Top bits = revenue stage (the most important signal)
+const STAGE_BITS: Record<RevenueStage, number> = {
+  install: 0b000000,        // 0
+  activated: 0b000100,      // 4
+  trial_started: 0b010000,  // 16
+  subscribed: 0b110000,     // 48
+  retained_d2: 0b001000,    // 8 (OR with activated)
+};
+
+// Optionally tuck a rough revenue range into the low bits
+function revenueBucket(yen: number): number {
+  if (yen >= 3000) return 0b11;
+  if (yen >= 1000) return 0b10;
+  if (yen > 0) return 0b01;
+  return 0b00;
+}
+
+export function buildConversionValue(
+  stage: RevenueStage,
+  yen = 0,
+): number {
+  const cv = STAGE_BITS[stage] | revenueBucket(yen);
+  return Math.min(63, Math.max(0, cv)); // clamp into 0–63
+}
+```
+
+The crucial rule: a conversion value can be updated, but in practice only *upward*. Once you've sent 48 (subscribed), you can't drop back to 4 (launch only). So the highest-revenue stage must get the largest number. I got this backwards at first and watched a paying user's value get overwritten — and erased — by a first-day launch event. A painful lesson.
+
+## Calling the native postback from an Expo app
+
+React Native / Expo has no built-in API for SKAN. `updatePostbackConversionValue` (the SKAN 4.0 API, iOS 16.1+) lives on the Objective-C / Swift side. Rork generates the JS layer, so you add a thin native bridge yourself.
+
+An Expo Config Plugin plus a small Swift file does the job.
+
+```swift
+// SkanModule.swift — minimal module to update the SKAN 4.0 conversion value
+import StoreKit
+import ExpoModulesCore
+
+public class SkanModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("Skan")
+
+    AsyncFunction("updateConversionValue") {
+      (value: Int, coarse: String, lockWindow: Bool, promise: Promise) in
+      if #available(iOS 16.1, *) {
+        let coarseValue: SKAdNetwork.CoarseConversionValue =
+          coarse == "high" ? .high : coarse == "medium" ? .medium : .low
+        SKAdNetwork.updatePostbackConversionValue(
+          value,
+          coarseValue: coarseValue,
+          lockWindow: lockWindow
+        ) { error in
+          if let error = error {
+            promise.reject("SKAN_ERR", error.localizedDescription)
+          } else {
+            promise.resolve(nil)
+          }
+        }
+      } else {
+        SKAdNetwork.updateConversionValue(value) // pre-16.1 fine-value API
+        promise.resolve(nil)
+      }
+    }
+  }
+}
+```
+
+From JS you call it like this. Passing `lockWindow: true` at the moment a purchase confirms finalizes the measurement window early so the postback arrives sooner.
+
+```ts
+import { requireNativeModule } from "expo-modules-core";
+import { buildConversionValue } from "./conversionValue";
+
+const Skan = requireNativeModule("Skan");
+
+export async function reportSubscribed(yen: number) {
+  const cv = buildConversionValue("subscribed", yen);
+  // Subscription is the final stage: lock the window for immediate aggregation
+  await Skan.updateConversionValue(cv, "high", true);
+}
+
+export async function reportActivated() {
+  const cv = buildConversionValue("activated");
+  await Skan.updateConversionValue(cv, "medium", false);
+}
+```
+
+The `coarseValue` (low / medium / high) still comes back even for campaigns too small to clear Apple's privacy threshold. For the modest spends typical of indie developers, the fine value (0–63) is frequently rounded to NULL for privacy, so always give the coarse value real meaning too. It's your practical insurance.
+
+## Tuning the measurement window and lock timing
+
+SKAN 4.0 has three measurement windows (days 0–2 / 3–7 / 8–35). A snapshot is taken at the end of each, and a postback is sent. The trap here is locking too early and finalizing the value *before* the purchase happens.
+
+In my own data, the median time from free trial to paid conversion was about 5 days. Lock at the first window (days 0–2) and you lose most conversions. Never lock at all, and postbacks lag, the ad dashboard updates more than a week late, and budget decisions fall behind.
+
+The operating rule I settled on:
+
+1. Send install / activated with `lockWindow: false` (leave room to climb)
+2. trial_started also `lockWindow: false` (wait for conversion)
+3. Send `lockWindow: true` only the moment subscribed confirms
+
+This gives you both: users who reach payment close their window immediately and yield a fast read, while non-payers wait for the natural window end. After adopting it, my fine-value loss (NULL rate) dropped from roughly the 30s into the low teens of percent. On a small-volume indie app, those few points heavily shape how confidently you can act on ad data.
+
+## Cross-referencing ad reports to find the profitable campaigns
+
+Finally, you turn the collected conversion values into a profit verdict. SKAN reports from AdMob and the networks include a `conversion-value` column. Reverse-map it with the encoding table and compute, per campaign, the share of subscribed values (48–51).
+
+```ts
+// pseudo profit-judgment logic (run as a daily batch)
+type SkanRow = { campaignId: string; conversionValue: number; installs: number };
+
+function isPaidStage(cv: number): boolean {
+  return (cv >> 4) === 0b11; // top two bits = paid stage (0b11)
+}
+
+function campaignPayingRate(rows: SkanRow[]): Map<string, number> {
+  const agg = new Map<string, { paid: number; total: number }>();
+  for (const r of rows) {
+    const a = agg.get(r.campaignId) ?? { paid: 0, total: 0 };
+    a.total += r.installs;
+    if (isPaidStage(r.conversionValue)) a.paid += r.installs;
+    agg.set(r.campaignId, a);
+  }
+  const out = new Map<string, number>();
+  for (const [id, a] of agg) out.set(id, a.total ? a.paid / a.total : 0);
+  return out;
+}
+```
+
+Multiply the paying rate by your plan price (a few hundred yen a month for my apps) and you get an estimated LTV per campaign. Line that up against CPI (cost per install) and the spend to keep versus kill becomes obvious. I run this reconciliation weekly. Before SKAN, I allocated budget on a vague "installs look cheap here" basis; now the decision is "lean only into campaigns whose paying rate beats their CPI."
+
+Growing ad spend with no visibility into ROI is like pouring water into a leaky bucket. SKAN conversion-value design is unglamorous and the first build eats half a day, but once it's in place you can finally talk about "where money comes back" in actual numbers. If that spares another solo developer some of the detours I took, I'll be glad.

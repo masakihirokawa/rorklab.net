@@ -1,0 +1,182 @@
+---
+title: "Rork アプリの広告ROIを見えるようにする — SKAdNetwork コンバージョン値を収益に紐づける設計"
+slug: "rork-skadnetwork-conversion-value-revenue-mapping-design"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-16T16:00"
+updated: "2026-06-16T16:00"
+author: "Rork Lab"
+description: "Rork で作ったアプリに広告を打っても「どのキャンペーンが黒字なのか」が見えない最大の理由は、SKAdNetwork のコンバージョン値を収益と結びつけていないことです。6ビットの値設計を実装まで落とし込みます。"
+tags: ["Rork", "SKAdNetwork", "ATT", "広告運用", "Expo", "アトリビューション"]
+highlights:
+  - "0〜63 の6ビットに「収益が立つ瞬間」を割り当てる具体的なエンコード表"
+  - "Expo アプリから updatePostbackConversionValue を呼ぶネイティブ橋渡しの実装"
+  - "個人開発の運用で計測欠損を10%台に抑えるロック解除タイマーの調整値"
+---
+
+ユーザー獲得広告を初めて回したとき、私が一番面食らったのは「インストールは増えているのに、どの出稿が黒字なのか一切分からない」という状態でした。iOS では ATT（App Tracking Transparency）の許可を取らない限り、広告クリックと個別ユーザーを結びつける IDFA が使えません。Google や AdMob のレポートには「インストール数」は出ても、「そのインストールが課金につながったか」が出てこないのです。
+
+この穴を埋めるのが SKAdNetwork（SKAN）です。ただし SKAN が返してくるのは、ユーザー単位ではなく「キャンペーン × コンバージョン値」という匿名で集約された数字だけです。そして、そのコンバージョン値（0〜63 の整数）に何を意味させるかは、開発者である私たち自身が設計しなければなりません。ここを空欄のまま広告を回している個人開発者が、本当に多いと感じています。
+
+私は壁紙・癒し系のアプリを App Store と Google Play で長く運用してきましたが、SKAN のコンバージョン値設計を入れる前と後では、広告予算の振り分け精度がまったく変わりました。ここではその設計を、Rork（Expo / React Native）で作ったアプリにそのまま組み込める形で残しておきます。
+
+## コンバージョン値は「6ビットの予算」だと考える
+
+SKAN のコンバージョン値は 0 から 63、つまり 6 ビットしかありません。この狭い帯域に「アプリ内で起きた価値あるイベント」を詰め込む必要があります。よくある失敗は、思いつくイベントを全部別の値に割り当てて、64 種類すぐに使い切ってしまうことです。
+
+私が採用しているのは、6 ビットを役割ごとに区切る方法です。
+
+- 上位2ビット（値 ×16）: 収益ステージ（無課金 / 試用 / 初回課金 / 継続課金）
+- 中位2ビット（値 ×4）: エンゲージメント深度（起動のみ / 主要機能到達 / 2日目復帰 / 通知許可）
+- 下位2ビット: 流入の質を測る補助フラグ
+
+この区切りにすると、SKAN ダッシュボードに並ぶ数字を見ただけで「この出稿は試用までは来るが課金しない層を連れてくる」といった解釈ができるようになります。値そのものに意味の階層が埋め込まれているからです。
+
+具体的なエンコード表は、運用するアプリの収益モデルに合わせます。サブスク型のアプリでは、私は次のような割り当てにしています。
+
+```ts
+// conversionValue.ts — 収益ステージを6ビットにエンコードする
+export type RevenueStage =
+  | "install"        // インストール直後
+  | "activated"      // 主要機能に到達
+  | "trial_started"  // 無料トライアル開始
+  | "subscribed"     // 有料課金が確定
+  | "retained_d2";   // 2日目に復帰
+
+// 上位ビット = 収益ステージ（最重要シグナル）
+const STAGE_BITS: Record<RevenueStage, number> = {
+  install: 0b000000,        // 0
+  activated: 0b000100,      // 4
+  trial_started: 0b010000,  // 16
+  subscribed: 0b110000,     // 48
+  retained_d2: 0b001000,    // 8（activated と OR して使う）
+};
+
+// 課金額の概算レンジを下位ビットに添える（任意）
+function revenueBucket(yen: number): number {
+  if (yen >= 3000) return 0b11;
+  if (yen >= 1000) return 0b10;
+  if (yen > 0) return 0b01;
+  return 0b00;
+}
+
+export function buildConversionValue(
+  stage: RevenueStage,
+  yen = 0,
+): number {
+  const cv = STAGE_BITS[stage] | revenueBucket(yen);
+  // 0〜63 にクランプ（万一のビット溢れ対策）
+  return Math.min(63, Math.max(0, cv));
+}
+```
+
+ここで大切なのは、コンバージョン値は「上書きできるが、原則として上げる方向にしか更新できない」というルールがある点です。一度 48（課金）を送った後に 4（起動のみ）へ下げることはできません。ですから、最も収益価値の高いステージほど大きい数字を割り当てるのが鉄則になります。私は最初これを逆に設計してしまい、課金したユーザーの値が初日の起動イベントで上書きされて消える、という痛い目を見ました。
+
+## Expo アプリからネイティブの postback を呼ぶ
+
+React Native / Expo には SKAN を直接叩く標準 API がありません。`updatePostbackConversionValue`（iOS 16.1 以降の SKAN 4.0 API）は Objective-C / Swift 側にあります。Rork が生成するのは JS 層のコードなので、ここはネイティブモジュールの薄い橋渡しを自分で足す必要があります。
+
+Expo の Config Plugin と小さな Swift ファイルで実装できます。
+
+```swift
+// SkanModule.swift — SKAN 4.0 のコンバージョン値を更新する最小モジュール
+import StoreKit
+import ExpoModulesCore
+
+public class SkanModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("Skan")
+
+    AsyncFunction("updateConversionValue") {
+      (value: Int, coarse: String, lockWindow: Bool, promise: Promise) in
+      if #available(iOS 16.1, *) {
+        let coarseValue: SKAdNetwork.CoarseConversionValue =
+          coarse == "high" ? .high : coarse == "medium" ? .medium : .low
+        SKAdNetwork.updatePostbackConversionValue(
+          value,
+          coarseValue: coarseValue,
+          lockWindow: lockWindow
+        ) { error in
+          if let error = error {
+            promise.reject("SKAN_ERR", error.localizedDescription)
+          } else {
+            promise.resolve(nil)
+          }
+        }
+      } else {
+        // iOS 16.0 以前は fine value のみの旧 API
+        SKAdNetwork.updateConversionValue(value)
+        promise.resolve(nil)
+      }
+    }
+  }
+}
+```
+
+JS 側からはこう呼びます。課金確定のタイミングで `lockWindow: true` を渡すと、計測ウィンドウを早めに確定させてポストバックを早く受け取れます。
+
+```ts
+import { requireNativeModule } from "expo-modules-core";
+import { buildConversionValue } from "./conversionValue";
+
+const Skan = requireNativeModule("Skan");
+
+export async function reportSubscribed(yen: number) {
+  const cv = buildConversionValue("subscribed", yen);
+  // 課金は最終ステージなのでウィンドウをロックして即時集計に回す
+  await Skan.updateConversionValue(cv, "high", true);
+}
+
+export async function reportActivated() {
+  const cv = buildConversionValue("activated");
+  await Skan.updateConversionValue(cv, "medium", false);
+}
+```
+
+`coarseValue`（low / medium / high）は、インストール数が少なくて Apple のプライバシー閾値を超えられないキャンペーンでも返ってくる粗い指標です。個人開発の小規模な出稿では fine value（0〜63）がプライバシー保護で丸められて NULL になることが頻繁にあるので、coarse 側にも必ず意味を持たせておくのが実用上の保険になります。
+
+## 計測ウィンドウとロックのタイミングをどう詰めるか
+
+SKAN 4.0 には計測ウィンドウが3つあります（0〜2日 / 3〜7日 / 8〜35日）。各ウィンドウの終了時にスナップショットが取られ、ポストバックが送られます。ここで個人開発者がつまずきやすいのが「ロックを早く掛けすぎて、課金前に値が確定してしまう」問題です。
+
+私のアプリのデータでは、無料トライアルから有料転換までの中央値が約 5 日でした。そのため第1ウィンドウ（0〜2日）でロックしてしまうと、転換イベントの大半を取りこぼします。逆にロックを一切掛けないと、ポストバックが遅延して広告管理画面への反映が1週間以上遅れ、予算判断が後手に回ります。
+
+私が落ち着いた運用ルールはこうです。
+
+1. install / activated は `lockWindow: false` で送る（まだ上振れの余地を残す）
+2. trial_started も `lockWindow: false`（転換を待つ）
+3. subscribed が確定した瞬間にだけ `lockWindow: true` を送る
+
+このルールにすると、課金まで到達したユーザーは即座にウィンドウが閉じて速報値が得られ、課金しなかったユーザーは自然な計測ウィンドウの終了を待つ、という両取りになります。導入後、私の運用では fine value の欠損（NULL 化）が体感で 30% 台から 10% 台前半まで下がりました。母数の小さい個人アプリでは、ここの数ポイントが広告判断の精度を大きく左右します。
+
+## 広告レポートと突き合わせて黒字キャンペーンを特定する
+
+最後に、集まったコンバージョン値を「黒字判定」に変換します。AdMob やネットワークの管理画面が出してくる SKAN レポートには `conversion-value` 列があります。これを先ほどのエンコード表で逆引きし、キャンペーンごとに「subscribed（値 48〜51）の割合」を出します。
+
+```ts
+// 黒字判定の擬似ロジック（日次バッチで回す）
+type SkanRow = { campaignId: string; conversionValue: number; installs: number };
+
+function isPaidStage(cv: number): boolean {
+  // 上位2ビットを取り出して「課金ステージ(0b11)」か判定
+  return (cv >> 4) === 0b11;
+}
+
+function campaignPayingRate(rows: SkanRow[]): Map<string, number> {
+  const agg = new Map<string, { paid: number; total: number }>();
+  for (const r of rows) {
+    const a = agg.get(r.campaignId) ?? { paid: 0, total: 0 };
+    a.total += r.installs;
+    if (isPaidStage(r.conversionValue)) a.paid += r.installs;
+    agg.set(r.campaignId, a);
+  }
+  const out = new Map<string, number>();
+  for (const [id, a] of agg) out.set(id, a.total ? a.paid / a.total : 0);
+  return out;
+}
+```
+
+課金到達率にプラン単価（私のアプリなら月額数百円）を掛けると、キャンペーンごとの推定 LTV が出ます。これを CPI（インストール単価）と並べれば、続けるべき出稿と止めるべき出稿が一目で分かります。私はこの突き合わせを週次でやっていますが、SKAN を入れる前は「なんとなくインストールが安いから」で予算を配っていたのが、今は「課金到達率が CPI を上回るキャンペーンにだけ寄せる」という判断に変わりました。
+
+広告 ROI が見えないまま予算を増やすのは、穴の空いたバケツに水を注ぐようなものです。SKAN のコンバージョン値設計は地味で、最初の実装に半日ほど取られますが、ここを通すと「どこにお金を置けば返ってくるか」が初めて数字で語れるようになります。同じように個人で広告運用を始めた方の遠回りが、少しでも減れば嬉しく思います。

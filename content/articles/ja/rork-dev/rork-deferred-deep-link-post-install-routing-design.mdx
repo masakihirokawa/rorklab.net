@@ -1,0 +1,127 @@
+---
+title: "インストール直後に「目的の画面」へ着地させる — Rork アプリの遅延ディープリンク設計"
+slug: "rork-deferred-deep-link-post-install-routing-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T16:30"
+updated: "2026-06-16T16:30"
+author: "Rork Lab"
+description: "キャンペーンのリンクから来たユーザーがストア経由でインストールすると、起動時には「どこから来たか」が消えています。外部サービスに頼らず、Rork で作ったアプリに遅延ディープリンクを実装する設計を解説します。"
+tags: ["Rork", "Deep Link", "Expo", "Universal Links", "オンボーディング", "計測"]
+highlights:
+  - "ストアを経由するとリンク情報が消える理由と、3つの復元経路の使い分け"
+  - "自前バックエンド + フィンガープリント照合で外部 SDK なしに着地先を復元する実装"
+  - "誤マッチを防ぐ照合ウィンドウと信頼度スコアのしきい値設計"
+---
+
+特定のテーマの壁紙を紹介するページから「アプリで開く」を押した人が、インストール後に立ち上げると普通のホーム画面に着地してしまう。せっかくそのテーマを見に来たのに、また一から探させてしまう——個人開発でキャンペーンを打ち始めたとき、私が取りこぼしていたのがこれでした。
+
+原因は単純です。ユーザーがリンクを踏んでも、アプリが未インストールなら一度 App Store / Google Play に飛びます。ストアからインストールして初回起動したアプリには、もう「どのリンクから来たか」という情報が渡っていません。リンクのクエリパラメータは、ストアを経由した瞬間に消えてしまうからです。
+
+この断絶を埋めるのが遅延ディープリンク（Deferred Deep Link）です。Branch や AppsFlyer のような外部 SDK を入れれば一発ですが、SDK は計測のためにかなりの個人データを抱え込みますし、月額もかかります。プライバシー配慮とコストの両面から、私は自前で軽量に実装する方を選びました。ここではその設計を、Rork（Expo / React Native）アプリ向けに残しておきます。
+
+## まず「経路は3つある」と整理する
+
+遅延ディープリンクの復元には、信頼度の異なる3つの経路があります。これを混同すると実装が無駄に複雑になります。
+
+1. すでにインストール済みのユーザー（Universal Links / App Links が直接効く・最も確実）
+2. iOS で同一ブラウザからインストールした場合（クリップボード経由・条件付きで確実）
+3. それ以外（サーバー側のフィンガープリント照合・確率的）
+
+経路1は遅延ではなく通常のディープリンクなので、ここでは扱いません。問題は経路2と3です。インストールという「断絶」をまたいで情報を運ぶには、アプリの外側（サーバーやクリップボード）に一時的に情報を預けておくしかありません。
+
+私の運用では、iOS は経路2を主、経路3を保険にしています。Android は Google Play の Install Referrer API が公式に経路を提供してくれるので、そちらを使います。プラットフォームで手段がまったく違う点は、最初に押さえておくと混乱しません。
+
+## ランディングページ側で「指紋」をサーバーに預ける
+
+外部 SDK を使わない場合、リンクを踏んだ瞬間の情報を自分のバックエンドに記録しておきます。記録するのは個人を特定しない、ゆるい特徴量（フィンガープリント）だけです。
+
+```ts
+// landing.ts — ランディングページで踏まれた瞬間に呼ぶ
+async function recordClick(targetPath: string) {
+  const fp = {
+    target: targetPath,                  // 着地させたい画面（例: /theme/aurora）
+    platform: /iphone|ipad/i.test(navigator.userAgent) ? "ios" : "other",
+    lang: navigator.language,
+    tzOffset: new Date().getTimezoneOffset(),
+    screen: `${screen.width}x${screen.height}`,
+    ts: Date.now(),
+  };
+  // iOS はクリップボードにも控える（経路2の主手段）
+  try {
+    await navigator.clipboard.writeText(`rork-dl:${targetPath}`);
+  } catch {
+    // クリップボード不可なら経路3のサーバー照合に委ねる
+  }
+  await fetch("https://api.example.com/dl/click", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(fp),
+  });
+  // ストアへ送り出す
+  location.href = "https://apps.apple.com/app/idXXXXXXXX";
+}
+```
+
+クリップボードへの書き込みは、iOS では「同じ Safari セッションから来た初回起動」とほぼ等価に扱える、最も確度の高い手がかりです。ただしユーザーが他の操作でクリップボードを上書きすると消えるので、あくまで主たる手段に留め、サーバー照合を保険として併走させます。
+
+## 初回起動時にアプリ側で着地先を復元する
+
+アプリ側は初回起動の一度だけ、復元を試みます。クリップボードを先に確認し、空振りならサーバーのフィンガープリント照合に問い合わせます。
+
+```ts
+// resolveDeferredLink.ts
+import * as Clipboard from "expo-clipboard";
+import { router } from "expo-router";
+
+const FIRST_RUN_KEY = "dl_resolved_v1";
+
+export async function resolveDeferredLink(storage: Storage) {
+  // 初回起動でのみ実行（2回目以降に他人のリンクを誤吸収しないため）
+  if (await storage.getItem(FIRST_RUN_KEY)) return;
+  await storage.setItem(FIRST_RUN_KEY, "1");
+
+  // 経路2: クリップボード
+  const clip = await Clipboard.getStringAsync();
+  const m = clip.match(/^rork-dl:(\/\S+)$/);
+  if (m) {
+    await Clipboard.setStringAsync(""); // 控えは使い切ったら消す
+    router.replace(m[1]);
+    return;
+  }
+
+  // 経路3: サーバーのフィンガープリント照合
+  const target = await matchFingerprint();
+  if (target) router.replace(target);
+}
+
+async function matchFingerprint(): Promise<string | null> {
+  const res = await fetch("https://api.example.com/dl/match", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(currentFingerprint()),
+  });
+  const { target, confidence } = await res.json();
+  // 信頼度が低い照合は採用しない（誤着地は体験を損なう）
+  return confidence >= 0.7 ? target : null;
+}
+```
+
+ここで `router.replace` を使い、`push` を使わないのが地味ですが重要です。ホーム画面の上に目的画面を積むのではなく、最初の着地先そのものを差し替えることで、戻るボタンの挙動が自然になります。私は最初 `push` で実装してしまい、目的画面から戻ると一瞬だけ空のホームが見える、という違和感を作ってしまいました。
+
+## 誤マッチを防ぐしきい値とウィンドウ
+
+経路3のフィンガープリント照合は確率的なので、「誤って別人のリンクを吸収する」リスクが常にあります。これを抑える設計が品質を決めます。私が運用しているルールは次の3点です。
+
+- 照合ウィンドウは短く保つ。クリックから初回起動まで 1 時間を超えた記録は照合対象から外します。広告クリックからインストール完了までの中央値は、私のアプリでは数分以内に収まっていたので、1 時間あれば十分でした。
+- 特徴量の一致数で信頼度スコアを出し、0.7 未満は採用しない。プラットフォーム・言語・タイムゾーン・画面解像度の一致を重み付けし、ぼんやり似ているだけのものは捨てます。
+- 一度照合したクリック記録は即座に消費済みにする。同じ指紋に複数の起動が当たっても、最初の1件だけが復元され、残りは通常のホーム着地になります。
+
+誤着地は「来てもいない画面に連れていかれた」という不信感を生むので、迷ったら復元しない方が安全です。私は信頼度のしきい値を最初 0.5 に設定して、無関係な画面に着地するクレームを一度受けてから 0.7 に引き上げました。確率的な手段は、外す方のコストを高く見積もって設計するのが結局は近道です。
+
+## どこまで自前でやるかの線引き
+
+正直に言えば、大規模に広告を回してアトリビューションを厳密に測りたい段階に入ったら、専用 SDK の方が運用は楽です。自前実装はクリップボード API の OS 仕様変更やフィンガープリントの精度低下に、自分で追従し続ける必要があります。
+
+それでも個人開発の初期、月数万インストール程度までの規模なら、この軽量な自前設計で「キャンペーンから来た人を正しい画面に着地させる」という最低限は十分まかなえます。外部に個人データを預けず、固定費もかからない構成を、まず一段目として持っておく。そのうえで規模が見えてきたら SDK を検討する、という順番が私には合っていました。同じ規模で迷っている方の判断材料になればと思います。
