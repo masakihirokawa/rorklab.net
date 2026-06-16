@@ -1,0 +1,175 @@
+---
+title: "Rork アプリの Stripe Webhook が本番でだけ取りこぼす — 冪等化・再送・順序ずれに耐える受信設計の実装メモ"
+slug: "rork-stripe-webhook-reliability-idempotency-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T13:30"
+updated: "2026-06-16T13:30"
+author: "Rork Lab"
+description: "ローカルでは通るのに本番でだけ権限付与がずれる Stripe Webhook を、署名検証・冪等化・順序ずれ補正・再送ストーム対策の4層で安定させた実装メモです。Cloudflare Workers と KV を前提にした受信設計を、運用で踏んだ落とし穴ごとに整理します。"
+tags: ["Stripe", "webhook", "Cloudflare Workers", "冪等性", "決済"]
+highlights:
+  - "イベントIDを使った KV 冪等化で、Stripe の at-least-once 再送による二重付与を止める具体的な実装"
+  - "署名検証の通過後に「速く 2xx を返してから処理する」設計へ切り替え、再送ストームを未然に防ぐ手順"
+  - "順序ずれするサブスクリプションイベントを payload で信じず、retrieve で現在状態に寄せて補正する運用パターン"
+---
+
+決済は成功しているのに、ユーザーの権限が変わらない。Stripe の管理画面では `Payment succeeded`、Recent deliveries も `200 OK`。なのにアプリ側は無料プランのまま——。個人開発で課金まわりを触っていると、この「全部正しく見えるのに合わない」状態に何度かぶつかります。
+
+厄介なのは、ローカルでは `stripe trigger` で一発で通るのに、本番でだけ静かに取りこぼすことです。署名検証のような分かりやすいエラーは早めに気づけます。本当に時間を溶かすのは、検証は通っているのに「同じイベントを二回処理した」「イベントが順番どおりに来なかった」「処理が遅くて Stripe に再送された」といった、ログを見ても一見正常に見える種類の失敗でした。
+
+ここでは Rork で作ったアプリのバックエンド（Cloudflare Workers + KV）を題材に、Webhook 受信を安定させるために実際に入れた4つの層を、踏んだ落とし穴とセットで残しておきます。署名検証の話は最小限にして、その先の「受け取った後どう壊れるか」に重心を置きます。
+
+## なぜ「200 が返っているのに合わない」が起きるのか
+
+最初に押さえておきたいのは、Stripe の Webhook が **at-least-once**（少なくとも一回）配信だという前提です。これは「同じイベントが二回以上届くことがある」という意味です。ネットワークの揺らぎ、こちらのレスポンスが遅い、Stripe 側のリトライ——理由は色々ありますが、結果として `checkout.session.completed` が二回飛んでくる状況は、低頻度ながら確実に起きます。
+
+受信ハンドラが「届いたイベントを毎回そのまま処理する」前提で書かれていると、二回目の配信でもう一度権限を付与したり、サブスク開始処理を重ねて走らせたりします。冪等化していなければ、これは正常系のログ（`200 OK` が二行）として記録されるだけで、エラーには見えません。「全部正しく見えるのに合わない」の正体の多くがこれです。
+
+もうひとつ、サブスクリプションのライフサイクルイベントは **順序が保証されません**。`customer.subscription.created` より先に `customer.subscription.updated` が届くことがあります。payload の中身を時系列の真実として信じて状態機械を回すと、古い情報で上書きしてしまいます。
+
+つまり安定化の本質は、署名検証そのものよりも「重複に強い」「順序ずれに強い」「遅延に強い」受信設計をどう作るかにあります。
+
+## 第1層: Workers 上での署名検証を非同期版で通す
+
+土台として署名検証は必要です。ここだけは Cloudflare Workers 固有のはまりどころがあるので最小限に触れておきます。Node 向けでよく使う同期版 `constructEvent()` は Workers の Web Crypto 環境では動きません。非同期版に切り替え、ボディは必ず生テキストで受け取ります。
+
+```typescript
+// src/app/api/webhook/route.ts
+import Stripe from 'stripe';
+import { NextRequest, NextResponse } from 'next/server';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+export async function POST(req: NextRequest) {
+  // json() ではなく text()。パースするとバイト列が変わり署名検証が必ず落ちる
+  const body = await req.text();
+  const signature = req.headers.get('stripe-signature') ?? '';
+
+  let event: Stripe.Event;
+  try {
+    const cryptoProvider = Stripe.createSubtleCryptoProvider();
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET!,
+      undefined,
+      cryptoProvider,
+    );
+  } catch (err) {
+    // 署名が合わない＝こちらの設定ミス。400 を返すと Stripe は再送しない
+    console.error('signature verification failed:', err);
+    return NextResponse.json({ error: 'invalid signature' }, { status: 400 });
+  }
+
+  return handleEvent(event);
+}
+```
+
+ここで覚えておきたいのは、署名検証で落としたときに **400 を返す** ことです。署名不一致は通信障害ではなく設定の問題なので、再送させても直りません。逆に、後述する一時的な処理失敗では 500 を返して再送させます。この「いつ再送させ、いつ諦めさせるか」の区別が、再送ストーム対策の出発点になります。
+
+## 第2層: イベントIDで冪等化する
+
+ここが本丸です。`event.id`（`evt_...`）を冪等キーとして使い、一度処理したイベントは二度処理しないようにします。KV に「処理済みマーカー」を残し、届いた瞬間に存在チェックします。
+
+```typescript
+async function handleEvent(event: Stripe.Event) {
+  const dedupeKey = `webhook:processed:${event.id}`;
+
+  // すでに処理済みなら、何もせず 200 を返す（Stripe の再送を打ち切る）
+  const seen = await KV.get(dedupeKey);
+  if (seen) {
+    return NextResponse.json({ received: true, duplicate: true });
+  }
+
+  try {
+    await routeEvent(event);
+  } catch (err) {
+    // 処理に失敗したらマーカーを残さない。500 で再送を促す
+    console.error(`processing failed for ${event.id}:`, err);
+    return NextResponse.json({ error: 'processing failed' }, { status: 500 });
+  }
+
+  // 成功して初めてマーカーを書く。TTL は Stripe の再送猶予（最大3日）より長く
+  await KV.put(dedupeKey, String(Date.now()), { expirationTtl: 60 * 60 * 24 * 7 });
+  return NextResponse.json({ received: true });
+}
+```
+
+ポイントは **マーカーを書くタイミング** です。処理が終わってから書きます。先に書いてしまうと、処理の途中で落ちたイベントが「処理済み」になり、再送が来ても弾かれて永久に欠落します。順番は「存在チェック → 処理 → 成功したら記録」です。
+
+KV は結合度の低い読み書きでは結果整合になりうるため、ほぼ同時刻に同じイベントが二重配信されるとすり抜ける可能性は残ります。私自身、最終的な権限付与処理そのものも「すでに付与済みなら何もしない」形（付与状態を見てから書く）にして、二重の防御にしています。冪等化は一箇所で完結させず、受信層とビジネスロジック層の両方に置くのが安全でした。
+
+## 第3層: 速く 2xx を返してから重い処理を走らせる
+
+Stripe は応答が遅いと配信失敗とみなして再送します。ハンドラの中で外部 API を何本も叩いたり、メール送信まで同期で待っていると、レスポンスが Stripe のタイムアウトを超え、まだ処理中なのに再送が重なります。これが再送ストームの典型でした。冪等化していれば二重付与は防げますが、無駄な再実行で Workers の実行時間を食い、ログも汚れます。
+
+対策は、検証と冪等チェックだけ同期で済ませ、重い処理は `waitUntil` でレスポンス後に逃がすことです。
+
+```typescript
+import { NextResponse } from 'next/server';
+
+async function handleEvent(event: Stripe.Event, ctx: ExecutionContext) {
+  const dedupeKey = `webhook:processed:${event.id}`;
+  if (await KV.get(dedupeKey)) {
+    return NextResponse.json({ received: true, duplicate: true });
+  }
+
+  // 受領を確定させてから、重い処理はバックグラウンドへ
+  ctx.waitUntil(
+    routeEvent(event)
+      .then(() => KV.put(dedupeKey, String(Date.now()), { expirationTtl: 604800 }))
+      .catch((err) => {
+        // 失敗は dead-letter に積み、後述の補正ジョブで拾う
+        console.error(`bg processing failed ${event.id}:`, err);
+        return KV.put(`webhook:dlq:${event.id}`, JSON.stringify({
+          type: event.type, at: Date.now(),
+        }), { expirationTtl: 604800 });
+      }),
+  );
+
+  return NextResponse.json({ received: true });
+}
+```
+
+ただしこの設計にはトレードオフがあります。`waitUntil` に逃がすと、処理が失敗しても Stripe には 200 を返してしまうため、**Stripe 標準の再送に頼れなくなります**。そこで失敗を dead-letter キュー（KV に `dlq:` プレフィックスで記録）へ積み、第4層の補正ジョブで自前で拾い直します。同期で 500 を返して Stripe に再送させる方式と、非同期で自前再送する方式は二者択一です。私は権限付与のように「数秒の遅延は許容できるが取りこぼしは許せない」処理では後者を選びました。
+
+## 第4層: 順序ずれと欠落を補正する照合ジョブ
+
+最後の層は、Webhook を「唯一の真実」にしないことです。順序ずれや欠落が起きる前提で、定期的に Stripe の現在状態と突き合わせて補正します。
+
+順序ずれ対策としては、サブスクリプションイベントを受け取ったとき payload の中身をそのまま信じず、`subscription.id` で **その場で retrieve して現在状態を取り直す** のが堅実でした。
+
+```typescript
+async function reconcileSubscription(subId: string) {
+  // payload の status ではなく、retrieve した「いまの真実」を使う
+  const sub = await stripe.subscriptions.retrieve(subId);
+  const active = sub.status === 'active' || sub.status === 'trialing';
+  const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
+
+  // 付与状態を見てから書く（ここでも冪等に）
+  const current = await KV.get(`entitlement:${customerId}`);
+  const next = active ? 'pro' : 'free';
+  if (current !== next) {
+    await KV.put(`entitlement:${customerId}`, next);
+    console.log(`entitlement ${customerId}: ${current} -> ${next}`);
+  }
+}
+```
+
+これで `created` の前に `updated` が届いても、常に「いまの Stripe の状態」に寄るため、古い情報で上書きする事故が消えます。
+
+加えて、欠落そのものを拾うために、一日一回の照合ジョブ（Cron Triggers）を回しています。直近で更新のあったサブスクと dead-letter に溜まったイベントを Stripe 側と突き合わせ、ずれていれば直す。Webhook が主、照合が保険、という二段構えにしてから、課金まわりの「なぜか合わない」問い合わせがほぼゼロになりました。
+
+```toml
+# wrangler.toml
+[triggers]
+crons = ["0 18 * * *"]  # 毎日 1 回、取りこぼしを掃除する
+```
+
+## どこから手を付けるか
+
+全部を一度に入れる必要はありません。順番をつけるなら、まず第2層の **イベントID冪等化** です。二重付与は実害が一番大きく、しかも一番気づきにくいからです。プロダクションで最初に守るべきはここだと考えており、これを最優先で入れることを推奨します。冪等化さえ効いていれば、再送による二重付与は確実に回避できます。次に、再送で実行時間を食っているなら第3層、サブスクのライフサイクルを扱うなら第3層より先に第4層の retrieve 補正を入れる、という優先順位で十分に効きます。
+
+Webhook の安定化は、突き詰めると「届いたものを信じすぎない」という一点に尽きます。届かないことより、届いたのに二重・逆順・遅延で静かにずれることのほうが、運用では何倍も時間を奪います。同じところで止まっている方の、調査の起点になれば幸いです。

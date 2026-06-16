@@ -1,0 +1,175 @@
+---
+title: "Why Your Rork App's Stripe Webhooks Drop Events Only in Production — Field Notes on Idempotency, Retries, and Out-of-Order Delivery"
+slug: "rork-stripe-webhook-reliability-idempotency-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-16T13:30"
+updated: "2026-06-16T13:30"
+author: "Rork Lab"
+description: "A field-tested four-layer design for stabilizing Stripe webhooks that pass locally but silently misfire in production: signature verification on Workers, event-ID idempotency, fast-2xx-then-process, and a reconciliation job that survives out-of-order delivery. Built around Cloudflare Workers and KV."
+tags: ["Stripe", "webhook", "Cloudflare Workers", "idempotency", "payments"]
+highlights:
+  - "A concrete KV idempotency pattern keyed on event.id that stops double-granting caused by Stripe's at-least-once retries"
+  - "How to switch to a fast-2xx-then-process handler so slow work never triggers Stripe's retry storm"
+  - "An operational pattern that stops trusting subscription event payloads and reconciles against a fresh retrieve instead"
+---
+
+The payment went through, but the user's access never changed. Stripe's dashboard shows `Payment succeeded`. Recent deliveries shows `200 OK`. And yet the app still treats them as a free user. If you do payments as a solo indie developer, you eventually hit this exact state: everything looks correct, but the numbers don't line up.
+
+The frustrating part is that it passes locally. A single `stripe trigger` works on the first try, and then production quietly drops events. The obvious failures — a broken signature — surface fast. The ones that eat hours are the failures that still log as success: the same event processed twice, an event that arrived out of order, a handler that ran too slowly and got retried. None of those look like errors in your logs.
+
+These are field notes from stabilizing webhook handling for an app I built with Rork, backed by Cloudflare Workers and KV. I'll keep the signature-verification part short and spend the time on the more interesting question: once the event is in your hands, how does it break?
+
+## Why "200 OK but still wrong" happens
+
+The premise to internalize is that Stripe delivers webhooks **at least once**. That means the same event can arrive more than once. Network jitter, a slow response from your side, a retry on Stripe's side — for any of these reasons, `checkout.session.completed` can show up twice. It's infrequent, but it absolutely happens.
+
+If your handler assumes "process whatever arrives, every time," the second delivery grants access again or re-runs the subscription-start logic. Without idempotency, that second run is recorded as a perfectly normal success — two `200 OK` lines, no error in sight. That's the real identity of most "everything looks right but it's wrong" cases.
+
+There's a second trap: subscription lifecycle events are **not ordered**. `customer.subscription.updated` can arrive before `customer.subscription.created`. If you treat the payload as the timeline of truth and drive a state machine from it, you'll overwrite current state with stale data.
+
+So stabilization is less about signature verification and more about designing a receiver that is resilient to duplicates, to reordering, and to delay.
+
+## Layer 1: Verify the signature with the async API on Workers
+
+You still need verification as a foundation. There's one Cloudflare-specific gotcha worth a paragraph. The synchronous `constructEvent()` used in Node doesn't work in the Workers Web Crypto environment. Switch to the async variant, and always take the body as raw text.
+
+```typescript
+// src/app/api/webhook/route.ts
+import Stripe from 'stripe';
+import { NextRequest, NextResponse } from 'next/server';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+export async function POST(req: NextRequest) {
+  // text(), not json(). Parsing changes the bytes and verification will always fail.
+  const body = await req.text();
+  const signature = req.headers.get('stripe-signature') ?? '';
+
+  let event: Stripe.Event;
+  try {
+    const cryptoProvider = Stripe.createSubtleCryptoProvider();
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET!,
+      undefined,
+      cryptoProvider,
+    );
+  } catch (err) {
+    // A bad signature is a config mistake, not a transient fault. 400 = don't retry.
+    console.error('signature verification failed:', err);
+    return NextResponse.json({ error: 'invalid signature' }, { status: 400 });
+  }
+
+  return handleEvent(event);
+}
+```
+
+The thing to remember is to return **400** when verification fails. A signature mismatch is a configuration problem, not a network glitch, so retrying won't fix it. Conversely, for the transient processing failures below, you return 500 to make Stripe retry. This distinction — when to invite a retry and when to give up — is the starting point for retry-storm prevention.
+
+## Layer 2: Make the handler idempotent on event.id
+
+This is the core. Use `event.id` (`evt_...`) as the idempotency key and never process the same event twice. Keep a "processed" marker in KV and check for it the moment the event arrives.
+
+```typescript
+async function handleEvent(event: Stripe.Event) {
+  const dedupeKey = `webhook:processed:${event.id}`;
+
+  // Already handled? Do nothing and return 200 to end Stripe's retries.
+  const seen = await KV.get(dedupeKey);
+  if (seen) {
+    return NextResponse.json({ received: true, duplicate: true });
+  }
+
+  try {
+    await routeEvent(event);
+  } catch (err) {
+    // On failure, don't write the marker. Return 500 to invite a retry.
+    console.error(`processing failed for ${event.id}:`, err);
+    return NextResponse.json({ error: 'processing failed' }, { status: 500 });
+  }
+
+  // Write the marker only after success. TTL longer than Stripe's retry window (up to 3 days).
+  await KV.put(dedupeKey, String(Date.now()), { expirationTtl: 60 * 60 * 24 * 7 });
+  return NextResponse.json({ received: true });
+}
+```
+
+The subtle part is **when** you write the marker — after the work completes. If you write it first, an event that dies mid-processing gets marked "done," and the retry that follows is rejected and lost forever. The order is: check existence, process, record on success.
+
+Because KV can be eventually consistent across loosely coupled reads and writes, two near-simultaneous deliveries of the same event can still slip through. I make the entitlement grant itself idempotent too — read the current grant state, then write only if it differs — as a second line of defense. Putting idempotency in both the receiver and the business-logic layer, rather than in one place, proved to be the safe choice.
+
+## Layer 3: Return 2xx fast, then do the heavy work
+
+Stripe treats a slow response as a delivery failure and retries. If your handler calls several external APIs or waits synchronously to send an email, the response can exceed Stripe's timeout and a retry piles on while you're still working. That's the classic retry storm. Idempotency stops the double grant, but the wasted re-runs burn Workers execution time and pollute your logs.
+
+The fix is to keep only verification and the dedup check synchronous, and push the heavy work past the response with `waitUntil`.
+
+```typescript
+import { NextResponse } from 'next/server';
+
+async function handleEvent(event: Stripe.Event, ctx: ExecutionContext) {
+  const dedupeKey = `webhook:processed:${event.id}`;
+  if (await KV.get(dedupeKey)) {
+    return NextResponse.json({ received: true, duplicate: true });
+  }
+
+  // Acknowledge receipt, then move the heavy work into the background.
+  ctx.waitUntil(
+    routeEvent(event)
+      .then(() => KV.put(dedupeKey, String(Date.now()), { expirationTtl: 604800 }))
+      .catch((err) => {
+        // Push failures to a dead-letter queue; the reconciliation job picks them up.
+        console.error(`bg processing failed ${event.id}:`, err);
+        return KV.put(`webhook:dlq:${event.id}`, JSON.stringify({
+          type: event.type, at: Date.now(),
+        }), { expirationTtl: 604800 });
+      }),
+  );
+
+  return NextResponse.json({ received: true });
+}
+```
+
+This design has a trade-off, though. Once you move work into `waitUntil`, a failure still returns 200 to Stripe, so you **can no longer rely on Stripe's built-in retries**. That's why failures go to a dead-letter queue (recorded in KV under a `dlq:` prefix) for the Layer 4 reconciliation job to recover on its own. Returning 500 synchronously to let Stripe retry, versus acknowledging and retrying yourself, is an either/or. For work like granting access — where a few seconds of delay is fine but a dropped event is not — I chose the latter.
+
+## Layer 4: A reconciliation job that fixes reordering and gaps
+
+The final layer is to stop treating the webhook as the single source of truth. Assume reordering and gaps happen, and periodically reconcile against Stripe's current state.
+
+For reordering, the robust move is to not trust the payload when a subscription event arrives, but to **retrieve the subscription by id and re-read its current state on the spot**.
+
+```typescript
+async function reconcileSubscription(subId: string) {
+  // Use the retrieved "current truth," not the status in the payload.
+  const sub = await stripe.subscriptions.retrieve(subId);
+  const active = sub.status === 'active' || sub.status === 'trialing';
+  const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
+
+  // Read before write here, too (idempotent).
+  const current = await KV.get(`entitlement:${customerId}`);
+  const next = active ? 'pro' : 'free';
+  if (current !== next) {
+    await KV.put(`entitlement:${customerId}`, next);
+    console.log(`entitlement ${customerId}: ${current} -> ${next}`);
+  }
+}
+```
+
+Now, even if `updated` arrives before `created`, you always converge to "Stripe's current state," and the stale-overwrite accident disappears.
+
+To catch gaps themselves, I run a once-a-day reconciliation job via Cron Triggers. It diffs recently updated subscriptions and the events sitting in the dead-letter queue against Stripe, and fixes anything that drifted. After moving to "webhook as primary, reconciliation as insurance," billing-related "it just doesn't match" reports dropped to roughly zero.
+
+```toml
+# wrangler.toml
+[triggers]
+crons = ["0 18 * * *"]  # once a day, sweep up anything that was dropped
+```
+
+## Where to start
+
+You don't need all of this at once. If you want an order, start with Layer 2 — **event-ID idempotency**. Double-granting does the most damage and is the hardest to notice. After that, add Layer 3 if retries are eating execution time, and reach for Layer 4's retrieve-based reconciliation early if you handle subscription lifecycles. That sequence covers most of the pain.
+
+Stabilizing webhooks comes down to one idea: don't trust what arrives too much. A dropped delivery costs you less, in practice, than a delivery that arrives duplicated, reversed, or delayed and quietly drifts your state. If you're stuck at the same spot, I hope this gives your investigation a place to begin.
