@@ -1,0 +1,261 @@
+---
+title: "Rork で出したアプリにオフライン優先を後付けする — 永続キャッシュと書き込みキューの設計"
+slug: "rork-expo-offline-first-tanstack-query-persist-retrofit"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-18T11:15"
+author: "Rork Lab"
+description: "地下鉄でアプリを開いたら真っ白、というレビューが続きました。エラー画面を整えるだけでは足りず、Rork が出した Expo アプリに TanStack Query の永続キャッシュとオフライン書き込みキューを後付けした記録です。楽観的更新・再接続フラッシュ・再生成で消さない隔離まで実装込みで整理します。"
+tags: ["Rork", "Expo", "オフライン対応", "TanStack Query", "個人開発"]
+highlights:
+  - "起動直後に前回のデータを描画する persistQueryClient + AsyncStorage の永続キャッシュ実装と、24時間 maxAge の根拠"
+  - "オフライン中のお気に入り操作を失わない楽観的更新つき Mutation キューと、再接続時に NetInfo で一括フラッシュする全コード"
+  - "後付けレイヤーを Rork の再生成で消さないための guarded/ 隔離と、本番で踏んだ重複フラッシュ・古いデータ混入の対処"
+---
+
+地下鉄のホームで開いたら真っ白なまま固まる——半年ほど前、運用中のアプリにそういう趣旨のレビューが立て続けに付きました。星は2つ。再現しようと電波の弱い場所で試すと、確かにホーム画面が空白のまま、くるくる回り続けます。
+
+私はそれまで、ネットワークが不安定なときのために「読み込み中」と「再試行」のエラー画面は用意していました。けれど、レビューを落とした人たちが求めていたのはエラー画面ではありませんでした。「昨日見た中身を、いまもう一度見せてほしい」だけだったのです。
+
+エラー画面は、失敗を丁寧に伝える仕組みです。一方でオフライン優先は、そもそも失敗を見せない仕組みです。Rork が生成するアプリは初期状態ではサーバー応答を前提に画面を組み立てるため、通信が途切れると描くものがありません。ここに、起動直後から前回のデータを描き、オフライン中の操作も失わない層を後付けする必要がありました。
+
+この記事は、Rork が出した Expo（React Native）プロジェクトに、TanStack Query v5 の永続キャッシュとオフライン書き込みキューを後から組み込んだ実装記録です。個人開発で複数のアプリを運用してきた立場から、特に「後付け」「AI が再生成する前提」という2つの制約の中でどう成立させたかに重点を置きます。
+
+## エラー画面を整えるより前に、最後のデータを描く
+
+まず方針です。オフライン対応というと再試行ボタンや通信状態バナーから手を付けがちですが、体感をいちばん大きく変えるのは「起動直後の空白を消すこと」でした。
+
+Rork の生成コードは TanStack Query を使っていれば `useQuery` でデータを取りに行きます。既定ではキャッシュはメモリ上にしか残らず、アプリを閉じると消えます。次回起動時はまた取得からやり直すため、圏外だと空白になります。
+
+ここで効くのが永続キャッシュです。取得済みのデータをストレージへ書き出しておき、起動時にメモリへ復元する。すると圏外でも「前回の中身」が即座に出ます。レビューの多くは、この一点だけで静まりました。
+
+実装は `@tanstack/react-query-persist-client` を使います。Expo なら `@react-native-async-storage/async-storage` を永続先にできます。
+
+```ts
+// guarded/offline/queryClient.ts
+import { QueryClient } from "@tanstack/react-query";
+import { persistQueryClient } from "@tanstack/react-query-persist-client";
+import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // メモリ上のキャッシュ寿命。永続キャッシュとは別物
+      gcTime: 1000 * 60 * 60 * 24, // 24時間（旧 cacheTime）
+      staleTime: 1000 * 60 * 5,    // 5分は再取得しない
+      retry: 2,
+    },
+  },
+});
+
+const persister = createAsyncStoragePersister({
+  storage: AsyncStorage,
+  key: "RORK_RQ_CACHE_V1", // スキーマ変更時はサフィックスを上げて捨てる
+  throttleTime: 1000,      // 書き込みを1秒間引く（過剰書き込み防止）
+});
+
+export function setupPersistence() {
+  persistQueryClient({
+    queryClient,
+    persister,
+    maxAge: 1000 * 60 * 60 * 24, // 24時間より古い永続キャッシュは復元しない
+    dehydrateOptions: {
+      // 成功したクエリだけ永続化する（エラー状態を焼き付けない）
+      shouldDehydrateQuery: (q) => q.state.status === "success",
+    },
+  });
+}
+```
+
+`maxAge` を24時間にしているのは、壁紙や記事のような「多少古くても困らないが、1日以上前だと体裁が悪い」種類のデータを基準にしたためです。残高や在庫のように鮮度が意味を持つデータでは、ここを数分に絞るか、後述の「古いデータの明示」を併用してください。`gcTime` はメモリ側の寿命で、永続キャッシュの `maxAge` とは別の軸です。両方を意識せずに片方だけ延ばすと、メモリから消えた直後に空白が出ます。
+
+アプリ側は `PersistQueryClientProvider` で包むだけです。Rork の `app/_layout.tsx` は再生成で上書きされるため、ここでの接続は1行に絞ります（理由は後半で述べます）。
+
+```tsx
+// app/_layout.tsx の最小の接続点
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
+import { queryClient, persister } from "../guarded/offline/queryClient";
+
+export default function RootLayout() {
+  return (
+    <PersistQueryClientProvider
+      client={queryClient}
+      persistOptions={{ persister, maxAge: 1000 * 60 * 60 * 24 }}
+    >
+      {/* Rork が生成する既存のツリー */}
+    </PersistQueryClientProvider>
+  );
+}
+```
+
+## オフライン中の操作を失わない — 楽観的更新つきの書き込みキュー
+
+読み取りの空白は永続キャッシュで消えました。次は書き込みです。圏外で「お気に入りに追加」を押したとき、何も起きずに無視されると、ユーザーは押したこと自体を忘れます。電波が戻ってから「あれ、保存されてない」となるのが、地味に評価を落とすパターンでした。
+
+ここでの設計判断は、書き込みを「即座に画面へ反映し、送信は後回しにする」ことです。TanStack Query の `onMutate` で楽観的に UI を更新し、失敗時は `onError` で巻き戻す。さらにオフライン中は送信自体を保留し、ローカルのキューに積みます。
+
+```ts
+// guarded/offline/mutationQueue.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export type PendingMutation = {
+  id: string;          // 重複送信を弾くための一意キー
+  kind: "favorite.add" | "favorite.remove";
+  payload: Record<string, unknown>;
+  createdAt: number;
+};
+
+const QUEUE_KEY = "RORK_PENDING_MUTATIONS_V1";
+
+export async function enqueue(m: PendingMutation): Promise<void> {
+  const raw = await AsyncStorage.getItem(QUEUE_KEY);
+  const list: PendingMutation[] = raw ? JSON.parse(raw) : [];
+  // 同一 id が既にあれば積み直さない（二重タップ・再試行対策）
+  if (list.some((x) => x.id === m.id)) return;
+  list.push(m);
+  await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(list));
+}
+
+export async function getQueue(): Promise<PendingMutation[]> {
+  const raw = await AsyncStorage.getItem(QUEUE_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+
+export async function removeFromQueue(id: string): Promise<void> {
+  const list = await getQueue();
+  await AsyncStorage.setItem(
+    QUEUE_KEY,
+    JSON.stringify(list.filter((x) => x.id !== id)),
+  );
+}
+```
+
+お気に入り追加の `useMutation` 側はこうなります。送信に失敗しても（圏外でも）キューへ積み、UI は楽観的に進めます。
+
+```ts
+// guarded/offline/useFavoriteMutation.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { enqueue } from "./mutationQueue";
+import { addFavoriteRequest } from "../../app/api/favorites"; // 生成コード側の送信関数
+
+export function useAddFavorite() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (itemId: string) => addFavoriteRequest(itemId),
+    onMutate: async (itemId) => {
+      await qc.cancelQueries({ queryKey: ["favorites"] });
+      const prev = qc.getQueryData<string[]>(["favorites"]) ?? [];
+      // 画面を即座に更新（楽観的更新）
+      qc.setQueryData<string[]>(["favorites"], [...prev, itemId]);
+      return { prev };
+    },
+    onError: async (_err, itemId, ctx) => {
+      // 送信に失敗 = 圏外の可能性。UI は戻さずキューへ退避する
+      await enqueue({
+        id: `fav-add-${itemId}`,
+        kind: "favorite.add",
+        payload: { itemId },
+        createdAt: Date.now(),
+      });
+      // ※ ここで ctx.prev に巻き戻さないのが肝。巻き戻すと「押したのに消える」体験になる
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["favorites"] });
+    },
+  });
+}
+```
+
+ここで一番悩んだのは `onError` の扱いです。教科書どおりだと `onError` で `ctx.prev` に巻き戻します。しかしオフライン前提では、巻き戻すと「押した直後に消える」という最悪の体験になります。私は「送信失敗＝後で送る」と割り切り、UI は進めたままキューに退避する方針にしました。サーバーが本当のエラー（権限不足など）を返した場合だけ巻き戻すよう、エラー種別で分岐させると、より厳密になります。
+
+## 再接続したらキューを流す — NetInfo で一度だけ
+
+積んだキューは、通信が戻った瞬間に送ります。`@react-native-community/netinfo` の購読で接続回復を検知し、キューを順に送信して、成功したものから消します。
+
+```ts
+// guarded/offline/flush.ts
+import NetInfo from "@react-native-community/netinfo";
+import { getQueue, removeFromQueue } from "./mutationQueue";
+import { addFavoriteRequest, removeFavoriteRequest } from "../../app/api/favorites";
+import { queryClient } from "./queryClient";
+
+let flushing = false; // 同時フラッシュを防ぐ門
+
+async function flushQueue(): Promise<void> {
+  if (flushing) return;
+  flushing = true;
+  try {
+    const queue = await getQueue();
+    for (const m of queue) {
+      try {
+        if (m.kind === "favorite.add") {
+          await addFavoriteRequest(m.payload.itemId as string);
+        } else if (m.kind === "favorite.remove") {
+          await removeFavoriteRequest(m.payload.itemId as string);
+        }
+        await removeFromQueue(m.id); // 成功したものだけ消す
+      } catch {
+        // 1件失敗したら以降は次回接続に回す（順序を保つ）
+        break;
+      }
+    }
+    queryClient.invalidateQueries({ queryKey: ["favorites"] });
+  } finally {
+    flushing = false;
+  }
+}
+
+export function startFlushWatcher(): () => void {
+  return NetInfo.addEventListener((state) => {
+    if (state.isConnected && state.isInternetReachable !== false) {
+      flushQueue();
+    }
+  });
+}
+```
+
+`flushing` のガードは本番で痛い目を見て足しました。NetInfo は接続状態が小刻みに揺れると短時間に複数回コールバックを呼びます。最初の実装ではこれで `flushQueue` が二重に走り、同じお気に入り追加が2回送信されてサーバー側に重複が生まれました。`flushing` フラグと、キューの `id` による重複排除の二段構えで、ようやく落ち着きました。1件失敗で `break` しているのは、送信順序を保つためです。「削除→再追加」の順序が崩れると、最終状態が逆になります。
+
+## 後付けで一番ハマったのは、再生成でこの層が消えること
+
+ここまでの実装でオフライン体験は安定しました。けれど Rork 特有の落とし穴がもう一つあります。再生成です。
+
+Rork は依頼に応じてプロジェクトを再構成します。私が `app/_layout.tsx` に直接オフラインの初期化を書き込んでいたとき、設定画面の文言を直す程度の依頼で `_layout.tsx` ごと書き換わり、`startFlushWatcher` の呼び出しが消えていました。オフラインキューは積まれ続けるのに、誰もフラッシュしない状態です。気付いたのは、再接続しても保存されないという別レビューが来てからでした。
+
+対処は単純で、オフライン関連のコードを全て `guarded/offline/` という Rork が生成しないディレクトリに隔離し、生成コードからの接続を最小限に絞ることです。`_layout.tsx` 側に残すのは Provider の1行と、ウォッチャ起動の1行だけにします。
+
+```tsx
+// app/_layout.tsx に残す接続は最小限に
+import { useEffect } from "react";
+import { setupPersistence } from "../guarded/offline/queryClient";
+import { startFlushWatcher } from "../guarded/offline/flush";
+
+setupPersistence(); // モジュール読み込み時に一度だけ
+
+export default function RootLayout() {
+  useEffect(() => startFlushWatcher(), []); // 解除関数を返して購読を後始末
+  // 以下 Rork 生成のツリー
+}
+```
+
+接続点を1行に絞っておくと、再生成で消えても復旧が「2行戻す」だけで済みます。私はこの2行を `patches/` にメモとして残し、再生成のたびに差分確認で存在を確かめる運用にしました。再生成と手動修正の境界設計そのものは別記事で詳しく書いていますが、オフライン層はその中でも「消えると無症状で壊れる（積まれるが送られない）」種類なので、特に隔離の徹底が要ります。
+
+もう一つの実害が、古いデータの混入です。永続キャッシュは便利な反面、サーバー側でデータ構造を変えると、古い形のキャッシュを復元してクラッシュします。`key` にバージョンサフィックス（`_V1`）を付け、構造変更時に上げて旧キャッシュを捨てるのは、このための保険です。加えて、復元したデータが古い可能性を UI に小さく示す（「最終更新: ◯分前」）と、鮮度が意味を持つ画面でも誤解が減ります。
+
+## すべてをオフライン化しない — 永続化する対象を絞る
+
+後付けを進めると、つい全画面をオフライン対応にしたくなります。私はここで一度やりすぎて、設定画面のサーバー設定値まで永続化し、サーバー側で値を変えてもアプリが古い値を握り続ける不具合を作りました。
+
+永続化する価値があるのは、「最後に見た状態を再び見たい」データです。一覧・お気に入り・閲覧履歴のように、多少古くても意味を保つものが向きます。逆に、リモート設定値・在庫・残高・認証トークンの有効期限のように、鮮度が正しさそのものに直結するデータは永続キャッシュに乗せません。これらは `gcTime` を短くするか、`shouldDehydrateQuery` で除外します。
+
+私が個人的に採用する判断基準は単純です。「このデータが1日前のものでも、ユーザーは困らないか」を一問だけ自問します。困るなら永続化しない。困らないなら永続化して空白を消す。この一問で、永続化対象は自然と一覧系へ絞られていきました。
+
+## 効果をレビューとクラッシュ率で確かめる
+
+体感だけで終わらせず、後付け前後で2つの数字を見ました。第一に、星1〜2のレビューに占める「真っ白／固まる／読み込めない」系の文言の割合です。後付け前は低評価レビューの体感で約40%がこの種でしたが、永続キャッシュ導入後の4週間でほぼ消えました。第二に、起動直後のクラッシュです。古いキャッシュ復元によるクラッシュが `key` バージョニング導入前に数件出ていましたが、サフィックス運用に切り替えてからは観測ゼロです。
+
+数字の取り方自体は地味です。AdMob やストアの管理画面とは別に、低評価レビューを手で読み、原因語をタグ付けして週次で数えるだけです。けれど「真っ白で固まる」という体験は、機能の不足ではなく前提設計の不足から来ます。エラー画面をいくら磨いても解けなかったのは、そもそも描くデータを手元に持っていなかったからでした。
+
+次の一手としては、まず運用中のアプリで `useQuery` を使っている画面を1つ選び、`persistQueryClient` だけを `guarded/offline/` に隔離して入れてみてください。書き込みキューはその後で構いません。読み取りの空白が消えるだけでも、低評価レビューの景色はかなり変わります。同じように電波の悪い日に星を落とされている方の、最初の一歩になれば嬉しいです。

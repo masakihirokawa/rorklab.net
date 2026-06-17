@@ -1,0 +1,260 @@
+---
+title: "Retrofitting Offline-First Into a Rork App: Persistent Cache and a Write Queue"
+slug: "rork-expo-offline-first-tanstack-query-persist-retrofit"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-18T11:15"
+author: "Rork Lab"
+description: "Reviews kept saying the app was blank on the subway. Polishing error screens was not enough, so I retrofitted TanStack Query persistence and an offline write queue into a Rork-generated Expo app. Optimistic updates, reconnect flushing, and keeping the layer safe from regeneration are all covered with code."
+tags: ["Rork", "Expo", "offline-first", "TanStack Query", "indie developer"]
+highlights:
+  - "A persistQueryClient + AsyncStorage setup that paints last session's data on launch, with the reasoning behind a 24-hour maxAge"
+  - "An optimistic-update mutation queue that never loses an offline tap, plus the full NetInfo code that flushes it once on reconnect"
+  - "How to keep the retrofitted layer out of Rork's regeneration path with a guarded/ folder, and the duplicate-flush and stale-data bugs I hit in production"
+---
+
+About six months ago I started getting a run of two-star reviews that all said roughly the same thing: open the app on the subway platform and it sits there blank. I reproduced it in a low-signal spot, and sure enough the home screen stayed empty with a spinner turning forever.
+
+I had already built "loading" and "retry" error screens for flaky networks. But the people leaving those reviews were not asking for a nicer error screen. They wanted one thing: "show me what I saw yesterday, right now."
+
+An error screen is a way to report failure politely. Offline-first is a way to avoid showing failure at all. A Rork-generated app assembles its screens around server responses by default, so when the connection drops there is nothing to draw. What I needed was a layer that paints last session's data on launch and never throws away an action taken offline.
+
+This is a record of retrofitting TanStack Query v5 persistence and an offline write queue into a Rork (React Native) Expo project. As an indie developer running several apps, I want to focus on how to make this work under two specific constraints: it is a retrofit, and the AI regenerates the project.
+
+## Paint the last data before you polish error screens
+
+A note on priorities first. "Offline support" usually starts with retry buttons and connectivity banners, but the change that moved the needle most was removing the blank screen on launch.
+
+If the generated code already uses TanStack Query, it fetches with `useQuery`. By default that cache lives only in memory and is gone when the app closes, so the next cold start refetches from scratch, which means a blank screen when there is no signal.
+
+Persistence is what fixes this. Write fetched data to storage, restore it into memory on launch, and even offline the user immediately sees "last time's content." Most of those reviews went quiet on this single change.
+
+You use `@tanstack/react-query-persist-client`, and on Expo you can persist to `@react-native-async-storage/async-storage`.
+
+```ts
+// guarded/offline/queryClient.ts
+import { QueryClient } from "@tanstack/react-query";
+import { persistQueryClient } from "@tanstack/react-query-persist-client";
+import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      gcTime: 1000 * 60 * 60 * 24, // in-memory cache lifetime (was cacheTime)
+      staleTime: 1000 * 60 * 5,    // do not refetch for 5 minutes
+      retry: 2,
+    },
+  },
+});
+
+const persister = createAsyncStoragePersister({
+  storage: AsyncStorage,
+  key: "RORK_RQ_CACHE_V1", // bump the suffix to drop the cache on schema change
+  throttleTime: 1000,      // throttle writes to once per second
+});
+
+export function setupPersistence() {
+  persistQueryClient({
+    queryClient,
+    persister,
+    maxAge: 1000 * 60 * 60 * 24, // do not restore persisted cache older than 24h
+    dehydrateOptions: {
+      // only persist successful queries; never bake in an error state
+      shouldDehydrateQuery: (q) => q.state.status === "success",
+    },
+  });
+}
+```
+
+I set `maxAge` to 24 hours because my baseline is data like wallpapers or articles: fine to be a little stale, but awkward if it is more than a day old. For data where freshness carries meaning, such as balances or inventory, tighten this to minutes or pair it with the "show how old this is" idea below. Note that `gcTime` is the in-memory lifetime and is a separate axis from the persisted `maxAge`. Extend one without the other and you get a blank flash the moment memory is evicted.
+
+On the app side you just wrap with `PersistQueryClientProvider`. Because Rork regenerates `app/_layout.tsx`, I keep the wiring here down to a single line (the reasoning comes later).
+
+```tsx
+// the minimal wiring point in app/_layout.tsx
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
+import { queryClient, persister } from "../guarded/offline/queryClient";
+
+export default function RootLayout() {
+  return (
+    <PersistQueryClientProvider
+      client={queryClient}
+      persistOptions={{ persister, maxAge: 1000 * 60 * 60 * 24 }}
+    >
+      {/* the existing tree Rork generates */}
+    </PersistQueryClientProvider>
+  );
+}
+```
+
+## Never lose an offline tap: a write queue with optimistic updates
+
+Persistence removed the blank screen on reads. Writes are next. When someone taps "add to favorites" while offline and nothing happens, they forget they ever tapped it. The quiet rating-killer was people noticing later, once back online, that it was never saved.
+
+The design call here is to reflect the write on screen immediately and defer the send. TanStack Query's `onMutate` updates the UI optimistically and `onError` rolls back. On top of that, while offline I hold the send itself and push it onto a local queue.
+
+```ts
+// guarded/offline/mutationQueue.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export type PendingMutation = {
+  id: string;          // unique key used to reject duplicate sends
+  kind: "favorite.add" | "favorite.remove";
+  payload: Record<string, unknown>;
+  createdAt: number;
+};
+
+const QUEUE_KEY = "RORK_PENDING_MUTATIONS_V1";
+
+export async function enqueue(m: PendingMutation): Promise<void> {
+  const raw = await AsyncStorage.getItem(QUEUE_KEY);
+  const list: PendingMutation[] = raw ? JSON.parse(raw) : [];
+  // if the same id is already queued, do not push again (double-tap / retry)
+  if (list.some((x) => x.id === m.id)) return;
+  list.push(m);
+  await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(list));
+}
+
+export async function getQueue(): Promise<PendingMutation[]> {
+  const raw = await AsyncStorage.getItem(QUEUE_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+
+export async function removeFromQueue(id: string): Promise<void> {
+  const list = await getQueue();
+  await AsyncStorage.setItem(
+    QUEUE_KEY,
+    JSON.stringify(list.filter((x) => x.id !== id)),
+  );
+}
+```
+
+The "add favorite" `useMutation` looks like this. Even when the send fails (including offline), it enqueues and lets the UI move forward optimistically.
+
+```ts
+// guarded/offline/useFavoriteMutation.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { enqueue } from "./mutationQueue";
+import { addFavoriteRequest } from "../../app/api/favorites"; // send fn in the generated code
+
+export function useAddFavorite() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (itemId: string) => addFavoriteRequest(itemId),
+    onMutate: async (itemId) => {
+      await qc.cancelQueries({ queryKey: ["favorites"] });
+      const prev = qc.getQueryData<string[]>(["favorites"]) ?? [];
+      // update the screen immediately (optimistic update)
+      qc.setQueryData<string[]>(["favorites"], [...prev, itemId]);
+      return { prev };
+    },
+    onError: async (_err, itemId, ctx) => {
+      // a failed send likely means offline. Do not revert the UI; stash to the queue
+      await enqueue({
+        id: `fav-add-${itemId}`,
+        kind: "favorite.add",
+        payload: { itemId },
+        createdAt: Date.now(),
+      });
+      // The key is NOT rolling back to ctx.prev here. Rolling back means "I tapped it and it vanished."
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["favorites"] });
+    },
+  });
+}
+```
+
+The part I agonized over was `onError`. The textbook version rolls back to `ctx.prev`. But offline-first, rolling back produces the worst experience: the item disappears the instant you tap it. I decided to treat a failed send as "send it later," keeping the UI advanced while stashing the action. To be stricter, branch on the error type so that a genuine server error (like a permission failure) does roll back.
+
+## Flush the queue on reconnect, exactly once
+
+The queued actions get sent the moment connectivity returns. Subscribe to `@react-native-community/netinfo`, detect recovery, send the queue in order, and remove the ones that succeed.
+
+```ts
+// guarded/offline/flush.ts
+import NetInfo from "@react-native-community/netinfo";
+import { getQueue, removeFromQueue } from "./mutationQueue";
+import { addFavoriteRequest, removeFavoriteRequest } from "../../app/api/favorites";
+import { queryClient } from "./queryClient";
+
+let flushing = false; // gate against concurrent flushes
+
+async function flushQueue(): Promise<void> {
+  if (flushing) return;
+  flushing = true;
+  try {
+    const queue = await getQueue();
+    for (const m of queue) {
+      try {
+        if (m.kind === "favorite.add") {
+          await addFavoriteRequest(m.payload.itemId as string);
+        } else if (m.kind === "favorite.remove") {
+          await removeFavoriteRequest(m.payload.itemId as string);
+        }
+        await removeFromQueue(m.id); // remove only what succeeded
+      } catch {
+        // if one fails, leave the rest for the next reconnect (preserve order)
+        break;
+      }
+    }
+    queryClient.invalidateQueries({ queryKey: ["favorites"] });
+  } finally {
+    flushing = false;
+  }
+}
+
+export function startFlushWatcher(): () => void {
+  return NetInfo.addEventListener((state) => {
+    if (state.isConnected && state.isInternetReachable !== false) {
+      flushQueue();
+    }
+  });
+}
+```
+
+I added the `flushing` gate after getting burned in production. When connectivity flickers, NetInfo fires the callback several times in quick succession. My first version let `flushQueue` run twice, the same favorite add went out twice, and the server ended up with duplicates. A two-layer defense, the `flushing` flag plus dedup by queue `id`, finally settled it. I `break` on the first failure to preserve send order; if a "remove then re-add" pair gets reordered, the final state flips.
+
+## The real trap of retrofitting: regeneration erasing the layer
+
+At this point the offline experience was stable. But Rork has one more pitfall: regeneration.
+
+Rork rebuilds the project based on your request. When I had written the offline init directly into `app/_layout.tsx`, a request as small as fixing some settings-screen copy rewrote the whole `_layout.tsx`, and the `startFlushWatcher` call vanished with it. The queue kept accumulating, but nobody flushed it. I only noticed when a different review came in saying things still were not saving after reconnecting.
+
+The fix is simple: move all offline code into a `guarded/offline/` directory that Rork does not generate, and keep the wiring from the generated code minimal. What stays in `_layout.tsx` is one line for the provider and one line to start the watcher.
+
+```tsx
+// keep the wiring in app/_layout.tsx minimal
+import { useEffect } from "react";
+import { setupPersistence } from "../guarded/offline/queryClient";
+import { startFlushWatcher } from "../guarded/offline/flush";
+
+setupPersistence(); // run once at module load
+
+export default function RootLayout() {
+  useEffect(() => startFlushWatcher(), []); // return the unsubscribe to clean up
+  // Rork-generated tree below
+}
+```
+
+With the wiring narrowed to two lines, recovering from a regeneration that erased them is just "put two lines back." I keep those two lines as a note in `patches/` and verify their presence in the diff after every regeneration. I cover the regeneration-versus-manual-edit boundary in more detail in a separate article, but the offline layer is the kind that "breaks silently when erased" (it queues but never sends), so it deserves especially strict isolation.
+
+The other real hazard is stale data. Persistence is convenient, but if you change a data shape on the server, restoring the old shape can crash the app. Putting a version suffix on the `key` (`_V1`) and bumping it on structural changes is the insurance for exactly this. On top of that, showing a small "last updated N minutes ago" hint reduces confusion on screens where freshness matters.
+
+## Do not make everything offline-first; narrow what you persist
+
+As the retrofit progresses, it is tempting to make every screen offline-capable. I overdid it once, persisted server-driven config values from the settings screen, and built a bug where the app clung to old values even after I changed them on the server.
+
+What is worth persisting is data where "I want to see the last state again" holds: lists, favorites, browsing history, things that keep their meaning when slightly stale. Conversely, data where freshness is correctness itself, such as remote config, inventory, balances, or token expiry, should not ride the persisted cache. Shorten `gcTime` for those or exclude them with `shouldDehydrateQuery`.
+
+My rule is one question: "If this data were a day old, would the user be in trouble?" If yes, do not persist it. If no, persist it and kill the blank screen. That single question naturally narrowed my persistence targets to list-type data.
+
+## Confirm the effect with reviews and crash rate
+
+Rather than trust the vibe, I watched two numbers before and after. First, the share of one- and two-star reviews whose wording was "blank / frozen / can't load." Before the retrofit it felt like roughly 40% of low ratings were this kind; within four weeks of adding persistence it nearly disappeared. Second, cold-start crashes: a few crashes from restoring old caches showed up before I introduced `key` versioning, and after switching to the suffix scheme I have observed zero.
+
+Collecting the numbers is unglamorous. Separate from AdMob or the store dashboards, I read the low-rated reviews by hand, tag the cause word, and count weekly. But "blank and frozen" comes from a missing foundational design, not a missing feature. No amount of polishing the error screen solved it, because the app simply had no data on hand to draw.
+
+For a next step, pick one screen in a live app that already uses `useQuery` and add only `persistQueryClient`, isolated in `guarded/offline/`. The write queue can come later. Just removing the blank read screen changes the landscape of your low ratings considerably. If you are also losing stars on low-signal days, I hope this is a useful first move.
