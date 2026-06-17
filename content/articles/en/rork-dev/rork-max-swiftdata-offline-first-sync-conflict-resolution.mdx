@@ -1,0 +1,156 @@
+---
+title: "Offline-First Sync for SwiftData in Rork Max — Merging Changes Without Conflicts"
+slug: "rork-max-swiftdata-offline-first-sync-conflict-resolution"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-17T21:00"
+author: "Rork Lab"
+description: "How to make the SwiftData apps Rork Max generates sync offline-first so edits survive a flaky connection. Instead of overwriting whole rows, we merge per change, propagate deletes with tombstones, and queue writes that can be resent — shown in code, with the production trade-offs that actually mattered."
+tags: ["Rork Max", "SwiftData", "Offline Sync", "Conflict Resolution", "Merge", "Architecture"]
+highlights:
+  - "A SwiftData model carrying sync metadata, plus a field-level merge that does not blindly let the last write overwrite everything"
+  - "A delete model that propagates as a tombstone instead of removing the row, so an item can't quietly resurrect on the other device"
+  - "An outbox queue that never discards edits when the signal drops, with an idempotency key that prevents the same change being saved twice"
+---
+I was reordering a wallpaper collection on my iPad, walked into a subway station, and when I reopened the app after the gate the order had snapped back to where it started — and it was my own app. The save had succeeded locally, but the moment I came back online the server's stale state overwrote it.
+
+The apps Rork Max generates are native Swift, so local persistence is straightforward with SwiftData. But "saved locally" and "won't be lost after sync" are two different guarantees. Here is how I structure offline-first sync that survives a flaky connection — by treating sync as merging changes, not overwriting rows.
+
+## Why "it saved" can't be trusted
+
+Many sync implementations send the device's entire current state to the server and write the server's entire state back. That works while one device touches the data in one direction. It breaks the instant a second device appears: a favorite you set on iPhone and an order you changed on iPad clobber each other through whichever "whole" syncs last.
+
+The root issue is choosing the row — the record's final state — as the unit of sync. Final state only tells you which side is newer. What you actually need is the history of changes: who touched which field, and when. Move the unit from row to change, and edits to different fields can coexist without conflict.
+
+## Give the SwiftData model sync metadata
+
+Start by adding the metadata each model needs for sync decisions: an update timestamp, a logical-delete flag (a tombstone), and a local-only flag for whether it is synced.
+
+```swift
+import SwiftData
+import Foundation
+
+@Model
+final class WallpaperItem {
+    @Attribute(.unique) var id: UUID
+    var title: String
+    var sortIndex: Int
+    var isFavorite: Bool
+
+    // --- sync metadata ---
+    var updatedAt: Date          // when the "content" last changed
+    var isDeleted: Bool          // tombstone (never hard-delete)
+    var dirty: Bool              // are there unsent local changes?
+    var revision: Int            // version number assigned by the server
+
+    init(id: UUID = UUID(), title: String, sortIndex: Int) {
+        self.id = id
+        self.title = title
+        self.sortIndex = sortIndex
+        self.isFavorite = false
+        self.updatedAt = .now
+        self.isDeleted = false
+        self.dirty = true
+        self.revision = 0
+    }
+}
+```
+
+Three things matter here. Make `id` a UUID shared with the server so identity holds across devices. Make deletion a logical `isDeleted` so the fact of deletion can itself be synced. And keep `dirty` so the device remembers which unsent edits it owes the server once the signal returns.
+
+## How to detect and resolve conflicts
+
+There are roughly three strategies, each trading implementation cost against safety. Choose by the nature of your app.
+
+<table>
+  <thead>
+    <tr><th>Strategy</th><th>Behavior</th><th>Best for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Last Write Wins</strong></td><td>Overwrite wholesale by newer <code>updatedAt</code></td><td>One user, identical data across devices. Simple settings</td></tr>
+    <tr><td><strong>Field-level merge</strong></td><td>Decide a winner per changed field</td><td>Apps where favorites and order are edited on different devices at once</td></tr>
+    <tr><td><strong>Intent-based (CRDT)</strong></td><td>Stack commutative operations</td><td>Collaborative editing, counters, list ordering</td></tr>
+  </tbody>
+</table>
+
+As an indie developer who has run a number of apps solo, I recommend starting with **field-level merge**. Last Write Wins is light to build but reproduces exactly the "order snaps back" incident above. CRDTs are powerful but too heavy to maintain for a domain that is little more than settings and favorites. With field-level merge, edits to separate attributes coexist, and you only fall back to a timestamp when the same attribute collides.
+
+## Implementing the merge
+
+Compare the server's version (remote) with the local current value, field by field. The axis is "which side touched this field more recently." Rather than carry a per-attribute timestamp, here is a practical approximation using the record-level `updatedAt` and the local `dirty` flag.
+
+```swift
+func merge(local: WallpaperItem, remote: RemoteItem) {
+    // a delete propagates first, as a tombstone
+    if remote.isDeleted {
+        local.isDeleted = true
+        local.dirty = false
+        local.revision = remote.revision
+        return
+    }
+
+    if local.dirty {
+        // unsent local edits exist. Keep whichever side "touched" each attribute.
+        if remote.updatedAt > local.updatedAt {
+            // take only the attributes remote changed; keep local edits
+            local.title = remote.titleChanged ? remote.title : local.title
+            local.sortIndex = remote.sortChanged ? remote.sortIndex : local.sortIndex
+        }
+        // do not clear dirty until the push succeeds
+    } else {
+        // local is clean. Apply remote directly.
+        local.title = remote.title
+        local.sortIndex = remote.sortIndex
+        local.isFavorite = remote.isFavorite
+        local.updatedAt = remote.updatedAt
+    }
+    local.revision = remote.revision
+}
+```
+
+The key is to advance `revision` but never clear `dirty` while it is set. Clearing it would treat an edit that hasn't reached the server as "synced," and the next pull would erase it. Only after the push is acknowledged do you return to clean.
+
+## An outbox that never drops edits
+
+The heart of offline-first is not pushing changes to the server immediately, but queuing them into a local outbox and sending in a batch once connectivity returns. Because the SwiftData record carries `dirty`, the send set is simply "a query for dirty rows."
+
+```swift
+@MainActor
+func flushOutbox(context: ModelContext, api: SyncAPI) async {
+    let pending = try? context.fetch(
+        FetchDescriptor<WallpaperItem>(predicate: #Predicate { $0.dirty })
+    )
+    guard let pending, !pending.isEmpty else { return }
+
+    for item in pending {
+        do {
+            // the idempotencyKey neutralizes duplicate sends
+            let ack = try await api.push(
+                item: item,
+                idempotencyKey: "\(item.id)-\(item.updatedAt.timeIntervalSince1970)"
+            )
+            item.revision = ack.revision
+            item.dirty = false           // clean only after success
+        } catch {
+            // on failure it stays dirty and is resent next time online
+            break
+        }
+    }
+    try? context.save()
+}
+```
+
+Building the `idempotencyKey` from `id` plus the update timestamp means that if the success response is lost to a dead signal and the item is resent, the server processes the same key only once. Without it, entering and leaving a tunnel registers the same edit twice — a quiet, hard-to-reproduce bug that bites in production.
+
+Trigger the flush from two places: when the app returns to the foreground (`scenePhase` becoming `.active`) for perceived immediacy, and from a `BGAppRefreshTask` to collect changes that piled up while it was closed.
+
+## Production judgments that paid off
+
+Chasing perfect sync from day one never ends, so I hardened it in this order. First, add delete tombstones before anything else. Hard-deleting a record lets it resurrect from a device that hasn't heard about the deletion — the worst experience for a user: "I deleted it and it came back."
+
+Second, always commit the local save before sending to the server. Show it as saved in the UI and let sync follow. What I learned running six apps in parallel is that the user is watching their own edit, not the network. As long as the edit survives, a sync delayed by a few minutes bothers no one.
+
+Last, keep an escape hatch that falls back to a full re-fetch when you detect a `revision` mismatch. When field-level merge rarely drifts out of consistency, taking the server as truth and pulling fresh recovers faster than reasoning it through. Held as a safety valve, it spares you from burning hours on edge cases.
+
+As a next step, add just `updatedAt` / `isDeleted` / `dirty` to your single most-edited model and wire `flushOutbox` to `scenePhase`. Even getting ordering and deletion to stay stable across devices noticeably changes how your support inbox feels. I hope it helps with your own build.

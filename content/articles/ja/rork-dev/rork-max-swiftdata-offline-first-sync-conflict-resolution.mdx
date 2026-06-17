@@ -1,0 +1,162 @@
+---
+title: "Rork Max の SwiftData をオフライン優先で同期する — 衝突を起こさない差分マージの設計"
+slug: "rork-max-swiftdata-offline-first-sync-conflict-resolution"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-17T21:00"
+author: "Rork Lab"
+description: "Rork Max が生成する SwiftData アプリを、電波が不安定でも編集を失わないオフライン優先で同期させる設計をまとめます。行ごとの上書きではなく変更を単位にした差分マージ、トゥームストーンによる削除の伝播、再送できる送信キューまで、本番で詰まった判断とともに実装で示します。"
+tags: ["Rork Max", "SwiftData", "オフライン同期", "衝突解決", "差分マージ", "アーキテクチャ"]
+highlights:
+  - "SwiftData モデルに同期メタデータを持たせ、最後の書き込みだけで上書きしない差分マージの実装が手に入る"
+  - "削除を「行を消す」ではなくトゥームストーンで伝播させ、片方の端末で復活してしまう事故を防ぐ設計が分かる"
+  - "電波が切れても編集を捨てない送信キュー（アウトボックス）の作り方と、二重送信を避ける冪等キーの置き方が分かる"
+---
+iPad で壁紙のコレクションを並べ替えていた最中に地下鉄へ入ってしまい、改札を出てアプリを開き直したら並びが元に戻っていた——自分のアプリで、自分でそれを踏んだときの気まずさは忘れられません。保存は成功していたのに、オンラインに戻った瞬間にサーバー側の古い状態で上書きされていたのです。
+
+Rork Max が生成するのはネイティブの Swift アプリなので、ローカルの保存は SwiftData で素直に書けます。けれど「ローカルに保存できた」と「同期しても消えない」は別物です。ここでは、電波が不安定でも編集を失わないオフライン優先の同期を、行の上書きではなく差分のマージとして組む設計を整理します。
+
+## 「保存できた」がなぜ信用できないのか
+
+多くの同期実装は、端末の現在状態をまるごとサーバーへ送り、サーバーの状態をまるごと端末へ書き戻します。これは片方向で一台しか触らない間は動きますが、二台目が現れた瞬間に壊れます。iPhone で付けたお気に入りと、iPad で変えた並び順が、後から同期したほうの「全体」で互いを潰し合うからです。
+
+問題の本質は、同期の単位を「行（レコードの最終状態）」に置いていることにあります。最終状態だけを見ると、どちらが新しいかしか判定できません。実際に必要なのは「誰が・いつ・どのフィールドを変えたか」という変更の履歴です。単位を行から変更へ移すと、別々のフィールドへの編集は衝突せずに共存できます。
+
+## SwiftData モデルに同期メタデータを持たせる
+
+まず、各モデルへ同期判断に使うメタデータを足します。更新時刻、論理削除フラグ（トゥームストーン）、そして同期済みかどうかを表すローカル専用の状態です。
+
+```swift
+import SwiftData
+import Foundation
+
+@Model
+final class WallpaperItem {
+    @Attribute(.unique) var id: UUID
+    var title: String
+    var sortIndex: Int
+    var isFavorite: Bool
+
+    // --- 同期メタデータ ---
+    var updatedAt: Date          // 最後に「中身」を変えた時刻
+    var isDeleted: Bool          // トゥームストーン（物理削除しない）
+    var dirty: Bool              // ローカルの未送信変更があるか
+    var revision: Int            // サーバーが採番する版番号
+
+    init(id: UUID = UUID(), title: String, sortIndex: Int) {
+        self.id = id
+        self.title = title
+        self.sortIndex = sortIndex
+        self.isFavorite = false
+        self.updatedAt = .now
+        self.isDeleted = false
+        self.dirty = true
+        self.revision = 0
+    }
+}
+```
+
+ポイントは三つあります。`id` をサーバーと共有する UUID にして端末をまたいで同一性を保つこと。削除を `isDeleted` の論理削除にして、消えた事実そのものを同期できるようにすること。そして `dirty` で未送信の編集を覚えておき、電波が戻った時に何を送ればよいかを端末側が把握できるようにすることです。
+
+## 衝突をどう判定し、どう解決するか
+
+衝突解決には大きく三つの方針があります。それぞれ実装コストと安全性が違うので、アプリの性質で選びます。
+
+<table>
+  <thead>
+    <tr><th>方針</th><th>挙動</th><th>向いている場面</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Last Write Wins</strong></td><td>新しい <code>updatedAt</code> で丸ごと上書き</td><td>1ユーザー・端末間の同一データ。単純設定など</td></tr>
+    <tr><td><strong>フィールド単位マージ</strong></td><td>変わったフィールドだけ個別に勝敗判定</td><td>お気に入りと並び順を別端末で同時に触るアプリ</td></tr>
+    <tr><td><strong>意図ベース（CRDT）</strong></td><td>操作そのものを可換に積む</td><td>共同編集・カウンタ・リスト順序</td></tr>
+  </tbody>
+</table>
+
+個人開発で多数のアプリを運用してきた立場からは、まず**フィールド単位マージ**を推奨します。私の場合は、ここから入って困ったことが一度もありません。Last Write Wins は実装は軽いものの、冒頭の「並びが戻る」事故をそのまま生みます。CRDT は強力ですが、設定値とお気に入り程度のドメインには重すぎて保守が割に合いません。フィールド単位なら、別々の属性への編集は衝突せずに両立し、同じ属性がぶつかった時だけ時刻で決着できます。
+
+## 差分マージの実装
+
+サーバーから受け取った版（remote）と、ローカルの現在値を、フィールドごとに比べてマージします。判定の軸は「そのフィールドをどちらが新しく触ったか」です。ここでは属性ごとの最終更新時刻を持たせる代わりに、レコード全体の `updatedAt` とローカルの `dirty` を使った実用的な近似で組みます。
+
+```swift
+func merge(local: WallpaperItem, remote: RemoteItem) {
+    // 削除はトゥームストーンとして最優先で伝播する
+    if remote.isDeleted {
+        local.isDeleted = true
+        local.dirty = false
+        local.revision = remote.revision
+        return
+    }
+
+    if local.dirty {
+        // ローカルに未送信の編集がある。属性ごとに「触ったほう」を残す。
+        if remote.updatedAt > local.updatedAt {
+            // リモートが新しい属性だけ取り込み、ローカル変更は保持
+            local.title = remote.titleChanged ? remote.title : local.title
+            local.sortIndex = remote.sortChanged ? remote.sortIndex : local.sortIndex
+        }
+        // dirty は送信が成功するまで落とさない
+    } else {
+        // ローカルは clean。リモートを素直に反映する
+        local.title = remote.title
+        local.sortIndex = remote.sortIndex
+        local.isFavorite = remote.isFavorite
+        local.updatedAt = remote.updatedAt
+    }
+    local.revision = remote.revision
+}
+```
+
+`local.dirty` が立っている間は `revision` を進めても `dirty` を落とさないのが要点です。落としてしまうと、まだサーバーに届いていない編集を「同期済み」とみなして次の取り込みで消してしまいます。送信の成功通知を受け取ってから初めて clean に戻します。
+
+## 電波が切れても編集を捨てない送信キュー
+
+オフライン優先の中心は、変更を即サーバーへ投げるのではなく、いったんローカルのアウトボックス（送信箱）に積み、接続が戻ったらまとめて送る設計です。SwiftData のレコードに `dirty` を持たせたので、送信対象は「dirty な行を拾うクエリ」で表せます。
+
+```swift
+@MainActor
+func flushOutbox(context: ModelContext, api: SyncAPI) async {
+    let pending = try? context.fetch(
+        FetchDescriptor<WallpaperItem>(predicate: #Predicate { $0.dirty })
+    )
+    guard let pending, !pending.isEmpty else { return }
+
+    for item in pending {
+        do {
+            // idempotencyKey で二重送信を無害化する
+            let ack = try await api.push(
+                item: item,
+                idempotencyKey: "\(item.id)-\(item.updatedAt.timeIntervalSince1970)"
+            )
+            item.revision = ack.revision
+            item.dirty = false           // 成功してから初めて clean
+        } catch {
+            // 失敗したら dirty のまま。次回の接続で再送される
+            break
+        }
+    }
+    try? context.save()
+}
+```
+
+`idempotencyKey` に `id` と更新時刻を組み合わせて入れておくと、送信成功の応答が電波の都合で届かず再送になっても、サーバーは同じキーを二度処理しません。これがないと、トンネルの出入りで同じ編集が二件登録される——という地味で再現しにくい落とし穴に本番運用で悩まされます。冪等キーを置けば、この事故は確実に回避できます。
+
+実行の起点は二つ用意します。アプリがフォアグラウンドへ戻った時（`scenePhase` の `.active`）と、`BGAppRefreshTask` による定期実行です。前者で体感の即時性を、後者で「閉じている間に溜まった変更」を回収します。
+
+## 本番で効いた運用上の判断
+
+最初から完璧な同期を目指すと終わらないので、私自身は次の順で堅くしていきました。
+
+1. 削除のトゥームストーンを最優先で入れる
+2. サーバー送信より先にローカル保存を確定させる
+3. revision のズレを検知したらフル再取得へ退避する
+
+それぞれの理由を補足します。まず削除のトゥームストーンを最優先で入れること。物理削除でレコードを消すと、片方の端末がまだ知らないうちに別端末で復活してしまい、ユーザーには「消したのに戻ってくる」最悪の体験になります。
+
+次に、サーバーへ送る前のローカル保存を必ず先に確定させること。UI 上は保存済みに見せ、同期は後追いにします。六本のアプリを並行運用していて学んだのは、ユーザーが見ているのはネットワークではなく自分の編集だ、ということです。編集が残っていれば、同期が数分遅れても誰も困りません。
+
+最後に、`revision` のズレを検知したらフル再取得へ退避する経路を残しておくことです。差分マージで稀に整合が崩れたとき、議論より「一度サーバーを正にして取り直す」ほうが復旧が速い場面があります。安全弁として持っておくと、エッジケースの追い込みに消耗せずに済みます。
+
+次の一歩として、まずは一番ユーザー編集が多いモデル一つに `updatedAt` / `isDeleted` / `dirty` の三点を足し、アウトボックスの `flushOutbox` を `scenePhase` に繋いでみてください。並びや削除が端末をまたいで安定するだけで、サポート問い合わせの体感が変わります。実装の参考になれば幸いです。
