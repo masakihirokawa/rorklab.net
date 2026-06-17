@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro向けにネイティブSwiftを生成し、2クリックでApp Store公開でき、Xcodeを必要としません",
-    "STACK — 通常のRorkはReact Native（Expo）でクロスプラットフォームのモバイルアプリを作る位置づけ。用途に応じた使い分けが鍵です",
-    "FOCUS — BoltやLovableのようなWeb中心ツールと違い、RorkはiOS/Androidのネイティブアプリ生成に特化しています",
-    "BUGS — 実利用レビューでは遭遇したバグの約70%を手動介入なしで解決、残り3割はエクスポート済みコードでの手修正が必要と報告されています",
-    "FUNDING — Rorkはa16z（Andreessen Horowitz）から$2.8Mを調達しました",
-    "PRICING — 無料で開始でき、有料プランは$25/月からです。まず触ってから判断できます",
+    "MAX — Rork Maxはネイティブ Swiftアプリを生成。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — AR/LiDAR・Metalによる3D・ウィジェット・Dynamic Island・Live Activities・Siri Intents・HealthKitなど、ネイティブ機能を引き出せます",
+    "RN — 標準のRorkはReact Native（Expo）でクロスプラットフォーム。素早く形にするならこちらが向いています",
+    "CHOICE — 手早さならReact Native版、Appleのハード/OS統合を活かすならRork Maxという棲み分けが現実的です",
+    "PRICE — Rorkは無料で開始でき有料は月$25から、Rork Maxは月$200です",
+    "FLOW — 作りたいアプリを平易な言葉で説明すると、ストアに配信できる動くコードが生成されます",
   ],
   en: [
-    "MAX — Rork Max generates native Swift for iPhone, iPad, Apple Watch, Apple TV, and Vision Pro, with 2-click App Store publishing and no Xcode required",
-    "STACK — Standard Rork builds cross-platform mobile apps with React Native (Expo); choosing between the two by use case is the key decision",
-    "FOCUS — Unlike web-first tools such as Bolt or Lovable, Rork specializes in native iOS and Android app generation",
-    "BUGS — A hands-on review reports Rork resolved about 70% of bugs without manual help, with the remaining 30% needing edits in the exported codebase",
-    "FUNDING — Rork raised $2.8M from a16z (Andreessen Horowitz)",
-    "PRICING — It is free to start, with paid plans from $25/month, so you can try before committing",
+    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — It unlocks native capabilities React Native cannot reach: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, Siri Intents, and HealthKit",
+    "RN — Standard Rork builds cross-platform apps with React Native (Expo), a good fit when you want something working fast",
+    "CHOICE — Pick React Native for speed, or Rork Max when you need Apple hardware and OS integration",
+    "PRICE — Rork is free to start with paid plans from $25/mo; Rork Max is $200/mo",
+    "FLOW — Describe the app you want in plain language and Rork produces working code you can ship to the stores",
   ],
 };
 
