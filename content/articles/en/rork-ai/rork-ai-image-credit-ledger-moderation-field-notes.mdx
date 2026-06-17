@@ -1,0 +1,279 @@
+---
+title: "Making Credits Add Up in a Rork AI Image App — Field Notes on Atomic Ledgers and Moderation"
+slug: "rork-ai-image-credit-ledger-moderation-field-notes"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-17T11:00"
+updated: "2026-06-17T11:00"
+author: "Rork Lab"
+description: "Credit billing in a Rork AI image and video app breaks in production because of the order between generation and deduction. Here are the field notes — atomic ledger consumption, idempotency, refunds on failure, and moderation — with Supabase code you can ship."
+tags: ["Rork", "AI image generation", "fal.ai", "Supabase", "credit billing", "idempotency", "content moderation", "advanced"]
+highlights:
+  - "The exact paths where check-then-generate-then-deduct breaks, and how to consume atomically in a Postgres function"
+  - "Idempotency keys that stop double charges, plus a refund ledger that reliably returns credits on failure or cancel"
+  - "Two-stage moderation on prompt input and image output, and the operational limits that keep you through App Store review"
+---
+
+The first AI image app I shipped got a support message on launch day: "Five images were generated but only one credit was deducted." It looked like a happy report, but it was proof the billing was broken. Tapping the generate button quickly five times sent five requests to the server almost simultaneously, and every one of them read the balance *before* any deduction landed.
+
+The hard part of a credit-based app is not generating the image. Throw the request at `fal.ai` and a result comes back in a second or two. The hard part is keeping an external operation (generation) and an internal state (the balance) in agreement, every time, without drift. Get this wrong and you either give images away for free or, worse, charge for failures and collect one-star reviews. Running paid apps as a solo developer, the second one costs you more than the lost revenue — it costs trust.
+
+These are field notes for a React Native app generated with Rork, backed by Supabase Edge Functions. I will show where the naive implementation falls apart, then move to atomic consumption, idempotency, refunds on failure, and moderation.
+
+## Three ways naive "check → generate → deduct" breaks in production
+
+Most tutorials are written in this order: read the balance, generate if it is enough, subtract one on success. It works in development. The problem is that production has concurrency and network jitter.
+
+<table>
+<thead>
+<tr><th>Failure path</th><th>What happens</th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td>Concurrency (TOCTOU)</td><td>Multiple requests read the same pre-deduction balance</td><td>Several images generated on a balance of 1; charges leak</td></tr>
+<tr><td>Crash/timeout before deduct</td><td>Generation succeeded but the deduct UPDATE never lands</td><td>Free generations keep flowing</td></tr>
+<tr><td>Deduct after failure</td><td>The API returned 5xx but you already subtracted</td><td>Charging for failures; bad reviews</td></tr>
+</tbody>
+</table>
+
+The first one is the nastiest. There is a time gap between `SELECT credits` and `UPDATE credits = credits - 1`, and another request slips into that gap. Disabling the button on the client does not save you: retries, double taps, and duplicate sends on slow networks still get through. The boundary you must defend lives inside the database, not in the client.
+
+## Hold credits as a ledger, not a balance column
+
+Change the data model first. Stop treating a single `users.credits` column as the source of truth, and make a ledger — one row per change — the source of truth. The balance becomes the sum, or a derived value kept for convenience. A ledger lets you trace exactly when, on what, and how many credits were spent or returned, which makes refunds and audits simple.
+
+```sql
+-- The ledger is the source of truth for credit changes
+create table credit_ledger (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users(id),
+  delta       integer not null,        -- purchase +, consumption -, refund +
+  reason      text not null,           -- 'purchase' | 'image' | 'video' | 'refund'
+  ref_id      text,                    -- generation job id or checkout session id
+  idem_key    text,                    -- idempotency key (below)
+  created_at  timestamptz not null default now()
+);
+
+-- Physically forbid double-recording under the same idempotency key
+create unique index credit_ledger_idem_uniq
+  on credit_ledger (user_id, idem_key)
+  where idem_key is not null;
+
+create index credit_ledger_user_idx on credit_ledger (user_id);
+```
+
+The current balance is `select coalesce(sum(delta), 0) from credit_ledger where user_id = $1`. If the growing ledger worries you, you can fold it into monthly snapshot rows, but at a solo-developer scale (tens of thousands of rows) the sum query is plenty fast.
+
+## Consume atomically in a single Postgres function
+
+The most reliable way to remove the concurrency gap is to close the balance check and the deduction into one transaction and serialize it with a lock. In Supabase, define it as an RPC (a Postgres function) and have the Edge Function call only that. The app never deducts.
+
+```sql
+create or replace function consume_credits(
+  p_user_id uuid,
+  p_amount  integer,
+  p_reason  text,
+  p_idem_key text
+) returns integer            -- returns the balance after consumption
+language plpgsql
+as $$
+declare
+  v_balance integer;
+begin
+  -- 1) Idempotency: if the key already exists, do not consume again
+  if exists (
+    select 1 from credit_ledger
+    where user_id = p_user_id and idem_key = p_idem_key
+  ) then
+    return (select coalesce(sum(delta),0) from credit_ledger where user_id = p_user_id);
+  end if;
+
+  -- 2) Serialize this user's consumption (advisory lock, no row contention)
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  v_balance := (select coalesce(sum(delta),0) from credit_ledger where user_id = p_user_id);
+  if v_balance < p_amount then
+    raise exception 'INSUFFICIENT_CREDITS' using errcode = 'P0001';
+  end if;
+
+  -- 3) Record consumption as one row (this is the point of charge)
+  insert into credit_ledger (user_id, delta, reason, idem_key)
+  values (p_user_id, -p_amount, p_reason, p_idem_key);
+
+  return v_balance - p_amount;
+end;
+$$;
+```
+
+Taking `pg_advisory_xact_lock` on a hash of the user id serializes only that user's concurrent consumption. It does not block the table or other users, so you remove TOCTOU without sacrificing throughput. Insufficient balance is raised as an exception that the Edge Function turns into a 402. The crucial discipline: never create a credit change that bypasses this function. If deduction logic is scattered across the app and SQL, it will drift somewhere.
+
+## Use idempotency keys to make double charges and retries safe
+
+On mobile, where networks are unstable, the same generation request arriving twice is routine — a client that timed out waiting auto-retries, a user goes back and resubmits. Issue a unique key per unit of consumption on the client and carry it all the way to the server.
+
+```typescript
+// src/lib/idempotency.ts
+import * as Crypto from "expo-crypto";
+
+// Issue exactly one per generation attempt; reuse it across retries
+export function newIdemKey(): string {
+  return Crypto.randomUUID();
+}
+```
+
+```typescript
+// supabase/functions/generate-image/index.ts (essentials)
+const { prompt, negativePrompt, style, aspectRatio, idemKey } = await req.json();
+const userId = await getUserIdFromJWT(req);      // settle auth on the server
+
+// 1) Consume atomically first; only then proceed to generation
+const { data: balance, error: consumeErr } = await admin.rpc("consume_credits", {
+  p_user_id: userId, p_amount: 1, p_reason: "image", p_idem_key: idemKey,
+});
+if (consumeErr) {
+  const code = consumeErr.message.includes("INSUFFICIENT_CREDITS") ? 402 : 500;
+  return json({ error: "credits" }, code);
+}
+
+// 2) Run the generation
+try {
+  const imageUrl = await runFalImage({ prompt, negativePrompt, style, aspectRatio });
+  await saveGeneration(userId, idemKey, imageUrl);
+  return json({ imageUrl, creditsRemaining: balance });
+} catch (e) {
+  // 3) On failure, always refund under the same idempotency key (next section)
+  await admin.rpc("refund_credits", { p_user_id: userId, p_amount: 1, p_ref: idemKey });
+  return json({ error: "generation_failed" }, 502);
+}
+```
+
+The design choice here is "consume before generating." The reverse order (consume after success) leaves a charge leak when generation succeeds but the process dies before consumption. Consume first and the worst case is "charged but generation failed," which the next refund undoes mechanically. With money, charging once and reliably returning it keeps the books straight more easily than trying never to miss — that is what running this taught me.
+
+## Always return credits on failure and cancel
+
+A refund is just one more ledger row. To stay idempotent, allow only one refund per generation reference (`ref_id`).
+
+```sql
+create or replace function refund_credits(
+  p_user_id uuid, p_amount integer, p_ref text
+) returns void language plpgsql as $$
+begin
+  -- Forbid double refunds for the same generation
+  if exists (
+    select 1 from credit_ledger
+    where user_id = p_user_id and reason = 'refund' and ref_id = p_ref
+  ) then
+    return;
+  end if;
+  insert into credit_ledger (user_id, delta, reason, ref_id)
+  values (p_user_id, p_amount, 'refund', p_ref);
+end;
+$$;
+```
+
+Client-side cancel is not enough if it only stops the UI. Consumption may already be settled on the server, so on cancel also tell the server "the result for this `idemKey` is no longer needed," and refund depending on whether the server could actually abort generation. `fal.ai`'s queue API lets you `cancel` a job, and `AbortController` cuts the request.
+
+```typescript
+// src/hooks/useImageGeneration.ts (cancel essentials)
+const controller = useRef<AbortController | null>(null);
+
+async function generate(params: GenerationParams) {
+  const idemKey = newIdemKey();
+  controller.current = new AbortController();
+  try {
+    const res = await fetch(GEN_URL, {
+      method: "POST",
+      signal: controller.current.signal,
+      body: JSON.stringify({ ...params, idemKey }),
+    });
+    // ...handle result
+  } catch (e) {
+    if ((e as Error).name === "AbortError") {
+      // Stop the UI, but leave billing reconciliation to the server's refund
+      await requestServerCancel(idemKey);
+    }
+  }
+}
+
+function cancel() {
+  controller.current?.abort();
+}
+```
+
+The point is not to judge the truth of billing by whether the client's cancel succeeded. The client only passes the intent — "I want to abort" — along with the key, and the server decides whether to return credits by reading the ledger.
+
+## Treat video as hold → capture / release
+
+Video generation takes 30–120 seconds and becomes an async job. The same "consume first" makes the refund timing hard to reason about when a long job fails midway. So for video, hold the required amount at start, capture it on the completion webhook, and release on failure or expiry. You can express all of this within the ledger's vocabulary by adding `hold` and `capture` reasons.
+
+<table>
+<thead>
+<tr><th>Stage</th><th>Ledger action</th><th>Trigger</th></tr>
+</thead>
+<tbody>
+<tr><td>Job submitted</td><td>delta = -5, reason = 'video_hold'</td><td>consume in Edge Function</td></tr>
+<tr><td>Generation done</td><td>no extra row (hold becomes the capture)</td><td>fal.ai completion webhook</td></tr>
+<tr><td>Failure/timeout</td><td>delta = +5, reason = 'refund'</td><td>webhook failure / expiry sweep</td></tr>
+</tbody>
+</table>
+
+Webhooks can be redelivered, so again put the job id in `ref_id` to reject duplicate processing. Expiry release is guaranteed by a periodic job that sweeps `video_hold` rows whose webhook has not arrived within a window and writes a `refund`. Whether you use standard Rork (Expo) or Rork Max (native Swift), this boundary lives in the backend, so the implementation is the same.
+
+## Build moderation in two stages: input and output
+
+For App Store review, and above all to protect users, moderation is mandatory in a generative app. One stage leaks. Reject clear violations at the prompt-input stage, and catch what the model slipped through at the image-output stage.
+
+The input stage is cheap and fast, so always run it before generating.
+
+```typescript
+// supabase/functions/_shared/moderate.ts
+const BLOCK_PATTERNS = [
+  /\b(nsfw|explicit|gore)\b/i,
+  // add domain-specific patterns for minors, real people, etc.
+];
+
+export function screenPrompt(prompt: string): { ok: boolean; reason?: string } {
+  for (const re of BLOCK_PATTERNS) {
+    if (re.test(prompt)) return { ok: false, reason: "prompt_blocked" };
+  }
+  return { ok: true };
+}
+```
+
+The output stage runs the generated image through an NSFW classifier (for example, a safety model from `fal.ai` or a dedicated image-classification endpoint) and does not deliver it if it crosses the threshold. Crucially, when you block at output, the user only attempted to generate, so refund the credit. Blocking at the input stage happens before consumption, so no deduction occurs — but the output verdict comes after consumption, and if you do not refund there, the user is "charged for nothing."
+
+```typescript
+// reconciliation when output moderation blocks
+const verdict = await classifyImage(imageUrl);   // { nsfw: number }
+if (verdict.nsfw > 0.8) {
+  await admin.rpc("refund_credits", { p_user_id: userId, p_amount: 1, p_ref: idemKey });
+  return json({ error: "blocked_output" }, 422);
+}
+```
+
+For review, add a report button on generated content, immediate hiding of reported generations, and retention of prompt and generation logs. Together these satisfy the "ability to manage user-generated content" Apple expects — a direct response to Guideline 1.2 (requirements for UGC apps).
+
+## Guardrails that stop runaway cost
+
+Separate from credit consistency, you need a mechanism to protect your own API bill. If you hand out credits as one-time purchases, abuse or an unexpected heavy user inflates your `fal.ai` / Replicate usage charges. At minimum, add a per-user daily limit and an account-wide hourly generation watch.
+
+```sql
+-- Count consumption (image/video) in the last 24h to compare against a limit
+create or replace function daily_usage(p_user_id uuid) returns integer
+language sql stable as $$
+  select count(*)::int from credit_ledger
+  where user_id = p_user_id
+    and reason in ('image','video_hold')
+    and created_at > now() - interval '24 hours';
+$$;
+```
+
+In the Edge Function, check this count before `consume_credits` and return 429 if it exceeds the limit (say, 100 per day). The point is to protect with a rate limit even when credits remain. Also always set a timeout and a maximum resolution on the `fal.ai` request. Resolution and step count drive cost directly, so narrowing the choices exposed in the UI makes per-image cost predictable.
+
+As a rough operational figure, a cheap Flux Schnell setup keeps a single image to a few cents, but more steps or larger resolution multiply that several times. Price your credit on the *worst-case* generation cost. If you work backward from a margin assumption instead, a heavy user's configuration can put you in the red.
+
+## Next step
+
+First, consolidate your existing app's deduction logic into one place so everything flows only through `consume_credits`. Delete every `credits - 1` UPDATE left in the app code, introduce the ledger and idempotency keys, and the "credits don't add up" support tickets nearly disappear. Then add refunds on failure and on output-moderation blocks, and you have closed the paths where billing trust breaks.
+
+Billing consistency is not flashy, but it is the foundation of a paid app. I hope these notes help anyone working on the same problem.

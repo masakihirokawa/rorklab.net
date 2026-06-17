@@ -1,0 +1,280 @@
+---
+title: "Rork の AI 画像生成アプリで「クレジットが合わない」を消す — 原子的な台帳消費とモデレーションの実装メモ"
+slug: "rork-ai-image-credit-ledger-moderation-field-notes"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-17T11:00"
+updated: "2026-06-17T11:00"
+author: "Rork Lab"
+description: "Rork で作る AI 画像・動画生成アプリのクレジット課金が本番で崩れる原因は、生成と減算の順序にあります。原子的な台帳消費・冪等化・失敗時返金・モデレーションを、Supabase の実装コード付きでまとめた運用メモです。"
+tags: ["Rork", "AI画像生成", "fal.ai", "Supabase", "クレジット課金", "冪等性", "コンテンツモデレーション", "上級"]
+highlights:
+  - "「確認→生成→減算」が本番で破綻する具体的な経路と、Postgres 関数で原子的に消費する実装"
+  - "二重課金を止める冪等キーと、生成失敗・キャンセル時にクレジットを確実に戻す返金台帳の設計"
+  - "入力プロンプトと出力画像の二段モデレーション、および App Store 審査で落ちないための運用上限"
+---
+
+最初に作った AI 画像生成アプリで、リリース当日に問い合わせが来ました。「5 枚生成されたのに 1 クレジットしか減っていない」という内容です。喜ぶ報告に見えて、これは課金が壊れている証拠でした。生成ボタンを素早く 5 回叩くと、5 本のリクエストがほぼ同時にサーバへ届き、どれもが「減算前の残高」を読んでしまっていたのです。
+
+クレジット制のアプリで本当に難しいのは、画像を生成すること自体ではありません。`fal.ai` に投げれば 1〜2 秒で結果が返ります。難しいのは、生成という外部処理と、残高という内部状態を、ずれなく一致させ続けることです。ここを甘く作ると、無料で生成され続けるか、逆に失敗したのに課金されて低評価レビューが付きます。個人開発で課金アプリを運用していると、後者は売上以上に信頼を削ります。
+
+このメモでは、Rork で生成した React Native アプリ（バックエンドは Supabase Edge Functions）を前提に、クレジット台帳を壊さないための実装を順に整理します。素朴な実装がどこで破綻するかを示してから、原子的な消費・冪等化・失敗時返金・モデレーションへ進みます。
+
+## 素朴な「確認 → 生成 → 減算」が本番で崩れる三つの経路
+
+多くのチュートリアルは次の順序で書かれています。残高を読み、足りていれば生成し、成功したら 1 引く。開発中はこれで動きます。問題は、本番には同時実行とネットワークの揺らぎがあることです。
+
+<table>
+<thead>
+<tr><th>破綻経路</th><th>何が起きるか</th><th>結果</th></tr>
+</thead>
+<tbody>
+<tr><td>同時実行（TOCTOU）</td><td>複数リクエストが減算前の同じ残高を読む</td><td>残高 1 で複数枚が生成され、課金漏れ</td></tr>
+<tr><td>減算前にクラッシュ／タイムアウト</td><td>生成は成功したが減算 UPDATE が届かない</td><td>無料で生成され続ける</td></tr>
+<tr><td>生成失敗後も減算</td><td>API が 5xx を返したのに先に引いてしまう</td><td>失敗課金で低評価レビュー</td></tr>
+</tbody>
+</table>
+
+中でも一つ目が厄介です。`SELECT credits` と `UPDATE credits = credits - 1` の間には時間の隙間があり、その隙間に別のリクエストが割り込みます。アプリ側でボタンを `disabled` にしても、リトライ・ダブルタップ・低速回線での重複送信は防ぎきれません。この落とし穴を回避するには、守るべき境界をクライアントではなくデータベースの中に置く必要があります。
+
+## クレジットは「残高カラム」ではなく「台帳」で持つ
+
+最初の設計を変えます。`users.credits` という単一カラムを正本にするのをやめ、増減を 1 行ずつ記録する台帳（ledger）を正本にします。残高はその合計、あるいは整合性のために保持する派生値として扱います。クレジットの購入自体は、Stripe の決済完了 Webhook を受けて `purchase` の正の行を台帳へ足すだけです。台帳方式にすると「いつ・何に・いくつ使ったか／戻したか」が後から完全に追え、返金や監査が単純になります。
+
+```sql
+-- クレジット増減の正本となる台帳
+create table credit_ledger (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users(id),
+  delta       integer not null,        -- 購入は +、消費は -、返金は +
+  reason      text not null,           -- 'purchase' | 'image' | 'video' | 'refund'
+  ref_id      text,                    -- 生成ジョブIDや決済セッションID
+  idem_key    text,                    -- 冪等キー（後述）
+  created_at  timestamptz not null default now()
+);
+
+-- 同じ冪等キーでの二重記録を物理的に禁止する
+create unique index credit_ledger_idem_uniq
+  on credit_ledger (user_id, idem_key)
+  where idem_key is not null;
+
+-- 現在残高は合計で求める（インデックスで高速化）
+create index credit_ledger_user_idx on credit_ledger (user_id);
+```
+
+残高の参照は `select coalesce(sum(delta), 0) from credit_ledger where user_id = $1` で求まります。台帳が増え続けるのが気になる場合は、後述のように月次でスナップショット行へ畳み込めますが、個人開発の規模（数万行）では合計クエリで十分高速です。
+
+## 消費は単一の Postgres 関数で原子的に行う
+
+同時実行の隙間をなくす最も確実な方法は、残高確認と減算を一つのトランザクションに閉じ込め、行ロックで直列化することです。Supabase なら RPC（Postgres 関数）として定義し、Edge Function からはこれを呼ぶだけにします。アプリ側では絶対に減算しません。
+
+```sql
+create or replace function consume_credits(
+  p_user_id uuid,
+  p_amount  integer,
+  p_reason  text,
+  p_idem_key text
+) returns integer            -- 消費後の残高を返す
+language plpgsql
+as $$
+declare
+  v_balance integer;
+begin
+  -- 1) 冪等チェック: 同じキーが既にあれば再消費せず現在残高を返す
+  if exists (
+    select 1 from credit_ledger
+    where user_id = p_user_id and idem_key = p_idem_key
+  ) then
+    return (select coalesce(sum(delta),0) from credit_ledger where user_id = p_user_id);
+  end if;
+
+  -- 2) 同一ユーザーの消費を直列化（advisory lock で行を奪い合わせない）
+  perform pg_advisory_xact_lock(hashtext(p_user_id::text));
+
+  v_balance := (select coalesce(sum(delta),0) from credit_ledger where user_id = p_user_id);
+  if v_balance < p_amount then
+    raise exception 'INSUFFICIENT_CREDITS' using errcode = 'P0001';
+  end if;
+
+  -- 3) 消費を 1 行記録（ここが課金の確定点）
+  insert into credit_ledger (user_id, delta, reason, idem_key)
+  values (p_user_id, -p_amount, p_reason, p_idem_key);
+
+  return v_balance - p_amount;
+end;
+$$;
+```
+
+`pg_advisory_xact_lock` をユーザー ID のハッシュで取ることで、同じユーザーの同時消費だけを直列化します。テーブル全体や他ユーザーをブロックしないので、スループットを落とさずに TOCTOU を消せます。残高不足は例外で返し、Edge Function 側で 402 に変換します。重要なのは、この関数を通らないクレジット変更を一切作らないことです。私の場合は、減算を必ず `consume_credits` 経由に限定することを強く推奨します。減算ロジックがアプリにも SQL にも散らばっていると、必ずどこかでずれます。
+
+## 冪等キーで二重課金とリトライを安全にする
+
+ネットワークが不安定なモバイルでは、同じ生成リクエストが二回届くことが普通に起きます。レスポンス待ちでタイムアウトしたクライアントが自動リトライする、ユーザーが戻って再送する、といった経路です。これに備え、消費の単位ごとにクライアントで一意なキーを発行し、サーバまで持ち回します。
+
+```typescript
+// src/lib/idempotency.ts
+import * as Crypto from "expo-crypto";
+
+// 1 回の生成試行に対して 1 つだけ発行し、リトライでは使い回す
+export function newIdemKey(): string {
+  return Crypto.randomUUID();
+}
+```
+
+```typescript
+// supabase/functions/generate-image/index.ts（要点のみ）
+const { prompt, negativePrompt, style, aspectRatio, idemKey } = await req.json();
+const userId = await getUserIdFromJWT(req);      // 認証はサーバで確定する
+
+// 1) 先に原子的に消費する（成功して初めて生成に進む）
+const { data: balance, error: consumeErr } = await admin.rpc("consume_credits", {
+  p_user_id: userId, p_amount: 1, p_reason: "image", p_idem_key: idemKey,
+});
+if (consumeErr) {
+  const code = consumeErr.message.includes("INSUFFICIENT_CREDITS") ? 402 : 500;
+  return json({ error: "credits" }, code);
+}
+
+// 2) 生成を実行する
+try {
+  const imageUrl = await runFalImage({ prompt, negativePrompt, style, aspectRatio });
+  await saveGeneration(userId, idemKey, imageUrl);
+  return json({ imageUrl, creditsRemaining: balance });
+} catch (e) {
+  // 3) 失敗したら同じ冪等キーで必ず返金する（次節）
+  await admin.rpc("refund_credits", { p_user_id: userId, p_amount: 1, p_ref: idemKey });
+  return json({ error: "generation_failed" }, 502);
+}
+```
+
+ここでの設計判断は「先に消費してから生成する」ことです。逆順（生成成功後に消費）だと、生成は成功したのに消費前に落ちた場合に課金漏れが残ります。先に消費しておけば、最悪のケースは「課金したのに生成失敗」ですが、それは次の返金で機械的に取り消せます。お金の話では、取りこぼすより一度引いて確実に戻すほうが整合を保ちやすいというのが、運用してみての実感です。
+
+## 失敗とキャンセルでは必ずクレジットを戻す
+
+返金も台帳に 1 行足すだけです。冪等性を保つため、同じ生成参照（`ref_id`）に対する返金は一度きりにします。
+
+```sql
+create or replace function refund_credits(
+  p_user_id uuid, p_amount integer, p_ref text
+) returns void language plpgsql as $$
+begin
+  -- 同じ生成に対する二重返金を禁止
+  if exists (
+    select 1 from credit_ledger
+    where user_id = p_user_id and reason = 'refund' and ref_id = p_ref
+  ) then
+    return;
+  end if;
+  insert into credit_ledger (user_id, delta, reason, ref_id)
+  values (p_user_id, p_amount, 'refund', p_ref);
+end;
+$$;
+```
+
+クライアント側のキャンセルは、UI を止めるだけでは不十分です。すでにサーバで消費が確定している可能性があるため、キャンセル時もサーバへ「この `idemKey` の結果は不要」と伝え、サーバ側で生成を中断できたかどうかに応じて返金します。`fal.ai` のキュー API ではジョブを `cancel` でき、`AbortController` でリクエストを切れます。
+
+```typescript
+// src/hooks/useImageGeneration.ts（キャンセル対応の要点）
+const controller = useRef<AbortController | null>(null);
+
+async function generate(params: GenerationParams) {
+  const idemKey = newIdemKey();
+  controller.current = new AbortController();
+  try {
+    const res = await fetch(GEN_URL, {
+      method: "POST",
+      signal: controller.current.signal,
+      body: JSON.stringify({ ...params, idemKey }),
+    });
+    // ...結果処理
+  } catch (e) {
+    if ((e as Error).name === "AbortError") {
+      // 表示は止めるが、課金の整合はサーバの返金に委ねる
+      await requestServerCancel(idemKey);
+    }
+  }
+}
+
+function cancel() {
+  controller.current?.abort();
+}
+```
+
+ポイントは、課金の真偽をクライアントのキャンセル成否で判断しないことです。クライアントは「中断したい」という意図をキーとともにサーバへ渡すだけで、戻すかどうかはサーバが台帳を見て決めます。
+
+## 動画は「保留 → 確定／解放」の二段で扱う
+
+動画生成は 30〜120 秒かかり、非同期ジョブになります。画像と同じ「先に消費」だと、長時間ジョブが途中で失敗したときの返金タイミングが読みにくくなります。そこで動画では、開始時に必要分を保留（hold）し、完了 Webhook で確定、失敗・期限切れで解放します。`reason` に `hold` と `capture` を足すだけで台帳の語彙の中で表現できます。
+
+<table>
+<thead>
+<tr><th>段階</th><th>台帳の動き</th><th>トリガー</th></tr>
+</thead>
+<tbody>
+<tr><td>ジョブ投入</td><td>delta = -5、reason = 'video_hold'</td><td>Edge Function で consume</td></tr>
+<tr><td>生成完了</td><td>追加記録なし（hold をそのまま確定）</td><td>fal.ai 完了 Webhook</td></tr>
+<tr><td>失敗・タイムアウト</td><td>delta = +5、reason = 'refund'</td><td>Webhook 失敗通知 / 期限監視</td></tr>
+</tbody>
+</table>
+
+Webhook は再送されることがあるため、ここでも `ref_id` にジョブ ID を入れて重複処理を弾きます。期限切れの解放は、`video_hold` のうち一定時間 Webhook が来ないものを定期ジョブで洗い、`refund` を書き込むことで担保します。Rork の通常版（Expo）でも Rork Max（ネイティブ Swift）でも、この境界はバックエンド側にあるので実装は共通です。
+
+## モデレーションは入力と出力の二段で構える
+
+App Store の審査と、何よりユーザー保護のために、生成系アプリではコンテンツモデレーションが必須です。一段だけでは漏れます。入力プロンプトの段で明確な違反を弾き、出力画像の段でモデルがすり抜けた表現を捕まえます。
+
+入力段は安価で速いので、生成前に必ず通します。
+
+```typescript
+// supabase/functions/_shared/moderate.ts
+const BLOCK_PATTERNS = [
+  /\b(nsfw|explicit|gore)\b/i,
+  // 未成年・実在人物の不適切表現などのドメイン固有パターンを追加
+];
+
+export function screenPrompt(prompt: string): { ok: boolean; reason?: string } {
+  for (const re of BLOCK_PATTERNS) {
+    if (re.test(prompt)) return { ok: false, reason: "prompt_blocked" };
+  }
+  return { ok: true };
+}
+```
+
+出力段は、生成画像を NSFW 分類器（例: `fal.ai` の安全モデルや専用の画像分類エンドポイント）に通し、閾値を超えたら配信しません。重要なのは、出力でブロックした場合もユーザーは生成を試みただけなので、クレジットは返金することです。違反プロンプトを弾いた入力段では消費前なので減算は発生しませんが、出力段の判定は消費後に来るため、ここを返金しないと「課金されたのに何も得られない」体験になります。
+
+```typescript
+// 出力モデレーションでブロックした場合の整合
+const verdict = await classifyImage(imageUrl);   // { nsfw: number }
+if (verdict.nsfw > 0.8) {
+  await admin.rpc("refund_credits", { p_user_id: userId, p_amount: 1, p_ref: idemKey });
+  return json({ error: "blocked_output" }, 422);
+}
+```
+
+審査対策としては、生成物の通報導線（report ボタン）と、通報された生成の即時非表示、そしてプロンプト・生成ログの保持を用意しておくと、Apple のレビューで求められる「ユーザー生成コンテンツの管理機能」を満たせます。これは Guideline 1.2（UGC を扱うアプリの要件）への素直な対応です。
+
+## コストの暴走を止めるガードレール
+
+クレジットの整合とは別に、自分の API 請求を守る仕組みも要ります。クレジットを買い切りで配ると、不正利用や想定外のヘビーユーザーで `fal.ai` / Replicate の従量課金が膨らみます。最低限、ユーザー単位の 1 日上限と、アカウント全体の 1 時間あたりの生成数監視を入れておきます。
+
+```sql
+-- 直近24時間の消費数（image/video）を数えて上限と比較
+create or replace function daily_usage(p_user_id uuid) returns integer
+language sql stable as $$
+  select count(*)::int from credit_ledger
+  where user_id = p_user_id
+    and reason in ('image','video_hold')
+    and created_at > now() - interval '24 hours';
+$$;
+```
+
+Edge Function 側では `consume_credits` の前にこの数を見て、上限（例: 1 日 100 枚）を超えていたら 429 を返します。クレジットが残っていても、レート上限で守るのが要点です。さらに、`fal.ai` 側のリクエストにはタイムアウトと最大解像度の上限を必ず付けます。解像度とステップ数は生成コストに直結するため、UI で選べる範囲を絞っておくと、1 枚あたりのコストが読めるようになります。
+
+実運用での目安として、Flux Schnell の安価な構成なら 1 枚あたり 3〜5 円程度に収まりますが、ステップ数を増やしたり大解像度を許すと 2〜3 倍に跳ねます。クレジット単価は「最悪ケースの生成コスト」を基準に決めるのが安全です。利益が出る単価から逆算してしまうと、ヘビーユーザーの構成で赤字になることがあります。
+
+## 次の一手
+
+まず既存アプリの減算ロジックを一箇所に集約し、`consume_credits` 関数経由だけに通る状態へ寄せてください。アプリのコードに残った `credits - 1` の UPDATE を全て消し、台帳と冪等キーを導入するだけで、「クレジットが合わない」系の問い合わせはほぼ消えます。その上で、失敗時返金と出力モデレーション返金を入れれば、課金の信頼が崩れる経路は塞がります。
+
+課金の整合は、派手ではないけれど、有料アプリの土台です。同じ問題に取り組んでいる方の実装の参考になれば嬉しいです。
