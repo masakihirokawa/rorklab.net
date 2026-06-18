@@ -1,0 +1,159 @@
+---
+title: "Turning Rork App Crash Reports You Can Actually Read — Field Notes on dSYM Recovery, Context Logs, and Staged Distribution"
+slug: "rork-crashlytics-actionable-crash-reports-staged-distribution-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-18T11:00"
+author: "Rork Lab"
+description: "You added Crashlytics, but the stack traces are unreadable. Field notes on restoring dSYM/mapping symbols, logging the context that led to a crash, and gating distribution with App Distribution and GitHub Actions."
+tags: ["Crashlytics", "Firebase", "dSYM", "GitHub Actions", "crash analysis", "App Distribution", "React Native", "operations"]
+highlights:
+  - "Why release-build stack traces show up as <unknown>, and how to reliably upload dSYM and R8 mapping files"
+  - "Attaching the story of what happened before a crash using custom keys, breadcrumbs, and non-fatal error records"
+  - "A staged App Distribution × GitHub Actions pipeline gated on crash-free rate"
+---
+
+The week after I wired up Crashlytics, my first production crash arrived. I opened the console expecting answers and found a stack trace full of `__hermes_internal` and `<unknown>` — no way to tell which screen or which line had failed. The tool was working perfectly, yet the information it gave me was close to zero. This is the most dangerous state to be in: you think you have crash monitoring, but you are effectively blind.
+
+Debug builds read fine; only release builds go dark. There is a clear reason for that. In this article I want to fix "unreadable crash reports," then go a step further so the report tells you what was happening just before the failure, and finally cover how to stop a bad build from spreading past your testers — all assuming an app generated with Rork.
+
+## Why release traces stop being readable
+
+The cause is optimization. Release builds rename functions and variables to short symbols (minification), and on the native side symbol information is stripped out of the binary. Crashlytics only receives the optimized addresses, so it needs a separate map file to turn them back into human-readable names — a process called symbolication.
+
+That map comes in three layers. The JavaScript layer uses the source map Metro emits; the iOS native layer uses the dSYM; the Android native layer and R8 obfuscation use a mapping file. Because Rork generates a React Native app, the Hermes engine adds its own source map into the mix. If any one of these is missing, that layer of the trace becomes `<unknown>`. Most "unreadable" crashes come down to one of these maps never being uploaded.
+
+## iOS: upload the dSYM without dropping it
+
+An `.ipa` built with EAS contains the dSYM, but finishing the build does not send it to Crashlytics. You have to upload it explicitly. With Bitcode disabled (the current default), the reliable approach is to run `upload-symbols` after the build.
+
+```bash
+# upload-symbols ships with @react-native-firebase/crashlytics
+SYMBOLS="node_modules/@react-native-firebase/crashlytics/ios/upload-symbols"
+
+# Extract the dSYM from the EAS artifact and upload it
+unzip -o build.ipa -d ./ipa_extracted
+"$SYMBOLS" -gsp ./GoogleService-Info.plist -p ios \
+  "$(find ./ipa_extracted -name '*.dSYM' -print -quit)"
+```
+
+If you use Hermes, the JS stack appears as Hermes bytecode addresses. Those need a source map combined with `compose-source-maps`, not a dSYM. The `react-native-xcode.sh` script emits `main.jsbundle.map` on release builds, so hand that to the Crashlytics source-map uploader. Forget this and you end up half-symbolicated: native reads fine, but the JS lines stay unknown. I lost half a day here the first time.
+
+## Android: always send the R8 mapping from CI
+
+On Android, release builds run R8 to shrink and obfuscate code. Enable the Crashlytics Gradle plugin in `android/app/build.gradle` and the mapping file upload kicks in automatically.
+
+```groovy
+plugins {
+  id 'com.android.application'
+  id 'com.google.gms.google-services'
+  id 'com.google.firebase.crashlytics'
+}
+
+android {
+  buildTypes {
+    release {
+      // If you obfuscate, uploading the mapping is mandatory
+      minifyEnabled true
+      firebaseCrashlytics {
+        mappingFileUploadEnabled true
+        nativeSymbolUploadEnabled true   // when you ship NDK code
+      }
+    }
+  }
+}
+```
+
+Leave `mappingFileUploadEnabled` off while obfuscation is on and your Android traces go uniformly unreadable. Turn obfuscation off and you no longer need the mapping, but the app becomes easier to reverse-engineer — so in production I prefer to build on the assumption that the mapping is always sent.
+
+## Give every crash its preceding context
+
+Once symbolication works, you know *where* it crashed. What actually eats your time is *how it got there*. This is where custom keys and breadcrumbs pay off: send the app state at the moment of the crash together with the trail of actions that led to it.
+
+```typescript
+import crashlytics from "@react-native-firebase/crashlytics";
+
+// Keep the latest app state attached as keys
+export function setCrashContext(state: {
+  screen: string;
+  userTier: "free" | "pro";
+  networkType: string;
+}) {
+  crashlytics().setAttributes({
+    screen: state.screen,
+    userTier: state.userTier,
+    network: state.networkType,
+  });
+}
+
+// Leave a trail of important actions (attached chronologically on a crash)
+export function trace(action: string) {
+  crashlytics().log(`[${new Date().toISOString()}] ${action}`);
+}
+```
+
+Call `setCrashContext` on every screen transition, and wrap "expensive to get wrong" operations like billing and API calls with `trace` before and after. Now the crash detail in Crashlytics shows a state like "Pro user / checkout screen / offline" alongside a trail of "checkout started → token fetch failed." The time spent guessing repro conditions drops dramatically.
+
+Non-fatal errors deserve recording too. Sending exceptions you swallow in `try/catch` — failures the user never sees but that quietly degrade quality — through `recordError` makes that hidden decay visible.
+
+```typescript
+try {
+  await syncPurchases();
+} catch (e) {
+  // Record without crashing
+  crashlytics().recordError(e as Error, "purchase-sync-failed");
+}
+```
+
+One caution here: never put personal or sensitive data such as email addresses or billing tokens into keys or logs. Keep context at the level of "categories of state" and never send raw values. Designing it that way saves you a great deal of trouble if an audit is ever needed.
+
+## Staged distribution gated on crash-free rate
+
+Once reports are readable, the next job is to keep a bad build from spreading. App Distribution lets you split recipients into groups, so ship first to an internal group (yourself plus a few testers), confirm the crash-free rate clears your bar, and only then promote to the wider tester group. Build this into GitHub Actions.
+
+```yaml
+name: distribute
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-distribute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build (EAS)
+        run: npx eas-cli build --platform android --profile preview --non-interactive --no-wait
+
+      - name: Distribute to internal group first
+        run: |
+          firebase appdistribution:distribute "$APP_PATH" \
+            --app "$FIREBASE_APP_ID" \
+            --groups "internal" \
+            --release-notes "$(git log -1 --pretty=%s)"
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+```
+
+Promotion to the wider group is safest as a separate job behind a manual approval (required reviewers on an `environment`). The crash-free rate still has limited automation APIs, so I run promotion on the condition of "24 hours of internal distribution with no new crashes." Rather than rushing toward full automation, leaving one gate to a human has, in practice, reduced incidents.
+
+The `FIREBASE_TOKEN` can expire. If CI suddenly stops with an "authentication error," suspect an expired token first. Leaning on a service-account approach (`GOOGLE_APPLICATION_CREDENTIALS`) keeps you from being jerked around by that expiry.
+
+## Crash-free rate as an operational metric
+
+The crash-free rate is the share of your users who did not experience a crash. The bar I aim for is 99.5% or higher by users, and 99.9% on critical screens such as launch and checkout. Half a percent sounds tiny, but in an app used by ten thousand people that means someone is crashing nearly every day.
+
+Staring at the number changes nothing. Once a week I look only at the top three crashes and knock them out one at a time, ordered by how many users they affect. This habit of "continuously shaving only the top issues" is, for the limited hours of solo development, the highest-leverage routine I have found. Trying to chase every crash burns you out, so I deliberately cap it at three.
+
+I have been building apps on my own since 2014, and I still run wallpaper and relaxation apps today. What hit home around the time AdMob revenue began to climb steadily was that watching whether already-shipped apps were quietly breaking mattered more to long-term revenue than new development did. Instrumenting crash monitoring with context, and guarding distribution with a gate, is not flashy — but it is the foundation that lets one person carry several apps that run far away from my desk.
+
+## Your next step
+
+Start by deliberately triggering a crash in a local release build and confirming that the Crashlytics trace shows function names rather than symbols. Only once that reads correctly do context logs and staged distribution start to mean anything. Verifying that the map arrived is where everything begins.
+
+If you are likewise watching several apps on your own, I hope this helps. Thank you for reading.

@@ -1,0 +1,159 @@
+---
+title: "Rorkアプリの本番クラッシュを「読める」レポートに変える — dSYM復元と文脈ログ、段階配布の実装メモ"
+slug: "rork-crashlytics-actionable-crash-reports-staged-distribution-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-18T11:00"
+author: "Rork Lab"
+description: "Crashlyticsを入れたのにスタックトレースが読めない——dSYM/mapping復元、文脈を持たせるログ設計、App DistributionとGitHub Actionsの段階配布までを実装メモとしてまとめます。"
+tags: ["Crashlytics", "Firebase", "dSYM", "GitHub Actions", "クラッシュ解析", "App Distribution", "React Native", "運用"]
+highlights:
+  - "リリースビルドのスタックトレースが <unknown> になる原因と、dSYM/R8 mapping を確実にアップロードする手順"
+  - "クラッシュに「直前に何をしていたか」を持たせる custom keys・breadcrumb・非致命エラー記録の実装"
+  - "crash-free レートをしきい値にした App Distribution × GitHub Actions の段階配布パイプライン"
+---
+
+Crashlytics を導入した翌週、最初の本番クラッシュが届きました。意気込んでコンソールを開いたのですが、並んでいたのは `__hermes_internal` と `<unknown>` ばかりのスタックトレースで、どの画面のどの行で落ちたのかまったく分かりませんでした。ツールは正しく動いているのに、得られる情報がゼロに近い——この状態は、クラッシュ監視を入れたつもりで実は何も見えていない、いちばん危ない状態です。
+
+開発ビルドでは普通に読めるのに、リリースビルドだけ読めなくなる。ここには明確な理由があります。やりたいことは三つです。まず「クラッシュレポートが読めない」を解消し、さらに一歩進んで「落ちる前に何が起きていたか」まで分かるレポートに変え、そして問題のあるビルドをテスターより広い層へ流さないための段階配布を組む。Rork で生成したアプリを前提に、実際に手を動かした順序で実装メモとして残します。
+
+## なぜリリースビルドのトレースは読めなくなるのか
+
+原因は最適化です。リリースビルドでは、関数名や変数名が短い記号へ置き換えられ（ミニファイ）、ネイティブ側はシンボル情報がバイナリから剥がされます。Crashlytics が受け取るのは最適化後のアドレスだけなので、人間が読める名前へ戻す「シンボリケーション」のための地図ファイルが別途必要になります。
+
+地図ファイルは三層に分かれています。JavaScript 層は Metro が出力するソースマップ、iOS のネイティブ層は dSYM、Android のネイティブ層と R8 による難読化は mapping ファイル。Rork が生成するのは React Native アプリなので、Hermes エンジンを使う場合は Hermes のソースマップも絡みます。どれか一つでも欠けると、その層のトレースが `<unknown>` になります。読めないクラッシュの大半は、この地図がアップロードされていないことが原因です。
+
+## iOS：dSYM を取りこぼさずアップロードする
+
+EAS Build で生成した `.ipa` には dSYM が含まれますが、ビルドが終わっただけでは Crashlytics には届きません。アップロードを明示的に行う必要があります。Bitcode を無効化（現在は既定で無効）した上で、ビルド後に `upload-symbols` を走らせるのが確実です。
+
+```bash
+# Firebase の upload-symbols を取得（@react-native-firebase/crashlytics に同梱）
+SYMBOLS="node_modules/@react-native-firebase/crashlytics/ios/upload-symbols"
+
+# EAS のアーティファクトから dSYM を展開してアップロード
+unzip -o build.ipa -d ./ipa_extracted
+"$SYMBOLS" -gsp ./GoogleService-Info.plist -p ios \
+  "$(find ./ipa_extracted -name '*.dSYM' -print -quit)"
+```
+
+Hermes を使っている場合、JS のスタックは Hermes バイトコードのアドレスとして現れます。これは dSYM ではなく `compose-source-maps` で結合したソースマップが必要です。`react-native-xcode.sh` がリリースビルド時に `main.jsbundle.map` を出力しているので、それを Crashlytics 用のソースマップアップローダに渡します。ここを忘れると、ネイティブは読めるのに JS 行だけ不明、という中途半端な状態になります。私自身、最初はここで半日溶かしました。
+
+## Android：R8 の mapping を CI で必ず送る
+
+Android はリリースビルドで R8 がコードを縮小・難読化します。`android/app/build.gradle` で Crashlytics の Gradle プラグインを有効にしておくと、mapping ファイルの自動アップロードが働きます。
+
+```groovy
+plugins {
+  id 'com.android.application'
+  id 'com.google.gms.google-services'
+  id 'com.google.firebase.crashlytics'
+}
+
+android {
+  buildTypes {
+    release {
+      // 難読化を有効にする場合は mapping のアップロードが必須
+      minifyEnabled true
+      firebaseCrashlytics {
+        mappingFileUploadEnabled true
+        nativeSymbolUploadEnabled true   // NDK を含む場合
+      }
+    }
+  }
+}
+```
+
+`mappingFileUploadEnabled` を false のまま難読化だけ有効にすると、Android のトレースが軒並み読めなくなります。逆に難読化を切れば mapping は不要ですが、アプリの解析耐性が下がるので、本番では mapping を送る前提で組むのが筋が良いと考えています。
+
+## クラッシュに「直前の文脈」を持たせる
+
+シンボリケーションが効けば「どこで落ちたか」は分かります。しかし本当に時間を食うのは「なぜその状態に至ったか」です。ここで効くのが custom keys と breadcrumb の記録です。落ちた瞬間のアプリ状態と、そこに至るまでの操作の足跡を一緒に送ります。
+
+```typescript
+import crashlytics from "@react-native-firebase/crashlytics";
+
+// アプリ状態をキーとして常に最新化しておく
+export function setCrashContext(state: {
+  screen: string;
+  userTier: "free" | "pro";
+  networkType: string;
+}) {
+  crashlytics().setAttributes({
+    screen: state.screen,
+    userTier: state.userTier,
+    network: state.networkType,
+  });
+}
+
+// 重要な操作の足跡を log として残す（クラッシュ時に時系列で添付される）
+export function trace(action: string) {
+  crashlytics().log(`[${new Date().toISOString()}] ${action}`);
+}
+```
+
+画面遷移のたびに `setCrashContext` を呼び、課金処理や API 呼び出しといった「失敗すると痛い操作」の前後で `trace` を仕込みます。こうしておくと、Crashlytics のクラッシュ詳細に「Pro ユーザー / 決済画面 / オフライン」といった状態と、「チェックアウト開始 → トークン取得失敗」という足跡が並びます。再現条件を推測する時間が劇的に短くなります。
+
+非致命的なエラーも記録に値します。`try/catch` で握りつぶしている例外や、ユーザーには見せないが内部的には失敗している処理を `recordError` で送ると、クラッシュには至らない品質劣化を可視化できます。
+
+```typescript
+try {
+  await syncPurchases();
+} catch (e) {
+  // クラッシュさせずに記録だけ残す
+  crashlytics().recordError(e as Error, "purchase-sync-failed");
+}
+```
+
+ここで一つだけ注意があります。メールアドレスや課金トークンのような個人情報・機密情報をキーやログに入れないこと。文脈は「状態の分類」までに留め、生の値は送らない設計にしておくと、後で監査が必要になったときに困りません。
+
+## crash-free レートをしきい値にした段階配布
+
+レポートが読めるようになったら、次は「悪いビルドを広げない」仕組みです。App Distribution は配布先をグループで分けられるので、まず社内（自分＋少数のテスター）グループへ配り、crash-free レートが基準を超えていることを確認してから広いテスターグループへ昇格させます。これを GitHub Actions に組み込みます。
+
+```yaml
+name: distribute
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-distribute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build (EAS)
+        run: npx eas-cli build --platform android --profile preview --non-interactive --no-wait
+
+      - name: Distribute to internal group first
+        run: |
+          firebase appdistribution:distribute "$APP_PATH" \
+            --app "$FIREBASE_APP_ID" \
+            --groups "internal" \
+            --release-notes "$(git log -1 --pretty=%s)"
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+```
+
+広いグループへの昇格は、別ジョブとして手動承認（`environment` の required reviewers）を挟むのが安全です。crash-free レートはまだ自動判定の API が限られるため、私は「内部配布から24時間、新規クラッシュなし」を昇格の条件として運用しています。完全自動化を急がず、ゲートを一つ人間に残しておくほうが、結果的に事故が減りました。
+
+`FIREBASE_TOKEN` は失効することがあります。CI が突然「認証エラー」で止まる場合、まず疑うべきはトークンの期限切れです。サービスアカウント方式（`GOOGLE_APPLICATION_CREDENTIALS`）に寄せておくと、この失効に振り回されにくくなります。
+
+## 運用指標としての crash-free レート
+
+クラッシュフリーレートは、ユーザー全体のうちクラッシュを経験しなかった割合です。私が目安にしているのは、ユーザー基準で 99.5% 以上、致命的な画面（起動・決済）に限れば 99.9% を維持することです。0.5% という数字は小さく見えますが、1万人が使うアプリなら毎日のように誰かが落ちている計算になります。
+
+数字を眺めるだけでは改善しません。週に一度、上位3件のクラッシュだけを見て、影響ユーザー数の多い順に一つずつ潰す——この「上位だけを継続的に削る」運用が、限られた個人開発の時間で最も費用対効果が高いと感じています。すべてのクラッシュを追おうとすると疲弊して続かないので、あえて3件に絞っています。
+
+私は2014年から個人でアプリを作り続けていて、壁紙や癒し系のアプリを今も運用しています。AdMob の収益が安定して伸びてきた頃に痛感したのは、新規開発よりも「既に出しているアプリが静かに壊れていないか」を見張ることのほうが、長期の売上を支えるという事実でした。クラッシュ監視を文脈つきで仕込み、配布をゲートで守るこの仕組みは、派手さはありませんが、離れて運用している複数アプリを一人で抱えるうえで欠かせない土台になっています。
+
+## 次の一歩
+
+まずは手元のリリースビルドで一度わざとクラッシュを起こし、Crashlytics のトレースが記号ではなく関数名で表示されることを確認してください。そこが読めて初めて、文脈ログも段階配布も意味を持ちます。地図が届いているかの確認が、すべての出発点です。
+
+同じように複数アプリを一人で見ている方の助けになれば嬉しいです。お読みいただきありがとうございました。
