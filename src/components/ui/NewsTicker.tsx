@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Maxはネイティブ Swiftアプリを生成。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "NATIVE — AR/LiDAR・Metalによる3D・ウィジェット・Dynamic Island・Live Activities・Siri Intents・HealthKitなど、ネイティブ機能を引き出せます",
-    "RN — 標準のRorkはReact Native（Expo）でクロスプラットフォーム。素早く形にするならこちらが向いています",
-    "CHOICE — 手早さならReact Native版、Appleのハード/OS統合を活かすならRork Maxという棲み分けが現実的です",
-    "PRICE — Rorkは無料で開始でき有料は月$25から、Rork Maxは月$200です",
-    "FLOW — 作りたいアプリを平易な言葉で説明すると、ストアに配信できる動くコードが生成されます",
+    "MAX — Rork MaxはSwiftのネイティブアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "PUBLISH — Rork Maxは2クリックでApp Store公開まで進められます。料金は月$200です",
+    "RN — 標準のRorkはReact Native（Expo）でiOS/Androidのネイティブアプリを生成。素早く形にするならこちらです",
+    "PRICE — Rorkは無料で開始でき、有料プランは月$25からです",
+    "FUND — Rorkはa16zから280万ドルを調達。月間訪問は74.3万を超え、成長率は85%とされています",
+    "FLOW — 作りたいアプリを平易な言葉で説明すると、ストアに配信できる動くコードが生成され、カメラや通知など端末機能も使えます",
   ],
   en: [
     "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — It unlocks native capabilities React Native cannot reach: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, Siri Intents, and HealthKit",
-    "RN — Standard Rork builds cross-platform apps with React Native (Expo), a good fit when you want something working fast",
-    "CHOICE — Pick React Native for speed, or Rork Max when you need Apple hardware and OS integration",
-    "PRICE — Rork is free to start with paid plans from $25/mo; Rork Max is $200/mo",
-    "FLOW — Describe the app you want in plain language and Rork produces working code you can ship to the stores",
+    "PUBLISH — Rork Max ships 2-click App Store publishing and runs $200/month",
+    "RN — The standard Rork builds native iOS/Android apps with React Native (Expo) — the quicker path to a working app",
+    "PRICE — Rork is free to start, with paid plans from $25/month",
+    "FUND — Rork raised $2.8M from a16z; the platform now sees 743k+ monthly visits with 85% growth",
+    "FLOW — Describe your app in plain English and Rork generates deployable code that can use the camera, notifications, and more",
   ],
 };
 
