@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはSwiftのネイティブアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "PUBLISH — Rork Maxは2クリックでApp Store公開まで進められます。料金は月$200です",
-    "RN — 標準のRorkはReact Native（Expo）でiOS/Androidのネイティブアプリを生成。素早く形にするならこちらです",
-    "PRICE — Rorkは無料で開始でき、有料プランは月$25からです",
-    "FUND — Rorkはa16zから280万ドルを調達。月間訪問は74.3万を超え、成長率は85%とされています",
-    "FLOW — 作りたいアプリを平易な言葉で説明すると、ストアに配信できる動くコードが生成され、カメラや通知など端末機能も使えます",
+    "MAX — Rork Maxが全Appleプラットフォーム向けのネイティブSwiftを生成。iPhoneからVision Proまで対応します",
+    "PUBLISH — Xcodeを使わず2クリックでApp Storeへ公開でき、Macのハードウェアを介さずiOS配布まで届きます",
+    "NATIVE — 通常のRorkはReact Native（Expo）でネイティブiOS/Androidを生成し、モバイルに特化しています",
+    "PROMPT — プレーンな英語でアプリの構想を書くと、ストアへ配布できる動くコードが生成されます",
+    "FUND — Rorkはa16zから$2.8Mを調達し、月間743,000訪問・成長率85%と報じられています",
+    "PRICE — 無料で開始でき、有料プランは月$25から。ただしクレジット消費が多いとの利用者の声もあります",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "PUBLISH — Rork Max ships 2-click App Store publishing and runs $200/month",
-    "RN — The standard Rork builds native iOS/Android apps with React Native (Expo) — the quicker path to a working app",
-    "PRICE — Rork is free to start, with paid plans from $25/month",
-    "FUND — Rork raised $2.8M from a16z; the platform now sees 743k+ monthly visits with 85% growth",
-    "FLOW — Describe your app in plain English and Rork generates deployable code that can use the camera, notifications, and more",
+    "MAX — Rork Max generates native Swift for every Apple platform, from iPhone to Vision Pro",
+    "PUBLISH — Publish to the App Store in two clicks without Xcode, reaching iOS distribution without Mac hardware",
+    "NATIVE — Standard Rork builds native iOS/Android via React Native (Expo), focused exclusively on mobile",
+    "PROMPT — Describe your app idea in plain English and Rork generates deployable, store-ready code",
+    "FUND — Rork raised $2.8M from a16z and reportedly sees 743,000 monthly visits at 85% growth",
+    "PRICE — Free to start with paid plans from $25/month, though some users note heavy credit consumption",
   ],
 };
 
