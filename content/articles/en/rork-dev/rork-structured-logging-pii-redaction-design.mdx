@@ -1,0 +1,176 @@
+---
+title: "Logging Design for Rork Apps: What to Keep and How to Redact PII"
+slug: "rork-structured-logging-pii-redaction-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-19T16:00"
+author: "Rork Lab"
+description: "Rork-generated apps tend to scatter console.log everywhere, and when a bug appears you cannot read the part that matters. This designs structured logging, log levels, automatic PII masking, and production send control — all with code you can use as-is."
+tags: ["Rork", "App Development", "Logging", "Privacy", "Operations"]
+highlights:
+  - "A migration path that consolidates scattered console.log into one logger and shifts to JSON structured logs"
+  - "A regex-based masking implementation that automatically hides emails, tokens, and device IDs before they are sent"
+  - "Log-level control that prints everything in dev but sends only warn-and-above in production, with sampling to cap cost"
+---
+
+A few days after the app cleared review, a report came in: saving fails on one specific device model. It would not reproduce on my own phone. Logs are what you lean on at moments like this, but when I opened the code Rork had exported, `console.log` calls were scattered around in raw form, and the part that actually mattered was impossible to read.
+
+As an indie developer running several apps across the App Store and Google Play, "bugs that don't reproduce on my machine" are unavoidable. Each time, it drives home that logs are too late if you add them after the accident.
+
+Logs also carry the opposite danger. The more detail you try to keep, the more you risk writing out personal information — email addresses, auth tokens — right alongside it. Here we build, hands-on, a logging design that keeps enough to investigate while reliably hiding what must be hidden.
+
+## Why scattered console.log fails you
+
+A string log like `console.log("saved")` looks clear in the moment. But when you search later, it gives almost nothing to grab onto.
+
+There are three problems. First, when, on which screen, and in what user state it happened are buried in a string rather than structured. Second, dev output lingers into production, leaking unnecessary information. Third, PII that should be hidden mixes in unprotected.
+
+So what you need is one place that does three things: shape logs into a readable form, switch the volume by environment, and automatically hide dangerous values.
+
+## Logs become searchable only once structured
+
+First, treat a log as an object, not a string. Shift to JSON from the start so you can filter mechanically later.
+
+```typescript
+// logger.ts — the single logger for the whole app
+type Level = "debug" | "info" | "warn" | "error";
+
+type LogRecord = {
+  ts: string;          // ISO8601 timestamp
+  level: Level;
+  event: string;       // a short identifier like "save.failed"
+  screen?: string;
+  meta?: Record<string, unknown>;
+};
+
+function emit(record: LogRecord) {
+  // dev: print as-is; production: route to the send logic below
+  console.log(JSON.stringify(record));
+}
+```
+
+The key is to standardize `event` into a short identifier like `"save.failed"`. With fixed names instead of free text, filtering for "only save failures" later is a one-liner.
+
+Attach context to `screen` and `meta`, and "on which screen, with what input" stays as structure. The point is to split into fields rather than write into a string.
+
+## Hide PII automatically before sending
+
+This is the most important part of the article. The more context you keep, the more PII slips in. Prepare a masking function that every value passed to `meta` must go through before sending.
+
+```typescript
+// redact.ts — hide dangerous values before sending
+const PATTERNS: { re: RegExp; mask: string }[] = [
+  { re: /[\w.+-]+@[\w-]+\.[\w.-]+/g, mask: "[email]" },      // email address
+  { re: /\b(?:eyJ|sk_|ghp_)[A-Za-z0-9._-]{8,}/g, mask: "[token]" }, // token-like
+  { re: /\b\d{12,19}\b/g, mask: "[number]" },                 // long digit runs (card/ID)
+];
+
+const SENSITIVE_KEYS = ["password", "token", "email", "deviceId", "authorization"];
+
+export function redact(value: unknown): unknown {
+  if (typeof value === "string") {
+    return PATTERNS.reduce((s, p) => s.replace(p.re, p.mask), value);
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SENSITIVE_KEYS.includes(k.toLowerCase()) ? "[redacted]" : redact(v);
+    }
+    return out;
+  }
+  return value;
+}
+```
+
+This function guards in two layers. Keys named `email` or `token` are replaced whole with `[redacted]`, and any other string is scanned by regex to hide email- or token-like fragments.
+
+Even if you carelessly pass a whole object like `meta: { user }`, it walks recursively and hides the contents. Nothing feels more pointless to me than scrubbing email addresses out of logs after the fact, so I strongly recommend a design that stops it mechanically at the entrance.
+
+## Switch volume by environment with log levels
+
+In development you want to see everything. But sending every log in production inflates both bandwidth and storage cost. So cut off by log level.
+
+```typescript
+// logger.ts (continued)
+const ORDER: Record<Level, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+
+// dev: debug and up; production: warn and up only
+const MIN_LEVEL: Level = __DEV__ ? "debug" : "warn";
+
+export function log(level: Level, event: string, meta?: Record<string, unknown>, screen?: string) {
+  if (ORDER[level] < ORDER[MIN_LEVEL]) return; // cut off
+  emit({
+    ts: new Date().toISOString(),
+    level,
+    event,
+    screen,
+    meta: meta ? (redact(meta) as Record<string, unknown>) : undefined,
+  });
+}
+```
+
+`__DEV__` is a constant Expo switches automatically. Now dev keeps everything down to `debug`, while production keeps only `warn` and `error`. The fine-grained logs you need for local investigation stay out of production.
+
+The call site simply attaches context as fields.
+
+```typescript
+log("error", "save.failed", { reason: err.message, retryCount: 2 }, "NoteEditor");
+```
+
+## Cap production cost with sampling
+
+You want every `error` sent, but sending all high-frequency logs like `info` makes cost spike as your user base grows. So thin out only the low-importance logs to a fixed fraction.
+
+```typescript
+// sampling built into the send logic
+const SAMPLE_RATE: Record<Level, number> = {
+  debug: 0,      // never sent in production
+  info: 0.1,     // send 10%
+  warn: 1,       // all
+  error: 1,      // all
+};
+
+function shouldSend(level: Level): boolean {
+  return Math.random() < SAMPLE_RATE[level];
+}
+```
+
+In my own operation, thinning `info` to 10% noticeably cut the number of sends, and it was still plenty to read trends. Since `warn` and `error` go at 100%, no real investigation ever loses data. Adjusting the ratio gradually while watching user count is the realistic approach.
+
+## Which events to keep: a starting list
+
+Logging everything makes things harder to read, not easier. Deciding the list of events to keep up front saves you hesitation. These are the four kinds I always include in a new app.
+
+<table>
+<thead>
+<tr><th>Example event name</th><th>Level</th><th>Why keep it</th></tr>
+</thead>
+<tbody>
+<tr><td>purchase.completed / purchase.failed</td><td>error / warn</td><td>Tied to revenue and hard to reproduce</td></tr>
+<tr><td>save.failed</td><td>error</td><td>Data loss leads straight to churn</td></tr>
+<tr><td>auth.expired</td><td>warn</td><td>Lets you gauge how often logins lapse</td></tr>
+<tr><td>screen.view</td><td>info</td><td>Tracks where in the flow users drop off</td></tr>
+</tbody>
+</table>
+
+Of these, the `purchase` events and `save.failed` are set to a level that always arrives, even in production. By contrast, `screen.view` is `info`, so sampling thins it and it never strains cost.
+
+## An order for rolling the logger into an existing app
+
+You don't need to replace every console.log at once. For an app already in production, this order is safe.
+
+1. Drop in the two files logger.ts and redact.ts
+2. Replace console.log calls around purchasing with log()
+3. Replace the spots for saving and network errors
+4. Migrate the rest gradually whenever you touch them
+
+With this order, the logs for the places you most want to know about get shaped first. For events that hurt revenue yet are hard to reproduce - like an AdMob initialization failure - I recommend keeping them as error early.
+
+The pitfall is deferring masking. Once PII lands in a log it's hard to recover, so I always build redact into the very first step.
+
+## Your next step
+
+Start by dropping in the two files `logger.ts` and `redact.ts`, and replace `console.log` calls one at a time with `log()`. You do not need to fix them all at once. Begin around purchasing and saving, and the logs for the places you most want to know about will start to remain — with PII already hidden.
+
+Logs are something you plant before the accident, not after. The longer you operate generated code, the more this bit of effort at the entrance ends up helping you.

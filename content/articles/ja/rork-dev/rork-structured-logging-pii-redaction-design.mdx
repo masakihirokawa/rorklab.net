@@ -1,0 +1,176 @@
+---
+title: "Rork アプリのログ設計 — 何を残し、個人情報をどう伏せるか"
+slug: "rork-structured-logging-pii-redaction-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-19T16:00"
+author: "Rork Lab"
+description: "Rork が生成したアプリは console.log が散らばりがちで、いざ不具合を追うときに肝心の情報が読めません。構造化ログ・ログレベル・個人情報の自動マスキング・本番での送信制御までを、そのまま使えるコードで設計します。"
+tags: ["Rork", "アプリ開発", "ログ", "プライバシー", "運用"]
+highlights:
+  - "console.log の散在を1つのロガーに集約し、JSON 形式の構造化ログへ寄せる移行手順"
+  - "メールアドレス・トークン・端末IDを送信前に自動で伏せる、正規表現ベースのマスキング実装"
+  - "開発では全部出し、本番では warn 以上だけ送るログレベル制御と、サンプリングでコストを抑える設計"
+---
+
+アプリの審査が通って数日後、特定の機種でだけ保存が失敗するという報告が届きました。手元では再現しません。こういうとき頼りになるのはログですが、Rork が書き出したコードを開くと、`console.log` があちこちに素のまま散らばっていて、肝心の状況がまるで読み取れませんでした。
+
+個人開発で複数のアプリを App Store と Google Play に出していると、こうした「手元で再現しない不具合」は避けて通れません。そのたびに痛感するのは、ログは事故が起きてから足すのでは遅い、ということです。
+
+同時に、ログには逆の危うさもあります。状況を細かく残そうとするほど、メールアドレスや認証トークンといった個人情報まで一緒に書き出してしまうのです。ここでは、追える量を確保しつつ、伏せるべきものは確実に伏せるログ設計を、手を動かしながら組み立てます。
+
+## 散らばった console.log が役に立たない理由
+
+`console.log("保存しました")` のような文字列ログは、その瞬間は分かりやすく見えます。けれども後から検索するときには、ほとんど手がかりになりません。
+
+問題は3つあります。第一に、いつ・どの画面で・どのユーザー状態で起きたかが文字列に埋もれて構造化されていないこと。第二に、開発中の出力が本番にもそのまま残り、不要な情報まで垂れ流しになること。第三に、伏せるべき個人情報が無防備に混ざることです。
+
+つまり必要なのは、ログを「読める形」に揃え、出す量を環境で切り替え、危険な値を自動で伏せる——この3つを1か所で担う仕組みです。
+
+## ログは構造化して初めて検索できる
+
+まず、ログを文字列ではなくオブジェクトとして扱います。あとから機械的に絞り込めるよう、最初から JSON に寄せておく設計です。
+
+```typescript
+// logger.ts — アプリ全体で唯一のロガー
+type Level = "debug" | "info" | "warn" | "error";
+
+type LogRecord = {
+  ts: string;          // ISO8601 のタイムスタンプ
+  level: Level;
+  event: string;       // "save.failed" のような短い識別子
+  screen?: string;
+  meta?: Record<string, unknown>;
+};
+
+function emit(record: LogRecord) {
+  // 開発中はそのまま、本番は後述の送信処理へ回す
+  console.log(JSON.stringify(record));
+}
+```
+
+ポイントは `event` を `"save.failed"` のような短い識別子にそろえることです。自由文ではなく決まった名前にしておくと、後から「保存失敗だけ集める」といった絞り込みが一発でできます。
+
+`screen` や `meta` に状況を添えれば、「どの画面で・どんな入力で起きたか」が構造として残ります。文字列に書き込むのではなく、フィールドに分けるのが要点です。
+
+## 個人情報を送信前に自動で伏せる
+
+ここが本記事のいちばん大事な部分です。ログに状況を残すほど、個人情報が紛れ込みます。`meta` に渡された値を、送信前に必ず通すマスキング関数を用意します。
+
+```typescript
+// redact.ts — 危険な値を送信前に伏せる
+const PATTERNS: { re: RegExp; mask: string }[] = [
+  { re: /[\w.+-]+@[\w-]+\.[\w.-]+/g, mask: "[email]" },      // メールアドレス
+  { re: /\b(?:eyJ|sk_|ghp_)[A-Za-z0-9._-]{8,}/g, mask: "[token]" }, // トークン類
+  { re: /\b\d{12,19}\b/g, mask: "[number]" },                 // 長い数字列(カード/ID)
+];
+
+const SENSITIVE_KEYS = ["password", "token", "email", "deviceId", "authorization"];
+
+export function redact(value: unknown): unknown {
+  if (typeof value === "string") {
+    return PATTERNS.reduce((s, p) => s.replace(p.re, p.mask), value);
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SENSITIVE_KEYS.includes(k.toLowerCase()) ? "[redacted]" : redact(v);
+    }
+    return out;
+  }
+  return value;
+}
+```
+
+この関数は2段構えで守ります。キー名が `email` や `token` のものは値ごと `[redacted]` に置き換え、それ以外の文字列は中身を正規表現で走査してメールやトークンらしき断片を伏せます。
+
+うっかり `meta: { user }` のようにオブジェクトを丸ごと渡しても、再帰的にたどって伏せてくれるのが効きます。私自身、ログに混ざったメールアドレスを後から消す作業ほど不毛なものはないと感じているので、入口で機械的に止める設計を強く推奨します。
+
+## ログレベルで「出す量」を環境ごとに切り替える
+
+開発中は全部見たい。けれど本番で全ログを送ると、通信量も保管コストも膨らみます。そこでログレベルで足切りします。
+
+```typescript
+// logger.ts(続き)
+const ORDER: Record<Level, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+
+// 開発は debug 以上、本番は warn 以上だけを送る
+const MIN_LEVEL: Level = __DEV__ ? "debug" : "warn";
+
+export function log(level: Level, event: string, meta?: Record<string, unknown>, screen?: string) {
+  if (ORDER[level] < ORDER[MIN_LEVEL]) return; // 足切り
+  emit({
+    ts: new Date().toISOString(),
+    level,
+    event,
+    screen,
+    meta: meta ? (redact(meta) as Record<string, unknown>) : undefined,
+  });
+}
+```
+
+`__DEV__` は Expo が自動で切り替える定数です。これで開発時は `debug` まで全部、本番では `warn` と `error` だけが残ります。手元の調査に必要な細かいログを、本番に持ち込まずに済みます。
+
+呼び出し側は次のように、状況をフィールドで添えるだけです。
+
+```typescript
+log("error", "save.failed", { reason: err.message, retryCount: 2 }, "NoteEditor");
+```
+
+## 本番ログはサンプリングでコストを抑える
+
+`error` は全部送りたい一方、`info` のような頻度の高いログまで全件送ると、利用者が増えたときに送信コストが跳ね上がります。そこで、重要度の低いログだけ一定割合に間引きます。
+
+```typescript
+// 送信処理に組み込むサンプリング
+const SAMPLE_RATE: Record<Level, number> = {
+  debug: 0,      // 本番では送らない
+  info: 0.1,     // 10% だけ送る
+  warn: 1,       // 全件
+  error: 1,      // 全件
+};
+
+function shouldSend(level: Level): boolean {
+  return Math.random() < SAMPLE_RATE[level];
+}
+```
+
+私の運用では、`info` を10%に間引くだけで送信件数が体感で大きく減り、それでも傾向の把握には十分でした。`warn` と `error` は100%送るので、いざという調査で取りこぼすことはありません。割合は、利用者数を見ながら少しずつ調整するのが現実的です。
+
+## どのイベントを残すべきか、最初の一覧
+
+何でもログにすると、かえって読めなくなります。最初に決めておくと迷わないのが、残すイベントの一覧です。私が新規アプリで必ず入れているのは次の4種類です。
+
+<table>
+<thead>
+<tr><th>イベント名の例</th><th>レベル</th><th>残す理由</th></tr>
+</thead>
+<tbody>
+<tr><td>purchase.completed / purchase.failed</td><td>error / warn</td><td>売上に直結し、再現が難しい</td></tr>
+<tr><td>save.failed</td><td>error</td><td>データ損失はユーザー離脱に直結</td></tr>
+<tr><td>auth.expired</td><td>warn</td><td>ログイン切れの頻度を把握できる</td></tr>
+<tr><td>screen.view</td><td>info</td><td>導線のどこで離脱したか追える</td></tr>
+</tbody>
+</table>
+
+このうち `purchase` 系と `save.failed` は、本番でも必ず届くレベルにしておきます。逆に `screen.view` は `info` なのでサンプリングで間引かれ、コストを圧迫しません。
+
+## 既存アプリへロガーを入れていく順番
+
+一度に全部の console.log を置き換える必要はありません。本番運用しているアプリへ後付けするなら、次の順番が安全です。
+
+1. logger.ts と redact.ts の2ファイルを置く
+2. 課金まわりの console.log を log() に置き換える
+3. 保存・通信エラーの箇所を置き換える
+4. 残りは触ったついでに少しずつ移していく
+
+この順番なら、いちばん知りたい場所のログから整います。AdMob の初期化失敗のように、収益に響くのに再現しづらいイベントは、早めに error として残すことを推奨します。
+
+落とし穴は、マスキングを後回しにすることです。個人情報は一度ログに残ると回収が難しいので、redact を最初から通す対処を、私は必ず最初の一歩に組み込んでいます。
+
+## 次の一歩
+
+まずは `logger.ts` と `redact.ts` の2ファイルを置き、アプリ内の `console.log` を1つずつ `log()` に置き換えてみてください。全部を一気に直す必要はありません。課金と保存まわりから着手すれば、いちばん知りたい場所のログが、個人情報を伏せた状態で残るようになります。
+
+ログは事故の後ではなく、事故の前に仕込むものです。生成コードを長く運用するほど、この入口の一手間が自分を助けてくれると感じています。
