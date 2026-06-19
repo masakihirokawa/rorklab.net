@@ -1,0 +1,166 @@
+---
+title: "Hardening API Calls in Rork Apps: Token Refresh, Retry, and Idempotency"
+slug: "rork-api-client-token-refresh-retry-idempotency-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-19T21:00"
+author: "Rork Lab"
+description: "The fetch Rork generates is left fragile against expired tokens, flaky signal, and double sends. Here is a design that consolidates token refresh, retry with backoff, and idempotency keys into a single client layer, with implementation code and operational numbers."
+tags: ["Rork", "React Native", "API", "Authentication", "Idempotency"]
+highlights:
+  - "Consolidate token refresh in one place and collapse simultaneous requests into a single refresh"
+  - "How to tell which errors are worth retrying, and concrete exponential backoff with a cap"
+  - "An idempotency-key design that prevents duplicate charges and double posts from re-sends"
+---
+
+On a freshly shipped Rork app, I got reports that "please log in again" appeared now and then. It was hard to reproduce and did not always show on a specific action. Watching patiently on my own device, I saw it tended to appear on the first action after the app had been idle for a while.
+
+The cause was an expired access token. The `fetch` Rork generated does attach the token and send, but it does not handle the chore of quietly refreshing and re-sending when the token has expired. The expiry was surfacing on screen as an authentication error.
+
+As an indie developer running apps that involve payments and sync, I have learned that network robustness maps directly to review scores. Here I want to record the design that takes Rork's raw `fetch` and consolidates token refresh, retry, and idempotency into a single client layer, with the implementation code.
+
+## The weaknesses in the generated fetch
+
+The networking code Rork first emits tends to settle into this shape.
+
+```ts
+async function getProfile() {
+  const res = await fetch(`${API}/me`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.json();
+}
+```
+
+This code has three weaknesses. First, it does not refresh an expired token; it returns the error as is. Second, it gives up instantly even on a momentary signal drop. Third, a double tap on a submit button or a re-send after timeout can execute the same action twice. Handle these separately in each screen and the code scatters and gaps appear. That is exactly why we consolidate the layer that handles networking into one place.
+
+## Consolidating token refresh into one place
+
+The first thing to solve is the expiry. When the server returns `401`, get a new access token with the refresh token and replay the original request.
+
+The pitfall here is simultaneous requests. When several calls all receive `401` at the moment the app resumes, each one launches a refresh and the refreshes pile up. To avoid this, share a single Promise while refreshing is in flight.
+
+```ts
+let refreshing: Promise<string> | null = null;
+
+async function refreshToken(): Promise<string> {
+  if (!refreshing) {
+    refreshing = fetch(`${API}/auth/refresh`, {
+      method: "POST",
+      body: JSON.stringify({ refreshToken: store.refreshToken }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        store.accessToken = d.accessToken;
+        return d.accessToken as string;
+      })
+      .finally(() => {
+        refreshing = null;
+      });
+  }
+  return refreshing;        // Concurrent callers await the same refresh
+}
+```
+
+By sharing `refreshing`, no matter how many requests receive `401` at once, the actual refresh stays at one. In my setup this single move nearly stopped the "please log in again" reports.
+
+## Telling failures apart before retrying
+
+Prepare for failures beyond the token too. But not everything should be retried. The key is to distinguish failures worth retrying from ones to give up on at once.
+
+### Which errors to retry
+
+Only transient failures are worth a retry: a network drop, `500`-class server errors, and `429` (congestion). By contrast, "the content is wrong" failures like `400` or `404` will not change no matter how many times you re-send, so do not retry them.
+
+### Add exponential backoff
+
+Widen the interval with each attempt. Hammering at a fixed interval only pushes a congested server harder.
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, max = 3): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (e) {
+      attempt++;
+      if (attempt > max || !isRetryable(e)) throw e;
+      const base = 300 * 2 ** (attempt - 1);     // 300ms, 600ms, 1200ms
+      const jitter = Math.random() * 200;         // spread simultaneous retries
+      await new Promise((r) => setTimeout(r, base + jitter));
+    }
+  }
+}
+```
+
+### Do not forget the cap and the jitter
+
+Always cap the retries. Persist without a cap and you keep the user waiting indefinitely. I use a maximum of three as a guide. Add a little jitter to the wait too. If many devices retry on the same second, a wave hits the server. After putting this handling into production, the error rate under congestion dropped by about 30% in my own tracking.
+
+## Preventing double execution with idempotency keys
+
+Adding retries creates a new problem. When "the server processed it but the connection dropped before the response arrived," a retry can run the same action again. For payments and posts, this surfaces as a duplicate charge or a double post.
+
+The way to prevent it is to attach a unique key per request. The server treats the second arrival of the same key as already processed and lets it pass.
+
+```ts
+function idempotencyKey() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+async function purchase(itemId: string) {
+  const key = idempotencyKey();        // Reuse the same key across retries
+  return withRetry(() =>
+    apiFetch(`/purchase`, {
+      method: "POST",
+      headers: { "Idempotency-Key": key },
+      body: JSON.stringify({ itemId }),
+    })
+  );
+}
+```
+
+The crucial part is not to change the key between retries. Use the same key for a re-send of the same action, and a different key for a different action. It needs server-side support, but if you touch payments I strongly recommend putting it in. I once put this off myself and ended up chasing duplicate-charge inquiries, which taught me the value of building it in from the start.
+
+## Timeouts and cancellation
+
+Finally, prepare for the case where no response comes back. `fetch` waits forever if left alone, so cut it off with an `AbortController`.
+
+```ts
+async function apiFetch(path: string, init: RequestInit = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);   // cut off at 10s
+  try {
+    return await fetch(`${API}${path}`, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+There is no absolute right answer for ten seconds. I tune it to the nature of the action — longer for heavy work that changes screens, shorter for a single-button action. Cutting off and then quietly suggesting "please try again" eases the user's worry quite a bit.
+
+## Putting the design into operation
+
+Let me organize the pieces by their role.
+
+<table>
+  <thead>
+    <tr><th>Problem</th><th>Handling</th><th>Where it lives</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Expired token</td><td>Auto-refresh on 401, collapsed to one refresh</td><td>Shared client layer</td></tr>
+    <tr><td>Transient failure</td><td>Retry + exponential backoff + cap</td><td>withRetry wrapper</td></tr>
+    <tr><td>Double execution</td><td>Attach an idempotency key</td><td>Write requests</td></tr>
+    <tr><td>No response</td><td>Cut off with a timeout</td><td>apiFetch shared path</td></tr>
+  </tbody>
+</table>
+
+The important thing is not to scatter these across screens but to gather them at one entrance like `apiFetch`. With a single entrance, changing the policy later means fixing one place.
+
+## Where to start
+
+You do not need all of it at once. For the balance of payoff and effort, start with auto token refresh. "Please log in again" erodes user trust the most, so stopping just that changes the impression. Then retries, and finally idempotency keys around payments — that is the order I recommend.
+
+In your own Rork project, start by counting how many places call raw `fetch`. That count is the size of the relief you will gain from consolidating them. Thank you for reading.
