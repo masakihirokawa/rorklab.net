@@ -1,0 +1,281 @@
+---
+title: "Rork の一覧が増えるほどスクロールで重複と欠落が出る——カーソルページネーションと再取得の状態設計"
+slug: "rork-cursor-pagination-resilient-refetch-state-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-20T14:41"
+updated: "2026-06-20T14:41"
+author: "Rork Lab"
+description: "Rork が生成する素朴な offset ページネーションは、リストが更新されるたびに重複や欠落を起こします。カーソル方式の契約設計、取得状態を一つに束ねる usePaginatedList フック、失敗時の指数バックオフ再試行まで、本番運用で詰まらない一覧の作り方を実装中心に解説します。"
+tags: ["Rork", "React Native", "Expo", "ページネーション", "無限スクロール", "FlatList", "状態設計"]
+highlights:
+  - "offset 方式が破綻する理由を理解し、リスト更新中でも重複と欠落が起きないカーソルページネーションの契約を設計できる"
+  - "取得・追加取得・再読込・エラー・終端を一つの状態機械として束ねる usePaginatedList フックを実装できる"
+  - "ページ取得失敗時の指数バックオフ再試行と重複排除によるキー安定化まで、本番で必要な実装を一通り習得できる"
+---
+## 50件で快適だった一覧が、3,000件で崩れ始めた
+
+個人開発で運用している一覧画面が、データが増えるにつれて少しずつおかしくなっていきました。最初の数十件のうちは何の問題もありません。ところが投稿が数千件を超えたあたりから、スクロールの途中で同じカードが二度現れたり、逆に数件が抜け落ちたり、末尾で永遠にスピナーが回り続けたりするようになりました。
+
+原因を追っていくと、Rork が最初に組み上げてくれた素朴なページネーションに行き着きました。「ページ番号で何件目から何件取る」という、いわゆる offset 方式です。プロトタイプの段階では完璧に動きます。けれども一覧が動き続ける——新しい投稿が増え、古い投稿が消える——本番では、この方式は静かに破綻します。
+
+ここでは、その破綻がなぜ起きるのかを腑に落としたうえで、カーソル方式への置き換えと、取得まわりの状態をひとつに束ねる設計を、実際のコードで組み立てていきます。私自身、個人開発の複数のアプリで同じ壁に順番にぶつかってきました。AI に下地を作ってもらった一覧を、長く運用に耐える形へ詰め直すための実装メモです。
+
+---
+
+## offset 方式はなぜ「動いているのに壊れる」のか
+
+offset 方式は「何件目から（offset）何件（limit）」という指定でデータを切り出します。1ページ目は `offset=0, limit=20`、2ページ目は `offset=20, limit=20`、という具合です。
+
+問題は、この offset が「順位」を指している点にあります。ユーザーが1ページ目を読んでいる数秒のあいだに、リストの先頭へ新しい1件が挿入されたとします。すると全体が1つ後ろへずれ、本来2ページ目の先頭に来るはずだった item は、すでに1ページ目の末尾で表示済みの item と同じものになります。これが重複の正体です。逆に先頭の item が削除されれば、全体が1つ前へ詰まり、1件が読み飛ばされます。
+
+<table>
+<thead>
+<tr><th>観点</th><th>offset 方式</th><th>カーソル方式</th></tr>
+</thead>
+<tbody>
+<tr><td>位置の指定</td><td>順位（何件目）</td><td>境界の値（このidより後）</td></tr>
+<tr><td>取得中にリストが変化</td><td>重複・欠落が発生する</td><td>境界が固定されるため安定</td></tr>
+<tr><td>深いページの性能</td><td>offset が大きいほど遅くなりやすい</td><td>索引で一定に保ちやすい</td></tr>
+<tr><td>「前のページ」への移動</td><td>容易</td><td>双方向カーソルが必要</td></tr>
+<tr><td>無限スクロール適性</td><td>低い</td><td>高い</td></tr>
+</tbody>
+</table>
+
+無限スクロールのように「先へ先へと読み進める」用途では、順位ではなく「どこまで読んだか」という境界そのものを持ち回るほうが理にかなっています。これがカーソル方式です。
+
+---
+
+## API 契約をカーソル方式に置き換える
+
+まず、サーバーが返す形を決めます。クライアントは「この境界より後ろを n 件」と頼み、サーバーは「データ本体」と「次に使う境界」を返します。次の境界が `null` であれば、それが終端の合図です。
+
+```ts
+// サーバーが返すレスポンスの契約
+type Page<T> = {
+  items: T[];
+  nextCursor: string | null; // null なら終端
+};
+
+// 例: Supabase / 自前 API のどちらでも同じ形に揃える
+// GET /posts?cursor=<id>&limit=20  ->  { items, nextCursor }
+```
+
+境界の値には、安定して単調に並ぶ列を選びます。多くの場合は「作成日時 + id」の複合キーが堅実です。日時だけだと同一時刻の衝突で取りこぼしが起きるため、id をタイブレーカーに添えるのが要点です。サーバー側はそのキーで `WHERE (created_at, id) < (:cursor)` のように境界を絞り込み、同じ並び順で `LIMIT n + 1` 件取り、n + 1 件目が存在すればその直前の item を次のカーソルにします。
+
+---
+
+## 取得の状態を一つの状態機械として束ねる
+
+一覧の不具合の多くは、状態がばらばらに散らばっていることから生まれます。`loading`、`isRefreshing`、`hasMore`、`error` といった真偽値を別々に持つと、組み合わせの数だけ「ありえない状態」が生まれ、二重取得や無限スピナーの温床になります。
+
+そこで、取りうる状態を列挙した一つの値にまとめます。
+
+```ts
+type Status =
+  | "idle"        // 初期状態
+  | "loading"     // 初回ロード中
+  | "ready"       // 表示中（追加取得が可能）
+  | "loadingMore" // 末尾で追加取得中
+  | "refreshing"  // 引っ張って再読込中
+  | "error"       // 直近の取得に失敗
+  | "end";        // 終端に到達
+```
+
+この `Status` を軸に、取得ロジックをフックへ閉じ込めます。重複排除とキーの安定化も、ここで一括して引き受けます。
+
+```ts
+import { useCallback, useReducer, useRef } from "react";
+
+type Item = { id: string };
+
+type State<T extends Item> = {
+  status: Status;
+  items: T[];
+  cursor: string | null;
+};
+
+type Action<T extends Item> =
+  | { type: "start"; mode: "initial" | "more" | "refresh" }
+  | { type: "success"; page: Page<T>; mode: "initial" | "more" | "refresh" }
+  | { type: "failure" };
+
+function dedupe<T extends Item>(prev: T[], next: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const it of prev) map.set(it.id, it);
+  for (const it of next) map.set(it.id, it); // 同一 id は後勝ちで上書き
+  return Array.from(map.values());
+}
+
+function reducer<T extends Item>(state: State<T>, action: Action<T>): State<T> {
+  switch (action.type) {
+    case "start":
+      return {
+        ...state,
+        status:
+          action.mode === "initial"
+            ? "loading"
+            : action.mode === "refresh"
+            ? "refreshing"
+            : "loadingMore",
+      };
+    case "success": {
+      const merged =
+        action.mode === "refresh"
+          ? action.page.items
+          : dedupe(state.items, action.page.items);
+      return {
+        items: merged,
+        cursor: action.page.nextCursor,
+        status: action.page.nextCursor === null ? "end" : "ready",
+      };
+    }
+    case "failure":
+      return { ...state, status: "error" };
+  }
+}
+```
+
+ポイントは三つあります。追加取得（`more`）では既存配列に `dedupe` を通してから連結するため、境界がわずかにずれても同じ id が二重に並びません。再読込（`refresh`）では配列をまるごと置き換え、古いカーソルを捨てます。そして `nextCursor` が `null` になった瞬間に `end` へ落とすので、終端後に追加取得が走り続けることがありません。
+
+---
+
+## フック本体と、二重取得を防ぐガード
+
+状態機械の上に、実際の取得関数を載せます。ここで最も効くのが「いま取得中なら新しい取得を始めない」というガードです。FlatList の `onEndReached` は条件次第で連続発火するため、これがないと同じページを何度も叩いてしまいます。
+
+```ts
+export function usePaginatedList<T extends Item>(
+  fetchPage: (cursor: string | null) => Promise<Page<T>>
+) {
+  const [state, dispatch] = useReducer(reducer<T>, {
+    status: "idle",
+    items: [],
+    cursor: null,
+  });
+
+  // 取得中フラグは描画に依存させず ref で持つ（連続発火を確実に弾く）
+  const inFlight = useRef(false);
+
+  const run = useCallback(
+    async (mode: "initial" | "more" | "refresh") => {
+      if (inFlight.current) return;
+      // 終端に達していて追加取得なら何もしない
+      if (mode === "more" && state.status === "end") return;
+
+      inFlight.current = true;
+      dispatch({ type: "start", mode });
+      const cursor = mode === "refresh" ? null : state.cursor;
+      try {
+        const page = await fetchPage(cursor);
+        dispatch({ type: "success", page, mode });
+      } catch {
+        dispatch({ type: "failure" });
+      } finally {
+        inFlight.current = false;
+      }
+    },
+    [fetchPage, state.cursor, state.status]
+  );
+
+  return {
+    ...state,
+    loadInitial: () => run("initial"),
+    loadMore: () => run("more"),
+    refresh: () => run("refresh"),
+  };
+}
+```
+
+`inFlight` を state ではなく `useRef` で持っているのは、描画の更新を待たずに同期的に弾きたいからです。state にすると更新が反映される前に次の `onEndReached` が届き、ガードをすり抜けてしまう瞬間が生まれます。`onEndReached` が複数回発火する挙動そのものの詳しい対処は、別記事の[FlatList の onEndReached が連続発火する問題の対処](/articles/rork-dev/rork-flatlist-onendreached-multiple-fire-fix)も併せてご覧ください。
+
+---
+
+## ページ取得の失敗を、止まらない再試行で受け止める
+
+スクロール中の追加取得は、電波の弱い場所でこそ失敗します。そこで一律にエラー画面へ飛ばしてしまうと、すでに読めている上半分まで巻き添えで消えてしまい、ユーザーの体感を大きく損ないます。望ましいのは「読めている分はそのまま、末尾だけ静かに再試行する」挙動です。
+
+指数バックオフを挟んだ再試行関数を用意し、それでも駄目なら末尾に小さな「再試行」フッターを出します。
+
+```ts
+async function withBackoff<T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  base = 500
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+      if (attempt === retries) break;
+      const wait = base * 2 ** attempt + Math.random() * 200; // ジッタを加える
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastError;
+}
+```
+
+`fetchPage` の中でこの `withBackoff` を噛ませておけば、瞬間的な通信断は利用者に気づかれないまま吸収されます。`base * 2 ** attempt` で待ち時間を倍々にしつつ、末尾に小さな乱数（ジッタ）を足しているのは、復帰時に全端末の再試行が同じ瞬間へ集中してサーバーを叩く事態を避けるためです。再試行を出し切ってもなお失敗したときだけ `status` を `error` にし、フッターのボタンから `loadMore` を呼び直せるようにします。
+
+---
+
+## FlatList への配線と、状態ごとのフッター
+
+最後に、フックを FlatList へつなぎます。フッターコンポーネントを `status` で出し分けることで、ローディング・エラー・終端を一箇所に集約できます。
+
+```tsx
+function Footer({ status, onRetry }: { status: Status; onRetry: () => void }) {
+  if (status === "loadingMore") return <ActivityIndicator style={{ padding: 16 }} />;
+  if (status === "error")
+    return (
+      <Pressable onPress={onRetry} style={{ padding: 16, alignItems: "center" }}>
+        <Text>読み込みに失敗しました。タップして再試行</Text>
+      </Pressable>
+    );
+  if (status === "end")
+    return <Text style={{ padding: 16, textAlign: "center", opacity: 0.5 }}>すべて表示しました</Text>;
+  return null;
+}
+
+// 一覧側
+<FlatList
+  data={items}
+  keyExtractor={(it) => it.id}
+  renderItem={renderItem}
+  onEndReached={loadMore}
+  onEndReachedThreshold={0.5}     // 末尾まで残り半画面で先読み
+  refreshing={status === "refreshing"}
+  onRefresh={refresh}
+  ListFooterComponent={<Footer status={status} onRetry={loadMore} />}
+  // 描画コストを抑える定番の設定
+  initialNumToRender={10}
+  windowSize={7}
+  removeClippedSubviews
+/>
+```
+
+`keyExtractor` が `it.id` を返し、フック側で id による重複排除を済ませているため、React が「同じ key が複数ある」と警告する状況が起きません。ここが安定していると、スクロール位置の飛びやちらつきが目に見えて減ります。
+
+---
+
+## 移行の順序——どこから手をつけるか
+
+一度にすべてを差し替える必要はありません。私自身が実際に進めた順序は、次の通りです。
+
+1. サーバー応答を `{ items, nextCursor }` の形へ揃える。境界キーは「作成日時 + id」を採用します。
+2. クライアントに `usePaginatedList` を載せ、`onEndReached` を `loadMore` につなぎ直す。
+3. `withBackoff` を `fetchPage` に噛ませ、末尾のエラーフッターを追加する。
+
+この順で進めることを推奨します。理由は単純で、1 の契約さえ固まれば重複と欠落の大半は消え、2 と 3 は体感品質を底上げする追加投資として、あとからでも安全に載せ替えられるからです。私は迷ったら、まず契約を直してから状態設計に取りかかるようにしています。
+
+---
+
+## 次の一手
+
+まずは、いま動いている一覧のサーバー応答に `nextCursor` を一つ足すところから始めてみてください。クライアントを丸ごと書き換える前に、API の戻り値を `{ items, nextCursor }` の形へ揃えるだけで、重複と欠落の根は断てます。状態機械とフックは、その契約が固まってから載せ替えれば十分です。
+
+一覧は、アプリの中で最も長く触れられ続ける画面のひとつです。だからこそ、件数が増えても静かに正しく動き続ける設計は、地味でも確かな手応えを返してくれます。同じところで詰まっている方の参考になれば幸いです。

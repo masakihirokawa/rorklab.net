@@ -1,0 +1,280 @@
+---
+title: "Why Your Rork List Starts Duplicating and Dropping Rows as It Grows — Cursor Pagination and Resilient Refetch State"
+slug: "rork-cursor-pagination-resilient-refetch-state-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-20T14:42"
+updated: "2026-06-20T14:42"
+author: "Rork Lab"
+description: "The naive offset pagination Rork scaffolds for you quietly breaks the moment your list changes underneath the user. Here is how to move to a cursor contract, fold every fetch state into one usePaginatedList hook, and recover failed page loads with exponential backoff — implementation first."
+tags: ["Rork", "React Native", "Expo", "pagination", "infinite scroll", "FlatList", "state design"]
+highlights:
+  - "Understand why offset pagination breaks and design a cursor contract that never duplicates or skips rows while the list mutates"
+  - "Fold initial load, load-more, refresh, error, and end-of-list into a single state machine inside a usePaginatedList hook"
+  - "Add exponential-backoff retries for failed page fetches and id-based de-duplication for stable keys — everything a production list needs"
+---
+## A list that felt fine at 50 rows fell apart at 3,000
+
+As an indie developer, a list screen I run in one of my own apps slowly started misbehaving as the data grew. For the first few dozen rows everything was flawless. But once the records crossed a few thousand, the same card would appear twice mid-scroll, a handful of rows would vanish entirely, and the spinner at the bottom would sometimes turn forever.
+
+When I traced it, I landed on the simple pagination Rork had scaffolded for me at the start: offset pagination — "give me n rows starting at position k." It works perfectly in a prototype. But on a list that keeps moving — new posts arriving, old ones removed — that approach fails silently in production.
+
+This article unpacks why that failure happens, then rebuilds the list around a cursor contract and a single state machine for all the fetch states, in real code. Think of it as a set of notes for taking a list the AI got you started on and reworking it into something that holds up over the long run.
+
+---
+
+## Why offset pagination "breaks while it's still working"
+
+Offset pagination slices data by "starting at row k (offset), take n rows (limit)." Page one is `offset=0, limit=20`; page two is `offset=20, limit=20`.
+
+The trouble is that the offset points at a *rank*. In the few seconds a user spends reading page one, suppose a new row is inserted at the top. Everything shifts back by one, and the row that should have led page two is now the same item already shown at the end of page one. That is your duplicate. Delete a row at the top instead and everything shifts forward by one, so a row gets skipped.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>Offset</th><th>Cursor</th></tr>
+</thead>
+<tbody>
+<tr><td>What it points at</td><td>A rank (row number)</td><td>A boundary value (after this id)</td></tr>
+<tr><td>List mutates mid-fetch</td><td>Duplicates and gaps appear</td><td>Boundary is fixed, so it stays stable</td></tr>
+<tr><td>Deep-page performance</td><td>Slows down as offset grows</td><td>Stays roughly constant with an index</td></tr>
+<tr><td>Jumping to a previous page</td><td>Easy</td><td>Needs a bidirectional cursor</td></tr>
+<tr><td>Fit for infinite scroll</td><td>Low</td><td>High</td></tr>
+</tbody>
+</table>
+
+For "keep reading forward" use cases like infinite scroll, carrying the boundary itself — "how far have I read?" — makes far more sense than carrying a rank. That is cursor pagination.
+
+---
+
+## Move the API contract to a cursor
+
+Start by fixing the shape the server returns. The client asks for "n rows after this boundary," and the server returns the data plus the next boundary to use. When the next boundary is `null`, that is the signal for end-of-list.
+
+```ts
+// The contract the server returns
+type Page<T> = {
+  items: T[];
+  nextCursor: string | null; // null means end-of-list
+};
+
+// Keep the same shape whether it's Supabase or your own API:
+// GET /posts?cursor=<id>&limit=20  ->  { items, nextCursor }
+```
+
+Choose a column for the boundary that sorts in a stable, monotonic way. A composite of "created_at + id" is usually the safe pick. Timestamps alone can collide at the same instant and cause skips, so add the id as a tiebreaker. On the server, filter with something like `WHERE (created_at, id) < (:cursor)`, take `LIMIT n + 1` in the same order, and if an (n+1)th row exists, use the row just before it as the next cursor.
+
+---
+
+## Fold the fetch states into one state machine
+
+Most list bugs come from state being scattered. Holding separate booleans like `loading`, `isRefreshing`, `hasMore`, and `error` invents an "impossible state" for every combination — fertile ground for double fetches and endless spinners.
+
+So collapse the reachable states into a single value.
+
+```ts
+type Status =
+  | "idle"        // before first load
+  | "loading"     // initial load
+  | "ready"       // showing rows; load-more allowed
+  | "loadingMore" // fetching the next page at the tail
+  | "refreshing"  // pull-to-refresh in flight
+  | "error"       // last fetch failed
+  | "end";        // reached the end
+```
+
+With `Status` as the spine, push the fetch logic into a hook and let it own de-duplication and key stability too.
+
+```ts
+import { useCallback, useReducer, useRef } from "react";
+
+type Item = { id: string };
+
+type State<T extends Item> = {
+  status: Status;
+  items: T[];
+  cursor: string | null;
+};
+
+type Action<T extends Item> =
+  | { type: "start"; mode: "initial" | "more" | "refresh" }
+  | { type: "success"; page: Page<T>; mode: "initial" | "more" | "refresh" }
+  | { type: "failure" };
+
+function dedupe<T extends Item>(prev: T[], next: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const it of prev) map.set(it.id, it);
+  for (const it of next) map.set(it.id, it); // same id: last write wins
+  return Array.from(map.values());
+}
+
+function reducer<T extends Item>(state: State<T>, action: Action<T>): State<T> {
+  switch (action.type) {
+    case "start":
+      return {
+        ...state,
+        status:
+          action.mode === "initial"
+            ? "loading"
+            : action.mode === "refresh"
+            ? "refreshing"
+            : "loadingMore",
+      };
+    case "success": {
+      const merged =
+        action.mode === "refresh"
+          ? action.page.items
+          : dedupe(state.items, action.page.items);
+      return {
+        items: merged,
+        cursor: action.page.nextCursor,
+        status: action.page.nextCursor === null ? "end" : "ready",
+      };
+    }
+    case "failure":
+      return { ...state, status: "error" };
+  }
+}
+```
+
+Three things matter here. On load-more, we run the existing array through `dedupe` before concatenating, so a slightly shifted boundary never lines up the same id twice. On refresh, we replace the array wholesale and throw away the old cursor. And the instant `nextCursor` becomes `null`, we drop into `end`, so load-more can't keep firing past the tail.
+
+---
+
+## The hook itself, and a guard against double fetches
+
+On top of the state machine sits the actual fetch function. The single most effective piece is a guard: "if a fetch is already running, don't start another." FlatList's `onEndReached` can fire repeatedly under the right conditions, and without this guard you'll hammer the same page over and over.
+
+```ts
+export function usePaginatedList<T extends Item>(
+  fetchPage: (cursor: string | null) => Promise<Page<T>>
+) {
+  const [state, dispatch] = useReducer(reducer<T>, {
+    status: "idle",
+    items: [],
+    cursor: null,
+  });
+
+  // Keep the in-flight flag in a ref, not in render state, so it blocks synchronously
+  const inFlight = useRef(false);
+
+  const run = useCallback(
+    async (mode: "initial" | "more" | "refresh") => {
+      if (inFlight.current) return;
+      if (mode === "more" && state.status === "end") return;
+
+      inFlight.current = true;
+      dispatch({ type: "start", mode });
+      const cursor = mode === "refresh" ? null : state.cursor;
+      try {
+        const page = await fetchPage(cursor);
+        dispatch({ type: "success", page, mode });
+      } catch {
+        dispatch({ type: "failure" });
+      } finally {
+        inFlight.current = false;
+      }
+    },
+    [fetchPage, state.cursor, state.status]
+  );
+
+  return {
+    ...state,
+    loadInitial: () => run("initial"),
+    loadMore: () => run("more"),
+    refresh: () => run("refresh"),
+  };
+}
+```
+
+`inFlight` lives in a `useRef` rather than state because we want to reject duplicate calls synchronously, without waiting for a re-render. Put it in state and there's a window where the next `onEndReached` arrives before the update lands and slips past the guard. For the deeper fix to the repeated-firing behavior itself, see [Fixing FlatList onEndReached firing multiple times](/articles/rork-dev/rork-flatlist-onendreached-multiple-fire-fix).
+
+---
+
+## Catch failed page fetches with retries that don't give up
+
+Load-more during a scroll fails exactly where the signal is weak. Throwing the whole screen into an error state there is the wrong move — the top half the user has already read gets dragged down with it. What you want is "keep what's loaded, quietly retry only the tail."
+
+Wrap fetches in an exponential-backoff retry, and only when that is exhausted do you show a small "retry" footer.
+
+```ts
+async function withBackoff<T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  base = 500
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+      if (attempt === retries) break;
+      const wait = base * 2 ** attempt + Math.random() * 200; // add jitter
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastError;
+}
+```
+
+Run `fetchPage` through `withBackoff` and a momentary drop is absorbed before the user ever notices. The wait doubles with `base * 2 ** attempt`, and the small random jitter on the end keeps every device from retrying at the same instant and stampeding the server on recovery. Only when retries are fully spent do we set `status` to `error` and let the footer button call `loadMore` again.
+
+---
+
+## Wiring it into FlatList, with a footer per state
+
+Finally, connect the hook to FlatList. Switching one footer component on `status` lets you keep loading, error, and end-of-list in a single place.
+
+```tsx
+function Footer({ status, onRetry }: { status: Status; onRetry: () => void }) {
+  if (status === "loadingMore") return <ActivityIndicator style={{ padding: 16 }} />;
+  if (status === "error")
+    return (
+      <Pressable onPress={onRetry} style={{ padding: 16, alignItems: "center" }}>
+        <Text>Couldn't load. Tap to retry</Text>
+      </Pressable>
+    );
+  if (status === "end")
+    return <Text style={{ padding: 16, textAlign: "center", opacity: 0.5 }}>You're all caught up</Text>;
+  return null;
+}
+
+// In the list
+<FlatList
+  data={items}
+  keyExtractor={(it) => it.id}
+  renderItem={renderItem}
+  onEndReached={loadMore}
+  onEndReachedThreshold={0.5}     // prefetch when half a screen from the end
+  refreshing={status === "refreshing"}
+  onRefresh={refresh}
+  ListFooterComponent={<Footer status={status} onRetry={loadMore} />}
+  // sensible defaults to keep render cost down
+  initialNumToRender={10}
+  windowSize={7}
+  removeClippedSubviews
+/>
+```
+
+Because `keyExtractor` returns `it.id` and the hook has already de-duplicated by id, React never hits the "two children with the same key" warning. Once that is stable, the scroll jumps and flicker drop off noticeably.
+
+---
+
+## What to migrate first
+
+You don't have to swap everything at once. The order I actually worked through was this:
+
+1. Reshape the server response into `{ items, nextCursor }`, using "created_at + id" as the boundary key.
+2. Drop `usePaginatedList` into the client and rewire `onEndReached` to `loadMore`.
+3. Wrap `fetchPage` in `withBackoff` and add the error footer at the tail.
+
+I'd recommend this order. The reason is simple: once the contract in step 1 is settled, most duplicates and gaps disappear, and steps 2 and 3 are additive investments in perceived quality that you can layer in safely later. When in doubt, I fix the contract before I touch the state design.
+
+---
+
+## Your next step
+
+Start by adding a single `nextCursor` to the server response of the list you already have. Before rewriting the whole client, just reshaping the API return into `{ items, nextCursor }` is enough to cut off duplicates and gaps at the root. The state machine and the hook can go in once that contract is settled.
+
+A list is one of the screens users touch the longest in an app. That's exactly why a design that keeps working quietly and correctly as the data grows pays back a steady, real sense of reliability — unglamorous as it is. I hope this helps anyone stuck at the same spot.
