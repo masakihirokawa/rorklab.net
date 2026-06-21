@@ -1,0 +1,177 @@
+---
+title: "Hardcoding Your OpenAI Key in a Rork (Expo) App Means It Gets Stolen — Slip a Thin Worker Proxy In Between"
+slug: "rork-expo-api-key-proxy-worker-rate-limit-rotation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T05:30"
+author: "Rork Lab"
+description: "Embed an OpenAI or Gemini API key directly in the Expo app Rork generates and it can be extracted from the shipped binary. Here is why a key inside an app is never secret, plus a minimal Cloudflare Workers proxy that hides it (streaming passthrough included), simple abuse controls, and key rotation that needs no app review."
+tags: ["Rork", "Expo", "Cloudflare Workers", "API keys", "security"]
+highlights:
+  - "A decision table that sorts keys you can ship in the client from keys you must never ship, based on design intent"
+  - "A minimal Cloudflare Workers proxy that hides an OpenAI / Gemini key (with streaming passthrough) plus the Expo client code that calls it"
+  - "Lightweight abuse controls so the proxy isn't open to everyone, and a rotation procedure that swaps the key without waiting on app review"
+---
+
+The first thing you want to do when adding AI to a Rork-generated app is set `EXPO_PUBLIC_OPENAI_KEY` and call OpenAI straight from the app. It works. The demo is done in seconds. But that key can be pulled out by anyone who downloads your app from the App Store, in minutes.
+
+You might assume the source is hidden because it's "compiled into the build." I assumed the same at first. In reality, a shipped app is not an encrypted treasure chest—it's a bundle of files with strings sitting in plain view. When the key leaks, the bill lands on you. Below I'll make it concrete why hardcoding is dangerous, then build—in real code—a minimal setup that slips one thin Cloudflare Workers relay in between to isolate the key on the server.
+
+## Why a key embedded in the app is never secret
+
+The logic is simple. An app binary (an iOS `.ipa`, an Android `.apk`/`.aab`) is copied whole onto the user's device. The owner of that device can unpack it freely. Expo / React Native JavaScript bundles are especially readable: run them through `strings` or an unpacking tool and the embedded literals line up for you.
+
+Environment variables with the `EXPO_PUBLIC_` prefix are statically baked into the JavaScript bundle at build time. As the "public" in the name says, they're meant to be readable from the client. So does dropping the prefix hide it? No. Placing it in a native config file or code only raises the extraction effort slightly; the essence is unchanged.
+
+Worse, HTTPS doesn't save you here. An attacker fully controls their own device, so they can put a man-in-the-middle proxy (such as mitmproxy) between the app and OpenAI and read their own traffic in the clear. If the request carries `Authorization: Bearer sk-...`, it's over.
+
+In short, **the moment it's on the client, it stops being secret**. The only reliable defense for a key worth protecting is to never deliver it to the device at all.
+
+## Keys you can ship in the client vs. keys you can't
+
+You don't need to hide every key. First, tell apart "keys designed to be used on the client" from "server-only keys." The single deciding question: if this key leaks, can a third party spend money or write data?
+
+<table>
+<thead>
+<tr><th>Key / value</th><th>Client?</th><th>Reason</th></tr>
+</thead>
+<tbody>
+<tr><td>Firebase apiKey (config)</td><td><strong>OK to ship</strong></td><td>An identifier, not a secret. Access control lives in Security Rules</td></tr>
+<tr><td>RevenueCat public SDK key</td><td><strong>OK to ship</strong></td><td>A public key issued for the client. Purchases are verified by server signatures</td></tr>
+<tr><td>Stripe publishable key (pk_)</td><td><strong>OK to ship</strong></td><td>Public by design. Charges are finalized by the server holding the secret key</td></tr>
+<tr><td>OpenAI / Gemini / Anthropic API key</td><td><strong>Never ship</strong></td><td>Leak it and a third party bills against your balance. Usage costs run uncapped</td></tr>
+<tr><td>Stripe secret key (sk_)</td><td><strong>Never ship</strong></td><td>Can even issue refunds and transfers. Top-tier secret</td></tr>
+<tr><td>Cloud admin tokens</td><td><strong>Never ship</strong></td><td>Can operate your whole infrastructure</td></tr>
+</tbody>
+</table>
+
+When in doubt, ask: "if this leaks, can someone spend money or alter data?" If yes, that key cannot live on the device. This article targets that bottom-right "never ship" group—especially metered AI API keys.
+
+## Slip one thin relay in between — Cloudflare Workers
+
+The core defense is almost anticlimactically simple. The app stops calling OpenAI directly and instead calls a **relay endpoint you control**. The relay holds the key as a server-side secret and only attaches the `Authorization` header when forwarding upstream (to OpenAI). The key never reaches the device.
+
+I run several of my own indie apps off the same Cloudflare Workers backend. I choose Workers because it runs at the edge with low latency, secret management is self-contained via `wrangler secret`, and the free tier comfortably covers an indie app's traffic.
+
+Here is the minimal relay that passes requests straight upstream. It forwards the request body the app sent to OpenAI and adds only the key on the server side.
+
+```ts
+// src/index.ts — minimal Cloudflare Workers relay
+export interface Env {
+  OPENAI_KEY: string; // registered via `wrangler secret put OPENAI_KEY` (never bundled)
+}
+
+const UPSTREAM = "https://api.openai.com/v1/chat/completions";
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    if (req.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    // The body from the app (model, messages) is forwarded as-is
+    const body = await req.text();
+
+    const upstream = await fetch(UPSTREAM, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // The key is attached only here. The client never knows it
+        Authorization: `Bearer ${env.OPENAI_KEY}`,
+      },
+      body,
+    });
+
+    // Return the upstream response as-is (streaming, below, flows the same way)
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: { "Content-Type": upstream.headers.get("Content-Type") ?? "application/json" },
+    });
+  },
+};
+```
+
+Configure your account and route in `wrangler.toml`, and register the key as a secret rather than in a file.
+
+```bash
+# Never write the key in code or a file — it goes into Cloudflare's encrypted store
+npx wrangler secret put OPENAI_KEY
+# Deploy
+npx wrangler deploy
+```
+
+That alone removes the key from the app bundle entirely. All the app knows now is its own relay URL.
+
+## Pass streaming through untouched
+
+For chat-style AI, streaming tokens back gradually is the heart of the experience. You may worry a relay breaks it, but the `new Response(upstream.body, ...)` above is already correct. `upstream.body` is a `ReadableStream`, so Workers passes it downstream without buffering. As long as the client requested `stream: true`, incremental rendering keeps working through the relay.
+
+One caveat: if you read the response to completion for logging (e.g. `await upstream.text()`), you consume the stream and can no longer pass it through. The rule is that the relay does not touch the body. If you must observe it, split it into two with `upstream.body.tee()` and return only one branch downstream.
+
+## Don't leave the relay open to everyone — lightweight abuse controls
+
+The key is hidden. But if the relay URL is callable by anyone, it becomes a stepping stone for "using OpenAI for free through your relay." You'd merely have traded key exposure for relay abuse.
+
+The minimal defense is to issue a short-lived token from your own auth backend (Firebase Auth, Supabase Auth, etc.) at app startup and verify it in the relay. The token expires in tens of minutes, so a stolen one does limited damage. Layer a naive KV-based rate limit on top and you also blunt abuse that slips past auth.
+
+```ts
+// just the core of rate limiting (using KV)
+async function allow(env: Env, id: string): Promise<boolean> {
+  const key = `rl:${id}:${Math.floor(Date.now() / 60000)}`; // 1-minute window
+  const current = parseInt((await env.RL.get(key)) ?? "0", 10);
+  if (current >= 30) return false; // up to 30 requests per minute
+  await env.RL.put(key, String(current + 1), { expirationTtl: 120 });
+  return true;
+}
+```
+
+For something stronger, you can verify on the server that a request came from a genuine app install via device attestation. The design for validating Apple's App Attest and Google's Play Integrity on the server is covered in detail in [validating App Attest and Play Integrity on the server for Rork apps](/articles/rork-dev/rork-app-attest-play-integrity-server-validation-guide). In the early stages of an indie project, a short-lived token plus a rate limit is already a realistic defense. Attestation can be added after abuse is actually observed.
+
+## Swapping the key — operations that don't wait on review
+
+Beyond security, the relay design buys one more practical win: **you can change the key without resubmitting the app**.
+
+With the key hardcoded into the app, every leak or expiry means building a version with the new key embedded, sending it to store review, and waiting for users to update. Running several apps, the part I find untenable is exactly that wait. Being stuck for days during a leak response is operationally broken.
+
+With the relay, the key lives only as a Cloudflare secret. Swapping it is a single command and never touches the app.
+
+```bash
+# On leak / rotation, this is all. No app rebuild, no review
+npx wrangler secret put OPENAI_KEY   # enter the new key
+```
+
+Within seconds every user switches to traffic on the new key. Even moving the upstream provider from OpenAI to Gemini becomes a change to the relay's URL and request shaping—reflected without an app update. One relay in the middle changes operational freedom this much.
+
+## The Rork (Expo) client code
+
+Finally, the app side. All you do is swap "the OpenAI URL" for "your relay URL"—the body shape is unchanged. The relay URL isn't a secret, so holding it in `EXPO_PUBLIC_` is fine (there's no longer anything on the device worth hiding).
+
+```ts
+// app/lib/ai.ts — call through the relay
+const PROXY = process.env.EXPO_PUBLIC_AI_PROXY_URL!; // e.g. https://ai.example.workers.dev
+
+export async function ask(authToken: string, prompt: string): Promise<string> {
+  const res = await fetch(PROXY, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${authToken}`, // short-lived token from your auth backend
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+
+  if (res.status === 429) throw new Error("We're busy right now. Please wait a moment and retry.");
+  if (!res.ok) throw new Error(`AI response error: ${res.status}`);
+
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? "";
+}
+```
+
+The very concept of an OpenAI key is gone from the app code. If someone analyzes this app, all they find is a relay URL and a short-lived token that expires.
+
+If even one key is hardcoded in your app, the first step you can take today is to move that key to the relay above. You don't need to stand up a new backend. Provision one Worker with `wrangler`, move the key into a secret, and repoint the app's fetch. Those three moves lighten both your billing risk and your operational load at once.

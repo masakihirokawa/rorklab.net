@@ -1,0 +1,183 @@
+---
+title: "Rork（Expo）生成アプリに OpenAI の鍵を直書きすると抜かれます — Workers で薄い中継を1枚挟む設計"
+slug: "rork-expo-api-key-proxy-worker-rate-limit-rotation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T05:30"
+author: "Rork Lab"
+description: "Rork が生成した Expo アプリに OpenAI や Gemini の API キーをそのまま埋め込むと、ビルド済みアプリから抜き取られます。なぜ「アプリに入れた鍵」は秘密にならないのかを整理し、Cloudflare Workers で鍵を隠す最小の中継、濫用対策、審査不要の鍵ローテーションまでを実装で示します。"
+tags: ["Rork", "Expo", "Cloudflare Workers", "APIキー", "セキュリティ"]
+highlights:
+  - "クライアントに置いてよい鍵・絶対に置いてはいけない鍵を、設計思想ベースで振り分けた判断表"
+  - "OpenAI / Gemini の鍵を隠す Cloudflare Workers 中継の最小実装（ストリーミングのそのまま通過つき）と Expo 側の呼び出しコード"
+  - "誰でも叩ける中継にしないための簡易な濫用対策と、アプリ審査を待たずに鍵を差し替えるローテーション手順"
+---
+
+Rork で生成したアプリに AI 機能を足すとき、いちばん最初にやりたくなるのが「`EXPO_PUBLIC_OPENAI_KEY` に鍵を入れてアプリから直接 OpenAI を叩く」構成です。動きます。デモも一瞬で完成します。けれどこの鍵は、あなたのアプリを App Store からダウンロードした誰かが、数分で取り出せます。
+
+「ビルドに埋め込まれているのだから、ソースは見えないはずだ」と感じるかもしれません。私も最初はそう思っていました。実際には、配布されるアプリは暗号化された宝箱ではなく、文字列がそのまま入ったファイルの集合です。鍵が露出すれば、請求はあなたに来ます。ここでは、なぜ直書きが危険なのかを腹落ちさせたうえで、Cloudflare Workers で薄い中継を一枚だけ挟んで鍵をサーバー側に隔離する最小構成を、実際のコードで組み立てていきます。
+
+## なぜ「アプリに埋め込んだ鍵」は秘密にならないのか
+
+理屈はシンプルです。アプリのバイナリ（iOS の `.ipa`、Android の `.apk` / `.aab`）は、ユーザーの端末に丸ごとコピーされます。端末の持ち主は、その中身を自由に展開できます。Expo / React Native の JavaScript バンドルはとくに読みやすく、`strings` コマンドや展開ツールに通すだけで、埋め込まれた文字列が並んで出てきます。
+
+`EXPO_PUBLIC_` プレフィックスを付けた環境変数は、ビルド時に JavaScript バンドルへ静的に焼き込まれます。つまり「公開（public）」という名前のとおり、クライアントから読める前提のものです。ではプレフィックスを外せば隠れるかというと、そうではありません。ネイティブの設定ファイルやコードに置いても、抜き取りの難易度が少し上がるだけで、本質は変わりません。
+
+さらに厄介なのは、HTTPS でも守れない点です。攻撃者は自分の端末を完全に支配しているので、アプリと OpenAI のあいだに中間プロキシ（mitmproxy など）を挟んで、自分宛ての通信を平文で覗けます。リクエストヘッダに `Authorization: Bearer sk-...` が乗っていれば、それで終わりです。
+
+要するに、**クライアントに置いた時点で「秘密」ではなくなります**。守るべき鍵は、端末に一度も届けないことが唯一の確実な防御です。
+
+## クライアントに置いてよい鍵・置いてはいけない鍵
+
+すべての鍵を隠す必要はありません。「クライアントで使われる前提で設計された鍵」と「サーバー専用の鍵」を見分けるのが先です。判断軸は「その鍵が漏れたとき、第三者が課金や書き込みをできるか」の一点に尽きます。
+
+<table>
+<thead>
+<tr><th>鍵・値</th><th>クライアント可否</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>Firebase の apiKey（config）</td><td><strong>置いてよい</strong></td><td>識別子であり秘密ではない。アクセス制御は Security Rules 側で行う設計</td></tr>
+<tr><td>RevenueCat の公開 SDK キー</td><td><strong>置いてよい</strong></td><td>クライアント用に発行された公開鍵。課金確定はサーバー署名で検証される</td></tr>
+<tr><td>Stripe の publishable key（pk_）</td><td><strong>置いてよい</strong></td><td>公開前提。決済確定は secret key を持つサーバーが行う</td></tr>
+<tr><td>OpenAI / Gemini / Anthropic の API キー</td><td><strong>絶対に置かない</strong></td><td>漏れた瞬間に第三者があなたの残高で叩ける。従量課金が青天井で増える</td></tr>
+<tr><td>Stripe の secret key（sk_）</td><td><strong>絶対に置かない</strong></td><td>返金・送金まで可能。最上位の機密</td></tr>
+<tr><td>各種クラウドの管理用トークン</td><td><strong>絶対に置かない</strong></td><td>インフラ全体を操作できる</td></tr>
+</tbody>
+</table>
+
+迷ったら「漏れたら誰かがお金を使えるか／データを書き換えられるか」を自問してください。答えが Yes なら、その鍵は端末に置けません。本記事で扱うのは、この右下の「絶対に置かない」群、とくに従量課金の AI API キーです。
+
+## 最小の中継を1枚挟む — Cloudflare Workers
+
+防御の本体は拍子抜けするほど単純です。アプリは OpenAI を直接叩くのをやめ、**自分が管理する中継エンドポイント**を叩きます。中継は鍵をサーバー側のシークレットとして保持し、上流（OpenAI）へ転送するときにだけ `Authorization` ヘッダを付け直します。鍵は一度も端末に届きません。
+
+私自身、個人開発で複数のアプリを同じ Cloudflare Workers のバックエンドにぶら下げて運用しています。Workers を選ぶ理由は、エッジで動いて遅延が小さいこと、シークレット管理が `wrangler secret` で完結すること、そして無料枠でも個人アプリのトラフィックなら十分まかなえることです。
+
+まず上流へ素通しする最小の中継です。アプリから来たリクエストボディをそのまま OpenAI へ流し、鍵だけをサーバー側で足します。
+
+```ts
+// src/index.ts — Cloudflare Workers の最小中継
+export interface Env {
+  OPENAI_KEY: string; // wrangler secret put OPENAI_KEY で登録（バンドルに含めない）
+}
+
+const UPSTREAM = "https://api.openai.com/v1/chat/completions";
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    if (req.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    // アプリから来たボディ（model や messages）はそのまま転送する
+    const body = await req.text();
+
+    const upstream = await fetch(UPSTREAM, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // 鍵はここで初めて付く。クライアントは一切知らない
+        Authorization: `Bearer ${env.OPENAI_KEY}`,
+      },
+      body,
+    });
+
+    // 上流のレスポンスをそのまま返す（後述のストリーミングもこの形で通る）
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: { "Content-Type": upstream.headers.get("Content-Type") ?? "application/json" },
+    });
+  },
+};
+```
+
+`wrangler.toml` 側でアカウントとルートを設定し、鍵はファイルにではなくシークレットとして登録します。
+
+```bash
+# 鍵はコードにもファイルにも書かない。Cloudflare 側の暗号化ストアに入る
+npx wrangler secret put OPENAI_KEY
+# デプロイ
+npx wrangler deploy
+```
+
+これだけで、鍵はアプリのバンドルから完全に消えます。アプリが知っているのは「自分の中継 URL」だけになりました。
+
+## ストリーミングをそのまま通す
+
+AI のチャット系はトークンを少しずつ返すストリーミングが体験の肝です。中継を挟むと止まってしまうのでは、と心配になりますが、上記の `new Response(upstream.body, ...)` がすでに正解です。`upstream.body` は `ReadableStream` なので、Workers はバッファリングせずにそのまま下流へ流します。クライアント側で `stream: true` を指定していれば、中継があっても逐次表示はそのまま動きます。
+
+一点だけ注意があります。レスポンスをログ目的で `await upstream.text()` のように読み切ってしまうと、ストリームが消費されて素通しできなくなります。中継ではボディに触らないのが原則です。どうしても観測したいときは `upstream.body.tee()` で2系統に分け、片方だけを下流へ返してください。
+
+## 誰でも叩ける中継にしない — 簡易な濫用対策
+
+鍵は隠れました。しかし中継 URL がそのまま誰でも叩ける状態だと、今度は「あなたの中継経由で OpenAI を無料で使われる」踏み台になります。鍵の露出を、中継の濫用に置き換えただけになりかねません。
+
+最小の防御は、アプリ起動時に自分の認証基盤（Firebase Auth や Supabase Auth など）から短命トークンを発行し、中継でそれを検証することです。トークンは数十分で失効するので、抜かれても被害が限定されます。あわせて、KV を使った素朴なレート制限を1枚かぶせておくと、認証をすり抜けた濫用も抑えられます。
+
+```ts
+// レート制限の核だけ抜粋（KV を利用）
+async function allow(env: Env, id: string): Promise<boolean> {
+  const key = `rl:${id}:${Math.floor(Date.now() / 60000)}`; // 1分窓
+  const current = parseInt((await env.RL.get(key)) ?? "0", 10);
+  if (current >= 30) return false; // 1分あたり30リクエストまで
+  await env.RL.put(key, String(current + 1), { expirationTtl: 120 });
+  return true;
+}
+```
+
+より強固にしたい場合は、リクエストが「本物のアプリインストールから来たか」を端末の構成証明で確かめる方法があります。Apple の App Attest と Google の Play Integrity をサーバーで検証する設計は別記事の[Rork アプリで App Attest と Play Integrity をサーバー検証する設計](/articles/rork-dev/rork-app-attest-play-integrity-server-validation-guide)に詳しくまとめてあります。個人開発の初期段階では、まず「短命トークン＋レート制限」で十分に現実的な防御になります。個人的には、本番運用で実際に濫用が観測されてから構成証明を足すことを推奨します。最初からすべてを盛り込む必要はありません。
+
+## 鍵を差し替える — 審査を待たない運用
+
+中継を挟む構成には、セキュリティ以外にもう一つ実利があります。**鍵を変えてもアプリを再申請しなくてよい**ことです。
+
+鍵をアプリに直書きしていると、鍵の漏えいや有効期限切れのたびに、新しい鍵を埋め込んだバージョンをビルドし、ストア審査に出し、ユーザーの更新を待つことになります。私が複数アプリを運用していて現実的でないと感じるのは、まさにこの待ち時間です。漏えい対応で何日も待たされるのは、運用としては破綻しています。
+
+中継方式なら、鍵は Cloudflare 側のシークレットにあるだけです。差し替えはコマンド一発で、アプリには一切触れません。
+
+```bash
+# 漏えい・ローテーション時はこれだけ。アプリの再ビルドも審査も不要
+npx wrangler secret put OPENAI_KEY   # 新しい鍵を入力
+```
+
+数秒で全ユーザーが新しい鍵での通信に切り替わります。上流のプロバイダを OpenAI から Gemini へ乗り換えるような変更も、中継側の URL とリクエスト整形を直すだけで、アプリの更新なしに反映できます。バックエンドを一枚挟むだけで、運用の自由度がここまで変わります。
+
+## Rork（Expo）側の呼び出しコード
+
+最後にアプリ側です。やることは「OpenAI の URL」を「自分の中継 URL」に置き換えるだけで、ボディの形は変わりません。中継 URL は秘密ではないので `EXPO_PUBLIC_` で持って構いません（隠す価値のある情報はもう端末にないからです）。
+
+```ts
+// app/lib/ai.ts — 中継経由で呼ぶ
+const PROXY = process.env.EXPO_PUBLIC_AI_PROXY_URL!; // 例: https://ai.example.workers.dev
+
+export async function ask(authToken: string, prompt: string): Promise<string> {
+  const res = await fetch(PROXY, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${authToken}`, // 自分の認証基盤の短命トークン
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+
+  if (res.status === 429) throw new Error("混み合っています。少し待って再試行してください。");
+  if (!res.ok) throw new Error(`AI 応答エラー: ${res.status}`);
+
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? "";
+}
+```
+
+アプリのコードからは OpenAI の鍵という概念が完全に消えました。万一このアプリを誰かが解析しても、出てくるのは「中継 URL」と「失効する短命トークン」だけです。
+
+鍵が一つでもアプリに直書きされているなら、今日できる最初の一歩は、その鍵を上の中継方式へ移すことです。新しいバックエンドを立てる必要はありません。次の三手だけで終わります。
+
+1. `wrangler` で Worker を一つ用意する
+2. 鍵を `wrangler secret put` でシークレットに移す
+3. アプリの fetch 先を中継 URL に差し替える
+
+この三手で、請求リスクと運用の重さの両方が同時に軽くなります。
