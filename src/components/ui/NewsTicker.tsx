@@ -5,19 +5,19 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
     "MAX — Rork Maxが全Appleプラットフォーム向けのネイティブSwiftを生成。iPhoneからVision Proまで対応します",
-    "PUBLISH — Xcodeを使わず2クリックでApp Storeへ公開でき、Macのハードウェアを介さずiOS配布まで届きます",
-    "NATIVE — 通常のRorkはReact Native（Expo）でネイティブiOS/Androidを生成し、モバイルに特化しています",
+    "NATIVE — AR/LiDAR・Metalの3D・Dynamic Island・Live Activities・HealthKitなどネイティブ機能に踏み込めます",
+    "PUBLISH — 2クリックでApp Storeへ公開できます。Rork Maxは月$200です",
+    "EXPO — 通常のRorkはReact Native（Expo）でiOS/Androidを同時生成し、無料から始められます",
     "PROMPT — プレーンな英語でアプリの構想を書くと、ストアへ配布できる動くコードが生成されます",
-    "FUND — Rorkはa16zから$2.8Mを調達し、月間743,000訪問・成長率85%と報じられています",
-    "PRICE — 無料で開始でき、有料プランは月$25から。ただしクレジット消費が多いとの利用者の声もあります",
+    "PRICE — 無印Rorkの有料プランは月$25から。まず無印で作り、ネイティブ機能が要る段でMaxを検討できます",
   ],
   en: [
     "MAX — Rork Max generates native Swift for every Apple platform, from iPhone to Vision Pro",
-    "PUBLISH — Publish to the App Store in two clicks without Xcode, reaching iOS distribution without Mac hardware",
-    "NATIVE — Standard Rork builds native iOS/Android via React Native (Expo), focused exclusively on mobile",
+    "NATIVE — It reaches native capabilities like AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, and HealthKit",
+    "PUBLISH — Publish to the App Store in two clicks; Rork Max is $200/month",
+    "EXPO — Standard Rork builds iOS and Android together via React Native (Expo) and is free to start",
     "PROMPT — Describe your app idea in plain English and Rork generates deployable, store-ready code",
-    "FUND — Rork raised $2.8M from a16z and reportedly sees 743,000 monthly visits at 85% growth",
-    "PRICE — Free to start with paid plans from $25/month, though some users note heavy credit consumption",
+    "PRICE — Standard Rork's paid plans start at $25/month: build with it first, then consider Max for native features",
   ],
 };
 
