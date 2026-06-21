@@ -1,0 +1,214 @@
+---
+title: "Where Should Your Rork App Store Auth Tokens? expo-secure-store and a Biometric Gate"
+slug: "rork-expo-secure-store-auth-token-biometric-gate-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-21T11:00"
+author: "Rork Lab"
+description: "How I moved a Rork-generated app's auth tokens out of AsyncStorage into expo-secure-store and put a biometric check in front of every read — including the size limit and sign-out gotchas I hit in production."
+tags: ["Rork", "expo-secure-store", "authentication", "security", "biometrics"]
+highlights:
+  - "A decision rule for splitting tokens, settings, and cache across SecureStore, AsyncStorage, and MMKV"
+  - "Putting biometric auth in front of the token read, with a fallback path for lockouts"
+  - "A run-once migration off AsyncStorage and a sign-out routine that actually clears the device"
+---
+
+When you run a handful of apps for long enough as an indie developer, you eventually notice that the riskiest line of code is usually the first one you ever wrote — and never touched again. For me it was the auth token. The login flow Rork generated wrote both the access and refresh tokens straight into `AsyncStorage`. It worked, so it sat there for six months.
+
+`AsyncStorage` is not encrypted. On Android the values live in a plain SQLite store; on iOS they get some protection but not the strength you'd consciously choose for a long-lived secret. If you assume a rooted or jailbroken device, or a leaky backup, plaintext tokens are simply not where credentials belong.
+
+This article walks through moving tokens into `expo-secure-store` and then putting a biometric check in front of the read — migration and cleanup included. Token refresh and retry are a separate topic; here I'm focused only on storage and retrieval.
+
+## You don't have one storage — split by role
+
+The first trap is thinking "just put everything in SecureStore." SecureStore goes through the OS keychain/keystore, so every read and write carries real cost. Push your settings and cache through it and your cold start gets visibly slower.
+
+Split by the nature of the data instead.
+
+<table>
+<thead>
+<tr><th>Data</th><th>Store</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Access/refresh tokens, user secrets</td><td><strong>expo-secure-store</strong></td><td>A leak is immediate harm. Protected by the OS keychain/keystore</td></tr>
+<tr><td>Theme, language, onboarding-complete flags</td><td>AsyncStorage</td><td>Low harm if exposed. Cheap to read and write</td></tr>
+<tr><td>API response cache, image metadata, bulk data</td><td>MMKV / SQLite</td><td>High volume, needs fast access. Low secrecy</td></tr>
+</tbody>
+</table>
+
+Isolating only the tokens in SecureStore narrows the attack surface considerably while keeping startup overhead minimal.
+
+## The basics, and the cost of a read
+
+If you're inside the managed Expo flow, install is one line.
+
+```bash
+npx expo install expo-secure-store
+```
+
+A thin wrapper pays off later when you start adding options. Keep keys as constants so a typo can't silently split your storage.
+
+```typescript
+// lib/secureToken.ts
+import * as SecureStore from "expo-secure-store";
+
+const ACCESS_KEY = "auth.accessToken";
+const REFRESH_KEY = "auth.refreshToken";
+
+// iOS: decryptable only after unlock, never migrates to another device
+// Android: AES-encrypted and held in the Keystore
+const OPTIONS: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+};
+
+export async function saveTokens(access: string, refresh: string) {
+  await SecureStore.setItemAsync(ACCESS_KEY, access, OPTIONS);
+  await SecureStore.setItemAsync(REFRESH_KEY, refresh, OPTIONS);
+}
+
+export async function getAccessToken(): Promise<string | null> {
+  return SecureStore.getItemAsync(ACCESS_KEY, OPTIONS);
+}
+
+export async function clearTokens() {
+  await SecureStore.deleteItemAsync(ACCESS_KEY);
+  await SecureStore.deleteItemAsync(REFRESH_KEY);
+}
+```
+
+The default for `keychainAccessible` is `WHEN_UNLOCKED`, but I usually reach for the `*_THIS_DEVICE_ONLY` variants. It's a deliberate statement that the token must not travel to another device through iCloud Keychain or a backup. If you genuinely need to refresh tokens in the background, loosen it to `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` — but decide that from the requirement, not by default.
+
+## Put biometrics in front of the read
+
+Encrypting the token at rest doesn't stop anyone who opens the app from continuing the session. Before a screen that touches money or personal data, you often want the token *read itself* to require a biometric check.
+
+Use `expo-local-authentication` as a gate immediately before pulling from SecureStore.
+
+```bash
+npx expo install expo-local-authentication
+```
+
+```typescript
+// lib/authGate.ts
+import * as LocalAuthentication from "expo-local-authentication";
+
+export async function canUseBiometrics(): Promise<boolean> {
+  const hasHardware = await LocalAuthentication.hasHardwareAsync();
+  const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+  return hasHardware && isEnrolled;
+}
+
+export async function requireBiometricUnlock(): Promise<boolean> {
+  // If the device has no biometrics enrolled, you may choose not to block here
+  if (!(await canUseBiometrics())) return true;
+
+  const result = await LocalAuthentication.authenticateAsync({
+    promptMessage: "Unlock the app",
+    fallbackLabel: "Use passcode",
+    // After a few biometric failures, fall back to the device passcode
+    disableDeviceFallback: false,
+  });
+  return result.success;
+}
+```
+
+The read path only fetches the token after passing the gate.
+
+```typescript
+// flow before entering a sensitive screen
+import { requireBiometricUnlock } from "./lib/authGate";
+import { getAccessToken } from "./lib/secureToken";
+
+async function unlockAndLoad() {
+  const ok = await requireBiometricUnlock();
+  if (!ok) {
+    // On failure, never touch the token; stay on the lock screen
+    return { authed: false } as const;
+  }
+  const token = await getAccessToken();
+  return { authed: !!token, token } as const;
+}
+```
+
+The point is that on failure you **never load the token into memory**. Call `getAccessToken()` before the gate and the biometric check becomes theater. The ordering *is* the design.
+
+SecureStore also has a `requireAuthentication: true` option that enforces auth on read at the OS level. Its behavior is sensitive to device differences, though — I hit rough edges on emulators and certain Android devices. Because I want to control the fallback myself, I keep `LocalAuthentication` out front as shown above.
+
+## The size limit landmine
+
+I tripped here once. Android's SecureStore can fail to save when the value is large (roughly past 2KB). I had stuffed a JWT full of claims, concatenated the refresh token, and packed it all into one key — which produced a low-reproducibility bug where the device alone returned `null`.
+
+The fix is mundane: **split long values, or don't pack them in the first place.**
+
+<table>
+<thead>
+<tr><th>Tempting approach</th><th>What happens</th><th>Fix</th></tr>
+</thead>
+<tbody>
+<tr><td>Concatenate access + refresh as JSON into one key</td><td>Android save fails past ~2KB</td><td>Use separate keys for access and refresh</td></tr>
+<tr><td>Store a huge JWT verbatim</td><td>Unstable near the boundary</td><td>Trim claims; keep display data elsewhere</td></tr>
+<tr><td>Bundle the entire user profile</td><td>Size balloons</td><td>Move profile to AsyncStorage / re-fetch from API</td></tr>
+</tbody>
+</table>
+
+"Only the secrets, minimal, in separate keys." Knowing SecureStore is size-sensitive saves you hours of chasing a mysterious save failure.
+
+## Migrate off AsyncStorage exactly once
+
+Existing users still have tokens in `AsyncStorage`. If an update changes the storage location, run the migration once on first launch and delete the old copy afterward.
+
+```typescript
+// lib/migrateTokens.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { saveTokens } from "./secureToken";
+
+const MIGRATION_FLAG = "auth.migratedToSecureStore.v1";
+
+export async function migrateTokensIfNeeded() {
+  const done = await AsyncStorage.getItem(MIGRATION_FLAG);
+  if (done) return;
+
+  const legacyAccess = await AsyncStorage.getItem("accessToken");
+  const legacyRefresh = await AsyncStorage.getItem("refreshToken");
+
+  if (legacyAccess && legacyRefresh) {
+    await saveTokens(legacyAccess, legacyRefresh);
+    // leave no plaintext trace behind
+    await AsyncStorage.multiRemove(["accessToken", "refreshToken"]);
+  }
+  await AsyncStorage.setItem(MIGRATION_FLAG, "1");
+}
+```
+
+Version the flag (`v1`). When you later change the key layout, you add a `v2` migration and roll forward in steps. Wrap this in `try/catch` so a failed migration doesn't crash the app, and on failure don't set the flag — let it retry next launch. Retrying is safer than swallowing the error.
+
+## Sign-out: what must not stay on the device
+
+Calling `deleteItemAsync` on sign-out is obvious. What's easy to miss is **everything else**: the token still in memory, the header your API client holds, the cached "signed-in user name." Leave those and the next person sees a flash of the previous session.
+
+```typescript
+async function signOut() {
+  await clearTokens();                 // remove from SecureStore
+  await AsyncStorage.multiRemove([     // and personal data on the settings side
+    "user.displayName",
+    "user.lastSyncedAt",
+  ]);
+  apiClient.setAuthHeader(null);       // drop the in-memory header
+  queryClient.clear();                 // discard fetched-data cache
+}
+```
+
+Reframe sign-out as "return the device to its pre-login state" rather than "delete the token," and the leftovers become easier to spot. I revisit this list whenever I add a feature: if I now persist a new piece of personal data, I add a line to this cleanup too.
+
+## Small gotchas from production
+
+A few places where the device and the simulator disagree.
+
+On the iOS simulator the biometric dialog appears, but unless you enable `Features > Face ID > Enrolled` it fails every time. Check that before you suspect your own code.
+
+Repeated biometric failures trigger a lockout, after which `authenticateAsync` stops returning success or failure for a while. Setting `disableDeviceFallback: false` so users can escape to the device passcode keeps them from getting stuck.
+
+With `WHEN_UNLOCKED_THIS_DEVICE_ONLY`, tokens do not carry over when the user upgrades phones. That's the safe, intended behavior — but it's kind to tell users up front that a new device means signing in again. A single line in the release notes cut my support questions noticeably.
+
+If you're starting, isolate the tokens into SecureStore first. The biometric gate is a layer you stack on top, so there's no rush until the foundation is solid. Thanks for reading — I hope it helps if you're stuck on the same thing.

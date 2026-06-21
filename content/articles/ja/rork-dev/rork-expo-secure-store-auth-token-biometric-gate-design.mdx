@@ -1,0 +1,214 @@
+---
+title: "Rork アプリの認証トークンはどこに保存すべきか — expo-secure-store と生体認証ゲートの設計"
+slug: "rork-expo-secure-store-auth-token-biometric-gate-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-21T11:00"
+author: "Rork Lab"
+description: "Rork で生成したアプリの認証トークンを AsyncStorage から expo-secure-store へ移し、生体認証を読み出しの前段に挟むまでの設計をまとめました。サイズ制限や失効処理など、運用で踏んだ落とし穴も添えています。"
+tags: ["Rork", "expo-secure-store", "認証", "セキュリティ", "生体認証"]
+highlights:
+  - "SecureStore / AsyncStorage / MMKV をトークン・設定・キャッシュでどう住み分けるかの判断基準"
+  - "生体認証を「トークンの読み出しの前」に挟む、ロックアウト時のフォールバックまで含めた実装"
+  - "AsyncStorage からの一度だけ走る移行と、サインアウト時に端末から確実に消すための後始末"
+---
+
+個人開発で複数のアプリを長く運用していると、最初の実装が一番危ういまま残っていることに、ある日ふと気づきます。私の場合は認証トークンでした。Rork に「ログイン機能を付けて」と頼んで生成されたコードは、アクセストークンとリフレッシュトークンをそのまま `AsyncStorage` に書き込んでいたのです。動くので半年放置していました。
+
+`AsyncStorage` は暗号化されていません。Android では端末内のプレーンな SQLite に、iOS では保護はされるものの開発者が意図した強度ではない場所に、文字列がそのまま残ります。root 化・脱獄された端末やバックアップ経由で読み出せてしまう前提で考えると、長期保存するトークンの置き場所としては適切ではありません。
+
+ここでは、私自身が実際にたどった手順——トークンの保存先を `expo-secure-store` に移し、さらに「読み出しの前に生体認証を挟む」ところまで——を、移行と後始末も含めて設計としてまとめます。トークンのリフレッシュやリトライそのものは別の主題なので、「保存と取り出し」に絞ります。
+
+## 保存先は一つではない — 役割で住み分ける
+
+まず混乱しやすいのは「全部 SecureStore に入れればいい」という発想です。SecureStore は OS のキーチェーン／キーストアを経由するため、読み書きのたびにそれなりのコストがかかります。設定値やキャッシュまで入れると、起動時の取り出しが目に見えて遅くなります。
+
+データの性質で置き場所を分けるのが現実的です。
+
+<table>
+<thead>
+<tr><th>データ</th><th>保存先</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>アクセス／リフレッシュトークン、ユーザー秘密鍵</td><td><strong>expo-secure-store</strong></td><td>漏洩が即被害につながる。OS のキーチェーン／キーストアで保護される</td></tr>
+<tr><td>テーマ、言語、オンボーディング完了フラグなどの設定</td><td>AsyncStorage</td><td>漏れても害が小さい。読み書きが軽い</td></tr>
+<tr><td>API レスポンスのキャッシュ、画像メタなど大量データ</td><td>MMKV / SQLite</td><td>件数が多く高速アクセスが要る。秘匿性は低い</td></tr>
+</tbody>
+</table>
+
+トークンだけを SecureStore に隔離する。これだけで攻撃面はかなり狭まりますし、起動時のオーバーヘッドも最小限で済みます。
+
+## expo-secure-store の基本と、取り出しのコスト
+
+導入は Expo の管理下なら一行です。
+
+```bash
+npx expo install expo-secure-store
+```
+
+ラッパーを薄く一枚かぶせておくと、後でオプションを足すときに楽になります。キーは定数にまとめ、文字列の打ち間違いを防ぎます。
+
+```typescript
+// lib/secureToken.ts
+import * as SecureStore from "expo-secure-store";
+
+const ACCESS_KEY = "auth.accessToken";
+const REFRESH_KEY = "auth.refreshToken";
+
+// iOS: 端末ロック解除後のみ復号可能・他端末へ移行しない
+// Android: AES で暗号化して Keystore に保管
+const OPTIONS: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+};
+
+export async function saveTokens(access: string, refresh: string) {
+  await SecureStore.setItemAsync(ACCESS_KEY, access, OPTIONS);
+  await SecureStore.setItemAsync(REFRESH_KEY, refresh, OPTIONS);
+}
+
+export async function getAccessToken(): Promise<string | null> {
+  return SecureStore.getItemAsync(ACCESS_KEY, OPTIONS);
+}
+
+export async function clearTokens() {
+  await SecureStore.deleteItemAsync(ACCESS_KEY);
+  await SecureStore.deleteItemAsync(REFRESH_KEY);
+}
+```
+
+`keychainAccessible` の既定は `WHEN_UNLOCKED` ですが、私は基本的に `*_THIS_DEVICE_ONLY` を選びます。トークンを iCloud キーチェーンやバックアップ経由で別端末に持ち出させない、という意思表示になるからです。バックグラウンドでトークンを更新する必要があるなら `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` に緩める、というように、要件から逆算して決めます。
+
+## 生体認証は「読み出しの前」に挟む
+
+トークンを暗号化して置いただけでは、アプリを開けば誰でも続きを操作できてしまいます。金融系や個人情報を扱う画面の手前では、トークンの読み出し自体に生体認証を要求したくなります。
+
+`expo-local-authentication` で、SecureStore から取り出す直前にゲートを置きます。
+
+```bash
+npx expo install expo-local-authentication
+```
+
+```typescript
+// lib/authGate.ts
+import * as LocalAuthentication from "expo-local-authentication";
+
+export async function canUseBiometrics(): Promise<boolean> {
+  const hasHardware = await LocalAuthentication.hasHardwareAsync();
+  const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+  return hasHardware && isEnrolled;
+}
+
+export async function requireBiometricUnlock(): Promise<boolean> {
+  // 端末に生体認証が未設定なら、ここではブロックしない判断もありえる
+  if (!(await canUseBiometrics())) return true;
+
+  const result = await LocalAuthentication.authenticateAsync({
+    promptMessage: "アプリのロックを解除します",
+    fallbackLabel: "パスコードを使う",
+    // 生体認証に数回失敗したら端末パスコードへ退避させる
+    disableDeviceFallback: false,
+  });
+  return result.success;
+}
+```
+
+読み出し側は、ゲートを通ってからトークンを取りに行きます。
+
+```typescript
+// 機微な画面に入る前のフロー
+import { requireBiometricUnlock } from "./lib/authGate";
+import { getAccessToken } from "./lib/secureToken";
+
+async function unlockAndLoad() {
+  const ok = await requireBiometricUnlock();
+  if (!ok) {
+    // 失敗時はトークンに触れず、ロック画面のまま留める
+    return { authed: false } as const;
+  }
+  const token = await getAccessToken();
+  return { authed: !!token, token } as const;
+}
+```
+
+ここで大切なのは、認証に失敗したら**トークンを一切メモリに載せない**ことです。`getAccessToken()` をゲートの前で呼んでしまうと、生体認証が形骸化します。順番が設計の本体です。
+
+SecureStore 自体にも `requireAuthentication: true` というオプションがあり、OS レベルで読み出しに認証を強制できます。ただし挙動が端末差に影響されやすく、エミュレータや一部の Android 端末で扱いづらい場面がありました。私はフォールバックを自分で制御したいので、上記のように `LocalAuthentication` を手前に置く方式を採っています。
+
+## SecureStore のサイズ制限という地雷
+
+ここで一度つまずきました。Android の SecureStore は、値が大きい（おおよそ 2KB を超える）と保存に失敗することがあります。JWT に大量のクレームを詰め、さらにリフレッシュトークンを連結して一つのキーに入れていたら、実機だけで `null` が返ってくる、という再現性の低いバグになりました。
+
+対処は単純で、**長い値は分割する／そもそも詰め込まない**ことです。
+
+<table>
+<thead>
+<tr><th>やりがちな書き方</th><th>起きること</th><th>直し方</th></tr>
+</thead>
+<tbody>
+<tr><td>access と refresh を JSON 連結して 1 キーに</td><td>2KB 超で Android が保存失敗</td><td>キーを分ける（access / refresh を別保存）</td></tr>
+<tr><td>巨大な JWT をそのまま保存</td><td>境界付近で不安定</td><td>クレームを削る。表示用情報は別ストアへ</td></tr>
+<tr><td>ユーザープロフィール全体を同梱</td><td>サイズ肥大</td><td>プロフィールは AsyncStorage / API 再取得に分離</td></tr>
+</tbody>
+</table>
+
+「秘匿すべきものだけを、最小限、別々のキーで」。SecureStore はサイズに敏感だと理解しておくと、原因不明の保存失敗で悩む時間が減ります。
+
+## AsyncStorage からの移行は「一度だけ」走らせる
+
+既存ユーザーのトークンは `AsyncStorage` に残っています。アップデートで保存先を切り替えるなら、初回起動時に一度だけ移行を走らせ、移行後は古い側を消します。
+
+```typescript
+// lib/migrateTokens.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { saveTokens } from "./secureToken";
+
+const MIGRATION_FLAG = "auth.migratedToSecureStore.v1";
+
+export async function migrateTokensIfNeeded() {
+  const done = await AsyncStorage.getItem(MIGRATION_FLAG);
+  if (done) return;
+
+  const legacyAccess = await AsyncStorage.getItem("accessToken");
+  const legacyRefresh = await AsyncStorage.getItem("refreshToken");
+
+  if (legacyAccess && legacyRefresh) {
+    await saveTokens(legacyAccess, legacyRefresh);
+    // 平文の痕跡を残さない
+    await AsyncStorage.multiRemove(["accessToken", "refreshToken"]);
+  }
+  await AsyncStorage.setItem(MIGRATION_FLAG, "1");
+}
+```
+
+フラグをバージョン付き（`v1`）にしておくのがコツです。将来キー構成を変えたとき、`v2` の移行を足すだけで段階的に進められます。移行に失敗してもアプリが落ちないよう、ここは `try/catch` で包み、失敗時はフラグを立てずに次回起動へ持ち越します。エラーで握りつぶすより、もう一度試せるほうが安全です。
+
+## 失効とサインアウト — 端末に何を残さないか
+
+サインアウトで `deleteItemAsync` を呼ぶのは当然として、見落としがちなのが**それ以外の痕跡**です。メモリ上のトークン、API クライアントが握っているヘッダ、キャッシュした「ログイン中のユーザー名」。これらを残すと、次の利用者に前の人の状態が一瞬見えます。
+
+```typescript
+async function signOut() {
+  await clearTokens();                 // SecureStore から削除
+  await AsyncStorage.multiRemove([     // 設定側の個人情報も
+    "user.displayName",
+    "user.lastSyncedAt",
+  ]);
+  apiClient.setAuthHeader(null);       // メモリ上のヘッダも破棄
+  queryClient.clear();                 // 取得済みデータのキャッシュを破棄
+}
+```
+
+サインアウトは「トークンを消す処理」ではなく「端末をログイン前の状態に戻す処理」だと捉え直すと、消し忘れに気づきやすくなります。私はこの一覧を機能追加のたびに見直すようにしています。新しく端末に保存する個人情報が増えたら、必ずこの後始末にも一行足す、という習慣です。
+
+## 運用で見えてきた、細かい落とし穴
+
+実機とエミュレータで挙動が違う点をいくつか書き残しておきます。
+
+iOS シミュレータでは生体認証のダイアログは出ますが、`Features > Face ID > Enrolled` を有効にしていないと毎回失敗します。テスト時に「実装が悪い」と疑う前に、ここを確認すると早いです。
+
+生体認証を連続で失敗するとロックアウトがかかり、`authenticateAsync` がしばらく成否を返さなくなります。`disableDeviceFallback: false` にして端末パスコードへ逃がせるようにしておくと、ユーザーが詰むのを避けられます。
+
+`WHEN_UNLOCKED_THIS_DEVICE_ONLY` を使うと、機種変更時にトークンは引き継がれません。これは仕様どおりの安全側の挙動ですが、ユーザーには「新しい端末では再ログインが必要」と事前に伝わっているほうが親切です。リリースノートに一行添えるだけで問い合わせが減りました。
+
+次に着手するなら、まずは保存先を SecureStore に分離するところから始めるのをおすすめします。生体認証ゲートはその上に積む機能なので、土台が固まってからで遅くありません。お読みいただきありがとうございました。同じところでつまずいている方の助けになれば幸いです。
