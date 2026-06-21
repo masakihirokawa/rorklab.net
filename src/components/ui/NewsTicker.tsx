@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Maxが全Appleプラットフォーム向けのネイティブSwiftを生成。iPhoneからVision Proまで対応します",
-    "NATIVE — AR/LiDAR・Metalの3D・Dynamic Island・Live Activities・HealthKitなどネイティブ機能に踏み込めます",
-    "PUBLISH — 2クリックでApp Storeへ公開できます。Rork Maxは月$200です",
-    "EXPO — 通常のRorkはReact Native（Expo）でiOS/Androidを同時生成し、無料から始められます",
-    "PROMPT — プレーンな英語でアプリの構想を書くと、ストアへ配布できる動くコードが生成されます",
-    "PRICE — 無印Rorkの有料プランは月$25から。まず無印で作り、ネイティブ機能が要る段でMaxを検討できます",
+    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成。iPhone・iPad・Watch・TV・Vision Pro・iMessageに対応します",
+    "NATIVE — AR/LiDAR・Metalの3Dゲーム・Dynamic Island・Live Activities・HealthKit・Core MLなどネイティブ機能を解放します",
+    "CORE — 通常のRorkはReact Native（Expo）でiOS/Androidアプリを生成。自然言語からストア公開まで到達できます",
+    "FUNDING — Rorkはa16zから$2.8Mを調達しました",
+    "GROWTH — 月間743,000訪問・成長率85%と勢いを増しています",
+    "PRICING — 無料で始められ、有料プランは$25/月〜です",
   ],
   en: [
-    "MAX — Rork Max generates native Swift for every Apple platform, from iPhone to Vision Pro",
-    "NATIVE — It reaches native capabilities like AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, and HealthKit",
-    "PUBLISH — Publish to the App Store in two clicks; Rork Max is $200/month",
-    "EXPO — Standard Rork builds iOS and Android together via React Native (Expo) and is free to start",
-    "PROMPT — Describe your app idea in plain English and Rork generates deployable, store-ready code",
-    "PRICE — Standard Rork's paid plans start at $25/month: build with it first, then consider Max for native features",
+    "MAX — Rork Max builds native Swift apps instead of React Native, supporting iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
+    "NATIVE — It unlocks native capabilities: AR/LiDAR, Metal 3D games, Dynamic Island, Live Activities, HealthKit, and Core ML",
+    "CORE — Standard Rork generates iOS/Android apps with React Native (Expo), taking you from plain English to the app stores",
+    "FUNDING — Rork raised $2.8M from a16z (Andreessen Horowitz)",
+    "GROWTH — The platform now sees 743,000 monthly visits with 85% growth",
+    "PRICING — Free to start, with paid plans from $25/month",
   ],
 };
 
