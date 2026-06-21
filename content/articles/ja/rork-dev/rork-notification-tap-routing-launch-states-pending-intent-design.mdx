@@ -1,0 +1,209 @@
+---
+title: "通知をタップしたのに目的の画面に飛ばない——Rorkアプリのルーティングを起動状態ごとに設計する"
+slug: "rork-notification-tap-routing-launch-states-pending-intent-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-21T11:05"
+author: "Rork Lab"
+description: "通知タップでアプリが起動したとき、目的の画面まで確実に届ける設計。killed / background / foreground の3状態と、ナビゲーション準備前のタップを取りこぼさない pending route の実装を解説します。"
+tags: ["Rork", "Expo", "通知", "ディープリンク", "ルーティング"]
+highlights:
+  - "通知をタップした瞬間と画面が描画できる瞬間のズレを pending route で吸収する設計"
+  - "killed / background / foreground の3つの起動状態それぞれで通知タップを確実に拾う実装"
+  - "未検証のルートへ飛ばさないための許可リストと安全なフォールバックの組み込み方"
+---
+
+ある運用中のアプリで、サーバーから「注文が発送されました」というプッシュ通知を送ったときのことです。通知をタップすると、アプリは起動するのにホーム画面が表示されるだけで、肝心の注文詳細には飛んでくれません。手元の検証端末では問題なく動いていたので、原因の特定にしばらく時間がかかりました。
+
+結論から申し上げますと、アプリが完全に終了した状態（killed）から通知タップで起動したとき、ナビゲーターがまだ準備できていないタイミングで遷移命令を出していたことが原因でした。命令は静かに無視され、エラーも出ません。
+
+通知ルーティングのつまずきは、ほとんどがこの「タップした瞬間」と「画面を描ける瞬間」のズレに集約されます。今回は、その差を吸収する設計を、起動状態ごとに整理してご紹介します。
+
+## まず押さえるべき3つの起動状態
+
+通知をタップしたとき、アプリがどの状態にあったかで、タップ情報の受け取り方がまったく違います。ここを混同すると、片方の状態でしか動かないコードになります。
+
+<table>
+<thead>
+<tr><th>起動状態</th><th>アプリの状況</th><th>タップ情報の取得元</th></tr>
+</thead>
+<tbody>
+<tr><td>killed（コールドスタート）</td><td>プロセスが終了していた</td><td><code>getLastNotificationResponseAsync()</code></td></tr>
+<tr><td>background</td><td>バックグラウンドに退避していた</td><td>レスポンスリスナー</td></tr>
+<tr><td>foreground</td><td>表示中だった</td><td>レスポンスリスナー</td></tr>
+</tbody>
+</table>
+
+killed からの起動が厄介なのは、起動のきっかけになったタップがリスナーに届かないことがある点です。アプリが立ち上がってリスナーを登録する頃には、そのイベントはすでに過ぎ去っています。だからこそ、起動時に一度だけ「最後のレスポンス」を取りに行く必要があります。
+
+逆に background / foreground では、アプリはすでに生きているのでリスナーが確実に発火します。
+
+## ルーティング情報は通知のdataに載せる
+
+遷移先を決めるのは通知の本文ではなく、`data` ペイロードです。サーバーから送る通知に、行き先を構造化して載せておきます。
+
+```ts
+// サーバー側が送る通知ペイロード（例）
+{
+  "to": "ExponentPushToken[xxxxxxxx]",
+  "title": "発送のお知らせ",
+  "body": "ご注文の商品を発送しました",
+  "data": {
+    "type": "order",
+    "id": "A-10293"
+  }
+}
+```
+
+`type` と `id` のように構造化しておくと、後でルートへ組み立て直すときに検証しやすくなります。`data` に完成済みのURL文字列を直接入れる方法もありますが、サーバーが送る文字列をそのまま遷移先に使うのは避けたいところです。理由は後半でご説明します。
+
+## 取りこぼさないための pending route
+
+設計の核心は、タップ情報を「いったん預かる」場所を一つ用意することです。ナビゲーションがまだ準備できていなくても、情報だけは保持しておき、準備ができた瞬間に消化します。
+
+```ts
+// lib/notificationRouting.ts
+type PendingTarget = { type: string; id: string };
+
+let pending: PendingTarget | null = null;
+const handledIds = new Set<string>();
+
+export function setPending(target: PendingTarget) {
+  pending = target;
+}
+
+export function consumePending(): PendingTarget | null {
+  const t = pending;
+  pending = null;
+  return t;
+}
+
+// 同じタップを killed 経路とリスナー経路で二重処理しないための番兵
+export function markHandled(notificationId: string): boolean {
+  if (handledIds.has(notificationId)) return false;
+  handledIds.add(notificationId);
+  return true;
+}
+```
+
+`handledIds` を挟んでいるのは、killed 起動の直後に `getLastNotificationResponseAsync()` とリスナーの両方が同じタップを拾ってしまう端末があるためです。通知の identifier をキーに、一度処理したものは二度目を弾きます。
+
+## ナビゲーション準備を待ってから遷移する
+
+expo-router では、ルートのナビゲーターがマウントされて初めて `router.push` が効きます。準備状態は `useRootNavigationState()` で確認できます。これがルーティング設計のもう一つの要です。
+
+```tsx
+// app/_layout.tsx の中で使うフック
+import { useEffect } from 'react';
+import { router, useRootNavigationState } from 'expo-router';
+import * as Notifications from 'expo-notifications';
+import { setPending, consumePending, markHandled } from '../lib/notificationRouting';
+import { resolveRoute } from '../lib/resolveRoute';
+
+export function useNotificationRouting() {
+  const navState = useRootNavigationState();
+
+  // 1) コールドスタート時に一度だけ「最後のレスポンス」を預かる
+  useEffect(() => {
+    let mounted = true;
+    Notifications.getLastNotificationResponseAsync().then((response) => {
+      if (!mounted || !response) return;
+      const id = response.notification.request.identifier;
+      if (!markHandled(id)) return;
+      const data = response.notification.request.content.data as any;
+      if (data?.type && data?.id) setPending({ type: data.type, id: String(data.id) });
+    });
+    return () => { mounted = false; };
+  }, []);
+
+  // 2) 起動中のタップはリスナーで預かる
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      const id = response.notification.request.identifier;
+      if (!markHandled(id)) return;
+      const data = response.notification.request.content.data as any;
+      if (data?.type && data?.id) setPending({ type: data.type, id: String(data.id) });
+    });
+    return () => sub.remove();
+  }, []);
+
+  // 3) ナビゲーターが準備できたら、預かったものを消化する
+  useEffect(() => {
+    if (!navState?.key) return; // まだ準備できていない
+    const target = consumePending();
+    if (!target) return;
+    const path = resolveRoute(target.type, target.id);
+    router.push(path);
+  }, [navState?.key]);
+}
+```
+
+3つの `useEffect` が、それぞれ killed / 起動中タップ / 準備完了に対応します。情報を預ける窓口（1と2）と、消化するタイミング（3）を分けたことで、どの順番でイベントが起きても破綻しません。`navState?.key` が変わるたびに pending を確認するので、準備が遅れても確実に拾えます。
+
+## 未検証のルートへ飛ばさない
+
+ここが、本番運用で最も気をつけている点です。通知の `data` は外から届くものです。仮にペイロードが書き換えられても、アプリが意図しない画面に飛ばないようにしておきます。
+
+そのために、`type` から行き先を組み立てる箇所を一つに集約し、許可した種類だけを通します。
+
+```ts
+// lib/resolveRoute.ts
+import type { Href } from 'expo-router';
+
+const FALLBACK: Href = '/';
+
+export function resolveRoute(type: string, id: string): Href {
+  // id の形も検証する（想定外の文字列を弾く）
+  const safeId = /^[A-Za-z0-9_-]{1,40}$/.test(id) ? id : null;
+  if (!safeId) return FALLBACK;
+
+  switch (type) {
+    case 'order':
+      return `/order/${safeId}`;
+    case 'message':
+      return `/messages/${safeId}`;
+    case 'promo':
+      return '/promotions';
+    default:
+      return FALLBACK; // 知らない type は安全に握りつぶす
+  }
+}
+```
+
+許可リスト方式にしておくと、サーバー側で新しい通知タイプを足したときも、アプリ側の更新を忘れれば「ホームに着地する」だけで済みます。想定外の遷移を回避でき、誤って深い階層の壊れた画面に放り込むより、ずっと安全です。
+
+加えて、遷移先の画面が必要なデータの取得に失敗したとき（注文IDが既に存在しない等）は、その画面側でエラー状態を出すか、一覧へ戻す導線を用意しておきます。ルーティングは「正しい入り口に立たせる」までが責務で、その先の不在はデータ層の責務だと整理しておくと、コードの見通しが良くなります。
+
+## フォアグラウンドでの扱いを決めておく
+
+アプリを開いている最中に通知が届いたとき、勝手に画面が切り替わると操作の邪魔になります。フォアグラウンドでは「タップされたときだけ」遷移する、というルールを徹底しています。
+
+通知の表示自体は `setNotificationHandler` で制御し、遷移はあくまでレスポンスリスナー（＝タップ）に限定します。表示と遷移を別の責務として切り離すのが要点です。
+
+```ts
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: false,
+    shouldSetBadge: true,
+  }),
+});
+```
+
+こうしておけば、フォアグラウンドではバナーが出るだけで、ユーザーがタップしない限り今の作業は中断されません。
+
+## 動作確認のすすめ
+
+この設計が効いているかは、3状態を意図的に作って確かめます。シミュレーターやプレビューだけでは killed 起動が再現しづらいので、実機での確認を強く推奨します。
+
+1. アプリをタスクスイッチャーから完全に終了させ、killed の状態から通知をタップします。
+2. ホーム操作でバックグラウンドへ退避させてから、通知をタップします。
+3. アプリを開いたまま別端末から通知を送り、その通知をタップします。
+
+3つとも目的の画面に着地すれば、起動状態に依存しないルーティングができています。
+
+私自身、個人開発で App Store と Google Play の双方にアプリを公開しながら運用していますが、通知まわりは「自分の検証端末では再現しない不具合」が出やすい領域です。だからこそ私は、起動状態を切り分けて一つずつ潰す地道な確認を毎回欠かさないようにしています。遠回りに見えて、結局はこれがいちばんの近道だと感じています。
+
+次に手を動かすなら、まず `resolveRoute` の許可リストを、お使いのアプリの画面構成に合わせて書き換えてみてください。そこが固まれば、あとは通知の `data` を構造化して送るだけで、起動状態を気にせず目的の画面まで届けられるようになります。

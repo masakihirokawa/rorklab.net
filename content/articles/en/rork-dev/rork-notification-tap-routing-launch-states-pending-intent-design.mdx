@@ -1,0 +1,209 @@
+---
+title: "Your Notification Opens the App but Lands on Home — Routing Rork Apps by Launch State"
+slug: "rork-notification-tap-routing-launch-states-pending-intent-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-21T11:05"
+author: "Rork Lab"
+description: "How to make a notification tap reliably reach its target screen. We cover the three launch states — killed, background, foreground — and a pending-route design that never drops a tap that arrives before navigation is ready."
+tags: ["Rork", "Expo", "Notifications", "Deep Linking", "Routing"]
+highlights:
+  - "A pending-route design that absorbs the gap between the moment of the tap and the moment a screen can render"
+  - "An implementation that reliably catches notification taps across all three launch states: killed, background, and foreground"
+  - "How to wire an allowlist and a safe fallback so you never push the user to an unvalidated route"
+---
+
+On one app I run, I once sent a "your order has shipped" push notification from the server. Tapping it launched the app — but it just sat on the home screen and never opened the order detail. It worked perfectly on my test device, so the cause took a while to pin down.
+
+The short version: when the app launched from a fully killed state via the tap, my navigation command fired before the navigator was mounted. The command was quietly ignored, with no error.
+
+Almost every notification-routing headache comes down to this one gap: the moment of the tap versus the moment a screen can actually be drawn. Let me walk through a design that absorbs that gap, organized by launch state.
+
+## The three launch states you have to account for
+
+When the user taps a notification, the way you receive that tap depends entirely on what state the app was in. Conflate these and you end up with code that only works in one of them.
+
+<table>
+<thead>
+<tr><th>Launch state</th><th>App condition</th><th>Where the tap comes from</th></tr>
+</thead>
+<tbody>
+<tr><td>killed (cold start)</td><td>Process was terminated</td><td><code>getLastNotificationResponseAsync()</code></td></tr>
+<tr><td>background</td><td>Suspended in the background</td><td>Response listener</td></tr>
+<tr><td>foreground</td><td>Visible on screen</td><td>Response listener</td></tr>
+</tbody>
+</table>
+
+A cold start is the tricky one: the tap that launched the app may never reach your listener. By the time the app boots and registers the listener, that event has already passed. That is exactly why you need to fetch the "last response" once at startup.
+
+In the background and foreground states the app is already alive, so the listener fires reliably.
+
+## Put the routing info in the notification's data
+
+What decides the destination is not the notification body — it's the `data` payload. Send a structured destination on every notification from the server.
+
+```ts
+// Notification payload the server sends (example)
+{
+  "to": "ExponentPushToken[xxxxxxxx]",
+  "title": "Shipping update",
+  "body": "Your order is on its way",
+  "data": {
+    "type": "order",
+    "id": "A-10293"
+  }
+}
+```
+
+Structuring it as `type` and `id` makes it far easier to validate when you reassemble the route later. You could also drop a fully formed URL string into `data`, but using a server-supplied string directly as a destination is something I'd rather avoid — I'll explain why toward the end.
+
+## A pending route so nothing gets dropped
+
+The heart of the design is having one place to "hold onto" the tap. Even when navigation isn't ready, you keep the information and consume it the instant it is.
+
+```ts
+// lib/notificationRouting.ts
+type PendingTarget = { type: string; id: string };
+
+let pending: PendingTarget | null = null;
+const handledIds = new Set<string>();
+
+export function setPending(target: PendingTarget) {
+  pending = target;
+}
+
+export function consumePending(): PendingTarget | null {
+  const t = pending;
+  pending = null;
+  return t;
+}
+
+// Sentinel so the killed path and the listener path don't process the same tap twice
+export function markHandled(notificationId: string): boolean {
+  if (handledIds.has(notificationId)) return false;
+  handledIds.add(notificationId);
+  return true;
+}
+```
+
+The `handledIds` guard is there because, on some devices, right after a killed launch both `getLastNotificationResponseAsync()` and the listener will pick up the same tap. Keyed on the notification identifier, anything already handled is rejected the second time.
+
+## Navigate only after the navigator is ready
+
+In expo-router, `router.push` only takes effect once the root navigator has mounted. You can check readiness with `useRootNavigationState()`. This is the other pillar of the design.
+
+```tsx
+// A hook used inside app/_layout.tsx
+import { useEffect } from 'react';
+import { router, useRootNavigationState } from 'expo-router';
+import * as Notifications from 'expo-notifications';
+import { setPending, consumePending, markHandled } from '../lib/notificationRouting';
+import { resolveRoute } from '../lib/resolveRoute';
+
+export function useNotificationRouting() {
+  const navState = useRootNavigationState();
+
+  // 1) On a cold start, fetch the "last response" once and hold it
+  useEffect(() => {
+    let mounted = true;
+    Notifications.getLastNotificationResponseAsync().then((response) => {
+      if (!mounted || !response) return;
+      const id = response.notification.request.identifier;
+      if (!markHandled(id)) return;
+      const data = response.notification.request.content.data as any;
+      if (data?.type && data?.id) setPending({ type: data.type, id: String(data.id) });
+    });
+    return () => { mounted = false; };
+  }, []);
+
+  // 2) Taps while the app is alive are held via the listener
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      const id = response.notification.request.identifier;
+      if (!markHandled(id)) return;
+      const data = response.notification.request.content.data as any;
+      if (data?.type && data?.id) setPending({ type: data.type, id: String(data.id) });
+    });
+    return () => sub.remove();
+  }, []);
+
+  // 3) Once the navigator is ready, consume whatever we're holding
+  useEffect(() => {
+    if (!navState?.key) return; // not ready yet
+    const target = consumePending();
+    if (!target) return;
+    const path = resolveRoute(target.type, target.id);
+    router.push(path);
+  }, [navState?.key]);
+}
+```
+
+The three `useEffect` blocks map to killed / live tap / ready. By separating the intake windows (1 and 2) from the consumption moment (3), the flow holds together no matter what order the events fire in. Because it re-checks the pending route every time `navState?.key` changes, a slow startup still gets caught.
+
+## Never push to an unvalidated route
+
+This is the point I'm most careful about in production. The notification `data` arrives from outside. Even if a payload were tampered with, the app should never land on a screen you didn't intend.
+
+So I concentrate the place that turns a `type` into a destination into a single function, and let only the allowed types through.
+
+```ts
+// lib/resolveRoute.ts
+import type { Href } from 'expo-router';
+
+const FALLBACK: Href = '/';
+
+export function resolveRoute(type: string, id: string): Href {
+  // Validate the shape of id too (reject anything unexpected)
+  const safeId = /^[A-Za-z0-9_-]{1,40}$/.test(id) ? id : null;
+  if (!safeId) return FALLBACK;
+
+  switch (type) {
+    case 'order':
+      return `/order/${safeId}`;
+    case 'message':
+      return `/messages/${safeId}`;
+    case 'promo':
+      return '/promotions';
+    default:
+      return FALLBACK; // unknown types are safely swallowed
+  }
+}
+```
+
+With an allowlist, even if you add a new notification type on the server and forget to update the app, the worst case is "the user lands on home." That's far safer than dropping them into a broken deep screen.
+
+On top of that, when the destination screen fails to load the data it needs (the order ID no longer exists, say), handle it on that screen — show an error state or a path back to the list. It helps to frame routing's job as "put the user at the right entrance," and treat a missing record beyond that as the data layer's responsibility. The code gets much clearer once you draw that line.
+
+## Decide foreground behavior up front
+
+When a notification arrives while the user is using the app, snapping the screen away mid-task is disruptive. My rule is firm: in the foreground, navigate only on an actual tap.
+
+Control the display itself with `setNotificationHandler`, and keep navigation strictly tied to the response listener (the tap). Separating display from navigation as two distinct responsibilities is the key.
+
+```ts
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: false,
+    shouldSetBadge: true,
+  }),
+});
+```
+
+Now a foreground notification just shows a banner, and nothing interrupts the current task unless the user taps it.
+
+## How to verify it
+
+To confirm the design works, deliberately reproduce all three states. Cold-start launches are hard to reproduce in a simulator or preview, so I strongly recommend testing on a real device.
+
+1. Kill the app from the task switcher, then tap the notification from a killed state.
+2. Send it to the background with the home gesture, then tap.
+3. Leave it open, send a notification from another device, and tap that notification.
+
+If all three land on the target screen, your routing is independent of launch state.
+
+I run several apps in parallel as an indie developer, shipping to both the App Store and Google Play, and notifications are an area where "bugs that never reproduce on my own test device" tend to surface. That's exactly why I never skip patient verification — separating the launch states and clearing them one at a time turns out to be the shortcut, even when it looks like the long way around.
+
+If you want a next step, start by rewriting the `resolveRoute` allowlist to match your own app's screen structure. Once that's settled, you only need to send structured `data` on your notifications, and taps will reach their target screen regardless of how the app was launched.
