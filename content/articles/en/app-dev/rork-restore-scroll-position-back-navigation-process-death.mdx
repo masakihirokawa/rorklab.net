@@ -1,0 +1,208 @@
+---
+title: "Your List Jumps Back to the Top — Restoring Scroll Position Across Back Navigation and Process Death"
+slug: "rork-restore-scroll-position-back-navigation-process-death"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-21T15:00"
+author: "Rork Lab"
+description: "How I rebuilt scroll restoration for a wallpaper grid by splitting it into two unrelated problems — back navigation and process death — covering getItemLayout, save timing, and killing the restore flicker."
+tags: ["Rork", "FlatList", "scroll position", "state restoration", "expo"]
+highlights:
+  - "Why a lost position on back-navigation and a lost position after process death are different bugs needing different fixes"
+  - "Restoring before the first paint with getItemLayout so there is no top-of-list flicker"
+  - "A low-cost save schedule: sample in onScroll, commit only on the move to background"
+---
+
+You're swiping through a wall of wallpapers, you tap one to see it full size, and you press back. The list has snapped to the top, and your thumb goes hunting for the row you were just on. Running a few wallpaper apps as an indie developer, the usage data slowly makes it clear how much that small friction quietly costs you.
+
+At first I thought the whole thing was one problem: "remember the scroll position on the way out." But once I started implementing it, I found the position gets lost in two situations with completely different causes. One is losing it while moving between screens. The other is losing it after the OS kills the app in the background and the user reopens it. Treat them as one problem and you only ever half-fix either.
+
+## Separate the two failures before writing any code
+
+Draw the line first. If you start bolting on persistence without this split, you end up writing the offset to disk far too often and making scrolling janky.
+
+<table>
+<thead>
+<tr><th>Situation</th><th>What is lost</th><th>Fix required</th></tr>
+</thead>
+<tbody>
+<tr><td>Push to detail, then back (within the stack)</td><td>Nothing, in principle. Lost only on tab switches or conditional unmounts</td><td>Stop unmounting the list screen</td></tr>
+<tr><td>Close and reopen the app (process alive)</td><td>Nothing — in-memory state survives</td><td>No work needed</td></tr>
+<tr><td>OS kills it in the background → relaunch</td><td>All in-memory state is gone</td><td>Persist the offset and restore it</td></tr>
+</tbody>
+</table>
+
+So persistence is genuinely needed only for the third row. The first is a navigation-structure problem and is solvable with no storage at all. Confuse the two and you drift toward writing the position to disk on every frame.
+
+## Jumping to the top on "back" usually means the screen was destroyed
+
+In a native-stack navigator, pushing the detail screen on top leaves the list screen mounted behind it. The FlatList's internal state is intact, so going back shows the same position — that is the default behavior.
+
+When it still snaps to the top, the list screen is being unmounted somewhere. The two usual culprits:
+
+The first is implementing a tab or segment switch with conditional rendering like `condition ? <List/> : <Other/>`. Every switch rebuilds `<List/>` from scratch and the scroll position resets to zero.
+
+The second is swapping the whole list out while fetching with `if (loading) return <Spinner/>`. Each refetch destroys the list and re-renders it at the top.
+
+The fix is simple: don't destroy the list.
+
+```tsx
+// ❌ List is rebuilt on every switch
+function Screen({ tab }: { tab: 'all' | 'favorites' }) {
+  return tab === 'all' ? <WallpaperList /> : <FavoriteList />;
+}
+
+// ✅ Keep both mounted, toggle only visibility
+function Screen({ tab }: { tab: 'all' | 'favorites' }) {
+  return (
+    <>
+      <View style={{ flex: 1, display: tab === 'all' ? 'flex' : 'none' }}>
+        <WallpaperList />
+      </View>
+      <View style={{ flex: 1, display: tab === 'favorites' ? 'flex' : 'none' }}>
+        <FavoriteList />
+      </View>
+    </>
+  );
+}
+```
+
+Hiding with `display: 'none'` keeps the list mounted and preserves its scroll position. For two or three tabs this plain approach is perfectly serviceable. Do the same with the loading spinner: overlay it or render it as a list header instead of replacing the whole list, and the position holds.
+
+That removes most of the back-navigation loss. What's left is the process-death case.
+
+## Hold an offset for process restoration
+
+A kill by the OS is indistinguishable, to the user, from "I closed the app." Coming back half an hour later to find yourself at the top breaks the thread. Only here does persisting the scroll offset earn its keep.
+
+Save the *index of the first visible item*, not the raw pixel offset (`contentOffset.y`). The literal offset loses meaning the moment row heights shift slightly because of fonts or thumbnail loading, whereas an index can be recomputed at restore time.
+
+Switch from `onScroll` to `onViewableItemsChanged` to grab the top visible item.
+
+```tsx
+import { useRef, useCallback } from 'react';
+import { FlatList, ViewToken } from 'react-native';
+import { storage } from '../lib/storage'; // a thin MMKV wrapper, for example
+
+const KEY = 'wallpaper:list:firstIndex';
+
+function WallpaperList({ data }: { data: Wallpaper[] }) {
+  const firstIndex = useRef(0);
+
+  const onViewableItemsChanged = useRef(
+    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
+      const top = viewableItems[0]?.index;
+      if (typeof top === 'number') firstIndex.current = top;
+    }
+  ).current;
+
+  // ... rendering below
+}
+```
+
+`onViewableItemsChanged`'s callback must be a stable reference, so it's wrapped in `useRef`. Stash the value in a ref here and write to disk on a *different* schedule — that separation is what keeps the cost down.
+
+## Commit the save when you leave, not while scrolling
+
+Calling `storage.set()` on every scroll event lets the write interleave with scroll frames and causes jank. I settled on committing only at the moment the app moves to the background, using `AppState` transitions.
+
+```tsx
+import { useEffect } from 'react';
+import { AppState } from 'react-native';
+
+function usePersistOnBackground(getIndex: () => number) {
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'background' || state === 'inactive') {
+        storage.set(KEY, getIndex());
+      }
+    });
+    return () => sub.remove();
+  }, [getIndex]);
+}
+```
+
+Before a process is killed, there is always exactly one transition to `background` first. So this single save captures everything you need to recover from a kill — there's no reason to write during scrolling. Pair it with `beforeRemove` and you also avoid dropping the value when the user dives deep into another screen.
+
+## Restore without a flicker — decide the position before the first paint
+
+Restoration is the harder half. The naive "call `scrollToIndex` after mount" paints the top first and then jumps, so the top flashes for a frame. To kill it, be at the target offset on the very first paint. That's the `initialScrollIndex` + `getItemLayout` combination.
+
+Give FlatList `getItemLayout` and it can compute each item's position instead of measuring it, so it can render straight from the `initialScrollIndex` position. For a grid (`numColumns`), derive the offset from the row height.
+
+```tsx
+const COLUMNS = 3;
+const ROW_HEIGHT = 180; // height of one row (thumbnail + spacing)
+
+const getItemLayout = (_: unknown, index: number) => {
+  const row = Math.floor(index / COLUMNS);
+  return { length: ROW_HEIGHT, offset: ROW_HEIGHT * row, index };
+};
+
+// Clamp the restored value to the data length (the list may have shrunk)
+const saved = storage.getNumber(KEY) ?? 0;
+const initialIndex = Math.min(saved, Math.max(0, data.length - 1));
+
+return (
+  <FlatList
+    data={data}
+    numColumns={COLUMNS}
+    getItemLayout={getItemLayout}
+    initialScrollIndex={initialIndex}
+    onViewableItemsChanged={onViewableItemsChanged}
+    viewabilityConfig={{ itemVisiblePercentThreshold: 50 }}
+    renderItem={renderItem}
+    keyExtractor={(item) => item.id}
+  />
+);
+```
+
+Two gotchas I hit in production.
+
+The `getItemLayout` row height must match what actually renders. If it's off, the restored position drifts up or down by a little. A fixed value is fine when thumbnails have a constant aspect ratio; for variable heights you can't use `initialScrollIndex` and switch to the "jump once after layout" approach below.
+
+And with `initialScrollIndex`, because the intermediate items aren't rendered while the target is offscreen, you occasionally get a `scrollToIndex out of range` warning. Implement `onScrollToIndexFailed` and fall back to `scrollToOffset` after a beat.
+
+```tsx
+const listRef = useRef<FlatList>(null);
+
+const onScrollToIndexFailed = (info: { index: number }) => {
+  // wait a tick, then retry by offset
+  setTimeout(() => {
+    listRef.current?.scrollToOffset({
+      offset: ROW_HEIGHT * Math.floor(info.index / COLUMNS),
+      animated: false,
+    });
+  }, 50);
+};
+```
+
+For variable-height lists, give up on `initialScrollIndex` and instead scroll once, the first time `onContentSizeChange` fires. Don't forget a flag to enforce the "once."
+
+```tsx
+const restored = useRef(false);
+
+<FlatList
+  // ...
+  onContentSizeChange={() => {
+    if (restored.current) return;
+    restored.current = true;
+    listRef.current?.scrollToOffset({ offset: savedOffset, animated: false });
+  }}
+/>
+```
+
+For variable heights, persist the raw offset rather than an index. Since row height isn't constant, you can't reconstruct a position from an index — this is the one place I choose to hold a pixel offset.
+
+## If you're on FlashList, the assumptions shift a little
+
+If you've moved to `@shopify/flash-list`, you don't need `getItemLayout`; you give it `estimatedItemSize` instead. Restoration still uses `initialScrollIndex` directly, and its recycling model makes the top-of-list flicker far less likely. The catch is that a wildly wrong estimate makes the first scroll rough, so seed it with a value close to the real measurement. After I moved the wallpaper grid onto FlashList, the restoration code got noticeably shorter — and `initialScrollIndex` working even with variable heights is a real advantage.
+
+## Where to draw the line
+
+You don't need process-restoration on every list. My rule of thumb runs like this.
+
+Main feeds, search results, and long vertical screens are worth it. Settings screens and short lists of a screen or two are not. The restore code is small, but it carries maintenance cost in the form of row-height bookkeeping and retry branches. Holding position on "back" comes free from the navigation structure, so guard it everywhere; reserve disk persistence for the genuinely long lists. That two-tier stance has frayed the least for me in practice.
+
+Scroll restoration is the kind of feature nobody thanks you for. But when it's broken, a sliver of trust wears away every time a thumb has to re-find the same spot. The parts that work quietly are exactly the ones I want to build with care.
