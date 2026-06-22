@@ -1,0 +1,189 @@
+---
+title: "壊れたキャッシュで毎回起動時に落ちるアプリ——ユーザーが自力で抜け出せる「セーフモード起動」を設計する"
+slug: "rork-expo-boot-loop-guard-safe-mode-poisoned-state-reset"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T21:05"
+author: "Rork Lab"
+description: "永続化したキャッシュが壊れて起動のたびに同じ場所で落ちると、ユーザーには再インストールしか残りません。アプリ自身が早期クラッシュの連続を数え、対話可能になって初めて起動を確定し、危険な状態だけを段階的にリセットするセーフモードを、Expo（React Native）の実装で設計します。"
+tags: ["Rork", "Expo", "React Native", "クラッシュ対策", "MMKV", "設計"]
+highlights:
+  - "ErrorBoundary でも Crashlytics でも救えない「起動ループ」を、アプリ自身に気づかせて自己回復させる設計"
+  - "起動を未確認で数え、対話可能になって初めて確定する仕組みと、なぜ同期ストレージ（MMKV）でないと数えられないのか"
+  - "被害範囲を最小にする段階的リセットの梯子と、ユーザー作成データを絶対に触らないための原則"
+---
+
+個人開発で複数のアプリを運用していると、ごくたまに「特定の端末だけ、起動した瞬間に落ちて二度と開けない」という報告が届きます。私自身、永続化していた設定の一部が壊れたレコードになり、起動時の復元処理がそこで例外を投げて、以後は何度開いても同じ場所で落ち続ける状態に遭遇したことがあります。
+
+厄介なのは、この状態に陥ったユーザーには手段がほとんど残らないことです。アプリは開けない、設定画面にもたどり着けない、つまりアンインストールして入れ直す以外にできることがありません。起動ループはそのまま離脱率に直結します。そして再インストールは、レビュー欄でいちばん辛辣な一言につながります。
+
+ここで扱いたいのは、壊れた状態を後から手で直すことではありません。アプリ自身が「自分は起動のたびに早期に落ちている」と気づき、危険な状態だけを段階的に捨てて立ち上がり直す——そんなセーフモード起動の設計を扱います。
+
+## なぜ ErrorBoundary や Crashlytics では抜け出せないのか
+
+まず、既存の備えがこの問題のどこに効かないかを整理しておきます。
+
+ErrorBoundary は強力ですが、守れるのは React のレンダーツリーの内側だけです。起動ループの多くは、プロバイダが永続ストアを復元している最中や、ネイティブ側のモジュール初期化で起きます。ツリーがマウントされる前に落ちれば、境界は捕まえる対象を持ちません。React の例外捕捉の基本は[未処理の Promise まで取りこぼさない ErrorBoundary の設計](/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide)で扱っていますが、それでも「マウント前のクラッシュ」は守備範囲の外です。
+
+Crashlytics はクラッシュを記録してくれますが、記録は事後です。ユーザーの端末でループが止まるわけではありません。[iOS の 0x8badf00d ウォッチドッグ終了](/articles/rork-dev/rork-ios-launch-watchdog-0x8badf00d-fix)のように OS がメインスレッドの停滞で殺してくるケースとも違い、ここで問題なのは「コードは正しく動いているのに、与えられた永続データが壊れている」点です。コードを直しても、すでに壊れた状態を持っている端末は救われません。
+
+つまり必要なのは、観測でも捕捉でもなく、**端末側で自走する回復ロジック**です。[起動直後の白画面・クラッシュの切り分け](/articles/rork-dev/rork-app-launch-crash-white-screen-fix)を一歩進め、切り分けをアプリ自身にやらせる、と考えると分かりやすいかもしれません。
+
+## 設計の核：起動を「未確認」で数え、対話可能になって初めて確定する
+
+仕組みの中心はとても単純です。
+
+起動が始まった瞬間に「未確認の起動」を1つ増やします。そしてアプリが実際に対話可能な状態（最初の画面が描画され、ユーザーが触れる状態）まで到達したら、その未確認カウントをゼロに戻します。これを「起動の確定」と呼ぶことにします。
+
+もしアプリが対話可能になる前に落ちれば、確定は実行されません。未確認カウントは増えたまま残ります。次の起動でまた増え、また落ちれば、カウントは積み上がっていきます。これが連続して一定回数に達したとき、「この端末は起動ループに入っている」と判断します。
+
+```ts
+import { MMKV } from 'react-native-mmkv'
+
+const store = new MMKV({ id: 'boot-guard' })
+const KEY_PENDING = 'boot.pending'      // 未確認の連続起動回数
+const KEY_LAST = 'boot.lastStartAt'     // 直近の起動開始時刻
+const FAILED_BOOT_THRESHOLD = 3         // この回数の連続失敗でセーフモード
+const RECENT_WINDOW_MS = 30_000         // この間隔を超える起動は「連続」とみなさない
+
+export type BootDecision = { safeMode: boolean; failedBoots: number }
+
+// プロバイダを一切マウントする前に、エントリの先頭で呼ぶ
+export function beginBoot(): BootDecision {
+  const now = Date.now()
+  const lastStart = store.getNumber(KEY_LAST) ?? 0
+  let pending = store.getNumber(KEY_PENDING) ?? 0
+
+  // 速い連続でなければ起動ループではない。数え直す
+  if (now - lastStart > RECENT_WINDOW_MS) pending = 0
+
+  store.set(KEY_PENDING, pending + 1)
+  store.set(KEY_LAST, now)
+
+  // この起動を始める前に、すでに閾値ぶん落ちているか
+  return { safeMode: pending >= FAILED_BOOT_THRESHOLD, failedBoots: pending }
+}
+
+// 対話可能になったら呼ぶ。これで連続失敗カウントが消える
+export function confirmBoot() {
+  store.set(KEY_PENDING, 0)
+}
+```
+
+`RECENT_WINDOW_MS` を挟んでいるのは、誤検知を避けるためです。ユーザーがアプリを開いてすぐ閉じ、数日後にまた開いた——というのはクラッシュループではありません。連続して短時間に起動が積み上がったときだけをループとみなします。
+
+## なぜ同期ストレージ（MMKV）でなければ数えられないのか
+
+ここが実装で最初につまずく点です。`AsyncStorage` でこのカウンタを書こうとすると、ほぼ確実に失敗します。
+
+理由は、`AsyncStorage` の書き込みが非同期だからです。`beginBoot()` で書き込みを発行しても、その値がディスクに書き終わる前にクラッシュが起きれば、カウンタは増えません。起動ループはまさに「起動直後に落ちる」現象なので、書き込みが間に合わない確率が高いのです。
+
+`react-native-mmkv` は同期 API を持ち、`store.set()` が戻った時点で値は確定しています。起動の数え上げという「クラッシュの直前に確実に残したい一行」には、この同期性が要ります。永続化の選択肢全体の比較は[AsyncStorage・MMKV・SQLite の使い分け](/articles/rork-dev/rork-local-storage-asyncstorage-mmkv-sqlite-guide)に譲りますが、ブートガードに限れば選択肢は実質ひとつです。
+
+もう一点、ブートガード用のストアは**アプリ本体の永続ストアとは別 ID で持つ**ことを推奨します。アプリ本体のデータが壊れてセーフモードに入る場面で、その同じストアにカウンタを同居させていると、リセット対象に巻き込んで自分の足を撃つことになります。
+
+## セーフモードの段階的リセット——被害範囲を最小にする梯子
+
+セーフモードに入ったら、いきなり全部を消してはいけません。失われるものが小さい操作から順に試し、それでも落ち続けるなら一段深く踏み込む——という梯子で考えます。
+
+<table>
+  <thead>
+    <tr><th>段階</th><th>条件（連続失敗回数）</th><th>操作</th><th>失われるもの</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>3 以上</td><td>サーバー由来のクエリキャッシュを破棄</td><td>なし（再取得で復元）</td></tr>
+    <tr><td>2</td><td>4 以上</td><td>UI 設定・表示状態など再構築可能なローカル状態を初期化</td><td>テーマや並び順などの設定</td></tr>
+    <tr><td>3</td><td>6 以上</td><td>破損が疑われる揮発レコードのみを削除</td><td>キャッシュ的な一時データのみ</td></tr>
+    <tr><td>4</td><td>上記でも復帰せず</td><td>復旧画面を出し、ユーザーの同意を得てから初期化</td><td>同意した範囲のみ</td></tr>
+  </tbody>
+</table>
+
+```ts
+export function enterSafeMode(failedBoots: number) {
+  // 被害の小さい順に。失敗が深いほど踏み込む
+  clearQueryCache()                              // 段階1: 再取得で戻る
+  if (failedBoots >= 4) clearRebuildableState()  // 段階2: 設定・表示状態
+  if (failedBoots >= 6) wipeVolatileRecords()    // 段階3: 破損が疑われる一時データ
+
+  // 観測のために必ず痕跡を残す（後述）
+  crashBreadcrumb('entered_safe_mode', { failedBoots })
+}
+```
+
+この梯子で守りたい原則は一つです。**ユーザーが自分で作ったデータ（メモ・写真・お気に入りなど）には、同意なしに絶対に触れない**こと。自動で消してよいのは「サーバーから再取得できるもの」「再計算・再構築できるもの」だけです。段階4で初期化に踏み込むときも、何を消すのかを画面で説明し、ユーザーの操作を待ちます。回復のために体験を壊しては本末転倒だからです。
+
+## 起動を「確定」させるシグナルをどこに置くか
+
+未確認カウントをゼロに戻すタイミングは、設計のもう一つの要です。早すぎれば、確定後にまだ初期化処理が残っていて落ちた場合にループを検知できません。遅すぎれば、正常な起動を誤って失敗とみなす確率が上がります。
+
+私の場合、落ち着いた置き方は「ナビゲーションの準備完了 → 最初の操作の後 → 短い猶予」の三段です。
+
+```tsx
+import { InteractionManager } from 'react-native'
+import { confirmBoot } from './boot-guard'
+
+let confirmTimer: ReturnType<typeof setTimeout> | null = null
+
+// RootNavigation の onReady から呼ぶ
+export function scheduleBootConfirm() {
+  InteractionManager.runAfterInteractions(() => {
+    // 直後の初期化が落ち着くまで少し待ってから確定する
+    confirmTimer = setTimeout(() => confirmBoot(), 2000)
+  })
+}
+
+export function cancelBootConfirm() {
+  if (confirmTimer) clearTimeout(confirmTimer)
+}
+```
+
+`InteractionManager.runAfterInteractions` で初回のアニメーションや遷移が落ち着くのを待ち、さらに2秒ほど置いてから確定します。この猶予のあいだに落ちれば未確認のまま残るので、「描画はできたが直後の処理で落ちる」タイプのループもすくい上げられます。
+
+エントリ側の組み立ては次のようになります。プロバイダをマウントする前に `beginBoot()` を呼び、その判断をプロバイダの復元挙動に渡すのが肝心です。
+
+```tsx
+import { beginBoot, enterSafeMode } from './boot-guard'
+
+const decision = beginBoot()             // 何よりも先に呼ぶ
+if (decision.safeMode) enterSafeMode(decision.failedBoots)
+
+export default function App() {
+  return (
+    <Providers skipRehydration={decision.safeMode}>
+      <RootNavigation onReady={scheduleBootConfirm} />
+    </Providers>
+  )
+}
+```
+
+`skipRehydration` が効いています。起動ループの原因の多くは「壊れた永続データの復元」なので、セーフモードでは復元そのものを飛ばし、既定値から立ち上げます。原因の現場を踏まずに、まず開ける状態を取り戻すわけです。
+
+## セーフモードが何回発動したかを観測する
+
+自己回復は、観測できて初めて運用に乗ります。セーフモードに入ったこと、どの段階まで踏み込んだか、そして無事に起動が確定したかを、必ず痕跡として残してください。
+
+```ts
+import crashlytics from '@react-native-firebase/crashlytics'
+
+export function crashBreadcrumb(event: string, attrs: Record<string, number | string>) {
+  crashlytics().log(`${event} ${JSON.stringify(attrs)}`)
+  for (const [k, v] of Object.entries(attrs)) {
+    crashlytics().setAttribute(`boot_${k}`, String(v))
+  }
+}
+```
+
+ブレッドクラムとして残しておけば、たとえセーフモードが効かず最終的に落ちた場合でも、クラッシュレポートに「直前にセーフモードへ入っていた」事実が添付されます。これは原因究明の出発点として非常に有効です。発動率を継続的に見れば、特定のアプリバージョンや特定のOSで急増していないかを早期に掴めます。クラッシュを率と予算で捉える視点は[クラッシュフリー率を SLO と誤差予算で運用する考え方](/articles/rork-dev/rork-crash-free-error-budget-slo-six-apps-investment-decision)と地続きで、ブートガードはその予算を守る最後の一枚になります。
+
+たとえばクラッシュフリー率の目標を 99.5% に置くなら、ブートガードはその最後の 0.5% を取りこぼさないための仕組みになります。理想は、セーフモードの発動率がゼロに近いことです。発動が常態化しているなら、それはガードが救っているのではなく、根本原因を放置しているサインです。ガードはあくまで時間を稼ぐ仕組みであって、壊れたデータを生む原因の修正を免除するものではありません。
+
+## 導入の順序と、壊さないための原則
+
+最後に、入れる順番を整理しておきます。いきなり全部を本番へ入れるのではなく、観測から始めるのが安全です。
+
+まずブートガードの数え上げとブレッドクラムだけを入れ、`enterSafeMode` は何もしない空実装で出します。これで「自分のアプリで起動ループがどのくらいの頻度で起きているか」が見えます。発動が観測できてから、段階1のクエリキャッシュ破棄だけを有効にし、効果を確かめながら段階を足していきます。
+
+設計を通して守るべき原則は、突き詰めれば二つです。ひとつは、**確実に残すべき一行は同期で書く**こと。もうひとつは、**自動で消してよいのは再構築できるものだけ**ということ。この二つを外さなければ、ブートガードはユーザーの最後の砦になります。
+
+同じように複数アプリを抱える方は、ブートガードを共通モジュールとして切り出し、リセット対象だけをアプリごとに差し替える形にしておくと運用が楽になります。私自身はこの形に落ち着いてから、起動ループの報告に対して「次のアップデートを待ってください」としか言えなかった状況から、ようやく一歩前へ進めたと感じています。

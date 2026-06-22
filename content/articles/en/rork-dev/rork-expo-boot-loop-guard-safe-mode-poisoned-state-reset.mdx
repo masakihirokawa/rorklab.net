@@ -1,0 +1,189 @@
+---
+title: "When a Poisoned Cache Crashes Your App on Every Launch — Designing a Safe-Mode Boot Your Users Can Escape On Their Own"
+slug: "rork-expo-boot-loop-guard-safe-mode-poisoned-state-reset"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T21:05"
+author: "Rork Lab"
+description: "When a persisted cache goes bad and the app crashes at the same spot on every launch, the only option left to the user is to reinstall. This article designs a safe-mode boot for Expo (React Native): the app counts its own early crashes, confirms a launch only once it becomes interactive, and resets just the dangerous state in graduated steps."
+tags: ["Rork", "Expo", "React Native", "Crash Resilience", "MMKV", "Architecture"]
+highlights:
+  - "Escaping a boot loop that neither ErrorBoundary nor Crashlytics can break — by letting the app notice and recover on its own"
+  - "Counting a launch as unconfirmed until the app becomes interactive, and why only synchronous storage (MMKV) can record that counter reliably"
+  - "A graduated reset ladder that minimizes blast radius, with a hard rule never to touch user-created data"
+---
+
+Running several apps on my own as an indie developer, I occasionally get a report that reads like a dead end: on one particular device, the app crashes the instant it launches and never opens again. I have hit this myself. A piece of persisted settings had turned into a corrupt record, the restore step on startup threw an exception right there, and from then on the app died at the same spot no matter how many times it was reopened.
+
+What makes it brutal is how few options the user has left. The app won't open, the settings screen is unreachable, so there is nothing to do but uninstall and reinstall. And a reinstall is exactly the kind of moment that produces the harshest line in a review.
+
+This article is about not fixing that broken state by hand after the fact, but designing a safe-mode boot: the app itself recognizes that it keeps crashing early, throws away only the dangerous state in graduated steps, and stands back up.
+
+## Why ErrorBoundary and Crashlytics Can't Get You Out
+
+Let me first place where the usual defenses fall short on this specific problem.
+
+ErrorBoundary is powerful, but it only protects the inside of the React render tree. Most boot loops happen while a provider is rehydrating a persisted store, or during native module initialization. If the crash lands before the tree mounts, the boundary has nothing to catch. The fundamentals of catching exceptions in React — down to unhandled promises — are covered in [designing an ErrorBoundary that doesn't drop unhandled promises](/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide), but a crash before mount is still out of its reach.
+
+Crashlytics records the crash, but the record is after the fact. It does not stop the loop on the user's device. This is also different from an [iOS 0x8badf00d watchdog termination](/articles/rork-dev/rork-ios-launch-watchdog-0x8badf00d-fix), where the OS kills you for blocking the main thread. Here the code is running correctly — the persisted data it was handed is the thing that is broken. Fixing the code doesn't save a device that already holds the poisoned state.
+
+So what you need is neither observation nor capture, but **recovery logic that runs on its own on the device**. It helps to think of it as taking [the white-screen-versus-crash triage at launch](/articles/rork-dev/rork-app-launch-crash-white-screen-fix) one step further and letting the app perform that triage itself.
+
+## The Core Idea: Count a Launch as Unconfirmed Until It Becomes Interactive
+
+The mechanism at the center is simple.
+
+The moment a launch begins, increment an "unconfirmed launch" counter by one. When the app actually reaches an interactive state — the first screen has rendered and the user can touch it — reset that counter to zero. Call this "confirming the launch."
+
+If the app crashes before it becomes interactive, the confirm never runs. The counter stays elevated. The next launch increments it again, and if it crashes again, the count keeps building. When that happens enough times in a row, you conclude that this device has entered a boot loop.
+
+```ts
+import { MMKV } from 'react-native-mmkv'
+
+const store = new MMKV({ id: 'boot-guard' })
+const KEY_PENDING = 'boot.pending'      // consecutive unconfirmed launches
+const KEY_LAST = 'boot.lastStartAt'     // timestamp of the most recent launch
+const FAILED_BOOT_THRESHOLD = 3         // this many consecutive failures -> safe mode
+const RECENT_WINDOW_MS = 30_000         // launches farther apart aren't "consecutive"
+
+export type BootDecision = { safeMode: boolean; failedBoots: number }
+
+// Call at the very top of the entry, before mounting any provider
+export function beginBoot(): BootDecision {
+  const now = Date.now()
+  const lastStart = store.getNumber(KEY_LAST) ?? 0
+  let pending = store.getNumber(KEY_PENDING) ?? 0
+
+  // Not a quick succession -> not a boot loop. Start counting over.
+  if (now - lastStart > RECENT_WINDOW_MS) pending = 0
+
+  store.set(KEY_PENDING, pending + 1)
+  store.set(KEY_LAST, now)
+
+  // Before this launch even starts, have we already failed the threshold?
+  return { safeMode: pending >= FAILED_BOOT_THRESHOLD, failedBoots: pending }
+}
+
+// Call once the app is interactive. This clears the consecutive-failure count.
+export function confirmBoot() {
+  store.set(KEY_PENDING, 0)
+}
+```
+
+The `RECENT_WINDOW_MS` gate exists to avoid false positives. A user who opens the app, closes it right away, and opens it again days later is not in a crash loop. Only launches that pile up in quick succession count as one.
+
+## Why You Can Only Count This with Synchronous Storage (MMKV)
+
+This is the first place the implementation trips people up. If you try to write this counter with `AsyncStorage`, it will almost certainly fail.
+
+The reason is that `AsyncStorage` writes asynchronously. Even if `beginBoot()` issues a write, the value may not have reached disk before the crash hits, so the counter never increments. A boot loop is precisely the "crash right after launch" phenomenon, which makes it very likely the write doesn't land in time.
+
+`react-native-mmkv` has a synchronous API: by the time `store.set()` returns, the value is committed. For "the one line you must persist right before a crash," that synchronicity is exactly what you need. A full comparison of the persistence options lives in [choosing between AsyncStorage, MMKV, and SQLite](/articles/rork-dev/rork-local-storage-asyncstorage-mmkv-sqlite-guide), but for a boot guard there is effectively one choice.
+
+One more thing: keep the boot-guard store under **a separate ID from your app's main persisted store**. If the app's own data is what's corrupt and triggering safe mode, and the counter lives in that same store, you'll sweep it into the reset and shoot yourself in the foot.
+
+## The Safe-Mode Reset Ladder — Minimizing Blast Radius
+
+Once you are in safe mode, do not wipe everything at once. Think in terms of a ladder: try the operation that loses the least first, and only step deeper if it keeps crashing.
+
+<table>
+  <thead>
+    <tr><th>Step</th><th>Condition (consecutive failures)</th><th>Action</th><th>What is lost</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>3 or more</td><td>Discard server-derived query cache</td><td>Nothing (restored by refetch)</td></tr>
+    <tr><td>2</td><td>4 or more</td><td>Reset rebuildable local state such as UI settings and view state</td><td>Settings like theme and sort order</td></tr>
+    <tr><td>3</td><td>6 or more</td><td>Delete only volatile records suspected of corruption</td><td>Cache-like temporary data only</td></tr>
+    <tr><td>4</td><td>Still not recovering</td><td>Show a recovery screen and reset only with the user's consent</td><td>Only what was consented to</td></tr>
+  </tbody>
+</table>
+
+```ts
+export function enterSafeMode(failedBoots: number) {
+  // Least destructive first; step deeper the worse it gets.
+  clearQueryCache()                              // step 1: comes back via refetch
+  if (failedBoots >= 4) clearRebuildableState()  // step 2: settings, view state
+  if (failedBoots >= 6) wipeVolatileRecords()    // step 3: suspected-corrupt temp data
+
+  // Always leave a trace for observability (see below)
+  crashBreadcrumb('entered_safe_mode', { failedBoots })
+}
+```
+
+There is one principle this ladder is built to protect: **never touch data the user created themselves — notes, photos, favorites — without consent.** The only things safe to delete automatically are "what can be refetched from the server" and "what can be recomputed or rebuilt." Even when you step into a reset at step 4, explain on screen what will be removed and wait for the user to act. Breaking the experience in the name of recovery defeats the purpose.
+
+## Where to Place the Signal That "Confirms" a Launch
+
+When to reset the unconfirmed counter is the other pillar of this design. Too early, and a crash that happens after confirm — while initialization is still finishing — won't be detected as a loop. Too late, and you raise the odds of misjudging a healthy launch as a failure.
+
+The placement I settled on is three-staged: navigation ready, then after the first interaction, then a short grace period.
+
+```tsx
+import { InteractionManager } from 'react-native'
+import { confirmBoot } from './boot-guard'
+
+let confirmTimer: ReturnType<typeof setTimeout> | null = null
+
+// Call from RootNavigation's onReady
+export function scheduleBootConfirm() {
+  InteractionManager.runAfterInteractions(() => {
+    // Wait a little for post-launch init to settle before confirming
+    confirmTimer = setTimeout(() => confirmBoot(), 2000)
+  })
+}
+
+export function cancelBootConfirm() {
+  if (confirmTimer) clearTimeout(confirmTimer)
+}
+```
+
+`InteractionManager.runAfterInteractions` waits for the first animations and transitions to settle, and then we wait about two more seconds before confirming. If the app crashes during that grace period, it stays unconfirmed — so loops of the "renders fine but dies in the work right after" variety are also caught.
+
+The entry assembly looks like this. Calling `beginBoot()` before mounting any provider, and feeding that decision into the providers' rehydration behavior, is the crux.
+
+```tsx
+import { beginBoot, enterSafeMode } from './boot-guard'
+
+const decision = beginBoot()             // call before anything else
+if (decision.safeMode) enterSafeMode(decision.failedBoots)
+
+export default function App() {
+  return (
+    <Providers skipRehydration={decision.safeMode}>
+      <RootNavigation onReady={scheduleBootConfirm} />
+    </Providers>
+  )
+}
+```
+
+`skipRehydration` is doing the work. Since most boot loops are caused by "restoring corrupt persisted data," safe mode skips the restore entirely and starts from defaults. You get the app openable again without stepping on the exact spot that was failing.
+
+## Observing How Often Safe Mode Fires
+
+Self-recovery only earns its place in operations once you can observe it. Always leave a trace: that safe mode was entered, how deep into the ladder it went, and whether the launch ultimately confirmed.
+
+```ts
+import crashlytics from '@react-native-firebase/crashlytics'
+
+export function crashBreadcrumb(event: string, attrs: Record<string, number | string>) {
+  crashlytics().log(`${event} ${JSON.stringify(attrs)}`)
+  for (const [k, v] of Object.entries(attrs)) {
+    crashlytics().setAttribute(`boot_${k}`, String(v))
+  }
+}
+```
+
+Left as a breadcrumb, even if safe mode fails to help and the app ultimately crashes, the crash report carries the fact that "safe mode had just been entered." That is a very effective starting point for diagnosis. Watching the firing rate over time lets you catch early when a specific app version or OS makes it spike. Treating crashes as a rate and a budget is continuous with [running crash-free rate as an SLO with an error budget](/articles/rork-dev/rork-crash-free-error-budget-slo-six-apps-investment-decision), and the boot guard is the last sheet of defense protecting that budget.
+
+Ideally, the safe-mode firing rate stays close to zero. If firing becomes routine, that is not the guard saving you — it is a sign you are leaving the root cause unaddressed. The guard only buys time; it does not excuse fixing whatever is producing the broken data.
+
+## The Rollout Order, and the Principles That Keep It From Breaking Things
+
+Finally, the order of adoption. Rather than shipping all of it to production at once, it is safer to begin with observation.
+
+First, ship only the boot-guard counting and the breadcrumb, with `enterSafeMode` as a no-op. That alone tells you how often boot loops actually happen in your app. Once firing is observable, enable just step 1 — discarding the query cache — and add steps as you confirm the effect.
+
+Boiled down, two principles run through the whole design. One: **the line you must persist reliably has to be written synchronously.** Two: **only what can be rebuilt is safe to delete automatically.** Hold to those two and the boot guard becomes the user's last line of defense.
+
+If you carry several apps the way I do, it pays to extract the boot guard as a shared module and swap only the reset targets per app. Personally, once I settled on this shape, I finally moved past the situation where all I could tell a stuck user was "please wait for the next update."
