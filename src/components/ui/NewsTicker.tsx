@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成。iPhone・iPad・Watch・TV・Vision Pro・iMessageに対応します",
-    "NATIVE — AR/LiDAR・Metalの3Dゲーム・Dynamic Island・Live Activities・HealthKit・Core MLなどネイティブ機能を解放します",
-    "CORE — 通常のRorkはReact Native（Expo）でiOS/Androidアプリを生成。自然言語からストア公開まで到達できます",
-    "FUNDING — Rorkはa16zから$2.8Mを調達しました",
-    "GROWTH — 月間743,000訪問・成長率85%と勢いを増しています",
-    "PRICING — 無料で始められ、有料プランは$25/月〜です",
+    "PRODUCT — Rork Maxがネイティブ Swift アプリを生成。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — Rork MaxはAR/LiDAR・Metalの3Dゲーム・Dynamic Island・Live Activities・HealthKit・Core MLなどを解放します",
+    "CLASSIC — 通常のRorkはReact Native（Expo）で、英語の説明だけからiOS/Androidアプリを生成しストア配信できます",
+    "FUNDING — a16zから$2.8Mを調達（別途$15Mも）。月743,000訪問・成長率85%と伸びています",
+    "PRICING — 無料で始められ、有料プランは月25ドル〜。Rork Maxは月200ドルです",
+    "CHOICE — クロスプラットフォームのRorkか、Apple専用機能まで踏み込むRork Maxか、用途で選び分けられます",
   ],
   en: [
-    "MAX — Rork Max builds native Swift apps instead of React Native, supporting iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
-    "NATIVE — It unlocks native capabilities: AR/LiDAR, Metal 3D games, Dynamic Island, Live Activities, HealthKit, and Core ML",
-    "CORE — Standard Rork generates iOS/Android apps with React Native (Expo), taking you from plain English to the app stores",
-    "FUNDING — Rork raised $2.8M from a16z (Andreessen Horowitz)",
-    "GROWTH — The platform now sees 743,000 monthly visits with 85% growth",
-    "PRICING — Free to start, with paid plans from $25/month",
+    "PRODUCT — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — Rork Max unlocks AR/LiDAR, Metal 3D games, Dynamic Island, Live Activities, HealthKit, and Core ML",
+    "CLASSIC — The original Rork uses React Native (Expo), turning plain-English prompts into shippable iOS/Android apps",
+    "FUNDING — Rork raised $2.8M from a16z (plus $15M more), reaching 743,000 monthly visits at 85% growth",
+    "PRICING — Rork is free to start, with paid plans from $25/month; Rork Max is $200/month",
+    "CHOICE — Pick cross-platform Rork or Rork Max for deep Apple-native capabilities, depending on your goal",
   ],
 };
 
