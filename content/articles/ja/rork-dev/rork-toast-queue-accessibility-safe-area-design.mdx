@@ -1,0 +1,340 @@
+---
+title: "Rork（Expo）のトーストは、重なっても読み上げられても崩れない設計にする"
+slug: "rork-toast-queue-accessibility-safe-area-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T14:40"
+author: "Rork Lab"
+description: "Rork が生成した React Native アプリにトースト通知を足すとき、単純な実装は『同時に2つ出ると重なる』『スクリーンリーダーに無視される』『ノッチやホームインジケータに隠れる』の3点で破綻します。ルート1か所に置くキュー設計、本体の再レンダーから切り離すアニメーション、AccessibilityInfo による読み上げ、セーフエリア対応までを動くコードで示します。"
+tags: ["Rork", "React Native", "Expo", "アクセシビリティ", "UX設計"]
+highlights:
+  - "画面ごとにトーストを置くと必ず破綻する理由と、ルート1か所のキューに集約する Context + reducer の最小実装"
+  - "複数のトーストが同時に飛んできたときの重なり・重複・自動消去を、本体ツリーの再レンダーを起こさずに捌く設計"
+  - "スクリーンリーダーに黙殺されないための AccessibilityInfo 読み上げと、ノッチ／ホームインジケータを避けるセーフエリア配置の実装"
+---
+
+最初に作ったトーストは、画面のコンポーネントの中に `useState` で1つだけ持たせる、ごく素直なものでした。保存に成功したら「保存しました」と一瞬出る。それだけのつもりでした。
+
+ところが本番で使い始めると、細かい綻びが次々に出てきます。同期処理が二重に走ったときに2つのトーストがぴったり重なって読めなくなる。VoiceOver をオンにしているユーザーには、そもそもトーストが出たことすら伝わっていない。iPhone のホームインジケータの上にちょうど被って、文字の下半分が切れている。どれも「動いてはいる」のに、肝心の人に届いていないのです。
+
+トーストは小さな部品ですが、こうした破綻はすべて「どこに状態を持つか」という一点に根があります。今回は、個人開発で複数の Expo アプリを同じ作法で運用するために私自身が落ち着いた、崩れにくいトースト設計を、動くコードで順に組み立てていきます。
+
+## 画面の中にトーストを持つと、なぜ必ず破綻するのか
+
+素直な実装は、トーストの表示状態を「今いる画面」のコンポーネントに持たせます。これが破綻の出発点です。
+
+問題は3つの層で起きます。1つ目は重なりです。状態が画面ごとに分散していると、別の画面遷移やバックグラウンド処理から飛んできた通知を1か所で調停できず、同時に複数が描画されます。2つ目は寿命です。トーストを出した画面がアンマウントされると、まだ表示中のトーストやその自動消去タイマーごと消えるか、逆に宙に浮きます。3つ目は再レンダーです。トーストの出入りアニメーションを画面コンポーネントの state で駆動すると、その画面の重いリスト全体が一緒に再レンダーされ、スクロール中にカクつきます。
+
+解決の方向は1つです。トーストの状態は、アプリのルートに1か所だけ置く。画面はそこへ「出して」と依頼するだけにする。この単一の真実の源（single source of truth）に寄せると、上の3つはまとめて消えます。
+
+## ルートに1か所だけ置く ToastProvider
+
+まず状態の入れ物を作ります。`useReducer` でトーストの配列を管理し、Context 経由で `show` と `hide` を配ります。ポイントは、表示そのもの（オーバーレイ）をこのプロバイダの中で1度だけ描画することです。画面側は state を一切持ちません。
+
+```tsx
+// toast/ToastContext.tsx
+import React, { createContext, useCallback, useContext, useReducer, useRef } from "react";
+
+export type ToastVariant = "success" | "error" | "info";
+
+export type ToastInput = {
+  message: string;
+  variant?: ToastVariant;
+  durationMs?: number; // 自動消去まで。0 で手動のみ
+  dedupeKey?: string;  // 同じキーは重複させない
+};
+
+export type Toast = Required<Omit<ToastInput, "dedupeKey">> & {
+  id: string;
+  dedupeKey?: string;
+};
+
+type Action =
+  | { type: "PUSH"; toast: Toast }
+  | { type: "REMOVE"; id: string };
+
+function reducer(state: Toast[], action: Action): Toast[] {
+  switch (action.type) {
+    case "PUSH": {
+      // 同じ dedupeKey が既にあるなら追加しない（二重送信対策）
+      if (action.toast.dedupeKey &&
+          state.some((t) => t.dedupeKey === action.toast.dedupeKey)) {
+        return state;
+      }
+      // 画面を埋め尽くさないよう、同時表示は最大3件に保つ
+      const next = [...state, action.toast];
+      return next.slice(-3);
+    }
+    case "REMOVE":
+      return state.filter((t) => t.id !== action.id);
+    default:
+      return state;
+  }
+}
+
+type ToastApi = {
+  show: (input: ToastInput) => string;
+  hide: (id: string) => void;
+};
+
+const ToastContext = createContext<ToastApi | null>(null);
+export const ToastStateContext = createContext<Toast[]>([]);
+
+export function ToastProvider({ children }: { children: React.ReactNode }) {
+  const [toasts, dispatch] = useReducer(reducer, []);
+  const seq = useRef(0);
+
+  const hide = useCallback((id: string) => {
+    dispatch({ type: "REMOVE", id });
+  }, []);
+
+  const show = useCallback((input: ToastInput) => {
+    const id = `t${Date.now()}_${seq.current++}`;
+    const toast: Toast = {
+      id,
+      message: input.message,
+      variant: input.variant ?? "info",
+      durationMs: input.durationMs ?? 3200,
+      dedupeKey: input.dedupeKey,
+    };
+    dispatch({ type: "PUSH", toast });
+    return id;
+  }, []);
+
+  return (
+    <ToastContext.Provider value={{ show, hide }}>
+      <ToastStateContext.Provider value={toasts}>
+        {children}
+      </ToastStateContext.Provider>
+    </ToastContext.Provider>
+  );
+}
+
+export function useToast() {
+  const ctx = useContext(ToastContext);
+  if (!ctx) throw new Error("useToast must be used within ToastProvider");
+  return ctx;
+}
+```
+
+`show` を呼ぶ画面側は、これだけになります。
+
+```tsx
+const { show } = useToast();
+
+async function onSave() {
+  try {
+    await save();
+    show({ message: "保存しました", variant: "success" });
+  } catch {
+    show({ message: "保存に失敗しました。通信状況をご確認ください", variant: "error", durationMs: 5000 });
+  }
+}
+```
+
+`dedupeKey` を渡せば、ボタン連打や再試行で同じ通知が積み上がるのを防げます。たとえばオフライン警告には `dedupeKey: "offline"` を付けておくと、何度トリガーされても画面には1枚しか出ません。ネットワーク不安定時のエラー表示と組み合わせる設計は、[通信が不安定なときの UX とエラー状態の設計](/articles/rork-dev/rork-unstable-network-ux-error-state-design)の考え方と相性が良いです。
+
+## アニメーションを本体の再レンダーから切り離す
+
+ここが実装の核心です。トーストの出入りアニメーションは、`ToastProvider` がルートで1度だけ描画する「オーバーレイ層」の内側で完結させます。こうすると、トーストが出入りしても画面側のコンポーネントツリーは一切再レンダーされません。`children`（=アプリ本体）と、トーストのスタックは兄弟として並ぶだけだからです。
+
+アニメーション自体は Reanimated の `entering` / `exiting` に任せます。JS スレッドの再レンダーではなく UI スレッドで動くため、重いリストのスクロール中でも滑らかに出入りします。
+
+```tsx
+// toast/ToastOverlay.tsx
+import React, { useContext } from "react";
+import { StyleSheet, View } from "react-native";
+import Animated, { FadeInDown, FadeOutUp, LinearTransition } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { ToastStateContext } from "./ToastContext";
+import { ToastCard } from "./ToastCard";
+
+export function ToastOverlay() {
+  const toasts = useContext(ToastStateContext);
+  const insets = useSafeAreaInsets();
+
+  return (
+    // pointerEvents="box-none" で、トースト以外の領域のタップは下の画面へ通す
+    <View
+      pointerEvents="box-none"
+      style={[styles.host, { paddingTop: insets.top + 8 }]}
+    >
+      {toasts.map((toast) => (
+        <Animated.View
+          key={toast.id}
+          entering={FadeInDown.springify().damping(18)}
+          exiting={FadeOutUp.duration(180)}
+          layout={LinearTransition.springify()}
+          style={styles.item}
+        >
+          <ToastCard toast={toast} />
+        </Animated.View>
+      ))}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  host: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+  },
+  item: { width: "100%", alignItems: "center", marginBottom: 8 },
+});
+```
+
+`layout={LinearTransition...}` を入れておくと、上のトーストが消えたときに下のトーストがスッと繰り上がります。手で位置計算をしなくても、配列の増減にレイアウトが追従します。
+
+`ToastProvider` の `children` の外側、ナビゲーションよりも上に `ToastOverlay` を1枚だけ置きます。
+
+```tsx
+// App.tsx
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <ToastProvider>
+        <NavigationContainer>{/* ...画面群... */}</NavigationContainer>
+        <ToastOverlay />
+      </ToastProvider>
+    </SafeAreaProvider>
+  );
+}
+```
+
+## ノッチとホームインジケータを避ける
+
+トーストを画面上端に出すなら `insets.top`、下端に出すなら `insets.bottom` を足すのが鉄則です。`useSafeAreaInsets` を使えば、ノッチのある端末・ない端末・Android のステータスバーの差を意識せずに済みます。上の `ToastOverlay` では `paddingTop: insets.top + 8` を入れているので、Dynamic Island やノッチの真下に文字が潜り込むことはありません。
+
+下端配置にしたい場合は、タブバーの高さも足す必要があります。私は下端トーストのとき、`insets.bottom + tabBarHeight + 8` を基準にしています。タブバーに被ると「消したいのにタブを押してしまう」誤操作が起きるためです。私はこの上端配置を既定にし、下端配置は取り消しボタン付きトーストのときだけ使うことを推奨します。理由は単純で、本番運用では下端の誤タップ報告が上端よりも明らかに多かったからです。
+
+## スクリーンリーダーに必ず届ける
+
+これが最も見落とされる点です。多くのトースト実装は、見た目には出ているのに、VoiceOver / TalkBack のユーザーには何も読み上げられません。視覚的に一瞬現れて消える要素は、スクリーンリーダーのフォーカスが自然に当たらないからです。
+
+対策は2層です。1つは、トーストが現れた瞬間に明示的にアナウンスをトリガーすること。`AccessibilityInfo.announceForAccessibility` を使います。もう1つは、カード自体に `accessibilityRole` と `accessibilityLiveRegion`（Android）を持たせ、フォーカスされたときにも読めるようにすることです。
+
+```tsx
+// toast/ToastCard.tsx
+import React, { useEffect } from "react";
+import { AccessibilityInfo, Platform, Pressable, StyleSheet, Text } from "react-native";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import Animated, {
+  runOnJS, useAnimatedStyle, useSharedValue, withTiming,
+} from "react-native-reanimated";
+import { useContext } from "react";
+import { ToastContext } from "./ToastContext";
+import type { Toast } from "./ToastContext";
+
+const COLORS: Record<Toast["variant"], string> = {
+  success: "#0f7b3f",
+  error: "#b3261e",
+  info: "#33415c",
+};
+
+export function ToastCard({ toast }: { toast: Toast }) {
+  const api = useContext(ToastContext)!;
+  const translateX = useSharedValue(0);
+
+  // 出現と同時に読み上げる（視覚と聴覚の両方に届ける）
+  useEffect(() => {
+    AccessibilityInfo.announceForAccessibility(toast.message);
+    if (toast.durationMs > 0) {
+      const timer = setTimeout(() => api.hide(toast.id), toast.durationMs);
+      return () => clearTimeout(timer);
+    }
+  }, [toast.id]);
+
+  // 横スワイプで手動ディスミス
+  const pan = Gesture.Pan()
+    .onUpdate((e) => { translateX.value = e.translationX; })
+    .onEnd((e) => {
+      if (Math.abs(e.translationX) > 80) {
+        translateX.value = withTiming(e.translationX > 0 ? 400 : -400, { duration: 160 });
+        runOnJS(api.hide)(toast.id);
+      } else {
+        translateX.value = withTiming(0);
+      }
+    });
+
+  const animStyle = useAnimatedStyle(() => ({ transform: [{ translateX: translateX.value }] }));
+
+  return (
+    <GestureDetector gesture={pan}>
+      <Animated.View style={[styles.card, { backgroundColor: COLORS[toast.variant] }, animStyle]}>
+        <Pressable
+          onPress={() => api.hide(toast.id)}
+          accessibilityRole="alert"
+          {...(Platform.OS === "android" ? { accessibilityLiveRegion: "polite" as const } : {})}
+        >
+          <Text style={styles.text}>{toast.message}</Text>
+        </Pressable>
+      </Animated.View>
+    </GestureDetector>
+  );
+}
+
+const styles = StyleSheet.create({
+  card: {
+    maxWidth: 480, width: "92%",
+    borderRadius: 12, paddingVertical: 12, paddingHorizontal: 16,
+    shadowColor: "#000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+  },
+  text: { color: "#fff", fontSize: 15, lineHeight: 21 },
+});
+```
+
+`announceForAccessibility` は iOS では発話キューに積まれ、Android では即時に読まれます。`error` のような重要度の高い通知は、`accessibilityLiveRegion` を `"assertive"` にして読み上げを割り込ませる選択もあります。ただし割り込みは多用すると鬱陶しいので、私は通常通知は `polite`、決済失敗など本当に止めたいものだけ `assertive` に分けています。アクセシビリティ全般の作り込みは[VoiceOver と Dynamic Type を本番品質で詰める](/articles/rork-dev/rork-voiceover-dynamic-type-production-accessibility)も併せてご覧ください。
+
+## 自動消去タイマーがバックグラウンド復帰で破綻しない
+
+`setTimeout` による自動消去には、見落としやすい穴があります。アプリがバックグラウンドに入っている間、JS タイマーは OS によって停止・遅延されます。3.2 秒で消すつもりのトーストが、復帰後に古いまま残ったり、復帰した瞬間にまとめて消えたりします。
+
+厳密にやるなら、`AppState` の `active` 復帰を監視し、バックグラウンド滞在が長かった場合は表示中のトーストを即座に畳む、という補正を入れます。
+
+```tsx
+import { AppState } from "react-native";
+
+// ToastProvider 内に追加
+const bgAt = useRef<number | null>(null);
+useEffect(() => {
+  const sub = AppState.addEventListener("change", (s) => {
+    if (s === "background") {
+      bgAt.current = Date.now();
+    } else if (s === "active" && bgAt.current) {
+      // 5秒以上バックグラウンドにいたなら、滞留トーストは一掃する
+      if (Date.now() - bgAt.current > 5000) {
+        toasts.forEach((t) => hide(t.id));
+      }
+      bgAt.current = null;
+    }
+  });
+  return () => sub.remove();
+}, [toasts, hide]);
+```
+
+ここまで作り込むかは、アプリの性格によります。一瞬で消える情報通知なら多少残っても実害は小さいですが、「コピーしました」のような操作直後のフィードバックが復帰後に出ると文脈がずれて混乱を招きます。
+
+## トーストを使うべき場面・使うべきでない場面
+
+最後に、設計判断として大事なのは「そもそもトーストが正しい器か」です。トーストは、ユーザーの操作を止めず、見逃しても致命的でない短い通知に向いています。逆に、選択を迫る・元に戻せない・必ず読ませたい情報をトーストに載せると、見逃しの事故になります。
+
+<table>
+  <thead>
+    <tr><th>伝えたいこと</th><th>適した器</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>保存・コピー成功など短い完了通知</td><td><strong>トースト</strong></td><td>操作を止めず、見逃しても実害が小さい</td></tr>
+    <tr><td>取り消し可能な操作（削除など）</td><td><strong>トースト＋取り消しボタン</strong></td><td>数秒の猶予で誤操作を救える</td></tr>
+    <tr><td>通信エラーで再試行が必要</td><td><strong>インライン or バナー</strong></td><td>消えると再試行の導線まで失われる</td></tr>
+    <tr><td>破壊的操作の確認</td><td><strong>ダイアログ</strong></td><td>明示的な選択を必須にすべき</td></tr>
+    <tr><td>恒常的な状態（オフライン中）</td><td><strong>常駐バナー</strong></td><td>状態が続く間は出し続ける必要がある</td></tr>
+  </tbody>
+</table>
+
+トーストに取り消しボタンを載せるなら、`durationMs` を長めに取り、カード内に押せる領域を足すだけで成立します。今回のキュー設計はそのまま拡張できます。
+
+## 次の一歩
+
+まずは `ToastProvider` と `ToastOverlay` をルートに1枚だけ置き、既存の `Alert.alert` で済ませていた成功通知を `show()` に置き換えてみてください。そのうえで、実機の VoiceOver をオンにして「保存しました」が読み上げられるかを必ず一度確認します。読み上げが通った瞬間に、トーストは「見える人だけの装飾」から「全員に届く通知」へ変わります。エラー通知をトーストで握りつぶしていないかは、[Error Boundary と未処理 Promise の本番設計](/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide)と合わせて点検すると、抜けが見つけやすくなります。
