@@ -1,0 +1,245 @@
+---
+title: "毎朝違う一言を出す日替わりリマインダーが、ある日から鳴らなくなる——iOSの保留64件という見えない上限"
+slug: "rork-daily-reminder-notifications-ios-64-limit-rolling-reschedule"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T20:15"
+updated: "2026-06-22T20:15"
+author: "Rork Lab"
+description: "Rork（Expo）で作った日替わりリマインダーが、しばらく経つと無言で止まる原因はiOSの保留通知64件上限です。固定文言のカレンダートリガーと、日替わりコンテンツのローリング再スケジュールを動くコードで設計し、サマータイムや複数リマインダー併用でも狂わない通知を組みます。"
+tags: ["Rork", "expo-notifications", "ローカル通知", "React Native", "iOS"]
+highlights:
+  - "毎朝違う一言を出すリマインダーがある日から鳴らなくなる——iOSの保留64件上限という見えない壁を理解し、回避する設計を手に入れられます"
+  - "固定文言のカレンダートリガー1枚で済む場合と、日替わりコンテンツにローリング再スケジュールが要る場合を、動くコードで判断できるようになります"
+  - "サマータイム・タイムゾーン移動・朝夜の二本立てでも時刻が狂わない通知設計に、自分のアプリを作り替えられます"
+---
+
+「毎朝8時に、その日の一言を届ける」。日替わりの引き寄せアプリにそんな機能を足したとき、私は素直に当日から30日分を一気にスケジュールしました。シミュレータでは完璧に動きます。ところが本番に出してしばらくすると、ユーザーから「最初の数日は鳴ったのに、その後止まった」という声が届くようになりました。
+
+原因はコードのバグではありません。iOSが**保留中のローカル通知を64件までしか抱えてくれない**という、公式チュートリアルではほとんど触れられない上限でした。30日分どころか、朝と夜の二本立てにしていたら1か月分すら積めません。超えた分はエラーも出さず、静かに捨てられます。
+
+ここからは、日替わりリマインダーを「鳴り続ける」設計に組み直す手順を、expo-notifications の動くコードで具体的に追っていきます。基礎的なセットアップ自体は[ローカル通知の基本実装ガイド](/articles/rork-dev/rork-local-notifications-expo-complete-guide)に譲り、ここでは上限との付き合い方だけに集中します。
+
+## iOSが保留する通知は64件まで——超えた分は黙って捨てられる
+
+Appleのローカル通知には、アプリごとに**未発火（pending）の通知を最大64件**しか保持しないという制限があります。65件目以降を `scheduleNotificationAsync` で積もうとしても、例外は飛びません。iOSは「発火時刻が最も早い64件」を残し、それ以外を保留リストから落とします。
+
+ここで厄介なのが、`repeats: true` の繰り返し通知は**1枠で1件**として数えられる点です。「毎日8時」を繰り返しトリガーで組めば、消費するのはたった1枠です。ところが「毎日違う本文」をやりたくなると繰り返しが使えず、日付ごとに個別の通知を積むことになり、あっという間に64の壁に当たります。
+
+つまり判断の分岐はシンプルです。
+
+- **文言が毎日同じでいい** → 繰り返しトリガー1枚。上限はまず気にしなくていい
+- **文言を毎日変えたい** → 個別スケジュール。64枠の予算管理が必須
+
+私自身、この切り分けを最初に決めずに作り始めて遠回りをしました。先に「このリマインダーは固定文言か、日替わりか」を1つずつ分類しておくと、設計が一気に楽になります。
+
+## まず現状を観測する——いま自分が何件積んでいるか
+
+設計を変える前に、計測です。`getAllScheduledNotificationsAsync` は現在保留中の通知配列を返すので、起動時にログを出すだけで「いま何枠使っているか」が見えます。
+
+```typescript
+import * as Notifications from 'expo-notifications';
+
+// 起動時に一度呼ぶ。本番では __DEV__ ガードしてログ量を抑える
+export async function inspectPendingNotifications(): Promise<number> {
+  const pending = await Notifications.getAllScheduledNotificationsAsync();
+  if (__DEV__) {
+    console.log(`[notif] pending=${pending.length}/64`);
+    pending.forEach((n) => {
+      // trigger の中身は型がプラットフォームで異なるので緩く出す
+      console.log('  -', n.identifier, JSON.stringify(n.trigger));
+    });
+  }
+  return pending.length;
+}
+```
+
+`pending.length` が60を超えていたら、もう危険水域です。私は本番アプリでこの数値を起動ごとに内部メトリクスへ送るようにして、「気づいたら上限に張り付いていた」を未然に防いでいます。数字を見ずに通知を積むのは、残量メーターを見ずに燃料を入れ続けるのと同じです。
+
+## 固定文言でいいなら、繰り返しカレンダートリガー1枚で足りる
+
+「毎朝8時に同じ一言（例: アプリを開く合図）」でよければ、答えは拍子抜けするほど単純です。`SchedulableTriggerInputTypes.CALENDAR` に `repeats: true` を付け、`hour` と `minute` を**そのまま**指定します。
+
+```typescript
+import * as Notifications from 'expo-notifications';
+import { SchedulableTriggerInputTypes } from 'expo-notifications';
+
+const MORNING_TAG = 'daily-morning';
+
+export async function scheduleFixedMorning(): Promise<void> {
+  // 同じタグの既存分を消してから積み直す（多重登録を防ぐ）
+  await cancelByTag(MORNING_TAG);
+
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: '今日のひとこと',
+      body: '画面を開いて、今日の言葉を受け取りましょう。',
+      data: { tag: MORNING_TAG }, // あとで選択的に消すための目印
+    },
+    trigger: {
+      type: SchedulableTriggerInputTypes.CALENDAR,
+      hour: 8,
+      minute: 0,
+      repeats: true,
+    },
+  });
+}
+
+// data.tag で自分の通知だけを選んで消すヘルパー
+export async function cancelByTag(tag: string): Promise<void> {
+  const pending = await Notifications.getAllScheduledNotificationsAsync();
+  await Promise.all(
+    pending
+      .filter((n) => n.content.data?.tag === tag)
+      .map((n) => Notifications.cancelScheduledNotificationAsync(n.identifier)),
+  );
+}
+```
+
+ポイントは、繰り返しトリガーが消費する枠が**永続的に1つだけ**であることです。カレンダートリガーは「端末のローカル時刻の8:00」に紐づくため、後述するサマータイムの問題も自動で吸収してくれます。固定文言で済むものは、無理に日替わりにせず、この1枚で組むのが最も堅牢です。
+
+## 日替わりコンテンツは「ローリング再スケジュール」で組む
+
+本題はこちらです。毎日違う本文を出したいなら、繰り返しトリガーは使えません。そこで取る戦略が**ローリング再スケジュール**——「先の全期間」ではなく「直近N日ぶん」だけを積み、アプリが開かれるたびに先頭へ詰め直す方式です。
+
+64枠を1種類のリマインダーで使い切るのは危険なので、私は**16日ぶん**を上限にしています。これなら他のリマインダーや一時的な通知と同居しても上限に余裕があり、16日に一度もアプリを開かないユーザーはそもそも通知で復帰しないので、実害もほぼありません。
+
+私自身が複数のアプリを並行運用してきた実感として、朝の窓を16日・夜の振り返りを12日に固定する配分を推奨します。この配分なら、突発の一時通知が10枠ほど割り込んでも合計が64を割らず、これまで上限への張り付きを一度も起こしていません。
+
+```typescript
+import * as Notifications from 'expo-notifications';
+import { SchedulableTriggerInputTypes } from 'expo-notifications';
+
+const DAILY_TAG = 'daily-affirmation';
+const WINDOW_DAYS = 16; // 64枠を食い尽くさない安全な窓
+const HOUR = 8;
+const MINUTE = 0;
+
+// その日のコンテンツを決める純粋関数（配信日を種にして循環させる）
+function affirmationFor(date: Date, pool: string[]): string {
+  // 端末ローカルの通算日数を種にする＝同じ日には同じ言葉
+  const dayIndex = Math.floor(
+    date.getTime() / 86_400_000 - date.getTimezoneOffset() / 1440,
+  );
+  return pool[((dayIndex % pool.length) + pool.length) % pool.length];
+}
+
+export async function rescheduleDailyWindow(pool: string[]): Promise<void> {
+  // 1) 自分の日替わり通知を一旦すべて消す
+  await cancelByTag(DAILY_TAG);
+
+  // 2) 「今日の発火時刻」を起点に、N日ぶんを個別スケジュール
+  const now = new Date();
+  for (let offset = 0; offset < WINDOW_DAYS; offset++) {
+    const fireAt = new Date(now);
+    fireAt.setDate(now.getDate() + offset);
+    fireAt.setHours(HOUR, MINUTE, 0, 0);
+
+    // すでに過ぎた時刻（今日の8時を回っている等）はスキップ
+    if (fireAt.getTime() <= now.getTime()) continue;
+
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: '今日のひとこと',
+        body: affirmationFor(fireAt, pool),
+        data: { tag: DAILY_TAG },
+      },
+      trigger: {
+        type: SchedulableTriggerInputTypes.DATE,
+        date: fireAt, // 個別の日時。repeats は付けない
+      },
+    });
+  }
+}
+```
+
+ここで `DATE` トリガーに**具体的な Date** を渡しているのがコツです。`new Date()` から `setHours` で組んだ時刻は端末のローカルタイムゾーンで解釈されるため、ユーザーの「朝8時」に正しく合います。`affirmationFor` を純粋関数にしておくと、後で「同じ日には必ず同じ言葉が出る」ことをテストで担保できます。
+
+## サマータイムとタイムゾーン移動で時刻がずれない設計
+
+ここが一番ハマりやすいところです。「8時」を表現する方法は2つあり、挙動がまったく違います。
+
+ひとつは `TIME_INTERVAL`（◯秒後）です。これは絶対的な経過時間なので、**サマータイムの切り替えで1時間ずれます**。「8時間後」を毎日積み直すような実装にすると、DST境界の日に7時や9時へ動いてしまいます。
+
+もうひとつが上で使った `CALENDAR` / `DATE`（壁時計の時刻）です。こちらは「ローカル時刻の8:00」に紐づくため、サマータイムでもユーザーから見た時刻は8時のまま保たれます。日替わりリマインダーのように「毎朝決まった時刻」が命の機能では、必ず壁時計ベースを選びます。
+
+タイムゾーンをまたぐ移動（旅行・引っ越し）にも、ローリング再スケジュールは自然に強くなります。アプリ起動のたびに**現在地のローカル時刻**で窓を組み直すので、移動先で開けば新しいタイムゾーンの8時に作り直されます。固定で365日先まで積む設計だと、この追従ができません。先のぶんを積みすぎないことが、結果的に時刻の正確さにもつながります。
+
+## 朝と夜の二本立てなら、64枠を“予算”として分配する
+
+リマインダーを複数種類持つと、64枠は共有資源になります。朝の一言と夜の振り返りを両方やるなら、片方が枠を食い尽くさないよう予算を切ります。私が複数アプリで使っている目安は次の通りです。
+
+<table>
+  <thead>
+    <tr><th>用途</th><th>方式</th><th>消費枠の目安</th><th>備考</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>固定文言の定刻リマインダー</td><td>繰り返しカレンダー</td><td>1枠/種類</td><td>最優先。まずここに寄せる</td></tr>
+    <tr><td>日替わりコンテンツ（朝）</td><td>ローリング16日</td><td>最大16枠</td><td>窓を縮めれば枠も減る</td></tr>
+    <tr><td>日替わりコンテンツ（夜）</td><td>ローリング12日</td><td>最大12枠</td><td>朝より短めに割り当てる</td></tr>
+    <tr><td>イベント連動の一時通知</td><td>個別DATE</td><td>残り枠から都度</td><td>積む前に空き枠を確認</td></tr>
+    <tr><td>安全マージン</td><td>—</td><td>10枠以上空ける</td><td>突発の通知用に常に確保</td></tr>
+  </tbody>
+</table>
+
+数字は厳密でなくて構いませんが、「合計が64を超えない」という制約を**コード上の定数として表現しておく**ことが大事です。窓の長さを `WINDOW_DAYS` のような定数に閉じ込め、種類が増えたら合計を見直す。私はこの合計をユニットテストで検算し、新しいリマインダーを足したときに上限を割らないか自動で気づけるようにしています。
+
+## アプリ起動時に“詰め直す”同期関数を1つだけ持つ
+
+ローリング方式の心臓は、起動時の同期です。フォアグラウンド復帰のたびに窓を組み直す関数を1つ用意し、入口をここに集約します。あちこちで `scheduleNotificationAsync` を呼ぶと、多重登録や枠の食い違いがすぐ起きます。
+
+```typescript
+import { useEffect } from 'react';
+import { AppState, AppStateStatus } from 'react-native';
+import * as Notifications from 'expo-notifications';
+
+const POOL = [
+  '小さな一歩でも、続けた人だけが景色を変えます。',
+  '今日できることに、静かに集中してみましょう。',
+  // ……実運用では数十〜数百件を用意して循環させる
+];
+
+// 同期の単一入口。ここ以外でスケジュールを触らない
+export async function syncReminders(): Promise<void> {
+  const granted = await ensurePermission();
+  if (!granted) return; // 権限がなければ何も積まない
+
+  await scheduleFixedMorning();       // 固定枠（1）
+  await rescheduleDailyWindow(POOL);  // 日替わり窓（最大16）
+
+  if (__DEV__) await inspectPendingNotifications();
+}
+
+async function ensurePermission(): Promise<boolean> {
+  const { status } = await Notifications.getPermissionsAsync();
+  return status === 'granted';
+}
+
+// 起動時とフォアグラウンド復帰時に同期する Hook
+export function useReminderSync(): void {
+  useEffect(() => {
+    syncReminders();
+    const sub = AppState.addEventListener('change', (s: AppStateStatus) => {
+      if (s === 'active') syncReminders();
+    });
+    return () => sub.remove();
+  }, []);
+}
+```
+
+`syncReminders` を冪等（何度呼んでも同じ結果）に保つのがポイントです。毎回タグ単位で消してから積み直すので、二重に呼ばれても保留数は一定に収束します。通知をタップして開いたときに目的の画面へ正しく飛ばす設計は範囲が別なので、[通知タップ後のルーティング設計](/articles/rork-dev/rork-notification-tap-routing-launch-states-pending-intent-design)に分けています。
+
+## 見落としやすい落とし穴
+
+**Androdidは挙動が違います。** 64件上限はiOS固有です。Androidに同等の固定上限はありませんが、メーカー独自の省電力（Doze・アプリの強制停止）でスケジュール済み通知が落ちることがあります。ローリング方式は「起動のたびに積み直す」ので、結果的にAndroidの取りこぼしにも強くなります。同じ同期関数で両OSをまかなえるのは、この方式の地味な利点です。
+
+**権限がないのに積まないこと。** `ensurePermission` を通さずにスケジュールすると、ユーザーから見れば「何も起きない」だけです。通知の許可をいつ求めるかは離脱率に直結するので、初回起動でいきなり出さず文脈を作ってから尋ねる設計を、[通知許可のソフトアスク設計](/articles/rork-dev/rork-notification-soft-ask-opt-in)に分けています。
+
+**本番ビルドでしか出ない差に注意。** スケジュール自体はExpo Goでも動きますが、通知の表示まわりは開発ビルドと本番で挙動が変わる箇所があります。リリース前に必ずTestFlight／内部テストの実機で、64枠の張り付きと発火時刻の両方を確認してください。
+
+## 次の一手
+
+まず手元のアプリで `getAllScheduledNotificationsAsync` の `length` を起動時にログへ出してみてください。その1行が、自分のリマインダーが上限に対してどれくらい余裕があるかを教えてくれます。数字が見えてから、固定枠と日替わり窓に仕分けていけば、設計は自然と定まります。
+
+私自身、日替わりの通知設計は長く運用しながら少しずつ詰めてきた領域で、いまも窓の長さは実データを見ながら調整しています。同じように「鳴り続ける通知」を作ろうとしている方の、遠回りを少し減らせたら嬉しいです。
