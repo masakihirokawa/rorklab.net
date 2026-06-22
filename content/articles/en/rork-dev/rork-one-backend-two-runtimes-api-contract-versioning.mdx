@@ -1,0 +1,191 @@
+---
+title: "Serving Both Plain Rork and Rork Max From One Backend — Designing an API Response Contract That Never Breaks Old Binaries"
+slug: "rork-one-backend-two-runtimes-api-contract-versioning"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T11:00"
+author: "Rork Lab"
+description: "When plain Rork (React Native / Expo) and Rork Max (native Swift) both call the same Cloudflare Workers backend, the whole design centers on not breaking old binaries you cannot force-update. Wrap responses in an envelope, evolve them additively, absorb client differences with capability flags, and retire old contracts safely — shown in code."
+tags: ["Rork", "Rork Max", "Cloudflare Workers", "API versioning", "architecture"]
+highlights:
+  - "A minimal response envelope that lets one backend serve both a React Native client and a native Swift client without either one breaking the other"
+  - "The additive-only discipline that keeps old binaries alive when you add fields, plus a decision table of the breaking changes you must never make"
+  - "An operational procedure for reading your client-version distribution from logs and deciding the threshold at which it is safe to sunset an old contract"
+---
+
+One morning I "tidied up" a response by renaming a field from `title` to `displayTitle` and shipped it. On my latest local build, nothing broke. A few hours later, reports started coming in from devices still running the previous version: their list screens had gone blank. The cause was mundane — the old app reached for `title`, and the value was no longer there.
+
+The decisive way a mobile backend differs from a web one is this: you cannot swap the client out from under your users. On the web, the next reload hands everyone fresh JS. An app sits behind store review and each user's decision to update. People who never update keep hitting your backend today on a binary from six months ago.
+
+That asymmetry gets heavier the moment you start using plain Rork (cross-platform generation via React Native / Expo) alongside Rork Max (native Swift generation). The same feature receives its response through JavaScript `fetch` on one side and Swift `URLSession` on the other. As an indie developer I run several Expo apps behind a single Cloudflare Workers backend, and I am currently revisiting the contract on the assumption that native clients from Max will join it later. This article shares the implementation that lets you grow such a backend without breaking it.
+
+## Why decide the "contract" first
+
+A response shape is a contract, not a casual promise. Once it is baked into some binary out in the world, you are bound to it until that binary disappears. So the first thing to settle is not the individual fields but the rule for how they are allowed to change.
+
+I keep only two rules. First, every response is wrapped in an envelope that separates the payload from metadata. Second, field changes are additive only — no deletions, no renames, no quiet shifts in meaning. Holding to just these two erases most of the incidents where an old binary falls over.
+
+## The minimal response envelope
+
+The envelope is the outer structure every endpoint shares. The payload itself lives in `data`, and around it you place the protocol version and any operational metadata the server wants to attach. On the Cloudflare Workers side, a thin helper does the wrapping.
+
+```ts
+// envelope.ts — every response comes back in this shape
+type Envelope<T> = {
+  protocol: number;       // version of the envelope itself (rarely bumped)
+  data: T;                // payload; grows additively only
+  meta: {
+    serverTime: string;   // ISO8601
+    minSupported: number; // clients below this are nudged to update
+    notice?: string;      // optional announcement (maintenance, etc.)
+  };
+};
+
+export function ok<T>(data: T, minSupported = 1): Response {
+  const body: Envelope<T> = {
+    protocol: 1,
+    data,
+    meta: { serverTime: new Date().toISOString(), minSupported },
+  };
+  return Response.json(body);
+}
+
+export function fail(code: string, message: string, status = 400): Response {
+  // errors are wrapped too; clients branch on error, not on the presence of data
+  return Response.json(
+    { protocol: 1, error: { code, message },
+      meta: { serverTime: new Date().toISOString(), minSupported: 1 } },
+    { status },
+  );
+}
+```
+
+The point is that both success and error come back in the same envelope. Clients branch on "is there an `error`," not on "is there `data`." Do this, and when you later add something like `retryAfter` to errors, existing clients simply look past it and ignore it. That they ignore it is the whole point of the envelope.
+
+## Clients "drop what they don't know"
+
+The parsing side on both runtimes is built to silently discard unknown fields the server might add later. As long as this holds, the server stops fearing additions.
+
+The React Native side (plain Rork) pulls out only the fields it needs and fills gaps with defaults.
+
+```ts
+// Parsing on the plain Rork (React Native) side
+type Wallpaper = { id: string; title: string; isPremium: boolean };
+
+async function fetchWallpapers(): Promise<Wallpaper[]> {
+  const res = await fetch(`${API_BASE}/wallpapers`, {
+    headers: { "X-Client-Version": String(CLIENT_VERSION) },
+  });
+  const env = await res.json();
+  if (env.error) throw new Error(env.error.code);
+  // never touch unknown keys; take only what you need, with defaults
+  return (env.data.items ?? []).map((it: any) => ({
+    id: String(it.id),
+    title: it.title ?? "(untitled)",
+    isPremium: Boolean(it.isPremium ?? false),
+  }));
+}
+```
+
+The Rork Max (native Swift) side follows the same thinking. Swift's `Codable` automatically ignores keys not declared on the struct. Fields that might be absent are treated as Optional, or given a default after decoding.
+
+```swift
+// Parsing on the Rork Max (native Swift) side
+struct Envelope<T: Decodable>: Decodable {
+    let data: T
+    let meta: Meta
+    struct Meta: Decodable { let minSupported: Int }
+}
+
+struct Wallpaper: Decodable {
+    let id: String
+    let title: String?        // Optional, in case it ever goes missing
+    let isPremium: Bool?
+    var displayTitle: String { title ?? "(untitled)" }
+}
+
+struct WallpaperPage: Decodable { let items: [Wallpaper] }
+```
+
+What both share is a posture: not "mirror everything the server sent exactly," but "extract only what I need, resiliently against absence." That alone makes server-side additions invisible to the client.
+
+## Capability flags absorb "features only one side has"
+
+Plain Rork and Rork Max can do different things on the device. Live Activities and some widget surfaces, for instance, only exist natively. If the server starts writing `if (platform === "ios-native")`, those conditionals multiply with every new client.
+
+Instead, the client declares what it can do, and the server adds data according to those capabilities. The trick is to hand the decision to the client side.
+
+```ts
+// the client declares its own capabilities
+// X-Capabilities: liveActivity,widgetLarge,offlineQueue
+const caps = new Set((req.headers.get("X-Capabilities") ?? "").split(","));
+
+const payload: any = { items };
+if (caps.has("liveActivity")) {
+  payload.liveActivityToken = await issueLiveActivityToken(userId);
+}
+return ok(payload, /* minSupported */ 3);
+```
+
+Now a plain Rork client without that capability simply does not receive `liveActivityToken`, and thanks to the "drop what you don't know" rule above, nothing breaks. When a new capability appears, you add one flag. Not branching on platform names is what keeps you out of conditional hell over the long run.
+
+## The changes you must not make
+
+"Additive only" is easy to say, but in practice changes show up where you genuinely wonder, "is this additive or breaking?" Here is the table I use to decide.
+
+<table>
+  <thead>
+    <tr><th>Change</th><th>Allowed?</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Add a new field</td><td><strong>Yes</strong></td><td>old clients ignore it</td></tr>
+    <tr><td>Add a field as Optional</td><td><strong>Yes</strong></td><td>same; the client supplies the default</td></tr>
+    <tr><td>Add an enum value</td><td><strong>Conditional</strong></td><td>only if clients handle unknown values safely</td></tr>
+    <tr><td>Rename a field</td><td><strong>No</strong></td><td>old clients can no longer read the old name</td></tr>
+    <tr><td>Delete a field</td><td><strong>No</strong></td><td>same; add the new name and keep the old one</td></tr>
+    <tr><td>Change a type (string to number, etc.)</td><td><strong>No</strong></td><td>decoding fails and takes the whole screen down</td></tr>
+    <tr><td>Change the meaning (same name, different value)</td><td><strong>No</strong></td><td>the hardest incident to ever find</td></tr>
+  </tbody>
+</table>
+
+When you want to rename, the standard move is to keep the old name and add the new one. My own failure at the top would have been a non-event if I had merely "added" `displayTitle` without removing `title`. Return both for a while, and only fold the old name away once the clients reading it have shrunk far enough.
+
+Separately from these contract questions, you should settle which keys may live in the client and which never can, ahead of time. That call is covered in "[Why hardcoding an API key in a Rork (Expo) app gets it stolen, and how to design the proxy](/articles/rork-dev/rork-expo-api-key-proxy-worker-rate-limit-rotation)," which is worth getting in order alongside this.
+
+## When to retire an old contract — decide from the logs
+
+Grow additively for long enough and eventually you will want to fold away an "old shape nobody uses anymore." Lean on a hunch here and you cut off devices still using it. Make the call from real data pulled from logs, not from guesswork.
+
+Stream the `X-Client-Version` that rides on every request into your Workers aggregation. On Cloudflare, writing to Analytics Engine is the easy path.
+
+```ts
+// measure the version distribution (the basis for retirement decisions)
+env.VERSIONS.writeDataPoint({
+  blobs: [req.headers.get("X-Client-Version") ?? "unknown"],
+  indexes: ["client_version"],
+});
+```
+
+The thresholds I use as a guide for retiring an old contract are these.
+
+<table>
+  <thead>
+    <tr><th>Signal</th><th>Safe-to-retire guide</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Target version's share of the last 7 days of actives</td><td>under <strong>1%</strong></td></tr>
+    <tr><td>Notice before retiring (meta.notice / in-app banner)</td><td>at least <strong>2 weeks</strong></td></tr>
+    <tr><td>Ability to roll back immediately (re-enable by flag)</td><td>always kept</td></tr>
+  </tbody>
+</table>
+
+Even then, do not delete in one stroke. First raise `meta.minSupported` so the affected clients show an update banner; only once the remaining devices drop below the threshold do you remove the old server-side branch. Separating the step that raises `minSupported` from the step that deletes the code is the only way to stay able to roll back.
+
+## Make it a habit, not a one-time design
+
+The real value of this design, I have come to feel, is not in any flashy feature but in how it turns into a habit of pausing for a beat before you deploy. Once you hold the three shapes — envelope, additive-only, capability flags — you naturally re-ask, with every change, "does this break an old binary?"
+
+The more the pragmatic split spreads — build fast in plain Rork, add Rork Max where native is required — the more often a single backend supports several runtimes at once. What pays off then is not the count of features but the discipline of not breaking the contract.
+
+As a next step, re-wrap even one existing endpoint in the envelope shape and wire up `X-Client-Version` aggregation. The foundation that lets you decide when to retire is the very first thing you will gain. Thank you for reading to the end.

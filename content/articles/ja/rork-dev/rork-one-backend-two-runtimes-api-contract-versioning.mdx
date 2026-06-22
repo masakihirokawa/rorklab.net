@@ -1,0 +1,191 @@
+---
+title: "無印 Rork と Rork Max を1つのバックエンドで支える — 旧バイナリを壊さない API レスポンス契約の設計"
+slug: "rork-one-backend-two-runtimes-api-contract-versioning"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-22T11:00"
+author: "Rork Lab"
+description: "無印 Rork（React Native / Expo）と Rork Max（ネイティブ Swift）が同じ Cloudflare Workers バックエンドを叩く構成では、強制アップデートできない旧バイナリを壊さないことが設計の中心になります。レスポンスを封筒型にして加算のみで育て、能力フラグでクライアント差を吸収し、古いバージョンを安全に畳むまでを実装で示します。"
+tags: ["Rork", "Rork Max", "Cloudflare Workers", "APIバージョニング", "アーキテクチャ"]
+highlights:
+  - "1つのバックエンドが React Native クライアントとネイティブ Swift クライアントの両方を、互いに壊さず支えるためのレスポンス封筒（envelope）の最小実装"
+  - "新フィールドを足しても旧バイナリが落ちない『加算のみ（additive-only）』の進化規律と、やってはいけない破壊的変更の判断表"
+  - "クライアントのバージョン分布をログから読み、どの閾値で古い契約を畳む（sunset）かを決める運用手順"
+---
+
+ある朝、レスポンスの一フィールドの名前を `title` から `displayTitle` に「整理」してデプロイしました。手元の最新ビルドでは何も問題が起きません。ところが数時間後、まだ前のバージョンを使い続けている端末から、一覧画面が空っぽになったという報告が届きはじめました。原因は単純で、古いアプリは `title` を読みに行き、そこに値がなくなっていたからです。
+
+モバイルアプリのバックエンドが Web と決定的に違うのは、クライアントを強制的に入れ替えられないという一点です。Web なら次のリロードで全員が新しい JS を受け取りますが、アプリは審査と各ユーザーの更新操作を挟みます。更新しない人は、半年前のバイナリのまま、今日もあなたのバックエンドを叩き続けます。
+
+この非対称性は、無印 Rork（React Native / Expo でクロスプラットフォーム生成）と Rork Max（ネイティブ Swift 生成）を併用しはじめると、さらに重くのしかかります。同じ機能でも、片方は JavaScript の `fetch` で、もう片方は Swift の `URLSession` でレスポンスを受け取ります。私自身、個人開発で複数の Expo アプリを1つの Cloudflare Workers バックエンドで束ねて運用していて、ここに将来 Max 由来のネイティブクライアントが加わる前提で契約を見直しているところです。本稿は、その「壊さずに育てる」ための実装を共有します。
+
+## なぜ「契約」を先に決めるのか
+
+API のレスポンス形は、口約束ではなく契約です。一度どこかのバイナリに焼き込まれたら、そのバイナリが世の中から消えるまで、あなたはその約束に縛られます。だからこそ、最初に決めるべきは個々のフィールドではなく、「どう変えてよいか」というルールのほうです。
+
+私が採っているルールは2つだけです。第一に、レスポンスは必ず封筒（envelope）でくるみ、データ本体とメタ情報を分けること。第二に、フィールドの変更は加算のみ（additive-only）に限り、削除・改名・意味の変更はしないこと。この2つを守るだけで、旧バイナリが落ちる事故の大半は消えます。
+
+## レスポンス封筒の最小形
+
+封筒は、すべてのエンドポイントが共有する外側の構造です。データそのものは `data` に入れ、その外側にプロトコルの版や、サーバーが付けたい運用メタを置きます。Cloudflare Workers 側では、次のような薄いヘルパーで包みます。
+
+```ts
+// envelope.ts — すべてのレスポンスはこの形で返す
+type Envelope<T> = {
+  protocol: number;      // 封筒そのものの版（滅多に上げない）
+  data: T;               // 本体。中身は加算のみで育てる
+  meta: {
+    serverTime: string;  // ISO8601
+    minSupported: number; // この値未満のクライアントは更新を促す対象
+    notice?: string;     // 任意の告知（メンテ予告など）
+  };
+};
+
+export function ok<T>(data: T, minSupported = 1): Response {
+  const body: Envelope<T> = {
+    protocol: 1,
+    data,
+    meta: { serverTime: new Date().toISOString(), minSupported },
+  };
+  return Response.json(body);
+}
+
+export function fail(code: string, message: string, status = 400): Response {
+  // エラーも封筒で返す。クライアントは data の有無ではなく error で分岐する
+  return Response.json(
+    { protocol: 1, error: { code, message },
+      meta: { serverTime: new Date().toISOString(), minSupported: 1 } },
+    { status },
+  );
+}
+```
+
+ポイントは、成功もエラーも同じ封筒で返すことです。クライアントは「`data` があるか」ではなく「`error` があるか」で分岐します。こうしておくと、後からエラーに `retryAfter` のような項目を足しても、既存のクライアントは知らんぷりして無視してくれます。無視してくれる、というのが封筒設計の肝です。
+
+## クライアントは「知らないものを捨てる」
+
+両ランタイムのパース側は、サーバーが将来足すかもしれない未知のフィールドを、黙って捨てる作りにします。これが守られていれば、サーバーは加算を恐れなくなります。
+
+React Native（無印 Rork）側は、必要なフィールドだけを取り出し、欠けていたら既定値で埋めます。
+
+```ts
+// 無印 Rork（React Native）側のパース
+type Wallpaper = { id: string; title: string; isPremium: boolean };
+
+async function fetchWallpapers(): Promise<Wallpaper[]> {
+  const res = await fetch(`${API_BASE}/wallpapers`, {
+    headers: { "X-Client-Version": String(CLIENT_VERSION) },
+  });
+  const env = await res.json();
+  if (env.error) throw new Error(env.error.code);
+  // 未知のキーは触れない。必要なものだけ既定値つきで取り出す
+  return (env.data.items ?? []).map((it: any) => ({
+    id: String(it.id),
+    title: it.title ?? "(無題)",
+    isPremium: Boolean(it.isPremium ?? false),
+  }));
+}
+```
+
+Rork Max（ネイティブ Swift）側も同じ思想です。Swift の `Codable` は、構造体に書いていないキーを自動で無視します。欠けるかもしれないフィールドは Optional か、デコード後に既定値を当てて扱います。
+
+```swift
+// Rork Max（ネイティブ Swift）側のパース
+struct Envelope<T: Decodable>: Decodable {
+    let data: T
+    let meta: Meta
+    struct Meta: Decodable { let minSupported: Int }
+}
+
+struct Wallpaper: Decodable {
+    let id: String
+    let title: String?        // 将来欠ける可能性に備えて Optional
+    let isPremium: Bool?
+    var displayTitle: String { title ?? "(無題)" }
+}
+
+struct WallpaperPage: Decodable { let items: [Wallpaper] }
+```
+
+両者に共通するのは、「サーバーが送ってきたものを全部正確に映す」のではなく、「自分が必要なものだけを、欠損に強く取り出す」という受け取り方です。これだけで、サーバーの加算はクライアントにとって透明になります。
+
+## 能力フラグで「片方にしかない機能」を吸収する
+
+無印 Rork と Rork Max では、端末側でできることが違います。たとえば Live Activities やウィジェットの一部はネイティブ側でしか扱えません。ここでサーバーが `if (platform === "ios-native")` のような分岐を書きはじめると、クライアントが増えるたびに条件が増殖します。
+
+代わりに、クライアントが「自分は何ができるか」を申告し、サーバーはその能力に応じてデータを足します。判断の主導権をクライアント側に渡すのがコツです。
+
+```ts
+// クライアントは自分の能力を申告する
+// X-Capabilities: liveActivity,widgetLarge,offlineQueue
+const caps = new Set((req.headers.get("X-Capabilities") ?? "").split(","));
+
+const payload: any = { items };
+if (caps.has("liveActivity")) {
+  payload.liveActivityToken = await issueLiveActivityToken(userId);
+}
+return ok(payload, /* minSupported */ 3);
+```
+
+こうしておくと、能力を持たない無印 Rork のクライアントには `liveActivityToken` が単に含まれず、前述の「知らないものを捨てる」原則のおかげで何も壊れません。新しい能力が増えたら、フラグを1つ足すだけで済みます。プラットフォーム名で分岐しないことが、長い目で見たときの分岐地獄を防ぎます。
+
+## やってはいけない変更の一覧
+
+加算のみ、と言葉で言うのは簡単ですが、現場では「これは加算かな、破壊かな」と迷う変更が出てきます。私が判断に使っている表を共有します。
+
+<table>
+  <thead>
+    <tr><th>変更</th><th>可否</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>新しいフィールドを足す</td><td><strong>可</strong></td><td>旧クライアントは無視する</td></tr>
+    <tr><td>フィールドを Optional として足す</td><td><strong>可</strong></td><td>同上。既定値はクライアントが当てる</td></tr>
+    <tr><td>列挙値（enum）を増やす</td><td><strong>条件付き可</strong></td><td>クライアントが未知値を安全に処理できる場合のみ</td></tr>
+    <tr><td>フィールドを改名する</td><td><strong>不可</strong></td><td>旧クライアントが旧名を読めなくなる</td></tr>
+    <tr><td>フィールドを削除する</td><td><strong>不可</strong></td><td>同上。必要なら新名を足して旧名は残す</td></tr>
+    <tr><td>型を変える（文字列→数値など）</td><td><strong>不可</strong></td><td>デコードが失敗し画面ごと落ちる</td></tr>
+    <tr><td>意味を変える（同じ名前で別の値）</td><td><strong>不可</strong></td><td>もっとも見つけにくい事故になる</td></tr>
+  </tbody>
+</table>
+
+改名したくなったときは、旧名を残したまま新名を足すのが定石です。冒頭の私の失敗も、`title` を消さずに `displayTitle` を「足す」だけにしておけば、何も起きませんでした。両方を当面返し、旧名を読むクライアントが十分に減ってから、ようやく旧名を畳みます。
+
+なお、こうした契約の話とは別に、クライアントに置く鍵と置けない鍵の線引きは事前に済ませておく必要があります。その判断は「[Rork（Expo）アプリに API キーを直書きすると抜かれる理由と中継の設計](/articles/rork-dev/rork-expo-api-key-proxy-worker-rate-limit-rotation)」で扱っていますので、あわせて整えておくと安心です。
+
+## 古い契約をいつ畳むか — ログから決める
+
+加算のみで育てていくと、いつか「もう誰も使っていない古い形」を畳みたくなります。本番運用でこの判断を勘に頼ると、まだ使っている端末を切り捨てる落とし穴にはまります。私はここで推測を避け、ログから取った実データだけで判断することを強く推奨します。
+
+毎リクエストに乗ってくる `X-Client-Version` を、Workers の集計に流しておきます。Cloudflare なら Analytics Engine に書き込むのが手軽です。
+
+```ts
+// バージョン分布を計測しておく（畳む判断のための土台）
+env.VERSIONS.writeDataPoint({
+  blobs: [req.headers.get("X-Client-Version") ?? "unknown"],
+  indexes: ["client_version"],
+});
+```
+
+私が古い契約を畳む目安にしている閾値は、次のとおりです。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>畳んでよい目安</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>対象バージョンの直近7日アクティブ比率</td><td>全体の <strong>1%未満</strong></td></tr>
+    <tr><td>畳む前の告知（meta.notice / アプリ内バナー）</td><td>最低 <strong>2週間</strong></td></tr>
+    <tr><td>畳んだ直後に戻せる準備（フラグで再有効化）</td><td>常に確保</td></tr>
+  </tbody>
+</table>
+
+畳むときも一気に消さず、まず `meta.minSupported` を引き上げて該当クライアントに更新バナーを出し、それでも残る端末がしきい値を割ってから、サーバー側の旧分岐を取り除きます。`minSupported` を上げる段と、コードを消す段を分けるのが、安全に巻き戻せる唯一のやり方です。
+
+## 一度きりの設計ではなく、習慣にする
+
+この設計の本当の価値は、派手な機能ではなく、「デプロイの前に一拍置ける」という習慣に変わるところにあると感じています。封筒・加算のみ・能力フラグという3つの型を持っていると、変更のたびに「これは旧バイナリを壊さないか」と自然に問い直せます。
+
+無印 Rork で素早く作り、ネイティブが要る局面で Rork Max を足す——という現実的な使い分けが広がるほど、1つのバックエンドが複数のランタイムを同時に支える場面は増えていきます。そのとき効いてくるのは、機能の数ではなく、契約を壊さない規律のほうです。
+
+次の一歩として、まずは既存の1エンドポイントだけでも封筒型に包み直し、`X-Client-Version` の集計を仕込んでみてください。畳む判断ができる土台が、いちばん最初に手に入ります。最後までお読みいただき、ありがとうございました。
