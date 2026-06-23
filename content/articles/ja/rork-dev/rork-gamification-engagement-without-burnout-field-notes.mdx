@@ -1,0 +1,316 @@
+---
+title: "ゲーミフィケーションでDAUは増えたのに継続率が動かなかった — Rork運用で効いた設計の立て直し"
+slug: "rork-gamification-engagement-without-burnout-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-23T11:00"
+updated: "2026-06-23T11:00"
+author: "Rork Lab"
+description: "ポイント・バッジ・リーダーボードを入れるとDAUは上がりますが、継続率は別物です。サーバー権威のポイント台帳、燃え尽きないストリーク、新規を萎えさせないリーグ設計まで、Rork運用で効いた立て直しを実装コード付きで整理します。"
+tags: ["ゲーミフィケーション", "リテンション", "Rork", "Supabase", "React Native", "リーダーボード"]
+highlights:
+  - "ローカル保存のポイントが「測れない・改ざんできる」二重の弱点を持つ理由と、Supabase RPCによる冪等なサーバー権威台帳の実装"
+  - "ストリークを切らさないための猶予日（streak freeze）をサーバー側で安全に計算するロジック"
+  - "全体ランキングが新規ユーザーを萎えさせる構造と、相対リーグ・自分の前後だけを見せるウィンドウ表示の設計"
+---
+ポイントとバッジとリーダーボードを自分のアプリに入れたとき、デイリーアクティブユーザーは確かに増えました。ログイン直後にポイントが跳ね、バッジが解放され、数字は気持ちよく動きます。ところが翌月、7日後継続率（D7 retention）のコホートを並べてみると、導入前とほとんど変わっていませんでした。むしろ一部のユーザーは、ストリークが途切れた翌日に静かに離れていきました。
+
+DAUが増えたのは「同じ人が習慣的にログインを叩いていた」だけで、新しく定着した人が増えたわけではなかったのです。これは個人開発で癒し系・壁紙系のアプリを運用してきたなかで、私自身が一番手痛く学んだことのひとつでした。ゲーミフィケーションは「楽しさで関係を強くする仕組み」ですが、設計を一段間違えると「虚栄の指標を増やすだけの仕組み」になります。
+
+この記事は、入れたあとに気づいた3つの落とし穴と、それをどう立て直したかの運用メモです。基本的な実装（ポイント加算フックやバッジ判定）はすでに動いている前提で、その先の「効くゲーミフィケーション」に踏み込みます。
+
+## ローカル保存のポイントは「測れない」「改ざんできる」
+
+最初の実装では、ポイントもストリークも `AsyncStorage` にローカル保存していました。手軽で動きは速いのですが、運用に入ってすぐ二つの問題に直面します。
+
+一つは**測定できないこと**。ポイントが端末の中にしかないと、サーバー側には「どのアクションが本当にリテンションに効いているか」のデータが残りません。バッジAを取った人とBを取った人で、30日後にどちらが残っているか——この比較ができないと、ゲーミフィケーションは改善のループに乗りません。
+
+もう一つは**改ざんできること**。リーダーボードに送る数値がクライアント発信だと、端末側でいくらでも書き換えられます。一人開発のニッチアプリでも、ランキング上位にいたずらスコアが並ぶと、まじめなユーザーの意欲を一瞬で削ぎます。
+
+結論として、**ポイントの「正本」はサーバーに置く**べきです。クライアントは「このアクションが起きた」という事実だけを送り、点数の確定とランキングはサーバーが行います。
+
+## サーバー権威のポイント台帳を冪等に設計する
+
+ここで一番つまずくのが「同じアクションを二重に加点してしまう」問題です。ネットワークが不安定なモバイルでは、リクエストの再送は日常的に起きます。タップが二回送られれば二回加点される——これを防ぐ鍵が**冪等性（idempotency）**です。
+
+クライアントはアクションごとに一意のIDを生成し、サーバーはそのIDを台帳に記録します。同じIDが再送されても、二度目は加点せずに現在値を返すだけにします。
+
+### 台帳テーブルとアトミックな加点RPC
+
+```sql
+-- Supabase SQL Editor で実行
+-- 1) ポイント台帳（1行 = 1トランザクション）。idempotency_key で二重加点を防ぐ
+create table public.point_ledger (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  action text not null,
+  points integer not null,
+  idempotency_key text not null,
+  created_at timestamptz not null default now(),
+  constraint uq_idem unique (user_id, idempotency_key)
+);
+
+-- 2) 集計済みスコア（リーダーボード用）
+create table public.user_scores (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null,
+  total_points integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+-- 3) サーバー権威の加点関数。点数表はサーバーが持つ（クライアントは送らない）
+create or replace function public.award_points(
+  p_action text,
+  p_idempotency_key text
+) returns integer
+language plpgsql
+security definer
+as $$
+declare
+  v_user uuid := auth.uid();
+  v_points integer;
+  v_total integer;
+begin
+  if v_user is null then
+    raise exception 'not authenticated';
+  end if;
+
+  -- 点数はサーバー側のソース・オブ・トゥルース
+  v_points := case p_action
+    when 'daily_login'   then 10
+    when 'complete_task' then 25
+    when 'share_content' then 15
+    when 'invite_friend' then 50
+    else 0
+  end;
+
+  if v_points = 0 then
+    raise exception 'unknown action: %', p_action;
+  end if;
+
+  -- 冪等性: 同じキーが既にあれば加点せず現在値を返す
+  begin
+    insert into public.point_ledger(user_id, action, points, idempotency_key)
+    values (v_user, p_action, v_points, p_idempotency_key);
+  exception when unique_violation then
+    select total_points into v_total from public.user_scores where user_id = v_user;
+    return coalesce(v_total, 0);
+  end;
+
+  -- 集計を1文でアトミックに更新（読み取り→書き込みの競合を避ける）
+  insert into public.user_scores(user_id, display_name, total_points)
+  values (v_user, coalesce((auth.jwt() ->> 'name'), 'Player'), v_points)
+  on conflict (user_id)
+  do update set total_points = public.user_scores.total_points + excluded.total_points,
+                updated_at = now()
+  returning total_points into v_total;
+
+  return v_total;
+end;
+$$;
+```
+
+ポイントは `RETURNING` を使って一文で加算しています。アプリ側で「現在値を読んで、足して、書き戻す」と、二つの端末やリクエストが同時に走ったときに片方の加算が消えます。データベースに計算を委ねるのが安全です。
+
+### クライアント側は「事実」と「キー」だけを送る
+
+```typescript
+// lib/awardPoints.ts — 冪等キー付きでサーバーに加点を依頼する
+import * as Crypto from 'expo-crypto';
+import { supabase } from './supabase';
+
+type Action = 'daily_login' | 'complete_task' | 'share_content' | 'invite_friend';
+
+export async function awardPoints(action: Action): Promise<number | null> {
+  // アクション1回ごとに一意キーを発行（再送されても同じ結果になる）
+  const idempotencyKey = Crypto.randomUUID();
+
+  const { data, error } = await supabase.rpc('award_points', {
+    p_action: action,
+    p_idempotency_key: idempotencyKey,
+  });
+
+  if (error) {
+    // 失敗時は同じキーで安全に再試行できる(=二重加点しない)
+    console.warn('award_points failed:', error.message);
+    return null;
+  }
+  return data as number; // サーバーが確定した合計ポイント
+}
+
+// 使用例:
+// const total = await awardPoints('complete_task');
+// total が更新後の合計。UI はこの値を信頼して描画する
+```
+
+ここで重要なのは、`daily_login` のキーは「1日に1回」しか有効にならないように、キー生成側で日付を混ぜる手もあるという点です。ランダムUUIDのままだと同じ日に何度もログイン加点できてしまうので、`daily_login` だけは `` `daily_login:${todayYYYYMMDD}` `` のような決定的キーにし、二回目以降は `unique_violation` で弾く設計にしています。
+
+## 燃え尽きないストリーク設計 — 猶予日をサーバーで持つ
+
+ストリークは継続率に効く一方で、もっとも人を疲れさせる仕組みでもあります。「連続記録が途切れる」恐怖は、楽しさより先にプレッシャーになりがちです。私のアプリでも、ストリークを長く伸ばしていた人ほど、一度途切れたあとの離脱が目立ちました。
+
+立て直しのポイントは二つでした。**ストリークの計算をサーバー側に寄せる**ことと、**月に数回の猶予日（streak freeze）を配る**ことです。猶予日は「1日空いても記録は守られる」という保険で、Duolingoのストリークフリーズと同じ考え方です。これがあるだけで、忙しい日への罪悪感がかなり和らぎます。
+
+```sql
+-- ログイン時に呼ぶストリーク更新関数（猶予日つき）
+create table public.user_streaks (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  current_streak integer not null default 0,
+  best_streak integer not null default 0,
+  freezes_available integer not null default 2, -- 月初に補充する保険
+  last_active_date date
+);
+
+create or replace function public.touch_streak()
+returns integer language plpgsql security definer as $$
+declare
+  v_user uuid := auth.uid();
+  v_today date := (now() at time zone 'Asia/Tokyo')::date;
+  r public.user_streaks;
+  v_gap integer;
+begin
+  select * into r from public.user_streaks where user_id = v_user;
+  if not found then
+    insert into public.user_streaks(user_id, current_streak, best_streak, last_active_date)
+    values (v_user, 1, 1, v_today);
+    return 1;
+  end if;
+
+  if r.last_active_date = v_today then
+    return r.current_streak; -- 同日内の再ログインは何もしない
+  end if;
+
+  v_gap := v_today - r.last_active_date;
+
+  if v_gap = 1 then
+    -- 連続: そのまま伸ばす
+    update public.user_streaks
+      set current_streak = r.current_streak + 1,
+          best_streak = greatest(r.best_streak, r.current_streak + 1),
+          last_active_date = v_today
+      where user_id = v_user
+      returning current_streak into v_gap;
+    return v_gap;
+  elsif v_gap = 2 and r.freezes_available > 0 then
+    -- 1日だけ空いた: 猶予日を1枚消費して記録を守る
+    update public.user_streaks
+      set current_streak = r.current_streak + 1,
+          best_streak = greatest(r.best_streak, r.current_streak + 1),
+          freezes_available = r.freezes_available - 1,
+          last_active_date = v_today
+      where user_id = v_user
+      returning current_streak into v_gap;
+    return v_gap;
+  else
+    -- 2日以上空いた、または保険切れ: リセット（ただし罰則は与えない）
+    update public.user_streaks
+      set current_streak = 1, last_active_date = v_today
+      where user_id = v_user;
+    return 1;
+  end if;
+end;
+$$;
+```
+
+日付の基準を `Asia/Tokyo` に固定しているのは、UTC基準だと深夜に使うユーザーのストリークが意図せず途切れるからです。タイムゾーンはストリークの体感を直接左右するので、アプリの主要ユーザーの生活時間に合わせます。
+
+そしてリセット時に**罰則を与えない**ことも意識しています。ポイントを没収したり、煽る通知を送ったりすると、戻ってきたユーザーをもう一度押し出してしまいます。記録は静かに1へ戻し、UIでは「またここから」と前向きに見せるだけにとどめます。
+
+## 全体ランキングは新規ユーザーを萎えさせる
+
+リーダーボードは諸刃の剣です。上位陣には強力な動機ですが、始めたばかりのユーザーが「1位 12,500pt / 自分 30pt」を見た瞬間、勝負が初めから決まっているように感じて離脱します。グローバルTOP50という設計は、実は大多数のユーザーにとって関係のない景色です。
+
+立て直しでは二つの仕組みを足しました。一つは**相対リーグ**。全員を点数帯でいくつかのリーグ（例: ブロンズ/シルバー/ゴールド）に分け、同じくらいの人同士で競わせます。もう一つは**自分の前後だけを見せるウィンドウ表示**です。世界一位ではなく「あと2人抜けば順位が上がる」という、手の届く目標を見せます。
+
+```sql
+-- 自分の順位の前後5人だけを返す（ウィンドウ表示）
+create or replace function public.leaderboard_around_me()
+returns table(rnk bigint, display_name text, total_points integer, is_me boolean)
+language sql security definer as $$
+  with ranked as (
+    select user_id, display_name, total_points,
+           rank() over (order by total_points desc) as rnk
+    from public.user_scores
+  ),
+  me as (select rnk from ranked where user_id = auth.uid())
+  select r.rnk, r.display_name, r.total_points, (r.user_id = auth.uid()) as is_me
+  from ranked r, me
+  where r.rnk between me.rnk - 5 and me.rnk + 5
+  order by r.rnk;
+$$;
+```
+
+```tsx
+// components/AroundMeBoard.tsx — 自分の前後だけを見せるランキング
+import { useEffect, useState } from 'react';
+import { View, Text, FlatList, StyleSheet } from 'react-native';
+import { supabase } from '../lib/supabase';
+
+type Row = { rnk: number; display_name: string; total_points: number; is_me: boolean };
+
+export default function AroundMeBoard() {
+  const [rows, setRows] = useState<Row[]>([]);
+
+  useEffect(() => {
+    supabase.rpc('leaderboard_around_me').then(({ data }) => {
+      if (data) setRows(data as Row[]);
+    });
+  }, []);
+
+  return (
+    <FlatList
+      data={rows}
+      keyExtractor={(r) => String(r.rnk)}
+      renderItem={({ item }) => (
+        <View style={[styles.row, item.is_me && styles.me]}>
+          <Text style={styles.rank}>{item.rnk}</Text>
+          <Text style={styles.name}>{item.display_name}</Text>
+          <Text style={styles.pt}>{item.total_points} pt</Text>
+        </View>
+      )}
+    />
+  );
+}
+
+const styles = StyleSheet.create({
+  row: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 8 },
+  me: { backgroundColor: '#eef2ff', borderRadius: 12 },
+  rank: { width: 44, fontWeight: '700', color: '#6366f1' },
+  name: { flex: 1, fontSize: 15 },
+  pt: { fontWeight: '700' },
+});
+```
+
+ウィンドウ表示に変えてから、ランキング画面を開いた新規ユーザーがすぐ閉じてしまう割合が下がりました。「届かない頂上」ではなく「次の一歩」を見せるだけで、同じデータでも体験は変わります。リーグ制と組み合わせると、上位の常連と新規の双方にちょうどいい競争が生まれます。
+
+オンボーディング初日の体験設計と合わせて考えると効果が高いので、[初日のリテンションを高めるオンボーディング設計](/articles/rork-dev/rork-onboarding-first-day-retention-design) も参考にしてみてください。
+
+## 「効いているか」はコホートで測る
+
+最後に、もっとも大事な運用習慣です。ゲーミフィケーションの成否は、DAUやポイント総量のような**虚栄の指標**ではなく、**コホート継続率**で判断します。導入週ごとに新規ユーザーを束ね、D1/D7/D30の残存率を追います。
+
+<table>
+<thead><tr><th>指標</th><th>何を見るか</th><th>落とし穴</th></tr></thead>
+<tbody>
+<tr><td><strong>DAU</strong></td><td>日々の活動量</td><td>同じ人の習慣ログインで水増しされる</td></tr>
+<tr><td><strong>ポイント総量</strong></td><td>機能の利用度</td><td>改ざん・連打で簡単に膨らむ</td></tr>
+<tr><td><strong>D7 / D30 コホート継続率</strong></td><td>新規が定着したか</td><td>反映が遅い（数週間待つ必要がある）</td></tr>
+<tr><td><strong>バッジ別の継続率差</strong></td><td>どの報酬が効くか</td><td>サーバーに台帳がないと計算できない</td></tr>
+</tbody>
+</table>
+
+私が個人開発で運用しているアプリ（AdMob で収益を得ている癒し系のアプリ群です）でも、立て直し後は次の数値を運用の目安に置いています。猶予日は月2枚まで補充し、リーグは4段階（ブロンズからプラチナまで）で運用、新規コホートのD7・D30は2〜3週間ごとにまとめて確認します。具体的な改善は、次の順序で一つずつ計測しながら進めることをお勧めします。
+
+1. リーダーボードのスコアをサーバー権威の `award_points` に置き換える
+2. `daily_login` を決定的キーにして二重加点を止める
+3. 猶予日を導入し、リセット時の罰則を外す
+4. ランキングをウィンドウ表示に切り替える
+
+一度に全部入れると、どの変更が継続率に効いたのかを後から分離できなくなります。私自身、最初に全部まとめて入れて切り分けに苦労したので、ここは順番が大事だと考えています。
+
+判断の指針はシンプルです。**新規コホートのD7・D30が、導入前のコホートより有意に上がったときだけ「効いた」と見なす**。ポイント台帳をサーバーに置いておけば、「最初の3日でバッジを1つ取った人」と「取らなかった人」の30日後を比較でき、どの報酬を前倒しすべきかが見えてきます。私の場合、初日に小さな成功体験を一つ用意したコホートだけが、継続率の差として表れました。
+
+## 次の一歩
+
+まずは一番改ざんと二重加点が起きやすい箇所——リーダーボードに送るスコア——を、クライアント発信からサーバー権威の `award_points` RPCに置き換えてみてください。冪等キーを足し、点数表をサーバーに移すだけで、測定の土台と公平性が同時に手に入ります。そのうえで導入週コホートのD7を2〜3週間追い、数字が動いた報酬だけを前に出していく。この順番が、燃え尽きさせずに継続率を育てる近道だと感じています。

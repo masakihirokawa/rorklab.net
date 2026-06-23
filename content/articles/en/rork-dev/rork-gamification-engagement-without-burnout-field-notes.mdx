@@ -1,0 +1,307 @@
+---
+title: "DAU Went Up but Retention Didn't — Rebuilding Gamification That Actually Sticks in Rork Apps"
+slug: "rork-gamification-engagement-without-burnout-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-23T11:00"
+updated: "2026-06-23T11:00"
+author: "Rork Lab"
+description: "Points, badges, and leaderboards lift DAU, but retention is a different story. Field notes on a server-authoritative point ledger, streaks that forgive, and leaderboards that don't crush newcomers — with working code for Rork apps."
+tags: ["Gamification", "Retention", "Rork", "Supabase", "React Native", "Leaderboard"]
+highlights:
+  - "Why locally stored points are both unmeasurable and tamperable, and how to build an idempotent server-authoritative ledger with a Supabase RPC"
+  - "How to compute forgiving streaks server-side with grace days (streak freeze) so a single missed day doesn't push users away"
+  - "Why a global leaderboard discourages new users, and how relative leagues plus an around-me window fix it"
+---
+When I first added points, badges, and a leaderboard to one of my apps, daily active users did climb. Points popped on login, badges unlocked, and the numbers felt great. But a month later, when I lined up D7 retention by cohort, it had barely moved from before the launch. Worse, some users quietly drifted away the day after their streak broke.
+
+The DAU bump came from the same people habitually tapping login — not from new users actually sticking around. As an indie developer running wallpaper and wellness apps, this was one of the more painful lessons I learned myself. Gamification is supposed to strengthen the relationship between a user and an app through enjoyment, but one wrong design turn and it just inflates vanity metrics.
+
+This is a field-notes account of the three traps I hit after shipping, and how I rebuilt around them. I'll assume the basics — point-award hooks, badge checks — are already working, and dig into what separates gamification that *works* from gamification that merely looks busy.
+
+## Locally stored points are unmeasurable and tamperable
+
+My first implementation kept points and streaks in `AsyncStorage`, locally. It's easy and fast, but two problems surface almost immediately in production.
+
+The first is that **you can't measure anything**. If points live only on the device, the server has no record of which actions actually drive retention. Did the people who earned Badge A stick around longer at 30 days than those who earned Badge B? Without that comparison, gamification never enters an improvement loop.
+
+The second is that **it's trivially tampered with**. If the score sent to the leaderboard originates on the client, anyone can rewrite it on-device. Even for a niche solo-developer app, a few prank scores at the top of the ranking will instantly deflate your honest users.
+
+The conclusion: the **source of truth for points belongs on the server**. The client should send only the fact that "this action happened," and the server decides the score and the ranking.
+
+## Make the server-authoritative ledger idempotent
+
+The thing most people stumble on here is double-counting the same action. On mobile, where networks are flaky, request retries are routine. If a tap gets sent twice, it gets credited twice. The key to preventing that is **idempotency**.
+
+The client generates a unique ID per action, and the server records that ID in the ledger. If the same ID arrives again, the second time simply returns the current value without crediting anything.
+
+### A ledger table and an atomic award RPC
+
+```sql
+-- Run in the Supabase SQL Editor
+-- 1) Point ledger (1 row = 1 transaction). idempotency_key blocks double credits
+create table public.point_ledger (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  action text not null,
+  points integer not null,
+  idempotency_key text not null,
+  created_at timestamptz not null default now(),
+  constraint uq_idem unique (user_id, idempotency_key)
+);
+
+-- 2) Aggregated scores (for the leaderboard)
+create table public.user_scores (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null,
+  total_points integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+-- 3) Server-authoritative award function. The point table lives on the server
+create or replace function public.award_points(
+  p_action text,
+  p_idempotency_key text
+) returns integer
+language plpgsql
+security definer
+as $$
+declare
+  v_user uuid := auth.uid();
+  v_points integer;
+  v_total integer;
+begin
+  if v_user is null then
+    raise exception 'not authenticated';
+  end if;
+
+  -- Point values are the server-side source of truth
+  v_points := case p_action
+    when 'daily_login'   then 10
+    when 'complete_task' then 25
+    when 'share_content' then 15
+    when 'invite_friend' then 50
+    else 0
+  end;
+
+  if v_points = 0 then
+    raise exception 'unknown action: %', p_action;
+  end if;
+
+  -- Idempotency: if the key already exists, return current total without crediting
+  begin
+    insert into public.point_ledger(user_id, action, points, idempotency_key)
+    values (v_user, p_action, v_points, p_idempotency_key);
+  exception when unique_violation then
+    select total_points into v_total from public.user_scores where user_id = v_user;
+    return coalesce(v_total, 0);
+  end;
+
+  -- Update the aggregate atomically in one statement (avoids read-then-write races)
+  insert into public.user_scores(user_id, display_name, total_points)
+  values (v_user, coalesce((auth.jwt() ->> 'name'), 'Player'), v_points)
+  on conflict (user_id)
+  do update set total_points = public.user_scores.total_points + excluded.total_points,
+                updated_at = now()
+  returning total_points into v_total;
+
+  return v_total;
+end;
+$$;
+```
+
+The points are incremented in a single statement with `RETURNING`. If you instead "read the current value in the app, add, and write it back," one increment vanishes whenever two devices or requests run at the same time. Let the database do the arithmetic — it's the safe choice.
+
+### The client sends only the fact and the key
+
+```typescript
+// lib/awardPoints.ts — ask the server to award points with an idempotency key
+import * as Crypto from 'expo-crypto';
+import { supabase } from './supabase';
+
+type Action = 'daily_login' | 'complete_task' | 'share_content' | 'invite_friend';
+
+export async function awardPoints(action: Action): Promise<number | null> {
+  // A unique key per action (retries produce the same result)
+  const idempotencyKey = Crypto.randomUUID();
+
+  const { data, error } = await supabase.rpc('award_points', {
+    p_action: action,
+    p_idempotency_key: idempotencyKey,
+  });
+
+  if (error) {
+    // On failure you can safely retry with the same key (no double credit)
+    console.warn('award_points failed:', error.message);
+    return null;
+  }
+  return data as number; // the server-confirmed total
+}
+
+// Usage:
+// const total = await awardPoints('complete_task');
+// total is the updated sum. The UI trusts this value to render
+```
+
+One nuance worth calling out: for `daily_login` you'll want the key to be valid only once per day. A pure random UUID would let someone earn the login bonus repeatedly in a single day, so for `daily_login` I use a deterministic key like `` `daily_login:${todayYYYYMMDD}` ``, and let the second attempt fail with `unique_violation`.
+
+## Streaks that forgive — keep grace days on the server
+
+Streaks help retention, but they're also the most exhausting mechanic you can ship. The fear of "breaking your run" tends to register as pressure before it registers as fun. In my own apps, the users with the longest streaks were exactly the ones most likely to leave after a single break.
+
+The rebuild came down to two things: **moving streak computation to the server**, and **handing out a few grace days (streak freeze) per month**. A grace day is insurance — "miss one day and your record survives" — the same idea as Duolingo's streak freeze. Just having it dramatically softens the guilt of a busy day.
+
+```sql
+-- Streak update function called on login (with grace days)
+create table public.user_streaks (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  current_streak integer not null default 0,
+  best_streak integer not null default 0,
+  freezes_available integer not null default 2, -- topped up at the start of each month
+  last_active_date date
+);
+
+create or replace function public.touch_streak()
+returns integer language plpgsql security definer as $$
+declare
+  v_user uuid := auth.uid();
+  v_today date := (now() at time zone 'Asia/Tokyo')::date;
+  r public.user_streaks;
+  v_gap integer;
+begin
+  select * into r from public.user_streaks where user_id = v_user;
+  if not found then
+    insert into public.user_streaks(user_id, current_streak, best_streak, last_active_date)
+    values (v_user, 1, 1, v_today);
+    return 1;
+  end if;
+
+  if r.last_active_date = v_today then
+    return r.current_streak; -- another login the same day does nothing
+  end if;
+
+  v_gap := v_today - r.last_active_date;
+
+  if v_gap = 1 then
+    -- consecutive: extend
+    update public.user_streaks
+      set current_streak = r.current_streak + 1,
+          best_streak = greatest(r.best_streak, r.current_streak + 1),
+          last_active_date = v_today
+      where user_id = v_user
+      returning current_streak into v_gap;
+    return v_gap;
+  elsif v_gap = 2 and r.freezes_available > 0 then
+    -- exactly one day missed: spend a grace day to protect the record
+    update public.user_streaks
+      set current_streak = r.current_streak + 1,
+          best_streak = greatest(r.best_streak, r.current_streak + 1),
+          freezes_available = r.freezes_available - 1,
+          last_active_date = v_today
+      where user_id = v_user
+      returning current_streak into v_gap;
+    return v_gap;
+  else
+    -- two or more days missed, or out of insurance: reset (but no penalty)
+    update public.user_streaks
+      set current_streak = 1, last_active_date = v_today
+      where user_id = v_user;
+    return 1;
+  end if;
+end;
+$$;
+```
+
+I pin the date basis to `Asia/Tokyo` because, on a UTC basis, the streak of someone who uses the app late at night breaks unintentionally. Time zone directly shapes how streaks *feel*, so I align it with the daily rhythm of the app's primary users.
+
+I'm also careful to **apply no penalty on reset**. Confiscating points or sending a guilt-trip notification just pushes a returning user back out the door. Quietly set the record to 1, and in the UI present it as a fresh, encouraging start.
+
+## A global leaderboard discourages new users
+
+A leaderboard is double-edged. It's a powerful motivator for the top tier, but the moment a brand-new user sees "#1: 12,500 pt / you: 30 pt," the contest feels decided before it began, and they leave. A global Top 50 is, in fact, a view that's irrelevant to the vast majority of users.
+
+The rebuild added two things. One is **relative leagues** — bucket everyone into a few leagues by point band (e.g., Bronze/Silver/Gold) so people compete with peers. The other is an **around-me window** that shows only your neighbors: not the world's best, but "pass two more people and your rank goes up" — a goal within reach.
+
+```sql
+-- Return only the five people above and below your own rank (around-me window)
+create or replace function public.leaderboard_around_me()
+returns table(rnk bigint, display_name text, total_points integer, is_me boolean)
+language sql security definer as $$
+  with ranked as (
+    select user_id, display_name, total_points,
+           rank() over (order by total_points desc) as rnk
+    from public.user_scores
+  ),
+  me as (select rnk from ranked where user_id = auth.uid())
+  select r.rnk, r.display_name, r.total_points, (r.user_id = auth.uid()) as is_me
+  from ranked r, me
+  where r.rnk between me.rnk - 5 and me.rnk + 5
+  order by r.rnk;
+$$;
+```
+
+```tsx
+// components/AroundMeBoard.tsx — show only the ranks around you
+import { useEffect, useState } from 'react';
+import { View, Text, FlatList, StyleSheet } from 'react-native';
+import { supabase } from '../lib/supabase';
+
+type Row = { rnk: number; display_name: string; total_points: number; is_me: boolean };
+
+export default function AroundMeBoard() {
+  const [rows, setRows] = useState<Row[]>([]);
+
+  useEffect(() => {
+    supabase.rpc('leaderboard_around_me').then(({ data }) => {
+      if (data) setRows(data as Row[]);
+    });
+  }, []);
+
+  return (
+    <FlatList
+      data={rows}
+      keyExtractor={(r) => String(r.rnk)}
+      renderItem={({ item }) => (
+        <View style={[styles.row, item.is_me && styles.me]}>
+          <Text style={styles.rank}>{item.rnk}</Text>
+          <Text style={styles.name}>{item.display_name}</Text>
+          <Text style={styles.pt}>{item.total_points} pt</Text>
+        </View>
+      )}
+    />
+  );
+}
+
+const styles = StyleSheet.create({
+  row: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 8 },
+  me: { backgroundColor: '#eef2ff', borderRadius: 12 },
+  rank: { width: 44, fontWeight: '700', color: '#6366f1' },
+  name: { flex: 1, fontSize: 15 },
+  pt: { fontWeight: '700' },
+});
+```
+
+After switching to the around-me window, the share of new users who opened the ranking screen and immediately closed it dropped. Showing "the next step" instead of "an unreachable summit" changes the experience even with identical data. Combine it with leagues and you get a competition that fits both the regulars at the top and the newcomers.
+
+It pays to think about this alongside the first-day experience, so you may find [Onboarding design that lifts first-day retention](/articles/rork-dev/rork-onboarding-first-day-retention-design) a useful companion.
+
+## Judge success by cohorts, not vanity
+
+Finally, the operating habit that matters most. Whether gamification worked is judged not by **vanity metrics** like DAU or total points, but by **cohort retention**. Group new users by their join week and follow D1/D7/D30 survival.
+
+<table>
+<thead><tr><th>Metric</th><th>What it shows</th><th>The trap</th></tr></thead>
+<tbody>
+<tr><td><strong>DAU</strong></td><td>Daily activity</td><td>Inflated by the same people's habitual logins</td></tr>
+<tr><td><strong>Total points</strong></td><td>Feature usage</td><td>Easily ballooned by tampering or tapping</td></tr>
+<tr><td><strong>D7 / D30 cohort retention</strong></td><td>Whether new users stuck</td><td>Slow to read (you have to wait weeks)</td></tr>
+<tr><td><strong>Retention by badge</strong></td><td>Which reward works</td><td>Uncomputable without a server-side ledger</td></tr>
+</tbody>
+</table>
+
+The decision rule is simple: **count it as "worked" only when the D7 and D30 of new cohorts rise meaningfully above pre-launch cohorts**. With the point ledger on the server, you can compare "people who earned a badge in their first three days" against "those who didn't" at the 30-day mark, and see which rewards to bring forward. In my case, only the cohort given one small early win showed up as a retention difference.
+
+## The next step
+
+Start with the spot most prone to tampering and double credits — the score sent to the leaderboard — and replace it from client-originated to the server-authoritative `award_points` RPC. Just adding an idempotency key and moving the point table to the server gets you both a measurement foundation and fairness at once. Then track the D7 of your join-week cohorts for two or three weeks, and only promote the rewards that actually moved the number. That order, I've found, is the shortest path to growing retention without burning anyone out.
