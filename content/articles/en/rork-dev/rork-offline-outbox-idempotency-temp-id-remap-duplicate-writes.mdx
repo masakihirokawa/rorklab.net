@@ -1,0 +1,261 @@
+---
+title: "The Post You Wrote Offline Shows Up Twice — Designing a Send Outbox That Survives Retries"
+slug: "rork-offline-outbox-idempotency-temp-id-remap-duplicate-writes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-23T21:00"
+author: "Rork Lab"
+description: "Persisting a queue and replaying it isn't enough — a lost response turns into a duplicate write. Here's a send outbox with idempotency keys, temp-to-server ID remapping, and poison-message quarantine, in working TypeScript."
+tags: ["offline-first", "react-native", "expo", "architecture", "idempotency"]
+highlights:
+  - "Why a retry creates a duplicate write, and the idempotency key that stops it"
+  - "Remapping a temporary local ID to the server ID so dependent offline writes resolve"
+  - "Quarantining a mutation that can never succeed, so it doesn't block the whole queue"
+---
+
+A reader was writing a long entry in one of my journaling apps while standing on a subway platform. They hit save in the dead zone, walked out past the gates, and a few seconds after the signal came back the same entry sat in their timeline twice. That review stuck with me.
+
+I run a few apps with write paths as an indie developer, and this "extra one that appears the moment you reconnect" is a trap you're more likely to hit the further you've taken your offline support. Queue the write, replay it on reconnect — most articles stop there, and so did I for a while. But that alone does not remove the duplicate.
+
+This article isn't about optimistic updates themselves. It's about what comes after them: the safety of the retry. Concretely, stopping duplicate writes with an idempotency key, remapping the temporary IDs you minted offline to real server IDs, and isolating a mutation that will never succeed. This is the load-bearing part of a write path you intend to operate for years.
+
+## The moment "just retry" falls apart
+
+Most send queues are written as "if it failed, send it again." The hard question is what counts as a failure.
+
+A network can drop after the request reaches the server, after the server finishes processing, but before the response makes it back to the client. From the client's side that's a timeout — a failure. From the server's side the post already exists. Retry naively and the server creates a second one.
+
+This isn't a bug so much as a property of writing across a network. Because responses can be lost, a client retry is inherently at-least-once. If you want to avoid duplicates, the receiving side has to refuse to count the same write twice. That's the idempotency key.
+
+## Decide the key once, at creation time
+
+The crux is to mint the key exactly once, the instant you enqueue, and never change it on retry. Generate a fresh key on every send and, as far as the server is concerned, each attempt is a different write — useless.
+
+Start with a type for a single outbox entry.
+
+```typescript
+// outbox/types.ts
+export type OutboxStatus = 'pending' | 'inflight' | 'failed' | 'dead';
+
+export interface OutboxItem {
+  localId: string;        // primary key on device (UUID)
+  idempotencyKey: string; // key sent to the server (minted once)
+  endpoint: string;       // e.g. 'POST /posts'
+  payload: unknown;       // request body
+  status: OutboxStatus;
+  attempts: number;
+  nextAttemptAt: number;  // exponential backoff time (epoch ms)
+  dependsOn?: string;     // localId of another item (see below)
+  createdAt: number;
+}
+```
+
+When enqueuing, fix `idempotencyKey` here and only here.
+
+```typescript
+// outbox/enqueue.ts
+import { randomUUID } from 'expo-crypto';
+
+export function buildOutboxItem(
+  endpoint: string,
+  payload: unknown,
+  dependsOn?: string,
+): OutboxItem {
+  const now = Date.now();
+  return {
+    localId: randomUUID(),
+    idempotencyKey: randomUUID(), // decided here, never changed again
+    endpoint,
+    payload,
+    status: 'pending',
+    attempts: 0,
+    nextAttemptAt: now,
+    dependsOn,
+    createdAt: now,
+  };
+}
+```
+
+Send it in a header. The server's contract is: on the second arrival of the same key, don't create anything new — return the first result.
+
+```typescript
+// outbox/send.ts
+async function send(item: OutboxItem): Promise<Response> {
+  return fetch(`https://api.example.com${item.endpoint.split(' ')[1]}`, {
+    method: item.endpoint.split(' ')[0],
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': item.idempotencyKey, // identical on every retry
+    },
+    body: JSON.stringify(item.payload),
+  });
+}
+```
+
+If you own the server, the receiver only needs to write one row keyed by the idempotency key. `INSERT ... ON CONFLICT DO NOTHING` rejects the second arrival and returns the existing result. For an external API like Stripe, most accept an `Idempotency-Key` header officially, so you align with that.
+
+## Put the box in SQLite so it survives a force quit
+
+Fixing the key is pointless if the box itself vanishes when the app restarts. Not an in-memory array or component state, but somewhere that lives across a cold start — I use SQLite. MMKV persists too, but once the count grows, the querying and transactions of a write path are easier to handle in SQLite.
+
+```typescript
+// outbox/store.ts
+import * as SQLite from 'expo-sqlite';
+
+const db = SQLite.openDatabaseSync('outbox.db');
+
+db.execSync(`
+  CREATE TABLE IF NOT EXISTS outbox (
+    localId TEXT PRIMARY KEY,
+    idempotencyKey TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    nextAttemptAt INTEGER NOT NULL,
+    dependsOn TEXT,
+    createdAt INTEGER NOT NULL
+  );
+`);
+
+export function insertItem(item: OutboxItem): void {
+  db.runSync(
+    `INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?)`,
+    item.localId, item.idempotencyKey, item.endpoint,
+    JSON.stringify(item.payload), item.status, item.attempts,
+    item.nextAttemptAt, item.dependsOn ?? null, item.createdAt,
+  );
+}
+
+export function dueItems(now: number): OutboxItem[] {
+  const rows = db.getAllSync<any>(
+    `SELECT * FROM outbox
+     WHERE status IN ('pending','failed') AND nextAttemptAt <= ?
+     ORDER BY createdAt ASC`, now,
+  );
+  return rows.map((r) => ({ ...r, payload: JSON.parse(r.payload) }));
+}
+```
+
+This foundation overlaps with the usual offline articles, so I'll keep it brief and move on. What matters is how you design ordering and failure handling on top of this box.
+
+## When a child write hangs off a parent you made offline
+
+After duplicates, the next headache is dependencies. Say you "create an album" and then "add a photo to it" while offline. The album only has a device-local temporary ID (`local:abc`). Send the photo first and the server references a parent that doesn't exist — error.
+
+There are two moves. First, give the child mutation a `dependsOn` so it won't send until the parent succeeds. Second, when the parent's send succeeds and the server ID comes back, remap the temporary ID inside the child's payload to the real one.
+
+```typescript
+// outbox/remap.ts
+// Called when a parent send succeeds. Propagates tempId -> serverId across the queue.
+export function remapId(tempId: string, serverId: string): void {
+  const children = db.getAllSync<any>(
+    `SELECT * FROM outbox WHERE payload LIKE ?`, `%${tempId}%`,
+  );
+  for (const row of children) {
+    // Walk the payload and replace tempId with serverId
+    const replaced = JSON.parse(
+      JSON.stringify(JSON.parse(row.payload as string))
+        .split(tempId).join(serverId),
+    );
+    db.runSync(
+      `UPDATE outbox SET payload = ?, dependsOn = NULL WHERE localId = ?`,
+      JSON.stringify(replaced), row.localId,
+    );
+  }
+}
+```
+
+Clearing `dependsOn` to `NULL` unblocks the child so it can send. The string replace looks crude, but if you mint temporary IDs with a non-colliding prefix like `local:`, accidental hits essentially never happen. Once I committed to that prefix rule, almost all of my remap bugs disappeared.
+
+## Don't let a write that can never succeed jam the front of the queue
+
+This last part pays off the most in production. Suppose a mutation always returns 422 from server-side validation — a reply to someone already deleted, or an old payload made invalid by a spec change. Drop it into a "failed, so retry" loop and it jams the head of the queue forever, dragging every healthy write behind it down with it.
+
+So split failures in two: ones a retry might fix (connection drops, 5xx, 429) and ones no number of retries will fix (most 4xx). The latter falls to quarantine (dead), and you tell the user quietly.
+
+```typescript
+// outbox/runner.ts
+const MAX_ATTEMPTS = 6;
+
+function isRetryable(status: number): boolean {
+  return status === 0 || status === 429 || status >= 500;
+}
+
+async function flushOne(item: OutboxItem): Promise<void> {
+  db.runSync(`UPDATE outbox SET status='inflight' WHERE localId=?`, item.localId);
+  try {
+    const res = await send(item);
+    if (res.ok) {
+      const body = await res.json();
+      if (body.id && item.payload && (item.payload as any).localId) {
+        remapId((item.payload as any).localId, body.id);
+      }
+      db.runSync(`DELETE FROM outbox WHERE localId=?`, item.localId);
+      return;
+    }
+    if (!isRetryable(res.status)) {
+      // never going to work -> quarantine and notify
+      db.runSync(`UPDATE outbox SET status='dead' WHERE localId=?`, item.localId);
+      notifyUserOfDeadItem(item);
+      return;
+    }
+    throw new Error(`retryable ${res.status}`);
+  } catch (e) {
+    const attempts = item.attempts + 1;
+    const status = attempts >= MAX_ATTEMPTS ? 'dead' : 'failed';
+    const backoff = Math.min(2 ** attempts * 1000, 5 * 60 * 1000); // cap 5 min
+    db.runSync(
+      `UPDATE outbox SET status=?, attempts=?, nextAttemptAt=? WHERE localId=?`,
+      status, attempts, Date.now() + backoff, item.localId,
+    );
+  }
+}
+```
+
+The flush as a whole must never run twice at once. Concurrent runs put the same item `inflight` twice, and even with the idempotency key in place you just burn extra round trips. A simple run lock plus catching the reconnect event from `@react-native-community/netinfo` exactly once was enough for me.
+
+```typescript
+// outbox/loop.ts
+let running = false;
+
+export async function flush(): Promise<void> {
+  if (running) return;        // single-run lock
+  running = true;
+  try {
+    const batch = dueItems(Date.now()).filter((i) => !i.dependsOn);
+    for (const item of batch) {
+      await flushOne(item);    // serial
+    }
+  } finally {
+    running = false;
+  }
+}
+```
+
+Items still carrying a `dependsOn` are skipped this pass and picked up on the next flush, once the parent resolves. Order holds by `createdAt` ascending, with dependencies as the only exception sent later — those two rules together preserve the before-and-after of what the user did offline.
+
+## What goes in the outbox, and what doesn't
+
+Not every write needs to go through this. The heavier it gets, the more fragile it becomes. Here's how I draw the line.
+
+<table>
+  <thead>
+    <tr><th>Kind of write</th><th>Outbox</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Creating a post or comment</td><td><strong>Yes</strong></td><td>Losing it wastes the user's effort; duplicates hurt too</td></tr>
+    <tr><td>Toggling a favorite or like</td><td>Yes (latest value only)</td><td>Collapse repeats on the same target to the last one</td></tr>
+    <tr><td>Read / view receipts</td><td>No</td><td>Little harm if lost; whatever sent is fine</td></tr>
+    <tr><td>Purchases / billing</td><td>No</td><td>Defer to StoreKit/RevenueCat restore paths</td></tr>
+  </tbody>
+</table>
+
+For a toggle like a like, just "replace any unsent write to the same target before enqueuing," and the wasted round trips drop noticeably. You only need idempotency keys for the things you actually put in the box.
+
+## What changed after I shipped it
+
+Since switching to this design, "the post showed up twice" reviews have all but stopped on my apps with write paths. Surfacing quarantined items on screen made failures that used to vanish silently visible, which also gave me the thread to pull on to fix the stale payloads behind them.
+
+If you own your server, idempotency keys can start from a single received-log row. Run just one path through it first — creating a post, the one that hurts most to lose. Add idempotency keys and temp-ID remapping to a persistent retry queue, and the write path goes remarkably quiet. I hope it's a useful next step if you're stuck on the same thing.

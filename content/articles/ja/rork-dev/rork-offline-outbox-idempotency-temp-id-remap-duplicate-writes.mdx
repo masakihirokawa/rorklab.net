@@ -1,0 +1,261 @@
+---
+title: "オフラインで書いた投稿が、復帰した瞬間にもう一つ増える——再送に強い送信アウトボックスの設計"
+slug: "rork-offline-outbox-idempotency-temp-id-remap-duplicate-writes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-23T21:00"
+author: "Rork Lab"
+description: "永続キューで再送するだけでは、失われた応答が二重投稿を生みます。冪等キー・一時IDの付け替え・毒メッセージの隔離を備えた送信アウトボックスを、動くTypeScriptで設計します。"
+tags: ["offline-first", "react-native", "expo", "architecture", "idempotency"]
+highlights:
+  - "再送が二重書き込みを生む仕組みと、Idempotency-Key で止める実装"
+  - "オフラインで作った親に子がぶら下がる依存を、一時IDの付け替えで解く方法"
+  - "常に422で失敗するミューテーションを隔離し、キュー全体を詰まらせない設計"
+---
+
+地下鉄のホームで、手記系のアプリに長めの投稿を書いていただいたユーザーがいました。電波がない区間で「保存」を押し、改札を出たあたりで通信が戻る。その数秒後、同じ投稿がタイムラインに二つ並んでいた——というレビューが届いたことがあります。
+
+私自身、個人開発で書き込みのあるアプリをいくつか運用していますが、この「復帰した瞬間に増える一つ」は、オフライン対応を一段進めた人ほど踏みやすい落とし穴だと感じています。永続キューに積んで、再接続したら流す。そこまでは多くの記事が書いている通りで、私も実装してきました。けれど、それだけでは二重投稿は消えません。
+
+ここで扱いたいのは、送信を後ろに回す楽観的更新そのものではなく、その先にある「再送の安全性」です。具体的には、冪等キーで二重書き込みを止め、オフラインで作った一時IDをサーバーのIDへ付け替え、決して成功しないミューテーションを隔離する。書き込み経路を長く運用するための、骨の部分です。
+
+## 「再送すれば安全」が崩れる瞬間
+
+送信キューの再送は、たいてい「失敗したら、もう一度送る」で書かれています。問題は、何をもって失敗とみなすかです。
+
+ネットワークは、リクエストがサーバーに届き、サーバーが処理を終え、その応答がクライアントへ戻る途中で切れることがあります。クライアントから見ればタイムアウト、つまり失敗です。けれどサーバーから見れば、投稿はすでに作られています。ここで素直に再送すると、サーバーは二つ目の投稿を作ります。
+
+これは設計の不備というより、ネットワーク越しの書き込みが本質的に持つ性質です。応答が失われうる以上、クライアントの再送は「少なくとも一回（at-least-once）」になります。二重を避けたければ、受け取る側が「同じ書き込みを二回数えない」仕組みを持つしかありません。それが冪等キーです。
+
+## 冪等キーは、生成時に一度だけ決める
+
+肝は、キューに積む瞬間に一度だけキーを発番し、再送では絶対に変えないことです。再送のたびに新しいキーを振ってしまうと、サーバーから見れば別々の書き込みになり、何の役にも立ちません。
+
+まず、アウトボックスの一件を表す型を決めます。
+
+```typescript
+// outbox/types.ts
+export type OutboxStatus = 'pending' | 'inflight' | 'failed' | 'dead';
+
+export interface OutboxItem {
+  localId: string;        // 端末内の主キー（UUID）
+  idempotencyKey: string; // サーバーへ渡す冪等キー（生成時に1回だけ）
+  endpoint: string;       // 例: 'POST /posts'
+  payload: unknown;       // 送信本文
+  status: OutboxStatus;
+  attempts: number;
+  nextAttemptAt: number;  // 指数バックオフの再試行時刻（epoch ms）
+  dependsOn?: string;     // 依存する別アイテムの localId（後述）
+  createdAt: number;
+}
+```
+
+積むときは、`idempotencyKey` をこの一回で固定します。
+
+```typescript
+// outbox/enqueue.ts
+import { randomUUID } from 'expo-crypto';
+
+export function buildOutboxItem(
+  endpoint: string,
+  payload: unknown,
+  dependsOn?: string,
+): OutboxItem {
+  const now = Date.now();
+  return {
+    localId: randomUUID(),
+    idempotencyKey: randomUUID(), // ← ここで決めたら二度と変えない
+    endpoint,
+    payload,
+    status: 'pending',
+    attempts: 0,
+    nextAttemptAt: now,
+    dependsOn,
+    createdAt: now,
+  };
+}
+```
+
+送信時は、このキーをヘッダーに載せます。サーバー側は、同じキーの二回目を受け取ったら新規作成せず、一回目の結果をそのまま返す約束にします。
+
+```typescript
+// outbox/send.ts
+async function send(item: OutboxItem): Promise<Response> {
+  return fetch(`https://api.example.com${item.endpoint.split(' ')[1]}`, {
+    method: item.endpoint.split(' ')[0],
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': item.idempotencyKey, // 再送でも同じ値
+    },
+    body: JSON.stringify(item.payload),
+  });
+}
+```
+
+サーバーを自分で持っている場合、受け側は「キーを主キーにした受信ログ」を一行書くだけで足ります。`INSERT ... ON CONFLICT DO NOTHING` で二回目を弾き、すでにある結果を返す。Stripe のような外部 API なら、多くが `Idempotency-Key` ヘッダーを公式に受け付けますので、それに合わせます。
+
+## アプリが落ちても消えないように、SQLite へ置く
+
+キーを固定しても、その箱がアプリの再起動で消えてしまえば意味がありません。インメモリの配列やコンポーネントの状態ではなく、コールド起動を跨いで残る場所——私は SQLite を使っています。MMKV でも残りますが、件数が増えたときの検索とトランザクションを考えると、書き込み経路は SQLite が扱いやすいと感じています。
+
+```typescript
+// outbox/store.ts
+import * as SQLite from 'expo-sqlite';
+
+const db = SQLite.openDatabaseSync('outbox.db');
+
+db.execSync(`
+  CREATE TABLE IF NOT EXISTS outbox (
+    localId TEXT PRIMARY KEY,
+    idempotencyKey TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    nextAttemptAt INTEGER NOT NULL,
+    dependsOn TEXT,
+    createdAt INTEGER NOT NULL
+  );
+`);
+
+export function insertItem(item: OutboxItem): void {
+  db.runSync(
+    `INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?)`,
+    item.localId, item.idempotencyKey, item.endpoint,
+    JSON.stringify(item.payload), item.status, item.attempts,
+    item.nextAttemptAt, item.dependsOn ?? null, item.createdAt,
+  );
+}
+
+export function dueItems(now: number): OutboxItem[] {
+  const rows = db.getAllSync<any>(
+    `SELECT * FROM outbox
+     WHERE status IN ('pending','failed') AND nextAttemptAt <= ?
+     ORDER BY createdAt ASC`, now,
+  );
+  return rows.map((r) => ({ ...r, payload: JSON.parse(r.payload) }));
+}
+```
+
+ここまでは既存のオフライン記事と重なる土台ですので、要点だけ押さえて先へ進みます。大切なのは、この箱の上で「順序」と「失敗の扱い」をどう設計するかです。
+
+## オフラインで作った親に、子がぶら下がるとき
+
+二重投稿の次に厄介なのが、依存関係です。オフライン中に「アルバムを作る」「そのアルバムに写真を追加する」と続けて操作したとします。アルバムはまだ端末内の一時ID（`local:abc`）しか持っていません。先に写真の追加を送ると、サーバーは存在しない親を参照してエラーになります。
+
+解決の筋は二つです。まず、子のミューテーションに `dependsOn` を持たせ、親が成功するまで送らないこと。次に、親の送信が成功してサーバーのIDが返ってきたら、子のペイロードの中の一時IDを本物のIDへ付け替えることです。
+
+```typescript
+// outbox/remap.ts
+// 親の送信成功時に呼ぶ。tempId -> serverId をキュー全体へ反映する。
+export function remapId(tempId: string, serverId: string): void {
+  const children = db.getAllSync<any>(
+    `SELECT * FROM outbox WHERE payload LIKE ?`, `%${tempId}%`,
+  );
+  for (const row of children) {
+    const next = JSON.parse(row.payload as string);
+    // payload を再帰的に走査して tempId を serverId へ置換
+    const replaced = JSON.parse(
+      JSON.stringify(next).split(tempId).join(serverId),
+    );
+    db.runSync(
+      `UPDATE outbox SET payload = ?, dependsOn = NULL WHERE localId = ?`,
+      JSON.stringify(replaced), row.localId,
+    );
+  }
+}
+```
+
+`dependsOn` を `NULL` に戻すことで、ブロックが解けて子が送れるようになります。文字列置換は乱暴に見えますが、一時IDを `local:` のような衝突しない接頭辞で発番しておけば、誤爆はまず起きません。私はこの接頭辞ルールを決めてから、付け替え周りのバグがほとんど消えました。
+
+## 決して成功しないミューテーションを、先頭で詰まらせない
+
+最後が、運用で一番効く部分です。あるミューテーションが、サーバー側の検証で必ず 422 を返すとします。たとえば、すでに削除された相手への返信や、仕様変更で無効になった古いペイロード。これを「失敗したから再送」のループに入れると、キューの先頭で永遠に詰まり、後ろの正常な書き込みまで道連れになります。
+
+ですので、失敗を二種類に分けます。再送して直りうるもの（通信断・5xx・429）と、何度送っても直らないもの（4xx の多く）。後者は隔離（dead）に落とし、ユーザーへ静かに知らせます。
+
+```typescript
+// outbox/runner.ts
+const MAX_ATTEMPTS = 6;
+
+function isRetryable(status: number): boolean {
+  return status === 0 || status === 429 || status >= 500;
+}
+
+async function flushOne(item: OutboxItem): Promise<void> {
+  db.runSync(`UPDATE outbox SET status='inflight' WHERE localId=?`, item.localId);
+  try {
+    const res = await send(item);
+    if (res.ok) {
+      const body = await res.json();
+      if (body.id && item.payload && (item.payload as any).localId) {
+        remapId((item.payload as any).localId, body.id);
+      }
+      db.runSync(`DELETE FROM outbox WHERE localId=?`, item.localId);
+      return;
+    }
+    if (!isRetryable(res.status)) {
+      // 何度送っても直らない → 隔離して通知
+      db.runSync(`UPDATE outbox SET status='dead' WHERE localId=?`, item.localId);
+      notifyUserOfDeadItem(item);
+      return;
+    }
+    throw new Error(`retryable ${res.status}`);
+  } catch (e) {
+    const attempts = item.attempts + 1;
+    const status = attempts >= MAX_ATTEMPTS ? 'dead' : 'failed';
+    const backoff = Math.min(2 ** attempts * 1000, 5 * 60 * 1000); // 上限5分
+    db.runSync(
+      `UPDATE outbox SET status=?, attempts=?, nextAttemptAt=? WHERE localId=?`,
+      status, attempts, Date.now() + backoff, item.localId,
+    );
+  }
+}
+```
+
+flush 全体は、同時に二つ走らせないことが肝心です。並行で走ると、同じアイテムが二度 `inflight` になり、せっかくの冪等キーがあっても無駄な往復が増えます。単純な実行ロックと、`@react-native-community/netinfo` の復帰イベントを「一度だけ」拾う組み合わせで十分でした。
+
+```typescript
+// outbox/loop.ts
+let running = false;
+
+export async function flush(): Promise<void> {
+  if (running) return;        // 単一実行ロック
+  running = true;
+  try {
+    let batch = dueItems(Date.now()).filter((i) => !i.dependsOn);
+    for (const item of batch) {
+      await flushOne(item);    // 直列に流す
+    }
+  } finally {
+    running = false;
+  }
+}
+```
+
+`dependsOn` が残っているものはこの回では送らず、親が解けた次の flush に回します。順序は `createdAt` 昇順で保ち、依存だけで例外的に後ろへ送る——この二段で、オフライン中の操作の前後関係が保たれます。
+
+## 何をアウトボックスに載せ、何を載せないか
+
+すべての書き込みをこの仕組みに通す必要はありません。重くするほど壊れやすくなります。私は次のように切り分けています。
+
+<table>
+  <thead>
+    <tr><th>書き込みの種類</th><th>アウトボックス</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>投稿・コメントの作成</td><td><strong>載せる</strong></td><td>失うとユーザーの労力が消える。二重も困る</td></tr>
+    <tr><td>お気に入り・いいねの切替</td><td>載せる（最新値のみ）</td><td>キュー内で同じ対象は最後の一件に畳む</td></tr>
+    <tr><td>既読・閲覧の記録</td><td>載せない</td><td>失っても実害が小さい。送れた分だけでよい</td></tr>
+    <tr><td>課金・購入</td><td>載せない</td><td>StoreKit/RevenueCat の復元経路に委ねる</td></tr>
+  </tbody>
+</table>
+
+いいねのような切替は、キューに積む前に「同じ対象の未送信があれば置き換える」だけで、無駄な往復がはっきり減ります。冪等キーは載せる対象だけに用意すれば十分です。
+
+## 実装してから変わったこと
+
+この設計に切り替えてから、書き込みのあるアプリで「投稿が二重に出る」というレビューはほぼ届かなくなりました。隔離されたアイテムを画面に出すようにしたことで、これまで黙って消えていた失敗が可視化され、原因の古いペイロードを直す手がかりにもなっています。
+
+冪等キーは、サーバーを自分で持っているなら受信ログ一行から始められます。まずは投稿の作成という、失うと一番痛い一本に絞って通してみてください。永続キューの再送に冪等キーと一時IDの付け替えが加わると、書き込み経路は驚くほど静かになります。同じところで悩んでいる方の、次の一手になれば幸いです。
