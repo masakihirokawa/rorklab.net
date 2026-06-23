@@ -1,0 +1,234 @@
+---
+title: "Foundation Models の Guided Generation で、オンデバイスAIの出力を型で受け取る"
+slug: "rork-max-foundation-models-guided-generation-typed-output"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-24T05:30"
+updated: "2026-06-24T05:30"
+author: "Rork Lab"
+description: "オンデバイスのFoundation Modelsで、AIの返答を自由文ではなく型付きの構造体として受け取る方法を、Guided GenerationとTool Callingの実装コードとともに整理します。"
+tags: ["Foundation Models", "オンデバイスAI", "Rork Max", "SwiftUI", "Guided Generation"]
+highlights:
+  - "モデルの自由文を毎回パースして壊れていた処理を、@Generable で型付きの構造体として安全に受け取れるようになる"
+  - "Tool Calling でモデルにアプリ側の関数を呼ばせ、ネットワークなしでも動くアシスタント機能を実装できる"
+  - "部分生成のストリーミング表示と、生成失敗時のフォールバック設計まで含めて、本番アプリに耐える on-device AI を組める"
+---
+
+オンデバイスのAIにアプリの機能を任せるとき、私が個人開発でいちばん神経を使ってきたのは、モデルの「自由文の返答」をアプリ側で構造化データに整形する部分でした。プロンプトで「JSONで返して」とお願いしても、前後に説明文が混じったり、キー名が微妙に揺れたり、配列が空のときだけ形が変わったりします。そのたびに正規表現や`try?`で受け止める処理が増えていき、いちばん壊れやすい場所になっていきました。
+
+iOS 26 の Foundation Models フレームワークには、この問題を根本から消すための仕組みが二つ用意されています。出力を Swift の型に縛る **Guided Generation** と、モデルにアプリ側の関数を呼ばせる **Tool Calling** です。Rork Max はネイティブ Swift を生成するため、これらの API をそのまま生成コードに組み込めます。自由文パースをやめて型でAIの出力を受け取るところまでを、ここから実際に動くコードで追っていきます。
+
+## なぜ自由文の返答をパースする実装は壊れやすいのか
+
+従来のクラウドLLM連携では、こういう形のコードを書きがちでした。
+
+```swift
+// 壊れやすい例：自由文を受け取って自前でJSONに整形する
+let text = try await callCloudLLM(prompt: "おすすめの瞑想テーマを3つ、JSON配列で返して")
+
+// text には「はい、こちらがおすすめです：[...]」のような前置きが混じることがある
+guard let jsonStart = text.firstIndex(of: "["),
+      let data = String(text[jsonStart...]).data(using: .utf8),
+      let themes = try? JSONDecoder().decode([String].self, from: data) else {
+    // ここに来る頻度が想像以上に高い
+    return fallbackThemes
+}
+```
+
+問題は、`text` が「人間向けの文章」である以上、フォーマットが保証されないことです。私が運用中のアプリにAI機能を足したときも、テスト中は安定していたのに、リリース後に特定の入力でだけ前置きが付いてパースが失敗する、という報告が出ました。`fallbackThemes` に逃げる回数が増えるほど、AI機能の価値は薄れていきます。
+
+Guided Generation は、この「文章を整形する」工程そのものを不要にします。モデルに最初から型を渡し、その型に適合した値だけを生成させるからです。
+
+## @Generable で出力を型に縛る
+
+まず、AIに返してほしいデータを Swift の構造体として宣言し、`@Generable` を付けます。
+
+```swift
+import FoundationModels
+
+@Generable
+struct MeditationTheme {
+    @Guide(description: "瞑想セッションのタイトル。15文字以内の日本語")
+    var title: String
+
+    @Guide(description: "そのテーマで意識すること。1文の説明")
+    var focus: String
+
+    @Guide(description: "推奨する時間（分）", .range(3...30))
+    var durationMinutes: Int
+}
+```
+
+`@Generable` を付けた型は、モデルにとって「この形で出力せよ」という設計図になります。あとはセッションに型を渡して生成を依頼するだけです。
+
+```swift
+let session = LanguageModelSession()
+
+let response = try await session.respond(
+    to: "初心者向けの瞑想テーマを1つ提案してください",
+    generating: MeditationTheme.self
+)
+
+// response.content は MeditationTheme 型。パース処理は一切ない
+let theme = response.content
+print(theme.title)          // 例：「呼吸に還る」
+print(theme.durationMinutes) // 例：5
+```
+
+ここがこの仕組みの核心です。`response.content` は文字列ではなく `MeditationTheme` そのものです。`JSONDecoder` も正規表現も登場しません。モデルが制約を満たせない値（たとえば`durationMinutes`に40を入れる）を生成しようとしても、フレームワーク側が型と`@Guide`の制約に沿うように生成を誘導するため、アプリに届く時点で`3...30`の範囲に収まっています。
+
+なぜ正規表現でのパースより信頼できるのか、という点が大事です。自前パースは「生成された後の文字列を検査する」後追いの防御ですが、Guided Generation は「生成の段階で型に沿わせる」前向きの制約です。壊れたものを直すのではなく、壊れたものを作らせない、という違いです。
+
+## @Guide でフィールドごとに意図と制約を伝える
+
+`@Guide` は単なる説明文ではなく、生成を制御する指示です。文字列の説明だけでなく、数値の範囲や、列挙からの選択を指定できます。
+
+```swift
+@Generable
+struct TodoItem {
+    @Guide(description: "やるべきことの内容。命令形ではなく名詞句で")
+    var task: String
+
+    // enum も @Generable にできる
+    @Guide(description: "優先度")
+    var priority: Priority
+
+    @Guide(description: "見積もり時間（分）", .range(5...240))
+    var estimatedMinutes: Int
+}
+
+@Generable
+enum Priority {
+    case high
+    case medium
+    case low
+}
+```
+
+`Priority` のような列挙型を `@Generable` にしておくと、モデルは必ず `high` / `medium` / `low` のいずれかを選びます。「優先度: とても高い」のような想定外の文字列が返ってくる余地がありません。アプリ側の`switch`文が網羅できることが型レベルで保証されるのは、運用していてとても安心できる部分です。
+
+配列も自然に扱えます。`generating: [TodoItem].self` のように指定すれば、要素すべてが制約を満たした配列が返ります。空配列のときだけ形が崩れる、という従来の悩みはここで消えます。
+
+## 部分生成（streaming）でUIを段階的に埋める
+
+構造体が大きくなると、生成完了まで待つとUIが固まったように見えます。Foundation Models は型付きのまま部分生成をストリーミングで受け取れます。
+
+```swift
+@Generable
+struct DailyPlan {
+    @Guide(description: "今日のひとことテーマ")
+    var theme: String
+    @Guide(description: "朝・昼・夜それぞれの小さな習慣")
+    var habits: [String]
+    @Guide(description: "締めの励ましの言葉")
+    var encouragement: String
+}
+
+let stream = session.streamResponse(
+    to: "穏やかに過ごすための一日プランを作ってください",
+    generating: DailyPlan.self
+)
+
+for try await partial in stream {
+    // partial は DailyPlan の各フィールドが Optional になった部分生成版
+    // 先に theme が埋まり、続いて habits が1件ずつ増えていく
+    await MainActor.run {
+        self.theme = partial.theme ?? self.theme
+        if let habits = partial.habits { self.habits = habits }
+    }
+}
+```
+
+`streamResponse` が返す部分生成版では、各プロパティが順に埋まっていきます。`theme`が先に表示され、`habits`が1件ずつ増え、最後に`encouragement`が現れる、という段階的な描画ができます。チャットの「タイピング中」のような体験を、型安全性を一切犠牲にせず実装できるのが利点です。私はこの部分生成を、生成に数秒かかる画面でだけ使い、即座に返る軽い生成では通常の`respond`にする、という使い分けにしています。
+
+## Tool Calling — モデルにアプリ側の関数を呼ばせる
+
+Guided Generation が「出力の形」を縛る仕組みなら、Tool Calling は「モデルにアプリの能力を貸す」仕組みです。モデルが自分の知識だけでは答えられないとき、こちらが用意した関数を呼んでもらえます。
+
+`Tool` プロトコルに準拠した型を作ります。引数も `@Generable` です。
+
+```swift
+import FoundationModels
+
+struct FavoriteLookupTool: Tool {
+    let name = "lookupFavorites"
+    let description = "ユーザーがお気に入り登録した壁紙のタグ一覧を返す"
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "絞り込みたいカテゴリ。指定なしなら全件")
+        var category: String?
+    }
+
+    // ローカルのデータストアを参照する。ネットワークは不要
+    func call(arguments: Arguments) async throws -> ToolOutput {
+        let tags = FavoriteStore.shared.tags(in: arguments.category)
+        return ToolOutput(tags.joined(separator: ", "))
+    }
+}
+```
+
+このツールをセッションに渡すと、モデルは必要だと判断したときに自分で `call` を呼びます。
+
+```swift
+let session = LanguageModelSession(tools: [FavoriteLookupTool()])
+
+let response = try await session.respond(
+    to: "私のお気に入りの傾向に合いそうな新しいテーマを提案して"
+)
+// モデルは内部で lookupFavorites を呼び、その結果を踏まえて提案を返す
+print(response.content)
+```
+
+ここでのポイントは、ツールの実体が**ローカルのデータストア参照**であることです。お気に入りタグはデバイス内にあり、ネットワークもクラウドAPIキーも使いません。つまりオフラインでも成立するアシスタントが作れます。個人開発で「機内モードでも動くか」を毎回確認する身としては、AI機能がオフライン前提で組めるかどうかは採否を分ける条件でした。Tool Calling とオンデバイスモデルの組み合わせは、その条件を満たします。
+
+クラウド推論への切り替えが必要なケースの判断軸は、別途まとめた[オンデバイス優先・クラウドフォールバックの設計](/articles/rork-ai/rork-ai-inference-router-on-device-first-cloud-fallback-2026)が参考になります。
+
+## オフライン前提の落とし穴とフォールバック設計
+
+オンデバイスモデルは常に使えるわけではありません。モデルがダウンロード中だったり、デバイスが非対応だったり、リソースが逼迫していたりします。利用可否は生成を試みる前に確認します。
+
+```swift
+import FoundationModels
+
+switch SystemLanguageModel.default.availability {
+case .available:
+    // 生成を実行
+    break
+case .unavailable(let reason):
+    // reason は .deviceNotEligible / .modelNotReady / .appleIntelligenceNotEnabled など
+    showFallbackUI(reason: reason)
+}
+```
+
+ここで大切なのは、AI機能を「あれば嬉しい上乗せ」として設計することです。私はオンデバイスAIに依存する画面でも、モデルが使えないときは手動の選択肢を必ず残すようにしています。たとえばテーマ提案がAIで出せないなら、あらかじめ用意した定番テーマの一覧を出す、という具合です。下の表は、私が機能を組むときの線引きです。
+
+<table>
+  <thead>
+    <tr><th>場面</th><th>オンデバイスAIに任せる</th><th>自分で詰める</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>提案・要約・分類</td><td>Guided Generation で型付き出力</td><td>結果の検証と表示の整形</td></tr>
+    <tr><td>ローカルデータの参照</td><td>Tool Calling で呼び出し判断</td><td>データストアの実装と権限</td></tr>
+    <tr><td>モデル非対応時</td><td>—</td><td>手動の選択肢を常に用意</td></tr>
+  </tbody>
+</table>
+
+生成が失敗したり時間がかかりすぎたりする場合に備えて、`withTimeout` 的なラッパーで打ち切り、フォールバックに落とす設計も入れておくと安心です。プロダクションでこの打ち切りを入れておくと、生成が返ってこないケースを回避できます。型で受け取れるようになっても、その可能性そのものは消えないからです。
+
+## 生成コードに任せる範囲と、自分で詰める範囲
+
+Rork Max は `@Generable` 付きの構造体や `Tool` 準拠型の骨格まで一気に生成してくれます。実際に試すと、型定義と`session.respond`の呼び出しまでは驚くほど素直に出てきます。一方で、`@Guide`の制約の妥当性（範囲や説明の精度）と、モデル非対応時のフォールバックは、生成任せにせず自分で詰めるべき部分でした。ここはアプリの体験を左右するところで、AIが「とりあえず動く形」を出した後に、人が運用視点で仕上げる工程が残ります。
+
+画像を入力に使いたい場合は、[Foundation Models の画像入力でオンデバイスにタグ付けする方法](/articles/rork-ai/rork-max-foundation-models-image-input-on-device-tagging)、Expo（React Native）側からネイティブモジュール経由で呼びたい場合は[Expo から Foundation Models をブリッジする実装](/articles/rork-ai/rork-expo-foundation-models-native-module-bridge)も合わせて検討すると、構成の選択肢が見えてきます。
+
+## 最初に組み込むなら、どの機能から
+
+もし既存アプリにオンデバイスAIをこれから足すなら、次の順番で進めることを推奨します。
+
+1. 一番小さな「分類」か「提案」の機能で `@Generable` を1つ定義する
+2. その機能の `respond(to:generating:)` を1か所だけ置き換え、自由文パースのコードを1つ消す
+3. 型付き生成の手応えを掴んでから、Tool Calling とストリーミングへ広げる
+
+自由文パースのコードが1つ消えるだけで、その機能の安定性は体感で変わります。私自身もまだ運用の中で最適な線引きを探っている途中ですが、共に試していけたら嬉しいです。
