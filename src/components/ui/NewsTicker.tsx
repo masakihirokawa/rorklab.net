@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PRODUCT — Rork Maxがネイティブ Swift アプリを生成。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "NATIVE — Rork MaxはAR/LiDAR・Metalの3Dゲーム・Dynamic Island・Live Activities・HealthKit・Core MLなどを解放します",
+    "FUNDING — RorkがLeft Lane Capital主導で$15Mのシードを調達。Peak XV・True Ventures・Goodwater・a16z Speedrunが参加しました",
+    "ENGINE — Rork MaxはClaude CodeとClaude Opus 4.6で駆動。X で800万超のビューを集め、2週間で年間売上を倍増させました",
+    "SWIFT — Rork MaxはWebで初めてSwiftアプリを生成できるビルダーで、Apple伝統のXcodeを置き換える位置づけです",
+    "PRODUCT — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでApple全域に対応します",
     "CLASSIC — 通常のRorkはReact Native（Expo）で、英語の説明だけからiOS/Androidアプリを生成しストア配信できます",
-    "FUNDING — a16zから$2.8Mを調達（別途$15Mも）。月743,000訪問・成長率85%と伸びています",
-    "PRICING — 無料で始められ、有料プランは月25ドル〜。Rork Maxは月200ドルです",
-    "CHOICE — クロスプラットフォームのRorkか、Apple専用機能まで踏み込むRork Maxか、用途で選び分けられます",
+    "PRICING — 無料で始められ、有料は月25ドル〜。Rork Maxは月200ドルです",
   ],
   en: [
-    "PRODUCT — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — Rork Max unlocks AR/LiDAR, Metal 3D games, Dynamic Island, Live Activities, HealthKit, and Core ML",
-    "CLASSIC — The original Rork uses React Native (Expo), turning plain-English prompts into shippable iOS/Android apps",
-    "FUNDING — Rork raised $2.8M from a16z (plus $15M more), reaching 743,000 monthly visits at 85% growth",
-    "PRICING — Rork is free to start, with paid plans from $25/month; Rork Max is $200/month",
-    "CHOICE — Pick cross-platform Rork or Rork Max for deep Apple-native capabilities, depending on your goal",
+    "FUNDING — Rork raised a $15M seed led by Left Lane Capital, with Peak XV, True Ventures, Goodwater, and a16z Speedrun joining",
+    "ENGINE — Rork Max runs on Claude Code and Claude Opus 4.6; it drew 8M+ views on X and doubled annual revenue in two weeks",
+    "SWIFT — Rork Max is the first web-based Swift app builder, positioned to replace Apple's traditional Xcode",
+    "PRODUCT — Rork Max covers the whole Apple ecosystem: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "CLASSIC — The original Rork uses React Native (Expo), building iOS/Android apps from a plain-English description",
+    "PRICING — Start free; paid plans begin at $25/mo, and Rork Max is $200/mo",
   ],
 };
 
