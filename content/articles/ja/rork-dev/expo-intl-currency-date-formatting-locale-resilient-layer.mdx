@@ -1,0 +1,223 @@
+---
+title: "価格が一部の端末だけ「¥1234」になる——Expo の Intl を信用しきらないフォーマット層の作り方"
+slug: "expo-intl-currency-date-formatting-locale-resilient-layer"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-06-23T11:00"
+author: "Rork Lab"
+description: "同じコードなのに、ある端末では「¥1,234」、別の端末では「¥1234」。Expo / Hermes の Intl は端末とOSのロケールデータに依存して出力が変わります。通貨・数値・日付・タイムゾーンを1ファイルに集約し、Intl が欠ける端末へ安全に後退するフォーマット層の設計を、動くコードで整理しました。"
+tags: ["Expo", "React Native", "Intl", "ローカライズ", "Hermes"]
+highlights:
+  - "Intl.NumberFormat / DateTimeFormat が端末・OS・エンジンで出力を変える理由と、出荷前に崩れを検知する方法"
+  - "通貨・数値・日付・相対時間を1ファイルに集約する format 層の実装（フォールバック付きの動くコード）"
+  - "任意の IANA タイムゾーンが効かない端末への後退と、UTC保存・ロケール表示を分ける設計"
+---
+
+ある朝、自分の運営アプリのレビューに「価格表示が崩れている」という一文が届きました。スクリーンショットを見ると、本来「¥1,480」と出るはずの値段が「¥1480」と、桁区切りのカンマだけが抜け落ちています。手元の検証端末では再現しません。コードは一行も変えていないのに、です。
+
+原因はコードではなく、端末が持っているロケールデータの差でした。React Native(Expo) のアプリは JavaScript エンジンに Hermes を使うことが多く、その `Intl` 実装は端末側の国際化データ（ICU）に寄りかかっています。つまり同じ `Intl.NumberFormat` を呼んでも、OS のバージョンや言語設定によって出力文字列が微妙に変わり得ます。
+
+個人開発で複数のアプリを各国向けに出していると、この「自分の端末では起きない不具合」が一番やっかいです。今日は、価格・数値・日付の表示を Intl 任せにせず、崩れを出荷前に捕まえるためのフォーマット層を、実際に私が使っている形で整理します。
+
+## なぜ「同じコード」で表示が変わるのか
+
+`Intl` は ECMAScript の国際化 API ですが、フォーマットに必要なロケールデータ（通貨記号の位置、桁区切り、月名、タイムゾーン規則）はランタイムが用意します。Hermes はこの部分を端末の ICU に橋渡しする設計のため、次の3つが変数になります。
+
+ひとつ目は OS バージョンです。Android は OS に同梱された ICU を使うため、古い端末ほどロケールデータが古く、新しい通貨や地域の表記が欠けることがあります。ふたつ目はユーザーの言語・地域設定で、`navigator` 由来のデフォルトロケールはユーザーが自由に変えられます。みっつ目はエンジンのビルド構成で、Intl を含むかどうか、どこまで含むかがプロジェクトの設定に依存します。
+
+ここで重要なのは、`Intl` が「ある／ない」の二択ではなく、「あるが、機能ごとに届く範囲が違う」状態だという点です。`NumberFormat` は広く動くのに、`DateTimeFormat` の `timeZone` に任意の IANA 名（`Asia/Tokyo` など）を渡すと一部端末で無視される、といった部分的な欠落が現実に起きます。
+
+## フォーマットの呼び出しを一点に集める
+
+最初の打ち手は、アプリ中に散らばった `toLocaleString()` や手書きの桁区切りを禁止し、フォーマットの入口を1ファイルに集約することです。表示の崩れが起きても、直す場所が1か所で済みます。
+
+```typescript
+// lib/format.ts — アプリ内のフォーマットはすべてここを通す
+import { getLocales } from "expo-localization";
+
+// 端末の第一言語。取れなければ日本語にフォールバック
+export const APP_LOCALE = getLocales()[0]?.languageTag ?? "ja-JP";
+
+// Intl が実際に使えるかを起動時に一度だけ判定する
+const hasIntl =
+  typeof Intl !== "undefined" &&
+  typeof Intl.NumberFormat === "function" &&
+  // 通貨スタイルが例外を投げないかまで確かめる
+  (() => {
+    try {
+      new Intl.NumberFormat("ja-JP", { style: "currency", currency: "JPY" }).format(1);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+export function formatNumber(value: number, locale: string = APP_LOCALE): string {
+  if (hasIntl) {
+    return new Intl.NumberFormat(locale).format(value);
+  }
+  // 後退: 3桁ごとにカンマを入れる素朴な実装
+  return value.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+```
+
+`hasIntl` を `try/catch` 付きで一度だけ評価しているのが要点です。`Intl` オブジェクトが存在しても、`style: "currency"` のような特定オプションで例外を投げる端末が稀にあるため、「呼べること」まで確認してから採用します。
+
+## 通貨は「ロケール × 通貨コード」を必ず両方渡す
+
+価格表示で一番事故が多いのが通貨です。`Intl.NumberFormat` の通貨スタイルは、表示ロケールと通貨コードの2つで結果が決まります。ここを曖昧にすると、冒頭のレビューのように桁区切りが消えたり、記号の位置がずれたりします。
+
+```typescript
+// lib/format.ts（続き）
+export function formatCurrency(
+  amountMinor: number,        // 最小単位で保持（円なら円、ドルならセント）
+  currency: string,          // "JPY" / "USD" など ISO 4217
+  locale: string = APP_LOCALE
+): string {
+  // 通貨ごとの小数桁を Intl 側に決めさせる（円は0桁、ドルは2桁）
+  const major =
+    currency === "JPY" || currency === "KRW" ? amountMinor : amountMinor / 100;
+
+  if (hasIntl) {
+    try {
+      return new Intl.NumberFormat(locale, {
+        style: "currency",
+        currency,
+        currencyDisplay: "symbol",
+      }).format(major);
+    } catch {
+      // 通貨コード未知などで失敗した場合のみ後退
+    }
+  }
+  const num = formatNumber(major, locale);
+  return currency === "JPY" ? `¥${num}` : `${num} ${currency}`;
+}
+```
+
+避けたいのは、自前で「¥」を文字列連結し、桁区切りも手で入れるやり方です。次の Before / After が、私が実際に書き換えた典型例です。
+
+<table>
+  <thead>
+    <tr><th>観点</th><th>Before（手書き連結）</th><th>After（フォーマット層）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>桁区切り</td><td>端末の Intl 差でカンマが消える</td><td>1か所で制御、後退実装も同じ規則</td></tr>
+    <tr><td>通貨記号</td><td>「¥」固定でドル建てに非対応</td><td>通貨コードで自動切替</td></tr>
+    <tr><td>小数桁</td><td>円もドルも同じ桁で表示</td><td>通貨ごとに Intl が判断</td></tr>
+    <tr><td>App Store 表記との整合</td><td>ずれて不審に見える</td><td>ロケール準拠で揃う</td></tr>
+  </tbody>
+</table>
+
+課金まわりの数字がストアの表記と食い違うと、それだけで課金率に響きます。私自身、価格の見え方を整えただけで問い合わせが減った経験があり、ここは手を抜けないと考えています。
+
+## 日付は「保存はUTC、表示はロケール」を徹底する
+
+日付・時刻のバグは、保存と表示を混ぜると一気に増えます。原則はシンプルで、サーバーやストレージには常に UTC（ISO 8601）で持ち、表示の瞬間だけロケールへ変換します。
+
+```typescript
+// lib/format.ts（続き）
+export function formatDate(
+  iso: string,                 // 例: "2026-06-23T02:00:00Z"（UTC）
+  locale: string = APP_LOCALE,
+  timeZone?: string            // 例: "Asia/Tokyo"
+): string {
+  const date = new Date(iso);
+  if (hasIntl) {
+    try {
+      return new Intl.DateTimeFormat(locale, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone,                // 効かない端末では無視されることがある
+      }).format(date);
+    } catch {
+      // timeZone 指定で失敗する端末向けの後退へ
+    }
+  }
+  return date.toISOString().slice(0, 16).replace("T", " ");
+}
+```
+
+ここで注意したいのが `timeZone` オプションです。任意の IANA タイムゾーンを渡しても、一部の端末では端末ローカルのタイムゾーンで表示され、指定が無視されることがあります。「サーバーで JST 固定の予約時刻を出したい」といった要件では、この落とし穴を本番で踏みがちです。
+
+確実に特定タイムゾーンで出したい箇所は、`Intl` の `timeZone` に頼り切らず、表示専用に固定オフセットを足した値を用意するか、タイムゾーン計算を担うライブラリを限定的に使う、という二段構えにしておくと安全です。
+
+## Intl が部分的に欠ける端末を「設計で」吸収する
+
+ここまでの `formatNumber` / `formatCurrency` / `formatDate` は、いずれも「Intl が使えれば使い、ダメなら後退する」同じ骨格で書かれています。この統一が効いてくるのは、相対時間のような少し凝った表示を足すときです。
+
+```typescript
+// lib/format.ts（続き）— 「3分前」のような相対表示
+export function formatRelative(iso: string, locale: string = APP_LOCALE): string {
+  const diffSec = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  const table: [Intl.RelativeTimeFormatUnit, number][] = [
+    ["day", 86400],
+    ["hour", 3600],
+    ["minute", 60],
+  ];
+  if (typeof Intl?.RelativeTimeFormat === "function") {
+    const rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+    for (const [unit, sec] of table) {
+      if (Math.abs(diffSec) >= sec) return rtf.format(-Math.round(diffSec / sec), unit);
+    }
+    return rtf.format(0, "second");
+  }
+  // RelativeTimeFormat 非対応端末への後退
+  if (diffSec < 60) return locale.startsWith("ja") ? "たった今" : "just now";
+  const mins = Math.round(diffSec / 60);
+  return locale.startsWith("ja") ? `${mins}分前` : `${mins}m ago`;
+}
+```
+
+`Intl.RelativeTimeFormat` は比較的新しい機能で、古い端末では未定義になり得ます。`typeof` で存在を確かめてから使い、無ければ最小限の自前実装に落とす——この後退をフォーマット層の内側に閉じ込めておくと、画面側のコードはエンジンの差を一切気にせずに済みます。
+
+## ロケール横断の崩れを出荷前に捕まえる
+
+最後に、テストの観点です。自分の端末1台では絶対に見つからない不具合なので、代表的なロケールを並べて出力を一覧で確認する小さなテストを書いておきます。
+
+```typescript
+// __tests__/format.test.ts
+import { formatCurrency, formatDate } from "../lib/format";
+
+const cases = [
+  { locale: "ja-JP", currency: "JPY", amount: 1480 },
+  { locale: "en-US", currency: "USD", amount: 1499 },   // minor=セント
+  { locale: "de-DE", currency: "EUR", amount: 1499 },
+];
+
+for (const c of cases) {
+  test(`currency ${c.locale}/${c.currency}`, () => {
+    const out = formatCurrency(c.amount, c.currency, c.locale);
+    // 数字が必ず含まれ、空文字でないことだけは最低限保証する
+    expect(out).toMatch(/\d/);
+    expect(out.length).toBeGreaterThan(0);
+  });
+}
+
+test("date stays UTC-stable on fallback", () => {
+  const out = formatDate("2026-06-23T02:00:00Z", "ja-JP", "Asia/Tokyo");
+  expect(out).toMatch(/\d/);
+});
+```
+
+CI のランナーと実機ではロケールデータが違うため、CI が通っても実機で崩れる可能性は残ります。そこで私は、ストア提出前に主要な対応言語へ端末の言語設定を手で切り替え、価格と日付の画面を1周だけ目視で確認する手順を入れています。数分の作業ですが、冒頭のようなレビューを未然に防げます。
+
+代表ロケールでの確認観点を、簡単な表にまとめておきます。
+
+<table>
+  <thead>
+    <tr><th>ロケール</th><th>見るべき点</th><th>崩れやすい箇所</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ja-JP</td><td>桁区切りカンマ・「¥」位置</td><td>古い Android でカンマ欠落</td></tr>
+    <tr><td>en-US</td><td>小数2桁・「$」前置</td><td>セント換算の有無</td></tr>
+    <tr><td>de-DE</td><td>小数点が「,」・記号が後置</td><td>記号位置の逆転</td></tr>
+  </tbody>
+</table>
+
+## 次の一手
+
+まずは自分のアプリ内で `toLocaleString()` と手書きの桁区切りを `grep` で洗い出し、1つだけでも `lib/format.ts` 経由に置き換えてみてください。入口が1か所に集まった瞬間から、ロケール起因の崩れは「再現できないバグ」ではなく「1ファイルを直せば済む既知の課題」に変わります。実装の参考になれば幸いです。
