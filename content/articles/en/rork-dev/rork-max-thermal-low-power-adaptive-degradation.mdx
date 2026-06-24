@@ -1,0 +1,187 @@
+---
+title: "Quietly Dialing Back Heavy Work When the Device Gets Hot or Enters Low Power Mode"
+slug: "rork-max-thermal-low-power-adaptive-degradation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-24T11:00"
+updated: "2026-06-24T11:00"
+author: "Rork Lab"
+description: "How to watch ProcessInfo's thermalState and Low Power Mode and degrade heavy work in stages when the device is hot or the battery is low, with working Swift code."
+tags: ["Rork Max", "SwiftUI", "Performance", "Battery", "On-Device AI"]
+highlights:
+  - "You can monitor ProcessInfo's thermalState and isLowPowerModeEnabled to wind down expensive work in stages as the device heats up or saves power"
+  - "You'll fold animations, background refresh, and on-device inference into a single quality tier, so you soften the experience instead of breaking features"
+  - "You'll learn how to protect battery and thermals without inconveniencing the user, for an app that holds up over the long run"
+---
+
+After I added an on-device AI feature to an app I have maintained for years as an indie developer, reviews started arriving a few days post-release: "the phone gets hot while I use it," "the battery drains fast." It never reproduced on my test device, and the cause eluded me for a while. What I eventually realized was that my testing always happened in the best possible conditions — a cool room and a full charge.
+
+Real users open the app outdoors in summer, or on a crowded commuter train with the battery in single digits. There, iOS itself has already started capping the CPU and GPU, and my app, by trying to run heavy work at full tilt, was making the heat and the battery drain worse. The app needed to read the device's state and back off on its own.
+
+This article walks through monitoring the two states that `ProcessInfo` exposes — the thermal stage (thermalState) and Low Power Mode (isLowPowerModeEnabled) — and degrading heavy work in stages, in a form you can drop straight into the native Swift that Rork Max generates.
+
+## Treat heat and low power as separate signals
+
+The first thing to settle is that these two have different causes and different remedies. Collapse them into one flag and you will make the wrong call.
+
+Thermal state represents the device physically heating up while the OS starts throttling. It has four stages — `.nominal`, `.fair`, `.serious`, `.critical` — and from `.serious` onward the OS throttles aggressively. If the app keeps running heavy work there, the felt experience collapses quickly.
+
+Low Power Mode is a setting the user chooses, or the system enables automatically as charge drops, to conserve battery. It happens independently of heat. Here, remedies that cut power directly — holding off on background refresh, lowering network frequency — are what work.
+
+So heat calls for "make what is running right now lighter," while low power calls for "do less from here on." Answering each from a different drawer is the design that fits.
+
+## Monitor thermalState and define stages
+
+`ProcessInfo` lets you read the current thermal stage synchronously and also posts a notification when it changes. Receive that notification in one place and convert it into state the whole app can read.
+
+```swift
+import Foundation
+import Combine
+
+@MainActor
+final class DeviceConditionMonitor: ObservableObject {
+    @Published private(set) var thermalState: ProcessInfo.ThermalState
+    @Published private(set) var isLowPower: Bool
+
+    init() {
+        let info = ProcessInfo.processInfo
+        thermalState = info.thermalState
+        isLowPower = info.isLowPowerModeEnabled
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(thermalChanged),
+            name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(powerChanged),
+            name: .NSProcessInfoPowerStateDidChange, object: nil)
+    }
+
+    @objc private func thermalChanged() {
+        let next = ProcessInfo.processInfo.thermalState
+        Task { @MainActor in self.thermalState = next }
+    }
+
+    @objc private func powerChanged() {
+        let next = ProcessInfo.processInfo.isLowPowerModeEnabled
+        Task { @MainActor in self.isLowPower = next }
+    }
+}
+```
+
+The notifications can arrive on any thread, so I re-receive them on `@MainActor` to stay consistent with UI state updates. If the code Rork Max generated does not already subscribe to these notifications, start by placing this single monitor — every later decision can then funnel through it.
+
+## Decide the quality tier in one place
+
+If each feature carries its own `thermalState == .serious` branch, every tuning change means editing all of them. I convert the device state one level up into a "quality tier," and have features look only at the tier.
+
+```swift
+enum RenderTier: Int, Comparable {
+    case full = 3      // no constraints
+    case reduced = 2   // drop decoration
+    case minimal = 1   // essentials only
+
+    static func < (lhs: RenderTier, rhs: RenderTier) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+extension DeviceConditionMonitor {
+    var tier: RenderTier {
+        switch thermalState {
+        case .critical, .serious: return .minimal
+        case .fair:               return isLowPower ? .minimal : .reduced
+        case .nominal:            return isLowPower ? .reduced : .full
+        @unknown default:         return .reduced
+        }
+    }
+}
+```
+
+Folding both heat and low power into one tier lets feature code receive only "how hard may I push right now." When you want to change the rule, the only place to edit is here.
+
+## Make each feature obey the tier
+
+Once the tier is set, you just have the heavy features follow it. Three representative ones:
+
+First, animation. At `.minimal`, stop decorative continuous animation and reflect state changes instantly instead.
+
+```swift
+struct PulseView: View {
+    @EnvironmentObject var monitor: DeviceConditionMonitor
+    @State private var animate = false
+
+    var body: some View {
+        Circle()
+            .scaleEffect(animate ? 1.2 : 1.0)
+            .onAppear {
+                guard monitor.tier >= .reduced else { return } // static at minimal
+                withAnimation(.easeInOut(duration: 1).repeatForever()) {
+                    animate = true
+                }
+            }
+    }
+}
+```
+
+Second, on-device inference or batch work. At `.minimal`, defer execution itself, and allow prefetching only at `.full`.
+
+```swift
+func prefetchRecommendations() async {
+    guard monitor.tier == .full else { return } // no prefetch when hot or low power
+    await recommendationEngine.warmUp()
+}
+```
+
+Third, refresh frequency. Stretch polling or timer intervals by tier.
+
+```swift
+var refreshInterval: TimeInterval {
+    switch monitor.tier {
+    case .full:    return 30
+    case .reduced: return 60
+    case .minimal: return 180
+    }
+}
+```
+
+The point is degrading quality or frequency in stages rather than cutting features entirely. To the user it reads as "a little more restrained," with none of the abrupt break of a feature that stops working.
+
+## In Low Power Mode, do more "not doing"
+
+In Low Power Mode, reducing the work you are about to start beats making running work lighter. I draw the line like this:
+
+<table>
+<thead>
+<tr><th>Work</th><th>Normal</th><th>Low Power Mode</th></tr>
+</thead>
+<tbody>
+<tr><td>Background refresh (BGTask)</td><td>Schedule it</td><td>Skip, refresh on next foreground</td></tr>
+<tr><td>Image / data prefetch</td><td>Do it eagerly</td><td>Defer until just before display</td></tr>
+<tr><td>Location accuracy</td><td>High accuracy</td><td>Lower to coarse</td></tr>
+<tr><td>Sync interval</td><td>Short</td><td>Long, batched</td></tr>
+</tbody>
+</table>
+
+The caution here is to never stop work that results from an explicit user action — pressing play, pressing sync — in the name of low power. The right scope is only "work the app starts on its own judgment." Delaying the user's intent is the very inconvenience you are trying to avoid.
+
+## Verify on device and simulator
+
+This kind of behavior is untestable if you cannot reproduce the conditions. Fortunately Xcode can force both.
+
+For heat, with a device attached, choose Simulate Thermal State from Xcode's Debug menu and step from `.fair` through `.critical`, watching the tier transitions by eye. Low Power Mode can be toggled from the simulator's Features menu, or from Settings on a real device.
+
+As my final check, I hold `.serious` and run through the main screens once, confirming that animation stops, prefetching does not fire, and the core feature still works fine. Seeing this "heavy but unbroken" state with my own eyes once takes a lot of the worry out of waiting for thermal reviews after release.
+
+## The steps I check before relying on it in production
+
+When I fold this into an existing app, I go in this order.
+
+1. Add a single monitor and surface the current tier in a debug overlay
+2. List the heavy features and replace each with a `tier` lookup
+3. Hold `.serious` forced, run through a production-equivalent pass, and crush whatever stumbles
+
+The caution here is making sure a lowered tier is not mistaken for a feature that "stopped." In my first build, cutting prefetch under low power made the display lag for a beat and feel broken, so I worked around it by adding a loading indicator. I recommend treating heat and low-power handling as two things at once: the work you lighten, and how you show the user that you lightened it.
+
+The longer you want people to use an app, the more its behavior in the worst conditions — not the best — decides its reputation. When the device is struggling, give it a design that can quietly take a step back on its own. Thank you for reading.

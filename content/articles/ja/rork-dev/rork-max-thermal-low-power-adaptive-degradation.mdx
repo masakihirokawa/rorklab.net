@@ -1,0 +1,187 @@
+---
+title: "発熱と省電力モードに合わせて、重い処理を静かに落とす設計"
+slug: "rork-max-thermal-low-power-adaptive-degradation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-24T11:00"
+updated: "2026-06-24T11:00"
+author: "Rork Lab"
+description: "ProcessInfo の thermalState と省電力モードを監視し、発熱時やバッテリー残量が少ないときに重い処理を段階的に落とす実装を、Swift のコードとともに整理します。"
+tags: ["Rork Max", "SwiftUI", "パフォーマンス", "バッテリー", "オンデバイスAI"]
+highlights:
+  - "ProcessInfo の thermalState と isLowPowerModeEnabled を監視し、発熱・省電力時に負荷の高い処理を段階的に落とす仕組みを組めます"
+  - "アニメーション・バックグラウンド更新・オンデバイス推論を「品質レベル」で切り替える設計に落とし込み、機能を止めずに体験だけ軽くできます"
+  - "ユーザーに不便を感じさせずにバッテリーと発熱を守る、長期運用に耐えるアプリの組み方が分かります"
+---
+
+個人開発で長く続けているアプリにオンデバイスのAI機能を足したとき、リリースから数日して「使っていると本体が熱くなる」「電池の減りが早い」というレビューが届きました。手元の検証機では一度も再現せず、しばらく原因が掴めませんでした。後から分かったのは、私の検証がいつも涼しい部屋・十分な充電という、いちばん条件の良い状態だったことです。
+
+実際のユーザーは、夏の屋外や、バッテリー残量が一桁の通勤電車の中でアプリを開きます。そこでは iOS 自身が CPU/GPU の上限を絞り始めていて、私のアプリは「重い処理を全力で回そうとし続ける」ことで、発熱と電池の減りをさらに悪化させていました。アプリ側が端末の状態を読んで、自分から負荷を引いていく必要があったのです。
+
+ここから、`ProcessInfo` が公開している二つの状態 — 発熱段階（thermalState）と省電力モード（isLowPowerModeEnabled）— を監視し、重い処理を段階的に落とす設計を、Rork Max が生成するネイティブ Swift にそのまま組み込める形で追っていきます。
+
+## 発熱と省電力は別の信号として扱う
+
+最初に押さえておきたいのは、この二つは原因も対処も違うということです。混ぜて一つのフラグにすると、判断を誤ります。
+
+発熱（thermalState）は、端末が物理的に熱を持ち、OS が性能を絞り始めている状態を表します。`.nominal`（通常）→ `.fair`（やや上昇）→ `.serious`（深刻）→ `.critical`（危機的）の4段階で、`.serious` 以降は OS が積極的にスロットリングをかけます。ここでアプリが重い処理を続けると、体感が一気に悪化します。
+
+省電力モード（Low Power Mode）は、ユーザーが、あるいは残量低下によって自動で、バッテリーを節約する設定を選んだ状態です。発熱とは無関係に発生します。ここでは「バックグラウンド更新を控える」「通信頻度を落とす」といった、電力を直接削る対処が効きます。
+
+つまり、発熱には「いま回っている処理を軽くする」、省電力には「これからやる処理を減らす」と、別の引き出しで応える設計が向いています。
+
+## thermalState を監視して段階を定義する
+
+`ProcessInfo` は現在の発熱段階を同期的に読めるほか、変化したときに通知を流してくれます。まずはこの通知を一箇所で受け、アプリ全体で参照できる状態に変換します。
+
+```swift
+import Foundation
+import Combine
+
+@MainActor
+final class DeviceConditionMonitor: ObservableObject {
+    @Published private(set) var thermalState: ProcessInfo.ThermalState
+    @Published private(set) var isLowPower: Bool
+
+    init() {
+        let info = ProcessInfo.processInfo
+        thermalState = info.thermalState
+        isLowPower = info.isLowPowerModeEnabled
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(thermalChanged),
+            name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(powerChanged),
+            name: .NSProcessInfoPowerStateDidChange, object: nil)
+    }
+
+    @objc private func thermalChanged() {
+        let next = ProcessInfo.processInfo.thermalState
+        Task { @MainActor in self.thermalState = next }
+    }
+
+    @objc private func powerChanged() {
+        let next = ProcessInfo.processInfo.isLowPowerModeEnabled
+        Task { @MainActor in self.isLowPower = next }
+    }
+}
+```
+
+通知は任意のスレッドから飛んでくるため、`@MainActor` で受け直して UI 側の状態更新と整合させています。Rork Max が生成したコードがこの通知購読を持っていない場合は、まずこの監視クラスを一つ置くところから始めると、後の判断がすべてここに集約できます。
+
+## 「品質レベル」を一箇所で決める
+
+各機能が `thermalState == .serious` のような条件分岐を個別に持つと、調整のたびに全箇所を直すことになります。私は、端末の状態を一段抽象化した「品質ティア」に変換し、機能側はティアだけを見るようにしています。
+
+```swift
+enum RenderTier: Int, Comparable {
+    case full = 3      // 制約なし
+    case reduced = 2   // 装飾を削る
+    case minimal = 1   // 必要最低限のみ
+
+    static func < (lhs: RenderTier, rhs: RenderTier) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+extension DeviceConditionMonitor {
+    var tier: RenderTier {
+        switch thermalState {
+        case .critical, .serious: return .minimal
+        case .fair:               return isLowPower ? .minimal : .reduced
+        case .nominal:            return isLowPower ? .reduced : .full
+        @unknown default:         return .reduced
+        }
+    }
+}
+```
+
+このように発熱と省電力の両方を一つのティアに畳み込んでおくと、機能側のコードは「いまどれくらい本気を出してよいか」だけを受け取れます。判断のルールを変えたくなっても、直すのはこの一箇所だけです。
+
+## 各機能をティアに従わせる
+
+ティアが決まれば、あとは負荷の高い機能をそれに従わせるだけです。代表的な三つを見ていきます。
+
+ひとつ目はアニメーションです。`.minimal` では装飾的な連続アニメーションを止め、状態変化だけを即時反映します。
+
+```swift
+struct PulseView: View {
+    @EnvironmentObject var monitor: DeviceConditionMonitor
+    @State private var animate = false
+
+    var body: some View {
+        Circle()
+            .scaleEffect(animate ? 1.2 : 1.0)
+            .onAppear {
+                guard monitor.tier >= .reduced else { return } // minimalでは静止
+                withAnimation(.easeInOut(duration: 1).repeatForever()) {
+                    animate = true
+                }
+            }
+    }
+}
+```
+
+ふたつ目はオンデバイス推論やバッチ処理です。`.minimal` では実行そのものを先送りし、`.full` のときだけ先読みを許します。
+
+```swift
+func prefetchRecommendations() async {
+    guard monitor.tier == .full else { return } // 発熱・省電力時は先読みしない
+    await recommendationEngine.warmUp()
+}
+```
+
+みっつ目は更新頻度です。ポーリングやタイマーの間隔をティアで伸縮させます。
+
+```swift
+var refreshInterval: TimeInterval {
+    switch monitor.tier {
+    case .full:    return 30
+    case .reduced: return 60
+    case .minimal: return 180
+    }
+}
+```
+
+機能を完全に消すのではなく、品質や頻度を段階的に落としているのがポイントです。ユーザーから見ると「少し控えめになった」程度で、機能が動かなくなる断絶は感じません。
+
+## 省電力モードでは「やらないこと」を増やす
+
+省電力モードのときは、いま動いている処理を軽くするより、これから走らせる処理を減らすほうが効きます。私は次のような線引きにしています。
+
+<table>
+<thead>
+<tr><th>処理</th><th>通常時</th><th>省電力モード時</th></tr>
+</thead>
+<tbody>
+<tr><td>バックグラウンド更新（BGTask）</td><td>スケジュールする</td><td>スキップ、次回前面復帰で更新</td></tr>
+<tr><td>画像・データの先読み</td><td>積極的に行う</td><td>表示直前まで遅延</td></tr>
+<tr><td>位置情報の精度</td><td>高精度</td><td>粗い精度に下げる</td></tr>
+<tr><td>同期の間隔</td><td>短い</td><td>長く、まとめて送る</td></tr>
+</tbody>
+</table>
+
+ここで気をつけたいのは、ユーザーが明示的に操作した結果（再生ボタンを押す、同期ボタンを押す）まで省電力を理由に止めないことです。あくまで「アプリが自分の判断で勝手に始める処理」を控えるのが筋で、ユーザーの意図を遅らせると不便そのものになってしまいます。
+
+## 実機とシミュレータで確かめる
+
+この種の挙動は、条件を再現できないとテストになりません。幸い Xcode から両方を強制できます。
+
+発熱は、実機を接続した状態で Xcode の Debug メニューから Simulate Thermal State を選び、`.fair` から `.critical` まで順に切り替えてティアの遷移を目視します。省電力モードは、シミュレータの Features メニュー、または実機の設定アプリから切り替えられます。
+
+私は確認の最後に、`.serious` を維持したまま主要画面を一通り触り、アニメーションが止まり、先読みが走らず、それでも中心の機能は問題なく使えることを確かめるようにしています。この「重くても壊れない」状態を一度自分の目で見ておくと、リリース後に発熱レビューが届く不安がかなり減ります。
+
+## 運用に乗せるときに私が確かめる手順
+
+実際にこの仕組みを既存アプリへ組み込むとき、私は次の順で進めています。
+
+1. 監視クラスを一つ追加し、現在のティアをデバッグ表示に出す
+2. 負荷の高い機能を洗い出し、それぞれを `tier` 参照に置き換える
+3. `.serious` を強制した状態で本番運用相当の操作を一周し、つまずく箇所を潰す
+
+ここでの注意点は、ティアを下げたときに機能が「止まった」と誤解されないことです。私自身、最初の実装では省電力時に先読みを切ったところ、表示が一瞬遅れて「壊れた」と感じる動きになってしまい、ローディング表示を添えて回避しました。発熱や省電力への対処は、軽くする処理と、軽くしたことをユーザーにどう見せるかをセットで考えることを推奨します。
+
+長く使ってもらうアプリほど、最高条件ではなく最悪条件での振る舞いが評価を決めます。端末がつらいときに、アプリのほうから静かに一歩引ける設計を、ぜひ一度組み込んでみてください。お読みいただきありがとうございました。

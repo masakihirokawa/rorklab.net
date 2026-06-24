@@ -1,0 +1,176 @@
+---
+title: "電話・イヤホン抜き・他アプリ再生に強い、音声アプリの中断ハンドリング"
+slug: "rork-max-avaudiosession-interruption-route-change-handling"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-24T16:00"
+updated: "2026-06-24T16:00"
+author: "Rork Lab"
+description: "AVAudioSession の中断通知とルート変更通知を正しく扱い、電話やイヤホン抜き差しで再生が破綻しない音声アプリを、Swift の実装コードとともに整理します。"
+tags: ["Rork Max", "AVFoundation", "オーディオ", "SwiftUI", "バックグラウンド再生"]
+highlights:
+  - "AVAudioSession の中断通知（電話・Siri）とルート変更通知（イヤホン抜き差し）を正しく購読し、再生を破綻させない実装ができます"
+  - "中断後に自分から再開してよい場合と、ユーザー操作を待つべき場合を shouldResume フラグで切り分けられます"
+  - "Now Playing とリモートコマンドに連動させ、ロック画面やコントロールセンターから操作できる本番品質の音声アプリを組めます"
+---
+
+瞑想や学習向けの音声を再生する小さなアプリを個人開発で出したとき、最初に届いた不具合報告が「電話が来た後、音が戻ってこない」というものでした。再生中に着信があると音が止まるのは当然なのですが、通話が終わってもアプリは止まったまま、画面の再生ボタンは「再生中」の見た目のまま固まっていたのです。
+
+原因は、AVAudioSession の中断を一切ハンドリングしていなかったことでした。再生は `AVAudioPlayer` に任せきりで、OS から「いま中断したよ」「もう戻っていいよ」という通知が来ていることに、私のコードがまったく耳を傾けていなかったのです。音声アプリの品質は、機能が一通り動くかどうかよりも、この種の割り込みにどれだけ丁寧に応えるかで決まると、その時に痛感しました。
+
+ここから、電話・Siri による中断、イヤホンの抜き差しによるルート変更を正しく扱い、再生が破綻しない実装を、Rork Max が生成するネイティブ Swift にそのまま組み込める形で見ていきます。
+
+## まずオーディオセッションのカテゴリを決める
+
+何より先に、アプリがどういう音を出すアプリなのかを OS に宣言します。これを怠ると、サイレントスイッチで音が消えたり、他アプリの音楽を不必要に止めてしまったりします。
+
+```swift
+import AVFoundation
+
+func configureAudioSession() {
+    let session = AVAudioSession.sharedInstance()
+    do {
+        // 再生主体のアプリ。サイレントスイッチに影響されず再生する
+        try session.setCategory(.playback, mode: .default)
+        try session.setActive(true)
+    } catch {
+        print("Audio session setup failed: \(error)")
+    }
+}
+```
+
+`.playback` は「このアプリの音はコンテンツそのものである」という宣言で、ロック中やバックグラウンドでも鳴らせます。逆に、他アプリの音楽の上に短い効果音を重ねたいだけなら `.ambient` を選ぶ、というように、用途に応じてカテゴリを変えます。最初の宣言を正しく選ぶことが、後の挙動すべての土台になります。
+
+## 中断通知を購読する
+
+中断は `AVAudioSession.interruptionNotification` で届きます。`.began`（中断開始）と `.ended`（中断終了）の二つの局面があり、終了時には「自分から再開してよいか」のヒントが付いてきます。
+
+```swift
+final class PlaybackController {
+    private var wasPlayingBeforeInterruption = false
+
+    func observeInterruptions() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleInterruption),
+            name: AVAudioSession.interruptionNotification, object: nil)
+    }
+
+    @objc private func handleInterruption(_ note: Notification) {
+        guard let info = note.userInfo,
+              let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+
+        switch type {
+        case .began:
+            // 電話やSiriが割り込んだ。状態を覚えておく
+            wasPlayingBeforeInterruption = player.isPlaying
+            player.pause()
+
+        case .ended:
+            guard let optsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt else { return }
+            let options = AVAudioSession.InterruptionOptions(rawValue: optsRaw)
+            // shouldResume が立っていて、かつ中断前に再生中だったときだけ再開
+            if options.contains(.shouldResume), wasPlayingBeforeInterruption {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                player.play()
+            }
+
+        @unknown default:
+            break
+        }
+    }
+}
+```
+
+ここで肝になるのが `shouldResume` の扱いです。OS は「再開してよい中断」と「再開すべきでない中断」を区別しています。たとえば他の音楽アプリがユーザー操作で前面に出てきたときは、勝手に再生を奪い返すべきではありません。`shouldResume` が立っていないのに再生を再開すると、ユーザーの意図に反してしまいます。中断前に再生中だったかどうかも併せて確認し、両方を満たすときだけ静かに戻すのが行儀の良い実装です。
+
+## ルート変更に対応する
+
+イヤホンを抜いたとき、再生が止まらずスピーカーから大音量で鳴ってしまう — これは Apple の Human Interface Guidelines でも明確に避けるべき挙動とされています。`AVAudioSession.routeChangeNotification` を購読し、出力経路が失われたら一時停止します。
+
+```swift
+func observeRouteChanges() {
+    NotificationCenter.default.addObserver(
+        self, selector: #selector(handleRouteChange),
+        name: AVAudioSession.routeChangeNotification, object: nil)
+}
+
+@objc private func handleRouteChange(_ note: Notification) {
+    guard let info = note.userInfo,
+          let raw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+          let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+
+    switch reason {
+    case .oldDeviceUnavailable:
+        // イヤホンやBluetooth機器が外れた。スピーカーに落ちる前に止める
+        DispatchQueue.main.async { self.player.pause() }
+    default:
+        break
+    }
+}
+```
+
+`.oldDeviceUnavailable` は「さっきまで使っていた出力先がなくなった」という理由で、イヤホンを抜いた瞬間に飛んできます。逆に、新しい機器を挿しただけのときは別の理由コードになるので、ここでは止めません。理由コードを見ずに一律で止めてしまうと、Bluetooth に切り替えた瞬間に意図せず停止する不便が生まれます。
+
+## Now Playing とリモートコマンドをつなぐ
+
+バックグラウンド再生をするアプリは、ロック画面やコントロールセンターから操作できてはじめて本番品質と言えます。`MPRemoteCommandCenter` で操作を受け、`MPNowPlayingInfoCenter` で表示する情報を渡します。
+
+```swift
+import MediaPlayer
+
+func setupRemoteCommands() {
+    let center = MPRemoteCommandCenter.shared()
+
+    center.playCommand.addTarget { [weak self] _ in
+        self?.player.play()
+        return .success
+    }
+    center.pauseCommand.addTarget { [weak self] _ in
+        self?.player.pause()
+        return .success
+    }
+}
+
+func updateNowPlaying(title: String, elapsed: TimeInterval, duration: TimeInterval) {
+    var info = [String: Any]()
+    info[MPMediaItemPropertyTitle] = title
+    info[MPMediaItemPropertyPlaybackDuration] = duration
+    info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+    info[MPNowPlayingInfoPropertyPlaybackRate] = player.isPlaying ? 1.0 : 0.0
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+}
+```
+
+中断やルート変更で再生状態が変わったら、その都度 `updateNowPlaying` を呼んで `PlaybackRate` を更新するのを忘れないでください。これを怠ると、アプリ内では止まっているのにロック画面では再生中に見える、という食い違いが起きます。先ほど私が遭遇した「ボタンが再生中のまま固まる」バグも、根は同じ状態の不整合でした。
+
+## バックグラウンド再生を有効にしてテストする
+
+最後に、バックグラウンドでも鳴り続けるよう Capabilities で Background Modes の Audio を有効にします。Rork Max が生成したプロジェクトでは、この設定が入っていないことがあるので確認してください。設定が漏れていると、画面を閉じた瞬間に音が止まります。
+
+テストは実機で、次の流れを一通り通すのが確実です。再生中に自分の番号へ電話をかけて切る、再生中にイヤホンを抜く、再生中に別の音楽アプリを開く、再生中に Siri を起動する。それぞれの後で、音と画面とロック画面の三つが食い違っていないかを確かめます。
+
+<table>
+<thead>
+<tr><th>割り込み</th><th>期待する挙動</th></tr>
+</thead>
+<tbody>
+<tr><td>電話・Siri</td><td>一時停止し、終了後 shouldResume が立てば再開</td></tr>
+<tr><td>イヤホンを抜く</td><td>一時停止（スピーカーで鳴らさない）</td></tr>
+<tr><td>他の音楽アプリ</td><td>譲って停止、勝手に奪い返さない</td></tr>
+<tr><td>アプリを背面へ</td><td>そのまま再生継続</td></tr>
+</tbody>
+</table>
+
+## 既存アプリへ組み込むときの順序
+
+中断ハンドリングを後付けする場合、私は次の順序で進めると安全だと考えています。
+
+1. オーディオセッションのカテゴリ設定を、起動直後に一度だけ呼ぶ
+2. 中断・ルート変更・リモートコマンドの購読をまとめて初期化する
+3. 実機で電話・イヤホン・他アプリの割り込みを一周し、本番運用で起こる組み合わせを潰す
+
+注意点は、購読の初期化を画面表示のたびに重ねて呼ばないことです。私自身、view の `onAppear` で購読を足していたら通知ハンドラが多重登録され、一回の中断で再生と停止が二度走る不具合に遭遇しました。購読は一箇所で一度だけ、という対処を徹底することを推奨します。
+
+音声アプリの完成度は、こうした割り込みへの応え方に集約されると私は考えています。機能を足すよりも地味な作業ですが、ここを丁寧に整えておくと、ユーザーは「よくできたアプリだ」という印象を言葉にしないまま受け取ってくれます。同じ課題に取り組んでいる方の参考になれば幸いです。
