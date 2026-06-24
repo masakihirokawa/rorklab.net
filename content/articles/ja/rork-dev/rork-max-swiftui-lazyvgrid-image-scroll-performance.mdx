@@ -1,0 +1,214 @@
+---
+title: "Rork Max の SwiftUI グリッドが画像でカクつくときに効く、スクロール最適化"
+slug: "rork-max-swiftui-lazyvgrid-image-scroll-performance"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-24T20:30"
+updated: "2026-06-24T20:30"
+author: "Rork Lab"
+description: "Rork Max が生成した SwiftUI の画像グリッドがスクロールでカクつく原因を計測し、ImageIO のダウンサンプリング・デコードのバックグラウンド化・セルの安定化で実機のヒッチを減らす実装手順をまとめました。"
+tags: ["Rork Max", "SwiftUI", "パフォーマンス", "画像処理", "LazyVGrid"]
+highlights:
+  - "壁紙のような画像グリッドでスクロールが詰まっていた人が、ヒッチを減らす具体的な実装を今日から試せる"
+  - "フル解像度画像をそのまま読み込む実装を、ImageIO のサムネイル生成で省メモリなものに置き換えられる"
+  - "Instruments の Hitches で hitch time ratio（5 ms/s が体感の目安）を数値で確認し、改善の前後を比較できる"
+---
+
+Rork Max に「壁紙を並べるグリッド画面を作って」と頼むと、数分で動く SwiftUI が返ってきます。シミュレータでは滑らかです。ところが実機に載せて、4K の壁紙を数十枚スクロールさせた瞬間、指の動きにスクロールが付いてこなくなる。私自身、個人開発で運用している壁紙アプリ Beautiful HD Wallpapers のグリッドを Rork Max で組み直したとき、まさにこの状態に出くわしました。
+
+原因は Rork Max の生成が雑だからではありません。生成されたコードは「画像をそのまま表示する」素直な実装で、これはサンプル画像が小さいうちは正しく動きます。問題は、実アプリで扱う画像が生成時の想定より遥かに大きいことです。ここでは、その素直な実装をどこから直すと実機のスクロールが戻るのかを、計測と一緒に追っていきます。
+
+## 生成直後のグリッドが実機でカクつく理由
+
+Rork Max が最初に出してくるグリッドは、だいたい次のような形をしています。
+
+```swift
+struct WallpaperGrid: View {
+    let items: [Wallpaper]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 2)]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 2) {
+                ForEach(items) { item in
+                    // 生成直後によくある形。URL からフル解像度をデコードして縮小表示するため、
+                    // 大きな画像が並ぶとメインスレッドでのデコードが重なり、スクロールが詰まります。
+                    AsyncImage(url: item.fileURL) { image in
+                        image.resizable().scaledToFill()
+                    } placeholder: {
+                        Color(.secondarySystemBackground)
+                    }
+                    .frame(width: 110, height: 110)
+                    .clipped()
+                }
+            }
+        }
+    }
+}
+```
+
+このコードの何が重いのか。`AsyncImage` は受け取った画像を「表示サイズに合わせて自動で軽くする」ことはしません。3024×4032 の壁紙であれば、110ポイント四方のセルに収めるためであっても、いったんフル解像度をビットマップに展開します。1枚あたり数十MBのメモリを使い、その展開（デコード）がメインスレッドで起きると、その間フレームが描けず、スクロールが一瞬止まります。これがセルの数だけ連鎖するのが、カクつきの正体です。
+
+公式ドキュメントには「`AsyncImage` は手軽」とは書かれていますが、「大量の高解像度画像には向かない」とは強調されていません。実際に重い画像を流して初めて分かる落とし穴です。
+
+## まず計測する — 体感ではなく数値で
+
+「カクついている気がする」だけで直し始めると、効いたかどうかが分からなくなります。先に計測の足場を作ります。
+
+Xcode の Instruments で **Animation Hitches** テンプレートを選び、実機で対象のグリッドをスクロールします。見るのは「hitch time ratio（ミリ秒/秒）」です。これは1秒のスクロールあたり、何ミリ秒フレームが遅れたかを表します。Apple の目安では 5 ms/s を超えると体感に出始め、10 ms/s を超えると明確に引っかかります。
+
+<table>
+  <thead>
+    <tr><th>症状</th><th>計測で見える兆候</th><th>主な原因</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>スクロール開始時に一瞬固まる</td><td>Time Profiler でデコード関数がメインスレッドに乗る</td><td>フル解像度のデコード</td></tr>
+    <tr><td>速くスクロールするとカクつく</td><td>hitch time ratio が 10 ms/s 超</td><td>セルごとの再デコード・再描画</td></tr>
+    <tr><td>下にスクロールするほど重くなる</td><td>メモリ使用量が右肩上がり</td><td>デコード済みビットマップの解放漏れ</td></tr>
+  </tbody>
+</table>
+
+私はこの計測を「直す前」「1つ直すごと」に取ることを習慣にしています。後述のダウンサンプリングだけで hitch が大きく下がることが多く、どこまでやれば十分かの判断が数値でつくからです。リリース後も Xcode Organizer の「Hitch Rate」で実ユーザーの値を追えるので、検証用の足場としても使えます。
+
+## 表示サイズに合わせてダウンサンプリングする
+
+最も効くのが、画像を「表示するサイズまで縮小してから」デコードする方法です。`UIImage(contentsOfFile:)` のようにフル解像度を読むのではなく、ImageIO にサムネイルを作らせます。これならフル解像度をメモリに展開せずに済みます。
+
+```swift
+import ImageIO
+import UIKit
+
+enum ImageDownsampler {
+    /// 指定したポイントサイズに合わせたサムネイルを生成します。
+    /// フル解像度を展開しないため、メモリ使用量とデコード時間を大きく抑えられます。
+    static func thumbnail(at url: URL, pointSize: CGSize, scale: CGFloat) -> CGImage? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
+            return nil
+        }
+        // 長辺をターゲットのピクセル数に合わせる
+        let maxPixel = max(pointSize.width, pointSize.height) * scale
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,   // デコードをこの場で済ませる
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel
+        ] as CFDictionary
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+    }
+}
+```
+
+ポイントは `kCGImageSourceShouldCacheImmediately` を `true` にしていることです。これでサムネイル生成の時点でデコードを終わらせます。描画の直前にデコードが走るのを防げるため、スクロール中のメインスレッドが軽くなります。
+
+## デコードをメインスレッドから降ろす
+
+ダウンサンプリングは軽くなったとはいえ、ゼロコストではありません。スクロール中のメインスレッドで走らせれば、やはりフレームを食います。`.task` の中で `Task.detached` に逃がして、結果だけをメインに戻します。
+
+```swift
+struct WallpaperCell: View, Equatable {
+    let item: Wallpaper       // Identifiable
+    let side: CGFloat
+
+    @State private var image: UIImage?
+
+    var body: some View {
+        Color(.secondarySystemBackground)
+            .overlay {
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                }
+            }
+            .frame(width: side, height: side)
+            .clipped()
+            .task(id: item.id) {        // セルが再利用されると前のタスクは自動でキャンセルされる
+                let target = CGSize(width: side, height: side)
+                let scale = UIScreen.main.scale
+                let url = item.fileURL
+                let cg = await Task.detached(priority: .userInitiated) {
+                    ImageDownsampler.thumbnail(at: url, pointSize: target, scale: scale)
+                }.value
+                if let cg {
+                    image = UIImage(cgImage: cg)
+                }
+            }
+    }
+
+    static func == (lhs: WallpaperCell, rhs: WallpaperCell) -> Bool {
+        lhs.item.id == rhs.item.id && lhs.side == rhs.side
+    }
+}
+```
+
+`.task(id: item.id)` を使うのが地味ですが重要です。`LazyVGrid` はセルを再利用するため、速くスクロールすると1つのセルビューが次々に別の `item` を表示します。`id:` を渡しておくと、表示対象が変わった瞬間に前のダウンサンプリングタスクが自動でキャンセルされ、もう画面にいない画像のデコードに時間を使わなくなります。これを忘れると、勢いよくスクロールしたあとに「見えない画像のデコード」が裏で延々と続き、スクロールが終わってからもしばらく重いままになります。
+
+## セルを安定させて、無駄な再描画を止める
+
+グリッド側は、セルが何度も作り直されないように整えます。`Wallpaper` を `Identifiable` にして安定した `id` を持たせ、`WallpaperCell` を `Equatable` にして「同じ item・同じサイズなら描き直さない」と SwiftUI に伝えます。
+
+```swift
+struct Wallpaper: Identifiable, Hashable {
+    let id: String
+    let fileURL: URL
+}
+
+struct WallpaperGrid: View {
+    let items: [Wallpaper]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 2)]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 2) {
+                ForEach(items) { item in
+                    WallpaperCell(item: item, side: 110)
+                        .equatable()      // 同じ値なら body を再評価しない
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+    }
+}
+```
+
+ここで `id` に「配列のインデックス」を使わないことが大切です。生成コードが `ForEach(items.indices, id: \.self)` のようにインデックスを使っていると、並び替えや追加のたびに別物として扱われ、画像の読み直しが起きます。安定した文字列 ID（ファイル名や UUID）を `Identifiable` で渡しておくと、この再読み込みが止まります。
+
+なぜ `AnyView` を避けるかも触れておきます。生成コードはセルを `AnyView` で包むことがありますが、`AnyView` は中身の型情報を消すため、SwiftUI が「同じビューかどうか」を判定できず、差分更新の最適化が効きにくくなります。セルは具体的な型のまま渡すのが速い、というのが実装現場での実感です。
+
+## 仕上げ — メモリの天井とプリフェッチ
+
+ダウンサンプリング済みの画像でも、表示中のものをすべて保持すれば、下にスクロールするほどメモリは増えます。`NSCache` に上限を決めて持たせると、メモリ警告時に自動で破棄され、解放漏れによる「下ほど重い」現象が止まります。
+
+```swift
+final class ThumbnailCache {
+    static let shared = ThumbnailCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    private init() {
+        cache.countLimit = 200          // 同時に保持するサムネイル数の上限
+    }
+
+    func image(for key: String) -> UIImage? { cache.object(forKey: key as NSString) }
+    func set(_ image: UIImage, for key: String) { cache.setObject(image, forKey: key as NSString) }
+}
+```
+
+セルの `.task` の中でまずこのキャッシュを引き、無ければ生成して入れる、という順にすれば、一度見たセルへ戻ったときの再デコードもなくなります。プリフェッチを足すなら、SwiftUI では `onAppear` で「数行先の画像」を先に温める程度に留めるのが現実的です。`LazyVGrid` は標準のプリフェッチ API を持たないため、凝った先読みはかえって複雑さを増やします。私はまずダウンサンプリングとキャッシュだけ入れて計測し、それで足りなければプリフェッチを検討する、という順番を取っています。
+
+なお、ここで手を入れたコードは Rork Max で再生成すると上書きされます。私は画像読み込み回りを `ImageDownsampler` と `ThumbnailCache` のように独立したファイルに切り出し、生成対象の画面からはそれを呼ぶだけにしています。こうしておくと、画面の作り直しを Rork Max に任せても、最適化した部分が消えません。生成と手直しの境界をどう引くかは、[Rork Max が生成した SwiftUI コードを本番向けにリファクタリングするパターン](/articles/rork-dev/rork-max-swiftui-generated-code-production-refactoring-patterns) でも整理しています。スクロール周りの考え方は React Native 版にも通じる部分があり、[画像キャッシュとプリフェッチでスクロール性能を設計する](/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design) と合わせて読むと、両ランタイムでの勘所が見えてきます。
+
+## 計測しながら入れる順番
+
+私自身がこのグリッドを直すときは、次の順番を踏みます。一度に全部入れず、1つごとに hitch を測り直すのがコツです。
+
+1. ダウンサンプリングを入れる。長辺で約12倍、ピクセル数では100倍以上小さくなるため、ここだけで hitch time ratio が半分以下に下がることが多いです。
+2. デコードをバックグラウンドに降ろし、`.task(id:)` でキャンセルを効かせる。速いスクロールでの取りこぼしを回避できます。
+3. `NSCache` と `Equatable` でセルを安定させる。本番のメモリ警告時にも崩れない状態にします。
+
+この場合、3 まで入れても hitch が下がらなければ、原因は別の場所（レイアウト計算や影の描画など）にあります。私はその時点で一度 Time Profiler に戻ることを推奨します。順番に1つずつ測りながら進めないと、どの変更が効いたのか分からなくなるからです。
+
+## ここから試すこと
+
+まずは Instruments の Animation Hitches で「直す前」の hitch time ratio を1つ取ってください。数値が手元にあれば、ダウンサンプリングを入れたときの効きが一目で分かります。多くの場合、フル解像度デコードをサムネイルに置き換えるだけで体感は戻ります。残りのセル安定化やキャッシュは、計測しながら効いた分だけ足していけば十分です。生成されたコードをそのまま責めるのではなく、どこか1か所を計測付きで直す——この進め方が、AI が書いた下地を実アプリの水準まで引き上げる近道だと感じています。

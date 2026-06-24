@@ -1,0 +1,205 @@
+---
+title: "Fixing Stutter When a Rork Max SwiftUI Image Grid Scrolls"
+slug: "rork-max-swiftui-lazyvgrid-image-scroll-performance"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-24T20:30"
+updated: "2026-06-24T20:30"
+author: "Rork Lab"
+description: "Measure why a Rork Max SwiftUI image grid stutters while scrolling, then fix it with ImageIO downsampling, off-main-thread decoding, and stable cells to cut real-device hitches."
+tags: ["Rork Max", "SwiftUI", "Performance", "Image Processing", "LazyVGrid"]
+highlights:
+  - "If your wallpaper-style image grid stalls on scroll, you can apply a concrete hitch-reducing implementation today"
+  - "You can replace the naive full-resolution image load with memory-friendly ImageIO thumbnail generation"
+  - "You'll be able to use Instruments Hitches to see exactly where and how much your grid stutters, and compare before and after"
+---
+
+Ask Rork Max to "build a grid screen that shows wallpapers" and you get working SwiftUI in a few minutes. It looks smooth in the simulator. Then you put it on a real device, scroll through a few dozen 4K wallpapers, and the scroll stops keeping up with your finger. As an indie developer running the wallpaper app Beautiful HD Wallpapers, I hit exactly this when I rebuilt its grid with Rork Max.
+
+The cause isn't sloppy generation. The generated code takes the straightforward path of "just display the image," which is correct while the sample images are small. The problem is that the real images your app ships are far larger than what the generator assumed. Let's walk through where to start fixing the naive version so that real-device scrolling comes back — measuring as we go.
+
+## Why the freshly generated grid stutters on device
+
+The grid Rork Max hands you first usually looks like this.
+
+```swift
+struct WallpaperGrid: View {
+    let items: [Wallpaper]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 2)]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 2) {
+                ForEach(items) { item in
+                    // The common freshly generated shape. It decodes full-resolution images
+                    // from the URL and scales them down for display, so when large images
+                    // pile up, main-thread decoding overlaps and scrolling stalls.
+                    AsyncImage(url: item.fileURL) { image in
+                        image.resizable().scaledToFill()
+                    } placeholder: {
+                        Color(.secondarySystemBackground)
+                    }
+                    .frame(width: 110, height: 110)
+                    .clipped()
+                }
+            }
+        }
+    }
+}
+```
+
+What makes this heavy? `AsyncImage` does not "automatically lighten the image to fit the display size." A 3024×4032 wallpaper is decoded into a full-resolution bitmap even when it only needs to fit a 110-point cell. Each image uses tens of megabytes of memory, and when that decode runs on the main thread, frames can't be drawn during it, so scrolling freezes for a moment. Chain that across every visible cell and you have the stutter.
+
+The official docs say `AsyncImage` is "convenient," but they don't emphasize that it's "not suited to large volumes of high-resolution images." It's a trap you only discover once you feed it genuinely heavy images.
+
+## Measure first — numbers, not gut feeling
+
+If you start fixing based on "it feels laggy," you won't know whether your change helped. Build a measurement footing first.
+
+In Xcode Instruments, choose the **Animation Hitches** template and scroll the grid on a real device. Watch the "hitch time ratio" (milliseconds per second): how many milliseconds of frames were delayed per second of scrolling. Apple's guidance is that it becomes perceptible past 5 ms/s and clearly catches past 10 ms/s.
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>What the measurement shows</th><th>Likely cause</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Brief freeze at the start of a scroll</td><td>Time Profiler shows decode functions on the main thread</td><td>Full-resolution decode</td></tr>
+    <tr><td>Stutter during fast scrolls</td><td>Hitch time ratio above 10 ms/s</td><td>Per-cell re-decode and re-render</td></tr>
+    <tr><td>Gets heavier the further you scroll</td><td>Memory usage climbs steadily</td><td>Decoded bitmaps not being released</td></tr>
+  </tbody>
+</table>
+
+I make a habit of taking this measurement "before fixing" and "after each single change." Downsampling alone often drops the hitch substantially, and the numbers tell you when you've done enough. After release, Xcode Organizer's "Hitch Rate" lets you track real users' values, so it doubles as a verification footing.
+
+## Downsample to the display size
+
+The biggest win is decoding the image only after shrinking it to the size you'll actually display. Instead of reading full resolution like `UIImage(contentsOfFile:)`, have ImageIO build a thumbnail so you never expand full resolution into memory.
+
+```swift
+import ImageIO
+import UIKit
+
+enum ImageDownsampler {
+    /// Generates a thumbnail sized to the given point size.
+    /// Because it never expands full resolution, it cuts both memory use and decode time sharply.
+    static func thumbnail(at url: URL, pointSize: CGSize, scale: CGFloat) -> CGImage? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
+            return nil
+        }
+        // Match the long edge to the target pixel count
+        let maxPixel = max(pointSize.width, pointSize.height) * scale
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,   // finish the decode right here
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel
+        ] as CFDictionary
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+    }
+}
+```
+
+The key is setting `kCGImageSourceShouldCacheImmediately` to `true`. That finishes decoding at thumbnail-generation time, so a decode doesn't fire right before drawing — which keeps the main thread light during scrolling.
+
+## Move the decode off the main thread
+
+Downsampling is lighter, but not free. Run it on the main thread during scrolling and it still eats frames. Push it into `Task.detached` inside `.task` and bring only the result back to the main actor.
+
+```swift
+struct WallpaperCell: View, Equatable {
+    let item: Wallpaper       // Identifiable
+    let side: CGFloat
+
+    @State private var image: UIImage?
+
+    var body: some View {
+        Color(.secondarySystemBackground)
+            .overlay {
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                }
+            }
+            .frame(width: side, height: side)
+            .clipped()
+            .task(id: item.id) {        // the previous task is cancelled automatically when the cell is reused
+                let target = CGSize(width: side, height: side)
+                let scale = UIScreen.main.scale
+                let url = item.fileURL
+                let cg = await Task.detached(priority: .userInitiated) {
+                    ImageDownsampler.thumbnail(at: url, pointSize: target, scale: scale)
+                }.value
+                if let cg {
+                    image = UIImage(cgImage: cg)
+                }
+            }
+    }
+
+    static func == (lhs: WallpaperCell, rhs: WallpaperCell) -> Bool {
+        lhs.item.id == rhs.item.id && lhs.side == rhs.side
+    }
+}
+```
+
+Using `.task(id: item.id)` looks minor but matters. Because `LazyVGrid` reuses cells, a fast scroll makes one cell view show a string of different `item`s. Pass `id:` and the previous downsampling task is cancelled the moment the target changes, so you stop spending time decoding images that are no longer on screen. Forget this and, after a hard fling, "decodes of invisible images" keep running in the background and the view stays heavy well after scrolling ends.
+
+## Stabilize cells to stop wasted re-renders
+
+On the grid side, keep cells from being rebuilt repeatedly. Make `Wallpaper` `Identifiable` with a stable `id`, and make `WallpaperCell` `Equatable` so you tell SwiftUI "don't redraw if it's the same item and size."
+
+```swift
+struct Wallpaper: Identifiable, Hashable {
+    let id: String
+    let fileURL: URL
+}
+
+struct WallpaperGrid: View {
+    let items: [Wallpaper]
+    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 2)]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 2) {
+                ForEach(items) { item in
+                    WallpaperCell(item: item, side: 110)
+                        .equatable()      // skip re-evaluating body when values are unchanged
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+    }
+}
+```
+
+It's important not to use "array index" as the `id`. If the generated code uses an index like `ForEach(items.indices, id: \.self)`, every reorder or insert treats cells as different items and forces image reloads. Pass a stable string ID (filename or UUID) through `Identifiable` and that reloading stops.
+
+Worth noting why to avoid `AnyView`: generated code sometimes wraps cells in `AnyView`, but `AnyView` erases the inner type, so SwiftUI can't tell "is this the same view?" and its diffing optimization loses traction. Passing cells as concrete types is faster — that's the on-the-ground experience.
+
+## Finishing touches — a memory ceiling and prefetch
+
+Even with downsampled images, holding every visible one means memory grows the further you scroll. Give an `NSCache` a hard limit so entries are dropped automatically under memory pressure, which stops the "heavier the further down" effect caused by leaks.
+
+```swift
+final class ThumbnailCache {
+    static let shared = ThumbnailCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    private init() {
+        cache.countLimit = 200          // max number of thumbnails held at once
+    }
+
+    func image(for key: String) -> UIImage? { cache.object(forKey: key as NSString) }
+    func set(_ image: UIImage, for key: String) { cache.setObject(image, forKey: key as NSString) }
+}
+```
+
+If the cell's `.task` checks this cache first and only generates-and-stores on a miss, returning to a cell you've already seen no longer re-decodes. For prefetching, the realistic move in SwiftUI is to warm "the next few rows" in `onAppear` and nothing fancier. `LazyVGrid` has no standard prefetch API, so elaborate look-ahead tends to add more complexity than it's worth. I add downsampling and the cache first, measure, and only consider prefetch if that isn't enough.
+
+One caveat: code you change here gets overwritten if you regenerate with Rork Max. I carve image-loading concerns into independent files like `ImageDownsampler` and `ThumbnailCache`, and the generated screens just call into them. That way I can let Rork Max rebuild a screen without losing the optimized parts. I cover where to draw that generate-versus-edit boundary in [refactoring patterns for Rork Max generated SwiftUI code](/en/articles/rork-dev/rork-max-swiftui-generated-code-production-refactoring-patterns). The scrolling mindset carries over to the React Native side too, and reading it alongside [designing scroll performance with image caching and prefetch](/en/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design) shows the key points across both runtimes.
+
+## Where to start
+
+First, take one "before" hitch time ratio in Instruments Animation Hitches. With a number in hand, the effect of adding downsampling is obvious at a glance. In most cases, swapping full-resolution decode for thumbnails is enough to bring back the feel. Add cell stabilization and caching afterward, only as much as measurement says helps. Rather than blaming the generated code as-is, fix one place with measurement attached — that, I've found, is the shortest path to lifting an AI-written foundation to real-app quality.
