@@ -1,0 +1,217 @@
+---
+title: "機内モードで開くと有料会員にペイウォールが出る — RevenueCat の権限をオフラインでも保つキャッシュ設計"
+slug: "rork-revenuecat-offline-entitlement-cache-trust-window-expo"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-25T12:00"
+updated: "2026-06-25T12:00"
+author: "Rork Lab"
+description: "電波の弱い場所でアプリを開いた有料会員に、一瞬ペイウォールが見えてしまう。RevenueCat の customerInfo がオフライン起動で揺れる仕組みと、最後の正解を信頼期限つきでキャッシュして権限を維持する設計を、Expo アプリの動くコードで整理します。"
+tags: ["Rork", "RevenueCat", "Expo", "サブスクリプション", "オフライン"]
+highlights:
+  - "電波の弱い場所で有料会員にペイウォールが出ていた人が、オフライン起動でも権限を保てる実装を手に入れられる"
+  - "RevenueCat の customerInfo のキャッシュ方針と信頼期限の置き方を理解し、解約後に権限が残り続ける事故を防げる"
+  - "コールドスタートの初回描画を「読み込み中・キャッシュ・ネットワーク照合」の三段で組み、ちらつきのない課金画面を作れる"
+---
+
+地下鉄に乗っている読者から「課金しているのに、アプリを開いた瞬間だけ購入画面が出る」という報告をもらったことがあります。再現しようと機内モードで自分のアプリを立ち上げたら、確かに起動直後の 1 秒ほど、有料コンテンツの上にペイウォールがちらりと重なりました。料金は払われているのに、です。
+
+原因は課金の判定そのものではなく、**権限を確認するための通信が間に合っていないこと**でした。RevenueCat は便利ですが、「会員かどうか」をネットワーク越しに取りに行く瞬間が必ずあります。そこがオフラインだと、アプリは一度「まだ会員と確認できていない」状態を経由します。ここからは、その瞬間に有料会員を締め出さないためのキャッシュ層を、Expo（React Native）アプリの実装として組み立てていきます。
+
+## オフライン起動で customerInfo が揺れる仕組み
+
+`react-native-purchases` の `Purchases.getCustomerInfo()` は、まずローカルキャッシュを返し、その裏でサーバーと照合します。ここで誤解しやすいのが、**キャッシュは永続的に信頼されるわけではない**という点です。SDK は一定時間が経つとキャッシュを「古い」とみなし、ネットワークが必要だと判断します。完全にオフラインのコールドスタートでは、この再取得が失敗し、`entitlements.active` が空に近い状態で返ってくることがあります。
+
+つまり問題は二段階で起きます。最初に SDK のキャッシュが残っていれば助かりますが、アプリを数日ぶりに開いた、あるいはOSがプロセスを完全に破棄した後だと、頼れるキャッシュがありません。ここで「`active` が空なら非会員」と素直に書いていると、払っている読者がペイウォールに戻されます。
+
+私自身、壁紙アプリを 6 本ほど個人開発で運用していますが、ユーザーがアプリを開く場所は自宅の Wi-Fi だけではありません。通勤電車、飛行機、山の中、海外の空港。**「通信できる前提」で権限を判定すると、もっとも静かに離れていくのは、いちばん大切にすべき有料会員です。**
+
+## 「最後に確認できた正解」を自前で持つ
+
+RevenueCat のキャッシュとは別に、アプリ側で「最後に確実に会員だと確認できた事実」を保存します。重要なのは、保存するのが真偽値ではなく、**いつまで有効かという期限**であることです。サブスクリプションには必ず `expirationDate` があります。これを保存しておけば、オフラインでも「その期限まではまだ会員のはず」と判断できます。
+
+```typescript
+// entitlementCache.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const KEY = "entitlement.lastKnownGood.v1";
+const ENTITLEMENT_ID = "premium"; // RevenueCat ダッシュボードの Entitlement 識別子
+
+export type CachedEntitlement = {
+  // この期限まではオフラインでも会員として扱ってよい（ISO 文字列）
+  activeUntil: string | null;
+  // 端末時刻の巻き戻し検知用。書き込んだ瞬間の壁時計
+  savedAt: string;
+};
+
+// ネットワークで権限を確認できたときだけ呼ぶ
+export async function writeLastKnownGood(
+  activeUntil: string | null
+): Promise<void> {
+  const payload: CachedEntitlement = {
+    activeUntil,
+    savedAt: new Date().toISOString(),
+  };
+  await AsyncStorage.setItem(KEY, JSON.stringify(payload));
+}
+
+export async function readLastKnownGood(): Promise<CachedEntitlement | null> {
+  const raw = await AsyncStorage.getItem(KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as CachedEntitlement;
+  } catch {
+    // 壊れたキャッシュは握りつぶし、ネットワーク判定に委ねる
+    await AsyncStorage.removeItem(KEY);
+    return null;
+  }
+}
+```
+
+`JSON.parse` を必ず `try` で囲んでいるのは理由があります。永続化したデータは、保存途中の異常終了などでまれに壊れます。壊れたキャッシュで `JSON.parse` が例外を投げると、それがそのまま起動時のクラッシュになりかねません。**読み取りで壊れていたら捨ててネットワーク判定に戻す**、という退避を最初から書いておきます。
+
+## 信頼期限は壁時計ではなく expirationDate に紐づける
+
+ここがこの設計の核心です。「キャッシュを保存してから 24 時間は信頼する」のような**壁時計ベースの有効期限にしてはいけません**。サブスクの実際の期限と無関係に権限を延ばすことになり、解約済みの読者にしばらく権限が残ります。代わりに、RevenueCat が返す `expirationDate` をそのまま信頼期限に使います。
+
+```typescript
+// resolveAccess.ts
+import Purchases from "react-native-purchases";
+import { readLastKnownGood, writeLastKnownGood } from "./entitlementCache";
+
+const ENTITLEMENT_ID = "premium";
+
+export type AccessState = "loading" | "entitled" | "not_entitled";
+
+// ネットワークが取れたときの正規ルート
+export async function resolveOnline(): Promise<AccessState> {
+  const info = await Purchases.getCustomerInfo();
+  const ent = info.entitlements.active[ENTITLEMENT_ID];
+  if (ent) {
+    // active な間は expirationDate を信頼期限として保存
+    await writeLastKnownGood(ent.expirationDate ?? null);
+    return "entitled";
+  }
+  // サーバーが「権限なし」と明言したら、キャッシュも失効させる
+  await writeLastKnownGood(null);
+  return "not_entitled";
+}
+
+// オフライン起動でネットワーク判定が間に合わないときの保険
+export async function resolveFromCache(): Promise<AccessState> {
+  const cached = await readLastKnownGood();
+  if (!cached || !cached.activeUntil) return "not_entitled";
+
+  const now = Date.now();
+  const until = new Date(cached.activeUntil).getTime();
+  const savedAt = new Date(cached.savedAt).getTime();
+
+  // 端末時刻が保存時より過去 = 時刻巻き戻しの疑い。信頼しない
+  if (now < savedAt) return "not_entitled";
+
+  // 本来の期限内なら、オフラインでも会員として扱う
+  return now < until ? "entitled" : "not_entitled";
+}
+```
+
+`expirationDate` を信頼期限にすると、自然に都合の良い性質が手に入ります。月額会員が更新日をまたいでオフラインのままでも、期限の瞬間にきっちり権限が切れます。サーバーに繋がった次の瞬間、`resolveOnline` が更新後の期限で上書きするので、正規の更新があれば自動で延びます。**人間が決めた猶予日数ではなく、課金システムが持っている本当の期限を使う**のが、解約後に権限が残る事故をいちばん確実に防ぎます。
+
+## コールドスタートの初回描画を三段で組む
+
+ここまでの部品を、起動時の描画フローにまとめます。狙いは、有料会員に一瞬たりともペイウォールを見せないことです。三段で考えます。第一段は「読み込み中」、第二段は「キャッシュによる暫定判定」、第三段は「ネットワークによる確定」です。
+
+```typescript
+// useAccess.ts
+import { useEffect, useState, useRef } from "react";
+import { resolveOnline, resolveFromCache, AccessState } from "./resolveAccess";
+import Purchases from "react-native-purchases";
+
+export function useAccess() {
+  const [state, setState] = useState<AccessState>("loading");
+  const settledOnline = useRef(false);
+
+  useEffect(() => {
+    let alive = true;
+
+    // 第二段: まずキャッシュで暫定的に決める（オフラインでも即答できる）
+    resolveFromCache().then((cached) => {
+      // ネットワークが先に確定していたら、暫定値で上書きしない
+      if (alive && !settledOnline.current) setState(cached);
+    });
+
+    // 第三段: ネットワークで確定させ、キャッシュも更新する
+    resolveOnline()
+      .then((online) => {
+        if (!alive) return;
+        settledOnline.current = true;
+        setState(online);
+      })
+      .catch(() => {
+        // オフライン等で失敗 = 第二段のキャッシュ判定を生かす
+      });
+
+    // SDK 側の更新通知も購読し、購入直後などに即反映する
+    const listener = (info: Purchases.CustomerInfo) => {
+      const active = !!info.entitlements.active["premium"];
+      if (alive) {
+        settledOnline.current = true;
+        setState(active ? "entitled" : "not_entitled");
+      }
+    };
+    Purchases.addCustomerInfoUpdateListener(listener);
+
+    return () => {
+      alive = false;
+      Purchases.removeCustomerInfoUpdateListener(listener);
+    };
+  }, []);
+
+  return state;
+}
+```
+
+`settledOnline` という ref を挟んでいるのは、競合を避けるためです。キャッシュ判定（第二段）とネットワーク判定（第三段）は非同期で走るので、運が悪いとネットワークが先に確定した後でキャッシュの古い値が上書きしてしまいます。**ネットワークが一度でも確定したら、それ以降キャッシュ値では state を触らない**、という一方通行を ref で表現しています。
+
+呼び出し側は素直です。
+
+```tsx
+function PremiumScreen() {
+  const access = useAccess();
+
+  if (access === "loading") return <SplashKeeper />;       // ここでペイウォールは出さない
+  if (access === "entitled") return <PremiumContent />;
+  return <Paywall />;                                       // 確定して非会員のときだけ
+}
+```
+
+肝は、`loading` のあいだにペイウォールを描かないことです。多くの実装が「会員でなければペイウォール」と書くために、判定前の `loading` を暗黙に非会員として扱ってしまいます。`loading` を独立した状態として持ち、その間はスプラッシュやスケルトンを見せるだけにすると、オフライン起動のちらつきは消えます。
+
+## 解約・返金でキャッシュを確実に失効させる
+
+オフラインで権限を延ばす設計には、必ず裏側の責任が伴います。**ネットワークが繋がったときには、必ずキャッシュを最新の事実で上書きする**ことです。`resolveOnline` が「権限なし」を受け取ったら `writeLastKnownGood(null)` を呼んでキャッシュを空にしているのは、このためです。これがないと、サーバー側で解約・返金が起きてもオフラインキャッシュが古い期限を主張し続けます。
+
+RevenueCat の `addCustomerInfoUpdateListener` も合わせて効いてきます。返金や解約がサーバーで処理されると、次にアプリが通信したときにこのリスナーが発火します。`useAccess` の中でリスナーがキャッシュ更新（`resolveOnline` 相当）に繋がっているので、剥奪も自動で反映されます。
+
+下の表は、状況ごとにどの判定が効くかを整理したものです。
+
+<table>
+  <thead>
+    <tr><th>状況</th><th>効く判定</th><th>会員の見え方</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>オンライン通常起動</td><td>resolveOnline</td><td>正しく即時反映</td></tr>
+    <tr><td>オフラインのコールドスタート</td><td>resolveFromCache</td><td>期限内なら会員のまま</td></tr>
+    <tr><td>期限切れ後のオフライン起動</td><td>resolveFromCache</td><td>非会員として扱う</td></tr>
+    <tr><td>解約後に再オンライン</td><td>resolveOnline / リスナー</td><td>権限を失効</td></tr>
+    <tr><td>端末時刻を過去へ巻き戻し</td><td>savedAt 比較</td><td>キャッシュを信頼しない</td></tr>
+  </tbody>
+</table>
+
+## 端末時刻の巻き戻しという小さな落とし穴
+
+`expirationDate` を信頼期限にすると、理屈の上では端末の時計を過去に戻すことで期限内の状態を作り出せます。`resolveFromCache` で `now < savedAt` を弾いているのは、その単純な手口への保険です。保存した瞬間より端末時刻が過去になっていたら、時計がいじられた疑いがあるのでキャッシュを信頼しません。
+
+ただし、これは完全な防御ではありません。本当に厳密にやるなら期限はサーバー検証に委ねるべきで、オフラインキャッシュはあくまで「正規の有料会員の体験を、通信が不安定な瞬間に守るための層」と位置づけることを推奨します。私の場合は、壁紙アプリのように単価が低く悪用の旨味が小さいカテゴリでは、この程度の保険で十分に釣り合うと考えて運用しています。逆に高単価の業務アプリなら、ここは判断を変える場面かもしれません。広告非表示の判定を 1 か所に畳む考え方は[広告非表示判定を1か所に畳む設計](/articles/rork-dev/rork-ad-free-state-source-of-truth-reward-window-expo)に、サーバー側まで含めた厳密な状態管理は[エンタイトルメント状態機械の設計](/articles/rork-dev/rork-subscription-entitlement-state-machine-design-guide)にまとめてあります。
+
+機内モードで自分のアプリを 10 回ほど開き直して、一度もペイウォールがちらつかないことを確認できたら、この設計はおおむね機能しています。まずは `useAccess` の `loading` 状態を独立させ、判定前にペイウォールを描かない一点だけでも入れてみてください。電波の弱い場所にいる有料会員の体験が、それだけで静かに変わります。

@@ -1,0 +1,216 @@
+---
+title: "Why Paying Members See a Paywall in Airplane Mode — Keeping RevenueCat Entitlements Alive Offline"
+slug: "rork-revenuecat-offline-entitlement-cache-trust-window-expo"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-25T12:00"
+updated: "2026-06-25T12:00"
+author: "Rork Lab"
+description: "Open the app on a weak connection and a paying subscriber sees a paywall flash for a second. Here is how RevenueCat's customerInfo wavers on an offline launch, and a cache design that keeps entitlements valid with a trust window — written as working code for an Expo app."
+tags: ["Rork", "RevenueCat", "Expo", "Subscriptions", "Offline"]
+highlights:
+  - "If paying members were seeing a paywall on weak connections, you'll get an implementation that holds their access even on an offline launch"
+  - "You'll understand how to cache customerInfo and where to anchor the trust window, so access never lingers after a cancellation"
+  - "You'll build the cold-start first paint as three stages — loading, cache, network reconcile — for a paywall that never flickers"
+---
+
+A reader on a subway once told me they were paying for the app yet saw the purchase screen "just for a moment" every time they opened it. I switched my own app to airplane mode to reproduce it, and sure enough, for about a second after launch a paywall flickered on top of the premium content. The money had been paid, and the app still showed it.
+
+The cause was not the entitlement logic itself. It was that **the network round-trip needed to confirm membership had not finished yet**. RevenueCat is convenient, but there is always a moment when it goes over the network to ask "is this person a member?" When that moment is offline, the app passes through a state of "not yet confirmed as a member." This article builds the cache layer that keeps a paying member from being locked out during that moment, as an implementation for an Expo (React Native) app.
+
+## Why customerInfo wavers on an offline launch
+
+`Purchases.getCustomerInfo()` in `react-native-purchases` returns a local cache first and reconciles with the server behind it. The easy misunderstanding here is that **the cache is not trusted forever**. After a certain interval the SDK treats the cache as stale and decides it needs the network. On a fully offline cold start, that refetch fails and `entitlements.active` can come back close to empty.
+
+So the problem happens in two stages. If the SDK's cache is still warm you are fine, but if you open the app for the first time in days, or the OS has fully killed the process, there is no cache to lean on. If you have naively written "empty `active` means not a member," a paying reader gets bounced back to the paywall.
+
+I run about six wallpaper apps on my own, and people do not open them only on home Wi-Fi. Commuter trains, planes, the mountains, an airport abroad. **When you judge entitlement on the assumption that the network is reachable, the person who quietly leaves first is the paying member you should value most.**
+
+## Hold your own "last known good"
+
+Separate from RevenueCat's cache, store on the app side the fact of "the last time we definitely confirmed membership." The key is that what you store is not a boolean but **an expiry — until when it is valid**. A subscription always has an `expirationDate`. Save that, and even offline you can reason that "they should still be a member until that date."
+
+```typescript
+// entitlementCache.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const KEY = "entitlement.lastKnownGood.v1";
+
+export type CachedEntitlement = {
+  // Treat as a member offline until this date (ISO string)
+  activeUntil: string | null;
+  // Wall clock at write time, for detecting clock rollback
+  savedAt: string;
+};
+
+// Call only when entitlement was confirmed over the network
+export async function writeLastKnownGood(
+  activeUntil: string | null
+): Promise<void> {
+  const payload: CachedEntitlement = {
+    activeUntil,
+    savedAt: new Date().toISOString(),
+  };
+  await AsyncStorage.setItem(KEY, JSON.stringify(payload));
+}
+
+export async function readLastKnownGood(): Promise<CachedEntitlement | null> {
+  const raw = await AsyncStorage.getItem(KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as CachedEntitlement;
+  } catch {
+    // Swallow a corrupted cache and fall back to network judgment
+    await AsyncStorage.removeItem(KEY);
+    return null;
+  }
+}
+```
+
+Wrapping `JSON.parse` in a `try` is deliberate. Persisted data does occasionally get corrupted — for instance when the app is killed mid-write. If `JSON.parse` throws on a corrupted cache, that can become a launch-time crash. Write the escape hatch from the start: **if the read is corrupted, drop it and go back to network judgment.**
+
+## Anchor the trust window to expirationDate, not the wall clock
+
+This is the heart of the design. **Do not use a wall-clock expiry** like "trust the cache for 24 hours after saving it." That extends access independent of the real subscription period, so a cancelled reader keeps access for a while. Instead, use the `expirationDate` RevenueCat returns as the trust window directly.
+
+```typescript
+// resolveAccess.ts
+import Purchases from "react-native-purchases";
+import { readLastKnownGood, writeLastKnownGood } from "./entitlementCache";
+
+const ENTITLEMENT_ID = "premium";
+
+export type AccessState = "loading" | "entitled" | "not_entitled";
+
+// The canonical path when the network is reachable
+export async function resolveOnline(): Promise<AccessState> {
+  const info = await Purchases.getCustomerInfo();
+  const ent = info.entitlements.active[ENTITLEMENT_ID];
+  if (ent) {
+    // While active, store expirationDate as the trust window
+    await writeLastKnownGood(ent.expirationDate ?? null);
+    return "entitled";
+  }
+  // If the server explicitly says "no access," expire the cache too
+  await writeLastKnownGood(null);
+  return "not_entitled";
+}
+
+// The fallback when network judgment can't finish on an offline launch
+export async function resolveFromCache(): Promise<AccessState> {
+  const cached = await readLastKnownGood();
+  if (!cached || !cached.activeUntil) return "not_entitled";
+
+  const now = Date.now();
+  const until = new Date(cached.activeUntil).getTime();
+  const savedAt = new Date(cached.savedAt).getTime();
+
+  // Device time earlier than save time = suspected rollback. Don't trust it
+  if (now < savedAt) return "not_entitled";
+
+  // Within the real window, treat as a member even offline
+  return now < until ? "entitled" : "not_entitled";
+}
+```
+
+Anchoring the trust window to `expirationDate` gives you a convenient property for free. A monthly member who stays offline across their renewal date loses access exactly at the expiry moment. The next time the device reaches the server, `resolveOnline` overwrites it with the renewed expiry, so a legitimate renewal extends access automatically. **Using the real expiry the billing system already holds — not a grace period a human picked — is the surest way to prevent access lingering after a cancellation.**
+
+## Build the cold-start first paint in three stages
+
+Now assemble these parts into the launch render flow. The goal is to never show a paying member a paywall, not even for an instant. Think in three stages: stage one is "loading," stage two is "provisional judgment from cache," and stage three is "confirmation from network."
+
+```typescript
+// useAccess.ts
+import { useEffect, useState, useRef } from "react";
+import { resolveOnline, resolveFromCache, AccessState } from "./resolveAccess";
+import Purchases from "react-native-purchases";
+
+export function useAccess() {
+  const [state, setState] = useState<AccessState>("loading");
+  const settledOnline = useRef(false);
+
+  useEffect(() => {
+    let alive = true;
+
+    // Stage 2: decide provisionally from cache (answers instantly, even offline)
+    resolveFromCache().then((cached) => {
+      // If network already settled, don't overwrite with the provisional value
+      if (alive && !settledOnline.current) setState(cached);
+    });
+
+    // Stage 3: settle over the network and refresh the cache
+    resolveOnline()
+      .then((online) => {
+        if (!alive) return;
+        settledOnline.current = true;
+        setState(online);
+      })
+      .catch(() => {
+        // Failed offline = keep the stage 2 cache judgment
+      });
+
+    // Also subscribe to SDK updates to reflect a purchase immediately
+    const listener = (info: Purchases.CustomerInfo) => {
+      const active = !!info.entitlements.active["premium"];
+      if (alive) {
+        settledOnline.current = true;
+        setState(active ? "entitled" : "not_entitled");
+      }
+    };
+    Purchases.addCustomerInfoUpdateListener(listener);
+
+    return () => {
+      alive = false;
+      Purchases.removeCustomerInfoUpdateListener(listener);
+    };
+  }, []);
+
+  return state;
+}
+```
+
+The `settledOnline` ref is there to avoid a race. The cache judgment (stage 2) and network judgment (stage 3) run asynchronously, so on a bad timing the stale cache value could overwrite the result after the network has already settled. The ref expresses a one-way rule: **once the network settles even once, never touch state with a cache value again.**
+
+The call site stays simple.
+
+```tsx
+function PremiumScreen() {
+  const access = useAccess();
+
+  if (access === "loading") return <SplashKeeper />;       // no paywall here
+  if (access === "entitled") return <PremiumContent />;
+  return <Paywall />;                                       // only when settled as non-member
+}
+```
+
+The crux is not drawing the paywall during `loading`. Many implementations write "paywall if not a member," which implicitly treats the pre-judgment `loading` as a non-member. Hold `loading` as its own distinct state and show only a splash or skeleton during it, and the offline-launch flicker disappears.
+
+## Make sure cancellations and refunds expire the cache
+
+A design that extends access offline always carries a responsibility on the other side: **whenever the network is reachable, overwrite the cache with the latest fact.** That is exactly why `resolveOnline` calls `writeLastKnownGood(null)` to clear the cache when it receives "no access." Without it, even after a cancellation or refund on the server, the offline cache keeps asserting a stale expiry.
+
+RevenueCat's `addCustomerInfoUpdateListener` reinforces this. When a refund or cancellation is processed on the server, the listener fires the next time the app communicates. Since the listener inside `useAccess` leads to a cache refresh (equivalent to `resolveOnline`), revocation is reflected automatically.
+
+The table below lays out which judgment takes effect per situation.
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>Active judgment</th><th>How the member sees it</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Normal online launch</td><td>resolveOnline</td><td>Reflected correctly and instantly</td></tr>
+    <tr><td>Offline cold start</td><td>resolveFromCache</td><td>Stays a member within the window</td></tr>
+    <tr><td>Offline launch after expiry</td><td>resolveFromCache</td><td>Treated as non-member</td></tr>
+    <tr><td>Back online after cancellation</td><td>resolveOnline / listener</td><td>Access revoked</td></tr>
+    <tr><td>Device clock rolled back</td><td>savedAt comparison</td><td>Cache not trusted</td></tr>
+  </tbody>
+</table>
+
+## The small hole of clock rollback
+
+Once you anchor the trust window to `expirationDate`, in theory someone could turn the device clock back to manufacture a within-window state. Rejecting `now < savedAt` in `resolveFromCache` is the insurance against that simple trick: if the device time is earlier than the moment you saved, the clock is suspect, so the cache is not trusted.
+
+That said, this is not airtight. If you truly need strictness, the expiry should be delegated to server-side verification, and the offline cache should be positioned purely as "a layer to protect a legitimate paying member's experience during an unstable moment." For low-priced categories like wallpaper apps, where the payoff from abuse is small, this level of insurance is a fair trade. For a high-priced business app, this might be the place to change the call. The idea of folding ad-free judgment into a single place is in [collapsing ad-free state into one source of truth](/en/articles/rork-dev/rork-ad-free-state-source-of-truth-reward-window-expo), and strict state management down to the server is in [designing an entitlement state machine](/en/articles/rork-dev/rork-subscription-entitlement-state-machine-design-guide).
+
+Reopen your own app in airplane mode about ten times, and if the paywall never flickers once, this design is mostly working. Start with just one thing: make `loading` in `useAccess` a distinct state and stop drawing the paywall before judgment. For a paying member standing somewhere with weak signal, that alone quietly changes the experience.
