@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — RorkがLeft Lane Capital主導で$15Mのシードを調達。Peak XV・True Ventures・Goodwater・a16z Speedrunが参加しました",
-    "ENGINE — Rork MaxはClaude CodeとClaude Opus 4.6で駆動。X で800万超のビューを集め、2週間で年間売上を倍増させました",
-    "SWIFT — Rork MaxはWebで初めてSwiftアプリを生成できるビルダーで、Apple伝統のXcodeを置き換える位置づけです",
-    "PRODUCT — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでApple全域に対応します",
-    "CLASSIC — 通常のRorkはReact Native（Expo）で、英語の説明だけからiOS/Androidアプリを生成しストア配信できます",
-    "PRICING — 無料で始められ、有料は月25ドル〜。Rork Maxは月200ドルです",
+    "ACQUISITION — Rorkが初の買収を実施。macOSでネイティブSwiftアプリを生成するPaperlineを取得しました",
+    "FUNDING — Left Lane Capital主導の$15Mシードは、AI時代のモバイルアプリの作り方と収益化の再定義に充てられます",
+    "GROWTH — Rork Maxはローンチから3日でARR $1.5Mに到達し、2週間で年間売上を倍増させたとされます",
+    "ENGINE — Rork MaxはClaude Code＋Claude Opus 4.6駆動。Web初のSwiftビルダーとしてXcodeを置き換えます",
+    "SPLIT — 通常RorkはReact Native(Expo)、Rork MaxはネイティブSwiftでAppleエコシステム全域が対象です",
+    "PRICING — 無料で開始でき、有料は月25ドル〜、Rork Maxは月200ドルです",
   ],
   en: [
-    "FUNDING — Rork raised a $15M seed led by Left Lane Capital, with Peak XV, True Ventures, Goodwater, and a16z Speedrun joining",
-    "ENGINE — Rork Max runs on Claude Code and Claude Opus 4.6; it drew 8M+ views on X and doubled annual revenue in two weeks",
-    "SWIFT — Rork Max is the first web-based Swift app builder, positioned to replace Apple's traditional Xcode",
-    "PRODUCT — Rork Max covers the whole Apple ecosystem: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "CLASSIC — The original Rork uses React Native (Expo), building iOS/Android apps from a plain-English description",
-    "PRICING — Start free; paid plans begin at $25/mo, and Rork Max is $200/mo",
+    "ACQUISITION — Rork makes its first acquisition, buying Paperline, a macOS app that generates native Swift apps with AI",
+    "FUNDING — The $15M seed led by Left Lane Capital backs Rork's push to redefine how mobile apps are built and monetized",
+    "GROWTH — Rork Max reportedly hit $1.5M ARR within three days of launch and doubled annual revenue in two weeks",
+    "ENGINE — Rork Max runs on Claude Code and Claude Opus 4.6, the first web Swift builder aiming to replace Xcode",
+    "SPLIT — Standard Rork uses React Native (Expo); Rork Max generates native Swift across the whole Apple ecosystem",
+    "PRICING — Start free; paid plans begin at $25/month, with Rork Max at $200/month",
   ],
 };
 
