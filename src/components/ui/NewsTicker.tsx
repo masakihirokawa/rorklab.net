@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ACQUISITION — Rorkが初の買収を実施。macOSでネイティブSwiftアプリを生成するPaperlineを取得しました",
-    "FUNDING — Left Lane Capital主導の$15Mシードは、AI時代のモバイルアプリの作り方と収益化の再定義に充てられます",
-    "GROWTH — Rork Maxはローンチから3日でARR $1.5Mに到達し、2週間で年間売上を倍増させたとされます",
-    "ENGINE — Rork MaxはClaude Code＋Claude Opus 4.6駆動。Web初のSwiftビルダーとしてXcodeを置き換えます",
-    "SPLIT — 通常RorkはReact Native(Expo)、Rork MaxはネイティブSwiftでAppleエコシステム全域が対象です",
-    "PRICING — 無料で開始でき、有料は月25ドル〜、Rork Maxは月200ドルです",
+    "BUILD — RorkはReact Native(Expo)でネイティブのiOS/Androidアプリを生成。平易な説明からデプロイ可能な実コードが出力されます",
+    "MAX — Rork Maxはnative Swiftを出力し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "MAX — 本物のSwift生成で性能とApp Store審査の通しやすさを両立。現状ほぼ唯一の選択肢です",
+    "DEPLOY — テスト用の共有リンク作成とiOS/Android双方の自動ビルドに対応し、別々の開発工程を省けます",
+    "PRICE — 無料で始められ、有料プランは月$25から。個人開発で試作から配布まで無理なく回せます",
+    "FOCUS — BoltやLovableのようなWeb中心ツールと違い、Rorkはモバイルに特化しています",
   ],
   en: [
-    "ACQUISITION — Rork makes its first acquisition, buying Paperline, a macOS app that generates native Swift apps with AI",
-    "FUNDING — The $15M seed led by Left Lane Capital backs Rork's push to redefine how mobile apps are built and monetized",
-    "GROWTH — Rork Max reportedly hit $1.5M ARR within three days of launch and doubled annual revenue in two weeks",
-    "ENGINE — Rork Max runs on Claude Code and Claude Opus 4.6, the first web Swift builder aiming to replace Xcode",
-    "SPLIT — Standard Rork uses React Native (Expo); Rork Max generates native Swift across the whole Apple ecosystem",
-    "PRICING — Start free; paid plans begin at $25/month, with Rork Max at $200/month",
+    "BUILD — Rork generates native iOS/Android apps with React Native (Expo) from a plain-English description into deployable code",
+    "MAX — Rork Max outputs native Swift, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "MAX — Real Swift output balances performance and App Store eligibility — currently the only tool doing this",
+    "DEPLOY — Shareable test links and automatic iOS/Android builds remove the need for separate build pipelines",
+    "PRICE — Free to start, with paid plans from $25/month — practical for solo devs from prototype to release",
+    "FOCUS — Unlike web-first tools like Bolt or Lovable, Rork specializes in mobile apps",
   ],
 };
 
