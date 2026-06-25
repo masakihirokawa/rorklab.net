@@ -1,0 +1,235 @@
+---
+title: "壁紙アプリの画像キャッシュが静かに膨らんでメモリで落ちる — Rork運用で効いた計測と上限設計の運用メモ"
+slug: "rork-image-cache-memory-bloat-wallpaper-app-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-25T09:30"
+updated: "2026-06-25T09:30"
+author: "Rork Lab"
+description: "画像が主役のRorkアプリで、ディスクキャッシュとメモリ常駐が少しずつ膨らみ、OOMクラッシュとして表面化する問題への対処。実測フック・キャッシュ上限・配信側リサイズまで、運用で効いた順に実装コード付きで整理します。"
+tags: ["Rork", "expo-image", "メモリ管理", "キャッシュ", "React Native", "パフォーマンス"]
+highlights:
+  - "expo-image のキャッシュサイズと画像メモリを実測する onLoad 計測フック（cacheHitRate と平均読み込み時間を取得）"
+  - "ディスクキャッシュに 200MB の上限を設け、LRU 風に古い画像から削除する手動エビクションの実装"
+  - "Crashlytics の OOM を減らした recyclingKey・cachePolicy・プリフェッチ抑制の使い分けと、p95 メモリの目標値"
+---
+画像が主役のアプリを個人開発で何本か運用していると、ある時期から Crashlytics に同じ顔ぶれのクラッシュが並び始めることがあります。再現手順は「アプリを開いて、ギャラリーを長くスクロールして、何枚か拡大表示する」だけ。例外メッセージは判で押したように `Out of memory` で、特定の画面に紐づくスタックトレースが出ないため、最初は原因が掴めませんでした。
+
+私自身、壁紙系のアプリでこれにぶつかりました。コードは正しく動いているのに、長く使うほど落ちやすくなる。犯人は「少しずつ膨らむ画像キャッシュ」でした。expo-image は賢くキャッシュしてくれますが、上限を自分で設計しなければ、ディスクとメモリの両方が静かに伸びていきます。その膨張をどう計測し、どこに上限を置き、配信側で何を減らしたか。私が運用で効いた順に、実装コードとあわせて書き残します。
+
+## まず「膨らんでいる」ことを数字で確認する
+
+メモリ問題で一番やってはいけないのは、勘で `clearMemoryCache()` を撒くことです。どこがどれだけ食っているのか分からないまま消すと、キャッシュヒット率まで一緒に下げてしまい、今度は読み込みが遅くなって別の離脱を生みます。最初にやるべきは計測です。
+
+expo-image はディスクキャッシュのサイズを直接は返してくれないので、`expo-file-system` でキャッシュディレクトリを実測しつつ、画像の読み込み結果を `onLoad` で拾って指標化します。
+
+```tsx
+// 画像の読み込み実績とディスクキャッシュ量を計測するフック
+import { useCallback, useRef, useState } from 'react';
+import * as FileSystem from 'expo-file-system';
+
+type LoadMetrics = {
+  loadCount: number;
+  cacheHits: number;
+  cacheHitRate: number;     // %
+  avgLoadMs: number;
+  diskCacheMB: number;
+};
+
+export const useImageMetrics = () => {
+  const startTimes = useRef<Record<string, number>>({});
+  const totals = useRef({ count: 0, ms: 0, hits: 0 });
+  const [metrics, setMetrics] = useState<LoadMetrics>({
+    loadCount: 0, cacheHits: 0, cacheHitRate: 0,
+    avgLoadMs: 0, diskCacheMB: 0,
+  });
+
+  const markStart = useCallback((key: string) => {
+    startTimes.current[key] = Date.now();
+  }, []);
+
+  // expo-image の onLoad は event.cacheType を返す（'memory' | 'disk' | 'none'）
+  const markLoad = useCallback((key: string, cacheType?: string) => {
+    const started = startTimes.current[key] ?? Date.now();
+    const ms = Date.now() - started;
+    const t = totals.current;
+    t.count += 1; t.ms += ms;
+    if (cacheType === 'memory' || cacheType === 'disk') t.hits += 1;
+    setMetrics((prev) => ({
+      ...prev,
+      loadCount: t.count,
+      cacheHits: t.hits,
+      cacheHitRate: Math.round((t.hits / t.count) * 100),
+      avgLoadMs: Math.round(t.ms / t.count),
+    }));
+  }, []);
+
+  const refreshDiskSize = useCallback(async () => {
+    const dir = (FileSystem.cacheDirectory ?? '') + 'expo-image/';
+    const info = await FileSystem.getInfoAsync(dir, { size: true });
+    const mb = (info.exists ? (info.size ?? 0) : 0) / (1024 * 1024);
+    setMetrics((prev) => ({ ...prev, diskCacheMB: Math.round(mb * 10) / 10 }));
+  }, []);
+
+  return { metrics, markStart, markLoad, refreshDiskSize };
+};
+
+// 実測の一例（私の壁紙アプリ・iPhone 12 / 1,200枚スクロール後）:
+// { loadCount: 1200, cacheHits: 1044, cacheHitRate: 87,
+//   avgLoadMs: 64, diskCacheMB: 612.4 }
+```
+
+この計測を入れて最初に見えたのは、`cacheHitRate` は 87% と良好なのに `diskCacheMB` が 600MB を超えていたことでした。つまりキャッシュは効いている、効きすぎて溜まり続けている、という状態です。問題はヒット率ではなく上限の不在だと、ここで初めて確信できました。
+
+## ディスクキャッシュに上限を置き、古い順に削る
+
+expo-image の `clearDiskCache()` は全消しなので、運用には粗すぎます。欲しいのは「上限を超えたぶんだけ、古いものから消す」挙動です。これは `expo-file-system` でキャッシュファイルの更新時刻とサイズを集め、合計が閾値を超えたら古い順に削除する、LRU 風のエビクションで実装できます。
+
+```tsx
+// ディスクキャッシュを上限 200MB に保つ手動エビクション
+import * as FileSystem from 'expo-file-system';
+
+const CACHE_DIR = (FileSystem.cacheDirectory ?? '') + 'images/';
+const MAX_BYTES = 200 * 1024 * 1024; // 200MB
+
+export const evictDiskCache = async () => {
+  const dir = await FileSystem.getInfoAsync(CACHE_DIR);
+  if (!dir.exists) return { freedMB: 0, keptMB: 0 };
+
+  const names = await FileSystem.readDirectoryAsync(CACHE_DIR);
+  const entries = await Promise.all(
+    names.map(async (name) => {
+      const info = await FileSystem.getInfoAsync(CACHE_DIR + name, { size: true });
+      return {
+        uri: CACHE_DIR + name,
+        size: info.exists ? (info.size ?? 0) : 0,
+        // modificationTime は秒。新しいものほど大きい
+        mtime: info.exists ? (info.modificationTime ?? 0) : 0,
+      };
+    })
+  );
+
+  const total = entries.reduce((sum, e) => sum + e.size, 0);
+  if (total <= MAX_BYTES) return { freedMB: 0, keptMB: Math.round(total / 1048576) };
+
+  // 古い順（mtime 昇順）に削って閾値の 80% まで落とす
+  entries.sort((a, b) => a.mtime - b.mtime);
+  let running = total;
+  let freed = 0;
+  const target = MAX_BYTES * 0.8;
+  for (const e of entries) {
+    if (running <= target) break;
+    await FileSystem.deleteAsync(e.uri, { idempotent: true });
+    running -= e.size; freed += e.size;
+  }
+  return { freedMB: Math.round(freed / 1048576), keptMB: Math.round(running / 1048576) };
+};
+
+// 呼び出しタイミング: アプリ起動時とバックグラウンド復帰時に一度ずつ。
+// 出力例: { freedMB: 430, keptMB: 160 }
+```
+
+ここで効いた工夫が二つあります。ひとつは閾値ちょうどではなく 80% まで落とすこと。境界ぴったりまで削ると、次に数枚読み込んだだけで再び上限を超え、エビクションが毎回走ってしまいます。少し余白を残すと削除の頻度が下がります。もうひとつは、削除を起動時とバックグラウンド復帰時に限定したことです。スクロール中に走らせると、その間のディスク I/O がフレーム落ちを招きました。重い掃除は、ユーザーが画面を見ていない瞬間に寄せるのが安全です。
+
+## メモリ常駐を減らす — recyclingKey と cachePolicy を使い分ける
+
+ディスクを抑えても、OOM の直接の引き金はメモリ側です。一覧でサムネイルを大量に並べる画面と、一枚を全画面で拡大する画面とでは、必要なキャッシュ戦略が違います。ここを同じ設定で済ませていたのが、私の最初の失敗でした。
+
+一覧では `cachePolicy="disk"` にしてメモリ常駐を避け、`recyclingKey` でビューを使い回します。逆に拡大表示は枚数が少ないので `memory-disk` で即時性を優先します。
+
+```tsx
+import { Image } from 'expo-image';
+import { FlatList } from 'react-native';
+
+// 一覧（多数・メモリは控えめに）
+const Thumb = ({ item, onStart, onLoad }) => (
+  <Image
+    source={{ uri: item.thumbUrl }}
+    style={{ width: '100%', aspectRatio: 1 }}
+    contentFit="cover"
+    cachePolicy="disk"          // メモリに溜めない
+    recyclingKey={item.id}       // ビュー再利用でメモリ安定
+    onLoadStart={() => onStart(item.id)}
+    onLoad={(e) => onLoad(item.id, e?.cacheType)}
+  />
+);
+
+export const Gallery = ({ images, m }) => (
+  <FlatList
+    data={images}
+    renderItem={({ item }) => (
+      <Thumb item={item} onStart={m.markStart} onLoad={m.markLoad} />
+    )}
+    keyExtractor={(i) => i.id}
+    numColumns={3}
+    windowSize={5}              // 画面外の保持量を絞る
+    maxToRenderPerBatch={9}
+    initialNumToRender={12}
+    removeClippedSubviews       // 画面外をアンマウント
+  />
+);
+
+// 全画面拡大（少数・即時性優先）
+const FullImage = ({ uri }) => (
+  <Image
+    source={{ uri }}
+    style={{ flex: 1 }}
+    contentFit="contain"
+    cachePolicy="memory-disk"
+    transition={150}
+  />
+);
+```
+
+`removeClippedSubviews` と `windowSize` の縮小は、スクロール中のメモリの伸びを目に見えて抑えてくれました。注意点として `removeClippedSubviews` は Android で稀に描画が抜けることがあるので、導入後は実機で空白セルが出ないかを必ず確認してください。私は念のため、一覧だけに限定して有効化しています。
+
+## 配信側で減らす — 表示幅に合わせた WebP を返す
+
+端末に届く前の画像が大きいと、デコード後にメモリへ展開されるビットマップも大きくなります。表示は幅 120pt のサムネイルなのに、元画像が 3000px 幅のまま届いていれば、見えない解像度のためにメモリを払っていることになります。配信側でのリサイズは、ディスクとメモリの両方に効く数少ない一手です。
+
+```tsx
+import { PixelRatio } from 'react-native';
+
+// 表示幅(pt)から、配信に必要な実ピクセル幅を求めて変換URLを作る
+export const sizedUrl = (base: string, displayPt: number) => {
+  const px = Math.min(Math.round(displayPt * PixelRatio.get()), 1280);
+  // Cloudflare Images の変換例。q=78 は壁紙でも劣化が分かりにくい実用域
+  return `${base}?w=${px}&format=webp&q=78`;
+};
+
+// 一覧サムネ(120pt)と全画面(390pt)で別URLを取りに行く
+// thumb : ...?w=360&format=webp&q=78   （3x端末）
+// full  : ...?w=1170&format=webp&q=78
+```
+
+ここで大事なのは、一覧と拡大で別のURLを取りに行くことです。サムネイルにフル解像度を渡してしまうと、せっかくの一覧軽量化が台無しになります。WebP 化だけでも JPEG 比でおおむね 25〜35% は小さくなり、`diskCacheMB` の伸びがそのぶん緩やかになりました。実測では、サムネイルをフル解像度から表示幅相当に切り替えただけで、1,200枚スクロール後のディスク使用量が 612MB から 180MB 台まで下がりました。
+
+## プリフェッチは「撃ちすぎない」
+
+先読みは諸刃です。次の画面で使う画像を `Image.prefetch()` で温めておくと体感は速くなりますが、温めた画像はメモリにも乗るため、撃ちすぎるとそのまま OOM の燃料になります。私は当初、一覧の全URLをまとめてプリフェッチしていて、これがメモリ常駐をいちばん押し上げていました。
+
+```tsx
+import { Image } from 'expo-image';
+
+// 先読みは「直近で見える数枚」だけに絞る
+export const prefetchAhead = (urls: string[], from: number, ahead = 6) => {
+  const slice = urls.slice(from, from + ahead);
+  // 低優先度で温める。一覧スクロールの可視範囲＋数枚に限定
+  return Promise.all(slice.map((u) => Image.prefetch(u, { cachePolicy: 'disk' })));
+};
+
+// onViewableItemsChanged の先頭indexを from に渡し、6枚先までだけ温める
+```
+
+可視範囲＋6枚という小さな窓に絞ったことで、先読みの速さは保ったまま、メモリのピークが下がりました。プリフェッチは「全部」ではなく「もうすぐ見えるぶんだけ」が運用上の正解だと感じています。
+
+## 計測 → 改善のループに落とす
+
+ここまでの施策は、入れて終わりにせず指標で守るのが肝心です。私が一覧画面で目安にしているのは次の3つです。`cacheHitRate` は 70% 以上、`avgLoadMs` は 200ms 以下、`diskCacheMB` は上限の 200MB 以内。加えて、リリースごとに Crashlytics の OOM 比率（クラッシュ全体に占める Out of memory の割合）を見て、増減を追っています。
+
+施策を入れた版では、OOM 比率が目に見えて下がり、低メモリ端末でのレビュー評価の落ち込みも和らぎました。広告（AdMob）を表示するアプリでは、クラッシュは表示機会の損失に直結するので、メモリ安定は収益面の地味な底上げにもなります。数字で守る仕組みがあると、次に機能を足したときの劣化にもすぐ気づけます。
+
+## 運用に落とすチェックリスト
+
+最後に、明日から自分のRorkアプリに入れる順番として、私が薦める手順を一つだけ挙げます。まず計測フックを入れて `diskCacheMB` と `cacheHitRate` を可視化してください。膨らんでいる確証が取れたら、ディスク上限のエビクションと配信側リサイズを入れ、最後にプリフェッチの窓を絞る。この順なら、各施策の効果を数字で確かめながら進められます。勘で消すのをやめて計測から始める、それがいちばんの近道でした。

@@ -1,0 +1,234 @@
+---
+title: "When an Image-Heavy Rork App Quietly Bloats Its Cache and Dies on Memory — Field Notes on Measuring and Capping"
+slug: "rork-image-cache-memory-bloat-wallpaper-app-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-25T09:30"
+updated: "2026-06-25T09:30"
+author: "Rork Lab"
+description: "In a Rork app where images are the product, expo-image's disk cache and resident memory creep up over a session and surface as OOM crashes. Here's how I measured the bloat, where I set caps, and what I trimmed on the delivery side — with working code, in the order that actually helped."
+tags: ["Rork", "expo-image", "Memory", "Caching", "React Native", "Performance"]
+highlights:
+  - "An onLoad measurement hook for expo-image that surfaces cacheHitRate, average load time, and live disk cache size in MB"
+  - "A manual LRU-style eviction that keeps the disk cache under a 200MB ceiling by deleting oldest files first"
+  - "The recyclingKey / cachePolicy / prefetch-throttling split that cut my Crashlytics OOM rate, plus the p95 memory targets I hold the list screen to"
+---
+If you run a few image-first apps as an indie developer, there comes a point where Crashlytics starts showing the same crash over and over. The repro is just "open the app, scroll the gallery for a while, zoom a few photos." The exception is always `Out of memory`, with no stack trace pinned to a specific screen, so the cause is hard to grab at first.
+
+I hit this in a wallpaper app of my own. The code worked correctly, yet the longer someone used it, the more likely it was to die. The culprit was a cache that grew a little at a time. expo-image caches intelligently, but unless you design the ceiling yourself, both disk and memory keep climbing quietly. These are my notes on how I measured that growth, where I placed the caps, and what I cut on the delivery side — written in the order that paid off.
+
+## First, confirm the bloat with numbers
+
+The worst move in a memory problem is to sprinkle `clearMemoryCache()` on a hunch. Clear without knowing what is consuming what, and you also tank your cache hit rate, which makes loading slow and creates a different kind of churn. Start by measuring.
+
+expo-image does not directly report disk cache size, so I measure the cache directory with `expo-file-system` and turn `onLoad` results into metrics.
+
+```tsx
+// Hook to measure load results and disk cache size
+import { useCallback, useRef, useState } from 'react';
+import * as FileSystem from 'expo-file-system';
+
+type LoadMetrics = {
+  loadCount: number;
+  cacheHits: number;
+  cacheHitRate: number;   // %
+  avgLoadMs: number;
+  diskCacheMB: number;
+};
+
+export const useImageMetrics = () => {
+  const startTimes = useRef<Record<string, number>>({});
+  const totals = useRef({ count: 0, ms: 0, hits: 0 });
+  const [metrics, setMetrics] = useState<LoadMetrics>({
+    loadCount: 0, cacheHits: 0, cacheHitRate: 0,
+    avgLoadMs: 0, diskCacheMB: 0,
+  });
+
+  const markStart = useCallback((key: string) => {
+    startTimes.current[key] = Date.now();
+  }, []);
+
+  // expo-image's onLoad returns event.cacheType ('memory' | 'disk' | 'none')
+  const markLoad = useCallback((key: string, cacheType?: string) => {
+    const started = startTimes.current[key] ?? Date.now();
+    const ms = Date.now() - started;
+    const t = totals.current;
+    t.count += 1; t.ms += ms;
+    if (cacheType === 'memory' || cacheType === 'disk') t.hits += 1;
+    setMetrics((prev) => ({
+      ...prev,
+      loadCount: t.count,
+      cacheHits: t.hits,
+      cacheHitRate: Math.round((t.hits / t.count) * 100),
+      avgLoadMs: Math.round(t.ms / t.count),
+    }));
+  }, []);
+
+  const refreshDiskSize = useCallback(async () => {
+    const dir = (FileSystem.cacheDirectory ?? '') + 'expo-image/';
+    const info = await FileSystem.getInfoAsync(dir, { size: true });
+    const mb = (info.exists ? (info.size ?? 0) : 0) / (1024 * 1024);
+    setMetrics((prev) => ({ ...prev, diskCacheMB: Math.round(mb * 10) / 10 }));
+  }, []);
+
+  return { metrics, markStart, markLoad, refreshDiskSize };
+};
+
+// One real reading (my wallpaper app, iPhone 12, after scrolling 1,200 images):
+// { loadCount: 1200, cacheHits: 1044, cacheHitRate: 87,
+//   avgLoadMs: 64, diskCacheMB: 612.4 }
+```
+
+The first thing this revealed: `cacheHitRate` was a healthy 87%, yet `diskCacheMB` was over 600MB. The cache was working — working so well it never stopped accumulating. The problem was not the hit rate but the missing ceiling.
+
+## Cap the disk cache and delete oldest first
+
+expo-image's `clearDiskCache()` wipes everything, which is too blunt for production. What you want is "delete only the overflow, oldest first." You can build that with `expo-file-system` by collecting each cached file's modification time and size, then deleting from the oldest once the total exceeds a threshold — an LRU-style eviction.
+
+```tsx
+// Keep the disk cache under a 200MB ceiling
+import * as FileSystem from 'expo-file-system';
+
+const CACHE_DIR = (FileSystem.cacheDirectory ?? '') + 'images/';
+const MAX_BYTES = 200 * 1024 * 1024; // 200MB
+
+export const evictDiskCache = async () => {
+  const dir = await FileSystem.getInfoAsync(CACHE_DIR);
+  if (!dir.exists) return { freedMB: 0, keptMB: 0 };
+
+  const names = await FileSystem.readDirectoryAsync(CACHE_DIR);
+  const entries = await Promise.all(
+    names.map(async (name) => {
+      const info = await FileSystem.getInfoAsync(CACHE_DIR + name, { size: true });
+      return {
+        uri: CACHE_DIR + name,
+        size: info.exists ? (info.size ?? 0) : 0,
+        mtime: info.exists ? (info.modificationTime ?? 0) : 0, // seconds; newer = larger
+      };
+    })
+  );
+
+  const total = entries.reduce((sum, e) => sum + e.size, 0);
+  if (total <= MAX_BYTES) return { freedMB: 0, keptMB: Math.round(total / 1048576) };
+
+  // Oldest first (ascending mtime), drop down to 80% of the ceiling
+  entries.sort((a, b) => a.mtime - b.mtime);
+  let running = total;
+  let freed = 0;
+  const target = MAX_BYTES * 0.8;
+  for (const e of entries) {
+    if (running <= target) break;
+    await FileSystem.deleteAsync(e.uri, { idempotent: true });
+    running -= e.size; freed += e.size;
+  }
+  return { freedMB: Math.round(freed / 1048576), keptMB: Math.round(running / 1048576) };
+};
+
+// When to call: once on launch and once on returning from background.
+// Example output: { freedMB: 430, keptMB: 160 }
+```
+
+Two details mattered here. First, drop to 80% rather than exactly the threshold. Trim to the boundary and a few more loads push you back over it, so eviction runs every time. A little headroom lowers how often you delete. Second, I limited deletion to launch and background-return. Running it mid-scroll caused the disk I/O to drop frames. Heavy cleanup belongs in the moments the user is not looking at the screen.
+
+## Cut resident memory — split recyclingKey and cachePolicy
+
+Even with disk under control, the direct trigger for OOM is the memory side. A grid showing many thumbnails and a screen zooming one image full-screen need different cache strategies. Handling both with one setting was my first mistake.
+
+For the grid I use `cachePolicy="disk"` to avoid resident memory and `recyclingKey` to recycle views. The zoom view holds few images, so it uses `memory-disk` for immediacy.
+
+```tsx
+import { Image } from 'expo-image';
+import { FlatList } from 'react-native';
+
+// Grid (many items, keep memory low)
+const Thumb = ({ item, onStart, onLoad }) => (
+  <Image
+    source={{ uri: item.thumbUrl }}
+    style={{ width: '100%', aspectRatio: 1 }}
+    contentFit="cover"
+    cachePolicy="disk"          // don't keep it in memory
+    recyclingKey={item.id}       // view reuse keeps memory stable
+    onLoadStart={() => onStart(item.id)}
+    onLoad={(e) => onLoad(item.id, e?.cacheType)}
+  />
+);
+
+export const Gallery = ({ images, m }) => (
+  <FlatList
+    data={images}
+    renderItem={({ item }) => (
+      <Thumb item={item} onStart={m.markStart} onLoad={m.markLoad} />
+    )}
+    keyExtractor={(i) => i.id}
+    numColumns={3}
+    windowSize={5}              // shrink off-screen retention
+    maxToRenderPerBatch={9}
+    initialNumToRender={12}
+    removeClippedSubviews       // unmount off-screen items
+  />
+);
+
+// Full-screen zoom (few items, immediacy first)
+const FullImage = ({ uri }) => (
+  <Image
+    source={{ uri }}
+    style={{ flex: 1 }}
+    contentFit="contain"
+    cachePolicy="memory-disk"
+    transition={150}
+  />
+);
+```
+
+Shrinking `windowSize` and turning on `removeClippedSubviews` visibly flattened the memory growth during scroll. One caveat: `removeClippedSubviews` can occasionally drop rendering on Android, so after enabling it, verify on a real device that no blank cells appear. I keep it scoped to the grid only, just in case.
+
+## Trim on the delivery side — return WebP sized to the display
+
+If the image arriving at the device is large, the bitmap it decodes into in memory is large too. When the display is a 120pt thumbnail but the source ships at 3000px wide, you are paying memory for resolution nobody sees. Server-side resizing is one of the few moves that helps both disk and memory.
+
+```tsx
+import { PixelRatio } from 'react-native';
+
+// From display width (pt), compute the real pixel width to request
+export const sizedUrl = (base: string, displayPt: number) => {
+  const px = Math.min(Math.round(displayPt * PixelRatio.get()), 1280);
+  // Cloudflare Images transform. q=78 hides degradation well even on wallpapers
+  return `${base}?w=${px}&format=webp&q=78`;
+};
+
+// Fetch different URLs for the grid thumb (120pt) and full screen (390pt)
+// thumb : ...?w=360&format=webp&q=78   (3x device)
+// full  : ...?w=1170&format=webp&q=78
+```
+
+The point is to fetch different URLs for grid and zoom. Hand a thumbnail full resolution and you undo the grid's whole reason for being light. WebP alone is roughly 25–35% smaller than JPEG, which slows the `diskCacheMB` climb. In practice, switching thumbnails from full resolution to display-sized dropped disk usage after a 1,200-image scroll from 612MB to the low 180s.
+
+## Don't over-fire prefetch
+
+Prefetch cuts both ways. Warming the next screen's images with `Image.prefetch()` feels faster, but warmed images also sit in memory, so over-firing it becomes fuel for OOM. I originally prefetched every URL in the list at once, and that was the single biggest driver of resident memory.
+
+```tsx
+import { Image } from 'expo-image';
+
+// Warm only the next few visible images
+export const prefetchAhead = (urls: string[], from: number, ahead = 6) => {
+  const slice = urls.slice(from, from + ahead);
+  // Warm at low priority, limited to the visible range plus a few
+  return Promise.all(slice.map((u) => Image.prefetch(u, { cachePolicy: 'disk' })));
+};
+
+// Pass the leading index from onViewableItemsChanged as `from`; warm 6 ahead only
+```
+
+Narrowing to a small window — visible range plus six — kept the speed of prefetch while lowering the memory peak. Prefetch's right answer in production is "only what's about to be visible," not "everything."
+
+## Close the measure-then-improve loop
+
+None of this should be set-and-forget; hold it with metrics. On the list screen I aim for three: `cacheHitRate` at or above 70%, `avgLoadMs` at or below 200ms, and `diskCacheMB` within the 200MB ceiling. On top of that, I watch the OOM share of crashes in Crashlytics per release and track whether it moves.
+
+On the version with these changes, the OOM share dropped clearly, and the dip in ratings on low-memory devices eased. In an app that shows ads (AdMob), a crash is a lost impression, so memory stability is a quiet boost to revenue too. With numbers guarding the screen, you also catch regressions the moment you add the next feature.
+
+## A checklist to put into practice
+
+To close, here is the single ordering I recommend for your own Rork app starting tomorrow. First add the measurement hook and surface `diskCacheMB` and `cacheHitRate`. Once you have proof of bloat, add disk-ceiling eviction and delivery-side resizing, then narrow the prefetch window last. In that order you can confirm each step's effect with numbers as you go. Stop clearing on a hunch and start from measurement — that was the shortest path for me.
