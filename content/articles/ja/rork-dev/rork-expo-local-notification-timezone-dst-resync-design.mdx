@@ -1,0 +1,219 @@
+---
+title: "海外に行くと毎朝の通知が9時に来ない — Expoの定時ローカル通知をタイムゾーンと夏時間に強くする設計"
+slug: "rork-expo-local-notification-timezone-dst-resync-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-25T20:15"
+updated: "2026-06-25T20:15"
+author: "Rork Lab"
+description: "Rork(Expo)で作った定時リマインダーが、出張やサマータイムで現地の9時に届かなくなる問題。timeIntervalトリガーの落とし穴と、ローカル時刻基準で再スケジュールする設計を実装コード付きで整理します。"
+tags: ["Rork", "expo-notifications", "タイムゾーン", "ローカル通知", "React Native", "DST"]
+highlights:
+  - "timeInterval/Date トリガーが時差・夏時間でずれる理由と、DAILYカレンダートリガーが現地時刻に追従する仕組みの切り分け"
+  - "意図した「現地9:00」を保持し、フォアグラウンド復帰時にタイムゾーン変化を検知して全件キャンセル＆再スケジュールする実装"
+  - "春の時刻飛び（2:30が存在しない日）と64件上限の回転枠を両立させる、次回発火時刻の安全な計算ロジック"
+---
+
+毎朝「今日の一枚」を届ける壁紙アプリで、ある利用者から「ヨーロッパに来たら通知が夕方に届く」という報告をもらったことがあります。日本では問題なく朝9時に出ていたので、最初はサーバー側の話かと疑いました。けれども原因はもっと手前、ローカル通知のトリガーの組み方にありました。
+
+個人開発で癒し・引き寄せ系のアプリを6本ほど並行運用していると、こうした「自分の端末では再現しないバグ」が一番厄介です。定時通知の時刻ずれは、まさにその典型でした。ここでは、Expo のローカル通知がタイムゾーンと夏時間（DST）でずれる仕組みを切り分け、現地時刻に追従させる再スケジュール設計を、私自身が実際に直した手順に沿って実装コードとともに整理します。
+
+## なぜ「現地の9時」に届かなくなるのか
+
+ずれの正体は、トリガーが「絶対的な瞬間」を指しているか「現地のカレンダー上の時刻」を指しているかの違いです。expo-notifications のトリガーは大きく3系統あります。
+
+<table>
+<thead>
+<tr><th>トリガー種別</th><th>指す対象</th><th>時差・DSTで</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>timeInterval</strong>（n秒後）</td><td>絶対的な瞬間（スケジュール時点から固定秒数）</td><td>ずれる</td></tr>
+<tr><td><strong>date</strong>（固定のDate）</td><td>絶対的な瞬間（UTC上の一点）</td><td>ずれる</td></tr>
+<tr><td><strong>daily / calendar</strong>（hour, minute）</td><td>端末の現地カレンダー上の時刻</td><td>追従する</td></tr>
+</tbody>
+</table>
+
+問題が起きやすいのは、`timeInterval` で「次の朝9時までの秒数」を計算して渡すパターンです。これは一見正しく見えますが、スケジュールした瞬間に「○○秒後」という絶対的な約束に変換されます。利用者が9時間進んだタイムゾーンへ移動しても、約束された瞬間は動きません。結果、現地では夕方に鳴る、というわけです。
+
+固定の `Date` を渡すパターンも同じ理屈でずれます。`new Date(2026, 5, 26, 9, 0)` は端末の現在オフセットでUTCの一点に焼き付けられるため、移動後にそのまま発火すると現地の時計とは合いません。
+
+私が踏んだのはこの両方でした。日替わりで通知文を変えたかったので、あえてカレンダートリガーではなく日付を1件ずつ計算して積んでいたのです。文面の出し分けと引き換えに、時差耐性を失っていました。
+
+## まず基本：現地時刻に追従させたいだけなら DAILY を使う
+
+毎日同じ文面・同じ現地時刻でよいなら、答えはシンプルです。`SchedulableTriggerInputTypes.DAILY` を使えば、OS が現地カレンダーで再評価してくれるため、時差移動も夏時間の切り替えも自動で吸収されます。
+
+```ts
+import * as Notifications from 'expo-notifications';
+
+export async function scheduleDailyReminder(hour: number, minute: number) {
+  // 既存の定時枠を一旦消してから積み直す（重複防止）
+  await Notifications.cancelAllScheduledNotificationsAsync();
+
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: '今日の一枚が届きました',
+      body: 'ホーム画面の気分を、静かに変えてみませんか。',
+    },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DAILY,
+      hour,   // 端末の現地時刻で解釈される
+      minute,
+    },
+  });
+}
+```
+
+iOS では内部的に `UNCalendarNotificationTrigger`、Android では繰り返しアラームに対応づきます。どちらも「現地の hour:minute」という意味なので、東京で設定して9時間進んだ地域へ移っても、現地の9時に鳴ります。`timeInterval` から `DAILY` に置き換えるだけで直る場合が、実は一番多いです。
+
+## 問題は「日付を計算して積む」必要があるとき
+
+ところが実運用では、`DAILY` だけでは足りない場面が出てきます。私のアプリでは次の2つが理由でした。
+
+ひとつは、**日替わりで内容を変えたい**こと。「今日の一枚」「今日の言葉」を曜日や日付で出し分けるには、1件ずつ内容を指定して積む必要があります。もうひとつは、**iOS の保留中通知64件の上限**です。先々の分まで内容を変えて積むと、回転させながら上限内に収める設計が要ります（この上限と回転枠の話自体は別記事で扱っています）。
+
+内容を変えるために日付トリガーへ戻ると、冒頭の時差ずれが再発します。ここからが本題で、**「意図した現地時刻」を真実の源として保存し、タイムゾーンが変わったら積み直す**設計にします。
+
+### 設計の核：保存するのは「現地のhour:minute」だけ
+
+絶対時刻ではなく、利用者が望む現地の時・分だけを保存します。発火時刻の計算は常に「今の端末オフセット」で行い、移動を検知したら全件キャンセルして再計算します。
+
+```ts
+import * as Notifications from 'expo-notifications';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const PREF_KEY = 'reminder:prefs:v1';
+
+type ReminderPrefs = {
+  enabled: boolean;
+  hour: number;    // 現地の時（0-23）
+  minute: number;  // 現地の分
+  lastTimeZone: string;   // 最後に積んだときのIANA時間帯
+  lastOffsetMin: number;  // 同上のオフセット（分）
+};
+
+function currentTimeZone(): string {
+  // Hermes でも Intl は利用可能。端末のIANA時間帯名を取得
+  return Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'unknown';
+}
+
+async function loadPrefs(): Promise<ReminderPrefs | null> {
+  const raw = await AsyncStorage.getItem(PREF_KEY);
+  return raw ? (JSON.parse(raw) as ReminderPrefs) : null;
+}
+
+async function savePrefs(p: ReminderPrefs) {
+  await AsyncStorage.setItem(PREF_KEY, JSON.stringify(p));
+}
+```
+
+### 次回発火時刻を「今のオフセット」で計算する
+
+日替わり文面のために、これから7日分を1件ずつ積みます。各日の「現地 hour:minute」を、その瞬間の端末オフセットで `Date` に落とし込みます。ここで春の時刻飛び（存在しない時刻）への手当てを入れておくのが肝心です。
+
+```ts
+// 指定した現地の時・分に最も近い「未来の」発火時刻を返す
+function nextLocalOccurrence(hour: number, minute: number, dayOffset: number): Date {
+  const now = new Date();
+  const d = new Date(now);
+  d.setDate(now.getDate() + dayOffset);
+  d.setHours(hour, minute, 0, 0);
+
+  // dayOffset=0 で既に過ぎていれば翌日へ送る
+  if (dayOffset === 0 && d.getTime() <= now.getTime()) {
+    d.setDate(d.getDate() + 1);
+  }
+
+  // 春の DST 飛びで「その時刻が存在しない」日への手当て。
+  // setHours しても時が繰り上がるため、ずれたら1時間後ろへ寄せる。
+  if (d.getHours() !== hour) {
+    d.setHours(hour + 1, minute, 0, 0);
+  }
+  return d;
+}
+
+async function scheduleRotatingReminders(p: ReminderPrefs, days = 7) {
+  await Notifications.cancelAllScheduledNotificationsAsync();
+  if (!p.enabled) return;
+
+  const messages = await getDailyMessages(days); // 日替わり文面の取得
+
+  for (let i = 0; i < days; i++) {
+    const fireDate = nextLocalOccurrence(p.hour, p.minute, i);
+    await Notifications.scheduleNotificationAsync({
+      content: { title: messages[i].title, body: messages[i].body },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: fireDate,
+      },
+    });
+  }
+
+  await savePrefs({
+    ...p,
+    lastTimeZone: currentTimeZone(),
+    lastOffsetMin: new Date().getTimezoneOffset(),
+  });
+}
+```
+
+`getTimezoneOffset()` は「UTCからの分の差」を符号反転で返す点に注意してください（東京は -540）。値そのものより、**前回積んだときと変わったか**だけを見れば十分です。
+
+### タイムゾーン変化を検知して積み直す
+
+最後に、アプリがフォアグラウンドへ戻った時にだけ、時間帯かオフセットが変わっていないかを確認します。毎回積み直すと無駄なので、変化したときだけ実行するガードを置きます。
+
+```ts
+import { AppState, AppStateStatus } from 'react-native';
+
+export function installReminderResync() {
+  const handler = async (state: AppStateStatus) => {
+    if (state !== 'active') return;
+
+    const prefs = await loadPrefs();
+    if (!prefs || !prefs.enabled) return;
+
+    const tzNow = currentTimeZone();
+    const offsetNow = new Date().getTimezoneOffset();
+
+    const moved = tzNow !== prefs.lastTimeZone || offsetNow !== prefs.lastOffsetMin;
+    if (moved) {
+      // 時差移動・夏時間切替を検知 → 全件キャンセルして現地時刻で積み直す
+      await scheduleRotatingReminders(prefs);
+    }
+  };
+
+  const sub = AppState.addEventListener('change', handler);
+  return () => sub.remove();
+}
+```
+
+オフセットも見ているのは、同じIANA時間帯のままサマータイムが切り替わるケース（例: ロンドンの GMT↔BST）を拾うためです。時間帯名だけだとこの遷移を取りこぼします。両方を比較するのが安全です。
+
+## 公式の挙動と、実際に効いた運用の差
+
+`DAILY` トリガーが現地時刻に追従するのは設計どおりの挙動です。ただ実運用では、日替わり文面と64件上限のために日付トリガーへ寄せざるを得ない場面が必ず出てきます。そこで「絶対時刻を保存しない・現地のhour:minuteだけを源にする・移動時に積み直す」という三点を守るだけで、報告されていた夕方通知はほぼ消えました。
+
+回転枠の日数は、私の6本では7日に落ち着きました。64件の上限ぎりぎりまで積むと、移動のたびに全件キャンセル＆再積みのコストが上がり、フォアグラウンド復帰が一瞬もたつきます。7日分なら積み直しは数十ミリ秒で済み、文面の鮮度も保てます。先々まで積むより、復帰時に短い窓を確実に積み直すほうが、個人開発の運用としては壊れにくいというのが実感です。
+
+## 現地時刻で並べて検証する
+
+検証は、デバッグ画面に保留中の通知一覧を現地時刻で並べるのが手早いです。端末の時間帯を手で切り替えて、一覧の発火時刻が現地9時へ寄り直すかを目視します。
+
+```ts
+export async function dumpScheduled() {
+  const items = await Notifications.getAllScheduledNotificationsAsync();
+  items.forEach((n) => {
+    const t: any = n.trigger;
+    const when = t?.date ? new Date(t.date).toLocaleString() : `${t?.hour}:${t?.minute}`;
+    console.log(n.content.title, '→', when);
+  });
+}
+```
+
+## Androidの省電力は時刻ずれと分けて調べる
+
+ひとつ補足すると、Android はメーカーの省電力制御で定時アラームが遅延・間引かれることがあります。時刻の正確さ以前に「鳴るかどうか」が機種依存になる領域なので、時刻ずれの調査と省電力の調査は分けて進めるのが結局は近道でした。
+
+時計の話は地味ですが、毎朝の一通が現地で正しく届くかどうかは、リテンションに直結します。次の一手としては、自分のアプリの定時通知が `timeInterval` で組まれていないかをまず確認してみてください。そこが起点になっているケースが、私の経験ではいちばん多いです。

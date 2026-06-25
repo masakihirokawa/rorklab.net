@@ -1,0 +1,219 @@
+---
+title: "Why Your 9 AM Reminder Stops Arriving Abroad — Making Expo Local Notifications Survive Time Zones and DST"
+slug: "rork-expo-local-notification-timezone-dst-resync-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-25T20:15"
+updated: "2026-06-25T20:15"
+author: "Rork Lab"
+description: "Daily reminders built with Rork (Expo) can drift to the wrong local time when users travel or DST flips. Here is the timeInterval trap, and a design that reschedules against local wall-clock time, with working code."
+tags: ["Rork", "expo-notifications", "Time Zones", "Local Notifications", "React Native", "DST"]
+highlights:
+  - "Why timeInterval/Date triggers drift across time zones and DST, and how the DAILY calendar trigger tracks local time instead"
+  - "A design that stores the intended local hour:minute and rebuilds the schedule on foreground when a time-zone change is detected"
+  - "Safe next-fire computation that handles the spring-forward gap (a 2:30 that does not exist) while keeping a rolling window under the 64-notification cap"
+---
+
+A user of one of my wallpaper apps once wrote in to say that the morning "image of the day" was arriving in the evening after they moved to Europe. It fired reliably at 9 AM in Japan, so my first guess was something server-side. The real cause sat much earlier in the stack: how the local notification trigger was built.
+
+Running about six healing- and manifestation-style apps on my own, the bugs I dread most are the ones that never reproduce on my own device. A drifting daily reminder is the textbook example. This article separates out exactly why Expo local notifications drift across time zones and DST, and lays out a rescheduling design that keeps them anchored to local time, with code you can drop in.
+
+## Why "local 9 AM" stops arriving
+
+The drift comes down to one distinction: does the trigger point at an absolute instant, or at a time on the device's local calendar? expo-notifications triggers fall into three families.
+
+<table>
+<thead>
+<tr><th>Trigger type</th><th>What it points at</th><th>Across travel / DST</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>timeInterval</strong> (n seconds)</td><td>An absolute instant (fixed seconds from scheduling time)</td><td>Drifts</td></tr>
+<tr><td><strong>date</strong> (a fixed Date)</td><td>An absolute instant (one point in UTC)</td><td>Drifts</td></tr>
+<tr><td><strong>daily / calendar</strong> (hour, minute)</td><td>A time on the device's local calendar</td><td>Tracks correctly</td></tr>
+</tbody>
+</table>
+
+The pattern that bites most is computing "seconds until the next 9 AM" and passing it to a `timeInterval` trigger. It looks right, but at scheduling time it is frozen into an absolute "fire N seconds from now." When the user moves nine hours east, that promised instant does not move. So it rings in the evening locally.
+
+Passing a fixed `Date` drifts for the same reason. `new Date(2026, 5, 26, 9, 0)` is baked into one UTC instant using the device's current offset, so after a move it no longer lines up with the local clock.
+
+I had shipped both. Because I wanted to vary the message per day, I had deliberately stacked one date at a time instead of using a calendar trigger. In exchange for per-day copy, I gave up time-zone resilience.
+
+## The basics: if you only need local time, use DAILY
+
+If the same copy at the same local time every day is enough, the answer is simple. With `SchedulableTriggerInputTypes.DAILY`, the OS re-evaluates against the local calendar, so both travel and DST switches are absorbed for you.
+
+```ts
+import * as Notifications from 'expo-notifications';
+
+export async function scheduleDailyReminder(hour: number, minute: number) {
+  // Clear the existing daily slot first, then re-add (avoid duplicates)
+  await Notifications.cancelAllScheduledNotificationsAsync();
+
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: 'Your image of the day is here',
+      body: 'A quiet change of mood for your home screen.',
+    },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DAILY,
+      hour,   // interpreted in the device's local time
+      minute,
+    },
+  });
+}
+```
+
+On iOS this maps to a `UNCalendarNotificationTrigger`; on Android, to a repeating alarm. Both mean "local hour:minute," so a reminder set in Tokyo still rings at the local 9 AM nine hours away. Swapping `timeInterval` for `DAILY` is, in fact, the most common one-line fix.
+
+## The hard part: when you must compute and stack dates
+
+In real operation, `DAILY` alone runs out of room. For my apps there were two reasons.
+
+First, I wanted **per-day content**, rotating the "image of the day" or "words for today" by weekday or date, which means specifying each item and stacking them individually. Second, there is **iOS's cap of 64 pending notifications**. Stacking varied content into the future requires a rolling design that stays under the cap (the cap and rolling window themselves are covered in a separate article).
+
+Going back to date triggers for variable content reintroduces the drift above. So here is the real design: **store the intended local time as the source of truth, and rebuild the schedule whenever the time zone changes.**
+
+### The core: store only the local hour:minute
+
+Instead of an absolute time, persist only the local hour and minute the user wants. Always compute fire times against the device's current offset, and on a detected move, cancel everything and recompute.
+
+```ts
+import * as Notifications from 'expo-notifications';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const PREF_KEY = 'reminder:prefs:v1';
+
+type ReminderPrefs = {
+  enabled: boolean;
+  hour: number;    // local hour (0-23)
+  minute: number;  // local minute
+  lastTimeZone: string;   // IANA zone at last scheduling
+  lastOffsetMin: number;  // and its offset (minutes)
+};
+
+function currentTimeZone(): string {
+  // Intl is available under Hermes. Read the device IANA zone name.
+  return Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'unknown';
+}
+
+async function loadPrefs(): Promise<ReminderPrefs | null> {
+  const raw = await AsyncStorage.getItem(PREF_KEY);
+  return raw ? (JSON.parse(raw) as ReminderPrefs) : null;
+}
+
+async function savePrefs(p: ReminderPrefs) {
+  await AsyncStorage.setItem(PREF_KEY, JSON.stringify(p));
+}
+```
+
+### Compute the next fire time against the current offset
+
+For per-day copy, stack the next seven days one item at a time. Drop each day's "local hour:minute" into a `Date` using the offset in effect at that moment. The key is handling the spring-forward gap (a time that does not exist).
+
+```ts
+// Return the nearest FUTURE fire time for the given local hour:minute
+function nextLocalOccurrence(hour: number, minute: number, dayOffset: number): Date {
+  const now = new Date();
+  const d = new Date(now);
+  d.setDate(now.getDate() + dayOffset);
+  d.setHours(hour, minute, 0, 0);
+
+  // If today's slot already passed, push to the next day
+  if (dayOffset === 0 && d.getTime() <= now.getTime()) {
+    d.setDate(d.getDate() + 1);
+  }
+
+  // Handle the spring-forward gap where "that time does not exist."
+  // setHours rolls the hour forward, so if it shifted, nudge one hour later.
+  if (d.getHours() !== hour) {
+    d.setHours(hour + 1, minute, 0, 0);
+  }
+  return d;
+}
+
+async function scheduleRotatingReminders(p: ReminderPrefs, days = 7) {
+  await Notifications.cancelAllScheduledNotificationsAsync();
+  if (!p.enabled) return;
+
+  const messages = await getDailyMessages(days); // fetch per-day copy
+
+  for (let i = 0; i < days; i++) {
+    const fireDate = nextLocalOccurrence(p.hour, p.minute, i);
+    await Notifications.scheduleNotificationAsync({
+      content: { title: messages[i].title, body: messages[i].body },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: fireDate,
+      },
+    });
+  }
+
+  await savePrefs({
+    ...p,
+    lastTimeZone: currentTimeZone(),
+    lastOffsetMin: new Date().getTimezoneOffset(),
+  });
+}
+```
+
+Note that `getTimezoneOffset()` returns the difference from UTC in minutes with the sign inverted (Tokyo is -540). You do not care about the value itself, only **whether it changed since the last scheduling.**
+
+### Detect a time-zone change and rebuild
+
+Finally, only when the app returns to the foreground, check whether the zone or offset changed. Rebuilding every time would be wasteful, so guard it to run only on an actual change.
+
+```ts
+import { AppState, AppStateStatus } from 'react-native';
+
+export function installReminderResync() {
+  const handler = async (state: AppStateStatus) => {
+    if (state !== 'active') return;
+
+    const prefs = await loadPrefs();
+    if (!prefs || !prefs.enabled) return;
+
+    const tzNow = currentTimeZone();
+    const offsetNow = new Date().getTimezoneOffset();
+
+    const moved = tzNow !== prefs.lastTimeZone || offsetNow !== prefs.lastOffsetMin;
+    if (moved) {
+      // Travel or DST switch detected -> cancel all and rebuild in local time
+      await scheduleRotatingReminders(prefs);
+    }
+  };
+
+  const sub = AppState.addEventListener('change', handler);
+  return () => sub.remove();
+}
+```
+
+The offset is checked too, to catch a DST switch within the same IANA zone (for example London's GMT↔BST). The zone name alone misses that transition; comparing both is the safe choice.
+
+## The documented behavior vs. what actually worked
+
+`DAILY` tracking local time is behaving as designed. In practice, though, per-day content and the 64-cap inevitably push you toward date triggers. Holding to three rules there — never store an absolute time, keep the local hour:minute as the source, rebuild on a move — made the reported evening notifications all but disappear.
+
+Across my six apps, the rolling window settled at seven days. Stacking close to the 64-item cap makes every move more expensive to cancel and rebuild, and the foreground resume stutters for a moment. Seven days rebuilds in tens of milliseconds and keeps the copy fresh. Rebuilding a short window reliably on resume has held up better in practice than stacking far into the future.
+
+## Verify by listing pending notifications in local time
+
+The fastest way to verify is a debug screen that lists pending notifications in local time. Switch the device's zone by hand and watch whether the listed fire times snap back toward local 9 AM.
+
+```ts
+export async function dumpScheduled() {
+  const items = await Notifications.getAllScheduledNotificationsAsync();
+  items.forEach((n) => {
+    const t: any = n.trigger;
+    const when = t?.date ? new Date(t.date).toLocaleString() : `${t?.hour}:${t?.minute}`;
+    console.log(n.content.title, '->', when);
+  });
+}
+```
+
+## Treat Android power-saving as a separate problem
+
+One caveat: on Android, vendor power-saving can delay or drop scheduled alarms. Whether it fires at all becomes device-dependent before accuracy even enters the picture, so I found it faster to investigate timing drift and power-saving as two separate problems.
+
+Clocks are unglamorous, but whether that one morning message lands at the right local time ties straight to retention. As a next step, check whether your own daily notifications are built on `timeInterval`. In my experience, that is the single most common starting point for the whole problem.
