@@ -1,0 +1,186 @@
+---
+title: "When Push Notifications Reach Only Some Users — A Delivery-Reliability and Diagnosis Design for Rork (Expo) Apps"
+slug: "rork-push-notification-delivery-reliability-token-priority-diagnosis-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-25T21:06"
+author: "Rork Lab"
+description: "A design for diagnosing why push notifications reach only some users in a Rork-generated Expo app, by splitting send-to-display into stages and measuring delivery to close the gap. Covers stale-token cleanup, recording APNs/FCM failure codes, priority and message type, and a per-user triage procedure, with implementation."
+tags: ["Rork", "Expo", "push notifications", "delivery rate", "APNs", "FCM", "token management", "notification design"]
+highlights:
+  - "Decomposes 'notifications don't arrive' into send → accepted → delivered → displayed → opened, and designs the observation points to isolate where it dropped"
+  - "Stale-token cleanup, recording APNs/FCM failure codes, and choosing priority and message type — shared as the exact implementation I run in my own indie notification operations"
+  - "Receiver-side instrumentation to measure delivery as a number, plus a triage procedure that pins the cause within five minutes when a specific user says they didn't get it"
+---
+
+# When Push Notifications Reach Only Some Users
+
+I once sent an announcement by push for one of my indie apps and the open count came in far below what I expected. The send log said "sent to everyone." Yet a few people wrote to say no notification arrived, and on one of my own spare devices it hadn't shown up either. Sent but not arriving — at the time I could only explain that vague state as "APNs must be acting up."
+
+What I learned later is that "not arriving" is not a single phenomenon. The token is stale, the server rejected acceptance, the platform throttled it as low priority, the device didn't display it — all produce the same "didn't arrive," but the cause and the fix are completely different. This article shares the design — with implementation — for observing notifications across the stages from send to display, isolating where they drop, and closing the delivery gap.
+
+## Decompose "Didn't Arrive" Into Stages
+
+The first move is to split one "didn't arrive" into stages that can each fail independently. Put an observation point at each stage and a vague malfunction becomes "N dropped at this stage."
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>Main reasons it drops</th><th>Signal to check</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1. Token acquisition</td><td>Not permitted / token not registered</td><td>Device permission status, server registration</td></tr>
+    <tr><td>2. Server acceptance</td><td>Stale token, bad payload</td><td>APNs/FCM response code</td></tr>
+    <tr><td>3. Platform delivery</td><td>Low-priority throttling</td><td>Priority setting, message type</td></tr>
+    <tr><td>4. Device display</td><td>Force-quit, notifications off, silent handling</td><td>Receive-handler arrival log</td></tr>
+    <tr><td>5. Open</td><td>Unnoticed / not interested</td><td>Open event</td></tr>
+  </tbody>
+</table>
+
+Most developers watch only stage 5 (open rate). But much of "didn't arrive" happens at stages 2–4, and without observing those you can't tell whether a low open rate means "the content is bad" or "it never arrived at all." Below, I knock down the most failure-prone stages in order.
+
+## Clean Up Stale Tokens (the Quietest Killer)
+
+In production the most common cause of "didn't arrive" is the server sending to old tokens forever. When a user deletes the app, reinstalls, or updates the OS, the token changes. Send to an old token and APNs/FCM return "invalid" at acceptance or in a later receipt — but if you don't record and clean those up, you keep sending to dead addresses indefinitely.
+
+Design tokens as a pair: not just "register" but "invalidate."
+
+```ts
+// register-token.ts — device side: register a token and update on change
+import * as Notifications from "expo-notifications";
+import * as Device from "expo-device";
+
+export async function registerPushToken(userId: string) {
+  if (!Device.isDevice) return; // simulators can't get a real token
+
+  const { status } = await Notifications.getPermissionsAsync();
+  let finalStatus = status;
+  if (status !== "granted") {
+    finalStatus = (await Notifications.requestPermissionsAsync()).status;
+  }
+  if (finalStatus !== "granted") {
+    // Drops at stage 1: not permitted. Record on the server as "cannot send"
+    await fetch("https://api.example.com/push/unregister", {
+      method: "POST",
+      body: JSON.stringify({ userId, reason: "denied" }),
+      headers: { "Content-Type": "application/json" },
+    });
+    return;
+  }
+
+  const token = (await Notifications.getExpoPushTokenAsync()).data;
+  await fetch("https://api.example.com/push/register", {
+    method: "POST",
+    body: JSON.stringify({ userId, token, platform: Device.osName }),
+    headers: { "Content-Type": "application/json" },
+  });
+}
+```
+
+On the server, always record the failure code returned on each send and stop invalid tokens. With Expo's push API, a token whose receipt returns `DeviceNotRegistered` should be invalidated immediately.
+
+```js
+// send.mjs — server side: send, and clean tokens by failure code
+import { Expo } from "expo-server-sdk";
+const expo = new Expo();
+
+export async function sendBatch(messages) {
+  const chunks = expo.chunkPushNotifications(messages);
+  const stats = { accepted: 0, rejected: 0, invalidTokens: [] };
+
+  for (const chunk of chunks) {
+    const tickets = await expo.sendPushNotificationsAsync(chunk);
+    tickets.forEach((t, i) => {
+      if (t.status === "ok") {
+        stats.accepted++;
+      } else {
+        stats.rejected++;
+        // Dropped at stage 2. Always keep the reason code
+        if (t.details?.error === "DeviceNotRegistered") {
+          stats.invalidTokens.push(chunk[i].to); // delete from DB later
+        }
+        console.error(`reject: ${t.details?.error} token=${chunk[i].to}`);
+      }
+    });
+  }
+  // Clean invalid tokens (don't send to these addresses next time)
+  await purgeTokens(stats.invalidTokens);
+  return stats;
+}
+```
+
+The key is keeping `accepted` and `rejected` as recorded metrics. Instead of "sent to everyone," knowing "N accepted, M rejected, K of them stale" turns stage-2 loss into a number. I log these three on every send and watch whether the share of stale tokens spikes. A sudden rise usually traces back to a major OS update or a surge of reinstalls.
+
+## Don't Confuse Priority and Message Type
+
+Even past stage 2, the platform can throttle at stage 3. In particular, "low-priority notifications" and "silent notifications (data-only / content-available)" are subject to the OS delaying or throttling delivery. Get this wrong and you get "the server accepted it but the user never received it."
+
+Send notifications you want shown immediately as high priority with a display payload. Treat silent notifications meant to wake background work as something else entirely.
+
+<table>
+  <thead>
+    <tr><th>Purpose</th><th>iOS</th><th>Android (FCM)</th><th>Delivery certainty</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Show immediately</td><td>apns-priority 10 + alert</td><td>priority high + notification</td><td>High</td></tr>
+    <tr><td>Wake in background</td><td>content-available + priority 5</td><td>data-only + priority high</td><td>OS throttles (no guarantee)</td></tr>
+    <tr><td>Update quietly</td><td>apns-priority 5</td><td>priority normal</td><td>May be delayed</td></tr>
+  </tbody>
+</table>
+
+There are two key points. First, **silent notifications are not guaranteed to be delivered.** iOS throttles `content-available` notifications based on battery and usage. Send important information as data-only alone and a certain share of users won't get it. The rule is to send anything you "must be noticed" with a display payload. Second, on iOS, when a user has **force-quit the app by swiping it away**, waking it via a silent notification is essentially hopeless. A design that relies on a notification trigger for background work must account for this reality.
+
+When sending the same kind back-to-back, use a collapse identifier (iOS `apns-collapse-id`, FCM `collapse_key`) to overwrite the old notification and avoid filling the notification center. But collapsing keeps "only the latest," so don't use it for transactional notifications where each one must be shown individually.
+
+## Measure Delivery on the Receiver Side
+
+Send-side logs (accepted/rejected) alone don't show stage 4 (device display). To know whether it actually reached the device, record an "arrived" event in the receive handler.
+
+```ts
+// delivery-instrument.ts — receiver side: report arrival back to measure delivery rate
+import * as Notifications from "expo-notifications";
+
+Notifications.addNotificationReceivedListener((notification) => {
+  const id = notification.request.content.data?.campaignId;
+  if (!id) return;
+  // Record the moment it reached the device (on foreground/background receipt)
+  fetch("https://api.example.com/push/delivered", {
+    method: "POST",
+    body: JSON.stringify({ campaignId: id, at: Date.now() }),
+    headers: { "Content-Type": "application/json" },
+    keepalive: true,
+  }).catch(() => {});
+});
+```
+
+Now against "N accepted" you know "D arrived at devices," and `D / N` is your effective delivery rate. I always attach a `campaignId` to announcement notifications and view accepted, delivered, and opened side by side per campaign. If accepted is high but delivered is low, suspect stage 3 (priority/type); if delivered is high but opened is low, suspect stage 5 (content/timing). Note that the receive handler doesn't run on a force-quit device, so read the delivery log as a *lower bound*. Even so, the resolution is far better than "look at accepted and call it done."
+
+## When a Specific User Says It Didn't Arrive
+
+What actually pays off in operations is a procedure to quickly triage an individual report. I pin the cause stage within five minutes in this order.
+
+1. **Stage 1:** Is the user's token registered on the server? If not, they haven't permitted it or registration failed.
+2. **Stage 2:** In the most recent send, was that token `accepted`, or rejected with `DeviceNotRegistered` and the like?
+3. **Stage 4:** Did a delivery log (delivered) come in? If so, it reached the device, and the cause is a display setting or a force-quit.
+4. **Device side:** Is the app turned off in OS notification settings, or are they in a focus / do-not-disturb mode?
+5. **Reproduce:** Send a single test notification to that token and check the acceptance code and delivery log on the spot.
+
+The value of this procedure is turning the vague guess "maybe APNs is acting up" into a definite diagnosis like "it was `DeviceNotRegistered` at stage 2, meaning the token is stale." Once you know the cause stage, the fix is mechanical: if the token is stale, prompt re-registration; if a force-quit is the cause, lean toward a display payload on the design side.
+
+## Operations Checklist
+
+The items I check routinely to keep delivery rates up.
+
+1. Tally accepted/rejected/stale on every send and watch for a spike in the stale share.
+2. Clean `DeviceNotRegistered` tokens from the DB immediately.
+3. Send "must be noticed" notifications with a display payload and high priority (don't rely on data-only).
+4. Assume silent-notification delivery is not guaranteed, and design so nothing breaks if one is dropped.
+5. Attach a `campaignId` to announcements and measure accepted, delivered, and opened per stage.
+6. Use a collapse identifier for bursts so the notification center doesn't fill up (but not for transactional ones).
+7. Triage individual reports to the cause stage within five minutes using the stage-isolation procedure.
+
+## Closing
+
+"Didn't arrive" for push is not a single malfunction — it's a set of stages that can each fail independently. Put an observation point at each stage and a vague "didn't arrive" becomes a diagnosable number: "N dropped at which stage." Clean up stale tokens, don't confuse priority and type, and measure delivery on the receiver side. Those three alone move delivery rate from guess to measurement, and the fix from prayer to procedure.
+
+Start by counting just three things on the send side: accepted, rejected, stale. The moment "sent to everyone" becomes "how many actually arrived," the resolution of your notification operations rises sharply. As an indie developer, I hope it helps anyone delivering notifications to users the same way.
