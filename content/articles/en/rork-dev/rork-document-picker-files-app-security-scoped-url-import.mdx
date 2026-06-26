@@ -1,0 +1,217 @@
+---
+title: "Import the User's Own Image From the Files App in a Rork App, Without the URL Going Stale"
+slug: "rork-document-picker-files-app-security-scoped-url-import"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-26T14:40"
+author: "Rork Lab"
+description: "Pull images from the Files app or iCloud Drive and the URL you picked goes invalid moments later. Here is how expo-document-picker, security-scoped URLs, and a reliable copy into your sandbox actually work, with running code."
+tags: ["Rork", "Expo", "iOS", "Document Picker", "File Management"]
+highlights:
+  - "Why copyToCacheDirectory flips the behavior, and the documentDirectory rescue code that survives cache eviction"
+  - "Handling startAccessingSecurityScopedResource and NSFileCoordinator correctly in Rork Max native Swift (iOS 16+)"
+  - "Concrete fixes for not-yet-downloaded iCloud files, HEIC, oversized files, and multi-selection"
+---
+
+The line I wanted to add to my wallpaper app was simple: "You can use your own images too." It came after a user wrote in asking to edit a photo they had taken and use it as a wallpaper. If the picture lives in the camera roll, `expo-image-picker` is enough. But the images people actually want are not always in Photos. A design asset parked in the cloud, a single file received over AirDrop, a folder organized inside iCloud Drive. Those live in the "Files" app, not in "Photos."
+
+So I added `expo-document-picker`, and selection worked on the first try. The problem showed up later: the imported image could not be opened the next day. The reason comes down to one fact. iOS does not hand you the real file inside the Files app. As an indie developer at Dolice, I hit these in a specific order, and this article walks through that same order: the minimal document picker, why the URL dies, copying reliably into the sandbox, and the native Swift route for Rork Max.
+
+## What the photo picker reaches, and where the file picker is needed
+
+`expo-image-picker` works against the Photos framework, meaning the camera roll and albums. The "Files" app is a different entry point that spans On My iPhone, iCloud Drive, and third-party provider extensions like Dropbox or Google Drive.
+
+The two also differ in their permission model. The photo picker copies the one item the user chose and hands it over, so your app needs no photo library permission. The document picker also grants access "only for the moment," but the way it does so is the catch. Since the target sits outside your app's sandbox, the URL has a lifespan. Save that `uri` without understanding this, and it will break on you.
+
+## The minimal expo-document-picker, and the first wall
+
+Here is the straightforward version.
+
+```tsx
+import * as DocumentPicker from 'expo-document-picker';
+
+async function pickImageFromFiles() {
+  const result = await DocumentPicker.getDocumentAsync({
+    type: ['image/jpeg', 'image/png', 'image/heic'],
+    copyToCacheDirectory: true,
+    multiple: false,
+  });
+
+  if (result.canceled) return null;
+
+  const asset = result.assets[0];
+  // asset.uri / asset.name / asset.size / asset.mimeType
+  return asset.uri;
+}
+```
+
+With `copyToCacheDirectory: true`, Expo copies the file into your app's cache and returns a `file://` URI. It displays fine. The trap is next. The cache directory (`FileSystem.cacheDirectory`) is a temporary area the OS may clear at any time, on storage pressure or during an app update. Persist that `uri` in AsyncStorage to restore "the same wallpaper next launch," and one day it simply will not read.
+
+Set `copyToCacheDirectory: false` and you skip the copy for speed, but what comes back is a security-scoped temporary URL. It is valid only inside the selection callback, and is revoked the instant you carry it elsewhere. On Android you get a `content://`, also unfit for long-term storage.
+
+## Why the imported URL disappears
+
+iOS lends temporary access to files outside your sandbox as a "security-scoped URL." The URL the document picker returns is exactly that, and the loan term is effectively "just for this operation." To hold it longer, you are meant to convert it to bookmark data (`bookmarkData`), store that, and resolve it again on each use.
+
+For image import, though, copying into your own sandbox up front is far more robust than chasing the original through a bookmark each time. If the original moves, is deleted, or leaves the cloud, your in-app copy survives. In my wallpaper apps, every imported image is duplicated under `documentDirectory`, and references point only to my own copy.
+
+## Copying into the app sandbox reliably
+
+Use `expo-file-system` to rescue the file into the persistent area (`documentDirectory`) rather than the cache, with a unique name to avoid collisions.
+
+```tsx
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
+
+const IMPORT_DIR = FileSystem.documentDirectory + 'imported/';
+
+async function ensureDir() {
+  const info = await FileSystem.getInfoAsync(IMPORT_DIR);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(IMPORT_DIR, { intermediates: true });
+  }
+}
+
+function extFromMime(mime?: string) {
+  if (mime === 'image/png') return 'png';
+  if (mime === 'image/heic') return 'heic';
+  return 'jpg';
+}
+
+export async function importImageFromFiles() {
+  const result = await DocumentPicker.getDocumentAsync({
+    type: ['image/jpeg', 'image/png', 'image/heic'],
+    copyToCacheDirectory: true, // cache first, then move to persistent storage
+    multiple: false,
+  });
+  if (result.canceled) return null;
+
+  const asset = result.assets[0];
+
+  // Size guard (e.g. 40MB). Reject huge files early
+  if (asset.size && asset.size > 40 * 1024 * 1024) {
+    throw new Error('FILE_TOO_LARGE');
+  }
+
+  await ensureDir();
+  const dest = `${IMPORT_DIR}${Date.now()}-${Math.random().toString(36).slice(2)}.${extFromMime(asset.mimeType)}`;
+
+  await FileSystem.copyAsync({ from: asset.uri, to: dest });
+
+  // From here on, reference only dest. Discard the original URI
+  return dest;
+}
+```
+
+The point is to let Expo copy once with `copyToCacheDirectory: true`, then, while that copy is still valid, run a second `copyAsync` into `documentDirectory`. Now every reference lives inside the app's persistent sandbox and reads at the same path after a relaunch or an app update. Store the relative path (`imported/xxxxx.jpg`), not the absolute one: the absolute `documentDirectory` path changes when the container UUID shifts on an app update, so putting an absolute path into AsyncStorage will break it.
+
+## Preparing for the "not yet downloaded" iCloud Drive file
+
+The image chosen in Files may sit in iCloud Drive without a local copy yet on the device. With `copyToCacheDirectory: true`, Expo usually waits for the download, but on a thin connection it feels frozen for a few seconds and users assume a crash.
+
+In practice, always wrap the import in a loading state and design the UI on the assumption that files can be large and slow.
+
+```tsx
+const [importing, setImporting] = useState(false);
+
+async function onPressImport() {
+  setImporting(true);
+  try {
+    const path = await importImageFromFiles();
+    if (path) setWallpaperSource(path);
+  } catch (e: any) {
+    if (e?.message === 'FILE_TOO_LARGE') {
+      Alert.alert('Image too large', 'Please choose an image under 40MB.');
+    } else {
+      Alert.alert('Import failed', 'Please wait a moment and try again.');
+    }
+  } finally {
+    setImporting(false);
+  }
+}
+```
+
+It is unglamorous, but with a cloud-backed file picker, "being made to wait" is part of the spec. Having a spinner and a clear error message ready from the start cuts a surprising number of low ratings.
+
+## Rork Max native code — handling the security-scoped URL correctly
+
+The Expo path covers most situations, but if you are writing a native Swift app with Rork Max, you touch the document picker directly. This is where you must explicitly open and close the "security-scoped URL" I described earlier as a concept.
+
+```swift
+import UIKit
+import UniformTypeIdentifiers
+
+final class ImageImporter: NSObject, UIDocumentPickerDelegate {
+    var onImported: ((URL) -> Void)?
+
+    func present(from vc: UIViewController) {
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: [UTType.image], asCopy: false
+        )
+        picker.delegate = self
+        picker.allowsMultipleSelection = false
+        vc.present(picker, animated: true)
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController,
+                        didPickDocumentsAt urls: [URL]) {
+        guard let src = urls.first else { return }
+
+        // 1. Open the scope. If it fails, do not touch the file
+        guard src.startAccessingSecurityScopedResource() else { return }
+        defer { src.stopAccessingSecurityScopedResource() }
+
+        // 2. Use coordinated reading for lazy iCloud loads
+        var coordError: NSError?
+        NSFileCoordinator().coordinate(
+            readingItemAt: src, options: [.withoutChanges], error: &coordError
+        ) { safeURL in
+            let dir = FileManager.default
+                .urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("imported", isDirectory: true)
+            try? FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+
+            let dest = dir.appendingPathComponent(
+                "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString).\(safeURL.pathExtension)")
+            do {
+                try FileManager.default.copyItem(at: safeURL, to: dest)
+                DispatchQueue.main.async { self.onImported?(dest) }
+            } catch {
+                // Copy failed. Prompt a retry on the UI side
+            }
+        }
+    }
+}
+```
+
+When opened with `asCopy: false`, the URL points outside the sandbox, so reading with `FileManager` without calling `startAccessingSecurityScopedResource()` fails with a permission error. Always pair `stop` with it via `defer`. And because the target may be undownloaded in iCloud, copying through `NSFileCoordinator`'s coordinated read rather than a bare `copyItem` lets you import safely while the download settles. Choosing `asCopy: true` makes the OS create the copy first, so no open/close is needed, but it adds an extra temporary copy for huge files. I prefer to choose per use case.
+
+## After import — HEIC, oversized files, multi-selection
+
+Finally, the details that bite after the import.
+
+HEIC is light and easy across Apple devices, but uploading it to another service later, or sharing with Android, can get it rejected as unsupported. If the wallpaper stays on-device, no conversion is needed; if sharing or uploading is involved, normalize to JPEG/PNG right after import to avoid accidents.
+
+```tsx
+import * as ImageManipulator from 'expo-image-manipulator';
+
+async function normalizeForUpload(uri: string) {
+  const out = await ImageManipulator.manipulateAsync(
+    uri, [{ resize: { width: 2048 } }],
+    { compress: 0.9, format: ImageManipulator.SaveFormat.JPEG }
+  );
+  return out.uri; // EXIF rotation is also resolved, so orientation is stable
+}
+```
+
+For oversized files, the first line of defense is an `asset.size` limit before import. High-resolution design exports can reach tens of megabytes, and copying then decoding unconditionally crashes on a memory warning. Treat them as resize-first.
+
+When you allow multi-selection (`multiple: true` / `allowsMultipleSelection = true`), run the copies sequentially with await and show progress per item. Showing "3 of 10" changes the felt wait far more than silently processing ten at once. Across the wallpaper apps I run at Dolice, imports always carry a progress indicator.
+
+## The next step
+
+Start by fixing the skeleton into one utility: a two-stage copy from `copyToCacheDirectory: true` into `documentDirectory`, with relative paths for storage. Get that solid and you can converge all three sources — photo library import, camera capture, and file import — onto the same "self-owned copy inside the sandbox." With a single entry point for references, the downstream logic for editing, caching, and deletion gets dramatically simpler.
+
+If this removed one early stumble for someone trying to handle "the user's own images," I am glad.
