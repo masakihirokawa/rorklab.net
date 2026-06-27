@@ -1,0 +1,215 @@
+---
+title: "リリースを重ねたら起動が静かに重くなっていたとき — Rork運用で効いたTTI計測と起動バジェットのメモ"
+slug: "rork-cold-start-regression-tti-instrumentation-startup-budget-field-notes"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-06-27T17:30"
+author: "Rork Lab"
+description: "Rorkで作ったアプリの起動が、機能を足すうちに少しずつ重くなる。平均値では気づけないコールドスタートの劣化を、起動トレースとTTIマークで計測し、CIの起動バジェットで止めるまでの運用メモです。"
+tags: ["Rork", "performance", "cold start", "TTI", "React Native"]
+highlights:
+  - "平均ではなくコールドスタートのp75と低スペック端末で起動劣化を捉える計測の置き方"
+  - "ネイティブの起動トレースとJS側のTTIマークをリリースに紐づけて回帰の出どころを特定する手順"
+  - "起動時間と初期バンドルをCIで監視し、PRで静かな劣化を止める起動バジェットの作り方"
+---
+
+リリース直後のアプリは、たいてい気持ちよく立ち上がります。問題は半年後です。機能を足し、SDKを増やし、画面を増やしていくうちに、起動が「なんとなく重い」状態へ静かに滑り落ちていきます。どのリリースが犯人かと聞かれても答えられない。一回の劣化が小さすぎて、その都度は誰も気づかないからです。
+
+私は個人開発で壁紙系のアプリを長く運用していますが、起動の重さはレビュー評価とアンインストール率にじわじわ効いてきます。AdMob による広告と解析を足したあとに「最近もっさりする」というレビューが増え、原因を一つに絞れずに数日を溶かしたことがありました。このメモは、その手の「犯人不明の起動劣化」を、感覚ではなく数字で追えるようにするための運用記録です。Rork（React Native / Expo 出力）で作ったアプリを前提にしています。
+
+## 平均値は劣化を隠す
+
+最初に捨てたほうがいい癖が、起動時間を一つの平均値で見ることです。平均は速い端末と暖まったキャッシュに引っ張られて、実際の体感より良い数字を出します。
+
+見るべきは三つに分けた起動です。
+
+<table>
+<thead>
+<tr><th>種類</th><th>定義</th><th>なぜ見るか</th></tr>
+</thead>
+<tbody>
+<tr><td>コールドスタート</td><td>プロセスが存在しない状態からの起動</td><td>新規ユーザーと再起動後の第一印象を決める。最も遅く、最も重要</td></tr>
+<tr><td>ウォームスタート</td><td>プロセスは生きていて画面を作り直す起動</td><td>SDK初期化やルート構築の重さが出る</td></tr>
+<tr><td>ホットスタート</td><td>バックグラウンドから戻るだけ</td><td>ここが遅いならリスナーやリレンダの問題</td></tr>
+</tbody>
+</table>
+
+そして平均ではなく p75 と p95 を見ます。体感のクレームは遅い側の四分の一から出ます。さらに端末を分けます。最新の iPhone だけ見ていると、実ユーザーの多くが使う数年前の Android 中位機での劣化を丸ごと見落とします。私の場合、手元の検証は必ず一番遅い実機を一台固定で持っておき、その端末でのコールドスタート p75 を基準値にしています。
+
+## 「いつ操作できるか」を計測する
+
+起動の指標としてよく出てくるのが TTI（Time To Interactive）です。スプラッシュが消えた瞬間ではなく、ユーザーが実際に最初の操作をできるようになった瞬間までの時間です。スプラッシュを長く見せれば「起動が速く見える」だけで、操作可能になるまでが遅ければ体感は改善しません。
+
+計測は二段構えにします。ネイティブのプロセス開始からの「アプリ起動トレース」と、JS 側で最初の画面が本当に使える状態になった「TTI マーク」です。
+
+ネイティブ側のトレースは、自前で正確に測るのは骨が折れるので、Firebase Performance の自動 `_app_start` トレースか、Sentry のモバイル App Start 計測に任せるのが現実的です。Rork が出力した Expo プロジェクトに後乗せできます。
+
+JS 側の TTI マークは、最初のインタラクティブな画面のマウント完了時に一度だけ記録します。`react-native-performance` を使うと `performance.now()` 起点で扱いやすくなります。
+
+```tsx
+// app/_layout.tsx など、ルートの最上位で
+import performance from 'react-native-performance';
+import { useEffect, useRef } from 'react';
+
+// モジュール評価のいちばん早い地点でマークを置く
+performance.mark('jsModuleStart');
+
+export function useReportTTI(screenName: string) {
+  const reported = useRef(false);
+
+  useEffect(() => {
+    // 最初のフレームが描画され、操作可能になった直後
+    if (reported.current) return;
+    reported.current = true;
+
+    performance.mark('firstScreenInteractive');
+    const tti = performance.measure(
+      'tti',
+      'jsModuleStart',
+      'firstScreenInteractive'
+    );
+
+    // 解析へ送る。リリースバージョンを必ず添える
+    reportMetric('tti_ms', Math.round(tti.duration), {
+      screen: screenName,
+      appVersion: APP_VERSION,
+      coldStart: wasColdStart(),
+    });
+  }, [screenName]);
+}
+```
+
+ここで肝心なのは、計測値に必ず `appVersion` を添えることです。これがないと、あとで「どのリリースから遅くなったか」を切り分けられません。起動劣化の調査は、結局この紐づけがあるかどうかで難易度が変わります。
+
+## 出どころを特定する
+
+数字がリリースに紐づくと、劣化のグラフが階段状に見えてきます。なだらかに悪化しているように見えても、実際は特定のリリースで一段上がっていることが多いです。段差が出たバージョンの差分を読みにいきます。
+
+私が実際に踏んだ犯人は、毎回ほぼ同じ顔ぶれでした。本番運用で繰り返し当たった注意点を、三つに分けて挙げます。
+
+### ルート直下の同期処理が起動を止める
+
+ルート直下でのモジュール評価時の同期処理です。`import` した瞬間に重いオブジェクトを構築するライブラリや、トップレベルで大きな JSON を `require` しているコードは、まだ何も描画していない段階で JS スレッドを止めます。次の例は、起動経路に「読み込んだだけで走る処理」を置いてしまう典型です。
+
+```ts
+// ❌ 起動時に必ず走ってしまう（画面に不要でも評価される）
+import heavyCatalog from '../assets/catalog.json'; // 数百KBを起動時に展開
+const prebuiltIndex = buildSearchIndex(heavyCatalog); // 同期で重い
+
+// ✅ 必要になった画面で、初回だけ遅延構築する
+let _index: SearchIndex | null = null;
+export async function getSearchIndex() {
+  if (_index) return _index;
+  const { default: catalog } = await import('../assets/catalog.json');
+  _index = buildSearchIndex(catalog);
+  return _index;
+}
+```
+
+### SDK初期化を起動経路に並べない
+
+SDK の初期化を起動経路に並べてしまうことです。広告、解析、クラッシュレポート、リモートコンフィグ——これらを root のマウント時にまとめて初期化すると、TTI の直前で渋滞します。クラッシュレポートだけは最初に上げる価値がありますが、AdMob の広告と多くの解析は最初の操作のあとで構いません。こうして起動経路の渋滞を回避します。
+
+```tsx
+import { InteractionManager } from 'react-native';
+
+// 最初の操作が落ち着いてから初期化を流す
+function deferNonCriticalInit() {
+  InteractionManager.runAfterInteractions(() => {
+    initAds();           // 初画面の表示に不要
+    initAnalyticsQueue(); // イベントはバッファして後送り
+    warmRemoteConfig();
+  });
+}
+```
+
+### 最初の画面に仕事を抱えさせない
+
+最初の画面で抱え込みすぎることです。タブを5つ持つアプリで、起動時に全タブ分のデータを取りにいっていたことがありました。表示しているのは1タブだけなのに、残り4タブ分のネットワークと整形処理が TTI を押し下げていた。最初の画面に本当に必要なものだけを同期で用意し、残りは画面が出てから取りにいく。当たり前のようでいて、機能を足していくと崩れやすい原則です。
+
+## Hermes と New Architecture は「切らさない」ほうの管理
+
+性能の話では「Hermes を有効にしましょう」「New Architecture に移行しましょう」という助言をよく見ます。2026 年時点の Expo / React Native では、これらはおおむね既定で有効です。つまり新しく入れるというより、設定をいじったり相性の悪い旧ライブラリを足したりして、知らないうちに既定から外していないかを点検する話になっています。
+
+ビルド設定でこれらが期待どおり効いているかは、リリース前に一度確認しておくと安心です。
+
+```jsonc
+// app.json（expo-build-properties 経由）
+{
+  "expo": {
+    "plugins": [
+      ["expo-build-properties", {
+        "android": { "newArchEnabled": true },
+        "ios": { "newArchEnabled": true }
+      }]
+    ]
+  }
+}
+```
+
+Hermes は JS をバイトコードに事前コンパイルするため、起動時のパース負荷を下げます。ここを意図せず無効化していると、コールドスタートが目に見えて重くなります。性能改善のつもりで触った設定が、実は既定の利点を外していた——という回り道を一度経験すると、この点検が習慣になります。
+
+## スプラッシュは「隠す」ためではなく「待たせる」ために使う
+
+スプラッシュスクリーンで起動を速く見せようとするのは、長期的には逆効果です。操作できない時間をスプラッシュで塗りつぶしても、TTI は縮みません。むしろ「立ち上がったのに反応しない」状態を作りがちです。
+
+正しくは、本当に操作可能になった瞬間にだけスプラッシュを下ろします。
+
+```tsx
+import * as SplashScreen from 'expo-splash-screen';
+
+SplashScreen.preventAutoHideAsync();
+
+export default function Root() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      // 初画面に必須の準備だけを待つ（全部を待たない）
+      await loadCriticalData();
+      setReady(true);
+    })();
+  }, []);
+
+  const onLayout = useCallback(async () => {
+    if (ready) await SplashScreen.hideAsync(); // 描画準備が整ってから
+  }, [ready]);
+
+  if (!ready) return null;
+  return <AppShell onLayout={onLayout} />;
+}
+```
+
+`loadCriticalData` には「最初の画面の最初の表示に要るもの」だけを入れます。ここに後回しでよい初期化を混ぜると、スプラッシュが長引き、体感が悪化します。
+
+## 起動バジェットをCIに置いて、二度と滑り落ちないようにする
+
+ここまでの計測と修正は、放っておけばまた同じ場所に戻ります。機能を足すのが開発である以上、起動は何もしなければ重くなる方向に進むからです。だから最後に、劣化を「人が気づく前に止める」仕組みを置きます。
+
+一番効いたのは、初期バンドルサイズの上限を CI で固定することでした。バンドルが膨らむと、ダウンロードと JS のロードがそのまま起動に乗ります。
+
+```js
+// scripts/check-startup-budget.js
+const fs = require('fs');
+
+const BUDGET = {
+  bundleBytes: 2.6 * 1024 * 1024, // 初期JSバンドル上限
+};
+
+const size = fs.statSync('dist/_expo/static/js/index.hbc').size;
+if (size > BUDGET.bundleBytes) {
+  console.error(
+    `起動バジェット超過: ${(size / 1024 / 1024).toFixed(2)}MB ` +
+    `> ${(BUDGET.bundleBytes / 1024 / 1024).toFixed(2)}MB`
+  );
+  process.exit(1); // PRを止める
+}
+console.log(`✅ 起動バジェット内: ${(size / 1024 / 1024).toFixed(2)}MB`);
+```
+
+可能なら、実機での TTI p75 もリリースごとに記録し、前リリースから一定以上悪化したら警告を出すようにします。閾値は厳密でなくて構いません。大事なのは、劣化が起きたその週に気づけることです。一度通り過ぎてから半年分まとめて取り戻すより、毎回少しずつ守るほうがずっと安く済みます。
+
+数字でいうと、私が運用しているアプリでは、ルート直下の同期処理と SDK 初期化を起動経路から外しただけで、固定した検証端末のコールドスタート p75 が体感できるほど縮みました。劇的な一手があったわけではなく、起動経路に置かれていた「今すぐ要らない仕事」を一つずつ後ろにずらしただけです。起動最適化の正体は、速くする魔法ではなく、起動の瞬間に何をさせないかを決める設計だと考えています。
+
+まず手元の一番遅い実機で、いまのコールドスタート p75 を一度測ってみてください。基準の数字が一つあるだけで、次のリリースが速くなったのか遅くなったのかを、感覚ではなく事実として言えるようになります。

@@ -1,0 +1,215 @@
+---
+title: "When Your App's Launch Got Quietly Slower Release After Release — Field Notes on TTI Instrumentation and a Startup Budget for Rork Apps"
+slug: "rork-cold-start-regression-tti-instrumentation-startup-budget-field-notes"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-06-27T17:30"
+author: "Rork Lab"
+description: "Rork apps tend to start fast on day one, then drift slower as you add features and SDKs. These field notes show how to catch cold-start regressions that averages hide, trace them to a release, and stop the drift with a CI startup budget."
+tags: ["Rork", "performance", "cold start", "TTI", "React Native"]
+highlights:
+  - "How to catch launch regressions using cold-start p75 on a slow device instead of a misleading average"
+  - "Tying a native app-start trace and a JS TTI mark to the release so you can find where the regression came from"
+  - "A CI startup budget that fails the PR before a quiet slowdown ships"
+---
+
+A freshly shipped app usually launches with a satisfying snap. The trouble shows up six months later. As you add features, pile on SDKs, and grow the number of screens, the launch quietly slides into "kind of sluggish." Ask which release caused it and you can't say — each individual regression is too small for anyone to notice on the day it lands.
+
+I've run a wallpaper app solo for a long time, and launch sluggishness erodes review scores and pushes up uninstalls in a slow, grinding way. After I added an ad SDK and analytics, reviews started mentioning "feels laggy lately," and I burned a few days unable to pin the cause on any single thing. These notes are the operational record of how I made that kind of mystery regression traceable with numbers instead of gut feel. They assume an app built with Rork (React Native / Expo output).
+
+## The average hides the regression
+
+The first habit to drop is looking at launch time as a single average. Averages get dragged toward fast devices and warm caches, so they report a number rosier than what people actually feel.
+
+What you want is launch split three ways.
+
+<table>
+<thead>
+<tr><th>Type</th><th>Definition</th><th>Why watch it</th></tr>
+</thead>
+<tbody>
+<tr><td>Cold start</td><td>Launch with no existing process</td><td>Sets the first impression for new users and after reboots. Slowest and most important</td></tr>
+<tr><td>Warm start</td><td>Process alive, UI rebuilt</td><td>Exposes the weight of SDK init and route construction</td></tr>
+<tr><td>Hot start</td><td>Returning from background</td><td>If slow here, suspect listeners and re-renders</td></tr>
+</tbody>
+</table>
+
+And look at p75 and p95, not the mean. The complaints about lag come from the slow quarter. Then split by device. If you only watch the newest iPhone, you'll miss regressions on the few-year-old mid-range Android that much of your real audience runs. I keep one slowest physical device fixed for testing and treat its cold-start p75 as my baseline.
+
+## Measure "when can the user act"
+
+The metric worth anchoring on is TTI (Time To Interactive): not the moment the splash disappears, but the moment the user can actually perform their first action. Showing a longer splash only makes launch *look* fast; if it still takes a while to become interactive, the felt experience hasn't improved.
+
+Measure it in two layers: a native "app start trace" from process start, and a JS-side "TTI mark" for when the first screen is genuinely usable.
+
+Measuring the native trace precisely by hand is painful, so the realistic move is to let Firebase Performance's automatic `_app_start` trace or Sentry's mobile App Start measurement handle it. You can bolt either onto the Expo project Rork generated.
+
+The JS-side TTI mark records once, when the first interactive screen finishes mounting. `react-native-performance` makes this easy to express off `performance.now()`.
+
+```tsx
+// At the very top of the root, e.g. app/_layout.tsx
+import performance from 'react-native-performance';
+import { useEffect, useRef } from 'react';
+
+// Place the mark at the earliest point of module evaluation
+performance.mark('jsModuleStart');
+
+export function useReportTTI(screenName: string) {
+  const reported = useRef(false);
+
+  useEffect(() => {
+    // Right after the first frame paints and becomes interactive
+    if (reported.current) return;
+    reported.current = true;
+
+    performance.mark('firstScreenInteractive');
+    const tti = performance.measure(
+      'tti',
+      'jsModuleStart',
+      'firstScreenInteractive'
+    );
+
+    // Send to analytics. Always attach the release version
+    reportMetric('tti_ms', Math.round(tti.duration), {
+      screen: screenName,
+      appVersion: APP_VERSION,
+      coldStart: wasColdStart(),
+    });
+  }, [screenName]);
+}
+```
+
+The crucial part is attaching `appVersion` to every sample. Without it, you can't later separate "which release got slow." Investigating launch regressions ultimately lives or dies on whether that link exists.
+
+## Find where it came from
+
+Once the numbers are tied to releases, the regression graph reveals its shape. What looks like a smooth decline is usually a staircase — one specific release stepped up. Go read the diff of the version where the step appeared.
+
+The culprits I actually hit were nearly the same cast every time. Here are the three I kept running into in production.
+
+### Synchronous work at the root stalls launch
+
+Synchronous work during module evaluation at the root. Libraries that build a heavy object the instant you `import` them, or code that `require`s a large JSON at the top level, block the JS thread before anything has rendered. The example below is the classic mistake of putting "runs just by being loaded" work on the launch path.
+
+```ts
+// ❌ Always runs at launch (evaluated even if the screen doesn't need it)
+import heavyCatalog from '../assets/catalog.json'; // unpacks hundreds of KB at boot
+const prebuiltIndex = buildSearchIndex(heavyCatalog); // synchronous and heavy
+
+// ✅ Build lazily, once, on the screen that needs it
+let _index: SearchIndex | null = null;
+export async function getSearchIndex() {
+  if (_index) return _index;
+  const { default: catalog } = await import('../assets/catalog.json');
+  _index = buildSearchIndex(catalog);
+  return _index;
+}
+```
+
+### Keep SDK init off the launch path
+
+Lining up SDK initialization on the launch path. Ads, analytics, crash reporting, remote config — initialize them all at root mount and they jam up right before TTI. Crash reporting is worth bringing up first; ads and most analytics can wait until after the first interaction.
+
+```tsx
+import { InteractionManager } from 'react-native';
+
+// Run init once the first interaction has settled
+function deferNonCriticalInit() {
+  InteractionManager.runAfterInteractions(() => {
+    initAds();            // not needed to paint the first screen
+    initAnalyticsQueue(); // buffer events and flush later
+    warmRemoteConfig();
+  });
+}
+```
+
+### Don't let the first screen carry too much
+
+The first screen carrying too much. I once had a five-tab app fetching data for every tab at launch. Only one tab was visible, yet the network and formatting for the other four were dragging TTI down. Prepare synchronously only what the first screen truly needs, and fetch the rest after it appears. Obvious in principle, easy to break as features accumulate.
+
+## Hermes and the New Architecture: manage them so you don't *lose* them
+
+Performance advice often says "enable Hermes" and "migrate to the New Architecture." On 2026-era Expo / React Native, these are largely on by default. So the task is less about adding them and more about checking that you haven't quietly turned the defaults off by tweaking config or adding an incompatible legacy library.
+
+It's reassuring to confirm once before release that they're in effect as expected.
+
+```jsonc
+// app.json (via expo-build-properties)
+{
+  "expo": {
+    "plugins": [
+      ["expo-build-properties", {
+        "android": { "newArchEnabled": true },
+        "ios": { "newArchEnabled": true }
+      }]
+    ]
+  }
+}
+```
+
+Hermes precompiles JS to bytecode, cutting parse cost at launch. Disable it unintentionally and cold start gets visibly heavier. Once you've taken the detour of "a setting I touched for performance actually removed a default benefit," this check becomes a habit.
+
+## Use the splash to make people *wait*, not to *hide* slowness
+
+Trying to make launch look fast with a splash screen backfires over time. Painting over the non-interactive window with a splash doesn't shrink TTI; if anything it manufactures the "it launched but won't respond" state.
+
+The right move is to drop the splash only at the moment the app is genuinely interactive.
+
+```tsx
+import * as SplashScreen from 'expo-splash-screen';
+
+SplashScreen.preventAutoHideAsync();
+
+export default function Root() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      // Wait only for what the first screen truly needs (not everything)
+      await loadCriticalData();
+      setReady(true);
+    })();
+  }, []);
+
+  const onLayout = useCallback(async () => {
+    if (ready) await SplashScreen.hideAsync(); // after the layout is ready
+  }, [ready]);
+
+  if (!ready) return null;
+  return <AppShell onLayout={onLayout} />;
+}
+```
+
+Put only "what the first paint of the first screen requires" into `loadCriticalData`. Mix deferrable init in here and the splash lingers, and the felt experience gets worse.
+
+## Put a startup budget in CI so it never slides again
+
+Left alone, all the measuring and fixing above returns to the same place. Since adding features *is* development, launch trends heavier whenever you do nothing. So the last step is a mechanism that stops the regression before a human notices.
+
+What worked best was fixing the initial bundle-size ceiling in CI. When the bundle swells, the download and JS load ride straight into launch.
+
+```js
+// scripts/check-startup-budget.js
+const fs = require('fs');
+
+const BUDGET = {
+  bundleBytes: 2.6 * 1024 * 1024, // initial JS bundle ceiling
+};
+
+const size = fs.statSync('dist/_expo/static/js/index.hbc').size;
+if (size > BUDGET.bundleBytes) {
+  console.error(
+    `Startup budget exceeded: ${(size / 1024 / 1024).toFixed(2)}MB ` +
+    `> ${(BUDGET.bundleBytes / 1024 / 1024).toFixed(2)}MB`
+  );
+  process.exit(1); // fail the PR
+}
+console.log(`✅ Within startup budget: ${(size / 1024 / 1024).toFixed(2)}MB`);
+```
+
+If you can, also record on-device TTI p75 per release and warn when it worsens past a margin from the previous one. The threshold doesn't need to be precise. What matters is noticing in the same week the regression happens. Defending a little every release is far cheaper than letting it slip and clawing back six months at once.
+
+In numbers: on the app I run, simply moving the root-level synchronous work and SDK init off the launch path shrank the cold-start p75 on my fixed test device by a felt amount. There was no dramatic single fix — I just pushed the "work I don't need right now" off the launch path, one item at a time. The real nature of launch optimization isn't a speed-up spell; it's deciding what *not* to make the app do at the moment of launch.
+
+Start by measuring your current cold-start p75 on the slowest device you have. With just one baseline number, you can say whether the next release got faster or slower as a fact, not a feeling.
