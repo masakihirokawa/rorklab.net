@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxがネイティブSwiftアプリを生成。iPhone・iPad・Watch・TV・Vision Pro・iMessageに対応します",
-    "NATIVE — AR/LiDARスキャン、Metalの3Dゲーム、ウィジェット、Live Activities、Core MLまで踏み込めます",
-    "FUNDING — Rorkがa16zから$2.8Mを調達。月間74.3万訪問・成長率85%と勢いがあります",
-    "PRICING — 無料で開始でき、有料プランは月額$25から利用できます",
-    "FLOW — アイデアを英語で説明すると動くコードを生成。共有リンク発行やiOS/Androidビルドに対応します",
-    "COMPARE — 従来のRorkはExpo/React Nativeでクロスプラットフォーム。用途で使い分けられます",
+    "TEST — Rork Companionアプリで、有料Apple Developerアカウント無しに実機iPhoneでテストできます",
+    "CLOUD — クラウド上のMacでコンパイルし、60fpsのライブシミュレータをタッチ入力付きで確認できます",
+    "BROWSER — Chrome・Safariだけで設計・コード・テストが完結。Xcodeは不要です",
+    "PUBLISH — 2クリックのApp Store公開で、提出まわりの煩雑さを抑えられます",
+    "MAX — Rork MaxはネイティブSwiftでiPhone・iPad・Apple Watch・Vision Proに対応します",
+    "RN — 通常のRorkはReact Native(Expo)でiOS/Androidアプリをまとめて生成します",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps across iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
-    "NATIVE — It reaches AR/LiDAR scanning, Metal 3D games, widgets, Live Activities, and on-device Core ML",
-    "FUNDING — Rork raised $2.8M from a16z, with 743K monthly visits and 85% growth",
-    "PRICING — It's free to start, with paid plans beginning at $25 per month",
-    "FLOW — Describe your idea in plain English to get working code, a shareable test link, and iOS/Android builds",
-    "COMPARE — The original Rork builds cross-platform apps on Expo/React Native; choose the right tool per goal",
+    "TEST — The Rork Companion app lets you test on a real iPhone without a paid Apple Developer account",
+    "CLOUD — Code compiles on a cloud Mac, streaming a 60fps live simulator with real touch input",
+    "BROWSER — Design, code, and test entirely in Chrome or Safari — no Xcode required",
+    "PUBLISH — Two-click App Store publishing keeps the submission process simple",
+    "MAX — Rork Max builds native Swift apps for iPhone, iPad, Apple Watch, and Vision Pro",
+    "RN — Standard Rork generates iOS and Android apps together with React Native (Expo)",
   ],
 };
 
