@@ -1,0 +1,207 @@
+---
+title: "When a User Rewinds the Clock, Today's Card Shouldn't Break — Day Boundaries and Streak Integrity in a Daily-Content App"
+slug: "rork-daily-content-day-boundary-streak-integrity-deterministic-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-27T16:00"
+updated: "2026-06-27T16:00"
+author: "Rork Lab"
+description: "Daily 'card of the day' content breaks under timezone travel and manual clock changes, showing duplicates, gaps, or lost streaks. Here is a deterministic day-key and monotonic-clock design, in real Rork (Expo) code, that keeps it solid."
+tags: ["Rork", "Expo", "Date handling", "Streaks", "Retention design"]
+highlights:
+  - "A single dayKey function that no screen bypasses, plus clear criteria for choosing local time, a fixed timezone, or server time"
+  - "Rollover at midnight that never gets lost, by recomputing on resume instead of trusting a setTimeout that the OS suspends"
+  - "Detecting a rewound device clock with a monotonic signal so traveling users never double-count or unfairly lose a streak"
+---
+
+Running a daily "card of the day" app as an indie developer, I started getting the same handful of reports after a while: "I see yesterday's image again today," and "my streak suddenly reset to zero." When I dug into the conditions, the users were either traveling abroad or had just nudged their device clock forward and back to chase a reward in some game.
+
+Daily content looks trivial — show the next item when the date changes. But the moment you trust `new Date()` directly, three sources of drift pour into that one spot: timezone travel, daylight saving, and manual clock changes. This is a design that funnels all of that into one place and makes "today" deterministic, written as code that runs in a Rork (Expo) app.
+
+## Decide "today" in exactly one place
+
+The first habit to drop is calling `new Date().getDate()` all over the UI. The "today" you compare against drifts slightly per call site, and around midnight your display and your saved state disagree.
+
+Instead, fold the current instant into a single `YYYY-MM-DD` string key (a dayKey) through one function that the whole app routes through.
+
+```ts
+// lib/dayKey.ts
+// Pick one "clock" you want content to flip on, and fix it.
+// For a Japan-facing daily app, Asia/Tokyo means users abroad
+// still see the same "today's card" as everyone at home.
+const CONTENT_TZ = "Asia/Tokyo";
+
+export function dayKeyFor(date: Date, timeZone: string = CONTENT_TZ): string {
+  // Intl gives the calendar date in that timezone, independent of device locale.
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`; // e.g. "2026-06-27"
+}
+
+export function todayKey(timeZone: string = CONTENT_TZ): string {
+  return dayKeyFor(new Date(), timeZone);
+}
+```
+
+The `en-CA` locale is deliberate: it yields `YYYY-MM-DD` natively, so string comparison doubles as date ordering. Any two dayKeys compare lexically, and `"2026-06-27" < "2026-06-28"` always holds. Content selection, streak logic, and persistence all look only at this string.
+
+## Local time, fixed timezone, or server time
+
+Which clock decides "today" depends on the app's character. For an indie app with no backend, asking a server every time is too heavy. Here is a practical split.
+
+<table>
+  <thead>
+    <tr><th>Basis</th><th>Behavior</th><th>Fits</th><th>Weakness</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Device local time</td><td>Flips at the user's local midnight</td><td>Habits, journals — the person's own day is the subject</td><td>Trusts manual clock changes verbatim</td></tr>
+    <tr><td>Fixed timezone</td><td>Always flips at one region's midnight</td><td>"Today's reading from Japan" — the publisher is the subject</td><td>Late-night users abroad feel a mismatch</td></tr>
+    <tr><td>Server time</td><td>Flips on an authoritative clock</td><td>Rewards/leaderboards where anti-abuse matters</td><td>No offline, network cost, latency</td></tr>
+  </tbody>
+</table>
+
+For the wallpaper and wellness daily apps I run, the content itself carries a sense of "the day," so I anchor on a fixed timezone (Asia/Tokyo). Readers abroad share the same "today's card," and the support thread about "different people see different art" disappeared. A pure habit tracker, by contrast, feels more natural closing on each person's local midnight. Pick one basis and commit; do not build a branch where an empty `CONTENT_TZ` silently means local. Mixed bases always break later.
+
+## Don't lose the midnight rollover
+
+If the app stays open across a date change, the screen keeps showing "yesterday's card" forever. A common fix is `setTimeout(handleMidnight, msUntilMidnight)`, but it loses events: iOS suspends background timers, and if the device sleeps through midnight it never fires.
+
+The reliable mindset is "recompute on resume," not "wait on a timer." On `AppState` returning to active, and on a light foreground interval, just check whether `todayKey()` still equals the held key.
+
+```ts
+// hooks/useDailyContent.ts
+import { useEffect, useRef, useState } from "react";
+import { AppState } from "react-native";
+import { todayKey } from "../lib/dayKey";
+
+export function useDailyContent() {
+  const [key, setKey] = useState(todayKey());
+  const keyRef = useRef(key);
+  keyRef.current = key;
+
+  useEffect(() => {
+    const check = () => {
+      const now = todayKey();
+      if (now !== keyRef.current) setKey(now); // date advanced -> swap
+    };
+
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s === "active") check(); // re-check on every resume
+    });
+    // For people who leave the screen open, a light foreground check.
+    const id = setInterval(check, 60_000);
+
+    return () => {
+      sub.remove();
+      clearInterval(id);
+    };
+  }, []);
+
+  return key; // pull content from this dayKey
+}
+```
+
+The timer is decorative; the truth lives in re-evaluating `todayKey()`. The one-minute `setInterval` is only for someone who leaves the screen open past midnight, and even if it drifts, the resume check always catches up.
+
+## Keep a rewound clock out of the streak
+
+This is the crux. If you count streaks by trusting `Date`, a user who jumps a day forward, collects a reward, and jumps back gets credited twice. And a legitimate user whose clock rewinds after travel can lose a record unfairly.
+
+The key is to run two clocks. Use the wall clock (`Date`) for the date decision, and a monotonic signal to detect rewinds. By storing the last observed wall time, you can spot the contradiction "the wall clock moved forward but cannot be trusted to have done so."
+
+```ts
+// lib/streak.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { todayKey } from "./dayKey";
+
+type StreakState = {
+  lastDayKey: string;   // last day completed
+  count: number;        // consecutive days
+  lastSeenWall: number; // last observed wall time (ms)
+};
+
+const KEY = "streak.v1";
+
+function diffInDays(a: string, b: string): number {
+  // Day difference between dayKeys. Anchor at UTC noon to erase DST edges.
+  const da = new Date(`${a}T12:00:00Z`).getTime();
+  const db = new Date(`${b}T12:00:00Z`).getTime();
+  return Math.round((db - da) / 86_400_000);
+}
+
+export async function recordToday(): Promise<StreakState> {
+  const raw = await AsyncStorage.getItem(KEY);
+  const now = Date.now();
+  const today = todayKey();
+
+  if (!raw) {
+    const fresh = { lastDayKey: today, count: 1, lastSeenWall: now };
+    await AsyncStorage.setItem(KEY, JSON.stringify(fresh));
+    return fresh;
+  }
+
+  const s: StreakState = JSON.parse(raw);
+
+  // Wall clock jumped into the past -> suspected tampering. Hold, do not add.
+  if (now < s.lastSeenWall - 60_000) {
+    s.lastSeenWall = now;
+    await AsyncStorage.setItem(KEY, JSON.stringify(s));
+    return s;
+  }
+
+  const gap = diffInDays(s.lastDayKey, today);
+
+  if (gap <= 0) {
+    // Opened multiple times the same day. No double count.
+    s.lastSeenWall = now;
+  } else if (gap === 1) {
+    s.count += 1;          // legitimate continuation from yesterday
+    s.lastDayKey = today;
+    s.lastSeenWall = now;
+  } else {
+    // Two or more days skipped. To allow one grace day, treat gap === 2 as continued.
+    s.count = 1;
+    s.lastDayKey = today;
+    s.lastSeenWall = now;
+  }
+
+  await AsyncStorage.setItem(KEY, JSON.stringify(s));
+  return s;
+}
+```
+
+Three things matter. First, the increment decision uses only the `dayKey` difference, never the fine-grained `Date` delta. Second, any number of opens within the same `dayKey` is rejected by `gap <= 0`, so double counting cannot happen structurally. Third, when the wall clock leaps far backward, that pass holds the record and skips the increment. That blocks "jump forward then back" inflation while never erasing a legitimate user's record.
+
+## Don't let travel mean "skip a day" or "arrive twice"
+
+As long as `dayKey` is generated in a fixed timezone, a user flying from Japan to Hawaii keeps Asia/Tokyo as the basis, so the boundary never wobbles. On a local-time basis, flying east shortens a day and breaks streaks easily, while flying west stretches a day so the same day arrives twice. For publisher-driven content, a fixed timezone is the simplest fix that wipes out traveler accidents.
+
+For apps that must use local time (a habit tracker where the person's life is the subject), anchoring `diffInDays` at UTC noon is what saves you. Wrapping the keys in `T12:00:00Z` prevents a one-hour edge from nudging the day count by ±1 across DST. Subtract dates naively with raw `getTime()` deltas and you will trip here every time.
+
+## Verify by moving the clock by hand
+
+This kind of logic only reveals its holes when you manipulate time on a real device. Run at least this before release.
+
+<table>
+  <thead>
+    <tr><th>Action</th><th>Expected</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Cross midnight with the app open</td><td>Today's card swaps on resume or within a minute</td></tr>
+    <tr><td>Advance the device clock a day</td><td>Content advances, but no credit right after rewinding</td></tr>
+    <tr><td>Rewind the device clock a day</td><td>Streak does not drop; it holds</td></tr>
+    <tr><td>Change timezone to abroad</td><td>On a fixed-TZ basis the boundary is unchanged</td></tr>
+    <tr><td>Open five times in one day</td><td>Streak increases by only one</td></tr>
+  </tbody>
+</table>
+
+`diffInDays` and `recordToday` are kept close to side-effect-free pure functions, so locking down the boundaries (gap of 0/1/2, wall-clock rewind) with unit tests is reassuring. Date bugs are hard to reproduce and easy to miss in review, so drawing a line with tests is especially worth it here.
+
+The whole feel of daily content rides on this one quiet detail. Start by standing up a single `dayKey` function and routing every scattered `new Date()` comparison through it. Even just removing the display drift should noticeably cut the confused messages that reach your support inbox.
