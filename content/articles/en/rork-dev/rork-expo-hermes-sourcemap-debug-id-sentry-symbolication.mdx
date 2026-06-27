@@ -1,0 +1,199 @@
+---
+title: "When your Rork app's production crashes arrive minified — wiring Hermes source maps and debug IDs into Sentry"
+slug: "rork-expo-hermes-sourcemap-debug-id-sentry-symbolication"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-28T12:00"
+updated: "2026-06-28T12:00"
+author: "Rork Lab"
+description: "Rork-generated Expo apps run on Hermes, so production crashes often arrive as index.bundle:1:284913 with no function names. Here is how to wire Hermes source maps and debug IDs into Sentry so your stack traces become readable."
+tags: ["Rork", "Expo", "Sentry", "Hermes", "Source Maps", "Crash Reporting"]
+highlights:
+  - "If you've been stuck with crashes that read index.bundle:1:284913, you'll get a crash view with real function names and line numbers today"
+  - "You'll bake the same Hermes debug ID into both the EAS Build output and its source map, so a tiny version drift never breaks symbolication again"
+  - "You'll symbolicate OTA (EAS Update) crashes too, so even a few-thousand-download production app lets you start triage within 5 minutes"
+---
+
+The first crash that reached Sentry after a release was a single line: `index.android.bundle:1:284913`. No repro steps, no screen name, nothing. The React Native (Expo) app that Rork generated for me runs on Hermes, and the production bundle is minified into one line. The crash was captured, but unreadable — the most frustrating state to be in.
+
+If you run apps as an indie developer for any length of time, the unreadable stack trace is a wall you hit at least once. Across the apps I run at Dolice, the native side is symbolicated through Crashlytics and dSYMs, but the Rork-based Expo apps work through a completely different mechanism. The keys are the Hermes **source map** and the **debug ID** that ties it to a specific build. Get those right, and the same crash view comes back with function names and original line numbers.
+
+## Why Hermes only sends you numbers
+
+Hermes does not run your JavaScript as-is. At build time it precompiles it into Hermes bytecode (`.hbc`). On top of that, the production build has Metro concatenate every module into a single file and shorten variable names. Line 42 of your `PaywallScreen.tsx` becomes "column 284913" of one enormous collapsed line.
+
+What the device sends on a crash is only that collapsed position. The lookup table that maps it back to the original file and line is the **source map** — and with Hermes you need a Hermes-specific compose step on top of the regular source map. Skip it and you fall into the trap of "uploading source maps" that never actually symbolicate.
+
+## Debug IDs guarantee "this is the same build"
+
+When symbolication breaks even though you uploaded source maps, the cause is almost always that **the bundle that crashed and the source map you uploaded came from different builds**. Tying them together by version name (like `1.8.0`) falls apart the moment you ship a hotfix.
+
+Debug IDs solve this at the root. A debug ID is a unique identifier generated per build and baked into both the bundle and its source map. Sentry matches the debug ID inside the crash against the debug ID of an uploaded source map, so it no longer depends on version names lining up. Modern `@sentry/react-native` makes this the default. Since switching from version matching to this approach myself, missed symbolication has dropped to nearly zero.
+
+## Wire the Sentry SDK into Expo correctly
+
+The first step is installing the SDK and wrapping the Metro config through Sentry. If you don't wrap Metro, the debug ID never gets injected into the bundle — so this part is non-negotiable.
+
+```bash
+# Add Sentry to the Expo project
+npx expo install @sentry/react-native
+```
+
+Add the config plugin to `app.json` (or `app.config.js`). Replace `organization` and `project` with your own Sentry values.
+
+```json
+{
+  "expo": {
+    "plugins": [
+      [
+        "@sentry/react-native/expo",
+        {
+          "organization": "your-sentry-org",
+          "project": "your-rork-app"
+        }
+      ]
+    ]
+  }
+}
+```
+
+Wrap `metro.config.js` with Sentry's helper. This is what bakes a debug ID into the production bundle.
+
+```js
+// metro.config.js
+// Wrapping with getSentryExpoConfig injects the debug ID into the
+// bundle and source map automatically at build time (no manual tagging)
+const { getSentryExpoConfig } = require('@sentry/react-native/metro');
+
+const config = getSentryExpoConfig(__dirname);
+
+module.exports = config;
+```
+
+Call `Sentry.init` at the app root. Don't hardcode `dist` and `release`; it's safer to let the SDK pick up the EAS values.
+
+```tsx
+// App.tsx (entry point)
+import * as Sentry from '@sentry/react-native';
+
+Sentry.init({
+  dsn: 'https://examplePublicKey@o0.ingest.sentry.io/0',
+  // Send in production only, so dev-build noise doesn't bury real issues
+  enabled: !__DEV__,
+  // Always run one hook that strips user-specific data before sending
+  beforeSend(event) {
+    if (event.user) delete event.user.email;
+    return event;
+  },
+});
+
+function App() {
+  // ...your app
+  return null;
+}
+
+// Wrapping with Sentry.wrap also catches exceptions thrown right at startup
+export default Sentry.wrap(App);
+```
+
+## Build automatic source-map upload into EAS Build
+
+For native builds (`eas build`), the config plugin injects a postBuild hook that uploads source maps automatically. There's exactly one condition: **the auth token has to be available as an environment variable.**
+
+Keep the token out of the repo and register it as an EAS secret.
+
+```bash
+# Register the Sentry auth token as an EAS secret
+# Give the token the project:releases and org:read scopes
+eas secret:create --scope project \
+  --name SENTRY_AUTH_TOKEN \
+  --value YOUR_SENTRY_AUTH_TOKEN \
+  --type string
+```
+
+Reference that secret in the production profile of `eas.json`.
+
+```json
+{
+  "build": {
+    "production": {
+      "env": {
+        "SENTRY_ALLOW_FAILURE": "false"
+      },
+      "ios": { "buildConfiguration": "Release" },
+      "android": { "buildType": "app-bundle" }
+    }
+  }
+}
+```
+
+Setting `SENTRY_ALLOW_FAILURE` to `false` stops any build where the source-map upload failed. That prevents the worst kind of silent miss — "the release shipped, but only the source maps never went up" — so I always make this explicit.
+
+## Don't lose OTA (EAS Update) crashes either
+
+This is where Rork apps trip people up most. The `eas build` source maps go up automatically, but **the OTA bundle you ship with `eas update` is a separate artifact.** If a crash happens after you swap UI over OTA, its debug ID won't match the store build's source map, and you're back to numbers-only stacks.
+
+The fix is to always upload the source map for that update right after `eas update`, using the artifact generated from the same commit, with the same debug ID.
+
+```bash
+# 1) Ship the OTA to the production channel
+eas update --branch production --message "paywall fix"
+
+# 2) Immediately upload the source map for that update.
+#    sentry-cli reads the debug ID and links it to the matching bundle
+npx sentry-cli sourcemaps upload \
+  --org your-sentry-org \
+  --project your-rork-app \
+  ./dist
+```
+
+Operationally, it's safest to put these two commands in a single script and never run an OTA by hand. I once lost half a day of crashes to a forgotten OTA source map, and since then I've treated "update and upload" as one inseparable set.
+
+## Verify that symbolication actually works
+
+To avoid stopping at "I think I uploaded them," throw a test exception on purpose and confirm function names come back in Sentry.
+
+```tsx
+// Verification button (press once before release, then delete it)
+import * as Sentry from '@sentry/react-native';
+
+function triggerTestCrash() {
+  // Throw a JS exception (not a native one).
+  // If the Hermes source map works, this function name shows in Sentry
+  throw new Error('Sourcemap verification - safe to ignore');
+}
+```
+
+If the Sentry issue shows `triggerTestCrash` and the original line number, you're done. If it's still numbers, that issue's debug ID couldn't be resolved. To triage the cause mechanically, this command helps.
+
+```bash
+# Explain which source map an event's debug ID resolved to (or why it didn't)
+npx sentry-cli sourcemaps explain <event-id>
+```
+
+`explain` tells you concretely whether "no source map exists for that debug ID" or "the map was found but doesn't contain the target line." When something breaks, I run this first, before suspecting my config. Editing `metro.config.js` on a hunch only burns more time.
+
+## Pitfalls and the rules I stick to
+
+A few things that tripped me up in production, with their fixes.
+
+First, projects with a custom `metro.config.js` that forgot to route it through `getSentryExpoConfig`. This happens easily when you've edited the initial code Rork generated — the bundle gets no debug ID, and nothing you upload will symbolicate. Always go through Sentry's wrapper.
+
+Second, Android native crashes are a separate track. The source maps in this article are for JS (Hermes) exceptions; if you crash on the Java/Kotlin side, you need to upload R8's `mapping.txt` separately. After an AdMob SDK update I once had native-side crashes, and re-uploading JS source maps didn't help — I took the long way around triage. Decide which layer crashed first; that's the shortcut.
+
+Third, if source-map upload starts failing quietly across releases and you've left `SENTRY_ALLOW_FAILURE` at `true`, you'll never notice. In the production profile I make it `false` and lean toward failing the build.
+
+As operating rules, every release I check three things: (1) Metro is always wrapped by Sentry, (2) `eas update` and the source-map upload are bundled into one script, and (3) I confirm symbolication once with a test exception before release. They're unglamorous, but having crashes be readable the instant they land is the single biggest factor in how fast I can respond to incidents as an indie developer.
+
+## The three steps I run before every release
+
+Here is the exact order I follow each release, in a form you can reproduce.
+
+1. Confirm `metro.config.js` routes through `getSentryExpoConfig` (if it doesn't, no debug ID is injected and everything downstream is wasted).
+2. Throw a test exception once, confirm the function name resolves in Sentry, then delete the verification button.
+3. After `eas update`, upload the source map in the same script (I've banned hand-run OTAs).
+
+After adding these three steps, the time from a production crash landing to me actually reading it shrank from tens of minutes to under five. During staged rollouts I also watch Crash-free users at 99.7% or higher and start narrowing causes from the symbolicated stacks. Only once readable stacks and a monitoring threshold are both in place does incident response shift from guessing to observing.
+
+As a next step, just check whether your current Rork project's `metro.config.js` actually routes through `getSentryExpoConfig`. Most "unreadable crashes" collapse down to that one missing line.
