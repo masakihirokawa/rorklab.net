@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "BUILD — RorkはReact Native(Expo)でネイティブのiOS/Androidアプリを生成。平易な説明からデプロイ可能な実コードが出力されます",
-    "MAX — Rork Maxはnative Swiftを出力し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "MAX — 本物のSwift生成で性能とApp Store審査の通しやすさを両立。現状ほぼ唯一の選択肢です",
-    "DEPLOY — テスト用の共有リンク作成とiOS/Android双方の自動ビルドに対応し、別々の開発工程を省けます",
-    "PRICE — 無料で始められ、有料プランは月$25から。個人開発で試作から配布まで無理なく回せます",
-    "FOCUS — BoltやLovableのようなWeb中心ツールと違い、Rorkはモバイルに特化しています",
+    "MAX — Rork MaxがネイティブSwiftアプリを生成。iPhone・iPad・Watch・TV・Vision Pro・iMessageに対応します",
+    "NATIVE — AR/LiDARスキャン、Metalの3Dゲーム、ウィジェット、Live Activities、Core MLまで踏み込めます",
+    "FUNDING — Rorkがa16zから$2.8Mを調達。月間74.3万訪問・成長率85%と勢いがあります",
+    "PRICING — 無料で開始でき、有料プランは月額$25から利用できます",
+    "FLOW — アイデアを英語で説明すると動くコードを生成。共有リンク発行やiOS/Androidビルドに対応します",
+    "COMPARE — 従来のRorkはExpo/React Nativeでクロスプラットフォーム。用途で使い分けられます",
   ],
   en: [
-    "BUILD — Rork generates native iOS/Android apps with React Native (Expo) from a plain-English description into deployable code",
-    "MAX — Rork Max outputs native Swift, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "MAX — Real Swift output balances performance and App Store eligibility — currently the only tool doing this",
-    "DEPLOY — Shareable test links and automatic iOS/Android builds remove the need for separate build pipelines",
-    "PRICE — Free to start, with paid plans from $25/month — practical for solo devs from prototype to release",
-    "FOCUS — Unlike web-first tools like Bolt or Lovable, Rork specializes in mobile apps",
+    "MAX — Rork Max generates native Swift apps across iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
+    "NATIVE — It reaches AR/LiDAR scanning, Metal 3D games, widgets, Live Activities, and on-device Core ML",
+    "FUNDING — Rork raised $2.8M from a16z, with 743K monthly visits and 85% growth",
+    "PRICING — It's free to start, with paid plans beginning at $25 per month",
+    "FLOW — Describe your idea in plain English to get working code, a shareable test link, and iOS/Android builds",
+    "COMPARE — The original Rork builds cross-platform apps on Expo/React Native; choose the right tool per goal",
   ],
 };
 
