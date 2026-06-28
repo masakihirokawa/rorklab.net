@@ -3,12 +3,16 @@ title: "Rork × RevenueCat + Stripe Web Integration: Managing iOS, Android & Web
 slug: "rork-revenuecat-stripe-web-unified-subscription-backend-guide"
 category: "rork-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-04-15T06:00"
-updated: "2026-04-15T06:00"
+updated: "2026-06-28T06:00"
 author: "Rork Lab"
 description: "A complete implementation guide for unifying iOS StoreKit, Android Google Play Billing, and Stripe Web payments under RevenueCat for Rork apps. Covers cross-platform entitlement sync, common pitfalls, and production deployment."
 tags: ["RevenueCat", "Stripe", "StoreKit", "Google Play Billing", "subscription", "cross-platform", "billing", "backend"]
+highlights:
+  - "Idempotent Stripe webhooks via KV so duplicate deliveries never extend an entitlement by mistake"
+  - "A Cron Triggers reconciliation job that treats Stripe as the source of truth to catch missed webhooks"
+  - "A grace-period design that separates past_due from real cancellations so you do not lock out good users"
 
 ---
 
@@ -91,7 +95,7 @@ export function useEntitlements() {
     Purchases.getCustomerInfo()
       .then((info) => {
         setCustomerInfo(info);
-        setIsPro(info.entitlements.active['pro'] \!== undefined);
+        setIsPro(info.entitlements.active['pro'] !== undefined);
       })
       .catch((error) => {
         // Fail closed — never grant access on error
@@ -103,7 +107,7 @@ export function useEntitlements() {
     // Subscribe to real-time entitlement updates
     const listener = Purchases.addCustomerInfoUpdateListener((info) => {
       setCustomerInfo(info);
-      setIsPro(info.entitlements.active['pro'] \!== undefined);
+      setIsPro(info.entitlements.active['pro'] !== undefined);
     });
 
     return () => listener.remove();
@@ -147,7 +151,7 @@ async function createStripeCustomer(appUserId: string) {
     body: JSON.stringify({ appUserId }),
   });
 
-  if (\!response.ok) {
+  if (!response.ok) {
     throw new Error(`Failed to create Stripe customer: ${response.status}`);
   }
 
@@ -213,7 +217,7 @@ async function handleCheckoutCompleted(
   env: Env
 ) {
   const appUserId = session.metadata?.appUserId;
-  if (\!appUserId) {
+  if (!appUserId) {
     console.error('Missing appUserId in session metadata:', session.id);
     return;
   }
@@ -252,7 +256,7 @@ async function grantRevenueCatEntitlement(
     }),
   });
 
-  if (\!response.ok) {
+  if (!response.ok) {
     const body = await response.text();
     throw new Error(`RevenueCat grant failed: ${response.status} - ${body}`);
   }
@@ -280,7 +284,7 @@ The Checkout session creation must include `appUserId` in both the session and s
 app.post('/api/create-checkout', async (c) => {
   const { appUserId, priceId, successUrl, cancelUrl } = await c.req.json();
 
-  if (\!appUserId) {
+  if (!appUserId) {
     return c.json({ error: 'appUserId is required' }, 400);
   }
 
@@ -330,7 +334,7 @@ async function handleSubscriptionUpdated(
   env: Env
 ) {
   const appUserId = subscription.metadata?.appUserId;
-  if (\!appUserId) {
+  if (!appUserId) {
     console.error('Missing appUserId in subscription metadata:', subscription.id);
     return;
   }
@@ -361,7 +365,7 @@ async function handleSubscriptionDeleted(
   env: Env
 ) {
   const appUserId = subscription.metadata?.appUserId;
-  if (\!appUserId) return;
+  if (!appUserId) return;
 
   // Revoke the promotional entitlement in RevenueCat
   const url = `https://api.revenuecat.com/v1/subscribers/${appUserId}/entitlements/pro/promotional`;
@@ -386,7 +390,7 @@ export function useProAccess() {
   const { user } = useAuth();
 
   useEffect(() => {
-    if (\!user) {
+    if (!user) {
       setHasAccess(false);
       setIsLoading(false);
       return;
@@ -427,15 +431,15 @@ export function useProAccess() {
 // Backend: /api/check-subscription
 app.get('/api/check-subscription', async (c) => {
   const appUserId = c.req.header('x-app-user-id');
-  if (\!appUserId) return c.json({ isActive: false }, 401);
+  if (!appUserId) return c.json({ isActive: false }, 401);
 
   const cached = await c.env.KV.get(`subscription:${appUserId}`);
-  if (\!cached) return c.json({ isActive: false });
+  if (!cached) return c.json({ isActive: false });
 
   const data = JSON.parse(cached);
   const isActive =
     data.status === 'active' &&
-    (\!data.expiresAt || new Date(data.expiresAt) > new Date());
+    (!data.expiresAt || new Date(data.expiresAt) > new Date());
 
   return c.json({ isActive });
 });
@@ -485,6 +489,130 @@ Operations:
 - Set up Stripe Webhook failure alerts
 - Verify monthly revenue summary in RevenueCat matches Stripe reports
 - Estimate Cloudflare KV storage cost (approx 500 bytes/entry × user count)
+
+## Webhook Idempotency: Preventing Double Grants
+
+Everything up to here is the part you can plan on paper. What follows is what I only learned by running this in production. When I operated the Stripe membership on Dolice Labs, the thing that made my stomach drop was duplicate webhook delivery.
+
+Stripe delivers with at-least-once semantics, which means the same `checkout.session.completed` can arrive twice or three times — for instance, when a brief network hiccup keeps your 200 response from reaching Stripe.
+
+Call `grantRevenueCatEntitlement` twice and the promotional entitlement stacks, quietly extending the expiry. I missed this at first and ended up creating a test user who "still had two extra months of access after canceling."
+
+The fix is simple: **record processed event IDs in KV and return early for anything you have already handled.**
+
+```typescript
+// Idempotency guard: each event.id is processed only once
+async function alreadyProcessed(eventId: string, env: Env): Promise<boolean> {
+  const key = `evt:${eventId}`;
+  const seen = await env.KV.get(key);
+  if (seen) return true;
+
+  // Keep for 30 days — comfortably longer than Stripe's retry window
+  await env.KV.put(key, '1', { expirationTtl: 60 * 60 * 24 * 30 });
+  return false;
+}
+```
+
+Run the guard at the very top of the handler, right after signature verification.
+
+```typescript
+// Insert right after signature verification
+if (await alreadyProcessed(event.id, c.env)) {
+  // Already handled — return 200 to stop retries
+  return c.json({ received: true, deduped: true }, 200);
+}
+```
+
+One caveat: there is a tiny window between `KV.get` and `KV.put`, so two truly simultaneous deliveries can both slip through. It never mattered at my scale, but if you process dozens of payments per second, also make the grant itself idempotent. RevenueCat promotional entitlements granted with an explicit `expires_date` are overwritten at that timestamp, so a duplicate becomes a re-set to the same expiry rather than an extension. Pass an explicit `expires_date` instead of `duration` whenever you can.
+
+## Reconciliation: Rescuing the Webhooks You Missed
+
+Webhooks are convenient, but you cannot trust them 100%. A transient Stripe outage, the few dozen seconds during your own deploy, the minutes right after you rotate a signing secret — delivery will drop at some point. I once missed renewal events that arrived in the minutes right after I swapped a signing secret, and a handful of users lost access.
+
+You cannot detect that kind of gap if you rely on webhooks alone. So run a **daily job that treats Stripe as the source of truth and reconciles it against KV**, using Cloudflare Workers Cron Triggers.
+
+```typescript
+// src/cron/reconcile.ts
+// Set [triggers] crons = ["0 18 * * *"] in wrangler.toml (around 03:00 JST)
+export async function reconcileSubscriptions(env: Env) {
+  const stripe = new Stripe(env.STRIPE_SECRET_KEY);
+  let processed = 0;
+  let repaired = 0;
+
+  // Pull active subscriptions from Stripe and compare against KV
+  for await (const sub of stripe.subscriptions.list({
+    status: 'active',
+    limit: 100,
+    expand: ['data.customer'],
+  })) {
+    const appUserId = sub.metadata?.appUserId;
+    if (!appUserId) continue;
+    processed++;
+
+    const expiresAt = new Date(sub.current_period_end * 1000).toISOString();
+    const cached = await env.KV.get(`subscription:${appUserId}`);
+    const parsed = cached ? JSON.parse(cached) : null;
+
+    // If KV is missing or the status/expiry has drifted, repair using Stripe as truth
+    const drift = !parsed || parsed.status !== 'active' || parsed.expiresAt !== expiresAt;
+    if (drift) {
+      await grantRevenueCatEntitlement(appUserId, 'pro', expiresAt, env);
+      await env.KV.put(
+        `subscription:${appUserId}`,
+        JSON.stringify({ status: 'active', source: 'stripe', expiresAt }),
+        { expirationTtl: 60 * 60 * 24 * 400 }
+      );
+      repaired++;
+    }
+  }
+
+  console.log(`reconcile done: processed=${processed} repaired=${repaired}`);
+}
+```
+
+On my small service this job repaired maybe one or two records a week, if that. But a single paying user with expired access is a serious dent in trust. Webhook as the primary path, reconciliation as the safety net — that two-layer setup is what lets you sleep at night.
+
+## Handling the Payment Grace Period
+
+A surprisingly common blind spot is what happens right after a payment fails. Expired cards and insufficient funds are routine. Revoke access instantly and you lock out well-meaning users who fully intended to keep their subscription once they updated their card.
+
+Stripe moves the subscription into a `past_due` state and retries the charge over several days according to your Smart Retries schedule. The standard play during `past_due` is to **keep access while nudging the user to update payment.**
+
+```typescript
+async function handleSubscriptionUpdated(
+  subscription: Stripe.Subscription,
+  env: Env
+) {
+  const appUserId = subscription.metadata?.appUserId;
+  if (!appUserId) return;
+
+  const status = subscription.status;
+  // Treat past_due as "in grace" and keep access, alongside active / trialing
+  const inGrace = status === 'past_due';
+  const isEntitled = ['active', 'trialing'].includes(status) || inGrace;
+
+  if (isEntitled) {
+    // Extend access to the end of the current billing period
+    const expiresAt = new Date(subscription.current_period_end * 1000).toISOString();
+    await grantRevenueCatEntitlement(appUserId, 'pro', expiresAt, env);
+    await env.KV.put(
+      `subscription:${appUserId}`,
+      JSON.stringify({ status, source: 'stripe', expiresAt, grace: inGrace }),
+      { expirationTtl: 60 * 60 * 24 * 400 }
+    );
+  } else {
+    // canceled / unpaid: let it expire naturally rather than revoking instantly
+    await env.KV.put(
+      `subscription:${appUserId}`,
+      JSON.stringify({ status, source: 'stripe' })
+    );
+  }
+}
+```
+
+Google Play has the same notion of a grace period and account hold (On-hold), which RevenueCat surfaces as `billing_issue` events. The names differ by platform, but the principle is identical: **distinguish a temporary payment failure from a clear intent to cancel.** Keep access for the former; withdraw it promptly for the latter.
+
+On the app side, it is kind to quietly let the user know they are in grace. I limited myself to a single understated banner — "Please review your payment method" — and applied no feature restrictions. It is guidance, not a lockout. That small touch noticeably improved the rate at which users recovered from a failed payment.
 
 ## The Core Design Principle
 
