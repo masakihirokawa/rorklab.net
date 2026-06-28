@@ -1,0 +1,242 @@
+---
+title: "リワード広告の報酬を、端末からの合図だけで配らない — Rork(Expo)アプリのSSV検証をWorkerで組む"
+slug: "rork-admob-rewarded-ssv-cloudflare-worker-signature-verification"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-28T15:00"
+updated: "2026-06-28T15:00"
+author: "Rork Lab"
+description: "リワード広告の「視聴完了」を端末側のコールバックだけで信じると、報酬の二重付与やなりすましが起こります。AdMobのサーバーサイド検証(SSV)コールバックをCloudflare Workerで署名検証し、transaction_idで冪等化して報酬を安全に配るまでの実装をまとめます。"
+tags: ["AdMob", "Rewarded", "SSV", "Cloudflare Workers", "個人開発", "Rork", "収益化"]
+highlights:
+  - "AdMobの公開鍵を24時間以内キャッシュで取得し、署名対象のクエリ文字列を取り違えずにECDSAで検証するWorkerの完全コード"
+  - "transaction_idをKVで冪等キーにして、リトライ5回でも報酬を一度しか配らない二重付与防止の設計"
+  - "custom_dataにユーザーIDを載せて端末と無関係に報酬を確定する、不正視聴に強い報酬確定フロー"
+---
+
+私自身、壁紙アプリと癒し系アプリをいくつか個人開発で運用していて、リワード広告は「広告を見てくれた人にだけ、もう一歩だけ良い体験を返す」ための大事な仕組みになっています。ある時、解析ログを眺めていて、特定のユーザーだけ報酬付与の回数が視聴回数より明らかに多いことに気づきました。端末側の `onUserEarnedReward` をそのまま信じて報酬を配っていたので、改造されたクライアントから同じ合図を何度も送られていたのです。
+
+リワード広告の報酬は、端末からの「見終わりました」という合図だけで配ってはいけません。そこを守ってくれるのが、AdMobのサーバーサイド検証(SSV)です。ここからは、Rorkで生成したExpoアプリにSSVを組み込み、検証用のエンドポイントをCloudflare Workerで実装するところまでを、実際に運用しているコードに近い形でたどっていきます。
+
+## 端末からの合図を信じるとどこが破れるのか
+
+クライアント側のコールバックは、便利ですが信頼境界の外にあります。改造アプリ、プロキシによるリプレイ、エミュレータからの連打。どれも端末の中で完結する処理なので、こちらからは真偽を区別できません。報酬がアプリ内通貨やサブスク日数のように「価値のあるもの」だと、ここが直接の収益漏れになります。
+
+SSVは、この合図をGoogleのサーバー経由に置き換えます。ユーザーが広告を最後まで見ると、AdMobのサーバーがこちらの指定したURLに対して署名付きのコールバックを送ってきます。署名はGoogleの秘密鍵で作られているので、こちらは対応する公開鍵で検証するだけで「これは本当にAdMobから来た、改ざんされていない通知だ」と確認できます。端末は一切信じません。
+
+<table>
+<thead>
+<tr><th>観点</th><th>端末側コールバックのみ</th><th>SSV併用</th></tr>
+</thead>
+<tbody>
+<tr><td>なりすまし</td><td>区別できない</td><td>署名検証で弾ける</td></tr>
+<tr><td>リプレイ(連打)</td><td>そのまま通る</td><td>transaction_idで冪等化</td></tr>
+<tr><td>報酬確定の場所</td><td>端末(信頼境界外)</td><td>自前サーバー(境界内)</td></tr>
+<tr><td>オフライン時</td><td>即時付与できる</td><td>サーバー到達後に確定</td></tr>
+</tbody>
+</table>
+
+ここで大切なのは、SSVは端末側コールバックを置き換えるのではなく、報酬の「確定」だけをサーバーに移す、という線引きです。UIの「報酬が付きました」という即時フィードバックは端末側で出してよいのですが、残高を本当に増やすのはWorkerが署名検証を終えた後にします。
+
+## 端末側 — 報酬を誰に渡すかをSSVに教える
+
+まず端末側で、SSVコールバックに自分のユーザーIDを載せます。`react-native-google-mobile-ads` では、広告リクエスト時に `serverSideVerificationOptions` を渡します。`userId` と `customData` が、後でコールバックの `custom_data` パラメータとして戻ってきます。
+
+```tsx
+import { RewardedAd, RewardedAdEventType, TestIds } from 'react-native-google-mobile-ads';
+
+const adUnitId = __DEV__ ? TestIds.REWARDED : 'ca-app-pub-xxxxxxxx/yyyyyyyy';
+
+export function loadRewardedAd(userId: string, purpose: string) {
+  const rewarded = RewardedAd.createForAdRequest(adUnitId, {
+    serverSideVerificationOptions: {
+      // SSVコールバックの custom_data に入って戻ってくる
+      userId,
+      customData: JSON.stringify({ purpose, ts: Date.now() }),
+    },
+  });
+
+  rewarded.addAdEventListener(RewardedAdEventType.LOADED, () => rewarded.show());
+
+  // 端末側の合図は「UIの即時演出」だけに使う。残高は触らない
+  rewarded.addAdEventListener(RewardedAdEventType.EARNED_REWARD, () => {
+    showOptimisticRewardUI(); // 「付与処理中…」の表示にとどめる
+  });
+
+  rewarded.load();
+}
+```
+
+`customData` に時刻や目的を載せておくと、後でサーバー側のログと突き合わせる時に役立ちます。ここで端末側の `EARNED_REWARD` に残高更新を書かないのがポイントです。書いてしまうと、せっかくSSVを入れても元の穴がそのまま残ります。
+
+## コールバックURLの形を理解する
+
+AdMobの管理画面で、リワード広告ユニットにSSVコールバックURLを設定します（例: `https://api.example.com/admob/ssv`）。ユーザーが視聴を完了すると、AdMobはこのURLにクエリ文字列付きでGETを送ってきます。主なパラメータは次の通りです。
+
+<table>
+<thead>
+<tr><th>パラメータ</th><th>意味</th></tr>
+</thead>
+<tbody>
+<tr><td>ad_network / ad_unit</td><td>広告ネットワークとユニットの識別子</td></tr>
+<tr><td>reward_amount / reward_item</td><td>付与する報酬の量と種類</td></tr>
+<tr><td>custom_data</td><td>端末側で渡した文字列(ここにユーザーIDが入る)</td></tr>
+<tr><td>timestamp</td><td>コールバック生成時刻(ミリ秒)</td></tr>
+<tr><td>transaction_id</td><td>視聴ごとに一意なID(冪等キーに使う)</td></tr>
+<tr><td>signature / key_id</td><td>署名と、検証に使う鍵のID</td></tr>
+</tbody>
+</table>
+
+検証で最も間違えやすいのが、署名対象の範囲です。`signature` と `key_id` は必ずクエリ文字列の末尾2つに、この順で並びます。署名の対象になるのは、`&signature=` の直前までの生のクエリ文字列です。ここをURLデコードしたり並べ替えたりすると、署名が一致しなくなります。届いたURLの文字列をそのまま切り取って使うのが鉄則です。
+
+## Worker — 公開鍵の取得とキャッシュ
+
+検証にはGoogleの公開鍵が要ります。鍵サーバーは `https://www.gstatic.com/admob/reward/verifier-keys.json` です。鍵は不定期にローテーションされるので、キャッシュは24時間を超えてはいけません。Cloudflare WorkersのCache APIを使い、TTLを丸一日に収めて取得します。
+
+```ts
+const KEY_SERVER = 'https://www.gstatic.com/admob/reward/verifier-keys.json';
+
+interface VerifierKey { keyId: number; pem: string; base64: string; }
+
+async function fetchVerifierKeys(): Promise<Map<number, string>> {
+  const cache = caches.default;
+  const cacheKey = new Request(KEY_SERVER);
+  let res = await cache.match(cacheKey);
+
+  if (!res) {
+    res = await fetch(KEY_SERVER);
+    // 鍵サーバーのレスポンスを最大23時間だけ保持(24h上限に余裕を持たせる)
+    const cached = new Response(res.body, res);
+    cached.headers.set('Cache-Control', 'max-age=82800');
+    await cache.put(cacheKey, cached.clone());
+    res = cached;
+  }
+
+  const data = await res.json<{ keys: VerifierKey[] }>();
+  const map = new Map<number, string>();
+  for (const k of data.keys) map.set(k.keyId, k.pem);
+  return map;
+}
+```
+
+`keyId` でPEM形式の公開鍵を引けるようにしておきます。コールバックの `key_id` と突き合わせて、対応する鍵だけを使って検証します。鍵が見つからない場合は、ローテーション直後でキャッシュが古い可能性があるので、キャッシュを無視して取り直す経路も用意しておくと堅くなります。
+
+## Worker — 署名検証の本体
+
+署名はECDSA(P-256)＋SHA-256で、ASN.1 DER形式をbase64urlでエンコードしたものです。ここが実装で一番つまずく所です。WebCryptoの `subtle.verify` は生の `r||s` 形式を期待するため、DER署名をそのまま渡すと失敗します。Cloudflare Workersでは `nodejs_compat` を有効にすると `node:crypto` の `verify` が使え、これはPEM鍵とDER署名をそのまま受け取ってくれるので、変換を自分で書かずに済みます。
+
+`wrangler.toml` に互換フラグを入れます。
+
+```toml
+compatibility_flags = ["nodejs_compat"]
+```
+
+検証本体です。生のクエリ文字列から署名対象を切り出すところに注意してください。
+
+```ts
+import { verify as nodeVerify } from 'node:crypto';
+
+function extractSignedContent(rawQuery: string) {
+  // rawQuery は "?" を除いた生のクエリ文字列
+  const sigMarker = '&signature=';
+  const idx = rawQuery.indexOf(sigMarker);
+  if (idx === -1) return null;
+
+  const signedContent = rawQuery.slice(0, idx); // 署名対象(デコード禁止)
+  const params = new URLSearchParams(rawQuery.slice(idx + 1));
+  const signatureB64url = rawQuery.slice(idx + sigMarker.length).split('&')[0];
+  const keyId = Number(params.get('key_id'));
+  return { signedContent, signatureB64url, keyId };
+}
+
+function b64urlToBuffer(s: string): Buffer {
+  const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(b64, 'base64');
+}
+
+async function verifyCallback(rawQuery: string): Promise<boolean> {
+  const parsed = extractSignedContent(rawQuery);
+  if (!parsed) return false;
+
+  const keys = await fetchVerifierKeys();
+  const pem = keys.get(parsed.keyId);
+  if (!pem) return false; // 未知のkey_id。取り直し経路へ回してもよい
+
+  const signature = b64urlToBuffer(parsed.signatureB64url);
+  return nodeVerify(
+    'sha256',
+    Buffer.from(parsed.signedContent, 'utf8'),
+    pem,
+    signature,
+  );
+}
+```
+
+ここで外してはいけない点を三つに整理します。
+
+1. `signedContent` は届いた生のクエリ文字列をデコードせずに使います。
+2. 署名はbase64urlなので、`+` と `/` へ戻してからバイト列にデコードします。
+3. 検証アルゴリズムはSHA-256です。鍵は `key_id` に対応するものだけを使います。
+
+## Worker — 鮮度チェックと二重付与の防止
+
+署名が正しくても、それだけでは足りません。古いコールバックの使い回し(リプレイ)を防ぐために、`timestamp` の鮮度を見ます。そして同じ視聴に対する再送やリトライで報酬が増えないよう、`transaction_id` を冪等キーにしてKVで一度きりに固定します。
+
+AdMobは到達しなかった場合に最大5回・1秒間隔で再送するため、冪等化は必須です。これでリトライ由来の二重付与を確実に回避できます。
+
+```ts
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    const rawQuery = url.search.startsWith('?') ? url.search.slice(1) : url.search;
+    const params = new URLSearchParams(rawQuery);
+
+    // 1) 署名検証
+    if (!(await verifyCallback(rawQuery))) {
+      return new Response('invalid signature', { status: 403 });
+    }
+
+    // 2) 鮮度チェック(5分より古いコールバックは拒否)
+    const ts = Number(params.get('timestamp'));
+    if (!ts || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
+      return new Response('stale', { status: 400 });
+    }
+
+    // 3) transaction_id で冪等化
+    const txId = params.get('transaction_id') ?? '';
+    const dedupeKey = `ssv:tx:${txId}`;
+    if (await env.REWARDS.get(dedupeKey)) {
+      return new Response('OK', { status: 200 }); // 既処理。200で再送を止める
+    }
+
+    // 4) 報酬確定(端末ではなくここで残高を増やす)
+    const customData = JSON.parse(params.get('custom_data') ?? '{}');
+    const userId = customData.userId ?? params.get('user_id');
+    const amount = Number(params.get('reward_amount') ?? '0');
+    await grantReward(env, userId, amount, txId);
+
+    // 5) 90日間ぶんの冪等キーを残す
+    await env.REWARDS.put(dedupeKey, '1', { expirationTtl: 60 * 60 * 24 * 90 });
+
+    // Googleは200を期待する。それ以外だと再送が続く
+    return new Response('OK', { status: 200 });
+  },
+};
+```
+
+`grantReward` の中で残高の加算自体も「既にこの `txId` を反映済みでないか」を確認できると、KVの結果整合性による取りこぼしまで塞げます。私は残高の更新を、ユーザーごとの行に対する条件付き書き込みにして、`txId` を適用済みリストに含めてから加算するようにしています。KVが一瞬遅れても、二回目の到達で同じ `txId` が既に入っていれば加算をスキップできます。
+
+レスポンスは必ず200を返します。検証に失敗した時だけ4xxを返しますが、その場合Googleは再送してくるので、403が続くようなら署名対象の切り出しを真っ先に疑ってください。経験上、ここでの不一致のほとんどはクエリ文字列をどこかでデコードしてしまっていることが原因でした。
+
+## 端末側の体験を壊さないために
+
+サーバーで報酬を確定する設計にすると、端末側は「付与処理中」の状態を一瞬挟むことになります。多くの場合コールバックは数秒以内に届くので、端末は確定をポーリングするか、軽いプッシュやリアルタイム購読で残高更新を受け取ります。私は残高を単一の真実の源として扱い、SSV確定後にその値を引き直すようにしています。端末側で先に増やして後で辻褄を合わせる作りは、結局あの「視聴回数より多い付与」を生む温床になりやすいからです。本番運用では、残高を増やす責任を端末から外し、Workerの確定後にだけ反映する設計を強く推奨します。
+
+万一コールバックが届かなかった時のために、視聴の事実は端末側にも記録しておき、一定時間内に確定が来なければサポート問い合わせで手当てできる導線を用意しておくと安心です。報酬が絡む機能では、静かに失敗して残高だけが食い違う状態が一番こわいので、確定の有無がログから追えることを最優先にしています。
+
+## まとめ — 次の一手
+
+リワード広告の報酬は、端末からの合図ではなくGoogleの署名で確定させる。これがSSVの肝です。今日の実装で次の三点が手に入りました。署名対象を取り違えないWorkerの検証、`transaction_id` による二重付与の防止、そしてユーザーIDを `custom_data` で運ぶ確定フロー。
+
+最初の一歩として、まずは本番の残高更新を端末側から外し、Workerのログに署名検証の成否と `txId` を吐くところから始めてみてください。数日ぶんのログを眺めるだけで、自分のアプリにどれだけ怪しい合図が来ていたかが見えてきます。同じように報酬機能を守りたい方の役に立てば幸いです。

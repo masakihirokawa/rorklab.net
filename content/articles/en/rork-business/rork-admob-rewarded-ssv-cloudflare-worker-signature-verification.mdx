@@ -1,0 +1,238 @@
+---
+title: "Don't Pay Out a Rewarded Ad on the Client's Word Alone — SSV Verification for a Rork (Expo) App on a Worker"
+slug: "rork-admob-rewarded-ssv-cloudflare-worker-signature-verification"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-06-28T15:00"
+updated: "2026-06-28T15:00"
+author: "Rork Lab"
+description: "Trusting the client-side 'reward earned' callback alone invites double-grants and spoofing. Here is how to wire AdMob server-side verification (SSV) into a Rork-generated Expo app, verify the signed callback on a Cloudflare Worker, and make payouts idempotent with transaction_id."
+tags: ["AdMob", "Rewarded", "SSV", "Cloudflare Workers", "Indie Dev", "Rork", "Monetization"]
+highlights:
+  - "A complete Worker that fetches AdMob's public keys with a sub-24h cache and verifies the signature with ECDSA without slicing the signed query string wrong"
+  - "An idempotency design that uses transaction_id as a KV key so a reward is granted exactly once even across Google's five retries"
+  - "A payout flow that carries the user ID in custom_data and finalizes rewards independent of the device, resistant to spoofed views"
+---
+
+I run a handful of wallpaper and calming-themed apps as a solo developer, and rewarded ads are how I give back a little something extra to the people who choose to watch one. One day, scanning my analytics, I noticed that for a few users the number of reward grants was clearly higher than the number of completed views. I had been granting rewards straight off the device's `onUserEarnedReward`, so a modified client was replaying the same signal over and over.
+
+You should never pay out a rewarded ad based only on the device saying "I finished watching." The thing that protects you here is AdMob's server-side verification (SSV). In this article I'll wire SSV into a Rork-generated Expo app and implement the verification endpoint as a Cloudflare Worker, in code close to what I actually run.
+
+## Where trusting the device breaks
+
+The client-side callback is convenient, but it lives outside your trust boundary. Modified apps, proxy replays, hammering from an emulator — all of it happens inside the device, so you can't tell the genuine signal from a forged one. When the reward is something with value, like in-app currency or subscription days, this is a direct revenue leak.
+
+SSV replaces that signal with one that travels through Google's servers. When a user finishes watching, AdMob's server sends a signed callback to a URL you specify. The signature is produced with Google's private key, so you only need the matching public key to confirm "this really came from AdMob and wasn't tampered with." You trust the device for nothing.
+
+<table>
+<thead>
+<tr><th>Concern</th><th>Client callback only</th><th>With SSV</th></tr>
+</thead>
+<tbody>
+<tr><td>Spoofing</td><td>Indistinguishable</td><td>Rejected by signature check</td></tr>
+<tr><td>Replay (hammering)</td><td>Goes through</td><td>Idempotent via transaction_id</td></tr>
+<tr><td>Where reward is finalized</td><td>Device (outside boundary)</td><td>Your server (inside boundary)</td></tr>
+<tr><td>Offline</td><td>Can grant instantly</td><td>Finalized after server is reached</td></tr>
+</tbody>
+</table>
+
+The key distinction: SSV doesn't replace the client callback, it just moves the *finalization* of the reward to the server. You can still show the instant "reward earned" feedback on the device, but you only actually increase the balance after the Worker has finished verifying the signature.
+
+## Client side — tell SSV who to reward
+
+First, on the device, attach your user ID to the SSV callback. In `react-native-google-mobile-ads` you pass `serverSideVerificationOptions` when you build the ad request. `userId` and `customData` come back later as the callback's `custom_data` parameter.
+
+```tsx
+import { RewardedAd, RewardedAdEventType, TestIds } from 'react-native-google-mobile-ads';
+
+const adUnitId = __DEV__ ? TestIds.REWARDED : 'ca-app-pub-xxxxxxxx/yyyyyyyy';
+
+export function loadRewardedAd(userId: string, purpose: string) {
+  const rewarded = RewardedAd.createForAdRequest(adUnitId, {
+    serverSideVerificationOptions: {
+      // comes back in the SSV callback's custom_data
+      userId,
+      customData: JSON.stringify({ purpose, ts: Date.now() }),
+    },
+  });
+
+  rewarded.addAdEventListener(RewardedAdEventType.LOADED, () => rewarded.show());
+
+  // Use the device signal only for instant UI flair. Don't touch the balance.
+  rewarded.addAdEventListener(RewardedAdEventType.EARNED_REWARD, () => {
+    showOptimisticRewardUI(); // keep it to a "granting…" indicator
+  });
+
+  rewarded.load();
+}
+```
+
+Putting a timestamp and purpose into `customData` helps later when you reconcile against your server logs. The important part is *not* writing a balance update into the device's `EARNED_REWARD`. If you do, the original hole stays open no matter how good your SSV is.
+
+## Understand the shape of the callback URL
+
+In the AdMob console, set an SSV callback URL on the rewarded ad unit (e.g. `https://api.example.com/admob/ssv`). When a user completes a view, AdMob sends a GET to that URL with a query string. The main parameters are:
+
+<table>
+<thead>
+<tr><th>Parameter</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td>ad_network / ad_unit</td><td>Ad network and unit identifiers</td></tr>
+<tr><td>reward_amount / reward_item</td><td>Amount and type of reward to grant</td></tr>
+<tr><td>custom_data</td><td>The string you passed on the device (your user ID lives here)</td></tr>
+<tr><td>timestamp</td><td>Callback creation time (ms)</td></tr>
+<tr><td>transaction_id</td><td>Unique ID per view (use it as the idempotency key)</td></tr>
+<tr><td>signature / key_id</td><td>The signature and the ID of the key to verify with</td></tr>
+</tbody>
+</table>
+
+The most error-prone part of verification is the *scope* of the signed content. `signature` and `key_id` are always the last two query parameters, in that order. What gets signed is the raw query string up to (but not including) `&signature=`. If you URL-decode or reorder it, the signature won't match. The rule is to slice the incoming URL string as-is.
+
+## Worker — fetching and caching the public keys
+
+Verification needs Google's public keys. The key server is `https://www.gstatic.com/admob/reward/verifier-keys.json`. Keys rotate on a variable schedule, so you must not cache them for longer than 24 hours. Using the Cloudflare Workers Cache API, fetch them with a TTL kept within a single day.
+
+```ts
+const KEY_SERVER = 'https://www.gstatic.com/admob/reward/verifier-keys.json';
+
+interface VerifierKey { keyId: number; pem: string; base64: string; }
+
+async function fetchVerifierKeys(): Promise<Map<number, string>> {
+  const cache = caches.default;
+  const cacheKey = new Request(KEY_SERVER);
+  let res = await cache.match(cacheKey);
+
+  if (!res) {
+    res = await fetch(KEY_SERVER);
+    // hold the key server response for at most 23h (margin under the 24h limit)
+    const cached = new Response(res.body, res);
+    cached.headers.set('Cache-Control', 'max-age=82800');
+    await cache.put(cacheKey, cached.clone());
+    res = cached;
+  }
+
+  const data = await res.json<{ keys: VerifierKey[] }>();
+  const map = new Map<number, string>();
+  for (const k of data.keys) map.set(k.keyId, k.pem);
+  return map;
+}
+```
+
+Index the PEM public keys by `keyId`. Match against the callback's `key_id` and verify with that key only. If the key isn't found, the cache may be stale right after a rotation, so it hardens the path to also have a route that bypasses the cache and refetches.
+
+## Worker — the signature verification core
+
+The signature is ECDSA (P-256) with SHA-256, ASN.1 DER encoded and then base64url encoded. This is where implementations stumble most. WebCrypto's `subtle.verify` expects the raw `r||s` form, so passing a DER signature straight in will fail. On Cloudflare Workers, enabling `nodejs_compat` lets you use `node:crypto`'s `verify`, which accepts the PEM key and the DER signature directly — so you don't have to write the conversion yourself.
+
+Add the compatibility flag to `wrangler.toml`:
+
+```toml
+compatibility_flags = ["nodejs_compat"]
+```
+
+The verification core. Watch the part that slices the signed content out of the raw query string.
+
+```ts
+import { verify as nodeVerify } from 'node:crypto';
+
+function extractSignedContent(rawQuery: string) {
+  // rawQuery is the raw query string with the leading "?" removed
+  const sigMarker = '&signature=';
+  const idx = rawQuery.indexOf(sigMarker);
+  if (idx === -1) return null;
+
+  const signedContent = rawQuery.slice(0, idx); // signed content (do not decode)
+  const params = new URLSearchParams(rawQuery.slice(idx + 1));
+  const signatureB64url = rawQuery.slice(idx + sigMarker.length).split('&')[0];
+  const keyId = Number(params.get('key_id'));
+  return { signedContent, signatureB64url, keyId };
+}
+
+function b64urlToBuffer(s: string): Buffer {
+  const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(b64, 'base64');
+}
+
+async function verifyCallback(rawQuery: string): Promise<boolean> {
+  const parsed = extractSignedContent(rawQuery);
+  if (!parsed) return false;
+
+  const keys = await fetchVerifierKeys();
+  const pem = keys.get(parsed.keyId);
+  if (!pem) return false; // unknown key_id; you may route to a refetch path
+
+  const signature = b64urlToBuffer(parsed.signatureB64url);
+  return nodeVerify(
+    'sha256',
+    Buffer.from(parsed.signedContent, 'utf8'),
+    pem,
+    signature,
+  );
+}
+```
+
+Three things matter: use `signedContent` as the raw incoming string without decoding; the signature is base64url, so convert back to `+/` before decoding; and the algorithm is SHA-256.
+
+## Worker — freshness and double-grant prevention
+
+A valid signature alone isn't enough. To block reuse of an old callback (replay), check the freshness of `timestamp`. And so retries of the same view don't inflate the balance, make `transaction_id` the idempotency key and pin it to once-only in KV.
+
+Because AdMob retries up to five times at one-second intervals when it can't reach you, idempotency is mandatory.
+
+```ts
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    const rawQuery = url.search.startsWith('?') ? url.search.slice(1) : url.search;
+    const params = new URLSearchParams(rawQuery);
+
+    // 1) verify the signature
+    if (!(await verifyCallback(rawQuery))) {
+      return new Response('invalid signature', { status: 403 });
+    }
+
+    // 2) freshness (reject callbacks older than 5 minutes)
+    const ts = Number(params.get('timestamp'));
+    if (!ts || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
+      return new Response('stale', { status: 400 });
+    }
+
+    // 3) idempotency via transaction_id
+    const txId = params.get('transaction_id') ?? '';
+    const dedupeKey = `ssv:tx:${txId}`;
+    if (await env.REWARDS.get(dedupeKey)) {
+      return new Response('OK', { status: 200 }); // already processed; 200 stops retries
+    }
+
+    // 4) finalize the reward (increase the balance here, not on the device)
+    const customData = JSON.parse(params.get('custom_data') ?? '{}');
+    const userId = customData.userId ?? params.get('user_id');
+    const amount = Number(params.get('reward_amount') ?? '0');
+    await grantReward(env, userId, amount, txId);
+
+    // 5) keep the idempotency key for 90 days
+    await env.REWARDS.put(dedupeKey, '1', { expirationTtl: 60 * 60 * 24 * 90 });
+
+    // Google expects a 200. Anything else keeps the retries coming.
+    return new Response('OK', { status: 200 });
+  },
+};
+```
+
+If `grantReward` itself can check "have I already applied this `txId`?", you also close the gap left by KV's eventual consistency. I make the balance update a conditional write against the user's row, including `txId` in an applied list before adding. Even if KV lags for a moment, the second delivery finds the same `txId` already present and skips the addition.
+
+Always return 200. Return a 4xx only when verification fails, but remember Google will retry then — so if you see 403s persist, suspect the signed-content slicing first. In my experience, almost every mismatch here came from decoding the query string somewhere along the way.
+
+## Keeping the device experience intact
+
+Once the server finalizes rewards, the device has to sit in a brief "granting" state. The callback usually arrives within a few seconds, so the device either polls for finalization or receives the balance update via a light push or realtime subscription. I treat the balance as a single source of truth and re-read it after SSV finalizes. Building it so the device increases first and reconciles later is exactly what breeds that "more grants than views" situation.
+
+In case a callback never arrives, record the view fact on the device too, and set up a path where the user can reach support if finalization doesn't come within a window. For anything involving rewards, the scariest failure is the silent one where only the balance drifts — so I make it my top priority that finalization is traceable from the logs.
+
+## Wrap-up — your next move
+
+Finalize a rewarded payout with Google's signature, not the device's word. That's the heart of SSV. Today's build gives you three things: a Worker that doesn't mis-slice the signed content, double-grant prevention via `transaction_id`, and a finalization flow that carries the user ID in `custom_data`.
+
+As a first step, pull the production balance update off the device and have the Worker log the verification result and `txId`. Just watching a few days of logs will show you how many suspicious signals your own app has been receiving. I hope it helps anyone looking to protect their own reward features the same way.
