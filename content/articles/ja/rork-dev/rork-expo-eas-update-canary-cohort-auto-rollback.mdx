@@ -1,0 +1,142 @@
+---
+title: "EAS Update を少人数から配り、クラッシュ率で自動的に止める"
+slug: "rork-expo-eas-update-canary-cohort-auto-rollback"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-28T16:00"
+author: "Rork Lab"
+description: "OTA 更新は一瞬で全員に届くからこそ、悪い更新も一瞬で全員に届きます。EAS Update を少人数（カナリア）から配り、クラッシュ率を見て広げるか止めるかを自動で判断し、最後は端末側で安全網を張る設計を、動くコードでまとめます。"
+tags: ["Rork", "Expo", "EAS Update", "OTA", "個人開発"]
+highlights:
+  - "EAS Update のロールアウト割合でカナリア配信を行う具体的なコマンドと運用"
+  - "クラッシュフリー率を読んで「広げる/止める」を機械的に判断するスクリプト"
+  - "更新直後のクラッシュループを expo-updates で検知し、埋め込みバンドルへ戻す安全網（5% カナリアと併用）"
+---
+
+OTA 更新（JavaScript バンドルの差し替え）には、ストア審査を待たずに修正を届けられるという大きな利点があります。けれど同じ性質が、そのまま怖さにもなります。良い更新が一瞬で全員に届くなら、悪い更新も一瞬で全員に届くからです。
+
+私自身、個人開発で運用しているアプリに小さな修正を OTA で流したとき、ある端末構成でだけ起動直後に落ちる不具合を巻き込んでしまったことがあります。気づいて差し戻すまでの数十分のあいだ、更新を受け取った人は全員アプリが開けない状態でした。原因はコード1行でしたが、問題は「全員に同時に届いた」という配り方のほうにありました。
+
+ここでは、EAS Update を少人数から配り、クラッシュフリー率を見て自動で広げるか止めるかを決め、最後は端末側でも安全網を張る——という三段構えの設計をまとめます。
+
+## なぜ「一気に配る」が危ないのか
+
+ストア配信なら、悪いビルドが出ても審査と段階的リリースが緩衝材になります。OTA はその緩衝材を外して速さを得る仕組みなので、緩衝材は自分で用意する必要があります。
+
+<table>
+<thead>
+<tr><th>配り方</th><th>悪い更新が当たる範囲</th><th>気づくまでの猶予</th></tr>
+</thead>
+<tbody>
+<tr><td>全員に即時配信</td><td>全ユーザー</td><td>ほぼゼロ</td></tr>
+<tr><td>カナリア 5%</td><td>5% のユーザー</td><td>広げる前に判断できる</td></tr>
+<tr><td>カナリア + 自動ロールバック</td><td>5% の一部のみ</td><td>機械が止めるまで数分</td></tr>
+</tbody>
+</table>
+
+目指すのは一番下の行です。人手の監視に頼らず、悪い兆候が出たら配信を止め、端末側でも自衛する状態をつくります。
+
+## 第一段: ロールアウト割合でカナリア配信する
+
+EAS Update には、1つの更新を「何 % の端末に配るか」を制御するロールアウト機能があります。最初から全員ではなく、小さな割合で公開します。
+
+```bash
+# まず 5% にだけ配る
+eas update --branch production \
+  --message "fix: crash on cold start" \
+  --rollout-percentage 5
+
+# 問題なければ段階的に広げる
+eas update:edit --branch production --rollout-percentage 25
+eas update:edit --branch production --rollout-percentage 100
+```
+
+割合を上げるのは手動でも構いませんが、判断材料（クラッシュフリー率）を毎回目視で集めるのは現実的ではありません。そこを次の段で自動化します。
+
+## 第二段: クラッシュフリー率で広げるか止めるか決める
+
+クラッシュ計測（Sentry や Crashlytics）の API から、直近の「クラッシュフリーセッション率」を取り、しきい値で機械的に判断します。下のスクリプトは、判断結果を標準出力に返すだけの小さなものです。CI から定期実行し、結果に応じて次のコマンドを打ちます。
+
+```typescript
+// scripts/rollout-decision.ts
+type Metrics = {
+  crashFreeRate: number;  // 0..1
+  sessions: number;       // 計測対象セッション数
+};
+
+const BASELINE = 0.995;   // 平常時のクラッシュフリー率
+const MIN_SESSIONS = 200; // これ未満は判断保留（標本が小さい）
+const DROP_LIMIT = 0.01;  // 平常比で1ポイント下がったら危険
+
+function decide(m: Metrics): "expand" | "hold" | "rollback" {
+  if (m.sessions < MIN_SESSIONS) return "hold";          // 標本不足
+  if (m.crashFreeRate < BASELINE - DROP_LIMIT) return "rollback";
+  if (m.crashFreeRate >= BASELINE) return "expand";
+  return "hold";                                          // 様子見
+}
+
+const metrics = await fetchCrashFreeRate({ window: "30m" });
+const action = decide(metrics);
+console.log(JSON.stringify({ action, ...metrics }));
+process.exit(action === "rollback" ? 2 : 0);
+```
+
+判断は3択にしておくのがコツです。「広げる」と「止める」の二択にすると、標本が小さい初動で誤って止めたり広げたりします。`hold`（様子見）を挟むことで、データが溜まるまで現状維持できます。`rollback` のときだけ終了コードを 2 にしておけば、CI 側で「直前の正常な更新を再公開する」処理に分岐させられます。
+
+```bash
+# CI 例: 判断 → ロールバック時は直前の更新を再公開
+node scripts/rollout-decision.ts || {
+  echo "危険信号を検知。直前の更新へ差し戻します"
+  eas update:republish --branch production --group "$LAST_GOOD_GROUP_ID"
+}
+```
+
+ここで注意したい落とし穴があります。クラッシュフリー率は配信直後だと標本が極端に少なく、1件のクラッシュで率が大きく振れます。`MIN_SESSIONS` を設けずに動かすと、最初のクラッシュ1件で過剰に `rollback` してしまいます。私は初期に標本下限を入れ忘れ、何でもない更新を何度も差し戻してしまいました。標本の下限は、自動化の安定性に直結する地味で重要な設定です。
+
+## 第三段: 端末側でクラッシュループを検知して埋め込みに戻す
+
+サーバー側で配信を止めても、すでに悪い更新を受け取った端末は救えません。そこで端末側にも安全網を張ります。更新適用後に連続でクラッシュしたら、その更新を捨てて、ビルドに埋め込んだバンドルへ戻します。
+
+```typescript
+// lib/update-guard.ts
+import * as Updates from "expo-updates";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const KEY = "update.launchProbe";
+const LIMIT = 2;  // 連続クラッシュ回数のしきい値
+
+// 起動のごく早い段階で呼ぶ
+export async function armLaunchProbe() {
+  if (Updates.isEmbeddedLaunch) return;          // 埋め込み起動なら監視不要
+  const raw = await AsyncStorage.getItem(KEY);
+  const count = raw ? Number(raw) : 0;
+  if (count >= LIMIT) {
+    await AsyncStorage.setItem(KEY, "0");
+    await Updates.rollbackToEmbeddedAsync();      // 埋め込みへ戻して再起動
+    return;
+  }
+  await AsyncStorage.setItem(KEY, String(count + 1)); // 「無事起動」前に加算
+}
+
+// 初期化が無事に終わったら呼ぶ（= 起動成功の証明）
+export async function disarmLaunchProbe() {
+  await AsyncStorage.setItem(KEY, "0");
+}
+```
+
+仕組みはシンプルです。起動の早い段階でカウンタを増やし、初期化を最後まで終えられたら 0 に戻します。もし初期化の途中で落ちれば、カウンタは増えたまま残ります。これが `LIMIT` 回続いたら、その更新は「この端末では起動できない」と判断し、埋め込みバンドルへ戻します。`isEmbeddedLaunch` で埋め込み起動を除外しておかないと、戻した先でも監視が走り続けてしまうので、この除外は必須です。
+
+## しきい値は控えめから始める
+
+ここまでの `BASELINE`（平常時のクラッシュフリー率）や `DROP_LIMIT`（許容する低下幅）は、アプリごとに最適値が違います。私はこの種のしきい値を、最初はあえて控えめ（止まりやすい側）に置くことを推奨します。誤って止めても、再公開すれば数分で復帰できますが、止め損ねて全員に悪い更新が届くと、戻すまでの体験が大きく損なわれるからです。
+
+運用しながら、平常時のクラッシュフリー率の実測値を1〜2週間ぶん集め、その分布を見て `BASELINE` を実データに合わせていきます。個人開発のように1人で監視まで回す場合は、しきい値を「人が見ていない時間帯でも安全側に倒れる」値にしておくと、夜間の配信でも安心して眠れます。この場合は感度を上げすぎないことも大切で、`hold` を厚めに取るのが現実的です。
+
+## 三段を合わせて初めて意味がある
+
+この3つは、どれか1つでは穴が残ります。カナリアだけでは、止める判断が遅れれば被害は広がります。自動判断だけでは、すでに配られた端末は救えません。端末側の安全網だけでは、配信は止まらず新しい受信者が増え続けます。三段を重ねて、ようやく「悪い更新の影響を、少人数・短時間・自己回復」に閉じ込められます。
+
+導入の順番として個人的にお勧めなのは、まず第三段（端末側の安全網）から入れることです。サーバー側の自動化はしきい値の調整に時間がかかりますが、端末側の安全網はコードを足すだけで、最悪のケース（全員が起動できない）をその日から防げます。本番運用で効くのは、派手な自動化よりも、この地味な一手だったと感じています。
+
+第一段のロールアウト割合は EAS の標準機能なので追加費用なく今日から使えます。まずは次の更新を `--rollout-percentage 5` で配ってみる。たったそれだけでも、OTA の怖さはかなり和らぎます。

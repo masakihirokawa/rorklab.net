@@ -1,0 +1,142 @@
+---
+title: "Ship EAS Updates to a Few First, and Halt Automatically on Crash Rate"
+slug: "rork-expo-eas-update-canary-cohort-auto-rollback"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-28T16:00"
+author: "Rork Lab"
+description: "Because OTA updates reach everyone instantly, a bad update reaches everyone instantly too. Here is a three-layer design: ship EAS Update to a small canary, decide expand-or-halt from crash-free rate automatically, and hold a safety net on the device — with working code."
+tags: ["Rork", "Expo", "EAS Update", "OTA", "indie developer"]
+highlights:
+  - "Concrete commands and operations for canary delivery via EAS Update rollout percentage"
+  - "A script that mechanically decides expand/hold/rollback from crash-free rate"
+  - "A device-side safety net using expo-updates to catch crash loops and fall back to the embedded bundle"
+---
+
+OTA updates — swapping the JavaScript bundle — have a big upside: you can deliver a fix without waiting for store review. But the same property is also the scary part. If a good update reaches everyone instantly, so does a bad one.
+
+As an indie developer at Dolice, I once pushed a small fix over the air and dragged in a bug that crashed on launch for one specific device configuration. For the tens of minutes until I noticed and reverted, everyone who received the update could not open the app. The cause was a single line of code, but the real problem was the delivery method: it reached everyone at once.
+
+This article lays out a three-layer design: ship EAS Update to a few first, let crash-free rate decide expand-or-halt automatically, and hold a safety net on the device too.
+
+## Why "ship to everyone at once" is dangerous
+
+With store delivery, review and phased release act as buffers even if a bad build ships. OTA removes those buffers to gain speed, so you have to provide the buffers yourself.
+
+<table>
+<thead>
+<tr><th>Delivery</th><th>Reach of a bad update</th><th>Grace before you notice</th></tr>
+</thead>
+<tbody>
+<tr><td>Instant to everyone</td><td>All users</td><td>Almost zero</td></tr>
+<tr><td>Canary 5%</td><td>5% of users</td><td>You can decide before expanding</td></tr>
+<tr><td>Canary + auto-rollback</td><td>Only part of the 5%</td><td>Minutes until the machine halts it</td></tr>
+</tbody>
+</table>
+
+The goal is the bottom row: a state that does not rely on human watching, halts delivery on a bad signal, and lets the device defend itself.
+
+## Layer one: canary delivery via rollout percentage
+
+EAS Update has a rollout feature that controls what percentage of devices receive a single update. Publish to a small fraction first, not everyone.
+
+```bash
+# ship to 5% first
+eas update --branch production \
+  --message "fix: crash on cold start" \
+  --rollout-percentage 5
+
+# expand in steps if all is well
+eas update:edit --branch production --rollout-percentage 25
+eas update:edit --branch production --rollout-percentage 100
+```
+
+Bumping the percentage by hand is fine, but visually gathering the deciding signal (crash-free rate) every time is impractical. We automate that in the next layer.
+
+## Layer two: let crash-free rate decide expand or halt
+
+Pull the recent crash-free session rate from your crash tooling (Sentry or Crashlytics) API, and decide mechanically with thresholds. The script below simply returns its decision on stdout. Run it on a schedule from CI and issue the next command based on the result.
+
+```typescript
+// scripts/rollout-decision.ts
+type Metrics = {
+  crashFreeRate: number;  // 0..1
+  sessions: number;       // measured sessions
+};
+
+const BASELINE = 0.995;   // normal crash-free rate
+const MIN_SESSIONS = 200; // below this, hold (sample too small)
+const DROP_LIMIT = 0.01;  // a 1-point drop vs normal is dangerous
+
+function decide(m: Metrics): "expand" | "hold" | "rollback" {
+  if (m.sessions < MIN_SESSIONS) return "hold";          // not enough sample
+  if (m.crashFreeRate < BASELINE - DROP_LIMIT) return "rollback";
+  if (m.crashFreeRate >= BASELINE) return "expand";
+  return "hold";                                          // wait and see
+}
+
+const metrics = await fetchCrashFreeRate({ window: "30m" });
+const action = decide(metrics);
+console.log(JSON.stringify({ action, ...metrics }));
+process.exit(action === "rollback" ? 2 : 0);
+```
+
+Keeping the decision to three options is the trick. A binary "expand or halt" wrongly halts or expands in the small-sample early window. Inserting `hold` lets you stay put until data accumulates. Setting the exit code to 2 only for `rollback` lets CI branch into "republish the last good update."
+
+```bash
+# CI example: decide -> on rollback, republish the previous update
+node scripts/rollout-decision.ts || {
+  echo "Danger signal detected. Reverting to the previous update."
+  eas update:republish --branch production --group "$LAST_GOOD_GROUP_ID"
+}
+```
+
+There is a pitfall here. Right after publishing, the sample is extremely small and a single crash swings the rate wildly. Running without `MIN_SESSIONS` makes you over-`rollback` on the first crash. Early on I forgot the sample floor and reverted harmless updates again and again. The sample floor is a humble but crucial setting that directly drives automation stability.
+
+## Layer three: detect crash loops on the device and revert to embedded
+
+Halting delivery on the server cannot save devices that already received the bad update. So put a safety net on the device too. If it crashes repeatedly after applying an update, drop that update and fall back to the bundle embedded in the build.
+
+```typescript
+// lib/update-guard.ts
+import * as Updates from "expo-updates";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const KEY = "update.launchProbe";
+const LIMIT = 2;  // consecutive-crash threshold
+
+// call very early in startup
+export async function armLaunchProbe() {
+  if (Updates.isEmbeddedLaunch) return;          // no need to watch embedded launches
+  const raw = await AsyncStorage.getItem(KEY);
+  const count = raw ? Number(raw) : 0;
+  if (count >= LIMIT) {
+    await AsyncStorage.setItem(KEY, "0");
+    await Updates.rollbackToEmbeddedAsync();      // revert to embedded and restart
+    return;
+  }
+  await AsyncStorage.setItem(KEY, String(count + 1)); // increment before "safe launch"
+}
+
+// call once init finishes safely (= proof of a successful launch)
+export async function disarmLaunchProbe() {
+  await AsyncStorage.setItem(KEY, "0");
+}
+```
+
+The mechanism is simple. Increment a counter early in startup, and reset it to 0 once init completes. If it crashes mid-init, the counter stays elevated. When that happens `LIMIT` times, the update is judged "cannot launch on this device" and we revert to the embedded bundle. Excluding embedded launches with `isEmbeddedLaunch` is mandatory; otherwise the watch keeps running on the reverted bundle too.
+
+## Start thresholds conservative
+
+The `BASELINE` (normal crash-free rate) and `DROP_LIMIT` (allowed drop) above have different optimal values per app. I recommend placing these thresholds conservatively at first (biased toward halting). A wrong halt recovers in minutes via republish, but a missed halt sends a bad update to everyone, and the experience until you revert is badly hurt.
+
+While operating, collect one to two weeks of your real normal crash-free rate, look at the distribution, and tune `BASELINE` to actual data. When you run monitoring solo, like indie development, set thresholds that "fall to the safe side even when no one is watching," so you can sleep through a nighttime rollout. In that case, do not crank sensitivity too high either — keeping a generous `hold` band is the realistic choice.
+
+## The three layers only work together
+
+Each layer alone leaves a hole. Canary alone still spreads damage if the halt decision lags. Auto-decision alone cannot save already-served devices. The device net alone does not stop delivery, so new recipients keep growing. Stacking all three is what finally confines a bad update to "few people, short time, self-healing."
+
+For order of adoption, I personally recommend starting with layer three (the device net). Server automation takes time to tune thresholds, but the device net is just added code and prevents the worst case (everyone unable to launch) from day one. What pays off in production is not the flashy automation but this humble move.
+
+Layer one's rollout percentage is a standard EAS feature you can use today at no extra cost. Just ship your next update at `--rollout-percentage 5`. That alone takes a lot of the fear out of OTA.

@@ -1,0 +1,167 @@
+---
+title: "Design On-Device Core ML So Cold Start and Heat Don't Break It"
+slug: "rork-max-coreml-cold-start-thermal-budget-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-28T21:00"
+author: "Rork Lab"
+description: "Put on-device Core ML in the native Swift that Rork Max generates and you hit two walls before accuracy: the first inference is slow, and the device heats up and slows down. Here is a design built around cold start and a thermal budget, with working Swift."
+tags: ["Rork Max", "Core ML", "Swift", "on-device AI", "indie developer"]
+highlights:
+  - "What cold start really is (first compile, first inference) and pulling it out of the launch flow with an actor"
+  - "Gating that reads ProcessInfo.thermalState and steps inference down across full / reduced / suspended"
+  - "Releasing the model on memory warnings and backgrounding, then warming it up again on return"
+---
+
+Because Rork Max can generate native Swift apps, on-device Core ML inference — long out of easy reach in React Native — is now within reach even for indie development. But put it on a real device and there are stumbling points before you ever get to accuracy. The first inference is oddly slow. After a while the device warms up and everything feels sluggish. Both are design problems about when and how much you run inference, not about whether the model is good.
+
+As an indie developer at Dolice, when I built on-device inference into an app I run, I struggled with a roughly one-second freeze on the very first call. The cause was not model accuracy; it was running the first load and inference on the main thread right at launch.
+
+This article lays out how to design Core ML around two constraints — cold start and a thermal budget — with Swift code.
+
+## Why the first inference is slow
+
+A Core ML model runs two heavy operations the first time you use it. One is loading and compiling the model (optimized for the device's Neural Engine); the other is the first inference, which allocates internal buffers. It is normal for the first call to be an order of magnitude slower than later ones.
+
+<table>
+<thead>
+<tr><th>Stage</th><th>What mainly happens</th><th>Felt impact</th></tr>
+</thead>
+<tbody>
+<tr><td>First load</td><td>Model compile and placement</td><td>Hundreds of ms to 1 s</td></tr>
+<tr><td>First inference</td><td>Buffer allocation, warmup</td><td>Tens to hundreds of ms</td></tr>
+<tr><td>Subsequent</td><td>Run on the allocated path</td><td>Often around 10-30 ms</td></tr>
+</tbody>
+</table>
+
+The problem is throwing that heavy first call at the moment the user is waiting for a result. The design goal is simple: move the heavy first call earlier, to a time when the user is not waiting.
+
+## Pull model load and warmup out of the launch flow
+
+First, do not synchronously load the model at app launch. Defer with `lazy`, and do the load and warmup (one inference on dummy input) on a background queue.
+
+```swift
+import CoreML
+
+actor InferenceEngine {
+    private var model: MyModel?
+
+    // warm up in the background; call after the first screen appears, not at launch
+    func warmUp() async {
+        guard model == nil else { return }
+        let config = MLModelConfiguration()
+        config.computeUnits = .all        // let it use the Neural Engine too
+        do {
+            let loaded = try MyModel(configuration: config)
+            // run the first inference on dummy input to allocate buffers
+            _ = try? loaded.prediction(input: .dummy)
+            model = loaded
+        } catch {
+            model = nil                   // do not block launch even on failure
+        }
+    }
+
+    func predict(_ input: MyModelInput) async throws -> MyModelOutput {
+        if model == nil { await warmUp() }
+        guard let model else { throw InferenceError.unavailable }
+        return try model.prediction(input: input)
+    }
+}
+```
+
+The caller invokes `warmUp()` in the brief gap after the first screen renders and before the user starts interacting.
+
+```swift
+.task {
+    // warm up during idle time after the screen shows
+    await engine.warmUp()
+}
+```
+
+The `actor` is what pays off here. Even if `predict` is called from several places at once, the language guarantees the load does not run twice. Early on I forgot this protection and multi-loaded the model on every screen transition, needlessly bloating memory. Concurrent access is a quiet pitfall in on-device inference.
+
+## Step inference down by thermal state
+
+On-device inference uses power and generates heat. Run it continuously and the device warms, the OS lowers the clock, and the whole app slows as a result. To avoid this, read `ProcessInfo.thermalState` and proactively reduce inference frequency or quality as heat rises.
+
+```swift
+import Foundation
+
+enum InferenceBudget {
+    case full        // as usual
+    case reduced     // thin out frequency
+    case suspended   // stop inference, switch to a lightweight fallback
+
+    static func current() -> InferenceBudget {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal, .fair: return .full
+        case .serious:        return .reduced
+        case .critical:       return .suspended
+        @unknown default:     return .reduced
+        }
+    }
+}
+```
+
+The caller changes behavior by budget. For real-time frame inference, under `reduced` it infers only once every few frames and reuses the last result in between; under `suspended` it stops inferring and switches to a light alternative such as a rule-based path.
+
+```swift
+func process(frame: Frame) async {
+    switch InferenceBudget.current() {
+    case .full:
+        lastResult = try? await engine.predict(frame.input)
+    case .reduced:
+        frameCounter += 1
+        if frameCounter % 3 == 0 {           // only once every 3 frames
+            lastResult = try? await engine.predict(frame.input)
+        }
+    case .suspended:
+        lastResult = fallbackHeuristic(frame) // stop inferring
+    }
+    render(lastResult)
+}
+```
+
+You might feel that reacting after heat rises is too late. But the key is not to treat heat as zero-or-one: thin out earlier at the `serious` stage so you never reach `critical`. What pays off in production was reducing quietly before it got hot, rather than stopping after it did.
+
+## Release the model on memory warnings and backgrounding
+
+A model can occupy tens of MB. Holding it while unused raises the chance of being killed under a memory warning. Release the model on backgrounding and memory warnings, and warm it up again on return.
+
+```swift
+extension InferenceEngine {
+    func release() { model = nil }   // drop the reference and return memory
+}
+
+// app side
+.onChange(of: scenePhase) { _, phase in
+    if phase == .background {
+        Task { await engine.release() }
+    } else if phase == .active {
+        Task { await engine.warmUp() }   // re-warm on return
+    }
+}
+```
+
+Release plus re-warm looks like double the cost, but the warmup on return hides in the gap before the user starts interacting. Letting go and re-warming is more stable than holding on and hitting a memory warning. This call depends on model size and usage frequency, so it is safest decided while measuring.
+
+## Do not decide without measuring
+
+The numbers above (how many frames per inference, where to set thresholds) vary by app and target device. I strongly recommend measuring first load, first inference, and subsequent times with `signpost` and deciding on your own app's real data. Pinning `computeUnits` to `.cpuOnly` by guess, or leaning on `.all` always, can backfire on some devices.
+
+```swift
+import os.signpost
+
+let log = OSLog(subsystem: "app.inference", category: .pointsOfInterest)
+let id = OSSignpostID(log: log)
+os_signpost(.begin, log: log, name: "predict", signpostID: id)
+let out = try await engine.predict(input)
+os_signpost(.end, log: log, name: "predict", signpostID: id)
+```
+
+## The one move to make first
+
+If you are unsure which of the three to start with, just "pull warmup out of the launch flow" is enough at first. Removing the initial freeze alone changes the feel dramatically. Thermal and memory control can be added only as needed, once you observe temperature and memory warnings on a real device.
+
+On-device Core ML becomes far more practical when you can design "when to run it" before accuracy. Precisely because Rork Max puts native Swift within reach now, locking down this foundation first pays off later.

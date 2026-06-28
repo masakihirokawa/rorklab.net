@@ -1,0 +1,167 @@
+---
+title: "オンデバイス Core ML を、起動の重さとサーマルで破綻させない設計"
+slug: "rork-max-coreml-cold-start-thermal-budget-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-28T21:00"
+author: "Rork Lab"
+description: "Rork Max が生成するネイティブ Swift でオンデバイス Core ML を載せると、精度よりも先に「最初の推論が遅い」「使っていると熱で重くなる」という壁にぶつかります。コールドスタートとサーマル予算を前提にした設計を、動く Swift とともに整理します。"
+tags: ["Rork Max", "Core ML", "Swift", "オンデバイスAI", "個人開発"]
+highlights:
+  - "Core ML コールドスタートの正体（初回コンパイル・初回推論）と、actor で起動フローから外す設計"
+  - "ProcessInfo.thermalState を見て推論を full / reduced / suspended の3段で落とすゲーティング"
+  - "メモリ警告・バックグラウンド遷移でモデルを手放し、復帰時に温め直す実装"
+---
+
+Rork Max はネイティブ Swift アプリを生成できるため、React Native では届きにくかったオンデバイスの Core ML 推論に、個人開発でも手が届くようになりました。けれど実機に載せてみると、精度の話に入る前につまずく場所があります。最初の推論が妙に遅い。しばらく使っていると、端末が温まって全体がもっさりする。この2つは、モデルの良し悪しではなく「いつ・どれだけ推論を走らせるか」という設計の問題です。
+
+私自身、個人開発で運用しているアプリにオンデバイス推論を組み込んだとき、最初の1回だけ体感で1秒近く固まる挙動に悩まされました。原因はモデルの精度ではなく、初回のロードと推論を起動直後のメインスレッド上で走らせていたことでした。
+
+ここでは、Core ML を「コールドスタート」と「サーマル予算」という2つの制約を前提に設計する方法を、Swift のコードとともにまとめます。
+
+## 最初の推論が遅い理由
+
+Core ML のモデルは、初めて使うときに2つの重い処理が走ります。1つはモデルの読み込みとコンパイル（端末の Neural Engine 向けに最適化される）、もう1つは初回推論で内部バッファが確保される処理です。2回目以降は速くても、初回だけは桁が違う、ということが普通に起きます。
+
+<table>
+<thead>
+<tr><th>段階</th><th>主に起きること</th><th>体感への影響</th></tr>
+</thead>
+<tbody>
+<tr><td>初回ロード</td><td>モデルのコンパイル・配置</td><td>数百 ms〜1 秒</td></tr>
+<tr><td>初回推論</td><td>バッファ確保・ウォームアップ</td><td>数十〜数百 ms</td></tr>
+<tr><td>2回目以降</td><td>確保済みの経路で実行</td><td>多くは 10〜30 ms 程度</td></tr>
+</tbody>
+</table>
+
+問題は、この重い初回を「ユーザーが結果を待っている瞬間」にぶつけてしまうことです。設計の目標は単純で、初回の重さを、ユーザーが待っていない時間に前倒しすることです。
+
+## モデルのロードとウォームアップを起動フローから外す
+
+まず、モデルをアプリ起動と同時に同期ロードしないことです。`lazy` で遅延させ、バックグラウンドのキューでロードとウォームアップ（ダミー入力での1回推論）を済ませておきます。
+
+```swift
+import CoreML
+
+actor InferenceEngine {
+    private var model: MyModel?
+
+    // バックグラウンドで温める。起動直後ではなく、最初の画面が出た後に呼ぶ
+    func warmUp() async {
+        guard model == nil else { return }
+        let config = MLModelConfiguration()
+        config.computeUnits = .all        // Neural Engine を含めて任せる
+        do {
+            let loaded = try MyModel(configuration: config)
+            // ダミー入力で初回推論を済ませ、バッファを確保しておく
+            _ = try? loaded.prediction(input: .dummy)
+            model = loaded
+        } catch {
+            model = nil                   // 失敗しても起動は止めない
+        }
+    }
+
+    func predict(_ input: MyModelInput) async throws -> MyModelOutput {
+        if model == nil { await warmUp() }
+        guard let model else { throw InferenceError.unavailable }
+        return try model.prediction(input: input)
+    }
+}
+```
+
+呼び出し側は、最初の画面が描画され、ユーザーが操作を始めるより前のわずかな余白で `warmUp()` を呼びます。
+
+```swift
+.task {
+    // 画面表示後のアイドル時間に温める
+    await engine.warmUp()
+}
+```
+
+ここで効くのは `actor` です。複数の場所から同時に `predict` が呼ばれても、ロードが二重に走らないことを言語レベルで保証できます。私は初期にこの保護を入れ忘れ、画面遷移のたびにモデルを多重ロードしてメモリを無駄に膨らませていました。並行アクセスは、オンデバイス推論で地味にハマる落とし穴です。
+
+## サーマル状態で推論の頻度を落とす
+
+オンデバイス推論は電力と熱を使います。連続で走らせると端末が温まり、OS がクロックを下げ、結果としてアプリ全体が重くなります。これを避けるには、`ProcessInfo.thermalState` を見て、熱が上がってきたら推論の頻度や品質を自分から落とします。
+
+```swift
+import Foundation
+
+enum InferenceBudget {
+    case full        // 通常どおり
+    case reduced     // 頻度を間引く
+    case suspended   // 推論を止め、軽量な代替に切り替える
+
+    static func current() -> InferenceBudget {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal, .fair: return .full
+        case .serious:        return .reduced
+        case .critical:       return .suspended
+        @unknown default:     return .reduced
+        }
+    }
+}
+```
+
+呼び出し側は、予算に応じて振る舞いを変えます。たとえばリアルタイムにフレームを推論する用途なら、`reduced` のときは何フレームかに1回だけ推論し、間は前回結果を使い回します。`suspended` のときは推論をやめ、ルールベースなどの軽い代替へ切り替えます。
+
+```swift
+func process(frame: Frame) async {
+    switch InferenceBudget.current() {
+    case .full:
+        lastResult = try? await engine.predict(frame.input)
+    case .reduced:
+        frameCounter += 1
+        if frameCounter % 3 == 0 {           // 3フレームに1回だけ
+            lastResult = try? await engine.predict(frame.input)
+        }
+    case .suspended:
+        lastResult = fallbackHeuristic(frame) // 推論を止める
+    }
+    render(lastResult)
+}
+```
+
+熱が上がってからの対処では遅い、と感じるかもしれません。しかし重要なのは、熱を「ゼロか100か」で扱わず、`serious` の段階で先に間引いて `critical` に到達させないことです。本番運用で効くのは、熱くなってから止めることより、熱くなる前に静かに減らすことでした。
+
+## メモリ警告とバックグラウンドでモデルを手放す
+
+モデルは数十 MB を占めることがあります。使っていない間も抱え続けると、メモリ警告でアプリが落とされる確率が上がります。バックグラウンド遷移とメモリ警告のときにモデルを解放し、復帰時に温め直す設計にします。
+
+```swift
+extension InferenceEngine {
+    func release() { model = nil }   // 参照を切ってメモリを返す
+}
+
+// アプリ側
+.onChange(of: scenePhase) { _, phase in
+    if phase == .background {
+        Task { await engine.release() }
+    } else if phase == .active {
+        Task { await engine.warmUp() }   // 復帰時に再ウォームアップ
+    }
+}
+```
+
+解放と再ウォームアップはコストが二重に見えますが、復帰時のウォームアップはユーザーが操作を始める前の余白に隠せます。抱えっぱなしでメモリ警告に当たるより、手放して温め直すほうが、結果として安定します。この判断は、モデルサイズと利用頻度で変わるので、計測しながら決めるのが確実です。
+
+## 計測なしに決めない
+
+ここまでの数値（何フレームに1回、しきい値をどこに置くか）は、アプリと対象端末で変わります。`signpost` で初回ロード・初回推論・2回目以降の時間を実測し、自分のアプリの実データで判断することを強くお勧めします。推測で `computeUnits` を `.cpuOnly` に固定したり、逆に常時 `.all` に頼ったりすると、端末によっては逆効果になります。
+
+```swift
+import os.signpost
+
+let log = OSLog(subsystem: "app.inference", category: .pointsOfInterest)
+let id = OSSignpostID(log: log)
+os_signpost(.begin, log: log, name: "predict", signpostID: id)
+let out = try await engine.predict(input)
+os_signpost(.end, log: log, name: "predict", signpostID: id)
+```
+
+## まず入れるべき一手
+
+3つのうちどれから始めるか迷うなら、最初は「ウォームアップを起動フローから外す」ことだけで十分です。初回の固まりが消えるだけで、体感は大きく変わります。サーマルとメモリの制御は、実機で温度やメモリ警告を観測してから、必要な分だけ足していけばよいと考えています。
+
+私はこの3つの土台を、新しくオンデバイス推論を載せるたびに最初に置くようにしています。オンデバイス Core ML は、精度の前に「いつ走らせるか」を設計できると、ぐっと実用的になります。Rork Max でネイティブ Swift に手が届く今だからこそ、この土台を最初に押さえておくと、後から効いてきます。
