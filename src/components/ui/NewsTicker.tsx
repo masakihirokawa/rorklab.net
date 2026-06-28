@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "TEST — Rork Companionアプリで、有料Apple Developerアカウント無しに実機iPhoneでテストできます",
-    "CLOUD — クラウド上のMacでコンパイルし、60fpsのライブシミュレータをタッチ入力付きで確認できます",
-    "BROWSER — Chrome・Safariだけで設計・コード・テストが完結。Xcodeは不要です",
-    "PUBLISH — 2クリックのApp Store公開で、提出まわりの煩雑さを抑えられます",
-    "MAX — Rork MaxはネイティブSwiftでiPhone・iPad・Apple Watch・Vision Proに対応します",
-    "RN — 通常のRorkはReact Native(Expo)でiOS/Androidアプリをまとめて生成します",
+    "MAX — Rork MaxはネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — Rork MaxはAR/LiDARスキャン、Metalの3D、ウィジェット、Live Activities、HealthKitなどネイティブ機能を解放します",
+    "FUNDING — Rorkはa16zから280万ドルを調達し、月間訪問は74万を超え、成長率は85%に達しています",
+    "RN — 通常のRorkはReact Native(Expo)でiOSとAndroidアプリをまとめて生成します",
+    "FOCUS — Rorkはネイティブモバイルアプリ専業で、Web中心のBoltやLovableと一線を画します",
+    "PRICING — 無料で始められ、有料プランは月25ドルから、Rork Maxは月200ドルで2クリックのApp Store公開に対応します",
   ],
   en: [
-    "TEST — The Rork Companion app lets you test on a real iPhone without a paid Apple Developer account",
-    "CLOUD — Code compiles on a cloud Mac, streaming a 60fps live simulator with real touch input",
-    "BROWSER — Design, code, and test entirely in Chrome or Safari — no Xcode required",
-    "PUBLISH — Two-click App Store publishing keeps the submission process simple",
-    "MAX — Rork Max builds native Swift apps for iPhone, iPad, Apple Watch, and Vision Pro",
-    "RN — Standard Rork generates iOS and Android apps together with React Native (Expo)",
+    "MAX — Rork Max builds native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — Rork Max unlocks AR/LiDAR scanning, Metal 3D, widgets, Live Activities, HealthKit, and more",
+    "FUNDING — Rork raised $2.8M from a16z, now drawing 743k+ monthly visits at an 85% growth rate",
+    "RN — Standard Rork generates iOS and Android apps together using React Native (Expo)",
+    "FOCUS — Rork focuses solely on native mobile apps, setting it apart from web-first Bolt and Lovable",
+    "PRICING — Free to start, paid plans from $25/mo, with Rork Max at $200/mo and two-click App Store publishing",
   ],
 };
 
