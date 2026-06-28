@@ -1,0 +1,155 @@
+---
+title: "Rork Max で NFC タグに書き込む — 読み取りで止まったアプリに一歩足す"
+slug: "rork-max-core-nfc-ndef-write-tag-encoding"
+category: "rork-dev"
+level: "advanced"
+premium: false
+date: "2026-06-28T16:00"
+author: "Rork Lab"
+description: "Rork Max が生成する NFC アプリは、まず読み取りから始まります。けれど本当に体験が変わるのは『書き込み』を足したときでした。CoreNFC で NDEF をタグに書き込む実装と、実機でしか確かめられない落とし穴を整理します。"
+tags: ["Rork Max", "NFC", "CoreNFC", "Swift", "個人開発"]
+---
+
+「タグにかざすと URL が開く」アプリを Rork Max で作ったあと、次に欲しくなるのはたいてい逆向きの機能です。アプリ側からタグに情報を書き込みたい。たとえば来店スタンプ、設定の引き継ぎ、展示物に紐づく一意の ID。読み取りだけのときは「便利な入口」でしたが、書き込みを足した瞬間に、アプリがモノと世界を結ぶ道具に変わります。私自身、Dolice として手がける壁紙系アプリの店頭展示で「かざすと設定が移る」仕掛けを試したとき、この一歩の手応えに驚きました。
+
+ところが Rork Max に英語で「NFC タグに書き込む機能」と頼んでも、出てくるコードがそのまま実機で動くとは限りません。書き込みは読み取りより一段デリケートで、シミュレータでは一切確認できず、タグの容量や状態に左右されます。以下では、Rork Max が生成する Swift をベースに、NDEF をタグへ書き込む実装の要点と、実機テストでしか見えない落とし穴を整理します。
+
+## 読み取りと書き込みは別物として設計する
+
+CoreNFC では、読み取りも書き込みも `NFCNDEFReaderSession` を入口にします。名前のせいで「読み取り専用」に見えますが、`connect` したタグに対して `writeNDEF` を呼べば書き込みになります。ここで設計上の分岐があります。読み取りはメッセージが届けば終わりですが、書き込みはタグの状態確認・容量確認・実書き込み・検証という複数段を踏む必要があります。
+
+Rork Max は「読み取り」を頼むと素直なコードを返しますが、「書き込み」では検証段を省いた版を出すことがありました。検証を省くと、書き込んだつもりで失敗していても気づけません。だから私は最初から、書き込みを「状態確認 → 容量確認 → 書き込み → 読み直し検証」の 4 段で考えることにしています。
+
+## NDEF を組み立ててタグへ書き込む
+
+まず、書き込むペイロードを `NFCNDEFMessage` として組み立てます。URL を1件書く例が最も実用的なので、それを軸にします。
+
+```swift
+import CoreNFC
+
+final class NFCWriter: NSObject, NFCNDEFReaderSessionDelegate {
+    private var session: NFCNDEFReaderSession?
+    private var payload: NFCNDEFMessage?
+
+    func write(urlString: String) {
+        guard NFCNDEFReaderSession.readingAvailable else {
+            print("この端末は NFC 非対応です")
+            return
+        }
+        guard let url = URL(string: urlString),
+              let record = NFCNDEFPayload.wellKnownTypeURIPayload(url: url) else {
+            print("URL を NDEF レコードに変換できませんでした")
+            return
+        }
+        payload = NFCNDEFMessage(records: [record])
+
+        session = NFCNDEFReaderSession(delegate: self,
+                                       queue: nil,
+                                       invalidateAfterFirstRead: false)
+        session?.alertMessage = "書き込むタグに iPhone をかざしてください"
+        session?.begin()
+    }
+
+    // タグ検出時のコールバック。ここで状態と容量を確認してから書き込む
+    func readerSession(_ session: NFCNDEFReaderSession,
+                       didDetect tags: [NFCNDEFTag]) {
+        guard let tag = tags.first else { return }
+        if tags.count > 1 {
+            session.alertMessage = "タグが複数あります。1枚だけにしてください"
+            session.restartPolling()
+            return
+        }
+        session.connect(to: tag) { error in
+            if let error = error {
+                session.invalidate(errorMessage: "接続に失敗: \(error.localizedDescription)")
+                return
+            }
+            self.queryAndWrite(tag: tag, session: session)
+        }
+    }
+
+    func readerSessionDidBecomeActive(_ session: NFCNDEFReaderSession) {}
+    func readerSession(_ session: NFCNDEFReaderSession,
+                       didInvalidateWithError error: Error) {}
+    func readerSession(_ session: NFCNDEFReaderSession,
+                       didDetectNDEFs messages: [NFCNDEFMessage]) {}
+}
+```
+
+`wellKnownTypeURIPayload(url:)` を使うと、URI 識別子の短縮（`https://www.` のような接頭辞を1バイトに圧縮する仕組み）を CoreNFC 側が面倒を見てくれます。手で TNF やタイプを組むより安全で、タグの限られた容量を無駄遣いしません。`invalidateAfterFirstRead` を `false` にしているのは、書き込みでは検出後に処理を続ける必要があるためです。ここを `true` のままにすると、タグに触れた瞬間にセッションが閉じて書き込めません。
+
+## 状態と容量を確かめてから書く
+
+書き込みの本体です。`queryNDEFStatus` でタグが書き込み可能か、どれだけ容量があるかを先に確認します。
+
+```swift
+extension NFCWriter {
+    func queryAndWrite(tag: NFCNDEFTag, session: NFCNDEFReaderSession) {
+        tag.queryNDEFStatus { status, capacity, error in
+            if let error = error {
+                session.invalidate(errorMessage: "状態取得に失敗: \(error.localizedDescription)")
+                return
+            }
+            guard let message = self.payload else {
+                session.invalidate(errorMessage: "書き込むデータがありません")
+                return
+            }
+
+            switch status {
+            case .notSupported:
+                session.invalidate(errorMessage: "このタグは NDEF 非対応です")
+            case .readOnly:
+                session.invalidate(errorMessage: "このタグは書き込み禁止です")
+            case .readWrite:
+                // 容量チェック。超過は書き込み時ではなく事前に弾く
+                let needed = message.length
+                if needed > capacity {
+                    session.invalidate(
+                        errorMessage: "容量不足: \(needed) バイト必要 / \(capacity) バイトしかありません")
+                    return
+                }
+                tag.writeNDEF(message) { error in
+                    if let error = error {
+                        session.invalidate(errorMessage: "書き込み失敗: \(error.localizedDescription)")
+                    } else {
+                        session.alertMessage = "書き込み完了"
+                        session.invalidate()
+                    }
+                }
+            @unknown default:
+                session.invalidate(errorMessage: "未知のタグ状態です")
+            }
+        }
+    }
+}
+```
+
+`NFCNDEFMessage` の `length` プロパティが、実際にタグへ書き込まれるバイト数です。これを `queryNDEFStatus` が返す `capacity` と先に突き合わせることで、容量オーバーを書き込みの瞬間ではなく事前に弾けます。安価な NTAG213 は 144 バイト前後しか入らないため、長い URL やクエリパラメータを盛ると簡単にあふれます。私は店頭用に短縮 URL を別途用意して、タグには短い URL だけを書くようにしました。
+
+なお `Info.plist` に `NFCReaderUsageDescription` の記述が必須で、さらに書き込みには Capabilities の Near Field Communication Tag Reading を有効にし、エンタイトルメントに NDEF フォーマットの許可が必要です。Rork Max のプロジェクト設定でこのあたりが抜けると、ビルドは通るのに実機でセッションが即座に閉じる、という分かりにくい失敗になります。
+
+## 実機でしか出ない失敗を先回りする
+
+NFC はシミュレータで一切動きません。つまり書き込み機能は、書いた瞬間から実機テストが前提になります。ここで効いたのが Rork Companion でした。有料の Apple Developer アカウントを用意する前の段階でも、実機 iPhone にアプリを載せてタグへの書き込みを確認できるので、試作の回数を増やせます。書き込みのように物理タグ相手の機能ほど、この「すぐ実機で試せる」価値は大きいと感じます。
+
+実機で先回りして潰しておきたい失敗は、おおむね次に集約されました。
+
+<table>
+<thead>
+<tr><th>症状</th><th>主な原因</th><th>対処</th></tr>
+</thead>
+<tbody>
+<tr><td>かざすとセッションが即終了</td><td>エンタイトルメント/Info.plist の設定漏れ</td><td>NFC Capabilities と NFCReaderUsageDescription を確認</td></tr>
+<tr><td>容量不足で失敗</td><td>URL が長すぎる・タグが小容量</td><td>短縮 URL を使う / NTAG215 以上を選ぶ</td></tr>
+<tr><td>書き込めるが後で消える</td><td>書き込み禁止ロックをかけていない</td><td>運用が固まったら readOnly 化を別途実装</td></tr>
+<tr><td>たまに書き込めない個体がある</td><td>タグのフォーマット未初期化</td><td>NDEF フォーマット段を事前に挟む</td></tr>
+</tbody>
+</table>
+
+特に最後の「フォーマット未初期化」は、新品のタグでも混じることがあり、読み直し検証を入れていないと「成功したつもりで空」という最悪の体験になります。書き込み後に同じセッションでもう一度読み、書いた URL が取れるかを確かめる検証段を、本番では必ず足すことをおすすめします。
+
+## 書き込みを足してから考える次の一手
+
+読み取りから書き込みへ広げると、アプリは「情報を受け取る」側から「世界に情報を置く」側へ役割を変えます。実装の核は、状態確認と容量確認を先に済ませ、書いたあと読み直して検証すること。この 4 段を崩さなければ、Rork Max が出すコードに検証段を足すだけで、実用に耐える書き込み機能になります。
+
+次の一歩としては、まず短い URL を1件だけ書く最小版を Companion で実機確認し、容量と検証のログを残してみてください。そのログがあれば、NTAG のどの型を選ぶか、URL をどこまで短くするかを、推測ではなく実測で決められます。同じように個人開発でモノと連携する機能に挑む方の、最初の足がかりになれば嬉しいです。
