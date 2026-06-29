@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "NATIVE — Rork MaxはAR/LiDARスキャン、Metalの3D、ウィジェット、Live Activities、HealthKitなどネイティブ機能を解放します",
-    "FUNDING — Rorkはa16zから280万ドルを調達し、月間訪問は74万を超え、成長率は85%に達しています",
-    "RN — 通常のRorkはReact Native(Expo)でiOSとAndroidアプリをまとめて生成します",
-    "FOCUS — Rorkはネイティブモバイルアプリ専業で、Web中心のBoltやLovableと一線を画します",
-    "PRICING — 無料で始められ、有料プランは月25ドルから、Rork Maxは月200ドルで2クリックのApp Store公開に対応します",
+    "FUNDING — RorkがLeft Lane Capital主導で$15Mのシードを調達しました",
+    "RORK MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成します",
+    "PLATFORM — iPhone・iPad・Watch・Vision Proに対応し、Live ActivitiesやCore MLまで使えます",
+    "GROWTH — 月間74.3万訪問・成長率85%と利用が伸び続けています",
+    "TEST — Companionアプリで有料Apple Developerアカウント無しに実機テストができます",
+    "STACK — 本体はReact NativeとExpoで、ウェブラッパーでない真のネイティブ体験を提供します",
   ],
   en: [
-    "MAX — Rork Max builds native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — Rork Max unlocks AR/LiDAR scanning, Metal 3D, widgets, Live Activities, HealthKit, and more",
-    "FUNDING — Rork raised $2.8M from a16z, now drawing 743k+ monthly visits at an 85% growth rate",
-    "RN — Standard Rork generates iOS and Android apps together using React Native (Expo)",
-    "FOCUS — Rork focuses solely on native mobile apps, setting it apart from web-first Bolt and Lovable",
-    "PRICING — Free to start, paid plans from $25/mo, with Rork Max at $200/mo and two-click App Store publishing",
+    "FUNDING — Rork raises a $15M seed led by Left Lane Capital",
+    "RORK MAX — Rork Max generates native Swift apps instead of React Native",
+    "PLATFORM — It targets iPhone, iPad, Watch, and Vision Pro, reaching Live Activities and Core ML",
+    "GROWTH — Traffic keeps climbing at 743K monthly visits and 85% growth",
+    "TEST — The Companion app lets you test on a real device without a paid Apple Developer account",
+    "STACK — Built on React Native and Expo for true native experiences, not web wrappers",
   ],
 };
 
