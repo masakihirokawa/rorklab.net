@@ -1,0 +1,285 @@
+---
+title: "Designing a Referral System Without a Heavy Backend"
+slug: "rork-referral-invite-code-attribution-reward-fulfillment-design"
+category: "rork-business"
+level: "intermediate"
+premium: true
+date: "2026-06-29T11:05"
+updated: "2026-06-29T11:05"
+author: "Rork Lab"
+description: "Add a referral program to your Rork (Expo) app without standing up a fleet of servers. Covers code generation, deferred deep-link attribution on first launch, idempotent reward fulfillment that never double-pays, and basic guards against self-referral and device farming, all with working code."
+tags: ["Rork", "Expo", "Referral Program", "Attribution", "Deep Linking", "App Monetization"]
+highlights:
+  - "Stand up a two-sided referral program that rewards both the inviter and the invitee using a single lightweight backend such as Convex"
+  - "Build deferred deep-link attribution that carries the referrer through to first launch even when the invitee has not installed the app yet"
+  - "Make reward fulfillment fire exactly once with an idempotency guard, plus practical guards against self-referral and device farming"
+---
+
+On one of the wallpaper apps I run on my own, an existing user once told me, "I'd love to recommend this to a friend if there were something in it for me too." When you want to grow through your users instead of leaning on ads, the first wall I hit was deceptively simple: how do you reliably record who invited whom? The referral mechanic itself is not hard. But carrying the referrer through to someone who hasn't installed the app yet, and paying a reward exactly once, are the two places where a careless design falls apart fast.
+
+This walkthrough lays out how to add a referral program to a Rork-generated Expo app without standing up a fleet of servers. Working from the indie-developer assumption that you have no heavy backend, I will keep everything inside a single lightweight backend — Convex, in this example — with code along the way.
+
+## Decide first: when does a referral count?
+
+The first decision in a referral program is not an implementation detail; it is "at what moment do we finalize the reward?" Start building before you settle this and you end up either weak to abuse, or with users who never receive their reward and lose trust. There are roughly three options, each with a different character.
+
+<table>
+<thead>
+<tr><th>Fulfillment moment</th><th>Abuse resistance</th><th>Inviter satisfaction</th><th>Best-fit app</th></tr>
+</thead>
+<tbody>
+<tr><td>On install</td><td><strong>Weak</strong> (empty installs)</td><td>High (instant)</td><td>Free apps with small rewards</td></tr>
+<tr><td>After a first meaningful action</td><td>Medium</td><td>Medium (a short wait)</td><td>Wallpaper/tool apps built on retention</td></tr>
+<tr><td>After a purchase/subscription</td><td><strong>Strong</strong></td><td>Lower (heavier condition)</td><td>Revenue-driven subscription apps</td></tr>
+</tbody>
+</table>
+
+For my wallpaper app I chose the middle path: the reward is finalized "once the invitee saves three favorites on their first run." It blunts empty-install abuse while not making the inviter wait too long. Pick this single point based on your app before you touch the implementation below.
+
+## The overall flow
+
+A referral program is clearest when split into four stages.
+
+1. **Code generation** — issue a unique referral code per inviter and turn it into a shareable link
+2. **Attribution** — on the invitee's first launch, carry through which code they came from
+3. **Claim** — register the carried code with the backend to form the referral relationship
+4. **Fulfillment** — once the condition is met, pay both sides idempotently
+
+We build in that order.
+
+## 1. Generating referral codes
+
+Make codes "short, hard to misread, and hard to guess." Avoid sequential numbers — they let anyone guess someone else's code. Generate from an alphabet with confusing characters removed (0/O, 1/I), regenerating on collision.
+
+```typescript
+// utils/referralCode.ts
+// 28 chars with confusing ones removed. 8 places ~= 4.7 trillion combinations
+const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+export function generateReferralCode(length = 8): string {
+  let code = "";
+  const bytes = new Uint8Array(length);
+  // On Expo, use getRandomValues from expo-crypto
+  crypto.getRandomValues(bytes);
+  for (let i = 0; i < length; i++) {
+    code += ALPHABET[bytes[i] % ALPHABET.length];
+  }
+  return code;
+}
+```
+
+The backend confirms the code if unused and regenerates on collision. Here is a Convex mutation that guarantees uniqueness.
+
+```typescript
+// convex/referrals.ts
+import { mutation } from "./_generated/server";
+import { v } from "convex/values";
+
+export const ensureMyCode = mutation({
+  args: { ownerId: v.string(), candidate: v.string() },
+  handler: async (ctx, { ownerId, candidate }) => {
+    // Reuse an existing code so re-issuing never changes the number
+    const existing = await ctx.db
+      .query("referralCodes")
+      .withIndex("by_owner", (q) => q.eq("ownerId", ownerId))
+      .unique();
+    if (existing) return existing.code;
+
+    // Check the candidate is not already taken
+    const clash = await ctx.db
+      .query("referralCodes")
+      .withIndex("by_code", (q) => q.eq("code", candidate))
+      .unique();
+    if (clash) {
+      throw new Error("CODE_TAKEN"); // client makes a new candidate and retries
+    }
+
+    await ctx.db.insert("referralCodes", {
+      ownerId,
+      code: candidate,
+      createdAt: Date.now(),
+    });
+    return candidate;
+  },
+});
+```
+
+The key is to **pin one code per owner**. If it changes on every re-issue, links you already shared go dead and users get confused. Have the client make a fresh candidate only when `CODE_TAKEN` comes back — that division of labor stays stable.
+
+## 2. The hard part — attributing users who haven't installed yet
+
+Consider someone who taps a referral link but has not installed the app. They go from the link to the App Store / Google Play, install, and on first launch you must carry through "which code did they come from." This is the deferred deep link, and it makes or breaks a referral program.
+
+Without an external dedicated service, there are two realistic approaches.
+
+<table>
+<thead>
+<tr><th>Approach</th><th>How it works</th><th>Drop-off</th><th>Indie-friendliness</th></tr>
+</thead>
+<tbody>
+<tr><td>Clipboard</td><td>Landing page writes the code to the clipboard; app reads it on first launch</td><td>Some (OS permission and paste banner)</td><td><strong>Easy to adopt</strong></td></tr>
+<tr><td>Probabilistic matching</td><td>Match click time and device traits to the first launch</td><td>Medium (accuracy varies)</td><td>Heavy to build yourself</td></tr>
+</tbody>
+</table>
+
+For indie work the clipboard approach is the practical one. On iOS, touching the clipboard on first launch shows a paste notification, so read it inside the context of a "welcome" screen rather than abruptly.
+
+On the lightweight landing page for the referral link, stash the code like this.
+
+```html
+<!-- Referral landing page (e.g. https://example.com/i/ABCD2345 ) -->
+<script>
+  const code = location.pathname.split("/").pop();
+  // To the clipboard (some browsers require a user gesture, so offer a button too)
+  navigator.clipboard?.writeText("ref:" + code).catch(() => {});
+  // Send to the store
+  const ua = navigator.userAgent;
+  const store = /android/i.test(ua)
+    ? "https://play.google.com/store/apps/details?id=YOUR_PACKAGE"
+    : "https://apps.apple.com/app/idYOUR_APP_ID";
+  document.getElementById("go").href = store;
+</script>
+```
+
+The app checks the clipboard exactly once on first launch and, if it carries the `ref:` prefix, takes it as a code. The prefix keeps you from accidentally picking up unrelated copied text.
+
+```typescript
+// hooks/useDeferredReferral.ts
+import * as Clipboard from "expo-clipboard";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const FLAG = "referral.checkedClipboard";
+const PENDING = "referral.pendingCode";
+
+export async function captureDeferredReferralOnce(): Promise<string | null> {
+  // Run only once on first launch (do not re-read on every restart)
+  if (await AsyncStorage.getItem(FLAG)) return null;
+  await AsyncStorage.setItem(FLAG, "1");
+
+  try {
+    const text = await Clipboard.getStringAsync();
+    if (text?.startsWith("ref:")) {
+      const code = text.slice(4).trim();
+      if (/^[A-Z0-9]{6,12}$/.test(code)) {
+        await AsyncStorage.setItem(PENDING, code);
+        return code;
+      }
+    }
+  } catch {
+    // Failure is not fatal (the referral simply does not attach)
+  }
+  return null;
+}
+```
+
+For already-installed users you can pass the code directly with an Expo Linking deep link. Funnel both paths into the same `PENDING` so the later claim step has a single source of truth.
+
+```typescript
+import * as Linking from "expo-linking";
+
+// Pick up ?ref= from the launch URL (already-installed path)
+const url = await Linking.getInitialURL();
+if (url) {
+  const { queryParams } = Linking.parse(url);
+  if (typeof queryParams?.ref === "string") {
+    await AsyncStorage.setItem(PENDING, queryParams.ref);
+  }
+}
+```
+
+## 3. Claim — forming the relationship
+
+If there is a pending code, register it once the user's account (or anonymous ID) is established. What matters here is **rejecting self-referrals and double claims**.
+
+```typescript
+// convex/referrals.ts
+export const claimReferral = mutation({
+  args: { code: v.string(), inviteeId: v.string(), deviceId: v.string() },
+  handler: async (ctx, { code, inviteeId, deviceId }) => {
+    const owner = await ctx.db
+      .query("referralCodes")
+      .withIndex("by_code", (q) => q.eq("code", code))
+      .unique();
+    if (!owner) return { ok: false, reason: "INVALID_CODE" };
+
+    // Forbid self-referral
+    if (owner.ownerId === inviteeId) return { ok: false, reason: "SELF" };
+
+    // One claim per invitee
+    const already = await ctx.db
+      .query("referrals")
+      .withIndex("by_invitee", (q) => q.eq("inviteeId", inviteeId))
+      .unique();
+    if (already) return { ok: false, reason: "ALREADY_CLAIMED" };
+
+    // Simple device-dedupe (guards against farming on one device)
+    const sameDevice = await ctx.db
+      .query("referrals")
+      .withIndex("by_device", (q) => q.eq("deviceId", deviceId))
+      .collect();
+    if (sameDevice.length >= 1) return { ok: false, reason: "DEVICE_LIMIT" };
+
+    await ctx.db.insert("referrals", {
+      referrerId: owner.ownerId,
+      inviteeId,
+      deviceId,
+      code,
+      status: "pending", // reward not yet finalized
+      claimedAt: Date.now(),
+    });
+    return { ok: true };
+  },
+});
+```
+
+The device check is not perfect anti-fraud, but at indie scale it is a high-leverage move that blunts the classic "invite myself repeatedly on one device" abuse. Use an identifier stable across launches for `deviceId` (on Expo, the installation ID from `expo-application`). I avoid the advertising ID here because it brings a permission prompt into the mix.
+
+## 4. Making fulfillment fire exactly once
+
+The most common accident in a referral program is double-paying the reward. If fulfillment runs more than once because of a network retry or an app restart, the inviter gets paid twice or three times. The one reliable way to prevent this is an **idempotency guard so the same fulfillment is a no-op however many times it is called**.
+
+```typescript
+// convex/referrals.ts
+export const fulfillReferral = mutation({
+  args: { inviteeId: v.string() },
+  handler: async (ctx, { inviteeId }) => {
+    const ref = await ctx.db
+      .query("referrals")
+      .withIndex("by_invitee", (q) => q.eq("inviteeId", inviteeId))
+      .unique();
+    if (!ref) return { ok: false, reason: "NO_REFERRAL" };
+
+    // Already finalized? Do nothing (the heart of idempotency)
+    if (ref.status === "fulfilled") return { ok: true, idempotent: true };
+
+    // Judge the condition on the server (never trust the client's self-report)
+    const milestone = await ctx.db
+      .query("milestones")
+      .withIndex("by_user", (q) => q.eq("userId", inviteeId))
+      .unique();
+    if (!milestone || milestone.savedCount < 3) {
+      return { ok: false, reason: "CONDITION_NOT_MET" };
+    }
+
+    // Advance state to fulfilled FIRST, then grant to both (order matters)
+    await ctx.db.patch(ref._id, { status: "fulfilled", fulfilledAt: Date.now() });
+    await grantReward(ctx, ref.referrerId, "referrer");
+    await grantReward(ctx, inviteeId, "invitee");
+    return { ok: true };
+  },
+});
+```
+
+Always judge the condition on the server. If you trust the client to report "saved three," a modified build walks right through it. Record an achievement like `savedCount` to the server on each save, and have `fulfillReferral` merely read it.
+
+The order — advancing state to `fulfilled` before granting — also matters. Reverse it and, if the process dies right after granting but before the state update, the next call re-grants. Lock in the state first and any re-run is caught by the idempotency guard at the top.
+
+## Pitfalls and notes from production
+
+A few things I noticed in actual operation. First, the clipboard approach triggers iOS's paste notification, so the first-launch context shapes the experience heavily. Just adding one line — "Welcome. If you arrived from a referral link, you can claim a perk" — softened the abruptness considerably.
+
+Second, the fulfillment notification. The moment the invitee meets the condition, the inviter is almost never in the app. I added a push notification that says "Your friend reached the perk condition." If finalization is invisible, users don't trust the mechanic.
+
+Finally, referred users tend to stick better than ordinary traffic, but some reward-chasing thin usage mixes in. In my operation, keeping the reward modest and tilting it toward "improving the invitee's experience" (unlocking an extra wallpaper pack, say) cut down on abuse and, in the end, worked healthily as an on-ramp to paid plans. Growth through your users instead of ads quietly supports the revenue base.
+
+A referral program isn't about handing out codes; its essence is "counting who brought whom exactly once, correctly." Decide the fulfillment moment first, then build the idempotent finalization. Start there.

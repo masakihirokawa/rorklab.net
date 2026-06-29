@@ -1,0 +1,285 @@
+---
+title: "紹介コードで友達を招く仕組みを、重いバックエンドなしで設計する"
+slug: "rork-referral-invite-code-attribution-reward-fulfillment-design"
+category: "rork-business"
+level: "intermediate"
+premium: true
+date: "2026-06-29T11:05"
+updated: "2026-06-29T11:05"
+author: "Rork Lab"
+description: "Rork(Expo)アプリに紹介コードによる招待の仕組みを、専用サーバーを立てずに組み込みます。コード発行、遅延ディープリンクでの初回起動アトリビューション、二重付与を防ぐ冪等な報酬確定、自己紹介や端末重複への基本的な対策までを実装コード付きで扱います。"
+tags: ["Rork", "Expo", "紹介プログラム", "アトリビューション", "ディープリンク", "アプリ収益化"]
+highlights:
+  - "招待した側とされた側の両方に報酬を渡す紹介プログラムを、Convex などの軽量バックエンド1つだけで成立させる構成を手に入れられる"
+  - "アプリ未インストールの相手にも紹介元を引き継ぐ、遅延ディープリンクの初回起動アトリビューション実装を組み立てられる"
+  - "再送やリトライで報酬が二重に付かないよう、冪等キーで確定を一度きりにする設計と、自己紹介・端末重複への基本的な歯止めを入れられる"
+---
+
+個人で運用している壁紙アプリのひとつで、既存の利用者から「友達に勧めたら自分にも何か返ってくると嬉しい」という声をもらったことがあります。広告に頼らず利用者の輪で広げたいと考えたとき、最初に立ちはだかったのは「誰が誰を招いたか」をどう確実に記録するか、という一点でした。紹介の仕組みそのものは難しくありませんが、アプリをまだ入れていない相手に紹介元を引き継ぐところと、報酬を一度だけ確実に渡すところで、設計を誤ると簡単に破綻します。
+
+ここでは Rork で生成した Expo アプリに、専用のサーバー群を立てずに紹介プログラムを組み込む設計を整理します。重いバックエンドを持たない個人開発の前提で、軽量バックエンド（ここでは Convex を例にします）1つで完結させる構成を、コードを添えて書いていきます。
+
+## まず決めるべきは「いつ紹介を確定させるか」
+
+紹介プログラムで最初に決めるのは、機能の実装ではなく「どの瞬間に報酬を確定させるか」です。ここが曖昧なまま作り始めると、不正に弱くなったり、利用者が報酬をもらえず不信感を抱いたりします。確定タイミングには大きく3つの選択肢があり、それぞれ性質が異なります。
+
+<table>
+<thead>
+<tr><th>確定タイミング</th><th>不正への強さ</th><th>招待者の満足度</th><th>向いているアプリ</th></tr>
+</thead>
+<tbody>
+<tr><td>インストール直後</td><td><strong>弱い</strong>（空インストールで荒らせる）</td><td>高い（すぐ返る）</td><td>無課金中心・報酬が小さいアプリ</td></tr>
+<tr><td>初回の意味ある操作後</td><td>中</td><td>中（少し待つ）</td><td>壁紙・ツール系など継続利用前提</td></tr>
+<tr><td>課金・サブスク開始後</td><td><strong>強い</strong></td><td>低め（条件が重い）</td><td>収益直結のサブスクアプリ</td></tr>
+</tbody>
+</table>
+
+私の壁紙アプリでは、報酬は「招待された側が初回にお気に入りを3枚保存したら確定」という中間の設計にしました。空インストールでの荒らしをある程度防ぎつつ、招待者を長く待たせない落としどころです。アプリの性質に応じてこの一点を先に決めてから、以下の実装に入ってください。
+
+## 全体の流れ
+
+紹介プログラムは、次の4つの段階に分けると見通しが良くなります。
+
+1. **コード発行** — 招待者ごとに一意な紹介コードを発行し、共有できるリンクにする
+2. **アトリビューション** — 招待された側の初回起動時に、どのコード経由で来たかを引き継ぐ
+3. **クレーム** — 引き継いだコードをバックエンドに登録し、招待関係を作る
+4. **報酬確定** — 条件を満たした時点で、両者に冪等に報酬を渡す
+
+この順に組み立てます。
+
+## 1. 紹介コードの発行
+
+コードは「短く・読み間違えにくく・推測されにくい」ものにします。連番にすると他人のコードを推測で当てられてしまうため避けます。紛らわしい文字（0とO、1とI）を除いた英数字から、衝突したら作り直す前提で生成します。
+
+```typescript
+// utils/referralCode.ts
+// 紛らわしい文字を除いた 28 文字。8 桁で約 4.7 兆通り
+const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+export function generateReferralCode(length = 8): string {
+  let code = "";
+  const bytes = new Uint8Array(length);
+  // Expo では expo-crypto の getRandomValues を使う
+  crypto.getRandomValues(bytes);
+  for (let i = 0; i < length; i++) {
+    code += ALPHABET[bytes[i] % ALPHABET.length];
+  }
+  return code;
+}
+```
+
+このコードはバックエンド側で「未使用なら確定、衝突したら再発行」とします。Convex のミューテーションで一意性を担保する例です。
+
+```typescript
+// convex/referrals.ts
+import { mutation } from "./_generated/server";
+import { v } from "convex/values";
+
+export const ensureMyCode = mutation({
+  args: { ownerId: v.string(), candidate: v.string() },
+  handler: async (ctx, { ownerId, candidate }) => {
+    // すでに自分のコードがあれば再利用（再発行で番号が変わらないようにする）
+    const existing = await ctx.db
+      .query("referralCodes")
+      .withIndex("by_owner", (q) => q.eq("ownerId", ownerId))
+      .unique();
+    if (existing) return existing.code;
+
+    // 候補コードが衝突していないか確認
+    const clash = await ctx.db
+      .query("referralCodes")
+      .withIndex("by_code", (q) => q.eq("code", candidate))
+      .unique();
+    if (clash) {
+      throw new Error("CODE_TAKEN"); // クライアント側で別候補を作って再試行
+    }
+
+    await ctx.db.insert("referralCodes", {
+      ownerId,
+      code: candidate,
+      createdAt: Date.now(),
+    });
+    return candidate;
+  },
+});
+```
+
+ポイントは、コードを**所有者ごとに1つに固定**することです。再発行のたびに変わると、すでに共有済みのリンクが無効になり混乱を招きます。`CODE_TAKEN` が返ったときだけクライアントで別候補を作り直す、という役割分担にしておくと安定します。
+
+## 2. 一番の難所 — 未インストール相手へのアトリビューション
+
+紹介リンクを踏んだ相手が、まだアプリを入れていない場合を考えます。リンクから App Store / Google Play に飛び、インストールして初回起動したときに「どのコード経由か」を引き継がなければなりません。これがいわゆる遅延ディープリンク（deferred deep link）で、紹介プログラムの成否を分ける部分です。
+
+外部の専用サービスを使わずに、現実的に成立させる方法は2通りあります。
+
+<table>
+<thead>
+<tr><th>方式</th><th>仕組み</th><th>取りこぼし</th><th>個人開発での扱いやすさ</th></tr>
+</thead>
+<tbody>
+<tr><td>クリップボード方式</td><td>リンク先 Web ページでコードをクリップボードに書き、初回起動時に読む</td><td>やや多い（OS の許可・貼り付けバナー）</td><td><strong>導入が容易</strong></td></tr>
+<tr><td>確率的マッチング</td><td>クリック時刻・端末特性で初回起動と突き合わせる</td><td>中（精度は環境依存）</td><td>自前実装は重い</td></tr>
+</tbody>
+</table>
+
+個人開発で現実的なのはクリップボード方式です。iOS では初回起動時にクリップボードへアクセスすると貼り付け通知が出るため、利用者に唐突な印象を与えないよう、初回起動の「ようこそ」画面の文脈で読むのが穏当です。
+
+紹介リンク先の軽量な Web ページ側では、次のようにコードを控えておきます。
+
+```html
+<!-- 紹介リンクの着地ページ（例: https://example.com/i/ABCD2345 ) -->
+<script>
+  const code = location.pathname.split("/").pop();
+  // クリップボードへ（ユーザー操作起点が必要なブラウザもあるためボタンも用意）
+  navigator.clipboard?.writeText("ref:" + code).catch(() => {});
+  // ストアへ誘導
+  const ua = navigator.userAgent;
+  const store = /android/i.test(ua)
+    ? "https://play.google.com/store/apps/details?id=YOUR_PACKAGE"
+    : "https://apps.apple.com/app/idYOUR_APP_ID";
+  document.getElementById("go").href = store;
+</script>
+```
+
+アプリ側は初回起動時に一度だけクリップボードを確認し、`ref:` 接頭辞が付いていればコードとして取り込みます。接頭辞を付けておくと、無関係なコピー内容を誤って拾いません。
+
+```typescript
+// hooks/useDeferredReferral.ts
+import * as Clipboard from "expo-clipboard";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const FLAG = "referral.checkedClipboard";
+const PENDING = "referral.pendingCode";
+
+export async function captureDeferredReferralOnce(): Promise<string | null> {
+  // 初回起動の1回だけ実行する（再起動で何度も読まない）
+  if (await AsyncStorage.getItem(FLAG)) return null;
+  await AsyncStorage.setItem(FLAG, "1");
+
+  try {
+    const text = await Clipboard.getStringAsync();
+    if (text?.startsWith("ref:")) {
+      const code = text.slice(4).trim();
+      if (/^[A-Z0-9]{6,12}$/.test(code)) {
+        await AsyncStorage.setItem(PENDING, code);
+        return code;
+      }
+    }
+  } catch {
+    // 失敗しても致命ではない（紹介が付かないだけ）
+  }
+  return null;
+}
+```
+
+インストール済みの相手には、Expo Linking のディープリンクで直接コードを渡せます。両方の経路で同じ `PENDING` に集約しておくと、後続のクレーム処理を一本化できます。
+
+```typescript
+import * as Linking from "expo-linking";
+
+// アプリ起動時のリンクから ?ref= を拾う（インストール済み経由）
+const url = await Linking.getInitialURL();
+if (url) {
+  const { queryParams } = Linking.parse(url);
+  if (typeof queryParams?.ref === "string") {
+    await AsyncStorage.setItem(PENDING, queryParams.ref);
+  }
+}
+```
+
+## 3. クレーム — 招待関係を作る
+
+保留中のコードがあれば、利用者のアカウント（または匿名 ID）が定まった時点でバックエンドに登録します。ここで重要なのは、**自己紹介と二重クレームを弾く**ことです。
+
+```typescript
+// convex/referrals.ts
+export const claimReferral = mutation({
+  args: { code: v.string(), inviteeId: v.string(), deviceId: v.string() },
+  handler: async (ctx, { code, inviteeId, deviceId }) => {
+    const owner = await ctx.db
+      .query("referralCodes")
+      .withIndex("by_code", (q) => q.eq("code", code))
+      .unique();
+    if (!owner) return { ok: false, reason: "INVALID_CODE" };
+
+    // 自己紹介を禁止
+    if (owner.ownerId === inviteeId) return { ok: false, reason: "SELF" };
+
+    // 同一招待者は一度だけ
+    const already = await ctx.db
+      .query("referrals")
+      .withIndex("by_invitee", (q) => q.eq("inviteeId", inviteeId))
+      .unique();
+    if (already) return { ok: false, reason: "ALREADY_CLAIMED" };
+
+    // 端末重複の簡易チェック（同じ端末で何度も招待される荒らし対策）
+    const sameDevice = await ctx.db
+      .query("referrals")
+      .withIndex("by_device", (q) => q.eq("deviceId", deviceId))
+      .collect();
+    if (sameDevice.length >= 1) return { ok: false, reason: "DEVICE_LIMIT" };
+
+    await ctx.db.insert("referrals", {
+      referrerId: owner.ownerId,
+      inviteeId,
+      deviceId,
+      code,
+      status: "pending", // 報酬はまだ確定していない
+      claimedAt: Date.now(),
+    });
+    return { ok: true };
+  },
+});
+```
+
+端末重複チェックは完璧な不正対策ではありませんが、個人開発の規模では「同じ端末で繰り返し招待される」典型的な荒らしを抑える費用対効果の高い一手です。`deviceId` には端末をまたいで安定する識別子（Expo なら `expo-application` の installationId 相当）を使います。広告 ID は許可が絡むため、ここでは使いません。
+
+## 4. 報酬確定を一度きりにする
+
+紹介プログラムで最も事故が多いのが、報酬の二重付与です。ネットワークのリトライやアプリの再起動で確定処理が複数回走ると、招待者に報酬が二重三重に入ってしまいます。これを防ぐ唯一確実な方法は、**冪等キーで「同じ確定は何度呼んでも一度きり」にする**ことです。
+
+```typescript
+// convex/referrals.ts
+export const fulfillReferral = mutation({
+  args: { inviteeId: v.string() },
+  handler: async (ctx, { inviteeId }) => {
+    const ref = await ctx.db
+      .query("referrals")
+      .withIndex("by_invitee", (q) => q.eq("inviteeId", inviteeId))
+      .unique();
+    if (!ref) return { ok: false, reason: "NO_REFERRAL" };
+
+    // すでに確定済みなら何もしない（冪等性の要）
+    if (ref.status === "fulfilled") return { ok: true, idempotent: true };
+
+    // 条件判定はサーバー側で行う（クライアントの自己申告を信じない）
+    const milestone = await ctx.db
+      .query("milestones")
+      .withIndex("by_user", (q) => q.eq("userId", inviteeId))
+      .unique();
+    if (!milestone || milestone.savedCount < 3) {
+      return { ok: false, reason: "CONDITION_NOT_MET" };
+    }
+
+    // 状態を fulfilled に進めてから両者へ付与（順序が大事）
+    await ctx.db.patch(ref._id, { status: "fulfilled", fulfilledAt: Date.now() });
+    await grantReward(ctx, ref.referrerId, "referrer");
+    await grantReward(ctx, inviteeId, "invitee");
+    return { ok: true };
+  },
+});
+```
+
+確定条件の判定は必ずサーバー側で行います。「3枚保存した」という事実をクライアントの申告に任せると、改造で簡単に突破されます。`savedCount` のような実績は保存処理のたびにサーバーへ記録しておき、`fulfillReferral` はそれを読むだけにします。
+
+状態を `fulfilled` に進めてから報酬を渡す順序も重要です。逆にすると、付与の直後・状態更新の前に処理が落ちた場合、次回呼び出しで再付与されます。先に状態を確定させておけば、再実行は冒頭の冪等ガードで弾かれます。
+
+## つまずきやすい点と本番運用での所感
+
+実際に運用してみて気づいた点をいくつか共有します。まず、クリップボード方式は iOS の貼り付け通知が出るため、初回起動の文脈設計が体験を大きく左右します。「ようこそ。紹介リンクから来られた方は特典が受け取れます」という一文を添えるだけで、唐突さがかなり和らぎました。
+
+次に、報酬の確定通知です。招待された側が条件を満たした瞬間、招待した本人はアプリを開いていないことがほとんどです。私はプッシュ通知で「お友達が特典の条件を達成しました」と伝える導線を入れました。確定が見えないと、利用者は仕組みを信用してくれません。
+
+最後に、紹介で増えた利用者は通常の流入より定着しやすい一方、報酬目的の薄い利用も混じります。私の運用では、報酬は控えめにして「招待された側の体験を良くする」方向（追加の壁紙パック開放など）に寄せたところ、荒らしが減り、結果的に課金への入り口としても健全に機能しました。広告に頼らずに利用者の輪で広げる設計は、収益の土台を静かに支えてくれる手応えがあります。
+
+紹介プログラムは、コードを配ることが目的ではなく「誰が誰を連れてきたかを、一度だけ正しく数える」ことが本質です。まずは確定タイミングを決め、冪等な確定から作ってみてください。

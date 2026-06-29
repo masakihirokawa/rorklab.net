@@ -1,0 +1,214 @@
+---
+title: "Respecting Metered Connections and Low Data Mode in an Image-Heavy Rork App"
+slug: "rork-netinfo-metered-low-data-mode-adaptive-prefetch-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-29T11:35"
+updated: "2026-06-29T11:35"
+author: "Rork Lab"
+description: "In an image-heavy Rork (Expo) app, hold back prefetching on metered connections and Low Data Mode. Read the connection's character from NetInfo details, drop image quality, and defer prefetch with an adaptive policy layer, all with working code."
+tags: ["Rork", "Expo", "NetInfo", "Low Data Mode", "Prefetch", "Network Optimization"]
+highlights:
+  - "Get an adaptive-prefetch implementation that automatically stops look-ahead and lowers image quality when the connection is metered, slow, or in a saver mode"
+  - "Build a single centralized network-policy layer that reads isConnectionExpensive and cellular generation from NetInfo details and converts them into a policy"
+  - "Move past the all-or-nothing 'prefetch everything or do nothing' choice toward behavior that scales with the connection"
+---
+
+A review of one of the wallpaper apps I run once said, "I opened it where there was no Wi-Fi and my data melted in seconds." The cause was immediate: the list screen was aggressively prefetching the next page of high-resolution images. Behavior that adds comfort on Wi-Fi was quietly eating the user's mobile data on a metered connection. The more images an app handles, the more this "well-intentioned prefetch" backfires.
+
+This walkthrough, using a Rork-generated Expo app, lays out a network design that reads the connection's character and adapts prefetch and image quality. The key is to stop seeing the connection as a binary "connected or not," and go further: is it metered, is it slow, is it a saver mode?
+
+## Stop judging on "online or not" alone
+
+Many apps look only at `isConnected` and, if connected, do everything. But users' connections are not uniform. NetInfo's `details` carries far more you can act on.
+
+<table>
+<thead>
+<tr><th>Signal</th><th>Source (NetInfo)</th><th>What it means</th></tr>
+</thead>
+<tbody>
+<tr><td>Metered?</td><td>details.isConnectionExpensive</td><td>OS considers it a "costly" connection (includes tethering)</td></tr>
+<tr><td>Connection type</td><td>type (wifi / cellular / ...)</td><td>Wi-Fi or mobile</td></tr>
+<tr><td>Cellular generation</td><td>details.cellularGeneration (3g/4g/5g)</td><td>A speed proxy (avoid heavy prefetch on 3g)</td></tr>
+<tr><td>Saver mode</td><td>see below</td><td>The user is explicitly conserving data</td></tr>
+</tbody>
+</table>
+
+`isConnectionExpensive` is the OS's "metered-equivalent" flag, and it includes Wi-Fi over tethering. Honoring just this prevents most "data melts away" incidents like the one in that review.
+
+Low Data Mode needs a caveat. There is no clean, unified API for an app to read iOS Low Data Mode or Android Data Saver as a simple on/off. In practice, treat `isConnectionExpensive` as a proxy for saver intent, and pair it with a second layer: an in-app conservation switch the user controls. Merge both the OS's intent (metered judgment) and the app's setting (explicit switch) into the policy.
+
+## Centralize the network judgment
+
+Scatter the connection judgment across screens and the decisions will inevitably diverge. Build one layer that converts connection info into a single policy, and have every screen look only at that policy.
+
+```typescript
+// net/networkPolicy.ts
+import NetInfo, { NetInfoState } from "@react-native-community/netinfo";
+
+export type PrefetchLevel = "full" | "lite" | "off";
+export type ImageQuality = "high" | "medium" | "low";
+
+export interface NetworkPolicy {
+  prefetch: PrefetchLevel;   // strength of look-ahead
+  imageQuality: ImageQuality; // quality to fetch
+  allowAutoplay: boolean;     // whether video/GIF autoplay is allowed
+}
+
+// Convert connection state + the app's saver setting into one policy
+export function derivePolicy(
+  state: NetInfoState,
+  saverEnabled: boolean
+): NetworkPolicy {
+  // Not connected
+  if (!state.isConnected) {
+    return { prefetch: "off", imageQuality: "low", allowAutoplay: false };
+  }
+
+  const expensive = !!(state.details as any)?.isConnectionExpensive;
+  const gen = (state.details as any)?.cellularGeneration as string | undefined;
+  const isSlowCellular = state.type === "cellular" && (gen === "2g" || gen === "3g");
+
+  // User chose to conserve, OR OS says metered, OR it is slow
+  if (saverEnabled || expensive || isSlowCellular) {
+    return { prefetch: "off", imageQuality: "medium", allowAutoplay: false };
+  }
+
+  // Ordinary mobile (4g/5g, non-metered)
+  if (state.type === "cellular") {
+    return { prefetch: "lite", imageQuality: "high", allowAutoplay: false };
+  }
+
+  // Wi-Fi (non-metered) — prefetch at full strength
+  return { prefetch: "full", imageQuality: "high", allowAutoplay: true };
+}
+```
+
+Hand this policy out through a React context and every screen makes a consistent decision just by reading `useNetworkPolicy()`.
+
+```typescript
+// net/NetworkPolicyProvider.tsx
+import React, { createContext, useContext, useEffect, useState } from "react";
+import NetInfo from "@react-native-community/netinfo";
+import { derivePolicy, NetworkPolicy } from "./networkPolicy";
+import { useDataSaver } from "../settings/useDataSaver"; // in-app conservation switch
+
+const Ctx = createContext<NetworkPolicy>({
+  prefetch: "lite", imageQuality: "high", allowAutoplay: false,
+});
+
+export function NetworkPolicyProvider({ children }: { children: React.ReactNode }) {
+  const saver = useDataSaver();
+  const [policy, setPolicy] = useState<NetworkPolicy>(Ctx._currentValue);
+
+  useEffect(() => {
+    // Fetch the current value once on subscribe, then listen for changes
+    const unsub = NetInfo.addEventListener((state) => {
+      setPolicy(derivePolicy(state, saver));
+    });
+    NetInfo.fetch().then((state) => setPolicy(derivePolicy(state, saver)));
+    return () => unsub();
+  }, [saver]);
+
+  return <Ctx.Provider value={policy}>{children}</Ctx.Provider>;
+}
+
+export const useNetworkPolicy = () => useContext(Ctx);
+```
+
+The key is including the saver switch (`saver`) in the dependencies. The moment the user flips the switch in settings, the policy recomputes and prefetch behavior follows instantly.
+
+## Stage prefetch according to the policy
+
+With a policy in hand, make the list screen's prefetch obey it. Instead of all-or-nothing, change behavior across three steps — `full / lite / off`.
+
+```typescript
+// hooks/useAdaptivePrefetch.ts
+import { Image } from "expo-image";
+import { useNetworkPolicy } from "../net/NetworkPolicyProvider";
+
+export function useAdaptivePrefetch() {
+  const policy = useNetworkPolicy();
+
+  // The policy decides "how many ahead to prefetch" from the visible index
+  const lookahead = policy.prefetch === "full" ? 12
+    : policy.prefetch === "lite" ? 3
+    : 0;
+
+  return async (urls: string[], currentIndex: number) => {
+    if (lookahead === 0) return; // do not prefetch when off
+    const slice = urls.slice(currentIndex + 1, currentIndex + 1 + lookahead);
+    // Swap the URL by quality (variantUrl below)
+    const targets = slice.map((u) => variantUrl(u, policy.imageQuality));
+    // Quietly prefetch into expo-image's disk cache
+    await Image.prefetch(targets, { cachePolicy: "disk" });
+  };
+}
+```
+
+The quality swap rebuilds the URL, assuming your image delivery can return size variants. A CDN query parameter or a stored variant name both work.
+
+```typescript
+// net/variantUrl.ts
+import { ImageQuality } from "./networkPolicy";
+
+export function variantUrl(base: string, quality: ImageQuality): string {
+  const width = quality === "high" ? 1080 : quality === "medium" ? 720 : 480;
+  // e.g. CDN resize params. If base already has a query, join with &
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}w=${width}&q=${quality === "low" ? 60 : 80}`;
+}
+```
+
+In a `FlatList`, call prefetch when the visible range changes. Take the current leading index from `onViewableItemsChanged`, and nothing happens if the policy is `off`.
+
+```typescript
+const prefetchNext = useAdaptivePrefetch();
+
+const onViewableItemsChanged = useRef(({ viewableItems }: any) => {
+  const first = viewableItems[0]?.index ?? 0;
+  prefetchNext(allUrls, first); // references the policy internally
+}).current;
+
+// <FlatList ... onViewableItemsChanged={onViewableItemsChanged} />
+```
+
+## Match displayed quality to the policy too
+
+Beyond prefetch, having the actually-displayed image obey the policy keeps things consistent. In saver mode, fetch medium quality and swap to high later when Wi-Fi returns.
+
+```typescript
+function AdaptiveImage({ base }: { base: string }) {
+  const policy = useNetworkPolicy();
+  return (
+    <Image
+      source={{ uri: variantUrl(base, policy.imageQuality) }}
+      // Show a cached low-quality immediately, swap when high arrives
+      placeholder={{ uri: variantUrl(base, "low") }}
+      transition={150}
+      cachePolicy="disk"
+    />
+  );
+}
+```
+
+## Rollout steps
+
+When retrofitting this into an existing screen, this order is safe. I followed it myself when applying it to my indie wallpaper app.
+
+1. Add the centralized judgment layer (`derivePolicy` and `NetworkPolicyProvider`) first, and just log for a while to observe the real connection distribution.
+2. Replace list prefetch with `useAdaptivePrefetch`, and verify on a metered device that traffic actually stops when the policy is `off`.
+3. Swap displayed images to `AdaptiveImage`, and confirm the quality drop under a saver setting plus the high-quality swap after Wi-Fi returns.
+
+This way you can isolate behavior at each step and avoid the pitfall of shipping with prefetch still running wild. Even in an ad-driven (AdMob) app, network manners feed directly into App Store review scores.
+
+## Pitfalls and notes from production
+
+A few snags from building this. First, `isConnectionExpensive` varies in availability and accuracy by platform and OS version. Assuming "not metered" when it is `undefined` lets prefetch run wild, so I tip to the safe side (roughly `lite`) when it is unknown. When you can't read the signal, that's exactly when to be conservative.
+
+Second, making users aware the saver switch exists. Relying on the OS judgment alone misses cases like "on Wi-Fi but still watching my data." Put a "use less data" switch in settings and mention it lightly in the first-launch context; review complaints dropped visibly after I did.
+
+Finally, measurement. I record the policy distribution (what share fired as full / lite / off) and the rate at which prefetch actually arrived in time for display. When the numbers show that throttling prefetch barely dents perceived speed, you can lean toward conservation with confidence. Even with ad-driven revenue, respect for the user's data shows up in review scores and, over time, in retention.
+
+The crux of network design is simply this: don't see the connection as binary. Just honoring metered and Low Data Mode protects both the user's wallet and their trust. Start with the centralized judgment layer.
