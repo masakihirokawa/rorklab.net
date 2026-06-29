@@ -1,0 +1,208 @@
+---
+title: "New Architecture へ移行したら本番だけ画面がカクつくとき — interop 層への静かなフォールバックを計測して切り分ける運用メモ"
+slug: "rork-new-architecture-interop-fallback-release-regression-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-29T11:00"
+updated: "2026-06-29T11:00"
+author: "Rork Lab"
+description: "New Architecture へ切り替えた Rork アプリが、開発中は快適なのにリリースビルドの実機でだけ一覧スクロールがカクつく。原因は旧式ネイティブモジュールが interop 層へ静かにフォールバックしていたことでした。検知の計測と段階的な切り戻しの実務メモです。"
+tags: ["Rork", "React Native", "New Architecture", "TurboModules", "Fabric", "パフォーマンス", "interop", "リリースビルド"]
+highlights:
+  - "「dev では出ないが release でだけ出る」回帰を、interop 層フォールバックの計測で切り分ける手順"
+  - "どのネイティブモジュールが legacy 経路に落ちているかを起動時に列挙する実装"
+  - "全体を旧アーキへ戻さず、問題モジュールだけを隔離して段階的に直す切り戻し設計"
+---
+
+## 開発機では出ない不具合に半日溶かした話
+
+ある壁紙アプリを Expo SDK 52 系へ上げ、New Architecture を有効にしたまま数週間、特に問題なく運用していました。ところが、ある日 TestFlight に配ったビルドで「一覧をスクロールすると一瞬引っかかる」という報告が届きます。手元の開発ビルドでは何度試しても再現しません。Expo Go でも、`expo run:ios` のデバッグビルドでも、滑らかに動くのです。
+
+最終的に原因は、特定のサードパーティ製ネイティブモジュールが New Architecture の TurboModule として動かず、**interop 層（後方互換のためのブリッジ）を経由して静かに動いていた**ことでした。interop 層は「動かなくする」のではなく「遅いまま動かす」ので、機能テストはすべて通ります。だからこそ release ビルドの実機で、しかも特定画面でだけ顔を出すのです。
+
+このメモは、同じ「dev では出ないが release でだけ出る」種類の回帰に当たったときに、当て推量ではなく計測で切り分け、全体を旧アーキへ巻き戻さずに直すための実務記録です。私自身、2014年から個人開発を続けていますが、こうした「環境差で出たり消えたりする」不具合ほど、まず観測点を置くことが近道だと感じています。
+
+## なぜ dev と release で挙動が割れるのか
+
+New Architecture では、JavaScript とネイティブの間が JSI（直接参照）に置き換わり、ネイティブモジュールは TurboModule として遅延初期化されます。しかし旧式の `NativeModules` / `NativeEventEmitter` に依存したライブラリは、いきなり動かなくなるわけではありません。React Native は **interop 層**を用意していて、旧 API を新ランタイム上で取り持ってくれます。
+
+問題は、この取り持ちにコストがかかる点です。旧経路では呼び出しごとに JSON シリアライズとスレッド跨ぎが発生し、JSI のゼロコピー同期呼び出しの恩恵が消えます。一覧のセルがマウントのたびに旧式モジュール（例えば画像のメタ情報取得やデバイス情報の同期取得）を叩いていると、その差がスクロールのフレーム落ちとして表面化します。
+
+dev ビルドでこれが見えにくいのは、Metro のリロード前提で最適化が浅く、そもそも体感のばらつきが大きいからです。逆に release ビルドは Hermes のバイトコード化や最適化が効くぶん、相対的に「旧経路だけが遅い」という差が際立ちます。つまり release でだけ出るのは偶然ではなく、構造的に起きやすい現象です。
+
+## まず観測点を置く — interop に落ちたモジュールを列挙する
+
+犯人を勘で探す前に、「どのネイティブモジュールが TurboModule になっていて、どれが legacy 経路か」を起動時に一覧化します。アプリ起動直後に一度だけ走らせる軽量な点検です。
+
+```typescript
+// src/diagnostics/archProbe.ts
+// 起動時に一度だけ呼び、TurboModule 化されているモジュールと
+// legacy interop に落ちているモジュールを切り分けて記録する。
+import { TurboModuleRegistry } from 'react-native';
+
+type ProbeResult = {
+  name: string;
+  isTurbo: boolean;
+};
+
+// 自分のアプリが実際に使っているネイティブモジュール名を列挙する。
+// （依存ライブラリの README やネイティブ実装の MODULE_NAME を確認して埋める）
+const SUSPECTS = [
+  'RNDeviceInfo',
+  'RNCImageMetadata',
+  'RNFSManager',
+  'RNCAsyncStorage',
+];
+
+export function probeArchitecture(): ProbeResult[] {
+  return SUSPECTS.map((name) => {
+    // TurboModuleRegistry.get は TurboModule として登録されていれば
+    // 非 null を返す。null の場合は legacy 側で解決されている可能性が高い。
+    const turbo = TurboModuleRegistry.get(name);
+    return { name, isTurbo: turbo != null };
+  });
+}
+// 期待する出力例:
+// [{ name: 'RNDeviceInfo', isTurbo: false }, ...]  ← false が要注意
+```
+
+`isTurbo: false` のモジュールが、interop 層を通っている候補です。ここで大事なのは、**この結果を本番ビルドのテレメトリに乗せて、実機の母集団で見る**ことです。手元の1台では再現しない問題を相手にしているので、観測も実機側に置きます。
+
+```typescript
+// App.tsx の初期化部
+import { probeArchitecture } from './src/diagnostics/archProbe';
+import { track } from './src/telemetry';
+
+const probes = probeArchitecture();
+const legacy = probes.filter((p) => !p.isTurbo).map((p) => p.name);
+// 個人情報を載せず、モジュール名と件数だけを送る。
+track('arch_probe', { legacyCount: legacy.length, legacyModules: legacy });
+```
+
+数日分のイベントが溜まると、「release 機の大半で RNCImageMetadata が legacy 経路」といった事実が、推測ではなくデータとして見えてきます。
+
+## ホットパスでの呼び出し回数を測る
+
+legacy モジュールが存在するだけでは、必ずしも体感に響きません。効いてくるのは、それが**スクロールのようなホットパスから高頻度で呼ばれている**ときです。そこで、疑わしいモジュールの呼び出しを薄く包んで頻度と所要時間を測ります。
+
+```typescript
+// src/diagnostics/wrapNativeCall.ts
+// 疑わしいネイティブ呼び出しを包み、1フレーム予算(約16.6ms)を
+// 超えた同期呼び出しだけを記録する。常時計測ではなく閾値超えのみ。
+import { track } from './src/telemetry';
+
+const FRAME_BUDGET_MS = 16.6;
+
+export function timed<T>(label: string, fn: () => T): T {
+  const start = performance.now();
+  const result = fn();
+  const elapsed = performance.now() - start;
+  if (elapsed > FRAME_BUDGET_MS) {
+    track('native_call_slow', { label, ms: Math.round(elapsed) });
+  }
+  return result;
+}
+```
+
+```typescript
+// 一覧セル内での使用例
+// 旧式モジュールの同期取得をセルのレンダリングごとに呼んでいた箇所
+const meta = timed('imageMeta', () => ImageMetadata.getSync(uri));
+```
+
+この計測を入れて初めて、「`imageMeta` がセル表示のたびに走り、release 機では 20〜30ms かかってフレームを落としている」という具体像がつかめました。dev で見えなかったのは、開発機の方が CPU に余裕があり、20ms 台でもフレーム落ちに至りにくかったからです。原因の所在が数値で確定したので、ここからは直し方の問題になります。
+
+## 直す — 全体を旧アーキへ戻さない
+
+いちばん手早い「対処」は `newArchEnabled: false` で全体を旧アーキへ戻すことです。しかしこれは、TurboModule 化できている他のモジュールの恩恵まで捨てることになり、しかも将来的に旧アーキ自体が廃止されるため、借金を先送りするだけです。問題は1モジュールに局在しているのですから、そこだけを隔離します。
+
+### 手当て1: ホットパスから外す
+
+最も効果が大きいのは、そもそもホットパスから旧式呼び出しを抜くことです。画像メタ情報のように一覧の各セルで都度取得していたものは、取得結果をキャッシュし、表示時には同期呼び出しをしないように組み替えます。
+
+```typescript
+// src/lib/imageMetaCache.ts
+// uri 単位でメタ情報をキャッシュし、セル描画時の同期呼び出しを無くす。
+// 取得はリスト表示の外（プリフェッチ時）で非同期に済ませる。
+const cache = new Map<string, { width: number; height: number }>();
+
+export async function prefetchMeta(uri: string): Promise<void> {
+  if (cache.has(uri)) return;
+  const meta = await ImageMetadata.getAsync(uri); // 非同期版を使う
+  cache.set(uri, meta);
+}
+
+export function readMeta(uri: string) {
+  return cache.get(uri); // セル内ではキャッシュ参照のみ。ネイティブを叩かない。
+}
+```
+
+セルはキャッシュを読むだけになり、ネイティブ往復がレンダリングから消えます。多くの場合、これだけでスクロールは元の滑らかさに戻ります。
+
+### 手当て2: TurboModule 対応版へ寄せる、なければ薄い自作 TurboModule
+
+ライブラリ側が New Architecture 対応の新バージョンを出していれば、まずそこへ上げます。directory での対応状況を確認しておきます。
+
+```bash
+# 依存が New Architecture 対応かを確認する
+npx @react-native-community/cli config 2>/dev/null | grep -i "newArch"
+# 対応表は React Native Directory の "New Architecture" バッジでも確認できる
+```
+
+対応版が無く、かつ機能が小さい場合は、必要な1〜2メソッドだけを TurboModule として自作するほうが、巨大ライブラリの interop コストを払い続けるより安く付くことがあります。Codegen の Spec を1枚書けば、型定義からネイティブのスタブが生成されます。
+
+```typescript
+// specs/NativeImageMeta.ts
+// 必要最小限の同期メソッドだけを TurboModule として宣言する。
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+
+export interface Spec extends TurboModule {
+  getSize(uri: string): { width: number; height: number };
+}
+
+export default TurboModuleRegistry.getEnforcing<Spec>('NativeImageMeta');
+```
+
+「全部を内製しろ」という話ではありません。ホットパスに居座る1つだけを、薄く置き換える判断です。
+
+### 手当て3: 切り戻しのための機能ゲート
+
+修正を一度に全ユーザーへ当てるのは怖いものです。新経路（キャッシュ＋TurboModule）と旧経路を、リモートで切り替えられるゲートの背後に置き、段階的に開きます。
+
+```typescript
+// src/lib/featureGate.ts
+// 新しい画像メタ経路を割合配信で開く。問題が出たら即座に 0% に戻せる。
+import remoteConfig from './remoteConfig';
+
+export function useTurboImageMeta(): boolean {
+  // 例: 0〜100 の数値を返すリモート値。まず 10、安定したら 50、100 と上げる。
+  return remoteConfig.getNumber('turbo_image_meta_rollout') >= bucketOf(userId);
+}
+```
+
+`arch_probe` と `native_call_slow` のテレメトリを見ながら割合を上げ、`native_call_slow` の発生率が下がっていることを確認してから全開にします。万一新経路で別の問題が出ても、ストア審査を待たずにリモートで 0% に戻せます。OTA（EAS Update）と組み合わせれば、JS 側の修正は審査なしで配れます。
+
+## 再発させないための運用
+
+一度直しても、依存を増やすたびに同じ穴に落ちる可能性があります。次の3つを習慣にしておくと、静かなフォールバックを早期に捕まえられます。
+
+第一に、`arch_probe` を本番に残し続けることです。新しいライブラリを足したリリースで `legacyCount` が増えたら、その時点で気づけます。第二に、`native_call_slow` の発生率をリリースごとのダッシュボードに置き、回帰の有無を毎回確認することです。第三に、依存追加のレビュー時に「これは New Architecture 対応か」を明示的に確認する項目を1行入れておくことです。
+
+<table>
+<thead>
+<tr><th>観測点</th><th>何を見るか</th><th>異常のサイン</th></tr>
+</thead>
+<tbody>
+<tr><td>arch_probe</td><td>legacy 経路のモジュール名と件数</td><td>リリースで件数が増える</td></tr>
+<tr><td>native_call_slow</td><td>フレーム予算超えの同期呼び出し</td><td>特定 label の発生率上昇</td></tr>
+<tr><td>依存追加レビュー</td><td>New Architecture 対応バッジ</td><td>未対応のまま merge される</td></tr>
+</tbody>
+</table>
+
+## 切り分けの型として残しておく
+
+今回の件で効いたのは、特別な知識よりも「dev で再現しないなら、観測も判断も release 実機側に置く」という単純な原則でした。interop 層は親切設計ゆえに失敗を隠します。隠れたコストを表に出すには、TurboModule 化の有無とホットパスでの所要時間という2つの数値を、本番の母集団で見るのがいちばん速い、というのが私の結論です。
+
+同じように「特定環境でだけ出る」不具合に向き合っている方の、切り分けの型として残しておきます。お読みいただきありがとうございました。

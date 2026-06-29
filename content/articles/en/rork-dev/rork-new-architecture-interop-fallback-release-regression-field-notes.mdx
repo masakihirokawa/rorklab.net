@@ -1,0 +1,210 @@
+---
+title: "When a New Architecture Migration Only Janks in Release Builds — Field Notes on Catching Silent Interop-Layer Fallback"
+slug: "rork-new-architecture-interop-fallback-release-regression-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-29T11:00"
+updated: "2026-06-29T11:00"
+author: "Rork Lab"
+description: "A Rork app on the New Architecture scrolled fine in development but stuttered only in release builds on real devices. The cause: a legacy native module quietly falling back to the interop layer. Field notes on measuring it and rolling out a fix without reverting the whole app."
+tags: ["Rork", "React Native", "New Architecture", "TurboModules", "Fabric", "performance", "interop", "release build"]
+highlights:
+  - "How to isolate a \"only happens in release\" regression by measuring interop-layer fallback"
+  - "An at-launch probe that lists which native modules dropped to the legacy path"
+  - "A staged rollback that fixes the one offending module instead of reverting the whole app"
+---
+
+## Half a day lost to a bug that never showed on my dev machine
+
+I had bumped a wallpaper app to the Expo SDK 52 line and left the New Architecture enabled. For weeks, nothing seemed off. Then a TestFlight build drew a report: "the list stutters for a moment when you scroll." On my own machine it never reproduced — not in Expo Go, not in an `expo run:ios` debug build. Everything scrolled smoothly.
+
+The cause turned out to be a specific third-party native module that was not running as a TurboModule. Instead it ran **quietly through the interop layer**, the backward-compatibility bridge. The interop layer doesn't make old modules *fail*; it keeps them *working, but slow*. So every functional test passes. That is exactly why it only surfaces on a release build, on a real device, on one particular screen.
+
+These are field notes for the next time you hit that class of "doesn't show in dev, shows in release" regression — how to isolate it with measurement instead of guesswork, and how to fix it without rolling the whole app back to the old architecture. I've been building apps solo since 2014, and in my experience the bugs that flicker in and out with the environment are the ones where placing an observation point first pays off most.
+
+## Why dev and release disagree
+
+On the New Architecture, the JS-to-native boundary becomes JSI (direct references) and native modules initialize lazily as TurboModules. But a library that still leans on the old `NativeModules` / `NativeEventEmitter` doesn't just break. React Native ships an **interop layer** that mediates the old API on top of the new runtime.
+
+The catch is that this mediation costs something. The legacy path serializes each call to JSON and crosses threads, erasing the zero-copy synchronous benefit of JSI. If your list cells call a legacy module on every mount — image metadata, a synchronous device-info read — that cost shows up as dropped frames while scrolling.
+
+Dev builds hide it because Metro favors reloadability over optimization and the timing is noisy to begin with. Release builds, with Hermes bytecode and full optimization, make "only the legacy path is slow" stand out by contrast. So a release-only symptom isn't a fluke — it's structurally likely.
+
+## Place an observation point first — list the modules that fell to interop
+
+Before hunting the culprit by intuition, enumerate at launch which native modules are TurboModules and which resolve on the legacy path. This is a light check that runs once, right after startup.
+
+```typescript
+// src/diagnostics/archProbe.ts
+// Run once at launch to separate modules that are TurboModules
+// from those falling back to the legacy interop layer.
+import { TurboModuleRegistry } from 'react-native';
+
+type ProbeResult = {
+  name: string;
+  isTurbo: boolean;
+};
+
+// List the native module names your app actually uses.
+// (Check each dependency's README or its native MODULE_NAME.)
+const SUSPECTS = [
+  'RNDeviceInfo',
+  'RNCImageMetadata',
+  'RNFSManager',
+  'RNCAsyncStorage',
+];
+
+export function probeArchitecture(): ProbeResult[] {
+  return SUSPECTS.map((name) => {
+    // TurboModuleRegistry.get returns non-null only if the module is
+    // registered as a TurboModule. null means it's likely resolved on
+    // the legacy side.
+    const turbo = TurboModuleRegistry.get(name);
+    return { name, isTurbo: turbo != null };
+  });
+}
+// Example output:
+// [{ name: 'RNDeviceInfo', isTurbo: false }, ...]  ← false is the flag
+```
+
+A module with `isTurbo: false` is a candidate for the interop path. The key move is to **send this result into your production telemetry and look at it across the real-device fleet**. You're chasing a problem that won't reproduce on one machine, so put the observation on the device side too.
+
+```typescript
+// In App.tsx initialization
+import { probeArchitecture } from './src/diagnostics/archProbe';
+import { track } from './src/telemetry';
+
+const probes = probeArchitecture();
+const legacy = probes.filter((p) => !p.isTurbo).map((p) => p.name);
+// No personal data — just module names and a count.
+track('arch_probe', { legacyCount: legacy.length, legacyModules: legacy });
+```
+
+After a few days of events, a fact emerges from the data rather than a guess: "on most release devices, RNCImageMetadata is on the legacy path."
+
+## Measure the call frequency on the hot path
+
+A legacy module's mere presence doesn't always hurt. It bites when it's **called frequently from a hot path** like scrolling. So wrap the suspect calls thinly and measure frequency and duration.
+
+```typescript
+// src/diagnostics/wrapNativeCall.ts
+// Wrap a suspect native call and record only synchronous calls that
+// blow the ~16.6ms frame budget. Threshold-only, not always-on.
+import { track } from './src/telemetry';
+
+const FRAME_BUDGET_MS = 16.6;
+
+export function timed<T>(label: string, fn: () => T): T {
+  const start = performance.now();
+  const result = fn();
+  const elapsed = performance.now() - start;
+  if (elapsed > FRAME_BUDGET_MS) {
+    track('native_call_slow', { label, ms: Math.round(elapsed) });
+  }
+  return result;
+}
+```
+
+```typescript
+// Usage inside a list cell
+// The legacy module's synchronous read was running on every cell render
+const meta = timed('imageMeta', () => ImageMetadata.getSync(uri));
+```
+
+Only with this in place did the concrete picture appear: `imageMeta` ran on every cell render and took 20–30ms on release devices, dropping frames. Dev never showed it because the dev machine had more CPU headroom and rarely missed a frame even at 20ms. With the location pinned down numerically, the rest is a question of *how* to fix it.
+
+## Fix it — without reverting the whole app
+
+The quickest "remedy" is `newArchEnabled: false`, reverting the entire app to the old architecture. But that throws away the benefits of every module that *is* a working TurboModule, and since the old architecture is slated for removal, it just defers the debt. The problem is localized to one module, so isolate that one.
+
+### Remedy 1: Take it off the hot path
+
+The biggest win is removing the legacy call from the hot path entirely. Things fetched per-cell, like image metadata, should be cached so that rendering performs no synchronous call.
+
+```typescript
+// src/lib/imageMetaCache.ts
+// Cache metadata per uri so cell rendering makes no synchronous call.
+// Fetch happens outside list rendering (during prefetch), asynchronously.
+const cache = new Map<string, { width: number; height: number }>();
+
+export async function prefetchMeta(uri: string): Promise<void> {
+  if (cache.has(uri)) return;
+  const meta = await ImageMetadata.getAsync(uri); // use the async variant
+  cache.set(uri, meta);
+}
+
+export function readMeta(uri: string) {
+  return cache.get(uri); // cells only read the cache; no native hit
+}
+```
+
+The cell only reads the cache, and the native round-trip disappears from rendering. In most cases this alone restores the original smoothness.
+
+### Remedy 2: Move to a TurboModule-ready version, or write a thin one
+
+If the library ships a New Architecture-ready release, upgrade to it first. Check its status in the directory.
+
+```bash
+# Check whether a dependency is New Architecture-ready
+npx @react-native-community/cli config 2>/dev/null | grep -i "newArch"
+# You can also check the "New Architecture" badge on React Native Directory
+```
+
+If there's no compatible version and the feature is small, writing the one or two methods you need as your own TurboModule can be cheaper than paying the interop cost of a large library forever. One Codegen Spec generates the native stubs from your type definitions.
+
+```typescript
+// specs/NativeImageMeta.ts
+// Declare only the minimal synchronous method as a TurboModule.
+import type { TurboModule } from 'react-native';
+import { TurboModuleRegistry } from 'react-native';
+
+export interface Spec extends TurboModule {
+  getSize(uri: string): { width: number; height: number };
+}
+
+export default TurboModuleRegistry.getEnforcing<Spec>('NativeImageMeta');
+```
+
+This isn't a call to build everything in-house. It's a decision to thinly replace the single module squatting on the hot path.
+
+### Remedy 3: A feature gate for rollback
+
+Shipping a fix to all users at once is nerve-wracking. Put the new path (cache + TurboModule) and the old path behind a remotely controlled gate, and open it gradually.
+
+```typescript
+// src/lib/featureGate.ts
+// Open the new image-meta path by percentage. Snap back to 0% instantly
+// if something goes wrong.
+import remoteConfig from './remoteConfig';
+
+export function useTurboImageMeta(): boolean {
+  // e.g. a remote value 0–100. Start at 10, then 50, then 100 once stable.
+  return remoteConfig.getNumber('turbo_image_meta_rollout') >= bucketOf(userId);
+}
+```
+
+Raise the percentage while watching the `arch_probe` and `native_call_slow` telemetry, and only go fully open after confirming that the `native_call_slow` rate has dropped. If the new path ever causes a different problem, you can snap it back to 0% remotely without waiting for store review. Combined with OTA (EAS Update), JS-side fixes ship without review at all.
+
+## Keep it from recurring
+
+Fixing it once doesn't stop you from falling into the same hole each time you add a dependency. Three habits catch silent fallback early.
+
+First, keep `arch_probe` in production. If `legacyCount` rises in a release that added a library, you notice right then. Second, put the `native_call_slow` rate on a per-release dashboard and check for regressions every time. Third, add a single line to dependency-review: "is this New Architecture-ready?"
+
+<table>
+<thead>
+<tr><th>Observation point</th><th>What to watch</th><th>Sign of trouble</th></tr>
+</thead>
+<tbody>
+<tr><td>arch_probe</td><td>names and count of legacy-path modules</td><td>count rises in a release</td></tr>
+<tr><td>native_call_slow</td><td>synchronous calls over the frame budget</td><td>rate of a specific label climbs</td></tr>
+<tr><td>dependency review</td><td>New Architecture-ready badge</td><td>an unsupported one gets merged</td></tr>
+</tbody>
+</table>
+
+## Keep it as an isolation pattern
+
+What helped here was less special knowledge than a simple principle: if it doesn't reproduce in dev, put both the observation and the judgment on the release device. The interop layer hides failure precisely because it's considerate. The fastest way to surface the hidden cost, in my experience, is to look at two numbers across the production fleet: whether a module is a TurboModule, and how long it takes on the hot path.
+
+I'm leaving this as an isolation pattern for anyone facing the same "only in a specific environment" class of bug. Thank you for reading.
