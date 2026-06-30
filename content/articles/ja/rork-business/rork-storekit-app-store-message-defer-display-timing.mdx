@@ -1,0 +1,133 @@
+---
+title: "App Store のシステムメッセージを「いい瞬間」まで遅らせる設計"
+slug: "rork-storekit-app-store-message-defer-display-timing"
+category: "rork-business"
+level: "intermediate"
+premium: true
+date: "2026-06-30T21:11"
+author: "Rork Lab"
+description: "値上げ同意やウィンバック、請求エラーといった App Store のシステムメッセージは、既定では起動直後に割り込んできます。StoreKit 2 の Message を握り、オンボーディングや決済を邪魔しない瞬間まで表示を遅らせる設計を、動く Swift コードでまとめました。"
+tags: ["StoreKit", "アプリ内課金", "Rork Max", "収益化", "UX"]
+highlights:
+  - "StoreKit 2 の Message.messages を購読し、message.display(in:) を呼ぶ瞬間を自分で選ぶ実装（動く Swift つき）"
+  - "priceIncreaseConsent / billingIssue / generic の理由ごとに「すぐ出す・後に回す」を切り替える判断表"
+  - "オンボーディング中・決済中・全画面再生中は保留し、ホームに戻った瞬間に出す保留キューの作り方"
+---
+
+値上げの同意を求めるシートが、新規ユーザーのオンボーディングの3画面目で突然せり上がってきたことがありました。私自身、個人開発で課金のあるアプリをいくつか運用していますが、この割り込みが起きると、その回のオンボーディング完了率がはっきり落ちます。まだ価値を感じる前の人に「価格に同意してください」と迫っているのですから、当然かもしれません。
+
+App Store のシステムメッセージ（値上げ同意・請求エラー・ウィンバックなど）は、既定ではアプリのフォアグラウンド復帰時に StoreKit が勝手に表示します。出すこと自体は避けられませんが、**いつ出すか**は開発側で握れます。StoreKit 2 の `Message` を購読し、表示の引き金を自分のタイミングで引く設計をまとめます。Rork Max が生成するネイティブ Swift を前提にしていますが、考え方は `react-native-iap` などをブリッジする場合にもそのまま使えます。
+
+## 既定の挙動と、握れるポイント
+
+理解の起点は「メッセージは保留できる」という一点です。`StoreKit.Message.messages` という非同期シーケンスを購読しておくと、システムが出そうとしたメッセージがアプリに流れてきます。ここで何もしなければ自動表示に任せることになりますが、シーケンスを受け取った時点で `for await` のループに入っていれば、**表示は `message.display(in:)` を自分で呼ぶまで起きません**。
+
+つまり「購読する」イコール「自動表示を止めて、表示権をアプリ側に移す」ことになります。受け取ったメッセージはアプリが明示的に出すまで保持され、出さなければ次回起動時にまた届きます。取りこぼしの心配は要りませんが、永遠に出さないのは規約・売上の両面で不利なので、必ずどこかで出し切る設計にします。
+
+## メッセージの購読を起動時に1本だけ張る
+
+購読はアプリ全体で1本に保ちます。複数箇所で `for await` を回すと、同じメッセージが二重に処理されかねません。`@MainActor` のコーディネーターを1つ用意し、起動直後にループを開始します。
+
+```swift
+import StoreKit
+import SwiftUI
+
+@MainActor
+final class StoreMessageCoordinator: ObservableObject {
+    /// 表示待ちのメッセージ（届いた時刻つき）
+    private(set) var pending: [(message: Message, since: Date)] = []
+    /// いま表示してよいか（画面状態で更新する）
+    var canPresent: Bool = false { didSet { flushIfPossible() } }
+
+    private var listenTask: Task<Void, Never>?
+
+    func start() {
+        guard listenTask == nil else { return }
+        listenTask = Task { [weak self] in
+            for await message in Message.messages {
+                // ここで display を呼ばない限り、システムは自動表示しない
+                self?.enqueue(message)
+            }
+        }
+    }
+
+    private func enqueue(_ message: Message) {
+        // 値上げ同意と請求エラーは売上・規約に直結するので、保留が長引かないよう先頭へ
+        switch message.reason {
+        case .priceIncreaseConsent, .billingIssue:
+            pending.insert((message, Date()), at: 0)
+        default:
+            pending.append((message, Date()))
+        }
+        flushIfPossible()
+    }
+
+    private func flushIfPossible() {
+        guard canPresent, let scene = Self.activeScene() else { return }
+        let next = pending
+        pending.removeAll()
+        for item in next {
+            do { try item.message.display(in: scene) }
+            catch { pending.append(item) } // 出せなければ戻して次の機会に
+        }
+    }
+
+    private static func activeScene() -> UIWindowScene? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+    }
+}
+```
+
+`canPresent` を画面状態に応じて切り替えるだけで、表示タイミングを完全に制御できます。ポイントは `display(in:)` が `UIWindowScene` を要求することです。シーンがまだ前面でない瞬間に呼ぶと失敗するので、`foregroundActive` なシーンが取れたときだけ出します。
+
+## 「出してよい画面」と「待つ画面」を線引きする
+
+保留キューがあっても、出す瞬間の判断がなければ意味がありません。私は次の基準で `canPresent` を更新しています。割り込みで失うものが大きい画面ほど、後に回します。
+
+<table>
+  <thead>
+    <tr><th>画面・状態</th><th>canPresent</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>起動直後・スプラッシュ</td><td>false</td><td>第一印象を妨げる</td></tr>
+    <tr><td>オンボーディング中</td><td>false</td><td>完了率が落ちる</td></tr>
+    <tr><td>購入・決済フロー中</td><td>false</td><td>StoreKit の二重シートで混乱する</td></tr>
+    <tr><td>全画面の動画・ゲーム中</td><td>false</td><td>体験の没入を壊す</td></tr>
+    <tr><td>ホーム（タブのトップ）に戻った</td><td>true</td><td>手が止まる自然な区切り</td></tr>
+    <tr><td>設定・アカウント画面</td><td>true</td><td>課金文脈と相性がよい</td></tr>
+  </tbody>
+</table>
+
+SwiftUI なら、トップ画面の `onAppear` で `coordinator.canPresent = true`、没入画面の `onAppear` で `false` に落とすだけです。タブを持つアプリなら「選択タブがトップに戻った」イベントに紐づけると、ほぼ取りこぼしなく自然な瞬間を拾えます。
+
+## 理由ごとに「待てる長さ」を変える
+
+すべてのメッセージを同じ重みで扱うと、待たせてはいけないものまで遅れます。理由（`Message.Reason`）ごとに上限を決めておくことを推奨します。
+
+### 値上げ同意（priceIncreaseConsent）
+
+同意が取れないと更新が止まります。没入画面を抜けたら最優先で出し、それでも長引くなら、多少強引でも次の区切りで出します。届いた時刻を保持しておき、一定時間（私は12時間を目安にしています）を超えたら没入画面でも次のフレームで出す、というフォールバックを入れておくと、規約面でも安心です。
+
+### 請求の問題（billingIssue）
+
+支払いが通っていない状態です。放置は解約に直結するので、これも早めに出します。請求エラーは売上に直結する数少ない「待たせない」メッセージなので、値上げ同意と同じく先頭に積むのが個人的にはお勧めです。
+
+### その他のメッセージ（generic）
+
+体験を最優先にできます。良い区切りまで落ち着いて待てます。ここを丁寧に遅らせるほど、重いメッセージを出すときの心理的な余白が生まれます。
+
+## つまずきやすいところ
+
+ひとつは**シーンの取り違え**です。`display(in:)` に渡すのは「いま前面にある」シーンでなければなりません。複数ウィンドウ（iPad）やバックグラウンド復帰直後はここで失敗しがちなので、失敗時はキューに戻す実装で確実に回避します。上のコードで `catch` から `pending` に戻しているのはこのためです。
+
+もうひとつは**テストの再現性**です。本番運用でいつ届くか分からないメッセージを待っていては検証になりません。Xcode の StoreKit Configuration（`.storekit` ファイル）を使うと、値上げ同意などのメッセージを手元で発火させられます。Sandbox と本番で挙動が割れることもあるので、リリース前に Sandbox でも一度通しておくと安心です。
+
+最後に、購読の開始忘れです。`Message.messages` のループに入る前に届いたメッセージは保持されますが、ループ自体を起動時に必ず張っておかないと、保留制御は働かず自動表示に戻ってしまいます。`App` の起動処理で `coordinator.start()` を一度だけ呼ぶ、という形に固定するのが安全です。
+
+## 計測しながら、出し方を直していく
+
+遅らせる設計を入れたら、出した結果を必ず見ます。私は「メッセージの理由」「表示した画面」「保留していた秒数」の3つを自前のログに残しています。値上げ同意の同意率が低ければ出す画面を変え、保留が長すぎる理由があればフォールバックの上限を縮める、という具合に、数字を見て少しずつ調整していきます。
+
+ここまで組めたら、次は自分のアプリで「割り込まれて困る画面」を3つ書き出し、その `onAppear` で `canPresent` を落とすところから始めてみてください。出す場所を1つ決めるだけでも、オンボーディングの体感はかなり変わります。
