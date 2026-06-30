@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — RorkがLeft Lane Capital主導で$15Mのシードを調達しました",
-    "RORK MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成します",
-    "PLATFORM — iPhone・iPad・Watch・Vision Proに対応し、Live ActivitiesやCore MLまで使えます",
-    "GROWTH — 月間74.3万訪問・成長率85%と利用が伸び続けています",
-    "TEST — Companionアプリで有料Apple Developerアカウント無しに実機テストができます",
-    "STACK — 本体はReact NativeとExpoで、ウェブラッパーでない真のネイティブ体験を提供します",
+    "MAX — Rork MaxがネイティブSwiftアプリを生成し、iPhone・iPad・Watch・TV・Vision Pro・iMessageに対応します",
+    "NATIVE — AR/LiDAR、Metalによる3D、Dynamic Island、Live Activities、HealthKit、Core MLなどに手が届きます",
+    "PUBLISH — 2クリックでApp Storeへ提出でき、申請まわりの手間が大きく圧縮されています",
+    "PRICING — Rork Maxは月200ドル、元のRorkは無料で始められ有料は月25ドルからです",
+    "FUNDING — Rorkがa16zから280万ドルを調達し、月間74万超の訪問・成長率85%と紹介されています",
+    "TOOL — 元のRorkはReact Native（Expo）でiOSとAndroidのアプリを自然言語から生成します",
   ],
   en: [
-    "FUNDING — Rork raises a $15M seed led by Left Lane Capital",
-    "RORK MAX — Rork Max generates native Swift apps instead of React Native",
-    "PLATFORM — It targets iPhone, iPad, Watch, and Vision Pro, reaching Live Activities and Core ML",
-    "GROWTH — Traffic keeps climbing at 743K monthly visits and 85% growth",
-    "TEST — The Companion app lets you test on a real device without a paid Apple Developer account",
-    "STACK — Built on React Native and Expo for true native experiences, not web wrappers",
+    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
+    "NATIVE — It reaches AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, HealthKit, and Core ML",
+    "PUBLISH — Two-click App Store submission sharply cuts the overhead of shipping an app",
+    "PRICING — Rork Max is 00/month, while the original Rork starts free with paid plans from 5/month",
+    "FUNDING — Rork raised .8M from a16z, with over 743k monthly visits and 85% growth",
+    "TOOL — The original Rork builds native iOS and Android apps from plain English using React Native (Expo)",
   ],
 };
 
