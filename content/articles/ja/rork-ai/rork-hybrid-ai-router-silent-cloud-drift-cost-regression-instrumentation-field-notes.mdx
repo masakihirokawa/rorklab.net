@@ -1,0 +1,178 @@
+---
+title: "Rork のハイブリッドAIが知らぬ間にクラウドへ偏って課金が膨らんでいたとき — 経路選択を計測して切り分ける運用メモ"
+slug: "rork-hybrid-ai-router-silent-cloud-drift-cost-regression-instrumentation-field-notes"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-06-30T20:30"
+updated: "2026-06-30T20:30"
+author: "Rork Lab"
+description: "オンデバイス・エッジ・クラウドを振り分けるAIルーターは、判断ログが無いと静かにクラウドへ偏り、トラフィックが横ばいでも課金だけが伸びます。経路選択を計測して原因を切り分けた運用メモです。"
+tags: ["Rork Max", "ハイブリッドAI", "オンデバイスAI", "エッジAI", "コスト最適化", "オブザーバビリティ", "Core ML", "Cloudflare Workers AI"]
+highlights:
+  - "AIルーターの判断を1リクエストずつ記録し、レイヤー別シェア・実測レイテンシ・推定トークン課金を集計する計測コード"
+  - "トラフィック横ばいなのに課金が伸びる「静かなクラウド偏り」の3つの典型原因と、それぞれの切り分け手順"
+  - "オンデバイス初期化失敗時の暗黙クラウドフォールバックを可視化し、予算アラームで早期検知する運用設計"
+---
+## 課金明細を見て初めて気づいた
+
+ハイブリッドAIを載せたアプリで、月末の API 課金が前月比で 1.7 倍になっていました。困ったのは、アクティブユーザーもリクエスト総数もほぼ横ばいだったことです。トラフィックが増えていないのに費用だけが伸びる。最初はモデル単価の改定を疑いましたが、単価は据え置きでした。
+
+原因にたどり着くまで時間がかかったのは、**AIルーターがどのリクエストをどこへ流したかを、どこにも記録していなかった**からです。オンデバイス・エッジ・クラウドの3層に賢く振り分ける設計にしていたのに、肝心の「実際にどう振り分いたか」は誰も見ていませんでした。設計図はあるのに、走行ログが無い状態です。
+
+このメモは、その走行ログを後付けで仕込み、課金が膨らんだ真因を切り分けるまでにやったことの記録です。コードは Rork Max で生成したアプリ（React Native + Expo 構成）に後から差し込める形にしてあります。
+
+個人開発で長くアプリを運用していると、こうした「壊れていないのに費用だけ伸びる」類の不具合に何度か出会います。私自身、派手なクラッシュより、誰も困らないまま静かに進む劣化のほうが見つけにくく、結局は計測を仕込んでいたかどうかで対応の速さが決まる、と感じてきました。今回もまさにその一例でした。
+
+## なぜ「静かに」偏るのか
+
+ハイブリッドAIの振り分けは、たいていこういうヒューリスティックで書かれています。個人情報を含むならオンデバイス、最新情報や複雑な推論が必要ならクラウド、それ以外はエッジ、という具合です。
+
+```typescript
+// src/ai/AIRouter.ts — よくある初期実装（判断を記録していない版）
+export type AILayer = 'on-device' | 'edge' | 'cloud';
+
+export function determineAILayer(req: AIRequest): AILayer {
+  const c = req.context ?? {};
+  if (c.offlineMode || c.containsPersonalInfo) return 'on-device';
+  if (c.requiresLatestInfo || c.complexReasoning) return 'cloud';
+  if (req.message.length <= 50) return 'on-device';
+  return 'edge';
+}
+```
+
+問題は、この `requiresLatestInfo` や `complexReasoning` といったフラグを誰が立てているか、です。多くの場合、上流の軽い分類器やプロンプト側のキーワード判定がふんわり立てています。そこの基準がほんの少し緩むだけで、クラウド送りの割合が静かに増えます。トラフィックの総量は変わらないので、ダッシュボードのどのグラフも異常を示しません。気づけるのは課金明細だけ、という事態になります。
+
+私が見た範囲では、静かなクラウド偏りの原因はだいたい次の3つに収束しました。
+
+<table>
+<thead><tr><th>原因</th><th>起きること</th><th>気づきにくい理由</th></tr></thead>
+<tbody>
+<tr><td>フラグの過剰付与</td><td>上流分類器が <code>complexReasoning</code> を立てすぎてクラウド送りが増える</td><td>各リクエストは正常に応答するため、エラー率に出ない</td></tr>
+<tr><td>暗黙のフォールバック</td><td>オンデバイスモデルの初期化失敗時に黙ってクラウドへ流す</td><td>ユーザー体験は維持されるので、誰も困らない</td></tr>
+<tr><td>会話履歴の肥大</td><td>履歴が長くなるとエッジ層の上限を超えクラウドへ昇格</td><td>セッション後半だけで起きるため再現しにくい</td></tr>
+</tbody>
+</table>
+
+3つに共通するのは「ユーザーから見ると何も壊れていない」点です。だからこそ計測なしには見つかりません。
+
+## まず判断を記録する
+
+直すより先に、見えるようにします。ルーターの戻り値を「レイヤー名だけ」から「判断の根拠と推定コストを含む構造体」に広げ、決定のたびに記録します。
+
+```typescript
+// src/ai/AIRouter.ts — 判断を記録する版
+export interface RoutingDecision {
+  layer: AILayer;
+  reason: string;        // なぜその層を選んだか（後で集計する軸）
+  estCostUsd: number;    // 推定課金（オンデバイスは0）
+  estLatencyMs: number;
+}
+
+const COST = { 'on-device': 0, edge: 0.0001, cloud: 0.002 } as const;
+const LAT  = { 'on-device': 40, edge: 200, cloud: 1500 } as const;
+
+export function decideLayer(req: AIRequest): RoutingDecision {
+  const c = req.context ?? {};
+  let layer: AILayer = 'edge';
+  let reason = 'default-edge';
+
+  if (c.offlineMode)            { layer = 'on-device'; reason = 'offline'; }
+  else if (c.containsPersonalInfo) { layer = 'on-device'; reason = 'pii-local'; }
+  else if (c.requiresLatestInfo)   { layer = 'cloud'; reason = 'needs-fresh'; }
+  else if (c.complexReasoning)     { layer = 'cloud'; reason = 'complex'; }
+  else if (req.message.length <= 50) { layer = 'on-device'; reason = 'short-msg'; }
+
+  return { layer, reason, estCostUsd: COST[layer], estLatencyMs: LAT[layer] };
+}
+```
+
+ポイントは `reason` を「人間が読める固定の短い文字列」にしておくことです。後でこの `reason` ごとに件数とコストを足し合わせると、どの判断がクラウド課金を生んでいるかが一目で出ます。自由文にすると集計できないので、必ず enum 相当の限られた語彙にします。
+
+次に、決定と実測値を計測層へ流します。`estCostUsd` は事前の見積もりなので、実際にクラウドを呼んだときは応答から得た**実トークン数で上書き**します。見積もりと実測の差そのものが、後で効いてくる重要な信号です。
+
+```typescript
+// src/ai/telemetry.ts — 1リクエスト1行のローカル集計
+type Row = { reason: string; layer: AILayer; costUsd: number; latencyMs: number; fallback: boolean };
+const buffer: Row[] = [];
+
+export function recordRouting(r: Row) {
+  buffer.push(r);
+  if (buffer.length >= 50) flush();   // 50件たまったらまとめて送信
+}
+
+export function summarize(rows: Row[]) {
+  const byLayer: Record<string, { n: number; cost: number }> = {};
+  for (const x of rows) {
+    const k = x.layer;
+    byLayer[k] ??= { n: 0, cost: 0 };
+    byLayer[k].n++; byLayer[k].cost += x.costUsd;
+  }
+  const total = rows.length || 1;
+  return Object.entries(byLayer).map(([layer, v]) => ({
+    layer,
+    share: +(100 * v.n / total).toFixed(1),   // レイヤー別シェア(%)
+    costUsd: +v.cost.toFixed(4),
+  }));
+}
+```
+
+端末から逐次イベントを送るとそれ自体が電池とネットワークを食うので、`buffer` に 50 件ためてからまとめて送る設計にしています。集計はサーバ側でも `summarize` を再利用できるよう、純粋関数に切り出しておくと検証が楽です。
+
+## シェアを見て切り分ける
+
+計測を入れて1日回すと、`reason` 別とレイヤー別のシェアが出ます。私のケースでは、想定 10〜15% のはずだったクラウド層が **38%** を占めていました。さらに `reason` で割ると、その大半が `complex`、つまり `complexReasoning` フラグ由来でした。ここで原因が一気に絞れます。
+
+切り分けの手順はこうしました。
+
+1. **レイヤー別シェアを見る。** クラウドが想定より高ければ偏りが起きている。横ばいトラフィックでシェアだけ動くなら、単価ではなく振り分けの問題。
+2. **`reason` 別に分解する。** クラウドの内訳が `needs-fresh` なのか `complex` なのかで原因が分かれる。`complex` が多ければ上流フラグの基準を疑う。
+3. **`fallback: true` の件数を見る。** これが多ければ、コードの分岐ではなく**オンデバイス初期化失敗の暗黙フォールバック**が犯人。エラーログには出ないので、この列がないと永遠に気づけません。
+
+3 番目は実際に効きました。一部の端末でオンデバイスモデルのロードが間に合わず、`try/catch` の `catch` で黙ってクラウドへ流す実装になっていたのです。ユーザー体験は保たれるので苦情も出ず、しかしクラウド課金だけが増える。フォールバックは「起きてもよいが、必ず計測される」状態にしておくべきでした。
+
+```typescript
+// オンデバイス失敗を「黙らせず」記録するフォールバック
+async function runOnDevice(req: AIRequest): Promise<Result> {
+  try {
+    return await onDevice.infer(req);
+  } catch (e) {
+    recordRouting({ reason: 'fallback-ondevice-fail', layer: 'cloud',
+                    costUsd: COST.cloud, latencyMs: LAT.cloud, fallback: true });
+    return await cloud.infer(req);   // 体験は維持。ただし可視化はする
+  }
+}
+```
+
+## 予算アラームで再発を止める
+
+原因を直しても、フラグ基準はまた緩みます。上流の分類器を差し替えたりプロンプトを直すたびに、振り分けは静かに動きます。そこで、課金明細を待たずに気づける仕組みを足しました。
+
+`summarize` の結果を日次でしきい値と突き合わせ、クラウドシェアが基準を超えたら通知する、という単純なものです。金額ではなく**シェアで見る**のがコツでした。金額は利用増でも上がるので「異常」と切り分けにくいのですが、シェアはトラフィック量に対して正規化されているため、振り分けの異常だけを拾えます。
+
+```typescript
+// 日次バジェットガード（サーバ側）
+const BUDGET = { cloudSharePct: 20, fallbackPct: 2 };
+
+export function checkBudget(rows: Row[]) {
+  const s = summarize(rows);
+  const cloud = s.find(x => x.layer === 'cloud')?.share ?? 0;
+  const fbRate = 100 * rows.filter(r => r.fallback).length / (rows.length || 1);
+  const alerts: string[] = [];
+  if (cloud > BUDGET.cloudSharePct) alerts.push(`cloud share ${cloud}% > ${BUDGET.cloudSharePct}%`);
+  if (fbRate > BUDGET.fallbackPct)  alerts.push(`fallback ${fbRate.toFixed(1)}% > ${BUDGET.fallbackPct}%`);
+  return { ok: alerts.length === 0, alerts };
+}
+```
+
+クラウドシェア 20%、フォールバック率 2% をしきい値にしました。この2つを超えたら振り分けが歪み始めた合図、という運用です。実際、後にプロンプトを更新した際にクラウドシェアが 26% へ跳ね、課金明細を見るより 3 週間早く気づけました。
+
+## この設計から私が学んだこと
+
+ハイブリッドAIの良し悪しは、振り分けロジックの賢さより**振り分けが見えているか**で決まる、というのが正直な実感です。賢いルーターを書くこと自体は難しくありません。難しいのは、その判断が運用の中で少しずつズレていくのを捉え続けることです。
+
+実装の優先順位を付けるなら、私は「3層を完璧に作る」より先に「1層でいいから判断を記録する」を勧めます。`reason` という限られた語彙で決定を残し、レイヤー別シェアと実トークン課金とフォールバック率の3つを見る。この最小構成があるだけで、課金明細を待たずに自分のアプリの挙動を語れるようになります。
+
+オンデバイス・エッジ・クラウドのどれを選ぶかは、結局ユーザーごと・セッションごとに変わり続けます。固定の正解はありません。だからこそ、選び続けている自分の判断を計測可能にしておくこと——それがハイブリッドAIを長く運用するうえで、私がいちばん効くと感じている準備です。
+
+実装の参考になれば幸いです。お読みいただきありがとうございました。
