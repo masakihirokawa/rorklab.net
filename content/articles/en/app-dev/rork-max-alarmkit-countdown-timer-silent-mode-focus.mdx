@@ -1,0 +1,325 @@
+---
+title: "Building an AlarmKit Timer in Rork Max's Native Swift — Alerts That Cut Through Silent Mode and Focus"
+slug: "rork-max-alarmkit-countdown-timer-silent-mode-focus"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-01T05:25"
+updated: "2026-07-01T05:25"
+author: "Rork Lab"
+description: "Implementation notes on solving the 'local notifications stay silent in Silent Mode and Focus' problem with iOS 26's AlarmKit. Covers authorization, scheduling a countdown, the Live Activity for the Lock Screen and Dynamic Island, and listing active timers in Swift — plus the boundary design for Rork Max native code and bridging from Expo, with the pitfalls I actually hit."
+tags: ["AlarmKit", "Rork Max", "Live Activity", "iOS", "Timer"]
+highlights:
+  - "Why UserNotifications stays silent in Silent Mode and Focus, how AlarmKit cuts through without the Critical Alerts entitlement, and when to switch"
+  - "A complete, working Swift flow: authorization, scheduling a countdown, and a minimal Live Activity for the Lock Screen and Dynamic Island"
+  - "How to use AlarmKit in the native Swift Rork Max generates, and the boundary design for bridging it from an Expo / React Native native module"
+---
+
+While building a small interval timer as an indie developer, a tester told me, "It doesn't ring when my phone is on silent." On my own device everything had worked, so at first I couldn't reproduce it. The cause was simple: I had built the timer with local notifications through `UserNotifications`. On an iPhone with the silent switch on, notification sounds don't play. For a notification whose entire point is to ring — a timer, an alarm — that's fatal.
+
+For a long time, the only sanctioned way past this wall was the Critical Alerts entitlement. But that's a special permission meant for medical, safety, and public-safety use, it requires an application to Apple, and a small indie timer app is very unlikely to be approved. iOS 26's AlarmKit changed that. Limited to timers and alarms, it lets you cut through Silent Mode and Focus without any application. And because Rork Max now generates native Swift, AlarmKit has become something you can realistically wire into an indie app. Here is what I learned doing exactly that.
+
+## Why local notifications stay silent
+
+Getting this precise up front makes the later design decisions much easier. Local and push notifications sent through `UserNotifications` obey the device's silent switch and Focus settings. If the user is on silent, no sound plays; if a Focus is suppressing alerts, even the banner is held back. That's correct behavior for not interrupting people, and it's welcome for news or marketing.
+
+The problem is the class of notifications where ringing *is* the feature: timers, alarms, reminders. A three-minute cooking timer, a workout interval, a 30-minute nap alarm. These are exactly the moments where the user wants a sound *because* the phone is on silent — and local notifications fall silent instead. The table below captures the difference between the three options.
+
+<table>
+  <thead>
+    <tr><th>Approach</th><th>Cuts through Silent / Focus?</th><th>Application needed?</th><th>Realistic for indie?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>UserNotifications (local)</td><td><strong>No</strong> (stays silent)</td><td>None</td><td>High, but the "won't ring" problem remains</td></tr>
+    <tr><td>Critical Alerts entitlement</td><td>Yes</td><td><strong>Per-app application to Apple</strong></td><td>Low (narrow use, rarely approved)</td></tr>
+    <tr><td>AlarmKit (iOS 26+)</td><td><strong>Yes</strong></td><td>None (just user authorization)</td><td>High (limited to timer / alarm use)</td></tr>
+  </tbody>
+</table>
+
+AlarmKit isn't a blank check. It's not a way to make arbitrary notifications loud — it's scoped strictly to "a timer or alarm the user set themselves." Put the other way around: for an app that fits that context exactly, a sanctioned route that never existed before is now open.
+
+## Requesting authorization
+
+Because an AlarmKit alert plays sound and appears on screen even during a Focus, explicit user permission is a precondition. There are two steps. First, add `NSAlarmKitUsageDescription` to `Info.plist` with a one-line explanation of why your app schedules alarms. That text appears alongside Apple's standard explanation in the first authorization prompt.
+
+Second, check the current status and, if it's still undetermined, show the system prompt with `requestAuthorization()`. `AlarmManager.shared` is the entry point.
+
+```swift
+import SwiftUI
+import AlarmKit
+
+struct TimerStartButton: View {
+    private let manager = AlarmManager.shared
+
+    var body: some View {
+        Button("Start timer", systemImage: "timer") {
+            Task {
+                if await ensureAuthorized() {
+                    await scheduleTimer()
+                } else {
+                    // Denied: disable the feature, point users to Settings
+                }
+            }
+        }
+    }
+
+    private func ensureAuthorized() async -> Bool {
+        switch manager.authorizationState {
+        case .notDetermined:
+            do {
+                let state = try await manager.requestAuthorization()
+                return state == .authorized
+            } catch {
+                print("Authorization error: \(error)")
+                return false
+            }
+        case .authorized:
+            return true
+        case .denied:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+}
+```
+
+The key detail is that the prompt fires only in the `.notDetermined` branch. Re-prompting a user who is already `.denied` shows nothing, and `.authorized` lets you proceed immediately. What you do on denial depends on the app's character: if the timer is the core feature, guide them to Settings; if it's a secondary feature, quietly fall back to local notifications.
+
+## Scheduling a countdown timer
+
+Once authorized, you can schedule the timer. Even the minimal configuration assembles a few parts, so let's go through them in order.
+
+First, describe the alert that appears when the timer ends with `AlarmPresentation.Alert`. It requires a `title` and a stop button; the stop button is an `AlarmButton` with text, color, and an SF Symbol.
+
+```swift
+let alert = AlarmPresentation.Alert(
+    title: "Done",
+    stopButton: AlarmButton(
+        text: "Stop",
+        textColor: .white,
+        systemImageName: "checkmark"
+    )
+)
+```
+
+This alert appears at two sizes: a compact banner when the timer ends while the device is unlocked, and a larger one on the Lock Screen. Keep `title` short so it isn't truncated in the compact form.
+
+Next, create `AlarmAttributes`. It requires a `presentation` and a `tintColor`. The `metadata` is optional, but `AlarmAttributes` is generic over `Metadata`, so you still have to supply a type conforming to `AlarmMetadata` even if it's empty. Forget it and you get the compile error `Generic parameter 'Metadata' could not be inferred`. In projects created with Xcode 26, where types are `MainActor`-isolated by default, mark this type `nonisolated` to satisfy the protocol.
+
+```swift
+nonisolated struct TimerData: AlarmMetadata {}
+
+let attributes = AlarmAttributes<TimerData>(
+    presentation: AlarmPresentation(alert: alert),
+    tintColor: .accentColor
+)
+```
+
+With those in place, start the timer by passing an `id` and a configuration to `AlarmManager`'s `schedule()`.
+
+```swift
+private func scheduleTimer() async {
+    let alert = AlarmPresentation.Alert(
+        title: "Done",
+        stopButton: AlarmButton(
+            text: "Stop",
+            textColor: .white,
+            systemImageName: "checkmark"
+        )
+    )
+
+    let attributes = AlarmAttributes<TimerData>(
+        presentation: AlarmPresentation(alert: alert),
+        tintColor: .accentColor
+    )
+
+    do {
+        _ = try await manager.schedule(
+            id: UUID(),
+            configuration: .timer(
+                duration: 180, // 3 minutes
+                attributes: attributes
+            )
+        )
+    } catch {
+        print("Scheduling error: \(error)")
+    }
+}
+```
+
+Set `duration` to `180` for a three-minute timer. In a real app you'd derive that value from user input or context. Keep the `UUID` you pass as `id` if you want to cancel the timer later.
+
+## Showing remaining time on the Lock Screen and Dynamic Island
+
+So far the timer rings when it ends, but the remaining time isn't displayed anywhere while it runs. To show a continuous countdown, you need a Live Activity. It's worth stressing early — AlarmKit's countdown *assumes* you implement a Live Activity, which catches a lot of people off guard.
+
+Add a Widget Extension target, delete the boilerplate widget code, and keep only the Live Activity definition. The key is passing your `AlarmAttributes` to `ActivityConfiguration`.
+
+```swift
+import WidgetKit
+import SwiftUI
+import AlarmKit
+
+@main
+struct CountdownBundle: WidgetBundle {
+    var body: some Widget {
+        CountdownLiveActivity()
+    }
+}
+
+struct CountdownLiveActivity: Widget {
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: AlarmAttributes<TimerData>.self) { context in
+            CountdownText(state: context.state)
+                .font(.largeTitle)
+                .padding()
+        } dynamicIsland: { context in
+            DynamicIsland {
+                DynamicIslandExpandedRegion(.bottom) {
+                    CountdownText(state: context.state)
+                        .font(.headline)
+                }
+            } compactLeading: {
+                CountdownText(state: context.state)
+            } compactTrailing: {
+                Image(systemName: "timer")
+            } minimal: {
+                Image(systemName: "timer")
+            }
+        }
+    }
+}
+```
+
+Draw the remaining time from the `AlarmPresentationState` the `context` carries. Only in the `.countdown` case do you get a `fireDate`, so pass the `Date.now ... fireDate` range to `Text(timerInterval:)` for a view that updates every second on its own. No manual ticking required.
+
+```swift
+struct CountdownText: View {
+    let state: AlarmPresentationState
+
+    var body: some View {
+        if case let .countdown(countdown) = state.mode {
+            Text(timerInterval: Date.now ... countdown.fireDate)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+    }
+}
+```
+
+One trap here: `TimerData` must compile into **both** the app target and the Widget Extension target. The safest move is to put it in a dedicated Swift file and check its Target Membership for both targets. Forget it and the Live Activity side can't resolve the type, and the build fails.
+
+## Listing active timers inside the app
+
+Once timers schedule and surface on the Lock Screen, you'll want to show the ones "currently running" in the foreground app. AlarmKit provides an async sequence, `alarmUpdates`, that emits the full set of active alarms every time the system adds, removes, or mutates one. Subscribe to it to keep local state in sync.
+
+```swift
+struct TimerListView: View {
+    @State private var alarms: [Alarm] = []
+
+    var body: some View {
+        List(alarms) { alarm in
+            TimerRow(alarm: alarm)
+        }
+        .task {
+            for await updated in AlarmManager.shared.alarmUpdates {
+                alarms.removeAll { local in
+                    updated.allSatisfy { $0.id != local.id }
+                }
+                for alarm in updated {
+                    if let i = alarms.firstIndex(where: { $0.id == alarm.id }) {
+                        alarms[i] = alarm
+                    } else {
+                        alarms.insert(alarm, at: 0)
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+There's a constraint to know. An `Alarm` instance carries only a few things: its identifier, the countdown duration it was configured with, and its current state (`.countdown` / `.alerting` / `.paused`). It does not hold the live "seconds remaining" value — that only comes through the `AlarmPresentationState` you used in the Live Activity. So your in-app list can show the configured duration and a state label, nothing more. The identifier does let you cancel.
+
+```swift
+struct TimerRow: View {
+    let alarm: Alarm
+
+    var body: some View {
+        HStack {
+            switch alarm.state {
+            case .countdown: Text("Running")
+            case .alerting: Text("Alerting")
+            case .paused: Text("Paused")
+            default: EmptyView()
+            }
+            Spacer()
+            Button("Cancel", systemImage: "xmark") {
+                try? AlarmManager.shared.cancel(id: alarm.id)
+            }
+            .labelStyle(.iconOnly)
+        }
+    }
+}
+```
+
+`cancel(id:)` stops a single one. This "the live remaining time never reaches the app" design feels inconvenient at first, but it makes sense once you see that consolidating the countdown's responsibility in the Live Activity is what keeps the display from breaking when the app isn't in the foreground.
+
+## Rork Max's native Swift, and bridging from Expo
+
+This is the heart of it for those of us using Rork. AlarmKit is a pure native iOS framework meant to be called from Swift. From the React Native (Expo) apps that ordinary Rork generates, you can't touch AlarmKit from the JavaScript world alone. Rork Max, on the other hand, generates native Swift, so a framework like AlarmKit — one the React Native standard can't reach — can live inside the generated code.
+
+My rule of thumb: if the core of the app is timers and alarms and you want to craft the Lock Screen experience, building in Rork Max's native Swift from the start is the natural path. If you've already built most of the app in Expo and only want a reliably-ringing timer on a few screens, carve out a native module with the Expo Modules API and bridge to it. The table shows the split.
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>Recommended approach</th><th>Bridge boundary</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Timers / alarms are the core feature</td><td>Build in Rork Max native Swift</td><td>No bridge. Call AlarmKit directly from SwiftUI</td></tr>
+    <tr><td>Adding to an existing Expo app</td><td>Wrap with the Expo Modules API</td><td>Expose only start / cancel / state updates; keep UI in JS</td></tr>
+    <tr><td>Same binary supports pre-iOS 26</td><td>Branch on availability; fall back to local notifications</td><td><code>if #available(iOS 26, *)</code> inside the module</td></tr>
+  </tbody>
+</table>
+
+When bridging via the Expo Modules API, expose as little as possible to JavaScript. I kept the boundary to just three things: "start a timer," "cancel by id," and "stream the active ids." All the Swift-specific parts — assembling `AlarmPresentation` and `AlarmAttributes`, drawing the Live Activity — stay sealed inside the native module. The thinner the boundary, the smaller the blast radius when AlarmKit's API later shifts.
+
+```swift
+// Minimal boundary exposed via the Expo Modules API (sketch)
+import ExpoModulesCore
+import AlarmKit
+
+public class AlarmTimerModule: Module {
+    public func definition() -> ModuleDefinition {
+        Name("AlarmTimer")
+
+        AsyncFunction("startTimer") { (seconds: Double) -> String in
+            // check authorization → call AlarmKit's schedule, return the id string
+            let id = UUID()
+            // ...(run the schedule shown earlier here)...
+            return id.uuidString
+        }
+
+        AsyncFunction("cancelTimer") { (id: String) in
+            if let uuid = UUID(uuidString: id) {
+                try? AlarmManager.shared.cancel(id: uuid)
+            }
+        }
+    }
+}
+```
+
+The thing to watch is always including the `if #available(iOS 26, *)` branch. Expo apps ship to devices across a wide range of OS versions. On devices where AlarmKit isn't available, design the same "start timer" entry point to quietly switch to a `UserNotifications` fallback, so your JS code doesn't have to branch on OS version itself.
+
+## Pitfalls you're likely to hit
+
+Finally, the spots where I actually stumbled, shared ahead of time. Each is avoidable once you know it.
+
+- **Forgetting the `AlarmMetadata` type**: even an empty `nonisolated struct TimerData: AlarmMetadata {}` must be declared and named explicitly, as in `AlarmAttributes<TimerData>`, or it won't compile.
+- **Forgetting `TimerData` in both targets**: check its Target Membership for both the app and the Widget Extension. With only one, the Live Activity side can't resolve the type.
+- **A `title` that's too long and gets cut**: the end-alert's compact form is narrow, so keep `title` short.
+- **Over-trusting the simulator**: verify the ringing behavior on a real device. Silent switch and Focus behavior only mean something on hardware.
+- **No fallback on denial**: make sure the feature doesn't die silently for `.denied` users — always provide a Settings path or a local-notification switch.
+
+Since this is an iOS 26 feature, on apps whose deployment target doesn't start at iOS 26 the availability branching and fallback design make up half the work. Conversely, build that branching carefully and you can offer something that was genuinely hard for indie developers before: a timer that reliably rings even on silent. Start by getting the authorization request and a three-minute `schedule()` running once in your own project. Once that works, the rest is just refining the presentation.
