@@ -1,0 +1,221 @@
+---
+title: "返金申請に12時間以内で応答する — CONSUMPTION_REQUEST を Cloudflare Workers で受け止める"
+slug: "rork-consumption-request-refund-response-worker"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-30T20:15"
+updated: "2026-06-30T20:15"
+author: "Rork Lab"
+description: "Rork で作ったサブスクアプリに届く App Store の CONSUMPTION_REQUEST 通知を、Cloudflare Workers で受信して Send Consumption Information API に12時間以内で応答する実装を、フィールドの意味づけと運用判断まで含めて解説します。"
+tags: ["App Store Server API", "返金", "Cloudflare Workers", "サブスクリプション", "StoreKit 2"]
+highlights:
+  - "返金申請時に Apple から届く CONSUMPTION_REQUEST 通知を Cloudflare Workers で受信し、Send Consumption Information API へ12時間以内に応答する最小構成を、動くコード付きで組める"
+  - "consumptionStatus・deliveryStatus・refundPreference など12個のフィールドを、自前の KV に持つ購読・利用ログからどう埋めるかの対応表が手に入る"
+  - "誠実なデータ提供で不正な返金を抑えつつ、本当に困っている利用者の返金は妨げない — その線引きを運用ルールとして言語化できる"
+---
+サブスクの解約理由を眺めていて、「使い込んだ直後に返金申請が通っている」取引にいくつか気づいたのは、Rork で出したアプリの売上がようやく月単位で読めるようになった頃でした。返金そのものは利用者の権利ですし、止めたいわけではありません。ただ、明らかにコンテンツを消費しきった後の申請まで自動で通っていくのは、個人開発の収益としては地味に効いてきます。
+
+そこで初めて真面目に向き合ったのが **CONSUMPTION_REQUEST** という通知でした。利用者が App Store に返金を申請すると、Apple はアプリ側に「このユーザーはどれくらいこの購入を消費しましたか」と尋ねてきます。これに12時間以内で誠実に応答すると、Apple が返金可否を判断する材料になります。応答しなくても罰則はありませんが、応答しなければ「使い込んだ後の返金」を抑える手段を一つ放棄することになります。
+
+このガイドは、その応答処理を Cloudflare Workers だけで完結させる構成を、フィールドの埋め方と運用判断まで含めて作るためのものです。サブスクの受信基盤（App Store Server Notifications V2 の受け口）をすでに持っている前提で書きますが、まだの方は先に[App Store Server Notifications V2 を自前運用する構成](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription)を読んでおくと、この記事の Worker をそのまま増築できます。
+
+## CONSUMPTION_REQUEST が届く条件と締め切り
+
+この通知は、いくつかの条件がそろったときだけ届きます。まず、App Store Connect の「App 情報」で **Consumption Request** の受信を有効にしていること。そして利用者が返金を申請し、かつその取引が消費型・非消費型・サブスクのいずれかであること。サブスクの自動更新分でも届きます。
+
+締め切りは通知の `signedDate` から **12時間**です。ここを過ぎると応答は受け付けられません。Cloudflare Workers は受信時に同期処理で重い計算をすると応答が遅れるので、受信はすぐ 200 を返し、実際の API 呼び出しは後段に回す設計が安全です。とはいえ12時間という猶予は長いので、`waitUntil` で受信ハンドラの裏で処理する程度で十分間に合います。
+
+<table>
+<thead><tr><th>項目</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td>通知タイプ</td><td>CONSUMPTION_REQUEST</td></tr>
+<tr><td>応答先 API</td><td>PUT /inApps/v1/transactions/consumption/{transactionId}</td></tr>
+<tr><td>締め切り</td><td>signedDate から12時間以内</td></tr>
+<tr><td>必須の前提</td><td>customerConsented を true で送れること（同意の取得）</td></tr>
+<tr><td>応答しない場合</td><td>罰則なし。ただし返金抑止の材料を1つ失う</td></tr>
+</tbody>
+</table>
+
+## customerConsented が立たないと、データは無視される
+
+最初に必ず押さえておきたい落とし穴がこれです。Send Consumption Information のリクエストには `customerConsented` というブール値があり、これが `true` でないと、**他のフィールドをどれだけ正確に埋めても Apple は一切参照しません**。「利用者が、消費データを Apple に提供することに同意している」という宣言だからです。
+
+ですから実装の前に、利用規約かプライバシーポリシー、あるいはオンボーディングのどこかで「返金申請時に、適切な判断のため利用状況を Apple と共有することがあります」という旨の同意を取得しておく必要があります。私自身、個人開発で続けている壁紙・癒し系アプリでは、サブスク購入画面のフッターにこの一文への導線を置き、規約への同意をもって `customerConsented` を立てる運用にしました。同意を取れていないユーザーについては、`customerConsented: false` で送るのではなく、応答自体を見送る方が誠実だと考えています。
+
+## まず受信ハンドラに CONSUMPTION_REQUEST を分岐させる
+
+すでに ASSN V2 を受けている Worker があるなら、`notificationType` での分岐を一つ足すだけです。署名検証（JWS の x5c チェーン検証）は受信基盤側で済んでいる前提で、ここでは分岐と取引 ID の取り出しに集中します。
+
+```javascript
+// Cloudflare Worker — ASSN V2 受信ハンドラ（抜粋）
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method !== "POST") return new Response("ok", { status: 200 });
+
+    const body = await request.json();
+    // verifyAndDecodeJWS は受信基盤側の関数（x5c チェーン検証 + payload デコード）
+    const payload = await verifyAndDecodeJWS(body.signedPayload, env);
+
+    if (payload.notificationType === "CONSUMPTION_REQUEST") {
+      const tx = await verifyAndDecodeJWS(
+        payload.data.signedTransactionInfo, env
+      );
+      // 受信は即 200。実処理は裏で走らせる（12時間の猶予がある）
+      ctx.waitUntil(handleConsumptionRequest(tx, payload, env));
+    }
+
+    // 他の notificationType の処理は既存のまま
+    return new Response("ok", { status: 200 });
+  },
+};
+```
+
+ポイントは `ctx.waitUntil` です。返金判断のための KV 参照や App Store Server API への往復を受信レスポンスの前でやると、Apple 側のタイムアウトに引っかかる可能性があります。受信は即座に確定し、判断と応答は裏に回します。
+
+## 12個のフィールドを、自前のログからどう埋めるか
+
+Send Consumption Information のリクエストボディは12個のフィールドを持ちます。多くは「0〜7の列挙値」で、自分の KV に持っている購読履歴・利用ログから機械的に導出できます。ここが実装の本体です。
+
+<table>
+<thead><tr><th>フィールド</th><th>意味</th><th>自前ログからの導出例</th></tr></thead>
+<tbody>
+<tr><td>customerConsented</td><td>同意の有無（必須）</td><td>規約同意フラグ。未取得なら応答を見送る</td></tr>
+<tr><td>consumptionStatus</td><td>消費の度合い（0–3）</td><td>機能利用ログ。未使用=1 / 一部=2 / 使い切り=3</td></tr>
+<tr><td>deliveryStatus</td><td>正常に提供できたか（0–5）</td><td>不具合報告がなければ 0（正常提供）</td></tr>
+<tr><td>refundPreference</td><td>返金可否の希望（0–3）</td><td>運用ルールで決定（後述）</td></tr>
+<tr><td>userStatus</td><td>アカウント状態（0–4）</td><td>BAN 中=3 / 通常=1</td></tr>
+<tr><td>lifetimeDollarsPurchased</td><td>累計購入額帯（0–7）</td><td>このアカウントの累計課金</td></tr>
+<tr><td>lifetimeDollarsRefunded</td><td>累計返金額帯（0–7）</td><td>過去の返金合計</td></tr>
+<tr><td>playTime</td><td>累計利用時間帯（0–6）</td><td>セッション時間の合算</td></tr>
+<tr><td>accountTenure</td><td>アカウント継続期間（0–7）</td><td>初回起動からの経過日数</td></tr>
+<tr><td>sampleContentProvided</td><td>無料体験を提供したか</td><td>トライアル提供の有無</td></tr>
+<tr><td>appAccountToken</td><td>購入時に紐づけた UUID</td><td>取引から取得</td></tr>
+<tr><td>platform</td><td>1=Apple / 2=非Apple</td><td>固定で 1</td></tr>
+</tbody>
+</table>
+
+導出ロジックを関数にまとめます。`appAccountToken` を手がかりに自分のユーザーレコードを引き、利用ログから各帯を計算する形です。
+
+```javascript
+async function buildConsumptionBody(tx, env) {
+  const accountToken = tx.appAccountToken;
+  if (!accountToken) return null; // 紐づけ無しは判断材料が薄いので見送り
+
+  const user = await env.SUBS.get(`user:${accountToken}`, "json");
+  if (!user || !user.consentedToShare) return null; // 同意なしは送らない
+
+  return {
+    customerConsented: true,
+    platform: 1,
+    sampleContentProvided: Boolean(user.usedFreeTrial),
+    appAccountToken: accountToken,
+
+    consumptionStatus: deriveConsumption(user),   // 0–3
+    deliveryStatus: user.hadDeliveryIssue ? 1 : 0,
+    accountTenure: tenureBucket(user.firstSeenAt), // 0–7
+    playTime: playTimeBucket(user.totalPlaySeconds),
+    lifetimeDollarsPurchased: dollarsBucket(user.lifetimePurchasedCents),
+    lifetimeDollarsRefunded: dollarsBucket(user.lifetimeRefundedCents),
+    userStatus: user.banned ? 3 : 1,
+
+    refundPreference: decideRefundPreference(user), // 運用ルール
+  };
+}
+
+// 消費の度合い: 機能をどれだけ使ったかで決める
+function deriveConsumption(user) {
+  if (user.featureUseCount === 0) return 1;        // 未消費
+  if (user.totalPlaySeconds > 3600) return 3;      // 使い切り
+  return 2;                                        // 一部消費
+}
+
+// 累計額の帯（USドル換算のセント値を 0–7 にマップ）
+function dollarsBucket(cents) {
+  const usd = (cents || 0) / 100;
+  if (usd <= 0) return 0;
+  if (usd < 50) return 1;
+  if (usd < 100) return 2;
+  if (usd < 500) return 3;
+  if (usd < 1000) return 4;
+  if (usd < 2000) return 5;
+  if (usd < 3000) return 6;
+  return 7;
+}
+```
+
+`accountTenure` や `playTime` の帯も同じ要領で、Apple の列挙定義に沿って境界値を決めます。境界はアプリの実態に合わせて構いませんが、`dollarsBucket` のように一度決めたら全フィールドで一貫させるのが、後でログを読み返すときに楽です。
+
+## refundPreference は「自動で2」にしてはいけない
+
+ここが運用判断の核心です。`refundPreference` は「あなたとして返金を認めたいか」を Apple に伝えるフィールドで、`0`=表明なし、`1`=返金を認める方向、`2`=返金を断る方向、`3`=どちらでもない、の4値です。
+
+不正返金を減らしたいからといって、これを機械的に `2`（断る方向）に倒すのは賢くありません。本当に不具合で困っている利用者の返金まで妨げてしまい、結果としてレビューの星を落とすからです。私は次のような単純なルールにしています。使い切った形跡（`consumptionStatus === 3`）があり、かつ提供は正常（`deliveryStatus === 0`）で、過去の返金常習でもない場合のみ `2`。不具合報告がある、または利用がごく僅か、あるいは購入直後なら `3`（どちらでもない）にして Apple の判断に委ねます。
+
+```javascript
+function decideRefundPreference(user) {
+  // 不具合があった、または購入直後ならニュートラル
+  if (user.hadDeliveryIssue) return 3;
+  const minutesSincePurchase =
+    (Date.now() - user.lastPurchaseAt) / 60000;
+  if (minutesSincePurchase < 15) return 3;
+
+  // 使い切り + 正常提供 + 返金常習でない → 断る方向
+  if (deriveConsumption(user) === 3 && !user.frequentRefunder) {
+    return 2;
+  }
+  // それ以外は表明しない（Apple に委ねる）
+  return 0;
+}
+```
+
+この「2を出すのは限定的な条件のときだけ」という線引きを、コードのコメントではなく運用ドキュメントに書いておくことを推奨します。半年後の自分が「なぜここで2を出しているのか」を思い出せるようにしておくと、レビューの炎上と収益保護のバランスを後から調整しやすくなります。
+
+## App Store Server API へ PUT する
+
+ボディが組めたら、App Store Server API の consumption エンドポイントへ送ります。認証は他の Server API 呼び出しと同じ ES256 の JWT です。受信基盤で JWT 生成関数を持っているなら再利用できます。
+
+```javascript
+async function handleConsumptionRequest(tx, payload, env) {
+  const consumption = await buildConsumptionBody(tx, env);
+  if (!consumption) return; // 同意なし・紐づけ無しは応答しない
+
+  const jwt = await makeAppStoreJWT(env); // 既存の ES256 JWT 生成
+  const base = env.USE_SANDBOX
+    ? "https://api.storekit-sandbox.itunes.apple.com"
+    : "https://api.storekit.itunes.apple.com";
+
+  const res = await fetch(
+    `${base}/inApps/v1/transactions/consumption/${tx.transactionId}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(consumption),
+    }
+  );
+
+  // 成功時は 202 Accepted（ボディ無し）が返る
+  if (res.status !== 202) {
+    console.error("consumption PUT failed", res.status, await res.text());
+    // 失敗は KV にためて、Cron Trigger で12時間以内に再送する
+    await env.SUBS.put(
+      `retry:consumption:${tx.transactionId}`,
+      JSON.stringify({ consumption, at: Date.now() }),
+      { expirationTtl: 60 * 60 * 12 }
+    );
+  }
+}
+```
+
+成功すると **202 Accepted** がボディ無しで返ります。`200` を期待して `res.ok` だけ見ていると取りこぼすので、`202` を明示的に成功扱いにしてください。失敗時は KV に積んで Cron Trigger で再送する形にしておくと、Apple 側の一時的な不調や Worker の瞬断による取りこぼしを回避でき、本番運用でも12時間の猶予内で確実に拾い直せます。
+
+## Sandbox で実際に CONSUMPTION_REQUEST を発火させる
+
+この処理は本番でしか確認できないと思われがちですが、Sandbox で発火させられます。Sandbox 環境でサブスクを購入し、App Store Connect のテスター設定から返金をリクエストすると、`USE_SANDBOX` 側のエンドポイント（`api.storekit-sandbox.itunes.apple.com`）と Sandbox の通知 URL に CONSUMPTION_REQUEST が流れます。
+
+私は最初、本番の通知 URL しか登録しておらず、Sandbox の通知 URL を App Store Connect 側で別に設定し忘れていて、テストイベントがどこにも届かず半日悩みました。ASSN V2 の通知先 URL は本番と Sandbox で別々に登録する欄があります。`USE_SANDBOX` の分岐を入れたら、通知 URL の登録も両方そろっているか必ず確認してください。Worker のログに `notificationType === "CONSUMPTION_REQUEST"` の到達ログを一行入れておくと、発火しているのに処理されていないのか、そもそも届いていないのかを切り分けられます。
+
+返金は利用者の正当な権利なので、この仕組みのゴールは「返金を減らすこと」そのものではありません。使い切った後の申請にだけ静かに事実を添え、困っている人の返金は妨げない。その節度を保てる範囲で運用するのが、長く続けるアプリにとっては結局いちばん得だと感じています。まずは Sandbox で1回、CONSUMPTION_REQUEST を自分の手で発火させて、Worker のログに到達することを確かめるところから始めてみてください。

@@ -1,0 +1,221 @@
+---
+title: "Answering a Refund Request Within 12 Hours: Handling CONSUMPTION_REQUEST in Cloudflare Workers"
+slug: "rork-consumption-request-refund-response-worker"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-06-30T20:15"
+updated: "2026-06-30T20:15"
+author: "Rork Lab"
+description: "How to receive the App Store CONSUMPTION_REQUEST notification for your Rork subscription app in Cloudflare Workers and respond to the Send Consumption Information API within 12 hours — with field-by-field mapping and the operational judgment behind it."
+tags: ["App Store Server API", "Refunds", "Cloudflare Workers", "Subscriptions", "StoreKit 2"]
+highlights:
+  - "Build a minimal Cloudflare Workers setup that receives the CONSUMPTION_REQUEST notification and answers the Send Consumption Information API within the 12-hour window — with working code"
+  - "Get a mapping table for filling all twelve fields (consumptionStatus, deliveryStatus, refundPreference, and more) from the subscription and usage logs you already keep in KV"
+  - "Define, as an operational rule, where to draw the line so honest data curbs abusive refunds without blocking refunds for users who genuinely need them"
+---
+I first noticed it while scanning subscription cancellation reasons: a handful of transactions where a refund went through right after the content had clearly been used up. This was around the time the revenue from my Rork-built apps had finally become predictable on a monthly basis. Refunds are a user's right, and I have no interest in fighting them. But when refunds keep clearing automatically even after someone has obviously consumed everything the purchase offered, it quietly eats into indie revenue.
+
+That was when I first took **CONSUMPTION_REQUEST** seriously. When a user requests a refund through the App Store, Apple asks your app, "How much did this user consume this purchase?" If you answer honestly within 12 hours, your answer becomes part of how Apple decides the refund. There's no penalty for staying silent — but staying silent means giving up one of the few levers you have against "refund-after-full-use."
+
+This guide builds that response flow entirely inside Cloudflare Workers, covering both how to fill the fields and the judgment behind them. I'll assume you already have a receiver for App Store Server Notifications V2; if you don't, read [the self-hosted App Store Server Notifications V2 setup](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription) first, and you'll be able to bolt this Worker straight onto it.
+
+## When CONSUMPTION_REQUEST arrives, and the deadline
+
+This notification only arrives when several conditions line up. First, you must have enabled **Consumption Request** delivery under "App Information" in App Store Connect. Second, the user must have filed a refund, and the transaction must be consumable, non-consumable, or a subscription. Auto-renewal transactions are included.
+
+The deadline is **12 hours** from the notification's `signedDate`. Miss it and your response is rejected. If a Cloudflare Worker does heavy synchronous work before returning a receipt response, Apple may time out, so the safe design is to return 200 immediately and push the actual API call to the background. Twelve hours is generous, so handling it behind the receive handler with `waitUntil` is more than enough.
+
+<table>
+<thead><tr><th>Item</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td>Notification type</td><td>CONSUMPTION_REQUEST</td></tr>
+<tr><td>Response API</td><td>PUT /inApps/v1/transactions/consumption/{transactionId}</td></tr>
+<tr><td>Deadline</td><td>Within 12 hours of signedDate</td></tr>
+<tr><td>Hard requirement</td><td>Being able to send customerConsented as true</td></tr>
+<tr><td>If you don't respond</td><td>No penalty, but you lose one refund-deterrent signal</td></tr>
+</tbody>
+</table>
+
+## Without customerConsented, your data is ignored
+
+This is the pitfall to internalize before anything else. The Send Consumption Information request has a boolean called `customerConsented`, and unless it is `true`, **Apple ignores every other field no matter how accurately you fill it in**. It is a declaration that "the customer has consented to provide consumption data to Apple."
+
+So before you implement anything, you need to have collected that consent somewhere — in your terms of service, your privacy policy, or onboarding — with language like "we may share usage information with Apple to support fair handling of refund requests." In my own wallpaper and relaxation apps, I placed a link to that clause in the footer of the subscription purchase screen, and treat agreement to the terms as the basis for setting `customerConsented`. For users from whom I haven't obtained consent, I think it's more honest to skip the response entirely rather than send `customerConsented: false`.
+
+## Branch CONSUMPTION_REQUEST in the receive handler
+
+If you already have a Worker receiving ASSN V2, you only add one branch on `notificationType`. Assuming signature verification (the JWS x5c chain check) is already done in your receiver, here we focus on the branch and pulling out the transaction ID.
+
+```javascript
+// Cloudflare Worker — ASSN V2 receive handler (excerpt)
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method !== "POST") return new Response("ok", { status: 200 });
+
+    const body = await request.json();
+    // verifyAndDecodeJWS lives in your receiver (x5c chain check + payload decode)
+    const payload = await verifyAndDecodeJWS(body.signedPayload, env);
+
+    if (payload.notificationType === "CONSUMPTION_REQUEST") {
+      const tx = await verifyAndDecodeJWS(
+        payload.data.signedTransactionInfo, env
+      );
+      // Acknowledge immediately; do the real work in the background (12h budget)
+      ctx.waitUntil(handleConsumptionRequest(tx, payload, env));
+    }
+
+    // Existing handling for other notificationTypes stays as-is
+    return new Response("ok", { status: 200 });
+  },
+};
+```
+
+The key is `ctx.waitUntil`. Doing KV lookups and a round trip to the App Store Server API before the receipt response risks Apple's timeout. Acknowledge the receipt instantly and move the decision and the response to the background.
+
+## Filling the twelve fields from your own logs
+
+The Send Consumption Information request body has twelve fields. Most are "enumerations from 0 to 7" that you can derive mechanically from the subscription history and usage logs you keep in KV. This is the heart of the implementation.
+
+<table>
+<thead><tr><th>Field</th><th>Meaning</th><th>How to derive from your logs</th></tr></thead>
+<tbody>
+<tr><td>customerConsented</td><td>Consent flag (required)</td><td>Terms-consent flag; skip the response if absent</td></tr>
+<tr><td>consumptionStatus</td><td>Degree of consumption (0–3)</td><td>Feature-use log: unused=1 / partial=2 / fully used=3</td></tr>
+<tr><td>deliveryStatus</td><td>Was it delivered and working (0–5)</td><td>0 if no issue reports (delivered and working)</td></tr>
+<tr><td>refundPreference</td><td>Your refund preference (0–3)</td><td>Decided by your policy (below)</td></tr>
+<tr><td>userStatus</td><td>Account state (0–4)</td><td>Banned=3 / normal=1</td></tr>
+<tr><td>lifetimeDollarsPurchased</td><td>Lifetime spend band (0–7)</td><td>This account's lifetime spend</td></tr>
+<tr><td>lifetimeDollarsRefunded</td><td>Lifetime refund band (0–7)</td><td>Past refund total</td></tr>
+<tr><td>playTime</td><td>Lifetime usage-time band (0–6)</td><td>Sum of session time</td></tr>
+<tr><td>accountTenure</td><td>How long the account has existed (0–7)</td><td>Days since first launch</td></tr>
+<tr><td>sampleContentProvided</td><td>Did you offer a free trial</td><td>Whether a trial was granted</td></tr>
+<tr><td>appAccountToken</td><td>UUID bound at purchase time</td><td>Read from the transaction</td></tr>
+<tr><td>platform</td><td>1=Apple / 2=non-Apple</td><td>Fixed at 1</td></tr>
+</tbody>
+</table>
+
+Gather the derivation logic into a function. Use `appAccountToken` to look up your own user record, then compute each band from the usage log.
+
+```javascript
+async function buildConsumptionBody(tx, env) {
+  const accountToken = tx.appAccountToken;
+  if (!accountToken) return null; // No binding = thin evidence; skip
+
+  const user = await env.SUBS.get(`user:${accountToken}`, "json");
+  if (!user || !user.consentedToShare) return null; // No consent = don't send
+
+  return {
+    customerConsented: true,
+    platform: 1,
+    sampleContentProvided: Boolean(user.usedFreeTrial),
+    appAccountToken: accountToken,
+
+    consumptionStatus: deriveConsumption(user),   // 0–3
+    deliveryStatus: user.hadDeliveryIssue ? 1 : 0,
+    accountTenure: tenureBucket(user.firstSeenAt), // 0–7
+    playTime: playTimeBucket(user.totalPlaySeconds),
+    lifetimeDollarsPurchased: dollarsBucket(user.lifetimePurchasedCents),
+    lifetimeDollarsRefunded: dollarsBucket(user.lifetimeRefundedCents),
+    userStatus: user.banned ? 3 : 1,
+
+    refundPreference: decideRefundPreference(user), // your policy
+  };
+}
+
+// Degree of consumption: decided by how much of the feature was used
+function deriveConsumption(user) {
+  if (user.featureUseCount === 0) return 1;        // not consumed
+  if (user.totalPlaySeconds > 3600) return 3;      // fully used
+  return 2;                                        // partially consumed
+}
+
+// Spend band (map a USD-equivalent cent value to 0–7)
+function dollarsBucket(cents) {
+  const usd = (cents || 0) / 100;
+  if (usd <= 0) return 0;
+  if (usd < 50) return 1;
+  if (usd < 100) return 2;
+  if (usd < 500) return 3;
+  if (usd < 1000) return 4;
+  if (usd < 2000) return 5;
+  if (usd < 3000) return 6;
+  return 7;
+}
+```
+
+Define the `accountTenure` and `playTime` bands the same way, following Apple's enum definitions. Set the boundaries to match your app's reality — but once you decide them, keep them consistent across all fields, which pays off when you re-read your logs later.
+
+## Don't set refundPreference to "2" automatically
+
+This is the core of the operational judgment. `refundPreference` tells Apple whether you, as the developer, lean toward granting the refund: `0`=no preference, `1`=lean toward granting, `2`=lean toward declining, `3`=no preference either way.
+
+Tipping this mechanically to `2` (lean toward declining) just because you want fewer refunds is unwise. You end up blocking refunds for users who are genuinely stuck with a defect, and your review stars pay for it. I use a simple rule: only set `2` when there's evidence the content was fully used (`consumptionStatus === 3`), delivery was fine (`deliveryStatus === 0`), and the account isn't a habitual refunder. If there's an issue report, usage is minimal, or the purchase was just made, I use `3` (no preference) and leave the call to Apple.
+
+```javascript
+function decideRefundPreference(user) {
+  // Defect or very recent purchase -> stay neutral
+  if (user.hadDeliveryIssue) return 3;
+  const minutesSincePurchase =
+    (Date.now() - user.lastPurchaseAt) / 60000;
+  if (minutesSincePurchase < 15) return 3;
+
+  // Fully used + clean delivery + not a habitual refunder -> lean decline
+  if (deriveConsumption(user) === 3 && !user.frequentRefunder) {
+    return 2;
+  }
+  // Otherwise express nothing (leave it to Apple)
+  return 0;
+}
+```
+
+I'd suggest writing this "only emit 2 under narrow conditions" line not as a code comment but in an operational doc. If your future self, six months from now, can remember why a 2 is emitted here, you'll find it much easier to retune the balance between review blowback and revenue protection.
+
+## PUT to the App Store Server API
+
+Once the body is built, send it to the consumption endpoint of the App Store Server API. Authentication is the same ES256 JWT as your other Server API calls. If your receiver already has a JWT generator, reuse it.
+
+```javascript
+async function handleConsumptionRequest(tx, payload, env) {
+  const consumption = await buildConsumptionBody(tx, env);
+  if (!consumption) return; // No consent / no binding -> don't respond
+
+  const jwt = await makeAppStoreJWT(env); // existing ES256 JWT generator
+  const base = env.USE_SANDBOX
+    ? "https://api.storekit-sandbox.itunes.apple.com"
+    : "https://api.storekit.itunes.apple.com";
+
+  const res = await fetch(
+    `${base}/inApps/v1/transactions/consumption/${tx.transactionId}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(consumption),
+    }
+  );
+
+  // Success returns 202 Accepted (no body)
+  if (res.status !== 202) {
+    console.error("consumption PUT failed", res.status, await res.text());
+    // Queue failures in KV and retry within 12h via a Cron Trigger
+    await env.SUBS.put(
+      `retry:consumption:${tx.transactionId}`,
+      JSON.stringify({ consumption, at: Date.now() }),
+      { expirationTtl: 60 * 60 * 12 }
+    );
+  }
+}
+```
+
+Success returns **202 Accepted** with no body. If you only check `res.ok` expecting `200`, you'll miss it, so treat `202` explicitly as success. On failure, queue it in KV and retry via a Cron Trigger, so a transient Apple hiccup or a Worker blip can still be recovered within the 12-hour budget.
+
+## Actually firing CONSUMPTION_REQUEST in Sandbox
+
+People assume this can only be verified in production, but you can fire it in Sandbox. Buy a subscription in the Sandbox environment, request a refund from the tester settings in App Store Connect, and CONSUMPTION_REQUEST flows to the `USE_SANDBOX` endpoint (`api.storekit-sandbox.itunes.apple.com`) and your Sandbox notification URL.
+
+At first I had only registered the production notification URL and had forgotten to set the separate Sandbox notification URL in App Store Connect, so my test events landed nowhere and I lost half a day. ASSN V2 has separate fields to register the production and Sandbox notification URLs. Once you add the `USE_SANDBOX` branch, double-check that both notification URLs are registered. Putting a single arrival log line on `notificationType === "CONSUMPTION_REQUEST"` in your Worker lets you tell apart "it fired but wasn't processed" from "it never arrived."
+
+Because a refund is a user's legitimate right, the goal of this mechanism isn't to "reduce refunds" as such. It quietly attaches the facts only to claims made after full use, and doesn't get in the way of refunds for people who are genuinely stuck. Running it within the bounds of that restraint is, for an app you intend to keep alive for years, ultimately the most profitable choice. Start by firing CONSUMPTION_REQUEST once in Sandbox with your own hands and confirming it reaches your Worker's logs.
