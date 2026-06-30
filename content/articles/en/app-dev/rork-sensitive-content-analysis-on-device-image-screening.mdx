@@ -1,0 +1,193 @@
+---
+title: "Screening Images On Device Before They Appear — Notes on SensitiveContentAnalysis"
+slug: "rork-sensitive-content-analysis-on-device-image-screening"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-06-30T14:47"
+updated: "2026-06-30T14:47"
+author: "Rork Lab"
+description: "Implementation notes on blocking inappropriate images before they render, right on the device, for apps that handle AI-generated or user-submitted photos. Covers calling Apple's SensitiveContentAnalysis framework from Swift and wiring it into Rork Max native code or an Expo native module, with the pitfalls I actually hit."
+tags: ["SensitiveContentAnalysis", "Rork Max", "Expo", "iOS", "Content Moderation"]
+highlights:
+  - "Working Swift code that flags explicit images entirely on device (iOS 17+) using SCSensitivityAnalyzer, without sending anything off the phone"
+  - "A concrete path for wiring the check into Rork Max native code or into an Expo Modules API native module called from TypeScript"
+  - "The judgment calls for fallback design — what to do on devices where the feature is off, and in the simulator where it never runs"
+---
+
+I run a few wallpaper apps as an indie developer, and I was adding a feature that lets people upload and edit their own photos. As long as I was only serving curated assets, this was a non-issue. The moment user submissions and AI-generated images entered the gallery, the risk of an inappropriate image sitting in the grid became very real.
+
+My first instinct was to handle everything with server-side moderation. But once I traced the actual paths — the brief window between upload and the image reaching another user's feed, and the offline path where a cached image is re-displayed on the device — server-side checks alone clearly left gaps. So I added one more layer: "check it once, inside the device, right before it is shown." Apple's SensitiveContentAnalysis framework is built precisely for that role. Here is what I learned wiring it in.
+
+## Why screen "before display" and "on device"
+
+When people think about inappropriate-image defense, they think of server-side checks at upload time. That is correct, but mobile apps have these leak paths:
+
+- The image reaches another user's feed before the server-side check finishes
+- A cached or saved image is re-displayed offline
+- A widget or share-sheet preview that loads a remote URL directly
+
+App Store Review Guideline 1.2 expects apps with user-generated content to provide a filtering mechanism and a way to report. If you run ads such as AdMob, an ad rendered next to an inappropriate image is itself a policy problem. So this is not only about passing review — it is also a defensive move for revenue.
+
+If the server check is the first line of defense, the on-device check at display time is the last gate. After I moved to this two-layer setup, both review feedback and user reports noticeably calmed down.
+
+## What the SensitiveContentAnalysis framework is
+
+SensitiveContentAnalysis arrived in iOS 17 (macOS 14) as the official framework for deciding, **on the device**, whether an image or video contains explicit nudity. Key traits:
+
+- Analysis runs entirely on device; the image is never sent anywhere. Privacy stays intact
+- Apple maintains the detection engine, so you never train or update a model yourself
+- It requires the dedicated entitlement `com.apple.developer.sensitivecontentanalysis.client`
+- Crucially, analysis only runs on devices where the user has enabled "Sensitive Content Warning" in Settings. When it is off, the analysis policy is `.disabled` and no judgment happens
+
+That last point dominates the design. The premise that "adding this API guarantees every device blocks bad images" is false, and holding that fact from the start is what leads to the fallback design below.
+
+## What Rork Max scaffolds, and what you add
+
+Plain Rork generates apps in React Native (Expo); Rork Max generates native Swift. An Apple-specific framework like SensitiveContentAnalysis is squarely Rork Max's territory.
+
+That said, what comes out of a natural-language prompt is the scaffolding — the image view, the upload flow. In my case, on top of the gallery screen Rork Max produced, I added three things myself:
+
+1. The entitlement
+2. A thin wrapper that calls the analyzer
+3. Display branching based on the verdict
+
+The boundary I settled on: do not hand the whole thing to generative AI. Keep the logic that touches security and review in code you wrote and can read. Not compromising here makes later audits much easier.
+
+## Swift implementation: images and video
+
+`SCSensitivityAnalyzer` is the center of it. Check the analysis policy first, and only analyze when it is active.
+
+```swift
+import SensitiveContentAnalysis
+
+enum ScreeningResult {
+    case sensitive      // flagged
+    case safe           // fine
+    case unavailable    // setting off / unsupported / could not judge
+}
+
+struct ContentScreener {
+    private let analyzer = SCSensitivityAnalyzer()
+
+    /// Screens an image on device. Returns .unavailable when it cannot judge.
+    func screen(imageAt url: URL) async -> ScreeningResult {
+        // Analysis won't run unless the user enabled the feature in Settings
+        guard analyzer.analysisPolicy != .disabled else {
+            return .unavailable
+        }
+        do {
+            let response = try await analyzer.analyzeImage(at: url)
+            return response.isSensitive ? .sensitive : .safe
+        } catch {
+            // Treat an analysis failure as "could not block", not "safe"
+            return .unavailable
+        }
+    }
+}
+```
+
+For video, use `analyzeVideo(at:)`. It samples frames, so it takes longer than an image — always call it from an async context so the UI never blocks.
+
+```swift
+extension ContentScreener {
+    func screen(videoAt url: URL) async -> ScreeningResult {
+        guard analyzer.analysisPolicy != .disabled else { return .unavailable }
+        do {
+            let response = try await analyzer.analyzeVideo(at: url)
+            return response.isSensitive ? .sensitive : .safe
+        } catch {
+            return .unavailable
+        }
+    }
+}
+```
+
+The point is to keep exceptions and `.disabled` out of the "safe" bucket, marking them clearly as `.unavailable` (could not judge). If you treat "could not judge" as safe, images slip straight past the gate.
+
+## Calling it from Expo / React Native
+
+If you want this check in a plain Rork (Expo) app, write a native module with the Expo Modules API and call it from TypeScript. Expose it on the Swift side with `AsyncFunction`.
+
+```swift
+import ExpoModulesCore
+import SensitiveContentAnalysis
+
+public class ContentScreenerModule: Module {
+    private let analyzer = SCSensitivityAnalyzer()
+
+    public func definition() -> ModuleDefinition {
+        Name("ContentScreener")
+
+        // Returns "sensitive" | "safe" | "unavailable" as a string
+        AsyncFunction("screenImage") { (uri: String) -> String in
+            guard let url = URL(string: uri) else { return "unavailable" }
+            guard self.analyzer.analysisPolicy != .disabled else { return "unavailable" }
+            do {
+                let response = try await self.analyzer.analyzeImage(at: url)
+                return response.isSensitive ? "sensitive" : "safe"
+            } catch {
+                return "unavailable"
+            }
+        }
+    }
+}
+```
+
+On the TypeScript side, decide as an app-level policy how to treat images that could not be judged.
+
+```typescript
+import ContentScreener from "./modules/content-screener";
+
+type Verdict = "sensitive" | "safe" | "unavailable";
+
+export async function shouldShowImage(uri: string): Promise<boolean> {
+  const verdict = (await ContentScreener.screenImage(uri)) as Verdict;
+  switch (verdict) {
+    case "safe":
+      return true;
+    case "sensitive":
+      return false; // flagged on device -> do not show
+    case "unavailable":
+      // defer images we could not judge to the server-side verdict
+      return await fallbackToServerVerdict(uri);
+  }
+}
+```
+
+Android has no equivalent API, so having the Android implementation of the native module always return `"unavailable"` and lean on the server-side check turned out to be the pragmatic call.
+
+## Handling the verdict — UX and operations
+
+Once something is flagged, blurring with a tap-to-reveal confirmation feels gentler than making it vanish outright.
+
+- Show a blurred placeholder by default; switch to the original only on an explicit "show" action
+- Always attach a report path to each image (this is part of Guideline 1.2 too)
+- Never store or transmit the verdict itself off device. Use it only to control display
+
+Operationally, logging the share of `.unavailable` results tells you how many users have the setting turned off. In my case that ratio was higher than I expected, which confirmed the original judgment that you cannot rely on the on-device check alone.
+
+## A two-layer setup with server-side moderation
+
+The structure I ended on uses server-side checks as the first line of defense and the on-device check as the gate right before display. The roles differ:
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>Server-side moderation</th><th>On-device SensitiveContentAnalysis</th></tr>
+</thead>
+<tbody>
+<tr><td>Timing</td><td>At upload</td><td>Right before display</td></tr>
+<tr><td>Coverage</td><td>Applies to all users</td><td>Only devices with the setting on</td></tr>
+<tr><td>Privacy</td><td>Image goes to the server</td><td>Stays on device, no transmission</td></tr>
+<tr><td>Offline display</td><td>Cannot protect</td><td>Protects it</td></tr>
+<tr><td>Custom criteria</td><td>Tunable yourself</td><td>Bound to Apple's engine</td></tr>
+</tbody>
+</table>
+
+It is not one or the other; the gaps close only when you have both. The server side is strong on reporting, statistics, and custom criteria; the device side is strong at display time and offline. Each covers the other's weakness. When you design a new feature that handles user submissions, I recommend building on this two-layer assumption.
+
+## Where to start
+
+Start small: add the on-device check to a single gallery screen and log the share of `.unavailable` results. Real data gives you the basis to decide how much to invest server-side.
+
+Note that the framework's API and entitlement handling can change with Apple updates. Before you integrate, always confirm the current `SCSensitivityAnalyzer` specification in the official documentation. I hope this gives a useful first step to anyone else wrestling with the safety of user-submitted content.
