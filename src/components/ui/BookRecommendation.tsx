@@ -92,11 +92,11 @@ const BOOKS: Record<string, Book[]> = {
       topics: ["dev", "api", "backend"],
     },
     {
-      title: "Python実践データ分析100本ノック 第3版",
-      author: "下山輝昌・松田雄馬・三木孝行",
-      url: "https://www.amazon.co.jp/dp/4798075663/?tag=pinocchio-22",
-      tag: "Python",
-      topics: ["dev", "python", "data"],
+      title: "Gemini AI活用 最強の教科書",
+      author: "桑名由美",
+      url: "https://www.amazon.co.jp/dp/4297155834/?tag=pinocchio-22",
+      tag: "Gemini活用",
+      topics: ["ai", "llm", "business", "google"],
     },
     // ── インフラ / DevOps ──
     {
