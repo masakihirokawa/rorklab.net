@@ -1,0 +1,216 @@
+---
+title: "Long-Form On-Device Transcription with SpeechAnalyzer in Rork Max's Native Swift"
+slug: "rork-max-speechanalyzer-long-form-on-device-transcription"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-01T11:00"
+updated: "2026-07-01T11:00"
+author: "Rork Lab"
+description: "Implementation notes on rebuilding long-form, offline transcription with iOS 26's SpeechAnalyzer and SpeechTranscriber after hitting the walls of SFSpeechRecognizer. Covers model asset downloads, feeding audio through an AsyncStream, drawing volatile vs. final results, and the boundary design for Rork Max native code and bridging from Expo — with the pitfalls I actually hit."
+tags: ["SpeechAnalyzer", "Rork Max", "Speech Recognition", "iOS", "On-Device AI"]
+highlights:
+  - "How iOS 26's SpeechAnalyzer removes SFSpeechRecognizer's roughly one-minute limit and cloud round-trips, and when it's worth switching"
+  - "A complete, working Swift flow: checking and downloading model assets, feeding audio through an AsyncStream, and drawing volatile vs. final results"
+  - "How to use SpeechAnalyzer in the native Swift Rork Max generates, and the boundary design for bridging it from an Expo / React Native native module"
+---
+
+While tinkering with a voice-journaling app as an indie developer, transcription of anything longer than a minute just wouldn't hold up. The `SFSpeechRecognizer` I was using at the time effectively cut off around the one-minute mark even with on-device recognition, so a long, rambling monologue would stop returning results partway through. Sending audio to a server wasn't a happy alternative either — for a journaling app, privacy weighs on you, and a weak signal means waiting. I couldn't compromise on any of the three: long-form, offline, and private. So the feature sat unfinished for a while.
+
+iOS 26's SpeechAnalyzer solves all three head-on. It's a newly designed API that transcribes long-form audio entirely on device, without sending anything to the cloud. And because Rork Max now generates native Swift, this API is something you can realistically wire into a small indie app. Here is what I learned porting my journaling app over to it, step by step.
+
+## What changed from SFSpeechRecognizer
+
+First, let's line up the difference in character between the two. Getting this wrong tends to leave you with a port that "works but is slow."
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>SFSpeechRecognizer</th><th>SpeechAnalyzer (iOS 26)</th></tr>
+</thead>
+<tbody>
+<tr><td>Intended length</td><td>Short utterances and commands</td><td>Long form: meetings, dictation</td></tr>
+<tr><td>Where it runs</td><td>On-device possible, but constraints remain</td><td>Fully on device once assets are installed</td></tr>
+<tr><td>API shape</td><td>Delegate plus request</td><td>Swift Concurrency (AsyncSequence)</td></tr>
+<tr><td>Model management</td><td>Opaque, left to the OS</td><td>Explicit download and management of language assets</td></tr>
+<tr><td>Composition</td><td>Mostly monolithic</td><td>Modules attached to an analysis session</td></tr>
+</tbody>
+</table>
+
+The key point is that SpeechAnalyzer is assembled by "attaching purpose-built modules to an analysis session." For transcription you attach `SpeechTranscriber`; for voice-activity detection you attach `SpeechDetector`. A module only processes audio from the point it was attached, so a design that adds capability mid-session reads cleanly.
+
+Note that supported platforms are iOS 26, iPadOS 26, macOS 26, visionOS 26, and tvOS 26; the current SDK does not support watchOS. Deciding up front on a split — record on Apple Watch, analyze on the phone — saves trouble later.
+
+## Check whether the model asset exists, and fetch it if not
+
+SpeechTranscriber uses a per-language model asset. That asset isn't guaranteed to ship on the device, so before running you check "is this language usable" and "is the asset present," and download it if not. Skip this and you get a bug that silently fails only on first launch — the hardest kind to reproduce. I skipped the check at first and spent half a day puzzled by empty results that appeared only on a fresh device.
+
+Here's a minimal flow that checks whether a locale is supported and waits for the download if the asset isn't installed.
+
+```swift
+import Speech
+
+/// Prepare the assets for the locale used for transcription.
+/// The returned Bool means "may we start transcribing in this locale."
+func ensureTranscriberAssets(for locale: Locale) async throws -> Bool {
+    // 1. Is this locale even a SpeechTranscriber target?
+    let supported = await SpeechTranscriber.supportedLocales
+    guard supported.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
+        return false
+    }
+
+    // 2. Is the asset installed on the device?
+    let installed = await SpeechTranscriber.installedLocales
+    if installed.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
+        return true
+    }
+
+    // 3. If not, request the download of the needed assets and wait
+    let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveLiveTranscription)
+    if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+        try await request.downloadAndInstall()
+    }
+    return true
+}
+```
+
+Pick a `preset:` that matches your use. For live, incremental display, a setting that actively returns volatile results — like `progressiveLiveTranscription` — fits well. For processing a finished recording in bulk, a preset that favors only final results avoids flicker on screen.
+
+Because downloading uses data, it's kind to build a path in the app: prefetch on Wi‑Fi, or let the user explicitly "enable speech recognition for English" in settings. In my case I run this download at the end of first-run onboarding and show progress with a bar, which eased the perceived uncertainty.
+
+## Build the analysis session and feed it audio
+
+Once the assets are ready, attach `SpeechTranscriber` to `SpeechAnalyzer` and feed audio as an `AsyncStream`. SpeechAnalyzer passes the audio it receives to the attached modules in turn.
+
+```swift
+import Speech
+import AVFoundation
+
+final class LiveTranscription {
+    private let analyzer: SpeechAnalyzer
+    private let transcriber: SpeechTranscriber
+    private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
+    private let engine = AVAudioEngine()
+
+    init(locale: Locale) {
+        self.transcriber = SpeechTranscriber(locale: locale,
+                                             preset: .progressiveLiveTranscription)
+        self.analyzer = SpeechAnalyzer(modules: [transcriber])
+    }
+
+    /// Start feeding microphone input into the analysis session.
+    func start() async throws {
+        // 1. Prepare a stream to hand audio to, and connect it to the analyzer
+        let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+        self.inputBuilder = continuation
+        try await analyzer.start(inputSequence: stream)
+
+        // 2. Wrap the raw mic buffers in AnalyzerInput and send them to the stream
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            self?.inputBuilder?.yield(AnalyzerInput(buffer: buffer))
+        }
+        engine.prepare()
+        try engine.start()
+    }
+
+    func stop() async {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        inputBuilder?.finish()
+        // After the supply stops, close out the remaining analysis
+        try? await analyzer.finalizeAndFinish()
+    }
+}
+```
+
+The heart of this is wrapping the `AVAudioPCMBuffer` from the mic tap in `AnalyzerInput` and handing it to the stream with `continuation.yield(_:)`. Because feeding audio and receiving results are two separate async flows, the UI stays responsive. To analyze a recorded file instead, read through the file and `yield` its buffers in place of the mic tap — the same skeleton works unchanged.
+
+## Draw volatile and final results differently
+
+In live transcription, nothing shapes the experience more than how you handle volatile versus final results. While someone is speaking, the tentative result shifts around; a moment later it settles. Draw both the same way and the text swaps every time, jittering and becoming hard to read.
+
+`transcriber.results` returns an `AsyncSequence` of results. Each result carries whether it's final, so you show volatile text in a faint gray placeholder and move it into the body once finalized.
+
+```swift
+func consumeResults() async {
+    var confirmed = ""          // The confirmed body text
+    for try? await result in transcriber.results {
+        let text = String(result.text.characters)
+        if result.isFinal {
+            confirmed += text
+            await MainActor.run {
+                self.finalText = confirmed   // Reflect only the confirmed part
+                self.volatileText = ""       // Clear the tentative placeholder
+            }
+        } else {
+            await MainActor.run {
+                self.volatileText = text      // Shifting tentative text, faint
+            }
+        }
+    }
+}
+```
+
+Adding just this distinction gives you the modern voice-app feel: text wells up as you speak and then settles a beat later. I first drew both together, and a tester told me "the text keeps flickering." Look at the final flag and change color and position — that alone changes the impression a great deal.
+
+## Decide the boundary between Rork Max native and Expo
+
+So how do you wire this into Rork Max? Because Rork Max generates native Swift, it reaches cleanly for a modern framework like SpeechAnalyzer. Many existing apps, meanwhile, are built in Rork's own Expo / React Native. Drawing the line between the two up front makes the implementation much easier.
+
+My design uses this split.
+
+<table>
+<thead>
+<tr><th>Layer</th><th>Owns</th><th>Doesn't own</th></tr>
+</thead>
+<tbody>
+<tr><td>Native Swift (Rork Max generated)</td><td>Starting SpeechAnalyzer, feeding audio, receiving results</td><td>Screen state, deciding where to save</td></tr>
+<tr><td>React Native (JS side)</td><td>Start/stop instructions, receiving final text, saving</td><td>Round-tripping the audio buffers themselves</td></tr>
+</tbody>
+</table>
+
+The key is to never hand raw audio buffers to the JS side. Round-tripping buffers across the bridge repeatedly is, by itself, a breeding ground for drops and latency. Keep the analysis fully on the native side and send only the confirmed text fragments to JS as events — a one-directional flow that stays stable.
+
+As a native module, exposing just two methods, `startTranscription` / `stopTranscription`, plus one event that streams final text, is enough.
+
+```swift
+// Minimal surface with the Expo Modules API (sketch)
+public class SpeechModule: Module {
+    var live: LiveTranscription?
+
+    public func definition() -> ModuleDefinition {
+        Name("SpeechAnalyzer")
+
+        // JS only touches these two methods and the onFinalText event
+        AsyncFunction("startTranscription") { (localeId: String) in
+            let live = LiveTranscription(locale: Locale(identifier: localeId))
+            self.live = live
+            try await live.start()
+        }
+
+        AsyncFunction("stopTranscription") {
+            await self.live?.stop()
+            self.live = nil
+        }
+
+        Events("onFinalText")   // Send only confirmed fragments to JS
+    }
+}
+```
+
+With this, the JS side is only ever "ask to start, receive the final text, save it." The heavy audio work stays sealed on the native side, so it never clogs the React Native bridge.
+
+## Pitfalls I found by actually porting
+
+Finally, a few things I stumbled on while porting. If it saves someone walking the same path a little time, I'll be glad.
+
+First, don't skip the asset-download check. As noted, first launch silently returns empty results. Always test once on a device in its clean, untouched state.
+
+Second, `AVAudioSession` category configuration. If you record, enable `.record` or `.playAndRecord` and think about interference with other apps' audio. Neglect this and you get the confusing symptom of a live mic with no buffers arriving.
+
+Third, no watchOS support. If your concept assumes a wearable, lean toward recording on the watch and passing analysis to the iPhone. Decide it during planning, or you'll be rebuilding later.
+
+Fourth, if you handle long form, watch power and heat. On-device analysis is pleasant, but tens of minutes of continuous recording will warm the device. Pausing analysis when the app goes to the background helps cut battery complaints.
+
+Start by building just one short recording, displayed with volatile and final results drawn differently. Once that feel clicks, extending to long form and splitting work between Rork Max and Expo both follow naturally. Thank you for reading.

@@ -1,0 +1,216 @@
+---
+title: "Rork Max のネイティブ Swift で SpeechAnalyzer を使い、長尺の音声を端末内で文字起こしする"
+slug: "rork-max-speechanalyzer-long-form-on-device-transcription"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-01T11:00"
+updated: "2026-07-01T11:00"
+author: "Rork Lab"
+description: "SFSpeechRecognizer では詰まっていた長尺・オフラインの文字起こしを、iOS 26 の SpeechAnalyzer と SpeechTranscriber で作り直す実装メモです。モデル資産のダウンロード、AsyncStream での音声供給、確定前と確定後の結果の扱い分け、Rork Max のネイティブ生成と Expo からの橋渡しの境界設計まで、実際にハマった点を添えてまとめます。"
+tags: ["SpeechAnalyzer", "Rork Max", "音声認識", "iOS", "オンデバイスAI"]
+highlights:
+  - "SFSpeechRecognizer の 1 分制限やクラウド往復といった制約を、iOS 26 の SpeechAnalyzer がどう解消するか、置き換えの判断基準が分かります"
+  - "モデル資産の確認とダウンロードから、AsyncStream での音声供給、確定前（volatile）と確定後（final）の結果の描き分けまでの、動く Swift コード一式が手に入ります"
+  - "Rork Max が生成するネイティブ Swift で SpeechAnalyzer を使う手順と、Expo / React Native からネイティブモジュールで橋渡しする際の境界設計が身につきます"
+---
+
+音声を録りためた日記アプリを個人開発で触っていたとき、1 分を超える録音の文字起こしがどうしても安定しませんでした。当時使っていた `SFSpeechRecognizer` は、オンデバイス指定にしても実質 1 分前後で切れてしまい、長い独り言をそのまま流し込むと途中で結果が返らなくなります。かといってサーバー送りにすると、日記という題材ではプライバシーが気になりますし、電波の弱い場所では待たされます。私自身、この「長尺・オフライン・プライバシー」の三点をどれも譲れないまま、しばらく実装を寝かせていました。
+
+iOS 26 で登場した SpeechAnalyzer は、この三点を正面から解いてくれます。長尺の音声を端末内で、しかもクラウドに一切送らずに文字起こしできる、新しい設計の API です。Rork Max がネイティブ Swift を生成するようになったことで、この API を個人開発の小さなアプリにも現実的に組み込めるようになりました。実際に日記アプリへ移植して分かったことを、順を追ってまとめます。
+
+## SFSpeechRecognizer から何が変わったのか
+
+まず、両者の性格の違いを整理しておきます。ここを取り違えると、せっかくの移植が「動くけれど遅い」ものになりがちです。
+
+<table>
+<thead>
+<tr><th>観点</th><th>SFSpeechRecognizer</th><th>SpeechAnalyzer（iOS 26）</th></tr>
+</thead>
+<tbody>
+<tr><td>想定する長さ</td><td>短い発話・コマンド向き</td><td>会議や口述など長尺向き</td></tr>
+<tr><td>処理場所</td><td>オンデバイス指定は可能だが制約が残る</td><td>資産を入れれば端末内で完結</td></tr>
+<tr><td>API の形</td><td>デリゲート＋リクエスト</td><td>Swift Concurrency（AsyncSequence）</td></tr>
+<tr><td>モデル管理</td><td>OS 任せで不透明</td><td>言語資産を明示的にダウンロード・管理</td></tr>
+<tr><td>構成</td><td>ほぼ一体</td><td>モジュールを付け外しする分析セッション</td></tr>
+</tbody>
+</table>
+
+要点は、SpeechAnalyzer が「分析セッションに、目的別のモジュールを取り付ける」という組み立て方になったことです。文字起こしをしたいなら `SpeechTranscriber` を、発話区間の検出をしたいなら `SpeechDetector` を取り付けます。取り付けた時点より後の音声だけをそのモジュールが処理するので、途中から機能を足す設計も素直に書けます。
+
+なお、対応プラットフォームは iOS 26・iPadOS 26・macOS 26・visionOS 26・tvOS 26 で、現行 SDK では watchOS では利用できません。Apple Watch 側で録って本体で解析する、といった役割分担を最初に決めておくと後で困りません。
+
+## モデル資産の有無を確かめ、必要なら取り寄せる
+
+SpeechTranscriber は言語ごとのモデル資産を使います。この資産は端末に最初から入っているとは限らないため、実行前に「その言語が使えるか」「資産が手元にあるか」を確認し、なければダウンロードします。ここを省くと、初回起動時だけ無言で失敗する、という再現しづらい不具合になります。私自身、最初はこの確認を飛ばしていて、実機の初回だけ結果が空になる現象に半日ほど悩まされました。
+
+以下は、指定したロケールが対応済みかを調べ、未取得ならダウンロードを待つところまでの最小構成です。
+
+```swift
+import Speech
+
+/// 文字起こしに使うロケールの資産を用意する。
+/// 戻り値の Bool は「このロケールで文字起こしを開始してよいか」を表す。
+func ensureTranscriberAssets(for locale: Locale) async throws -> Bool {
+    // 1. そもそもこのロケールが SpeechTranscriber の対象か
+    let supported = await SpeechTranscriber.supportedLocales
+    guard supported.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
+        return false
+    }
+
+    // 2. 端末に資産が入っているか
+    let installed = await SpeechTranscriber.installedLocales
+    if installed.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
+        return true
+    }
+
+    // 3. 入っていなければ、必要な資産のダウンロードを依頼して完了を待つ
+    let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveLiveTranscription)
+    if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+        try await request.downloadAndInstall()
+    }
+    return true
+}
+```
+
+`preset:` には用途に合ったものを選びます。ライブで逐次表示したいなら `progressiveLiveTranscription` のように、確定前の暫定結果を積極的に返す設定が向いています。録り終えた音声をまとめて処理するなら、確定結果だけを重視するプリセットのほうが、画面のちらつきを避けられます。
+
+ダウンロードは通信量を伴うので、Wi‑Fi 時に先回りで取り寄せる、設定画面で明示的に「日本語の音声認識を有効化」させる、といった導線をアプリ側で用意しておくと親切です。私の場合は、初回オンボーディングの最後にこのダウンロードを走らせ、進捗をプログレスバーで見せるようにして、体感の不安を減らしました。
+
+## 分析セッションを組み、音声を流し込む
+
+資産が揃ったら、`SpeechTranscriber` を `SpeechAnalyzer` に取り付け、音声を `AsyncStream` として供給します。SpeechAnalyzer は受け取った音声を、取り付けられたモジュールへ順に渡していきます。
+
+```swift
+import Speech
+import AVFoundation
+
+final class LiveTranscription {
+    private let analyzer: SpeechAnalyzer
+    private let transcriber: SpeechTranscriber
+    private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
+    private let engine = AVAudioEngine()
+
+    init(locale: Locale) {
+        self.transcriber = SpeechTranscriber(locale: locale,
+                                             preset: .progressiveLiveTranscription)
+        self.analyzer = SpeechAnalyzer(modules: [transcriber])
+    }
+
+    /// マイク入力を分析セッションへ流し始める。
+    func start() async throws {
+        // 1. 音声を渡すためのストリームを用意し、アナライザに接続する
+        let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+        self.inputBuilder = continuation
+        try await analyzer.start(inputSequence: stream)
+
+        // 2. マイクの生バッファを AnalyzerInput に包んでストリームへ送る
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            self?.inputBuilder?.yield(AnalyzerInput(buffer: buffer))
+        }
+        engine.prepare()
+        try engine.start()
+    }
+
+    func stop() async {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        inputBuilder?.finish()
+        // 供給を止めたあと、残りの解析を締める
+        try? await analyzer.finalizeAndFinish()
+    }
+}
+```
+
+ここでの肝は、マイクのタップで受け取った `AVAudioPCMBuffer` を `AnalyzerInput` に包み、`continuation.yield(_:)` でストリームへ渡している点です。音声の供給と結果の受信が別々の非同期の流れになっているので、UI を止めずに済みます。録音済みファイルを解析したい場合は、マイクのタップの代わりにファイルを読み進めてバッファを `yield` していけば、同じ骨組みがそのまま使えます。
+
+## 確定前と確定後を描き分ける
+
+ライブ文字起こしで最も体験を左右するのが、確定前（volatile）と確定後（final）の結果の扱いです。話している最中は暫定結果が揺れ動き、少し経つと確定します。この二つを同じ見た目で描くと、文字が入れ替わるたびにガタつき、読みづらくなります。
+
+`transcriber.results` は結果の `AsyncSequence` を返します。各結果は「確定かどうか」を持っているので、確定前は薄いグレーで仮表示し、確定したら本文へ移す、という描き分けにします。
+
+```swift
+func consumeResults() async {
+    var confirmed = ""          // 確定済みの本文
+    for try? await result in transcriber.results {
+        let text = String(result.text.characters)
+        if result.isFinal {
+            confirmed += text
+            await MainActor.run {
+                self.finalText = confirmed   // 確定分だけを本文に反映
+                self.volatileText = ""       // 仮表示はいったん消す
+            }
+        } else {
+            await MainActor.run {
+                self.volatileText = text      // 揺れ動く暫定分を薄色で
+            }
+        }
+    }
+}
+```
+
+この描き分けを入れるだけで、「話した先から文字が沸き上がり、少し遅れて固まる」という、いま時の音声アプリらしい手触りになります。私自身、ここを最初は一緒くたに描いていて、テスターから「文字がチカチカする」と言われて気づきました。確定フラグを見て色と場所を変える、それだけで印象がずいぶん変わります。
+
+## Rork Max のネイティブ生成と Expo の境界を決める
+
+さて、Rork Max でこれをどう組み込むかです。Rork Max はネイティブ Swift を生成するので、SpeechAnalyzer のような最新フレームワークにも素直に手が届きます。一方で、既存のアプリの多くは Rork 本体の Expo / React Native で作られています。両者をどう分担させるかを、最初に線引きしておくのが実装を楽にするコツです。
+
+私の設計は、次の切り分けにしています。
+
+<table>
+<thead>
+<tr><th>層</th><th>担わせるもの</th><th>担わせないもの</th></tr>
+</thead>
+<tbody>
+<tr><td>ネイティブ Swift（Rork Max 生成）</td><td>SpeechAnalyzer の起動・音声供給・結果の受信</td><td>画面の状態管理・保存先の決定</td></tr>
+<tr><td>React Native（JS 側）</td><td>録音の開始／停止の指示・確定テキストの受け取り・保存</td><td>音声バッファそのものの往復</td></tr>
+</tbody>
+</table>
+
+要点は、音声の生バッファを JS 側へ渡さないことです。バッファをブリッジ越しに何度も往復させると、それだけで取りこぼしや遅延の温床になります。ネイティブ側で解析を完結させ、確定したテキストの断片だけをイベントで JS へ送る、という一方向の流れにすると安定します。
+
+ネイティブモジュールとしては、`startTranscription` / `stopTranscription` の二つのメソッドと、確定テキストを流す一つのイベントだけを公開すれば足ります。
+
+```swift
+// Expo Modules API での最小の公開面（イメージ）
+public class SpeechModule: Module {
+    var live: LiveTranscription?
+
+    public func definition() -> ModuleDefinition {
+        Name("SpeechAnalyzer")
+
+        // JS からは、この2メソッドと onFinalText イベントだけを触らせる
+        AsyncFunction("startTranscription") { (localeId: String) in
+            let live = LiveTranscription(locale: Locale(identifier: localeId))
+            self.live = live
+            try await live.start()
+        }
+
+        AsyncFunction("stopTranscription") {
+            await self.live?.stop()
+            self.live = nil
+        }
+
+        Events("onFinalText")   // 確定した断片だけを JS へ送る
+    }
+}
+```
+
+こうしておくと、JS 側は「開始を頼み、確定テキストを受け取って保存する」だけになります。音声処理の重い部分はネイティブに閉じ込められるので、React Native のブリッジを詰まらせません。
+
+## 移植してみて分かった落とし穴
+
+最後に、実際に移植する中でつまずいた点を残しておきます。同じ道を通る方の時間を少しでも節約できれば幸いです。
+
+第一に、資産のダウンロード確認を飛ばさないことです。前述の通り、初回だけ無言で空の結果になります。実機の「まっさら」な状態で必ず一度試してください。
+
+第二に、`AVAudioSession` のカテゴリ設定です。録音するなら `.record` か `.playAndRecord` を有効にし、他のアプリの音との干渉を考えておきます。ここを怠ると、マイクは動いているのにバッファが来ない、という紛らわしい症状が出ます。この症状の対処は単純で、セッションのカテゴリを見直せば回避できます。本番運用に載せる前に、実機で一度確かめておくことをお勧めします。
+
+第三に、watchOS 非対応です。ウェアラブル前提の企画なら、録音だけウォッチで受け持ち、解析は iPhone 側へ渡す構成に倒します。企画段階で決めておかないと、後から作り直しになります。
+
+第四に、長尺を扱うなら電力と発熱に目を配ることです。オンデバイス解析は快適ですが、数十分の連続録音では端末が温まります。バックグラウンドに回ったら解析を一時停止する、といった配慮を入れておくと、電池持ちのクレームを減らせます。
+
+まずは短い録音を一つ、確定前と確定後を描き分けて表示するところまで作ってみてください。その手触りが掴めれば、あとは長尺への拡張も、Rork Max と Expo の分担も、素直に伸ばしていけるはずです。お読みいただきありがとうございました。
