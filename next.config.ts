@@ -8,6 +8,8 @@ const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 const REMOVED_ARTICLE_REDIRECTS_2026_05_09: { from: string; to: string }[] = [
   // 2026-06-27 premium-upgrade: slug rename (drop -complete-guide)
   { from: "/articles/rork-ai/rork-ai-monetization-strategy-complete-guide", to: "/articles/rork-ai/rork-app-monetization-ad-subscription-freemium-2026" },
+  // 2026-07-01 premium-upgrade: slug rename (drop -guide)
+  { from: "/articles/rork-dev/rork-max-cloud-compile-guide", to: "/articles/rork-dev/rork-max-cloud-compile-mac-free-native-build" },
   // 2026-05-15 Tax-related article removal (YMYL compliance for GSC崩壊 recovery)
 
   // 2026-05-15 GSC崩壊対応: TMPL_TITLE違反+他違反の記事を一括削除（Helpful Content System対応）
