@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxがネイティブSwiftアプリを生成し、iPhone・iPad・Watch・TV・Vision Pro・iMessageに対応します",
-    "NATIVE — AR/LiDAR、Metalによる3D、Dynamic Island、Live Activities、HealthKit、Core MLなどに手が届きます",
-    "PUBLISH — 2クリックでApp Storeへ提出でき、申請まわりの手間が大きく圧縮されています",
-    "PRICING — Rork Maxは月200ドル、元のRorkは無料で始められ有料は月25ドルからです",
-    "FUNDING — Rorkがa16zから280万ドルを調達し、月間74万超の訪問・成長率85%と紹介されています",
-    "TOOL — 元のRorkはReact Native（Expo）でiOSとAndroidのアプリを自然言語から生成します",
+    "BUILD — Rork Maxがネイティブ Swift アプリを生成し、React Nativeでは届きにくい領域に踏み込めます",
+    "PLATFORM — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — HealthKit・Core ML・NFC・Dynamic Island・Live Activitiesなどのネイティブ機能が使えます",
+    "TEST — ブラウザ内ストリーミングiOSシミュレータで、XcodeやMacなしでテストできます",
+    "DEPLOY — ビルド・証明書・App Store申請までの自動化で公開までを簡素化します",
+    "PRICE — 無料で開始でき、有料プランは$25/月〜、Rork Maxは$200/月です",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
-    "NATIVE — It reaches AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, HealthKit, and Core ML",
-    "PUBLISH — Two-click App Store submission sharply cuts the overhead of shipping an app",
-    "PRICING — Rork Max is 00/month, while the original Rork starts free with paid plans from 5/month",
-    "FUNDING — Rork raised .8M from a16z, with over 743k monthly visits and 85% growth",
-    "TOOL — The original Rork builds native iOS and Android apps from plain English using React Native (Expo)",
+    "BUILD — Rork Max generates native Swift apps, reaching areas React Native struggles to touch",
+    "PLATFORM — Rork Max supports iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — Tap native features like HealthKit, Core ML, NFC, Dynamic Island, and Live Activities",
+    "TEST — A browser-based streaming iOS simulator lets you test without Xcode or a Mac",
+    "DEPLOY — Automated builds, certificates, and App Store submission simplify shipping",
+    "PRICE — Start free; paid plans begin at $25/month and Rork Max is $200/month",
   ],
 };
 
