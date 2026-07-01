@@ -1,0 +1,221 @@
+---
+title: "When a Rork Video Call Is 'Connected' but Only One Side Can Hear — Field Notes on Instrumenting WebRTC's Silent Failures"
+slug: "rork-webrtc-one-way-audio-ice-drop-relay-instrumentation-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-02T14:00"
+updated: "2026-07-02T14:00"
+author: "Rork Lab"
+description: "Rork video calls that go one-way or quietly drop on the subway, diagnosed by measuring WebRTC with getStats instead of guessing. Covers ICE restart, verifying TURN relay, and clean teardown."
+tags: ["Rork", "WebRTC", "video call", "ICE", "TURN", "getStats", "React Native"]
+highlights:
+  - "A monitor class that turns one-way audio and quiet disconnects into numbers via getStats deltas"
+  - "ICE-restart recovery with grace periods and exponential backoff for subway and Wi-Fi handoffs"
+  - "A procedure to confirm TURN relay actually works, so calls don't silently fail on cellular only"
+---
+
+As an indie developer, the bug that cost me the most time on my first app with video calling wasn't a crash. The call would start. The other person's face appeared. The connection state read `connected`. And yet only one side could hear the other. Between two phones on the same Wi-Fi it succeeded every single time, so for days I couldn't even locate where the problem lived.
+
+That is the trap with WebRTC: failure rarely arrives as an exception. Your `try/catch` never fires, the logs stay clean, and the UI keeps saying "in call" while the experience quietly degrades. What follows is what actually worked once I started running Rork-generated calling apps on real devices and cellular networks — a symptom-by-symptom account of making silent failures visible. It isn't about shiny features; it's about the unglamorous measurement and cleanup that only start to matter after launch.
+
+## Sort the symptoms first — "it doesn't connect" is really three problems
+
+Field reports of "the call is weird" split into three problems whose root causes sit in completely different layers. Blur them together and you'll suspect a camera permission when you should be editing TURN config.
+
+<table>
+<thead>
+<tr><th>Symptom</th><th>Layer to suspect</th><th>First metric to read</th></tr>
+</thead>
+<tbody>
+<tr><td>No video or audio at all (specific networks only)</td><td>ICE / TURN reachability</td><td>candidate-pair <code>state</code> and relay use</td></tr>
+<tr><td>Audio flows one way only</td><td>Track attach or receiver playback</td><td>inbound-rtp <code>bytesReceived</code></td></tr>
+<tr><td>Quietly freezes or stutters after minutes</td><td>Network handoff / packet loss</td><td>iceConnectionState and packetsLost</td></tr>
+</tbody>
+</table>
+
+The shared vocabulary for this triage is `RTCPeerConnection.getStats()`. Before touching code on a hunch, I get numbers out of it first.
+
+## A monitor class that turns silent failure into numbers
+
+`getStats()` returns a bag of raw reports that is awkward to eyeball. I now always insert a thin monitoring layer that answers one question — "is this call healthy right now?" The point is to observe, in one place, whether inbound bytes for audio and video are actually increasing, whether the path went through a relay, and whether round-trip time and loss have crossed a threshold.
+
+```typescript
+type CallHealth = {
+  audioInbound: number;   // received audio bytes (flat = one-way suspicion)
+  videoInbound: number;
+  usingRelay: boolean;    // routed through a TURN relay?
+  rtt: number;            // round-trip time (seconds)
+  lossRate: number;       // video packet loss rate
+  iceState: string;
+};
+
+class CallStatsMonitor {
+  private pc: RTCPeerConnection;
+  private prevAudio = 0;
+
+  constructor(pc: RTCPeerConnection) {
+    this.pc = pc;
+  }
+
+  async sample(): Promise<CallHealth> {
+    const stats = await this.pc.getStats();
+    let audioInbound = 0, videoInbound = 0;
+    let packetsLost = 0, packetsReceived = 0, rtt = 0;
+    let usingRelay = false;
+
+    stats.forEach((r: any) => {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        audioInbound = r.bytesReceived || 0;
+      }
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        videoInbound = r.bytesReceived || 0;
+        packetsLost = r.packetsLost || 0;
+        packetsReceived = r.packetsReceived || 0;
+      }
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) {
+        rtt = r.currentRoundTripTime || 0;
+        const local = stats.get(r.localCandidateId);
+        if (local && local.candidateType === 'relay') usingRelay = true;
+      }
+    });
+
+    const lossRate = packetsReceived > 0
+      ? packetsLost / (packetsLost + packetsReceived) : 0;
+
+    return {
+      audioInbound, videoInbound, usingRelay, rtt, lossRate,
+      iceState: this.pc.iceConnectionState,
+    };
+  }
+
+  // Judge "is audio really flowing" from the delta, not the raw value
+  isAudioFlowing(h: CallHealth): boolean {
+    const delta = h.audioInbound - this.prevAudio;
+    this.prevAudio = h.audioInbound;
+    return delta > 0;
+  }
+}
+```
+
+The crucial part is reading the **delta** rather than the instantaneous value. `bytesReceived` is cumulative, so you must ask "did it grow since last time," not "is the current value non-zero" — otherwise a momentary reading right after the call starts fools you. Once I could reliably reproduce the one-way audio bug with this single line (`delta > 0`), I finally reached the actual cause.
+
+## One-way audio — usually a track you never added, or a stream you never played
+
+One-way audio almost always has a cause upstream of the network. When the receiver's `audioInbound` isn't growing in the monitor, either the packets arrive but aren't played, or the sender never attached the track. Here are the checkpoints, in the order I actually hit them.
+
+On the sending side, is the audio track truly passed to `addTrack`? Even when you grab `audio: true` in `getUserMedia`, code generation sometimes loops over tracks and adds only the video track, dropping audio. On the receiving side, is `event.streams[0]` from `ontrack` wired to audio output? In `react-native-webrtc`, `RTCView` renders video while audio is meant to auto-play on connection — but mishandle the stream and you get silence.
+
+```typescript
+// Sender: verify both tracks are attached before entering the call
+function assertTracksAttached(pc: RTCPeerConnection) {
+  const kinds = pc.getSenders()
+    .map((s) => s.track?.kind)
+    .filter(Boolean);
+  if (!kinds.includes('audio')) {
+    throw new Error('Audio track was never addTrack-ed');
+  }
+  if (!kinds.includes('video')) {
+    console.warn('No video track (expected for audio-only calls)');
+  }
+}
+```
+
+Dropping `assertTracksAttached` right before you create the offer stops the entire "call starts with audio forgotten" class of bugs before release. It throws, so the quiet degradation becomes loud — that's the whole idea.
+
+## Quietly dropping on the subway — design ICE restart with cleanup baked in
+
+Mobile calls change paths as you switch from Wi-Fi to cellular or enter a tunnel. WebRTC then moves `iceConnectionState` through `disconnected` → `failed`, but many implementations just show "disconnected" and give up. In practice most `disconnected` events self-heal within seconds, and `failed` is recoverable with an ICE restart.
+
+```typescript
+class CallRecovery {
+  private pc: RTCPeerConnection;
+  private sendOffer: (o: RTCSessionDescriptionInit) => Promise<void>;
+  private retries = 0;
+  private readonly maxRetries = 3;
+  private graceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(pc: RTCPeerConnection, sendOffer: (o: RTCSessionDescriptionInit) => Promise<void>) {
+    this.pc = pc;
+    this.sendOffer = sendOffer;
+    pc.oniceconnectionstatechange = () => this.onChange();
+  }
+
+  private onChange() {
+    const s = this.pc.iceConnectionState;
+    if (s === 'connected' || s === 'completed') {
+      this.retries = 0;
+      if (this.graceTimer) { clearTimeout(this.graceTimer); this.graceTimer = null; }
+    } else if (s === 'disconnected') {
+      // Give a brief drop 5s to self-heal
+      this.graceTimer = setTimeout(() => {
+        if (this.pc.iceConnectionState === 'disconnected') this.restart();
+      }, 5000);
+    } else if (s === 'failed') {
+      this.restart();
+    }
+  }
+
+  private async restart() {
+    if (this.retries >= this.maxRetries) {
+      // Only now do we tell the user the call has ended
+      return;
+    }
+    this.retries++;
+    try {
+      const offer = await this.pc.createOffer({ iceRestart: true });
+      await this.pc.setLocalDescription(offer);
+      await this.sendOffer(offer);
+    } catch {
+      const backoff = Math.pow(2, this.retries) * 1000;
+      setTimeout(() => this.restart(), backoff);
+    }
+  }
+}
+```
+
+Don't treat `disconnected` as instant failure, and reset `retries` once recovered. Keeping just those two rules noticeably raised the survival rate of calls crossing subway sections. Conversely, skip the `graceTimer` cleanup (`clearTimeout`) and a stale timer fires after recovery, triggering a needless renegotiation that disrupts the call instead. Recovery code, more than anything, is where cleanup matters — a lesson I relearned repeatedly.
+
+## Failing on cellular only — is TURN relay actually working?
+
+"It was flawless in development, but some users can't complete a call." When that report lands, suspect Symmetric NAT and TURN first. With a STUN-only setup, depending on the carrier's NAT type, roughly 10–20% of clients can't connect directly, and without a TURN relay they fail in silence. Your test environment is on one shared Wi-Fi, so this layer almost never surfaces during development.
+
+Confirming it takes only the monitor's `usingRelay`. Deliberately drop STUN and force TURN-only with `iceTransportPolicy: 'relay'` once, and verify a call still completes — that catches the "our TURN credentials had quietly expired" accident early.
+
+```typescript
+const configuration: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    {
+      urls: ['turn:turn.example.com:3478', 'turns:turn.example.com:5349'],
+      username: 'YOUR_TURN_USERNAME',
+      credential: 'YOUR_TURN_CREDENTIAL',
+    },
+  ],
+  // For verification only: force relay to test TURN reachability in isolation
+  // iceTransportPolicy: 'relay',
+};
+```
+
+For TURN you'll pick a managed option like Cloudflare TURN or Twilio, or self-host coturn. Either way, bake "confirm a relay-forced call connects before release" into your process. Credentials on most services are short-lived, so ideally you detect expiry in CI.
+
+## The hard part is *ending* a call
+
+Finally, teardown causes more incidents than you'd expect. Reports that the mic indicator won't disappear after closing the call screen, or that the next call can't grab the camera, are almost always leaked teardown. Beyond closing the `RTCPeerConnection`, you must `stop()` each acquired track and clear both the monitoring interval and the recovery timer.
+
+```typescript
+function teardownCall(
+  pc: RTCPeerConnection,
+  localStream: MediaStream | null,
+  timers: Array<ReturnType<typeof setInterval>>,
+) {
+  timers.forEach(clearInterval);
+  localStream?.getTracks().forEach((t) => t.stop()); // release mic and camera
+  pc.getSenders().forEach((s) => s.track?.stop());
+  pc.close();
+}
+```
+
+Forget to stop the `localStream` tracks and the OS keeps the mic held. To the user it looks like "the app is still recording after I closed it," so it isn't only a resource issue — it's a privacy one. Having run this in production, my honest takeaway is that a calling feature is easier to break in the code that ends it than in the code that starts it.
+
+Get to a measurable state, then fix. That pays off especially in a domain like WebRTC where failure is silent. Start by inserting one `CallStatsMonitor` and logging the `audioInbound` delta and `usingRelay` during a call. Your first guess turns from speculation into observation.

@@ -1,0 +1,229 @@
+---
+title: "Rork のビデオ通話が『つながっているのに片方だけ聞こえない』とき — WebRTC の沈黙する失敗を計測して切り分ける運用メモ"
+slug: "rork-webrtc-one-way-audio-ice-drop-relay-instrumentation-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-02T14:00"
+updated: "2026-07-02T14:00"
+author: "Rork Lab"
+description: "Rork で作ったビデオ通話が本番でだけ片方向音声になる・地下鉄で静かに切れる問題を、WebRTC の getStats で計測して切り分ける運用メモ。ICE 再起動・TURN リレー確認・後始末の実装まで。"
+tags: ["Rork", "WebRTC", "ビデオ通話", "ICE", "TURN", "getStats", "React Native"]
+highlights:
+  - "片方向音声・接続断の『沈黙する失敗』を getStats で数値として捕まえる監視クラスの実装"
+  - "地下鉄やWi-Fi切替で落ちる通話を ICE 再起動と指数バックオフで静かに復旧させる設計"
+  - "TURN リレーが本当に効いているかを candidate-pair から確認し、セルラーだけ失敗する事故を防ぐ手順"
+---
+
+個人開発でビデオ通話機能を初めてアプリに組み込んだとき、私自身が一番長く悩まされたのは「クラッシュしないバグ」でした。通話は始まる。相手の顔も映る。接続状態は `connected` と出ている。なのに、片方だけ声が届かない。テスト機の Wi-Fi 同士では毎回成功するので、原因の場所すら分からないまま数日が過ぎました。
+
+WebRTC の厄介さは、失敗が例外として飛んでこないことにあります。`try/catch` は通り抜け、ログにはエラーが出ず、UI 上は「通話中」のまま静かに劣化します。ここでは、Rork で生成したビデオ通話アプリを実機とセルラー回線で運用してきて、実際に効いた「沈黙する失敗を数値にする」やり方を、症状ごとにまとめます。派手な新機能の話ではなく、リリース後に効いてくる地味な計測と後始末の話です。
+
+## 症状を先に分類する — 「つながらない」は3種類ある
+
+現場で報告される「通話が変」は、原因の層がまったく違う3つに分かれます。ここを混ぜると、TURN の設定をいじるべき場面でカメラのパーミッションを疑う、といった遠回りが起きます。
+
+<table>
+<thead>
+<tr><th>症状</th><th>疑うべき層</th><th>最初に見る指標</th></tr>
+</thead>
+<tbody>
+<tr><td>映像も音声も一切来ない（特定回線だけ）</td><td>ICE / TURN 到達性</td><td>candidate-pair の <code>state</code> と <code>relay</code> 使用</td></tr>
+<tr><td>片方向だけ音が出ない</td><td>トラック追加 or 受信側の再生</td><td>inbound-rtp の <code>bytesReceived</code></td></tr>
+<tr><td>数分後に静かに固まる・カクつく</td><td>回線切替 / パケットロス</td><td>iceConnectionState と packetsLost</td></tr>
+</tbody>
+</table>
+
+この切り分けの共通言語が `RTCPeerConnection.getStats()` です。推測でコードをいじる前に、まずここから数字を出します。
+
+## 沈黙する失敗を数値にする監視クラス
+
+`getStats()` は生の統計の集合で、そのまま眺めても使いにくいものです。私は「今この通話は健全か」を一言で返す薄い監視層を必ず挟むようにしました。ポイントは、映像・音声それぞれの受信バイト数が増えているか、リレー経由になっていないか、往復遅延とロス率がしきい値を超えていないかを、同じ場所で観測することです。
+
+```typescript
+type CallHealth = {
+  audioInbound: number;   // 受信音声バイト（増えていないと片方向の疑い）
+  videoInbound: number;
+  usingRelay: boolean;    // TURN リレー経由か
+  rtt: number;            // 往復遅延（秒）
+  lossRate: number;       // 映像パケットロス率
+  iceState: string;
+};
+
+class CallStatsMonitor {
+  private pc: RTCPeerConnection;
+  private prevAudio = 0;
+  private prevVideo = 0;
+
+  constructor(pc: RTCPeerConnection) {
+    this.pc = pc;
+  }
+
+  async sample(): Promise<CallHealth> {
+    const stats = await this.pc.getStats();
+    let audioInbound = 0, videoInbound = 0;
+    let packetsLost = 0, packetsReceived = 0, rtt = 0;
+    let usingRelay = false;
+
+    stats.forEach((r: any) => {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        audioInbound = r.bytesReceived || 0;
+      }
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        videoInbound = r.bytesReceived || 0;
+        packetsLost = r.packetsLost || 0;
+        packetsReceived = r.packetsReceived || 0;
+      }
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) {
+        rtt = r.currentRoundTripTime || 0;
+        // 選ばれた経路のローカル候補が relay なら TURN 経由
+        const local = stats.get(r.localCandidateId);
+        if (local && local.candidateType === 'relay') usingRelay = true;
+      }
+    });
+
+    const lossRate = packetsReceived > 0
+      ? packetsLost / (packetsLost + packetsReceived) : 0;
+
+    return {
+      audioInbound, videoInbound, usingRelay, rtt, lossRate,
+      iceState: this.pc.iceConnectionState,
+    };
+  }
+
+  // 前回サンプルとの差分で「音声が本当に流れているか」を判定する
+  isAudioFlowing(h: CallHealth): boolean {
+    const delta = h.audioInbound - this.prevAudio;
+    this.prevAudio = h.audioInbound;
+    return delta > 0;
+  }
+}
+```
+
+ここでの肝は、瞬間値ではなく**差分**を見ることです。`bytesReceived` は累積値なので、「今の値が正か」ではなく「前回より増えたか」で判定しないと、通話開始直後の一瞬の値に騙されます。片方向音声のバグを、私は最終的にこの1行（`delta > 0`）で毎回再現できるようにしてから、ようやく原因にたどり着けました。
+
+## 片方向音声 — たいてい「追加していないトラック」か「再生していないストリーム」
+
+### 送信側と受信側のどちらで止まっているか
+
+片方向音声の原因は、ネットワークより手前にあることがほとんどです。監視クラスで受信側の `audioInbound` が増えていない場合、パケットは届いているのに再生されていないか、そもそも送信側がトラックを乗せていません。私が実際に踏んだ順に、確認ポイントを並べます。
+
+まず送信側で、音声トラックを本当に `addTrack` しているか。`getUserMedia` で `audio: true` を取っていても、映像トラックだけをループで追加して音声を取りこぼす実装をコード生成がしてくることがあります。次に受信側で、`ontrack` の `event.streams[0]` を音声出力に結びつけているか。React Native の `react-native-webrtc` では `RTCView` が映像を描画しますが、音声は接続時点で自動再生されるはずが、ストリームの取り回しを間違えると無音になります。
+
+### offer の直前でトラックを検証する
+
+```typescript
+// 送信側: 音声・映像の両方を確実に乗せたか検証してから通話に入る
+function assertTracksAttached(pc: RTCPeerConnection) {
+  const kinds = pc.getSenders()
+    .map((s) => s.track?.kind)
+    .filter(Boolean);
+  if (!kinds.includes('audio')) {
+    throw new Error('音声トラックが addTrack されていません');
+  }
+  if (!kinds.includes('video')) {
+    console.warn('映像トラック未追加（音声通話なら想定内）');
+  }
+}
+```
+
+この `assertTracksAttached` を offer 作成の直前に置くだけで、「音声を乗せ忘れたまま通話が始まる」クラスの事故はリリース前に止まります。例外で落ちるので、静かな劣化が可視化される、という発想です。
+
+## 地下鉄で静かに切れる — ICE 再起動を後始末込みで設計する
+
+モバイルの通話は、Wi-Fi からセルラーへの切替やトンネル進入で経路が変わります。このとき WebRTC は `iceConnectionState` を `disconnected` → `failed` と遷移させますが、多くの実装はここで「切断されました」と表示して終わってしまいます。実際には `disconnected` の多くは数秒で自然復旧し、`failed` は ICE 再起動で救えます。
+
+```typescript
+class CallRecovery {
+  private pc: RTCPeerConnection;
+  private sendOffer: (o: RTCSessionDescriptionInit) => Promise<void>;
+  private retries = 0;
+  private readonly maxRetries = 3;
+  private graceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(pc: RTCPeerConnection, sendOffer: (o: RTCSessionDescriptionInit) => Promise<void>) {
+    this.pc = pc;
+    this.sendOffer = sendOffer;
+    pc.oniceconnectionstatechange = () => this.onChange();
+  }
+
+  private onChange() {
+    const s = this.pc.iceConnectionState;
+    if (s === 'connected' || s === 'completed') {
+      this.retries = 0;
+      if (this.graceTimer) { clearTimeout(this.graceTimer); this.graceTimer = null; }
+    } else if (s === 'disconnected') {
+      // 短時間の断は自然復旧を5秒待つ
+      this.graceTimer = setTimeout(() => {
+        if (this.pc.iceConnectionState === 'disconnected') this.restart();
+      }, 5000);
+    } else if (s === 'failed') {
+      this.restart();
+    }
+  }
+
+  private async restart() {
+    if (this.retries >= this.maxRetries) {
+      // ここで初めてユーザーに通話終了を通知する
+      return;
+    }
+    this.retries++;
+    try {
+      const offer = await this.pc.createOffer({ iceRestart: true });
+      await this.pc.setLocalDescription(offer);
+      await this.sendOffer(offer);
+    } catch {
+      const backoff = Math.pow(2, this.retries) * 1000;
+      setTimeout(() => this.restart(), backoff);
+    }
+  }
+}
+```
+
+`disconnected` を即座に失敗扱いしないこと、そして復旧したら `retries` を戻すこと。この2点を守るだけで、地下鉄区間をまたいだ通話の生存率が体感で大きく変わりました。逆に、ここで `graceTimer` の後始末（`clearTimeout`）を怠ると、復旧後に古いタイマーが発火して不要な再ネゴシエーションが走り、かえって通話が乱れます。復旧処理ほど後始末が重要になる、というのが繰り返し学んだ点です。
+
+## セルラーだけ失敗する — TURN リレーが本当に効いているか
+
+### relay 強制で到達性を先に確かめる
+
+「開発中は完璧だったのに、ユーザーの一部でだけ通話が成立しない」——この報告が来たら、まず疑うのは Symmetric NAT と TURN です。STUN だけの構成では、モバイルキャリアの NAT タイプによって 全体の 10〜20% 程度が直接接続できず、TURN リレーがないと沈黙のまま失敗します。テスト環境は同一 Wi-Fi なので、この層は開発中まず露見しません。
+
+確認は監視クラスの `usingRelay` で足ります。あえて STUN を外し、TURN のみを `iceTransportPolicy: 'relay'` で強制した接続が成立するかを一度検証しておくと、TURN 認証が実は失効していた、という事故を早期に潰せます。
+
+```typescript
+const configuration: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    {
+      urls: ['turn:turn.example.com:3478', 'turns:turn.example.com:5349'],
+      username: 'YOUR_TURN_USERNAME',
+      credential: 'YOUR_TURN_CREDENTIAL',
+    },
+  ],
+  // 検証時のみ relay 強制で TURN 単独の到達性を確認する
+  // iceTransportPolicy: 'relay',
+};
+```
+
+TURN を選ぶ場合は、Cloudflare TURN や Twilio のマネージドを使うか、coturn を自前で立てるかになりますが、どちらにせよ「リリース前に relay 強制で一度つながることを確認する」手順を運用に組み込んでおくことを推奨します。認証情報は多くのサービスで短命なので、期限切れを CI で検知できると理想的です。ここは事故が起きてからの対処が難しい層なので、注意点として先回りしておく価値があります。
+
+## 通話を「終わらせる」ことの難しさ
+
+最後に、意外と事故が多いのが後始末です。通話画面を閉じたのにマイクの通知インジケータが消えない、次の通話で内蔵カメラが掴めない、という報告はたいてい teardown の漏れです。`RTCPeerConnection` を閉じるだけでなく、取得したトラックを1つずつ `stop()` し、監視のインターバルとリカバリのタイマーも止める必要があります。
+
+```typescript
+function teardownCall(
+  pc: RTCPeerConnection,
+  localStream: MediaStream | null,
+  timers: Array<ReturnType<typeof setInterval>>,
+) {
+  timers.forEach(clearInterval);
+  localStream?.getTracks().forEach((t) => t.stop()); // マイク・カメラを解放
+  pc.getSenders().forEach((s) => s.track?.stop());
+  pc.close();
+}
+```
+
+`localStream` のトラックを止め忘れると、OS 上ではマイクが掴まれたままになります。ユーザーから見れば「アプリを閉じたのに録音され続けている」ように映るため、プライバシー面でも軽視できません。通話機能は、始めるコードより終わらせるコードの方が事故りやすい、というのが運用してみての実感です。
+
+計測できる状態にしてから直す。これが WebRTC のように失敗が沈黙する領域では特に効きます。まずは `CallStatsMonitor` を一つ挟み、通話中の `audioInbound` の差分と `usingRelay` をログに流すところから始めてみてください。原因の当たりが、推測から観測に変わります。
