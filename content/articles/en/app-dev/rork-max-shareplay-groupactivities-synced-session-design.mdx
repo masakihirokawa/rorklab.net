@@ -1,0 +1,179 @@
+---
+title: "Building SharePlay in Rork Max's Native Swift — Keeping Two Screens in the Same State"
+slug: "rork-max-shareplay-groupactivities-synced-session-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-01T21:30"
+updated: "2026-07-01T21:30"
+author: "Rork Lab"
+description: "Implementation notes on building SharePlay with GroupActivities in Rork Max's native Swift — moving two screens through the same state over FaceTime. Covers declaring the GroupActivity, joining a GroupSession, syncing state with GroupSessionMessenger, handling latency and conflicts, catching up late joiners, and the boundary for bridging from React Native, with the pitfalls I actually hit."
+tags: ["SharePlay", "GroupActivities", "Rork Max", "iOS", "SwiftUI"]
+highlights:
+  - "Follow the full arc in working Swift — from declaring a GroupActivity to joining a GroupSession to tearing it down"
+  - "A minimal design for keeping two devices in the same state with GroupSessionMessenger, plus how to handle latency, conflicts, and catching up people who join late"
+  - "Why SharePlay is not realistic in the React Native version and needs Rork Max's native generation, explained at the implementation level"
+---
+
+There are moments when you want to look at the same screen together with family who live far away, while on a call — not trading photos one at a time, but where the moment you swipe, their screen shows the same photo too. That "seeing the same thing together" experience is harder to build than it looks, and once it works, it is quietly delightful. As an indie developer who has run a few small utility apps on my own for years — monetized mostly through AdMob on the App Store — I have come to see SharePlay as one of the rare mechanisms that turns "a tool you use alone" into "a space you use with someone."
+
+The foundation for it is GroupActivities. It layers your app's session on top of a FaceTime call and keeps the state aligned across every participant's device. The catch is that this lives entirely in native territory — there is no API you can reach cleanly from JavaScript. That is exactly why it matters that Rork Max now generates native Swift. Here, I will build the smallest SharePlay that moves two screens through the same state, and walk through the spots where I actually got stuck.
+
+## Why this is not realistic in the React Native version
+
+Getting this straight up front makes the later design choices easier. The core of SharePlay is the `GroupActivities` framework: conforming to the `GroupActivity` protocol, receiving a `GroupSession` asynchronously, and exchanging low-level messages through `GroupSessionMessenger`. All of these are tied deeply to Swift types and async sequences — the kind of thing that fits poorly across a bridge.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>React Native (Expo) alone</th><th>Rork Max native Swift</th></tr>
+</thead>
+<tbody>
+<tr><td>Conforming to GroupActivity</td><td>Cannot be expressed in JS types</td><td>Declared plainly as a Swift struct</td></tr>
+<tr><td>Receiving a GroupSession</td><td>Async sequences are awkward to bridge</td><td>Taken directly with <code>for await</code></td></tr>
+<tr><td>State-sync granularity</td><td>Carries bridge round-trip latency</td><td>Stays inside native, stays light</td></tr>
+<tr><td>System UI integration</td><td>Hard to surface in the share picker</td><td>Rides the OS SharePlay UI naturally</td></tr>
+</tbody>
+</table>
+
+At first I assumed a thin wrapper as an Expo native module would be enough. But once I tried to bridge both receiving the GroupSession and the Messenger's send/receive, the state drifted every time it crossed the boundary — a sync that stopped being a sync. For SharePlay, I have concluded that the practical move is to place the heart of the experience on the native side and let React Native only tap "start" and "stop." Because Rork Max generates that central part in Swift, that separation actually holds together as an implementation.
+
+## Declaring the "activity" you do together
+
+SharePlay starts by declaring, as a type, what you are doing together. That activity becomes the unit shared among participants. For a "swipe through photos together" experience, you give it the minimum information needed to identify what is being paged.
+
+```swift
+import GroupActivities
+
+struct SharedGalleryActivity: GroupActivity {
+    // Identifier for the gallery being viewed together
+    var galleryID: String
+
+    var metadata: GroupActivityMetadata {
+        var meta = GroupActivityMetadata()
+        meta.title = "View a gallery together"
+        meta.type = .generic     // .generic unless it is video or music
+        return meta
+    }
+}
+```
+
+Choose `type` by purpose. For synchronized video use `.watchTogether`, for music `.listenTogether`, and the system will even handle playback controls for you. But for syncing your own custom screen, `.generic` is far easier to work with. Set it to `.watchTogether` and the OS starts expecting a playback UI, which ends up fighting you. I got that wrong at first and spent a while confused about why extra controls kept appearing on screen.
+
+## Starting and receiving a session
+
+Once the activity is declared, you start it from a user action. If a FaceTime call is already in progress, calling `activate()` is enough for the system to present the join prompt. If there is no call, the system asks whether to start one first.
+
+```swift
+func startSharing(galleryID: String) async {
+    let activity = SharedGalleryActivity(galleryID: galleryID)
+    switch await activity.prepareForActivation() {
+    case .activationPreferred:
+        do { _ = try await activity.activate() }
+        catch { print("Failed to start: \(error)") }
+    case .activationDisabled:
+        // Cannot start (e.g. not in a call). Fall back to solo view.
+        break
+    case .cancelled:
+        break
+    @unknown default:
+        break
+    }
+}
+```
+
+What matters is that both the side that called `activate()` and the invited side receive the session through the same path. The session arrives as an async sequence, so you keep waiting for it from the moment the app launches.
+
+```swift
+func observeSessions() async {
+    for await session in SharedGalleryActivity.sessions() {
+        await join(session)
+    }
+}
+```
+
+Neglect this "always be listening" and you get a one-sided bug: the other person starts a session but only you fail to enter it. I once tied this to when a screen appeared, and hit a hard-to-reproduce symptom where sync failed only after returning from the background. Tie the listener to the app's lifetime, not a view's.
+
+## Keeping two devices in the same state
+
+Once you have joined, it is just a matter of sending state back and forth. `GroupSessionMessenger` lets you deliver arbitrary messages to participants. Here we sync exactly one thing: which photo index we are looking at. The trick is to keep the synced state as small as possible and shaped so there is a single source of truth.
+
+```swift
+struct GalleryState: Codable {
+    var index: Int
+    var updatedAt: Date
+}
+
+@MainActor
+final class SharedGallery: ObservableObject {
+    @Published var index = 0
+    private var messenger: GroupSessionMessenger?
+    private var session: GroupSession<SharedGalleryActivity>?
+
+    func join(_ session: GroupSession<SharedGalleryActivity>) {
+        self.session = session
+        let messenger = GroupSessionMessenger(session: session)
+        self.messenger = messenger
+        session.join()
+
+        Task { await receiveLoop(messenger) }
+    }
+
+    // When I swipe, notify everyone
+    func setIndex(_ newIndex: Int) {
+        index = newIndex
+        let state = GalleryState(index: newIndex, updatedAt: Date())
+        Task { try? await messenger?.send(state) }
+    }
+
+    private func receiveLoop(_ messenger: GroupSessionMessenger) async {
+        for await (state, _) in messenger.messages(of: GalleryState.self) {
+            // Naive last-write flickers on round trips, so reconcile
+            await MainActor.run { self.index = state.index }
+        }
+    }
+}
+```
+
+The biggest lesson here was handling latency and conflicts. When two people swipe at almost the same time, their updates cross and the screen jitters back and forth for a moment. Reflect updates naively "the instant they arrive" and that jitter is obvious. I added `updatedAt` and inserted a small last-write reconciliation — discard an incoming state if it is older than my most recent action — which settled it into something that holds up in real use. Narrowing the synced state down to "a single index" is what let that reconciliation stay a simple comparison.
+
+## Catching up people who join late
+
+An easy thing to forget in SharePlay is care for late joiners. Someone who opens the app partway through the call never received the earlier swipes, so they are left stranded at the initial state. To prevent this, resend the current state whenever you detect a new participant.
+
+```swift
+func watchParticipants(_ session: GroupSession<SharedGalleryActivity>) async {
+    for await participants in session.$activeParticipants.values {
+        let newcomers = participants.subtracting(session.localParticipant.asSet)
+        guard !newcomers.isEmpty, let messenger else { continue }
+        let state = GalleryState(index: index, updatedAt: Date())
+        // Send only the current position, only to the newcomers
+        try? await messenger.send(state, to: .only(newcomers))
+    }
+}
+```
+
+Because `send(_:to:)` lets you scope the recipients, there is no need to broadcast to everyone. Broadcast here and people who are already caught up can see their screen jump back for an instant. It is a small thing, but stacking up these "who do I send to" decisions is what determines how good the sync feels.
+
+## Starting and stopping from React Native
+
+Since I decided to place the heart of the experience on the native side, the React Native role is minimal. You bridge only a start button and a stop button. Expose `startSharing` and `endSharing` as a native module, and if you need it, stream the current index to JS as an event.
+
+```swift
+@objc(SharePlayBridge)
+final class SharePlayBridge: NSObject {
+    @objc func start(_ galleryID: String) {
+        Task { await SharedGalleryCoordinator.shared.startSharing(galleryID: galleryID) }
+    }
+    @objc func end() {
+        SharedGalleryCoordinator.shared.leave()
+    }
+}
+```
+
+Hold that boundary and the sync itself stays entirely inside native, so bridge round-trip latency never bleeds into sync accuracy. In my case I wanted to add only SharePlay to an existing Expo app, and this "hand over just the entrance and the exit" shape ended up the most stable. My first attempt, trying to manage each piece of state on the JS side, drifted and fell apart as described above. My honest sense now is that SharePlay behaves better the more generously you draw the line around what native owns.
+
+## Where you are likely to get stuck
+
+Finally, a few places where my hands actually stopped. First, the simulator does not always match a real device for SharePlay behavior; verifying with two physical devices over FaceTime was the reliable path. Second, tie the session listener to the app's lifetime, not to a view — drop that and you get the one-sided connection symptom. And third, always `leave()` a `GroupSession` when you are done and release the reference; leave it hanging and its state bleeds into the next session.
+
+One monetization note: during a SharePlay session, be deliberate about where ads appear. In my case, when a full-screen interstitial cut in while two people were looking at the same screen, it broke the moment and the shared session tended to end there. Suppressing interstitials while the session is live and batching them after it ends let me add sharing without hurting retention. It is "just" a feature that moves the same screen together, but handle the three things — latency, conflicts, and late joiners — with care and the quality of the experience visibly changes. Start with a gallery whose synced state is "a single number," and pass it back and forth between two real devices. The feel you get there will tell you what you want to sync next.

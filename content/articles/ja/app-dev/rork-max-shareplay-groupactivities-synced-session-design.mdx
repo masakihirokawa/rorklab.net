@@ -1,0 +1,181 @@
+---
+title: "Rork Max のネイティブ Swift で SharePlay を組む — 二人の画面を同じ状態で動かす設計"
+slug: "rork-max-shareplay-groupactivities-synced-session-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-01T21:30"
+updated: "2026-07-01T21:30"
+author: "Rork Lab"
+description: "GroupActivities を使い、FaceTime 越しに二人の画面を同じ状態で動かす SharePlay を Rork Max のネイティブ Swift で組む実装メモです。GroupActivity の宣言、GroupSession への参加、GroupSessionMessenger での状態同期、遅延と競合の扱い、そして React Native 側から橋渡しするときの境界設計まで、実際に詰まった点を添えてまとめます。"
+tags: ["SharePlay", "GroupActivities", "Rork Max", "iOS", "SwiftUI"]
+highlights:
+  - "GroupActivity の宣言から GroupSession への参加、セッション破棄までの一連の流れを、動く Swift コードで追えます"
+  - "GroupSessionMessenger で二台の状態を揃える最小設計と、遅延・競合・後から参加した人への追いつきをどう扱うかの判断基準が分かります"
+  - "SharePlay がなぜ React Native 版では現実的でなく Rork Max のネイティブ生成が要るのか、その境界を実装レベルで説明します"
+---
+
+離れて暮らす家族と電話をつなぎながら、同じ画面を一緒に眺めたい、という場面があります。写真を一枚ずつ送り合うのではなく、こちらがめくれば相手の画面も同じ写真になる。そういう「同じものを一緒に見る」体験は、実装してみると想像以上に難しく、そして一度動くと理屈抜きに楽しいものでした。個人開発でユーティリティ系のアプリをいくつか運営してきましたが、SharePlay は「一人で使う道具」を「二人で使う場」に変える数少ない仕組みだと感じています。
+
+その土台になるのが GroupActivities です。FaceTime 通話の上に自分のアプリのセッションを重ね、参加者全員の端末で状態を揃えられます。ただしこの仕組みは完全にネイティブの領域で、JavaScript から素直に触れる API がありません。だからこそ、Rork Max がネイティブ Swift を生成するようになったことに意味があります。ここでは、二人の画面を同じ状態で動かす最小の SharePlay を組みながら、実際に詰まった箇所を順にまとめます。
+
+## なぜこれは React Native 版では現実的でないのか
+
+最初にここを整理しておくと、後の設計判断が楽になります。SharePlay の中核は `GroupActivities` フレームワークで、`GroupActivity` プロトコルへの準拠、`GroupSession` の非同期な受け取り、`GroupSessionMessenger` による低レベルなメッセージ授受で構成されます。これらはいずれも Swift の型と async シーケンスに深く結びついていて、ブリッジ越しに扱うには相性が悪い部類です。
+
+<table>
+<thead>
+<tr><th>観点</th><th>React Native（Expo）単体</th><th>Rork Max のネイティブ Swift</th></tr>
+</thead>
+<tbody>
+<tr><td>GroupActivity の準拠</td><td>JS の型で表現できない</td><td>Swift の構造体で素直に宣言できる</td></tr>
+<tr><td>GroupSession の受け取り</td><td>async シーケンスを橋渡ししづらい</td><td><code>for await</code> でそのまま受ける</td></tr>
+<tr><td>状態同期の粒度</td><td>ブリッジ往復の遅延が乗る</td><td>ネイティブ内で完結し軽い</td></tr>
+<tr><td>システム UI 連携</td><td>共有ピッカーに出しにくい</td><td>OS の SharePlay UI に自然に載る</td></tr>
+</tbody>
+</table>
+
+私自身、最初は「Expo のネイティブモジュールで薄く包めば足りるだろう」と考えていました。ところが GroupSession の受け取りと Messenger の送受信を橋渡ししようとすると、境界を越えるたびに状態がずれ、同期のはずが同期にならないという本末転倒に陥りました。SharePlay に関しては、体験の中心をネイティブ側に置き、React Native からは「始める／終える」だけを叩く、という割り切りが現実的だと考えています。Rork Max がこの中心部分を Swift で生成してくれるので、その割り切りが実装として成立します。
+
+## 一緒に動かす「活動」を宣言する
+
+SharePlay は、まず「何を一緒にするのか」を型として宣言するところから始まります。ここでいう活動が、参加者の間で共有される単位になります。写真を一緒にめくる、という体験なら、めくっている対象を識別できる最小限の情報を持たせます。
+
+```swift
+import GroupActivities
+
+struct SharedGalleryActivity: GroupActivity {
+    // 一緒に見るギャラリーの識別子
+    var galleryID: String
+
+    var metadata: GroupActivityMetadata {
+        var meta = GroupActivityMetadata()
+        meta.title = "ギャラリーを一緒に見る"
+        meta.type = .generic     // 動画や音楽でなければ .generic
+        return meta
+    }
+}
+```
+
+`type` は用途に応じて選びます。動画同時再生なら `.watchTogether`、音楽なら `.listenTogether` を選ぶと、システムが再生制御まで面倒を見てくれますが、今回のように独自の画面を同期させるだけなら `.generic` が扱いやすいです。ここを `.watchTogether` にすると OS が再生 UI を期待してしまい、かえって噛み合わなくなります。私は最初にそこを取り違えて、余計なコントロールが画面に出てくる理由がしばらく分からず悩みました。
+
+## セッションを始め、受け取る
+
+活動を宣言したら、ユーザーの操作で開始します。FaceTime 通話中であれば、`activate()` を呼ぶだけでシステムが参加確認を出してくれます。通話中でなければ、システムが「先に通話を始めますか」と促します。
+
+```swift
+func startSharing(galleryID: String) async {
+    let activity = SharedGalleryActivity(galleryID: galleryID)
+    switch await activity.prepareForActivation() {
+    case .activationPreferred:
+        do { _ = try await activity.activate() }
+        catch { print("開始に失敗: \(error)") }
+    case .activationDisabled:
+        // 通話外などで開始できない。単体表示にフォールバック
+        break
+    case .cancelled:
+        break
+    @unknown default:
+        break
+    }
+}
+```
+
+大切なのは、`activate()` を呼んだ側も、招かれた側も、同じ経路でセッションを受け取るという点です。セッションは非同期のシーケンスとして流れてくるので、アプリの起動直後からずっと待ち受けておきます。
+
+```swift
+func observeSessions() async {
+    for await session in SharedGalleryActivity.sessions() {
+        await join(session)
+    }
+}
+```
+
+この「常に待ち受ける」を怠ると、相手が先に始めたセッションに自分だけ入れない、という片側だけ繋がらない不具合になります。私はここを画面表示のタイミングに紐づけてしまい、バックグラウンドから復帰したときだけ同期が始まらない、という再現しづらい症状に一度はまりました。待ち受けはアプリの生存期間に紐づけるのが安全です。
+
+## 二台の状態を揃える
+
+セッションに参加できたら、あとは状態を送り合うだけです。`GroupSessionMessenger` を使うと、参加者へ任意のメッセージを届けられます。ここでは「いま何番目の写真を見ているか」という一点だけを同期します。同期する状態は、可能な限り小さく、そして「真実は一つ」と言い切れる形にするのがコツです。
+
+```swift
+struct GalleryState: Codable {
+    var index: Int
+    var updatedAt: Date
+}
+
+@MainActor
+final class SharedGallery: ObservableObject {
+    @Published var index = 0
+    private var messenger: GroupSessionMessenger?
+    private var session: GroupSession<SharedGalleryActivity>?
+
+    func join(_ session: GroupSession<SharedGalleryActivity>) {
+        self.session = session
+        let messenger = GroupSessionMessenger(session: session)
+        self.messenger = messenger
+        session.join()
+
+        Task { await receiveLoop(messenger) }
+    }
+
+    // 自分がめくったら全員へ通知
+    func setIndex(_ newIndex: Int) {
+        index = newIndex
+        let state = GalleryState(index: newIndex, updatedAt: Date())
+        Task { try? await messenger?.send(state) }
+    }
+
+    private func receiveLoop(_ messenger: GroupSessionMessenger) async {
+        for await (state, _) in messenger.messages(of: GalleryState.self) {
+            // 後勝ちだと往復でちらつくので、より新しい更新だけ採用
+            await MainActor.run { self.index = state.index }
+        }
+    }
+}
+```
+
+ここで一番学びが多かったのは、遅延と競合の扱いです。二人がほぼ同時にめくると、お互いの更新が交差して画面が一瞬前後に揺れます。素朴に「受け取ったら即反映」にすると、この揺れが目立ちます。私は `updatedAt` を持たせ、受け取った状態が自分の直近の操作より古ければ捨てる、という後勝ちの調停を一枚挟むことで、実用に耐える手触りに落ち着きました。同期する状態を「番号一つ」に絞っていたおかげで、この調停が単純な比較で済んだのも大きかったです。
+
+## 後から参加した人を追いつかせる
+
+SharePlay で忘れやすいのが、途中参加への配慮です。通話の途中でアプリを開いた人は、最初のめくり操作を受け取っていないので、初期状態のまま取り残されます。これを防ぐには、新しい参加者を検知したときに現在の状態を送り直します。
+
+```swift
+func watchParticipants(_ session: GroupSession<SharedGalleryActivity>) async {
+    for await participants in session.$activeParticipants.values {
+        let newcomers = participants.subtracting(session.localParticipant.asSet)
+        guard !newcomers.isEmpty, let messenger else { continue }
+        let state = GalleryState(index: index, updatedAt: Date())
+        // 参加者を限定して現在地だけ送る
+        try? await messenger.send(state, to: .only(newcomers))
+    }
+}
+```
+
+`send(_:to:)` で宛先を限定できるので、全員に配り直す必要はありません。ここを全体送信にすると、既に追いついている人の画面まで一瞬巻き戻ることがあります。細かい点ですが、こうした「誰に送るか」の判断の積み重ねが、同期の気持ちよさを決めるのだと実感しました。
+
+## React Native から始める／終える
+
+体験の中心をネイティブに置くと決めたので、React Native 側の役目は最小限です。共有を始めるボタンと、終えるボタンだけをブリッジします。ネイティブモジュールとして `startSharing` と `endSharing` を公開し、現在何番目を見ているかは、必要ならイベントで JS に流します。
+
+```swift
+@objc(SharePlayBridge)
+final class SharePlayBridge: NSObject {
+    @objc func start(_ galleryID: String) {
+        Task { await SharedGalleryCoordinator.shared.startSharing(galleryID: galleryID) }
+    }
+    @objc func end() {
+        SharedGalleryCoordinator.shared.leave()
+    }
+}
+```
+
+この境界を守ると、同期そのものはネイティブ内で完結し、ブリッジ往復の遅延が同期精度に響きません。私の場合、既存の Expo アプリに SharePlay だけを足したかったので、この「入口と出口だけを渡す」構成が結果的に一番安定しました。逆に、状態の一つひとつを JS 側で管理しようとした最初の試みは、前述のとおり同期がずれて破綻しました。SharePlay は、ネイティブに任せる範囲をはっきり広めに取るほど素直に動く、というのが今の実感です。
+
+## 詰まりやすい点と本番運用での注意
+
+最後に、実際に手が止まった落とし穴を挙げておきます。まず、シミュレータでは SharePlay の挙動が実機と噛み合わないことがあり、二台の実機と FaceTime で確認するのが確実でした。次に、セッションの待ち受けを画面ではなくアプリの生存期間に紐づけること。これを外すと片側だけ繋がらない症状が出ます。回避策は単純で、待ち受けの Task をアプリ起動時に一度だけ張り、以後は解放しないことです。そして、`GroupSession` は使い終わったら必ず `leave()` し、参照を手放すこと。本番運用で放置すると、次のセッションと状態が混ざり、原因の特定に時間を取られます。
+
+収益化まわりでひとつ補足すると、SharePlay 中は広告の出しどころに配慮することをお勧めします。私の場合、個人開発で AdMob を収益の柱にしてきましたが、二人で同じ画面を見ている最中に全画面広告が割り込むと、体験が途切れて共有そのものが終わってしまいがちでした。共有セッションが続く間はインタースティシャルを抑え、セッション終了後にまとめて出す、という切り分けにしたところ、共有機能を入れた月でもリテンションを落とさずに済みました。共有は「二人で使う場」を作る機能なので、収益の設計もその前提に合わせるのが素直だと考えています。
+
+一緒に同じ画面を動かす、というだけの機能ですが、遅延・競合・途中参加という三つを丁寧に扱うと、体験の質がはっきり変わります。まずは同期する状態を「一つの数字」に絞ったギャラリーから始めて、二台の実機で往復させてみてください。そこで得られる手触りが、次に何を同期させたいかを教えてくれます。
