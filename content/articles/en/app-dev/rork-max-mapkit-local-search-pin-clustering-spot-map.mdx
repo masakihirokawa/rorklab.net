@@ -1,0 +1,235 @@
+---
+title: "Building a Place-Search Map in Rork Max with MapKit: MKLocalSearch, Pin Clustering, and Location Permissions"
+slug: "rork-max-mapkit-local-search-pin-clustering-spot-map"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-07-02T20:30"
+author: "Rork Lab"
+description: "A hands-on guide to building a place-search map screen with Rork Max native Swift: nearby search with MKLocalSearch, when to switch from SwiftUI Map to MKMapView for pin clustering, and location permission design that survives App Review."
+tags: ["Rork Max", "MapKit", "SwiftUI", "Location", "MKLocalSearch", "iOS Development"]
+highlights:
+  - "You'll move past a map that merely renders and ship a full place-search flow with nearby search, detail sheets, and directions handoff"
+  - "You'll be able to decide between SwiftUI Map and MKMapView (clustering) based on pin count and feature requirements"
+  - "You can now write location permission prompts and timing that won't get bounced under App Review Guideline 5.1.1"
+---
+
+Ask Rork Max for a map screen and it delivers one almost immediately. As an indie developer, I prototyped a small tool for logging photo-spot candidates on a map, and the first prompt round-trip already gave me a map following my location with pins on it. The trouble starts right after that. Searching nearby places by keyword, keeping the map responsive once pins grow into the hundreds, and requesting location permission at a moment that makes sense to the user — none of these survived the first AI generation. Each needed deliberate work.
+
+For solo projects, the map screen is often the app's flagship feature: store finders, travel logs, spot-sharing apps. The skeleton is always the same, and so are the places where it breaks. This guide walks through taking a Rork Max native Swift map screen from "it renders" to genuinely usable, including the measurements and mistakes from my own prototype.
+
+## What We're Building and How It Splits Apart
+
+The target: a screen that searches spots around the user's location, opens a detail sheet when a pin is tapped, and hands off directions to Apple Maps. It decomposes into four parts.
+
+1. Location acquisition and permission management (CoreLocation)
+2. Map rendering and pins (SwiftUI Map, MKMapView where needed)
+3. Nearby search (MKLocalSearch)
+4. Detail sheet and directions handoff (MKMapItem)
+
+Passing this decomposition directly to Rork Max is the efficient move. I prefer prompts at this level of granularity:
+
+```text
+Build a screen showing a map around the current location.
+- Use iOS 17 SwiftUI Map with MapCameraPosition
+- Search bar on top; run MKLocalSearch and show results as pins
+- Tapping a pin opens a bottom sheet with name, address, and a Directions button
+- Request When In Use location permission when the map screen appears
+- Keep CLLocationManager logic in a separate ObservableObject
+```
+
+Explicitly saying "use the iOS 17 APIs" matters. Without it, I received code that mixed the older `MKCoordinateRegion` style with the newer `MapCameraPosition` style, and consolidating them afterwards burned extra credits.
+
+## Design When You Ask for Permission, Not Just Whether
+
+The first wall isn't the map — it's the permission dialog. Generated code tends to request authorization at app launch, which reads as "why now?" to the user, and a single denial forces you into a settings-redirect flow. Requesting the moment the map screen appears is the smallest design that carries context.
+
+Info.plist needs a purpose string, and this is the single most common rejection point under App Store Review Guideline 5.1.1. Generic wording like "to improve app functionality" can fail review. Tie it to the feature: "Your location is used to search nearby spots and show their distance from you."
+
+```swift
+// LocationManager.swift — minimal setup streaming authorization to the UI
+import CoreLocation
+import Observation
+
+@Observable
+final class LocationManager: NSObject, CLLocationManagerDelegate {
+    private let manager = CLLocationManager()
+    var authorization: CLAuthorizationStatus = .notDetermined
+    var lastLocation: CLLocation?
+
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+    }
+
+    func requestWhenInUse() {
+        // Call from the map screen's onAppear — never at app launch
+        manager.requestWhenInUseAuthorization()
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        authorization = manager.authorizationStatus
+        if authorization == .authorizedWhenInUse {
+            manager.startUpdatingLocation()
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager,
+                         didUpdateLocations locations: [CLLocation]) {
+        lastLocation = locations.last
+    }
+}
+```
+
+Prepare the denied branch as well. When `authorization == .denied`, replace the map with a notice view offering an "Open Settings" button. When I asked Rork Max to "add a fallback UI for the denied state," it generated the `UIApplication.openSettingsURLString` flow in one pass.
+
+Background location (Always authorization) is unnecessary for this class of app. Enabling it triggers justification requests in review, and an unjustified use is grounds for rejection. Before submitting, grep the generated code for `allowsBackgroundLocationUpdates` to make sure it hasn't crept in. For debugging when location simply won't come through, [Five Things to Check First When Rork Can't Get Location Data](/articles/rork-dev/rork-geolocation-permission-not-working-fix-guide) covers the checklist, including the React Native side.
+
+## Composing SwiftUI Map with the iOS 17 APIs
+
+From iOS 17, SwiftUI Map controls its camera declaratively through `MapCameraPosition`. Following the user is a single initial value — `.userLocation(fallback:)` — and the standard behavior even handles detaching the follow mode when the user drags the map.
+
+```swift
+// SpotMapView.swift — the map body rendering search results as pins
+import SwiftUI
+import MapKit
+
+struct SpotMapView: View {
+    @State private var camera: MapCameraPosition =
+        .userLocation(fallback: .automatic)
+    @State private var spots: [Spot] = []   // search results
+    @State private var selected: Spot?
+
+    var body: some View {
+        Map(position: $camera, selection: $selected) {
+            UserAnnotation()   // the blue current-location dot
+            ForEach(spots) { spot in
+                Marker(spot.name, coordinate: spot.coordinate)
+                    .tag(spot)
+            }
+        }
+        .mapControls {
+            MapUserLocationButton()
+            MapCompass()
+        }
+        .sheet(item: $selected) { spot in
+            SpotDetailSheet(spot: spot)
+                .presentationDetents([.height(220), .medium])
+        }
+    }
+}
+```
+
+`Marker` gives you the system look; `Annotation` hosts any custom SwiftUI view as a pin. The temptation is to start with fancy `Annotation` pins right away, but for the performance reasons below, I build with `Marker` first and only upgrade when the design genuinely calls for it.
+
+## Nearby Search with MKLocalSearch
+
+The core of nearby search is `MKLocalSearch`. The one thing you must get right is passing the currently visible region into the request. Skip it and you get the badly broken experience of searching "cafe" in Tokyo and receiving results from another city.
+
+```swift
+// SpotSearchService.swift — nearby search biased to the visible region
+import MapKit
+
+struct SpotSearchService {
+    func search(for query: String,
+                in region: MKCoordinateRegion) async throws -> [Spot] {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        request.region = region                    // bias to the visible area
+        request.resultTypes = .pointOfInterest     // exclude address hits
+
+        let response = try await MKLocalSearch(request: request).start()
+        return response.mapItems.map { item in
+            Spot(name: item.name ?? "Unknown",
+                 coordinate: item.placemark.coordinate,
+                 mapItem: item)
+        }
+    }
+}
+// Example: searching "cafe" with a region around a train station
+// returns roughly 20 results within about 1 km (the API caps the count)
+```
+
+The visible region comes from the map's `onMapCameraChange`. When asking Rork Max to wire this up, specify the data flow itself — "hold the region from onMapCameraChange in State, and use it when searching" — and the plumbing comes out right. When I only said "add a search bar," the generated code reused a fixed initial region, and I was slow to notice that panning the map never changed the search area.
+
+To constrain categories, use `pointOfInterestFilter`. Restricting to cafés and restaurants is `MKPointOfInterestFilter(including: [.cafe, .restaurant])`. It stabilizes results compared to free-form natural language queries, which is worth it whenever your app's search domain is fixed.
+
+## When Pins Multiply, SwiftUI Map Runs Out of Road
+
+This is the judgment call I most want to pass on. As of July 2026, SwiftUI's Map still has no automatic pin clustering. When my saved photo spots grew to around 300 pins rendered as `Annotation` views, map dragging stuttered visibly even on my iPhone 15 Pro. Switching to `Marker` helped somewhat, but with no clustering the map turns into a carpet of pins — usability collapses before performance does.
+
+You have two options.
+
+<table><thead><tr><th>Approach</th><th>Clustering</th><th>Implementation cost</th><th>Best for</th></tr></thead><tbody><tr><td>SwiftUI Map (Marker/Annotation)</td><td>None (thin out manually)</td><td>Low</td><td>Up to ~100 pins; search results</td></tr><tr><td>MKMapView wrapped in UIViewRepresentable</td><td>MKClusterAnnotation built in</td><td>Medium–high</td><td>Hundreds of pins; saved-spots views</td></tr></tbody></table>
+
+For rendering search results (a few dozen at most), SwiftUI Map is fine as is. For a screen drawing every spot the user has saved, switching to `MKMapView` turned out to be the shortcut after all. Clustering activates simply by setting `clusteringIdentifier` on the `MKMarkerAnnotationView`.
+
+```swift
+// ClusteredMapView.swift — wrapping MKMapView for built-in clustering
+import SwiftUI
+import MapKit
+
+struct ClusteredMapView: UIViewRepresentable {
+    let annotations: [MKPointAnnotation]
+
+    func makeUIView(context: Context) -> MKMapView {
+        let mapView = MKMapView()
+        mapView.delegate = context.coordinator
+        mapView.register(
+            MKMarkerAnnotationView.self,
+            forAnnotationViewWithReuseIdentifier: "spot")
+        return mapView
+    }
+
+    func updateUIView(_ mapView: MKMapView, context: Context) {
+        mapView.removeAnnotations(mapView.annotations)
+        mapView.addAnnotations(annotations)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, MKMapViewDelegate {
+        func mapView(_ mapView: MKMapView,
+                     viewFor annotation: MKAnnotation) -> MKAnnotationView? {
+            guard !(annotation is MKUserLocation) else { return nil }
+            let view = mapView.dequeueReusableAnnotationView(
+                withIdentifier: "spot", for: annotation)
+                as! MKMarkerAnnotationView
+            view.clusteringIdentifier = "spotCluster"  // enables clustering
+            return view
+        }
+    }
+}
+```
+
+When requesting this switch from Rork Max, write "replace the SwiftUI Map with a UIViewRepresentable-wrapped MKMapView and enable clustering via clusteringIdentifier" and it lands in one pass. A vague "the map is slow with many pins, please fix" got me a response that merely capped the number of rendered pins — treating the symptom, not the cause. This matches the pattern I described in [How to Build SwiftUI Native Apps with Rork Max](/articles/rork-dev/rork-max-swiftui-native-app-development-guide): the dividing line is whether you can specify *what to solve it with*, not just what hurts.
+
+## Handing Directions Off to Apple Maps
+
+There's no need to implement routing yourself. Pass the search result's `MKMapItem` straight to Apple Maps and walking, driving, and transit directions are all handled for you.
+
+```swift
+// The Directions button inside SpotDetailSheet
+Button("Directions") {
+    spot.mapItem.openInMaps(launchOptions: [
+        MKLaunchOptionsDirectionsModeKey:
+            MKLaunchOptionsDirectionsModeWalking
+    ])
+}
+```
+
+In-app route rendering with `MKDirections` is possible, but for a first indie release, delegating to Apple Maps cuts maintenance cost dramatically. I always choose the handoff for version one and only consider in-app routing once users actually ask for it.
+
+## Where Review and Real-World Use Slowed Me Down
+
+Finally, the points where my prototype-to-submission run actually stalled.
+
+- **Purpose string specificity**: the Guideline 5.1.1 classic mentioned above. I rewrote mine to name the feature before resubmitting.
+- **Location testing in the simulator**: Rork Max's in-browser simulator supports custom coordinates, but verification involving movement simulation (freeway drives and the like) was more reliable on a physical device via the Companion app.
+- **Combining with WeatherKit**: showing weather in the spot detail sheet is a natural extension, but the authentication has its own hoops. The pitfalls in [Using WeatherKit in a Rork Max Weather App: Authentication and Attribution Pitfalls](/articles/app-dev/rork-max-weatherkit-forecast-app) apply directly.
+- **Conserving credits**: map screens invite many revision round-trips. Scoping change requests to specific files — "only LocationManager," "only the search service" — prevented unrelated screens from being regenerated and cut my credit consumption by what felt like 30–40%.
+
+## Wrapping Up
+
+Start by having Rork Max generate just the search-results-as-Markers stage, then verify the `onMapCameraChange`-to-search wiring before anything else. The clustering switch can wait until saved pins pass the 100 mark. Don't build the whole map screen at once: permission, rendering, search, clustering — confirming one layer at a time has proven to be the fastest route in the end.
