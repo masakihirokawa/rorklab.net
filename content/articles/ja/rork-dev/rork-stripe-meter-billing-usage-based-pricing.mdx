@@ -1,14 +1,18 @@
 ---
 title: "Rork × Stripe Meter で AI アプリの使用量課金を実装する — トークン数・API 呼び出し回数で正確に課金する設計ガイド"
-slug: "rork-stripe-meter-billing-usage-based-pricing-complete-guide"
+slug: "rork-stripe-meter-billing-usage-based-pricing"
 category: "rork-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-04-26T11:15"
-updated: "2026-04-26T11:15"
+updated: "2026-07-02T20:45"
 author: "Rork Lab"
-description: "Stripe Meter Billing を使い Rork アプリに使用量ベース課金を実装する完全ガイド。Cloudflare Workers でのメーター報告・サブスクリプション設計・エラーハンドリングまで動作確認済みコード付きで解説します。"
+description: "Stripe Meter Billing で Rork アプリに使用量課金を実装します。メーター報告・冪等キー・リトライキュー・イベント集約・前払いクレジットとの使い分けまで、運用の実感を交えて解説します。"
 tags: ["Stripe", "Meter Billing", "使用量課金", "Cloudflare Workers", "AI課金", "サブスクリプション", "個人開発"]
+highlights:
+  - "報告失敗を二重課金なしで救済する Cloudflare Queues リトライキューの実装コード"
+  - "レート制限を見据えた Durable Object によるメーターイベント集約設計"
+  - "前払いクレジット方式との比較表と、iOS 審査境界を踏まえた課金モデルの選び方"
 
 ---
 月額 580 円でアプリを提供していた頃、ある月に一人のユーザーが AI チャット機能を 3,000 回以上使ったとき、正直焦りました。OpenAI API の請求を見ると、そのユーザー一人分だけで月額料金をゆうに超えていたんです。
@@ -414,6 +418,140 @@ async function onUserSignUp(userId: string, email: string): Promise<void> {
 
 サインアップ時に必ず Stripe Customer ID を作成・保存する設計にしておくことで、後の混乱を防げます。このマッピングテーブルが Meter Billing の核心なので、サービス開始前に設計を固めておくことをお勧めします。
 
+## 報告失敗を取りこぼさない — リトライキューの実装
+
+Step 3 のコードで、報告失敗は「リトライキューに積む」とだけ書きました。ここではその中身を具体化します。
+
+私自身、最初は「失敗したらログに残して、あとで手で補填すればいい」と考えていました。しかし実際に運用してみると、報告失敗は深夜のネットワーク断や Stripe 側の一時的な 5xx でまとまって発生します。1 件ずつの手作業での補填は、すぐに現実的でなくなりました。
+
+Cloudflare Queues を使うと、Workers の中だけでリトライの仕組みを完結できます。まず `wrangler.toml` にキューを定義します。
+
+```toml
+# wrangler.toml
+[[queues.producers]]
+queue = "meter-retry"
+binding = "METER_RETRY"
+
+[[queues.consumers]]
+queue = "meter-retry"
+max_batch_size = 10
+max_retries = 5
+dead_letter_queue = "meter-retry-dlq"
+```
+
+Step 2 のハンドラで Stripe への送信が失敗したら、`catch` 節からキューへ積みます。
+
+```typescript
+// 送信失敗時にキューへ積む（Step 2 の catch 節から呼ぶ）
+await env.METER_RETRY.send({
+  customerId: body.customerId,
+  eventName: body.eventName,
+  value: body.value,
+  idempotencyKey, // 初回送信と同じキーを必ず引き継ぐ
+  failedAt: Date.now(),
+});
+```
+
+コンシューマ側は、同じ Worker に `queue()` ハンドラを追加するだけです。
+
+```typescript
+interface RetryPayload {
+  customerId: string;
+  eventName: string;
+  value?: number;
+  idempotencyKey: string;
+  failedAt: number;
+}
+
+export default {
+  async queue(batch: MessageBatch<RetryPayload>, env: Env): Promise<void> {
+    const stripe = new Stripe(env.STRIPE_SECRET_KEY);
+    for (const msg of batch.messages) {
+      try {
+        await stripe.billing.meterEvents.create(
+          {
+            event_name: msg.body.eventName,
+            payload: {
+              stripe_customer_id: msg.body.customerId,
+              ...(msg.body.value !== undefined && { value: String(msg.body.value) }),
+            },
+          },
+          { idempotencyKey: msg.body.idempotencyKey }
+        );
+        msg.ack();
+      } catch {
+        msg.retry({ delaySeconds: 300 }); // 5分後に再試行
+      }
+    }
+  },
+};
+```
+
+設計の要点は 2 つあります。
+
+一つ目は、**冪等キーは初回送信の前に生成し、リトライでも同じキーを使い回す**ことです。リトライのたびにキーを作り直すと、「初回のリクエストは実は Stripe に届いていた」というケースで同じ使用量が二重に計上されます。落とし穴 1 で紹介した `sessionId` ベースのキーを、キューのペイロードに乗せてそのまま運ぶのが安全です。
+
+二つ目は、**`max_retries` を使い切って DLQ（デッドレターキュー）に落ちた分は課金しない**と先に決めておくことです。取りすぎてユーザーの信頼を失うより、取り漏らして自分が少し損をする方を選びます。DLQ の件数は週次で確認し、恒常的に増えていくようであれば送信側の実装かペイロードの形式を疑ってください。
+
+## 送信回数を絞る — 高頻度イベントの集約設計
+
+チャットアプリで「1 メッセージ = 1 イベント」をそのまま送る設計は、ユーザー数が少ないうちは何の問題もありません。ただ、利用が伸びてくると Stripe API のレート制限と Workers の呼び出し回数が気になり始めます。伸びてから直すのは大変なので、集約の設計だけは先に知っておくと安心です。
+
+方針はシンプルで、**Stripe に送る前に自分の側で集計してしまう**ことです。Durable Object にユーザーごとのカウンタを持たせ、アラームで 5 分ごとにまとめて 1 イベントとして送ります。
+
+```typescript
+// Durable Object: ユーザーごとの使用量を貯めて、5分ごとにまとめて送る
+export class MeterBuffer {
+  constructor(
+    private state: DurableObjectState,
+    private env: Env
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const { customerId, value } = await request.json<{
+      customerId: string;
+      value: number;
+    }>();
+
+    // ストレージ上のカウンタに加算（DO の休止・再起動に耐える）
+    const key = `count:${customerId}`;
+    const current = (await this.state.storage.get<number>(key)) ?? 0;
+    await this.state.storage.put(key, current + value);
+
+    // アラーム未設定なら 5 分後の flush を予約
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
+    }
+    return new Response('ok');
+  }
+
+  async alarm(): Promise<void> {
+    const stripe = new Stripe(this.env.STRIPE_SECRET_KEY);
+    const windowId = Math.floor(Date.now() / (5 * 60 * 1000)); // 5分窓のID
+    const entries = await this.state.storage.list<number>({ prefix: 'count:' });
+
+    for (const [key, total] of entries) {
+      const customerId = key.slice('count:'.length);
+      await stripe.billing.meterEvents.create(
+        {
+          event_name: 'ai_api_call',
+          payload: {
+            stripe_customer_id: customerId,
+            value: String(total),
+          },
+        },
+        { idempotencyKey: `flush_${customerId}_${windowId}` }
+      );
+      await this.state.storage.delete(key);
+    }
+  }
+}
+```
+
+flush 中に Stripe への送信が失敗した場合は、前のセクションで作ったリトライキューにそのまま接続できます。カウンタをメモリではなくストレージに置いているのは、Durable Object が休止・再起動してもカウントが消えないようにするためです。
+
+トレードオフも正直に書いておきます。集約すると、ユーザー向けのリアルタイム使用量表示が最大で集約窓の分だけ遅れます。表示用のカウンタはアプリ側（またはバックエンドの KV）で別に持ち、Stripe のメーターは「請求の真実」、アプリ内カウンタは「表示の速報値」と役割を分けるのが私の落としどころです。集約窓を大きくしすぎると請求期間の締めをまたぐ事故が起きやすくなるため、5〜15 分程度に収めておくのが扱いやすいと考えています。
+
 ## 実用的な応用例
 
 ### AI チャットアプリ
@@ -453,6 +591,28 @@ await reportUsage({
 });
 ```
 
+## 前払いクレジットという選択肢 — 従量課金とどちらを選ぶか
+
+ここまで従量課金の実装を進めてきましたが、公平な課金を実現する方法はもう一つあります。「100 回分クレジット ¥500」のように先にまとめて購入してもらう、前払いクレジット方式です。どちらを選ぶかはアプリの配信形態でほぼ決まるので、判断材料を表に整理しておきます。
+
+<table>
+<thead>
+<tr><th>観点</th><th>従量課金（Stripe Meter）</th><th>前払いクレジット（消耗型 IAP）</th></tr>
+</thead>
+<tbody>
+<tr><td>収益のタイミング</td><td>後払い（月末にまとめて請求）</td><td>先払い（購入時に確定）</td></tr>
+<tr><td>ユーザー心理</td><td>「今月いくらになるか」の不安が出やすい</td><td>使い切り型で金額が先に見える安心感</td></tr>
+<tr><td>iOS 単体アプリでの利用</td><td>ガイドライン 3.1.1 の制約で使える場面が限られる</td><td>App Store の標準的な仕組みに乗れる</td></tr>
+<tr><td>実装の中心</td><td>メーター報告と集計の信頼性設計</td><td>残高管理・復元・失効ポリシーの設計</td></tr>
+<tr><td>未使用分の扱い</td><td>そもそも発生しない</td><td>失効や返金への方針決めが必要</td></tr>
+<tr><td>B2B・Web への展開</td><td>請求書払い・API 課金へ自然に拡張できる</td><td>Web では別の決済導線を作る必要がある</td></tr>
+</tbody>
+</table>
+
+私の使い分けはこうです。**iOS アプリ内で完結するデジタル機能なら消耗型 IAP のクレジット方式、Web 版や B2B の API 提供があるなら Stripe Meter**。アプリ審査の観点では、アプリ内で消費されるデジタルサービスの課金は In-App Purchase を経由するのが原則なので、モバイル単体のアプリで Stripe Meter を選ぶ理由はあまりありません。逆に Web と併売するなら、内部の使用量カウンタを 1 つに統一した上で、アプリはクレジット残高から引き、Web ユーザーは Meter で後払い、という二本立てが運用しやすい形でした。
+
+前払い方式には収益面の利点もあります。購入時点で売上が確定するため、月末まで請求額が読めない従量課金と比べて資金繰りの見通しが立てやすくなります。個人開発で AI の API 原価を先に支払っている身としては、この「先にもらえる」性質は想像以上に効きました。
+
 ## 使用量課金導入後に備えるべきこと
 
 実装が完了したら、次の 2 点を必ず確認してください。
@@ -463,7 +623,28 @@ await reportUsage({
 
 Stripe Meter Billing を実装したアプリを App Store に提出する際は、[App Store Review Guidelines の Section 3.1.1](https://developer.apple.com/app-store/review/guidelines/#in-app-purchase) に従い、デジタルサービスの購入には In-App Purchase を経由する必要がある点にも注意が必要です。Web アプリや B2B 利用など、対象外となるケースも多いので、事前に確認してください。
 
-詳細な Stripe API の使い方については[Rork × Cloudflare Workers での REST API 構築ガイド](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide)も参考にしてください。また、Stripe サブスクリプションの基礎については[Rork アプリへの Stripe サブスクリプション実装ガイド](/articles/rork-dev/rork-stripe-subscription-complete-guide)で詳しく解説しています。
+詳細な Stripe API の使い方については[Rork × Cloudflare Workers での REST API 構築ガイド](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide)も参考にしてください。また、Stripe サブスクリプションの基礎については[Rork × Stripe サブスクリプション実装](/articles/rork-business/rork-stripe-subscription-monetization-guide)で詳しく解説しています。
+
+## 運用が始まってから見る 3 つの数字
+
+課金が動き始めたら、週次で見る数字を 3 つに絞っています。
+
+一つ目は**ユーザーごとの原価と収益の比率**です。AI API の請求（OpenAI・Gemini・Anthropic のダッシュボード）と、Stripe のメーター集計から得られる従量収益を突き合わせます。私は「収益 1 に対して原価 0.4」を警戒ラインにしていて、これを超えて推移するようなら単価か無料枠の見直しを検討します。
+
+```typescript
+// 今月の原価率を計算する（週次バッチで実行）
+function costRatio(aiApiCost: number, meteredRevenue: number) {
+  const ratio = aiApiCost / meteredRevenue;
+  return {
+    ratio,
+    status: ratio < 0.4 ? 'healthy' : ratio < 0.6 ? 'warning' : 'critical',
+  } as const;
+}
+```
+
+二つ目は**無料枠の消化率**です。無料枠の 80% に到達したユーザーにアプリ内で「今月 80 / 100 回を使用しました」と知らせると、月末の請求で驚かせることがなくなり、上位プランへの自然な導線にもなります。
+
+三つ目は**異常値の検知**です。平均の 10 倍を使うユーザーは、熱心なファンか、自動化による濫用かのどちらかです。Stripe の Billing Alerts を平均使用額の 3 倍あたりに張っておき、発火したら使用パターンを確認します。一日を通して分散しているなら人間、数分間に集中しているなら Bot を疑う、という見方をしています。
 
 ## 次のステップ
 

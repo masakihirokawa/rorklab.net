@@ -1,14 +1,18 @@
 ---
 title: "Usage-Based Billing for Rork AI Apps with Stripe Meter — Charge by API Calls and Tokens, Not Flat Rates"
-slug: "rork-stripe-meter-billing-usage-based-pricing-complete-guide"
+slug: "rork-stripe-meter-billing-usage-based-pricing"
 category: "rork-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-04-26T11:15"
-updated: "2026-04-26T11:15"
+updated: "2026-07-02T20:45"
 author: "Rork Lab"
-description: "A complete guide to implementing Stripe Meter Billing in your Rork AI app. Covers meter setup, Cloudflare Workers usage reporting, subscription design with free tiers, and error handling — all with working, production-ready code."
+description: "Implement usage-based billing in your Rork AI app with Stripe Meter — meter setup, Cloudflare Workers reporting, retry queues, event aggregation, and how to choose between metered billing and prepaid credits."
 tags: ["Stripe", "Meter Billing", "Usage-Based Pricing", "Cloudflare Workers", "AI Monetization", "Subscription", "Indie Dev"]
+highlights:
+  - "Working Cloudflare Queues retry code that recovers failed usage reports without double-billing"
+  - "A Durable Object aggregation pattern that keeps meter events under Stripe rate limits"
+  - "A prepaid-credits vs. metered-billing comparison with App Store review boundaries for choosing your model"
 
 ---
 
@@ -446,6 +450,140 @@ Store the `stripe_customer_id` in a column on your users table with a unique con
 
 If you're adding metered billing to an existing app that doesn't have Stripe Customer IDs for all users, build the migration script before you launch. It's much easier to run a one-time migration on a Sunday than to retroactively patch six months of missing usage data.
 
+## A Retry Queue That Doesn't Lose Usage Reports
+
+Back in Step 3, the failure path simply pushed the report into a "retry queue" and moved on. Let's build that queue for real.
+
+My first instinct as an indie developer was to skip this entirely — log the failure, fix it by hand later. That plan survived about two weeks of production traffic. Report failures don't arrive one at a time; they arrive in clusters, triggered by a flaky network window or a transient 5xx on Stripe's side. Backfilling them manually stopped being realistic almost immediately.
+
+Cloudflare Queues lets you keep the whole retry mechanism inside Workers. First, define the queue in `wrangler.toml`:
+
+```toml
+# wrangler.toml
+[[queues.producers]]
+queue = "meter-retry"
+binding = "METER_RETRY"
+
+[[queues.consumers]]
+queue = "meter-retry"
+max_batch_size = 10
+max_retries = 5
+dead_letter_queue = "meter-retry-dlq"
+```
+
+When the Stripe call in your Step 2 handler fails, enqueue the report from the `catch` block:
+
+```typescript
+// Called from the catch block of the Step 2 handler
+await env.METER_RETRY.send({
+  customerId: body.customerId,
+  eventName: body.eventName,
+  value: body.value,
+  idempotencyKey, // carry the SAME key used on the first attempt
+  failedAt: Date.now(),
+});
+```
+
+The consumer is a `queue()` handler in the same Worker:
+
+```typescript
+interface RetryPayload {
+  customerId: string;
+  eventName: string;
+  value?: number;
+  idempotencyKey: string;
+  failedAt: number;
+}
+
+export default {
+  async queue(batch: MessageBatch<RetryPayload>, env: Env): Promise<void> {
+    const stripe = new Stripe(env.STRIPE_SECRET_KEY);
+    for (const msg of batch.messages) {
+      try {
+        await stripe.billing.meterEvents.create(
+          {
+            event_name: msg.body.eventName,
+            payload: {
+              stripe_customer_id: msg.body.customerId,
+              ...(msg.body.value !== undefined && { value: String(msg.body.value) }),
+            },
+          },
+          { idempotencyKey: msg.body.idempotencyKey }
+        );
+        msg.ack();
+      } catch {
+        msg.retry({ delaySeconds: 300 }); // try again in 5 minutes
+      }
+    }
+  },
+};
+```
+
+Two design decisions matter here.
+
+First, **generate the idempotency key before the first attempt and reuse it on every retry**. If you mint a fresh key per retry, the case where the original request actually reached Stripe — but the response got lost — turns into a double charge. The `sessionId`-based key from the pitfalls section travels inside the queue payload for exactly this reason.
+
+Second, **decide up front that anything landing in the dead-letter queue does not get billed**. Overcharging users costs you trust you can't buy back; undercharging costs you a few cents. Check the DLQ count weekly — if it grows steadily, the problem is usually in the producer's payload shape, not in Stripe.
+
+## Aggregating High-Frequency Events Before They Hit Stripe
+
+Sending one meter event per chat message is perfectly fine at launch. As usage grows, though, you start brushing against Stripe's API rate limits and paying for a Workers invocation per message. Retrofitting aggregation under load is painful, so it's worth knowing the pattern before you need it.
+
+The idea is simple: **accumulate usage on your side and flush it to Stripe periodically**. A Durable Object holds a per-customer counter and an alarm flushes every five minutes as a single event:
+
+```typescript
+// Durable Object: buffer per-customer usage, flush every 5 minutes
+export class MeterBuffer {
+  constructor(
+    private state: DurableObjectState,
+    private env: Env
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const { customerId, value } = await request.json<{
+      customerId: string;
+      value: number;
+    }>();
+
+    // Persist the counter so a DO restart can't lose counts
+    const key = `count:${customerId}`;
+    const current = (await this.state.storage.get<number>(key)) ?? 0;
+    await this.state.storage.put(key, current + value);
+
+    // Schedule a flush if one isn't already pending
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
+    }
+    return new Response('ok');
+  }
+
+  async alarm(): Promise<void> {
+    const stripe = new Stripe(this.env.STRIPE_SECRET_KEY);
+    const windowId = Math.floor(Date.now() / (5 * 60 * 1000)); // 5-minute window ID
+    const entries = await this.state.storage.list<number>({ prefix: 'count:' });
+
+    for (const [key, total] of entries) {
+      const customerId = key.slice('count:'.length);
+      await stripe.billing.meterEvents.create(
+        {
+          event_name: 'ai_api_call',
+          payload: {
+            stripe_customer_id: customerId,
+            value: String(total),
+          },
+        },
+        { idempotencyKey: `flush_${customerId}_${windowId}` }
+      );
+      await this.state.storage.delete(key);
+    }
+  }
+}
+```
+
+If a flush fails, it plugs straight into the retry queue from the previous section. The counters live in Durable Object storage rather than memory so that hibernation or a restart can't silently drop usage.
+
+The trade-off is honest to state: your in-app real-time usage display now lags by up to one aggregation window. My resolution is to keep two counters with different jobs — the Stripe meter is the billing source of truth, and a lightweight app-side counter (or KV value) is the fast display estimate. Keep the window in the 5–15 minute range; stretch it much further and a flush can straddle the billing period boundary at month end, which is a genuinely annoying bug to chase.
+
 ## Application Patterns for Different App Types
 
 **AI chat app**: Charge per message. Show "X / 100 messages this month" in the UI. Use "messages" rather than "tokens" as the unit — it's more intuitive for consumer apps, and you can adjust the internal token-to-message ratio as AI models change without confusing users.
@@ -484,6 +622,28 @@ This lets you use a single Meter across all AI operations while pricing them pro
 
 **Code generation app**: Charge per code generation request. For developer-focused apps, sophisticated users often appreciate the transparency of seeing their exact usage data — consider exposing a usage API that they can query programmatically.
 
+## Prepaid Credits vs. Metered Billing — Choosing the Right Model
+
+Everything so far has assumed postpaid metering, but there's a second way to charge fairly for usage: sell credits up front — "500 yen for 100 messages" — and burn them down. Which model fits is mostly decided by how you distribute the app, so here's the comparison I wish I'd had earlier.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>Metered billing (Stripe Meter)</th><th>Prepaid credits (consumable IAP)</th></tr>
+</thead>
+<tbody>
+<tr><td>Revenue timing</td><td>Postpaid — collected at month end</td><td>Prepaid — locked in at purchase</td></tr>
+<tr><td>User psychology</td><td>"What will this month cost me?" anxiety</td><td>Fixed spend, known up front</td></tr>
+<tr><td>iOS-only apps</td><td>Limited applicability under Guideline 3.1.1</td><td>Rides the App Store's standard machinery</td></tr>
+<tr><td>Engineering focus</td><td>Reliable reporting and aggregation</td><td>Balance ledger, restore flows, expiry policy</td></tr>
+<tr><td>Unused allowance</td><td>Never exists</td><td>Needs an expiry and refund policy</td></tr>
+<tr><td>B2B and web expansion</td><td>Extends naturally to invoicing and API billing</td><td>Requires a separate web checkout path</td></tr>
+</tbody>
+</table>
+
+My own split works like this: **for digital features consumed entirely inside an iOS app, use consumable IAP credits; the moment you have a web version or a B2B API surface, Stripe Meter earns its keep**. From a review standpoint, purchases of digital services consumed in-app are expected to go through In-App Purchase, so a mobile-only app rarely has a good reason to pick Stripe Meter. If you run both, unify the internal usage counter and let the app decrement a credit balance while web users get metered postpaid — one measurement layer, two billing frontends.
+
+Prepaid also has an underrated financial property: revenue is certain at the moment of purchase. When you're an indie developer fronting the AI API costs out of pocket, getting paid before you incur the inference bill smooths cash flow more than I expected it to.
+
 ## Pre-Launch Checklist
 
 Before going live with metered billing, verify these items:
@@ -496,7 +656,7 @@ Before going live with metered billing, verify these items:
 
 **Webhook handling is in place.** Specifically, handle `invoice.payment_failed` to notify users of failed charges and `customer.subscription.deleted` to revoke access when subscriptions lapse.
 
-For more on setting up Cloudflare Workers as a Rork app backend, see [Building REST APIs with Hono and Cloudflare Workers](/en/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide). For Stripe subscription fundamentals, [Stripe Subscription Monetization Guide](/en/articles/rork-dev/rork-stripe-subscription-complete-guide) covers the basics in depth.
+For more on setting up Cloudflare Workers as a Rork app backend, see [Building REST APIs with Hono and Cloudflare Workers](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide). For Stripe subscription fundamentals, [Rork × Stripe Subscription Implementation](/articles/rork-business/rork-stripe-subscription-monetization-guide) covers the basics in depth.
 
 ## Monitoring Usage in Production
 
