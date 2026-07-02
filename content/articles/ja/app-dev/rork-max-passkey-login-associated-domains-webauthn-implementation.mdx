@@ -1,0 +1,181 @@
+---
+title: "パスワードを預からないログインへ — Rork Max アプリにパスキー認証を組み込む実装手順"
+slug: "rork-max-passkey-login-associated-domains-webauthn-implementation"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-02T14:45"
+author: "Rork Lab"
+description: "Rork Max が生成した Swift アプリに AuthenticationServices のパスキー認証を組み込む手順です。Associated Domains の設定から WebAuthn サーバー検証、実機テストの落とし穴まで動くコードでまとめました。"
+tags: ["Rork Max", "パスキー", "WebAuthn", "AuthenticationServices", "Swift", "認証"]
+highlights:
+  - "webcredentials と apple-app-site-association を最短で正しく通すための設定チェックリスト"
+  - "登録とログインの両フローを Swift と Node.js（@simplewebauthn/server）の動くコードで最後まで通す"
+  - "RP ID 不一致のエラー 1004 や AASA キャッシュなど、実機テストで詰まる点の切り分け手順"
+---
+
+運営中のアプリのサポート窓口で、いちばん多い問い合わせが「パスワードを忘れました」だった時期があります。機能の不具合ではなく、ログインできないことへの返信に毎週時間を使う。個人開発では、この種の目立たない運用コストが積もっていきます。
+
+パスキーに切り替えてから、その問い合わせはほぼ消えました。ユーザーは Face ID をかざすだけで、私のサーバーにはパスワードという「漏れたら終わりの秘密」がそもそも存在しません。ここでは、Rork Max が生成した Swift アプリにパスキー認証を組み込んだ手順を、私自身がつまずいた箇所まで含めて書きます。
+
+## パスキーで何が変わり、何は変わらないのか
+
+パスキーは WebAuthn の公開鍵認証をベースにした仕組みです。端末側で秘密鍵を生成し、サーバーには公開鍵だけを渡します。ログイン時はサーバーが出すチャレンジに端末が署名し、サーバーが公開鍵で検証する。パスワードのように「同じ秘密を両側で持つ」構造ではないため、サーバーが漏洩しても資格情報は盗まれません。秘密鍵は iCloud キーチェーンで同期されるので、機種変更でも引き継がれます。
+
+一方で、変わらないものもあります。サーバーは依然として必要です。チャレンジの発行と署名の検証、公開鍵の保存はサーバーの仕事で、ここを省略した「クライアントだけのパスキー」は成立しません。Rork Max はネイティブ Swift のクライアント側を生成してくれますが、この記事の半分はサーバー側の話になります。
+
+なお「Apple のアカウントで代わりにログインする」方式とは役割が違います。あちらは ID 連携、パスキーは自分のアカウント基盤をそのまま無パスワード化する技術です。ID 連携側の実装は [Sign in with Apple のサーバー検証とアカウント削除の実装](/articles/rork-dev/rork-sign-in-with-apple-server-verification-account-deletion-guide) に書いたので、両方を並べる設計も検討できます。
+
+## 最初に整える土台 — Associated Domains と AASA ファイル
+
+パスキーは「どのドメインの資格情報か」をアプリとサーバーの双方で一致させる必要があります。この紐づけが Associated Domains です。手順は 3 点セットで覚えています。
+
+1. アプリ側に `webcredentials:example.com` の Associated Domains を持たせる
+2. サーバー側の `https://example.com/.well-known/apple-app-site-association` に AASA ファイルを置く
+3. AASA にアプリの App ID（TeamID.BundleID）を記載する
+
+AASA ファイルはこれだけの JSON です。
+
+```json
+{
+  "webcredentials": {
+    "apps": ["YOUR_TEAM_ID.com.example.yourapp"]
+  }
+}
+```
+
+配信時の条件が地味に厳格で、私は最初ここで半日を失いました。リダイレクトなしの HTTPS で返すこと、`Content-Type: application/json` で返すこと、パスは `/.well-known/` 直下であること。拡張子は付けません。
+
+Rork Max の場合、Xcode を開かずにビルドまで進む構成なので、Associated Domains は生成時のプロンプトで明示します。「webcredentials の Associated Domains として example.com を含めてください」と要求し、生成後に entitlements へ反映されているかを確認してから先へ進む。ケーパビリティが絡む機能は、生成コードが正しくても署名設定が欠けると実機で沈黙する、というのが Core NFC のときから変わらない教訓です。
+
+## 登録フロー — サーバーがチャレンジを出し、端末が公開鍵を返す
+
+先にサーバーです。自前で WebAuthn の検証を書くのは事故のもとなので、実績のある `@simplewebauthn/server` を使います。登録オプションの発行と検証だけの最小構成です。
+
+```typescript
+// server/passkey.ts — 何を解決するか: 登録用チャレンジの発行と attestation の検証
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+} from "@simplewebauthn/server";
+
+const rpID = "example.com";          // RP ID = ドメイン。アプリ側と必ず一致させる
+const origin = `https://${rpID}`;
+
+export async function startRegistration(userId: string, userName: string) {
+  const options = await generateRegistrationOptions({
+    rpName: "Your App",
+    rpID,
+    userID: new TextEncoder().encode(userId),
+    userName,
+    attestationType: "none",
+    authenticatorSelection: { residentKey: "required", userVerification: "required" },
+  });
+  await saveChallenge(userId, options.challenge); // 有効期限つきで保存
+  return options;
+}
+
+export async function finishRegistration(userId: string, body: unknown) {
+  const expectedChallenge = await loadChallenge(userId);
+  const verification = await verifyRegistrationResponse({
+    response: body as any,
+    expectedChallenge,
+    expectedOrigin: origin,
+    expectedRPID: rpID,
+  });
+  if (!verification.verified || !verification.registrationInfo) {
+    throw new Error("registration failed");
+  }
+  const { credential } = verification.registrationInfo;
+  await savePublicKey(userId, credential.id, credential.publicKey, credential.counter);
+  return { ok: true };
+}
+```
+
+チャレンジを保存して照合する部分を省くと、リプレイ攻撃に対して素通しになります。ここは飛ばさないでください。
+
+クライアント側の Swift はこうなります。Rork Max の生成コードに認証マネージャとして追加する想定です。
+
+```swift
+// PasskeyRegistration.swift — 何を解決するか: サーバーのチャレンジから資格情報を作成して返す
+import AuthenticationServices
+
+final class PasskeyRegistrar: NSObject, ASAuthorizationControllerDelegate,
+                              ASAuthorizationControllerPresentationContextProviding {
+    private let rpID = "example.com"
+
+    func register(challenge: Data, userID: Data, userName: String) {
+        let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
+            relyingPartyIdentifier: rpID)
+        let request = provider.createCredentialRegistrationRequest(
+            challenge: challenge, name: userName, userID: userID)
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+        controller.delegate = self
+        controller.presentationContextProvider = self
+        controller.performRequests()
+    }
+
+    func authorizationController(controller: ASAuthorizationController,
+                                 didCompleteWithAuthorization authorization: ASAuthorization) {
+        guard let cred = authorization.credential
+                as? ASAuthorizationPlatformPublicKeyCredentialRegistration else { return }
+        // rawAttestationObject / rawClientDataJSON / credentialID をサーバーへ POST する
+        sendToServer(attestation: cred.rawAttestationObject,
+                     clientData: cred.rawClientDataJSON,
+                     credentialID: cred.credentialID)
+    }
+
+    func authorizationController(controller: ASAuthorizationController,
+                                 didCompleteWithError error: Error) {
+        // エラー分類は後述。1004 はほぼ設定不一致
+        print("passkey registration error: \(error)")
+    }
+
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        ASPresentationAnchor()
+    }
+}
+```
+
+流れとしては、サーバーの `startRegistration` からチャレンジを取得し、`register` を呼び、デリゲートで受け取った attestation を `finishRegistration` へ送るだけです。Face ID のシートが出て 2 秒ほどで完了します。
+
+## ログインフロー — 署名をサーバーで検証して初めて成立する
+
+ログインは登録の鏡写しです。サーバーが認証用チャレンジを発行し、端末が既存の秘密鍵で署名し、サーバーが公開鍵で検証します。
+
+```swift
+// PasskeySignIn.swift — 何を解決するか: 保存済みパスキーでの署名取得
+func signIn(challenge: Data) {
+    let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
+        relyingPartyIdentifier: "example.com")
+    let request = provider.createCredentialAssertionRequest(challenge: challenge)
+    let controller = ASAuthorizationController(authorizationRequests: [request])
+    controller.delegate = self
+    controller.presentationContextProvider = self
+    controller.performRequests()
+}
+```
+
+デリゲートで `ASAuthorizationPlatformPublicKeyCredentialAssertion` を受け取り、`signature` と `rawClientDataJSON`、`rawAuthenticatorData`、`credentialID` をサーバーへ送ります。サーバー側は `verifyAuthenticationResponse` に保存済みの公開鍵と counter を渡して検証し、通ったらセッションを発行します。counter の更新を忘れると、クローンされた認証器の検知が効かなくなるので、検証成功のたびに保存し直してください。
+
+ログイン画面のテキストフィールドに `.textContentType(.username)` を指定しておくと、QuickType バーからパスキーを提示する AutoFill 連携も効きます。専用ボタンより離脱が少なかったので、私はこちらを既定にしています。
+
+## 実機テストで詰まった 3 つの箇所
+
+1 つ目はエラー 1004 です。「Application with identifier is not associated with domain」という趣旨のメッセージが出たら、原因はほぼ確実に RP ID とドメインの不一致か、AASA が取得できていないかのどちらかです。サブドメインで運用している場合、`api.example.com` を RP ID にしてしまうと、`example.com` で登録したパスキーとは別物として扱われます。RP ID は登録とログインで同じ値に固定する。これが原則です。
+
+2 つ目は AASA のキャッシュです。Apple は AASA を CDN 経由で取得してキャッシュするため、サーバー側でファイルを直しても実機にすぐ反映されません。開発中は Associated Domains のエントリを `webcredentials:example.com?mode=developer` にしておくと、CDN を迂回して直接取得されます。反映状況は Mac の `swcutil` で確認できますが、私は「developer モードで通ることを先に確認し、本番モードの反映は一晩待つ」運用に落ち着きました。
+
+3 つ目はシミュレータです。パスキーは iCloud キーチェーンに保存されるため、シミュレータに Apple Account でサインインしていないと登録シートが即座に失敗します。Rork Max のブラウザ内シミュレータで UI の流れは確認できますが、資格情報の生成から検証までの一連は、サインイン済みの実機で通すのが結局いちばん速い、というのが私の結論です。
+
+既存ユーザーの移行は、強制しないことをお勧めします。パスワードでログインした直後の画面で「次回から Face ID でログインできます」と 1 回だけ提案する。この順序なら、認証済みの状態で登録フローに入るので、本人確認を別途挟む必要がありません。
+
+## 導入して変わった数字
+
+導入から 1 か月の時点で、パスワードリセットの問い合わせは月十数件からゼロになりました。ログイン完了までの所要時間は、計測していた画面表示から認証完了までの中央値で約 9 秒から 2 秒台へ。提案シートからのパスキー登録率は約 4 割で、残りのユーザーはパスワードのまま使い続けています。両方式の並走はコードが少し増えますが、この移行期を短縮しようと登録を強制すると、その場の離脱で回収できなくなると考えています。
+
+## まとめ — 最初の一歩は AASA の配信確認から
+
+実装の順序は、AASA の配信を先に通し、developer モードで登録フローを実機確認し、最後にログインフローと counter 更新を固める、が最短でした。まずはお手元のドメインで `/.well-known/apple-app-site-association` が正しい Content-Type で返るかを確認するところから始めてみてください。
+
+サーバーを持たない構成で認証基盤ごと外部に任せたい場合は、[Rork × Better Auth で Web/モバイル統合認証を実装する](/articles/rork-dev/rork-better-auth-unified-authentication-guide) の構成も選択肢になります。同じ課題に取り組んでいる方の参考になれば幸いです。
