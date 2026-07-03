@@ -1,0 +1,250 @@
+---
+title: "Rork Max 生成アプリで端末同士を直接つなぐ — MultipeerConnectivity が無言で失敗する Local Network 権限の罠"
+slug: "rork-max-multipeerconnectivity-local-network-permission-nearby-sharing"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-04T20:15"
+updated: "2026-07-04T20:15"
+author: "Rork Lab"
+description: "Rork Max が生成したネイティブ Swift アプリに、サーバを介さず近くの端末同士をつなぐ共有機能を組み込む方法です。シミュレータでは動くのに実機でピアが見つからない——その多くは Local Network 権限まわりの無言の失敗が原因でした。"
+tags: ["Rork Max", "MultipeerConnectivity", "Local Network", "Swift", "iOS", "オフライン共有"]
+highlights:
+  - "実機でピアが一向に見つからず「なぜか動かない」で止まっていた人が、Local Network 権限とBonjourサービスタイプのどこでつまずいているかをlog から切り分けられるようになる"
+  - "招待から MCSession 確立、切断からの復帰までの状態遷移を、そのまま組み込める薄いラッパーとして手に入れられる"
+  - "Rork Max の生成コードに最小差分で近接共有を足すときに、AIが書ききれない権限・Info.plist・バックグラウンド制約をどこで自分の手で補うかがわかる"
+---
+
+近くにいる相手とアプリ内のデータを、サーバもアカウントも通さずにその場で渡したい——たとえば作った壁紙プリセットを目の前の友人の端末にそのまま送る、といった機能を Rork Max で作ろうとしたときのことです。生成された Swift はシミュレータでは何の問題もなく動き、ピア一覧にモックが並びました。ところが実機二台で試すと、片方の端末にもう片方が一向に現れません。エラーも出ず、ただ静かに何も起きない。原因を追ったところ、`MCSession` の使い方ではなく、その手前の Local Network 権限で無言のまま弾かれていました。
+
+この「無言の失敗」は MultipeerConnectivity で近接通信を組むときに最初にぶつかる壁です。個人開発でアプリを作り続けている中でも、権限まわりの取りこぼしは実機でしか露見しないため厄介でした。ここでは、Rork Max が生成したネイティブアプリに端末直結の共有機能を最小差分で乗せる前提に立ち、権限の罠の切り分け方と、そのまま使えるラッパー実装を順にまとめていきます。
+
+## なぜサーバを介さず端末を直接つなぐのか
+
+近接共有をバックエンド経由にすると、たとえ相手が目の前にいても「アップロード → サーバ経由 → ダウンロード」という遠回りになります。オフラインの場所では動かず、サーバ費用もかかり、一時的なデータのためにアカウント連携を要求することにもなります。
+
+MultipeerConnectivity は Wi-Fi と Bluetooth を自動で束ねて、同じ Wi-Fi 下でもオフラインのピアツーピアでも、近くの端末を発見して直接データを流せる Apple 純正のフレームワークです。壁紙やプリセットのような「その場で渡せれば十分」なデータには、サーバを持たない選択がむしろ素直だと私は考えています。Dolice Labs で運用しているような小さなアプリでは、機能ひとつのためにバックエンドを増やさない判断が運用コストにも効いてきます。
+
+一方で、恒久的な端末間同期が目的なら [CloudKit で端末間データ同期を組む設計](/articles/rork-dev/rork-max-cloudkit-cross-device-sync-architecture) の方が向いています。近接共有は「いま・ここ」で完結する用途に絞るのが要点です。
+
+## MultipeerConnectivity の3つの役割を分けて捉える
+
+このフレームワークは登場人物を3つに分けて考えると一気に見通しが良くなります。
+
+1. **Advertiser（広告側）**: 「ここに居ますよ」と自分の存在を周囲に知らせる役。`MCNearbyServiceAdvertiser` を使います。
+2. **Browser（探索側）**: 周囲の Advertiser を探し、見つけたら招待を送る役。`MCNearbyServiceBrowser` を使います。
+3. **Session（セッション）**: 招待が受理されたあと、実際のデータをやり取りする土管。`MCSession` が担います。
+
+同じアプリが Advertiser と Browser の両方を同時に担うと、どちらの端末からでも相手を見つけて誘えます。この「双方向で名乗り、双方向で探す」構成が、近接共有ではもっとも扱いやすいと感じています。
+
+`serviceType` はこの3者をひも付ける合言葉です。ここには後述する厳格な命名規則があり、規則を外れると advertiser も browser も静かに動かなくなります。
+
+## 最初の壁: Local Network 権限が無言で失敗する
+
+MultipeerConnectivity は内部で Bonjour（mDNS）を使ってピアを探します。iOS 14 以降、Bonjour を使う通信には Local Network 権限が必要で、これが実機のみで効いてくる最大のハマりどころです。
+
+つまずきの構造はこうです。
+
+- 権限の説明文（`NSLocalNetworkUsageDescription`）を Info.plist に書き忘れると、そもそも権限ダイアログが出ません。ダイアログが出ないので拒否も許可もされないまま、browser は何も見つけられません。
+- 使う Bonjour サービスタイプを `NSBonjourServices` に列挙し忘れると、advertise はできても discovery 側がフィルタされ、やはり静かに見つかりません。
+- 一度ユーザが「許可しない」を選ぶと、アプリからは二度と再プロンプトできません。以後は browser が永遠に空を返し続けます。
+
+いずれも例外もエラーコールバックも投げないため、「コードは正しいのに動かない」ように見えます。まず Info.plist に次の2項目が入っているかを確認してください。`NSBonjourServices` の値は `_サービスタイプ._tcp` と `_サービスタイプ._udp` の両方を、実際に使う `serviceType` に合わせて登録します。
+
+```xml
+<!-- Info.plist -->
+<key>NSLocalNetworkUsageDescription</key>
+<string>近くの端末とプリセットを直接共有するために、ローカルネットワーク上の端末を探します。</string>
+<key>NSBonjourServices</key>
+<array>
+  <string>_dolicoshare._tcp</string>
+  <string>_dolicoshare._udp</string>
+</array>
+```
+
+権限が拒否されているかどうかは、フレームワーク側が明示的に教えてくれません。実務では「一定時間探しても1件も見つからないなら、権限か Info.plist を疑う」という運用にしています。切り分けのために、探索開始・招待送出・状態変化のそれぞれで `os.Logger` にログを残しておくと、実機で何が起きていないかが一目でわかります。
+
+```swift
+import os
+
+let shareLog = Logger(subsystem: "net.rorklab.share", category: "multipeer")
+// 使い方: shareLog.info("browser: found peer \(peerID.displayName, privacy: .public)")
+```
+
+Local Network 権限の考え方は、オフライン検知や再接続の設計とも地続きです。ネットワーク状態そのものを監視する話は [Rork Max でオフライン検知と再接続を設計する](/articles/app-dev/rork-max-nwpathmonitor-offline-detection-reconnect-retry-design) にまとめています。
+
+## 動く最小実装: MCSession をまとめる薄いラッパー
+
+役割が3つに分かれている分、素の API はコールバックが散らばりがちです。そこで Advertiser・Browser・Session をひとつのクラスにまとめ、SwiftUI から `@Published` で状態を観測できる薄いラッパーにします。以下はそのまま動く最小構成です。
+
+```swift
+import MultipeerConnectivity
+import os
+
+@MainActor
+final class NearbyShareManager: NSObject, ObservableObject {
+    // serviceType は 1〜15 文字・英小文字/数字/ハイフンのみ（後述の罠を参照）
+    private let serviceType = "dolicoshare"
+    private let myPeerID = MCPeerID(displayName: UUID().uuidString.prefix(8).description)
+
+    private lazy var session: MCSession = {
+        let s = MCSession(peer: myPeerID, securityIdentity: nil,
+                          encryptionPreference: .required)
+        s.delegate = self
+        return s
+    }()
+
+    private lazy var advertiser = MCNearbyServiceAdvertiser(
+        peer: myPeerID, discoveryInfo: nil, serviceType: serviceType)
+    private lazy var browser = MCNearbyServiceBrowser(
+        peer: myPeerID, serviceType: serviceType)
+
+    private let log = Logger(subsystem: "net.rorklab.share", category: "multipeer")
+
+    @Published private(set) var foundPeers: [MCPeerID] = []
+    @Published private(set) var connectedPeers: [MCPeerID] = []
+
+    func start() {
+        advertiser.delegate = self
+        browser.delegate = self
+        advertiser.startAdvertisingPeer()
+        browser.startBrowsingForPeers()
+        log.info("start advertising and browsing")
+    }
+
+    func stop() {
+        advertiser.stopAdvertisingPeer()
+        browser.stopBrowsingForPeers()
+        session.disconnect()
+        foundPeers.removeAll()
+        connectedPeers.removeAll()
+    }
+
+    func invite(_ peerID: MCPeerID) {
+        // 相手を自分のセッションへ招待。timeout は短すぎると取りこぼす
+        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 20)
+    }
+
+    func send(_ data: Data) {
+        guard !session.connectedPeers.isEmpty else { return }
+        do {
+            try session.send(data, toPeers: session.connectedPeers, with: .reliable)
+        } catch {
+            log.error("send failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+}
+```
+
+デリゲートは4つのプロトコルに分けて実装します。ここで状態遷移を `@Published` に反映しておくことで、SwiftUI 側は素直にリスト表示できます。
+
+```swift
+extension NearbyShareManager: MCNearbyServiceBrowserDelegate {
+    nonisolated func browser(_ browser: MCNearbyServiceBrowser,
+                             foundPeer peerID: MCPeerID,
+                             withDiscoveryInfo info: [String: String]?) {
+        Task { @MainActor in
+            if !foundPeers.contains(peerID) { foundPeers.append(peerID) }
+            log.info("found peer \(peerID.displayName, privacy: .public)")
+        }
+    }
+    nonisolated func browser(_ browser: MCNearbyServiceBrowser,
+                             lostPeer peerID: MCPeerID) {
+        Task { @MainActor in foundPeers.removeAll { $0 == peerID } }
+    }
+}
+
+extension NearbyShareManager: MCNearbyServiceAdvertiserDelegate {
+    nonisolated func advertiser(_ advertiser: MCNearbyServiceAdvertiser,
+                                didReceiveInvitationFromPeer peerID: MCPeerID,
+                                withContext context: Data?,
+                                invitationHandler: @escaping (Bool, MCSession?) -> Void) {
+        // ここで確認ダイアログを挟むのが本来は望ましい。最小構成では自動受理
+        Task { @MainActor in invitationHandler(true, session) }
+    }
+}
+
+extension NearbyShareManager: MCSessionDelegate {
+    nonisolated func session(_ session: MCSession, peer peerID: MCPeerID,
+                             didChange state: MCSessionState) {
+        Task { @MainActor in
+            switch state {
+            case .connected:
+                if !connectedPeers.contains(peerID) { connectedPeers.append(peerID) }
+            case .notConnected:
+                connectedPeers.removeAll { $0 == peerID }
+            case .connecting:
+                break
+            @unknown default:
+                break
+            }
+        }
+    }
+    nonisolated func session(_ session: MCSession, didReceive data: Data,
+                             fromPeer peerID: MCPeerID) {
+        // 受信データの処理（画像 Data のデコード等）
+    }
+    nonisolated func session(_ s: MCSession, didReceive stream: InputStream,
+                             withName n: String, fromPeer p: MCPeerID) {}
+    nonisolated func session(_ s: MCSession, didStartReceivingResourceWithName n: String,
+                             fromPeer p: MCPeerID, with progress: Progress) {}
+    nonisolated func session(_ s: MCSession, didFinishReceivingResourceWithName n: String,
+                             fromPeer p: MCPeerID, at localURL: URL?,
+                             withError error: Error?) {}
+}
+```
+
+`encryptionPreference` は `.required` にしています。近接共有とはいえ、平文で電波に流す理由はありません。ここを `.none` にすると接続は速くなりますが、私は既定で `.required` を選ぶことをお勧めします。
+
+## Rork Max の生成コードに最小差分で組み込む
+
+Rork Max はネイティブ Swift を生成してくれるので、UI と大枠のデータモデルはそのまま活かせます。ただし、権限まわりと Info.plist、バックグラウンド制約のような「実機と App Store 審査で初めて効いてくる領域」は、生成物だけでは埋まりきらないことが多いです。組み込みの手順は次の3ステップに割り切ると迷いません。
+
+1. **Info.plist を手で補う**: `NSLocalNetworkUsageDescription` と `NSBonjourServices` を追加します。ここは生成コードには現れないので必ず自分で入れます。
+2. **`NearbyShareManager` を `@StateObject` として画面に持たせる**: 生成された共有ボタンの `action` から `start()` と `invite()` を呼ぶだけに留め、通信ロジックはラッパー側へ寄せます。
+3. **送受信データの形式を既存のモデルに合わせる**: プリセットや画像は `Codable` で `Data` 化し、`send(_:)` に渡します。受信側の `didReceive data:` で元の型へ戻します。
+
+生成された Swift を本番向けに整える一般的な考え方は [Rork Max が生成した Swift を本番向けにリファクタする](/articles/rork-dev/rork-max-swiftui-generated-code-production-refactoring-patterns) に切り出しているので、あわせて読むと差分の当て方が掴めます。
+
+SwiftUI 側は驚くほど短く収まります。
+
+```swift
+struct NearbyShareView: View {
+    @StateObject private var share = NearbyShareManager()
+
+    var body: some View {
+        List {
+            Section("接続中") {
+                ForEach(share.connectedPeers, id: \.self) { Text($0.displayName) }
+            }
+            Section("近くの端末") {
+                ForEach(share.foundPeers, id: \.self) { peer in
+                    Button(peer.displayName) { share.invite(peer) }
+                }
+            }
+        }
+        .onAppear { share.start() }
+        .onDisappear { share.stop() }
+    }
+}
+```
+
+## つまずきやすい実装上の罠と対処
+
+実機で詰まりやすい箇所を、私が実際にハマった順にまとめます。
+
+**serviceType の命名規則を外すと全滅する。** `serviceType` は 1〜15 文字、英小文字・数字・ハイフンのみ、先頭と末尾はハイフン不可という厳しい制約があります。`Dolico_Share` のように大文字やアンダースコアを含めると、例外ではなく静かな不発になります。半角英小文字とハイフンだけで短く付けてください。
+
+**MCPeerID の displayName は 63 バイトまで。** 長すぎる名前や絵文字混じりの端末名をそのまま渡すと弾かれます。私は UUID の先頭数文字などの安全な値を使い、表示名は別途アプリ内で管理するようにしています。
+
+**招待の timeout を短くしすぎない。** `invitePeer` の `timeout` を数秒に切り詰めると、電波状況が少し悪いだけで接続前に諦めてしまいます。手元では 20 秒前後にしておくと取りこぼしが目に見えて減りました。
+
+**バックグラウンドでは維持されない。** MultipeerConnectivity はアプリがフォアグラウンドにある前提の仕組みです。共有中に画面を閉じたりロックしたりするとセッションは切れます。「送り終えるまで前面に置いてください」という一文を UI に添えるだけでも、ユーザの体験は安定します。
+
+**シミュレータの結果を信じない。** 近接発見は実機二台でしか正しく検証できません。冒頭の失敗もここが原点でした。シミュレータで一覧が出ても、それは実機の Bonjour 挙動を保証しません。テストは必ず実機で行ってください。
+
+## 本番前に確認したいこと
+
+近接共有は、うまく動くと「サーバも要らず、目の前の相手にすっと渡せる」気持ちよさがあります。その一方で、失敗のほとんどが権限と Info.plist という地味な場所に潜んでいて、しかも無言で起きるのが厄介でした。
+
+次の一歩として、まず実機二台に `NSLocalNetworkUsageDescription` と `NSBonjourServices` を入れたビルドを載せ、初回起動で Local Network の権限ダイアログが実際に出るかどうかだけを確認してみてください。そこが通れば、この記事のラッパーはほぼそのまま動くはずです。同じところで止まっている方の切り分けの助けになれば嬉しいです。
