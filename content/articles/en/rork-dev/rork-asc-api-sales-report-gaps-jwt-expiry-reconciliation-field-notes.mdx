@@ -1,0 +1,216 @@
+---
+title: "When Your App Store Connect API Pipeline Quietly Drops Days — Field Notes on JWT Expiry, Report Lag, and Reconciliation"
+slug: "rork-asc-api-sales-report-gaps-jwt-expiry-reconciliation-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-03T14:30"
+author: "Rork Lab"
+description: "Automated App Store Connect API pipelines rarely stop — they leak. This piece breaks down the three silent failure modes behind 401, 404, and 429, and shows how a fetch ledger, a 72-hour backfill window, and a weekly reconciliation query keep daily sales and review data complete."
+tags: ["App Store Connect API", "JWT", "Sales Report", "Automation", "Supabase", "Rate Limits", "Backfill", "Rork"]
+highlights:
+  - "How to classify the three silent gap patterns caused by 401, 404, and 429, and detect missing days mechanically with a fetch ledger table"
+  - "Working code for a 72-hour backfill window that treats Sales API 404s as pending rather than empty, absorbing Apple's report-generation lag"
+  - "A generate_series reconciliation query for weekly completeness proofs, plus an upsert pattern that keeps review collection idempotent and analysis costs flat"
+---
+
+At the start of the month I opened App Store Connect, compared the dashboard totals against the daily sales rows I had been accumulating in Supabase, and the numbers were off by about 3% — three days out of thirty were missing their sales rows entirely.
+
+The daily Slack report had arrived every single morning. That was exactly why I trusted the pipeline. In reality, the fetch for a handful of days had failed quietly, and those rows simply never existed when the month closed.
+
+An automated pipeline that stops is easy to notice. One that leaks is not — as long as notifications keep arriving, the holes stay invisible. These field notes document the gap patterns I actually hit while automating sales and review collection with the App Store Connect API (ASC API), along with the detection and repair mechanisms that fixed them, code included.
+
+## Gaps Arrive Wearing Three Different Faces
+
+Auditing a month of execution logs, every missing row traced back to one of three causes.
+
+<table><thead><tr><th>Symptom</th><th>HTTP status</th><th>Root cause</th><th>What goes missing</th></tr></thead><tbody><tr><td>Auth failure</td><td>401</td><td>JWT expiry, clock skew, lost newlines in the .p8 key</td><td>Everything in that run</td></tr><tr><td>Report not ready</td><td>404</td><td>Apple's daily report generation lagging</td><td>Sales rows for one specific date</td></tr><tr><td>Dropped pages</td><td>429</td><td>Rate limiting mid-pagination</td><td>The later pages of reviews</td></tr></tbody></table>
+
+What makes these three nasty is that they share one property: swallow the exception and everything works fine again tomorrow. Without retries, only the hole for the failed day remains.
+
+Some groundwork first. The ASC API requires an ES256-signed JWT on every request, with a maximum token lifetime of 20 minutes. The Sales and Trends API returns daily reports as `.tsv.gz`, but the previous day's report is finalized in the early hours Pacific time — which can slide into the evening or even the next day in other timezones. And the rate limits are not publicly documented. Those three facts map directly onto the 401, 404, and 429 failure modes.
+
+## Measure Token Age Instead of Minting Blindly
+
+My first implementation logged nothing more than "got a 401" on failure. That gives you no way to tell whether the token was stale or the key material was broken.
+
+Caching the token together with its issue time, and logging the token's age whenever a request fails, made the diagnosis almost mechanical.
+
+```typescript
+// supabase/functions/_shared/asc-token.ts
+import { create } from "https://deno.land/x/djwt@v3.0.2/mod.ts";
+
+const ISSUER_ID = Deno.env.get("ASC_ISSUER_ID")!;
+const KEY_ID = Deno.env.get("ASC_KEY_ID")!;
+const PRIVATE_KEY_PEM = Deno.env.get("ASC_PRIVATE_KEY")!;
+
+let cached: { token: string; issuedAt: number } | null = null;
+
+// Refresh at 15 minutes — a 5-minute buffer against the 20-minute cap
+const REFRESH_AFTER_MS = 15 * 60 * 1000;
+
+export async function getAscToken(): Promise<string> {
+  const now = Date.now();
+  if (cached && now - cached.issuedAt < REFRESH_AFTER_MS) {
+    return cached.token;
+  }
+
+  const pemBody = PRIVATE_KEY_PEM
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s/g, "");
+  const binaryKey = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
+
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryKey,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+
+  const nowSec = Math.floor(now / 1000);
+  const token = await create(
+    { alg: "ES256", kid: KEY_ID, typ: "JWT" },
+    {
+      iss: ISSUER_ID,
+      iat: nowSec,
+      exp: nowSec + 1140, // 19 minutes — one under the cap to absorb clock skew
+      aud: "appstoreconnect-v1",
+    },
+    privateKey,
+  );
+
+  cached = { token, issuedAt: now };
+  return token;
+}
+
+/** Evidence for deciding whether a 401 was caused by a stale token */
+export function tokenAgeMs(): number | null {
+  return cached ? Date.now() - cached.issuedAt : null;
+}
+```
+
+Setting `exp` to 1140 seconds rather than the full 1200 protects against the "freshly issued yet already expired" accident that clock skew between your runtime and Apple's servers can produce. In cold-start environments like Edge Functions, key import time widens the gap between `iat` and the actual request, so that one-minute margin earns its keep.
+
+The other classic 401 cause is the `.p8` key losing its newlines. Paste it into a secret store carelessly and you get a key that still parses as PEM but produces broken signatures — a genuinely confusing failure. The reliable fix was procedural: a smoke test that calls `/v1/apps` once right after every deploy and asserts a 200.
+
+## Never Record a Sales API 404 as "No Data"
+
+This was the highest-volume gap by far. The Sales and Trends API returns 404 when the report for the requested date has not been generated yet. My original code interpreted that as "zero sales that day" and saved an empty result.
+
+But a 404 conflates two very different situations: "not finalized yet" and "will never exist." The previous day's report usually lands in the early hours Pacific time, but some days it runs late. A job that fetches at a fixed local hour turns every late day into a permanent hole.
+
+The fix was a fetch ledger table that records outcomes as facts, treating 404 as pending.
+
+```sql
+create table asc_fetch_log (
+  report_date date primary key,
+  status text not null check (status in ('pending', 'fetched', 'gave_up')),
+  attempts int not null default 0,
+  last_attempt_at timestamptz,
+  row_count int,
+  note text
+);
+```
+
+```typescript
+// supabase/functions/fetch-sales/index.ts (essentials only)
+const BACKFILL_HOURS = 72;
+
+async function fetchWithLedger(reportDate: string) {
+  const token = await getAscToken();
+  const res = await requestSalesReport(token, reportDate);
+
+  if (res.status === 404) {
+    const hoursSince = hoursSinceReportDate(reportDate);
+    // Treat as pending for 72 hours and retry next run; then escalate to a human
+    const status = hoursSince < BACKFILL_HOURS ? "pending" : "gave_up";
+    await upsertLog(reportDate, { status, note: "404 from Sales API" });
+    if (status === "gave_up") await notifySlack(`Sales report never arrived: ${reportDate}`);
+    return;
+  }
+
+  const rows = await parseTsvGz(res);
+  await saveSales(reportDate, rows);
+  await upsertLog(reportDate, { status: "fetched", row_count: rows.length });
+}
+
+// Every run, retry all pending dates from the last 7 days
+async function backfillPending() {
+  const { data } = await supabase
+    .from("asc_fetch_log")
+    .select("report_date")
+    .eq("status", "pending")
+    .gte("report_date", isoDaysAgo(7));
+  for (const row of data ?? []) {
+    await fetchWithLedger(row.report_date);
+    await sleep(200); // rate-limit hygiene
+  }
+}
+```
+
+The essential shift is redefining the daily job from "fetch today's report" to "fetch whichever expected dates are still missing." Once fetching is date-driven, report lag and transient job failures are both healed by the same backfill loop. The 72-hour cutoff to `gave_up` exists so that a 404 which will never resolve — a wrong vendor number, say — does not get retried forever; it gets escalated instead.
+
+## A Weekly Reconciliation Query Turns Silent Gaps into Numbers
+
+Even with a fetch ledger, a bug could skip the ledger write itself. As the last line of defense, a weekly query compares the expected date series against actual data.
+
+```sql
+-- List every day in the last 30 with zero sales rows
+with expected as (
+  select generate_series(
+    current_date - interval '30 days',
+    current_date - interval '2 days',  -- exclude the most recent day; not finalized
+    interval '1 day'
+  )::date as report_date
+)
+select e.report_date,
+       coalesce(l.status, 'no_log') as log_status
+from expected e
+left join asc_fetch_log l using (report_date)
+left join (
+  select report_date, count(*) as cnt
+  from app_daily_sales
+  group by report_date
+) s using (report_date)
+where coalesce(s.cnt, 0) = 0
+order by e.report_date;
+```
+
+The result gets posted to Slack every Monday, and the expectation is an empty set. If it is not empty, the gap gets backfilled manually that week. What surprised me after adopting this was that the real value is not fixing gaps faster — it is having a machine prove completeness every week, so the anxiety disappears.
+
+As an indie developer I checked sales by hand every morning for years, and back then I noticed mismatches the same day. Automation actually made me less sensitive to missing data — an honest lesson. I have come to see automation not as removing the verification work, but as promoting it: from eyeballing daily numbers to asserting pipeline completeness.
+
+## Reviews: Separate Deduplication from Reprocessing Cost
+
+The Customer Reviews API caused a different problem: duplication and wasted reprocessing rather than gaps. When a 429 interrupts pagination midway, the next run refetches the same reviews from the first page.
+
+The answer had two layers. Storage became an upsert keyed on the review ID, making refetches harmless; expensive work like sentiment analysis runs only against rows that have never been analyzed.
+
+```typescript
+// Storage: safe to refetch any number of times
+await supabase.from("app_reviews").upsert(reviews, { onConflict: "id" });
+
+// Analysis: only rows where sentiment is still null
+const { data: unanalyzed } = await supabase
+  .from("app_reviews")
+  .select("id, body")
+  .is("sentiment", null)
+  .limit(50);
+```
+
+For 429s, I sleep 200ms between pages and cap the number of pages per run. Since Apple does not publish concrete rate limits, a design that advances a little every hour at a speed that never triggers the limit turns out far more stable in operation than one that probes the ceiling. Whatever a run fails to collect, the next hourly run picks up naturally.
+
+## An Operational Checklist
+
+For anyone assembling the same stack, here is the distilled checklist.
+
+1. Cache the JWT, refresh at 15 minutes, and set `exp` one minute under the cap; log token age alongside every 401
+2. After storing the `.p8` in secrets, smoke-test signature health with a `/v1/apps` call on every deploy
+3. Record Sales API 404s as pending in a fetch ledger, not as empty data, and retry within a 72-hour backfill window
+4. Design the daily job as "fill missing expected dates," not "fetch today"
+5. Run a generate_series reconciliation query weekly and require an empty result
+6. Upsert reviews by ID; restrict costly analysis to unprocessed rows only
+
+If you adopt just two things, make them the fetch ledger table and the weekly reconciliation query. Both retrofit cleanly onto an existing pipeline, and by tonight you will know whether your data is already leaking. A metrics pipeline is only truly automated once the proof that the numbers are complete is automated too.

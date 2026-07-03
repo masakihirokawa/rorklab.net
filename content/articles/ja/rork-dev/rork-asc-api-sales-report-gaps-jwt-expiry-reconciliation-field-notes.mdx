@@ -1,0 +1,216 @@
+---
+title: "App Store Connect API の日次集計が月末に合わなくなるとき — JWT 失効・レポート確定遅延・突合の運用メモ"
+slug: "rork-asc-api-sales-report-gaps-jwt-expiry-reconciliation-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-03T14:30"
+author: "Rork Lab"
+description: "App Store Connect API で自動化した売上・レビュー収集は、止まらずに「欠け」ます。401/404/429 が生む3種類の静かな欠損を fetch ログと突合クエリで検出し、バックフィルで埋める運用設計を実装コード付きでまとめます。"
+tags: ["App Store Connect API", "JWT", "Sales Report", "自動化", "Supabase", "レート制限", "バックフィル", "Rork"]
+highlights:
+  - "401・404・429 が引き起こす3種類の欠損を切り分け、fetch ログテーブルで「取れたはずの日」を機械的に検出する設計"
+  - "Sales API の 404 を「データなし」と確定させず、レポート確定遅延を吸収する 72 時間バックフィルの実装コード"
+  - "generate_series を使った週次突合 SQL と、レビュー収集の重複・再分析コストを抑える upsert パターン"
+---
+
+月初に App Store Connect の管理画面を開いて、Supabase に貯めてきた日次売上の合計と見比べたとき、数字が 3% ほど合いませんでした。調べると、30日のうち3日分の売上行が丸ごと欠けていました。
+
+Slack への日次レポートは毎朝欠かさず届いていました。だからパイプラインは健全だと思い込んでいたのです。実際には、特定の日のレポート取得だけが静かに失敗し、その日の行が存在しないまま月が締まっていました。
+
+自動化した集計は「止まる」より「欠ける」ほうが厄介です。止まれば通知の沈黙で気づけますが、欠けは通知が届き続ける限り見えません。この運用メモでは、App Store Connect API（以下 ASC API）で売上・レビュー収集を自動化したときに実際に踏んだ欠損のパターンと、それを検出・修復する仕組みを実装コードごと残します。
+
+## 欠損は3つの顔でやってくる
+
+ひと月分の実行ログを洗い直すと、欠損の原因は3つに分類できました。
+
+<table><thead><tr><th>症状</th><th>HTTPステータス</th><th>根本原因</th><th>欠け方</th></tr></thead><tbody><tr><td>認証切れ</td><td>401</td><td>JWT の失効・クロックずれ・.p8 の改行消失</td><td>その実行回の全データ</td></tr><tr><td>レポート未確定</td><td>404</td><td>Apple 側の日次レポート生成が遅れている</td><td>特定日の売上行だけ</td></tr><tr><td>取りこぼし</td><td>429</td><td>ページネーション中のレート制限</td><td>レビューの後半ページだけ</td></tr></tbody></table>
+
+厄介なのは、この3つがすべて「例外を握りつぶしても翌日は普通に動く」性質を持つことです。リトライなしの実装では、失敗した日の穴だけが残ります。
+
+まず前提の整理です。ASC API は全リクエストに ES256 署名の JWT を要求し、トークンの有効期限は最大20分です。Sales and Trends API は日次レポートを `.tsv.gz` で返しますが、前日分が確定するのは太平洋時間の早朝で、日本時間だと当日夜〜翌日昼にずれ込むことがあります。そしてレート制限の具体値は公開されていません。この3つの仕様が、それぞれ 401・404・429 の欠損に対応します。
+
+## JWT は「毎回作る」より「寿命を計測する」
+
+最初の実装では、失敗時のログに「401 だった」としか残していませんでした。これでは、トークンが古かったのか、鍵の読み込みが壊れたのか、区別がつきません。
+
+トークンに発行時刻を持たせてキャッシュし、失敗時には「トークン年齢」をログに残すようにしたところ、原因の切り分けが一気に楽になりました。
+
+```typescript
+// supabase/functions/_shared/asc-token.ts
+import { create } from "https://deno.land/x/djwt@v3.0.2/mod.ts";
+
+const ISSUER_ID = Deno.env.get("ASC_ISSUER_ID")!;
+const KEY_ID = Deno.env.get("ASC_KEY_ID")!;
+const PRIVATE_KEY_PEM = Deno.env.get("ASC_PRIVATE_KEY")!;
+
+let cached: { token: string; issuedAt: number } | null = null;
+
+// 15分で更新（上限20分に対して5分のバッファ）
+const REFRESH_AFTER_MS = 15 * 60 * 1000;
+
+export async function getAscToken(): Promise<string> {
+  const now = Date.now();
+  if (cached && now - cached.issuedAt < REFRESH_AFTER_MS) {
+    return cached.token;
+  }
+
+  const pemBody = PRIVATE_KEY_PEM
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s/g, "");
+  const binaryKey = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
+
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryKey,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+
+  const nowSec = Math.floor(now / 1000);
+  const token = await create(
+    { alg: "ES256", kid: KEY_ID, typ: "JWT" },
+    {
+      iss: ISSUER_ID,
+      iat: nowSec,
+      exp: nowSec + 1140, // 19分。上限より1分短くしてクロックずれを吸収
+      aud: "appstoreconnect-v1",
+    },
+    privateKey,
+  );
+
+  cached = { token, issuedAt: now };
+  return token;
+}
+
+/** 401 が返ったときに、トークンが古かったのか判定するための材料 */
+export function tokenAgeMs(): number | null {
+  return cached ? Date.now() - cached.issuedAt : null;
+}
+```
+
+`exp` を上限ぴったりの1200秒ではなく1140秒にしているのは、実行環境と Apple 側のクロックずれで「発行直後なのに期限切れ扱い」になる事故を避けるためです。Edge Functions のようなコールドスタートのある環境では、鍵のインポートに時間がかかった分だけ `iat` と実リクエストの間が開くので、この1分の余白が効きます。
+
+もうひとつ、401 の定番の注意点が `.p8` の改行消失です。シークレットストアに貼り付けた際に改行が失われると、PEM のパースは通るのに署名だけが壊れる、という分かりにくい壊れ方をします。対処として、デプロイ直後に一度だけ `/v1/apps` を叩いて 200 を確認するスモークテストを、デプロイ手順に固定で入れておくのが確実でした。ローカルで通って本番だけ落ちる場合は、まずここを疑うのが早道です。
+
+## Sales API の 404 を「データなし」と記録してはいけない
+
+欠損の中でいちばん件数が多かったのがこれです。Sales and Trends API は、指定日のレポートがまだ生成されていないとき 404 を返します。当初の実装はこれを「その日は売上ゼロ」と解釈して空配列を保存していました。
+
+しかし 404 には「まだ確定していない」と「本当に存在しない」の両方が混ざります。前日分のレポートは太平洋時間の早朝に確定することが多いものの、遅れる日もあります。日本時間の朝9時に取りに行く設計だと、確定遅延の日はそのまま穴になります。
+
+対策は、取得結果を事実として記録する fetch ログテーブルを挟み、404 を「未確定（pending）」として扱うことでした。
+
+```sql
+create table asc_fetch_log (
+  report_date date primary key,
+  status text not null check (status in ('pending', 'fetched', 'gave_up')),
+  attempts int not null default 0,
+  last_attempt_at timestamptz,
+  row_count int,
+  note text
+);
+```
+
+```typescript
+// supabase/functions/fetch-sales/index.ts（要点のみ）
+const BACKFILL_HOURS = 72;
+
+async function fetchWithLedger(reportDate: string) {
+  const token = await getAscToken();
+  const res = await requestSalesReport(token, reportDate);
+
+  if (res.status === 404) {
+    const hoursSince = hoursSinceReportDate(reportDate);
+    // 72時間は「未確定」として翌実行で再試行。それを超えたら人間に通知
+    const status = hoursSince < BACKFILL_HOURS ? "pending" : "gave_up";
+    await upsertLog(reportDate, { status, note: "404 from Sales API" });
+    if (status === "gave_up") await notifySlack(`売上レポート未取得: ${reportDate}`);
+    return;
+  }
+
+  const rows = await parseTsvGz(res);
+  await saveSales(reportDate, rows);
+  await upsertLog(reportDate, { status: "fetched", row_count: rows.length });
+}
+
+// 実行のたびに、直近7日の pending をまとめて再試行する
+async function backfillPending() {
+  const { data } = await supabase
+    .from("asc_fetch_log")
+    .select("report_date")
+    .eq("status", "pending")
+    .gte("report_date", isoDaysAgo(7));
+  for (const row of data ?? []) {
+    await fetchWithLedger(row.report_date);
+    await sleep(200); // レート制限への予防
+  }
+}
+```
+
+ポイントは、日次ジョブの仕事を「今日の分を取る」から「期待される日付のうち、まだ取れていないものを取る」に変えたことです。取得対象を日付起点にすると、確定遅延もジョブの一時的な失敗も、同じバックフィルの仕組みで自然に埋まります。72時間で `gave_up` に落として通知するのは、vendor number の間違いのような「待っても解決しない404」を無限に再試行しないためです。
+
+## 週次の突合クエリで「静かな欠け」を数字にする
+
+fetch ログを入れても、ログへの書き込み自体が漏れるバグはあり得ます。最後の防衛線として、期待される日付列と実データを突き合わせるクエリを週次で回しています。
+
+```sql
+-- 過去30日で「売上行が1件もない日」を列挙する
+with expected as (
+  select generate_series(
+    current_date - interval '30 days',
+    current_date - interval '2 days',  -- 直近1日は未確定なので除外
+    interval '1 day'
+  )::date as report_date
+)
+select e.report_date,
+       coalesce(l.status, 'no_log') as log_status
+from expected e
+left join asc_fetch_log l using (report_date)
+left join (
+  select report_date, count(*) as cnt
+  from app_daily_sales
+  group by report_date
+) s using (report_date)
+where coalesce(s.cnt, 0) = 0
+order by e.report_date;
+```
+
+この結果が空であることを毎週月曜に Slack へ流します。空でなければ、その週のうちに手動バックフィルで埋めます。導入後の実感として、欠損への不安がなくなったこと自体より、「合っていることを機械が毎週証明してくれる」安心感のほうが大きいです。
+
+私自身、個人開発のアプリ運用で売上を毎朝手で確認していた時期は、数字が合わないことに当日気づけていました。自動化してからのほうが欠損に鈍感になった、というのが正直な反省です。自動化は確認作業を消すのではなく、確認の対象を「日々の数字」から「パイプラインの完全性」へ引き上げるものだと捉えるようになりました。
+
+## レビュー収集は「重複」と「再分析コスト」を分けて考える
+
+Customer Reviews API のほうは、欠損よりも重複と無駄な再処理が問題になりました。ページネーションの途中で 429 を受けて中断すると、次回実行で同じレビューを先頭から取り直すためです。
+
+対処は2段構えにしました。保存はレビュー ID キーの upsert にして重複を無害化し、感情分析のような高コスト処理は「まだ分析していない行」だけに限定します。
+
+```typescript
+// 保存: 何度取り直しても安全
+await supabase.from("app_reviews").upsert(reviews, { onConflict: "id" });
+
+// 分析: sentiment が null の行だけを対象にする
+const { data: unanalyzed } = await supabase
+  .from("app_reviews")
+  .select("id, body")
+  .is("sentiment", null)
+  .limit(50);
+```
+
+429 対策としては、ページ間に 200ms の待機を入れ、1回の実行で取得するページ数に上限を設けることを推奨します。レート制限の公式な数値が公開されていない以上、個人的には、限界を攻めるより「制限に当たらない速度で毎時少しずつ進める」設計のほうが運用は安定すると考えています。取り切れなかった分は次の毎時実行が自然に拾います。
+
+## 運用チェックリスト
+
+同じ構成を組む方のために、欠損対策の要点をチェックリストにまとめます。
+
+1. JWT はキャッシュして15分で更新し、`exp` は上限より1分短くする。401 のログにはトークン年齢を残す
+2. `.p8` をシークレットに保存したら、デプロイ直後に `/v1/apps` へのスモークテストで署名の健全性を確認する
+3. Sales API の 404 は「データなし」ではなく「未確定」として fetch ログに記録し、72時間のバックフィルで再試行する
+4. 日次ジョブは「今日の分を取る」ではなく「期待日付のうち未取得を埋める」設計にする
+5. 週次で generate_series による突合クエリを回し、欠損ゼロを機械的に証明する
+6. レビュー保存は ID キーの upsert、高コストな分析は未処理行のみに限定する
+
+次のアクションとしては、まず fetch ログテーブルと週次突合クエリの2つだけでも入れてみてください。既存のパイプラインに後付けでき、いま実際に欠けているかどうかが今日のうちに分かります。数字が合っていることを確かめる仕組みごと自動化して、はじめて集計の自動化は完成するのだと思います。
