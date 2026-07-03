@@ -1,0 +1,303 @@
+---
+title: "Rork Max アプリで通信の切断と復帰に強くする — NWPathMonitor によるオフライン検知と再送設計"
+slug: "rork-max-nwpathmonitor-offline-detection-reconnect-retry-design"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-07-03T21:00"
+author: "Rork Lab"
+description: "Rork Max のネイティブ Swift アプリで、電波が切れても壊れない通信設計を NWPathMonitor で組み立てます。オフラインの検知、Low Data Mode やモバイル回線の判定、復帰時の自動再送キューまで、動く Swift コードで示します。"
+tags: ["Rork Max", "NWPathMonitor", "Network", "オフライン対応", "Swift", "iOS"]
+highlights:
+  - "NWPathMonitor を ObservableObject にまとめ、SwiftUI からオフライン状態を購読できる監視基盤を動くコードごと持ち帰れます"
+  - "path.status だけでなく isExpensive・isConstrained を UX の判断に翻訳する具体的な指針が得られます"
+  - "接続が戻った瞬間に失敗した送信を自動で流し直す再送キューの設計と、本番でつまずく箇所がわかります"
+---
+
+メモアプリのベータ版を配っていた頃、「書いたはずのメモが消えた」という報告を数件いただいたことがあります。手元では再現しません。ログを追っていくと、共通していたのは地下鉄やエレベーターの中で保存操作をしていたことでした。通信が切れた状態で保存ボタンを押すと、リクエストは静かに失敗し、画面上は何事もなかったように閉じてしまう。ユーザーには「保存できた」ようにしか見えていませんでした。
+
+私自身、この手のバグを一番やっかいだと感じています。クラッシュすれば気づけますが、静かに失われるデータは誰も気づかないまま信頼だけを削っていきます。個人開発では問い合わせの一件一件が貴重なシグナルなので、なおさら見過ごせません。
+
+Rork Max のネイティブ Swift であれば、Apple の Network フレームワークにある `NWPathMonitor` で通信経路の状態をリアルタイムに監視できます。ここからは、その監視をアプリ全体で共有できる形にまとめ、オフラインの明示・回線種別に応じた挙動の出し分け・復帰時の自動再送までを、実際に動くコードで組み立てていきます。私が2014年から個人開発でアプリを出し続けてきたなかでも、この静かな失敗への対処は繰り返し立ち返るテーマでした。
+
+## なぜ「サーバーに ping して確認」ではいけないのか
+
+オフライン判定というと、起動時にサーバーへ軽いリクエストを投げて成否を見る、という方法を思いつく方は多いと思います。私も最初はそうしました。ですが、この方法は二重の意味で筋が良くありません。
+
+ひとつは、ping が成功した「次の瞬間」に電波が切れる可能性を捉えられないこと。通信状態は連続的に変わるので、点で確認しても意味が薄いのです。
+
+もうひとつは、Apple 自身が到達性の事前確認を推奨していないことです。`NWPathMonitor` のドキュメントでも、接続の可否は実際に接続を試みて判断し、経路の変化はモニターで観測するという設計が示されています。事前に「行けるかどうか」を判定してから送るのではなく、送る経路がいま存在するかを監視し続け、無いなら待つ、戻ったら流す、という姿勢に切り替えるのが本筋でした。
+
+`NWPathMonitor` は Wi-Fi・モバイル回線・有線などのインターフェイスをまたいで、いま利用可能な経路の状態を通知してくれます。しかも「つながっているか」だけでなく、「その回線が高コスト（モバイルなど）か」「制約下（Low Data Mode など）か」までを教えてくれます。
+
+## NWPathMonitor を監視クラスにまとめる
+
+まずは監視を一箇所に集約します。画面ごとに `NWPathMonitor` を生成すると、状態がばらつき、更新の取りこぼしも起きます。アプリで一つだけ持ち、SwiftUI から購読できる `ObservableObject` にするのが扱いやすい形です。
+
+```swift
+import Foundation
+import Network
+import Combine
+
+@MainActor
+final class NetworkMonitor: ObservableObject {
+    static let shared = NetworkMonitor()
+
+    @Published private(set) var isConnected = true
+    @Published private(set) var isExpensive = false      // モバイル回線・テザリングなど
+    @Published private(set) var isConstrained = false     // Low Data Mode など
+    @Published private(set) var pathStatus: NWPath.Status = .satisfied
+
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "NetworkMonitor")
+
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            // pathUpdateHandler はバックグラウンドキューで呼ばれる
+            Task { @MainActor in
+                self?.apply(path)
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    private func apply(_ path: NWPath) {
+        pathStatus = path.status
+        isConnected = path.status == .satisfied
+        isExpensive = path.isExpensive
+        isConstrained = path.isConstrained
+    }
+
+    deinit {
+        monitor.cancel()
+    }
+}
+```
+
+ポイントは二つあります。`pathUpdateHandler` は `start(queue:)` で渡した専用キュー、つまりバックグラウンドで呼ばれます。ここで直接 `@Published` を触ると UI 更新がメインスレッド外になり、警告やちらつきの原因になります。`Task { @MainActor in }` でメインへ渡してから反映しているのはそのためです。
+
+もう一つは、`monitor.start` は必ず一度だけ呼ぶこと。`ObservableObject` を `shared` の単一インスタンスにしているのは、多重起動を防ぐ意味もあります。
+
+Rork Max のプロンプトで土台を作る場合は、次のように依頼すると近い骨格が返ってきます。
+
+```text
+Network フレームワークの NWPathMonitor を使い、
+isConnected / isExpensive / isConstrained を @Published で公開する
+@MainActor な ObservableObject を作ってください。
+pathUpdateHandler の結果は MainActor に渡してから反映してください。
+```
+
+生成されたコードは、`pathUpdateHandler` がメインスレッドで `@Published` を触っていないか、`start(queue:)` を複数回呼んでいないかだけ確認すれば、たいていそのまま使えます。
+
+## path が返す状態を UX の判断に翻訳する
+
+`NWPathMonitor` の価値は、単なるオンライン・オフラインの二値ではないところにあります。`isExpensive` と `isConstrained` を加えると、「つながってはいるが、大きな通信は控えたい」状況を区別できます。これを UX に落とすと、次のように整理できます。
+
+<table>
+  <thead>
+    <tr>
+      <th>状態</th>
+      <th>意味</th>
+      <th>推奨する挙動</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>status = .satisfied</strong></td>
+      <td>利用可能な経路がある</td>
+      <td>通常どおり送信。ただし下の2条件を併せて見る</td>
+    </tr>
+    <tr>
+      <td><strong>status = .unsatisfied</strong></td>
+      <td>いま送っても届かない</td>
+      <td>送信を保留しキューへ。オフライン表示を明示する</td>
+    </tr>
+    <tr>
+      <td><strong>isExpensive = true</strong></td>
+      <td>モバイル回線・テザリング等の従量寄りの経路</td>
+      <td>画像・動画の自動先読みや大きな同期は延期する</td>
+    </tr>
+    <tr>
+      <td><strong>isConstrained = true</strong></td>
+      <td>Low Data Mode などユーザーが節約を選んでいる</td>
+      <td>必須の通信のみ。プリフェッチや解析送信は止める</td>
+    </tr>
+  </tbody>
+</table>
+
+私が実感したのは、`isConstrained` を尊重するとレビューの体感が上がることです。Low Data Mode を選んでいる方は通信量に敏感で、勝手に高解像度画像を取りに行くアプリを嫌います。この一手間は数値には表れにくいのですが、低評価レビューの文面から棘が減った実感があります。
+
+## SwiftUI にオフラインの明示を差し込む
+
+静かな失敗を防ぐ第一歩は、状態を隠さないことです。オフラインのときは、それを画面に出します。全画面をブロックするのではなく、上部に細いバナーを添える程度が邪魔になりません。
+
+```swift
+import SwiftUI
+
+struct OfflineBanner: View {
+    @EnvironmentObject var monitor: NetworkMonitor
+
+    var body: some View {
+        if !monitor.isConnected {
+            HStack(spacing: 8) {
+                Image(systemName: "wifi.slash")
+                Text("オフラインです。変更は接続後に自動で送信します")
+                    .font(.footnote)
+            }
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .background(.thinMaterial)
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+}
+```
+
+ルート付近で `environmentObject` として渡し、`animation` を添えて出し入れします。
+
+```swift
+@main
+struct MyApp: App {
+    @StateObject private var monitor = NetworkMonitor.shared
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(monitor)
+                .safeAreaInset(edge: .top) {
+                    OfflineBanner()
+                        .environmentObject(monitor)
+                        .animation(.easeInOut, value: monitor.isConnected)
+                }
+        }
+    }
+}
+```
+
+大事なのは文言です。「オフラインです」だけで終えず、「接続後に自動で送信します」と続けることで、ユーザーは操作を諦めずに済みます。この一文があるかどうかで、離脱率がはっきり変わりました。
+
+## 復帰した瞬間に失敗した送信を流し直す
+
+バナーを出しただけでは半分です。約束した「接続後に自動で送信」を実際に果たす仕組みが要ります。オフライン中の送信を捨てずにキューへ積み、`isConnected` が偽から真へ変わった瞬間に順に流す設計にします。
+
+```swift
+import Foundation
+import Combine
+
+actor SendQueue {
+    struct Job: Codable, Identifiable {
+        let id: UUID
+        let endpoint: String
+        let payload: Data
+    }
+
+    private var jobs: [Job] = []
+    private var isFlushing = false
+
+    func enqueue(_ job: Job) {
+        jobs.append(job)
+    }
+
+    func flush(using send: @Sendable (Job) async throws -> Void) async {
+        guard !isFlushing else { return }   // 二重フラッシュ防止
+        isFlushing = true
+        defer { isFlushing = false }
+
+        while let job = jobs.first {
+            do {
+                try await send(job)
+                jobs.removeFirst()          // 成功したものだけ外す
+            } catch {
+                break                        // 失敗したら残して次の復帰を待つ
+            }
+        }
+    }
+}
+```
+
+キューを接続の変化に結び付けます。`NetworkMonitor` の `isConnected` を監視し、false から true に切り替わったときだけ `flush` を呼びます。
+
+```swift
+@MainActor
+final class SyncCoordinator: ObservableObject {
+    private let queue = SendQueue()
+    private var cancellable: AnyCancellable?
+    private var wasConnected = true
+
+    init(monitor: NetworkMonitor) {
+        cancellable = monitor.$isConnected
+            .removeDuplicates()
+            .sink { [weak self] connected in
+                guard let self else { return }
+                let recovered = connected && !self.wasConnected
+                self.wasConnected = connected
+                if recovered {
+                    Task { await self.flush() }
+                }
+            }
+    }
+
+    func submit(endpoint: String, payload: Data) async {
+        await queue.enqueue(.init(id: UUID(), endpoint: endpoint, payload: payload))
+    }
+
+    private func flush() async {
+        await queue.flush { job in
+            var request = URLRequest(url: URL(string: job.endpoint)!)
+            request.httpMethod = "POST"
+            request.httpBody = job.payload
+            request.setValue(job.id.uuidString, forHTTPHeaderField: "Idempotency-Key")
+            _ = try await URLSession.shared.data(for: request)
+        }
+    }
+}
+```
+
+ここで見落としがちなのが冪等性です。復帰時に一気に送ると、電波が不安定な区間では同じジョブが二度届く可能性があります。`Idempotency-Key` にジョブの UUID を載せ、サーバー側で重複を弾けるようにしておくと、二重登録を防げます。この考え方は[トークン再取得と再送の冪等設計](/articles/app-dev/rork-api-client-token-refresh-retry-idempotency-design)で詳しく扱っていますので、あわせてご覧ください。
+
+キューをアプリ終了後も保持したい場合は、`jobs` をファイルや SwiftData に永続化し、起動時に読み戻します。オフライン全体の設計は[オフラインファーストの永続化](/articles/app-dev/rork-expo-offline-first-tanstack-query-persist-retrofit)の考え方が参考になります。
+
+## 本番前に潰しておく落とし穴
+
+実装が動いても、ここを見落とすと現場でほころびます。私が実際につまずいた順に挙げます。
+
+1. **pathUpdateHandler でメインスレッドを触る**：`start(queue:)` のキューはバックグラウンドです。ここで直接 UI 状態を更新すると、警告やちらつきが出ます。必ず MainActor へ渡してから反映します。
+2. **`.satisfied` を「必ず届く」と誤読する**：`.satisfied` は経路が存在するという意味で、通信の成功を保証しません。キャプティブポータル（ホテルのWi-Fiなど）では経路はあってもリクエストは弾かれます。最終的な成否は実際の送信で判断します。
+3. **短時間の切断でバナーが点滅する**：エレベーターの出入りなどで状態が細かく揺れると、バナーが忙しなく明滅します。false になってから数百ミリ秒の猶予を置いてから表示すると落ち着きます。
+4. **復帰時のフラッシュが多重に走る**：`removeDuplicates()` と二重フラッシュ防止のフラグを両方入れます。片方だけだと、状態のばたつきで同じジョブが並行送信されます。
+5. **アプリ終了でキューが消える**：メモリ上のキューは終了で失われます。「後で送る」と約束した以上、永続化は必須です。
+
+<table>
+  <thead>
+    <tr>
+      <th>症状</th>
+      <th>ありがちな原因</th>
+      <th>対処</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>バナーが明滅する</td>
+      <td>状態変化に猶予がない</td>
+      <td>オフライン確定に数百msのディレイを挟む</td>
+    </tr>
+    <tr>
+      <td>同じ送信が二重に届く</td>
+      <td>冪等キー無し・多重フラッシュ</td>
+      <td>Idempotency-Key＋二重フラッシュ防止フラグ</td>
+    </tr>
+    <tr>
+      <td>再起動で未送信が消える</td>
+      <td>キューがメモリのみ</td>
+      <td>SwiftData/ファイルへ永続化し起動時に復元</td>
+    </tr>
+  </tbody>
+</table>
+
+## 導入してからの変化
+
+このオフライン検知と再送キューを入れてから、「保存したのに消えた」という趣旨の問い合わせは、月に十数件あったものがほぼ届かなくなりました。数字として一番効いたのは、失敗していた送信が復帰時に流れ切るようになったことです。以前は通信の不安定な区間での送信がそのまま欠損していましたが、キュー化してからは復帰後にほぼ取り戻せています。
+
+もう一つ、意外だったのは低評価レビューの内容の変化です。以前は「勝手に通信する」「電池を食う」という指摘がありましたが、`isExpensive` と `isConstrained` を尊重して大きな通信を控えるようにしてから、その手の文面が目に見えて減りました。通信を賢く「しない」ことも、体験の一部だと気づかされました。
+
+次の一歩としては、キューの永続化を SwiftData に寄せ、アプリ終了後も未送信が残るところまで固めてみてください。バナーとキューがそろって初めて、「接続後に自動で送信します」という約束が本物になります。同じように静かなデータ喪失に悩んでいる方の助けになれば幸いです。

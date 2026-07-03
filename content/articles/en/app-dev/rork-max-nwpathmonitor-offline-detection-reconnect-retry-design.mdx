@@ -1,0 +1,303 @@
+---
+title: "Making Your Rork Max App Resilient to Dropped and Restored Connections: Offline Detection and Retry with NWPathMonitor"
+slug: "rork-max-nwpathmonitor-offline-detection-reconnect-retry-design"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-07-03T21:00"
+author: "Rork Lab"
+description: "Build networking that survives a lost signal in your Rork Max native Swift app with NWPathMonitor. Detect offline states, respect Low Data Mode and cellular, and auto-resend queued work on reconnect — all with working Swift code."
+tags: ["Rork Max", "NWPathMonitor", "Network", "Offline", "Swift", "iOS"]
+highlights:
+  - "Take home a working NetworkMonitor ObservableObject that lets any SwiftUI view subscribe to connectivity state"
+  - "Learn to translate not just path.status but isExpensive and isConstrained into concrete UX decisions"
+  - "Get a reconnect-triggered send queue that flushes failed requests the moment connectivity returns, plus the production pitfalls"
+---
+
+Back when I was handing out a beta of a notes app, I received a handful of reports saying "the note I wrote disappeared." I couldn't reproduce it on my own device. Digging through the logs, the one thing they had in common was that the save had happened inside a subway car or an elevator. Tapping save with no connection failed silently, and the screen simply closed as if nothing had gone wrong. To the user, it looked like the note had been saved.
+
+As an indie developer, I find this kind of bug the most insidious. A crash is at least visible. Data that vanishes quietly erodes trust while nobody notices.
+
+With Rork Max's native Swift, you can watch the state of the network path in real time using `NWPathMonitor` from Apple's Network framework. In this article we'll wrap that monitoring into something the whole app can share, then build offline signaling, behavior that adapts to the connection type, and automatic resend on recovery — all with code that actually runs.
+
+## Why "ping the server to check" is the wrong instinct
+
+When people think about detecting offline states, a common first idea is to fire a lightweight request at the server on launch and read success or failure. I did exactly that at first. But the approach is weak in two ways.
+
+First, it can't capture the possibility that the signal drops the instant *after* the ping succeeds. Connectivity changes continuously, so checking it at a single point in time tells you little.
+
+Second, Apple itself discourages pre-flighting reachability. The `NWPathMonitor` documentation frames it clearly: judge whether you can connect by actually attempting the connection, and observe path changes with the monitor. Rather than deciding "can I get through?" before sending, the better posture is to keep watching whether a path exists right now, wait if there isn't one, and flush when it comes back.
+
+`NWPathMonitor` reports the state of the currently available path across interfaces — Wi-Fi, cellular, wired. And it tells you more than "connected or not": it also reveals whether that path is *expensive* (cellular, tethering) and whether it's *constrained* (Low Data Mode).
+
+## Wrap NWPathMonitor in a single monitor
+
+Start by consolidating the monitoring in one place. Creating an `NWPathMonitor` per screen leads to scattered state and missed updates. Hold exactly one for the app and expose it as an `ObservableObject` that SwiftUI can subscribe to.
+
+```swift
+import Foundation
+import Network
+import Combine
+
+@MainActor
+final class NetworkMonitor: ObservableObject {
+    static let shared = NetworkMonitor()
+
+    @Published private(set) var isConnected = true
+    @Published private(set) var isExpensive = false      // cellular, tethering
+    @Published private(set) var isConstrained = false     // Low Data Mode
+    @Published private(set) var pathStatus: NWPath.Status = .satisfied
+
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "NetworkMonitor")
+
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            // pathUpdateHandler is called on a background queue
+            Task { @MainActor in
+                self?.apply(path)
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    private func apply(_ path: NWPath) {
+        pathStatus = path.status
+        isConnected = path.status == .satisfied
+        isExpensive = path.isExpensive
+        isConstrained = path.isConstrained
+    }
+
+    deinit {
+        monitor.cancel()
+    }
+}
+```
+
+Two things matter here. `pathUpdateHandler` is invoked on the dedicated queue you passed to `start(queue:)` — a background queue. Touching `@Published` directly there moves UI updates off the main thread and causes warnings and flicker. That's why we hop to the main actor with `Task { @MainActor in }` before applying anything.
+
+The second is that `monitor.start` must be called exactly once. Making the `ObservableObject` a single `shared` instance also guards against starting it more than once.
+
+If you scaffold this with a Rork Max prompt, phrase it like this to get a close skeleton:
+
+```text
+Using the Network framework's NWPathMonitor, create a @MainActor
+ObservableObject that publishes isConnected / isExpensive / isConstrained
+via @Published. Marshal the pathUpdateHandler result onto the MainActor
+before applying it.
+```
+
+The generated code is usually usable as-is once you confirm the `pathUpdateHandler` isn't touching `@Published` off the main thread and that `start(queue:)` isn't called more than once.
+
+## Translate the path's state into UX decisions
+
+The value of `NWPathMonitor` lies in not being a mere online/offline boolean. Adding `isExpensive` and `isConstrained` lets you distinguish "connected, but we should hold back on large transfers." Mapped to UX, it looks like this.
+
+<table>
+  <thead>
+    <tr>
+      <th>State</th>
+      <th>Meaning</th>
+      <th>Recommended behavior</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>status = .satisfied</strong></td>
+      <td>A usable path exists</td>
+      <td>Send normally — but read the two conditions below alongside it</td>
+    </tr>
+    <tr>
+      <td><strong>status = .unsatisfied</strong></td>
+      <td>Sending now won't arrive</td>
+      <td>Hold the send in a queue; make the offline state explicit</td>
+    </tr>
+    <tr>
+      <td><strong>isExpensive = true</strong></td>
+      <td>Metered-leaning path such as cellular or tethering</td>
+      <td>Defer image/video prefetch and large syncs</td>
+    </tr>
+    <tr>
+      <td><strong>isConstrained = true</strong></td>
+      <td>User has opted into saving, e.g. Low Data Mode</td>
+      <td>Essential traffic only; stop prefetch and analytics uploads</td>
+    </tr>
+  </tbody>
+</table>
+
+What I came to appreciate is that respecting `isConstrained` improves how the app *feels* in reviews. People who enable Low Data Mode are sensitive to usage and dislike apps that reach for high-resolution images on their own. This small courtesy rarely shows up in metrics, but I did feel the edge come off the wording in low-star reviews.
+
+## Make the offline state visible in SwiftUI
+
+The first step to preventing silent failure is not hiding state. When you're offline, show it. Rather than blocking the whole screen, a thin banner along the top stays out of the way.
+
+```swift
+import SwiftUI
+
+struct OfflineBanner: View {
+    @EnvironmentObject var monitor: NetworkMonitor
+
+    var body: some View {
+        if !monitor.isConnected {
+            HStack(spacing: 8) {
+                Image(systemName: "wifi.slash")
+                Text("You're offline. Changes will send automatically once you reconnect.")
+                    .font(.footnote)
+            }
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .background(.thinMaterial)
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+}
+```
+
+Pass it near the root as an `environmentObject` and animate its appearance.
+
+```swift
+@main
+struct MyApp: App {
+    @StateObject private var monitor = NetworkMonitor.shared
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(monitor)
+                .safeAreaInset(edge: .top) {
+                    OfflineBanner()
+                        .environmentObject(monitor)
+                        .animation(.easeInOut, value: monitor.isConnected)
+                }
+        }
+    }
+}
+```
+
+The wording carries a lot of weight. Don't stop at "You're offline"; add "will send automatically once you reconnect" so the user doesn't abandon their action. Whether that sentence is there or not visibly changed my drop-off rate.
+
+## Flush failed sends the moment the connection returns
+
+A banner alone is only half of it. You need machinery that actually keeps the promise of "sends automatically once you reconnect." Don't throw away sends made while offline — stack them in a queue and drain it, in order, the instant `isConnected` flips from false to true.
+
+```swift
+import Foundation
+import Combine
+
+actor SendQueue {
+    struct Job: Codable, Identifiable {
+        let id: UUID
+        let endpoint: String
+        let payload: Data
+    }
+
+    private var jobs: [Job] = []
+    private var isFlushing = false
+
+    func enqueue(_ job: Job) {
+        jobs.append(job)
+    }
+
+    func flush(using send: @Sendable (Job) async throws -> Void) async {
+        guard !isFlushing else { return }   // prevent double flush
+        isFlushing = true
+        defer { isFlushing = false }
+
+        while let job = jobs.first {
+            do {
+                try await send(job)
+                jobs.removeFirst()          // remove only what succeeded
+            } catch {
+                break                        // leave the rest and wait for the next recovery
+            }
+        }
+    }
+}
+```
+
+Tie the queue to connectivity changes. Observe `NetworkMonitor`'s `isConnected` and call `flush` only on the false-to-true transition.
+
+```swift
+@MainActor
+final class SyncCoordinator: ObservableObject {
+    private let queue = SendQueue()
+    private var cancellable: AnyCancellable?
+    private var wasConnected = true
+
+    init(monitor: NetworkMonitor) {
+        cancellable = monitor.$isConnected
+            .removeDuplicates()
+            .sink { [weak self] connected in
+                guard let self else { return }
+                let recovered = connected && !self.wasConnected
+                self.wasConnected = connected
+                if recovered {
+                    Task { await self.flush() }
+                }
+            }
+    }
+
+    func submit(endpoint: String, payload: Data) async {
+        await queue.enqueue(.init(id: UUID(), endpoint: endpoint, payload: payload))
+    }
+
+    private func flush() async {
+        await queue.flush { job in
+            var request = URLRequest(url: URL(string: job.endpoint)!)
+            request.httpMethod = "POST"
+            request.httpBody = job.payload
+            request.setValue(job.id.uuidString, forHTTPHeaderField: "Idempotency-Key")
+            _ = try await URLSession.shared.data(for: request)
+        }
+    }
+}
+```
+
+The thing that's easy to miss here is idempotency. Draining all at once on recovery can, over a flaky stretch of signal, deliver the same job twice. Putting the job's UUID in an `Idempotency-Key` header so the server can reject duplicates prevents double writes. I cover that pattern in depth in [idempotent design for token refresh and retries](/articles/app-dev/rork-api-client-token-refresh-retry-idempotency-design), so take a look alongside this.
+
+If you want the queue to survive app termination, persist `jobs` to a file or SwiftData and read it back on launch. For the broader offline picture, the thinking in [offline-first persistence](/articles/app-dev/rork-expo-offline-first-tanstack-query-persist-retrofit) is a useful reference.
+
+## Pitfalls to close before shipping
+
+Even when it runs, missing these will let it unravel in the field. Here they are in roughly the order I stumbled into them.
+
+1. **Touching the main thread inside pathUpdateHandler**: the `start(queue:)` queue is a background one. Updating UI state directly there produces warnings and flicker. Always hop to the MainActor before applying.
+2. **Misreading `.satisfied` as "guaranteed to arrive"**: `.satisfied` means a path exists; it does not guarantee a successful request. On a captive portal (hotel Wi-Fi and the like) a path may exist while requests are blocked. Judge final success by the actual send.
+3. **The banner flickering on brief drops**: when state jitters — stepping in and out of an elevator — the banner blinks restlessly. Waiting a few hundred milliseconds after it goes false before showing it settles things down.
+4. **Multiple flushes on recovery**: add both `removeDuplicates()` and the double-flush guard flag. With only one, state jitter sends the same job in parallel.
+5. **The queue evaporating on termination**: an in-memory queue is lost on quit. Once you've promised "I'll send it later," persistence is mandatory.
+
+<table>
+  <thead>
+    <tr>
+      <th>Symptom</th>
+      <th>Common cause</th>
+      <th>Fix</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Banner flickers</td>
+      <td>No grace on state changes</td>
+      <td>Add a few hundred ms delay before confirming offline</td>
+    </tr>
+    <tr>
+      <td>Same send arrives twice</td>
+      <td>No idempotency key / multiple flushes</td>
+      <td>Idempotency-Key plus a double-flush guard flag</td>
+    </tr>
+    <tr>
+      <td>Unsent work lost on relaunch</td>
+      <td>Queue held only in memory</td>
+      <td>Persist to SwiftData/file and restore on launch</td>
+    </tr>
+  </tbody>
+</table>
+
+## What changed after adopting it
+
+After introducing this offline detection and resend queue, the "I saved it but it disappeared" inquiries — which had run to over a dozen a month — nearly stopped arriving. The number that mattered most was that previously failed sends now drain fully on recovery. Sends over unstable stretches used to be lost outright; since queuing them, I can recover almost all of them after reconnection.
+
+The other surprise was a shift in the content of low-star reviews. I used to see complaints about "using data on its own" and "draining the battery," but after respecting `isExpensive` and `isConstrained` to hold back on large transfers, that kind of wording visibly declined. Choosing *not* to transmit, and doing so intelligently, turned out to be part of the experience too.
+
+As a next step, move the queue's persistence onto SwiftData so unsent work survives even after the app is terminated. Only when the banner and the queue are both in place does the promise "will send automatically once you reconnect" become real. I hope this helps anyone wrestling with the same quiet loss of data.
