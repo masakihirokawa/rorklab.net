@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FUNDING — Rorkの$15MシードはLeft Lane Capital主導で、Peak XV・True Ventures・Goodwater・a16z Speedrunが参加しています",
-    "GROWTH — Rorkは月間74.3万訪問・成長率85%と、利用の伸びが続いています",
+    "GROWTH — Rorkは月間74.3万訪問・成長率85%と、利用が伸び続けています",
     "MAX — Rork MaxはネイティブSwiftアプリを生成し、iPhone・iPad・Watch・TV・Vision Pro・iMessageに対応します",
-    "MAX — HealthKit・Core ML・Dynamic Islandなど、React Nativeでは届きにくい領域に踏み込めます",
-    "MARKET — AppleもXcode 27でエージェント型コーディングを推進し、AIがネイティブ開発を担う流れが加速しています",
+    "MAX — AR/LiDARスキャン・Metalの3Dゲーム・Live Activities・HealthKit・Core MLなど、React Nativeでは届きにくい領域に踏み込めます",
+    "STACK — 通常のRorkはReact Native（Expo）でiOSとAndroidを同時に生成し、非エンジニアでも実機アプリを作れます",
+    "PRICE — 料金は無料から用意され、有料プランは月$25から、Rork Maxは月$200です",
     "MARKET — Gartnerは2026年末までに新規アプリの75%が低コード/ノーコード製になると予測しています",
   ],
   en: [
-    "FUNDING — Rork's $15M seed was led by Left Lane Capital with Peak XV, True Ventures, Goodwater, and a16z Speedrun",
     "GROWTH — Rork keeps growing with 743K monthly visits and an 85% growth rate",
     "MAX — Rork Max generates native Swift apps for iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
-    "MAX — It reaches HealthKit, Core ML, and Dynamic Island — territory React Native struggles with",
-    "MARKET — Apple pushes agentic coding in Xcode 27, accelerating AI-driven native development",
+    "MAX — It reaches AR/LiDAR scanning, Metal 3D games, Live Activities, HealthKit, and Core ML, beyond React Native's reach",
+    "STACK — Standard Rork builds iOS and Android together in React Native (Expo), so non-engineers can ship real apps",
+    "PRICE — Plans start free, paid tiers from $25/month, and Rork Max at $200/month",
     "MARKET — Gartner projects 75% of new apps will be low-code or no-code by the end of 2026",
   ],
 };
