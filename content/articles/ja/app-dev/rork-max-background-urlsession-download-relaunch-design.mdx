@@ -1,0 +1,228 @@
+---
+title: "Rork Max アプリでダウンロードをアプリ終了後も続ける — バックグラウンド URLSession の設計と再起動復帰"
+slug: "rork-max-background-urlsession-download-relaunch-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-03T11:00"
+author: "Rork Lab"
+description: "Rork Max のネイティブ Swift アプリで、アプリがサスペンド・終了されてもダウンロードを OS 側で継続させるバックグラウンド URLSession の設計を解説します。再起動復帰・resumeData・isDiscretionary の実測挙動まで動くコードで示します。"
+tags: ["Rork Max", "URLSession", "バックグラウンド転送", "Swift", "iOS", "ダウンロード"]
+highlights:
+  - "アプリがサスペンド・終了されても OS 側で転送が続くダウンロード基盤を、動く Swift コードごと持ち帰れます"
+  - "再起動をまたいで完了通知を受け取る handleEventsForBackgroundURLSession の配線と、SwiftUI アプリでの実装方法がわかります"
+  - "resumeData による再開・一時ファイルの即時移動・isDiscretionary の実測挙動など、本番でつまずく箇所を先回りで塞げます"
+---
+
+壁紙アプリで高解像度の画像パックを配信し始めた頃、レビュー欄に「ダウンロードが毎回途中で止まる」という報告が続いたことがあります。調べてみると、ユーザーはダウンロード開始後すぐホーム画面へ戻っており、およそ30秒後にアプリがサスペンドされた時点で転送が打ち切られていました。個人開発でサーバー側のログだけを眺めていても、この切断は「クライアント都合の切断」としか見えません。私自身、原因の切り分けに数日を費やしました。
+
+答えはアプリ側の設計にありました。標準の URLSession はアプリのプロセスと運命を共にします。アプリが止まれば転送も止まる。これを避けるには、転送そのものを OS のデーモンに委ねる「バックグラウンドセッション」へ切り替える必要があります。
+
+Rork Max はネイティブ Swift を生成するため、この仕組みをそのまま使えます。ただし通常のセッションと同じ感覚で書くと実行時エラーやファイル消失につながる制約がいくつもあります。以下、私が壁紙アプリの追加コンテンツ配信で実際に組んだ構成をもとに、設計の勘所を順に追っていきます。
+
+## 転送を持つのはアプリではなく nsurlsessiond
+
+バックグラウンドセッションの本質は「転送の実行主体がアプリのプロセス外に移る」ことです。実体は nsurlsessiond というシステムデーモンで、アプリがサスペンドされても、メモリ不足で終了されても、転送は OS 側で進み続けます。
+
+通常セッションとの違いを先に整理しておきます。
+
+<table><thead><tr><th>観点</th><th>通常セッション</th><th>バックグラウンドセッション</th></tr></thead><tbody><tr><td>転送の実行主体</td><td>アプリのプロセス内</td><td>nsurlsessiond（プロセス外）</td></tr><tr><td>アプリのサスペンド後</td><td>転送は打ち切られる</td><td>転送は継続する</td></tr><tr><td>アプリの終了後</td><td>転送は消える</td><td>転送は継続し、完了時にアプリが再起動される</td></tr><tr><td>completion handler 型の API</td><td>使える</td><td><strong>使えない（実行時エラー）</strong></td></tr><tr><td>delegate</td><td>任意</td><td>必須</td></tr><tr><td>dataTask</td><td>使える</td><td>原則不可（download / upload タスクのみ）</td></tr></tbody></table>
+
+表の下2行が最初のつまずきどころです。`session.downloadTask(with: url) { location, response, error in ... }` のようなクロージャ渡しの API は、バックグラウンド構成のセッションでは呼んだ瞬間に例外で落ちます。アプリが生きていない間に完了する可能性がある以上、クロージャを保持し続けられないためで、すべての結果は delegate 経由で受け取る設計が強制されます。
+
+## セッションの生成と3つの制約
+
+まずマネージャをシングルトンで用意します。identifier が同じセッションを複数生成すると挙動が不定になるため、生成箇所を一つに絞るのが安全です。
+
+```swift
+// BackgroundDownloadManager.swift
+import Foundation
+
+final class BackgroundDownloadManager: NSObject {
+    static let shared = BackgroundDownloadManager()
+    static let sessionIdentifier = "com.example.app.asset-downloads"
+
+    /// アプリ再起動時に AppDelegate から渡される完了ハンドラ
+    var backgroundCompletionHandler: (() -> Void)?
+
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.background(
+            withIdentifier: Self.sessionIdentifier)
+        config.sessionSendsLaunchEvents = true  // 終了後もアプリを起こす
+        config.isDiscretionary = false          // 即時実行（後述）
+        config.allowsCellularAccess = true
+        return URLSession(configuration: config,
+                          delegate: self,
+                          delegateQueue: nil)
+    }()
+
+    func download(_ url: URL) {
+        let task = session.downloadTask(with: url)
+        // 期待サイズを伝えると OS のスケジューリングが安定します
+        task.countOfBytesClientExpectsToReceive = 20_000_000
+        task.resume()
+    }
+}
+```
+
+このコードが解決するのは「開始したダウンロードをアプリのライフサイクルから切り離す」ことです。押さえておく制約は3つあります。
+
+第一に、delegate は初期化時にしか渡せません。後から差し替える API はないため、シングルトンの self を渡す構成が素直です。
+
+第二に、`sessionSendsLaunchEvents` を true にしておかないと、アプリ終了後に転送が完了してもアプリは起こされません。デフォルトは true ですが、意図を明示するために書いています。
+
+第三に、identifier はアプリ内で一意にします。機能ごとにセッションを分けたい場合は identifier も分け、それぞれの delegate を独立させます。
+
+## didFinishDownloadingTo の一時ファイルはその場で移す
+
+ダウンロード完了は delegate の `didFinishDownloadingTo` で受け取ります。ここに最も事故が多い罠があります。引数の location が指す一時ファイルは、**このメソッドを抜けた瞬間に削除される**ことです。
+
+```swift
+extension BackgroundDownloadManager: URLSessionDownloadDelegate {
+    func urlSession(_ session: URLSession,
+                    downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        // HTTP ステータスの検証を忘れない（404 の HTML も「成功」で届く）
+        guard let response = downloadTask.response as? HTTPURLResponse,
+              (200...299).contains(response.statusCode) else {
+            return
+        }
+        guard let sourceURL = downloadTask.originalRequest?.url else { return }
+
+        let dest = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(sourceURL.lastPathComponent)
+
+        do {
+            try? FileManager.default.removeItem(at: dest)
+            // 非同期にせず、この場で同期的に移動する
+            try FileManager.default.moveItem(at: location, to: dest)
+        } catch {
+            // 移動失敗はダウンロード失敗として扱い、再試行キューへ
+        }
+    }
+}
+```
+
+私はここで一度失敗しています。移動処理を `Task { ... }` で非同期に逃したところ、メソッドを抜けた後に実行された moveItem が「ファイルが存在しない」エラーを返し続けました。DispatchQueue に投げるのも同じ理由で駄目です。移動だけは同期で済ませ、重い後処理（展開やサムネイル生成）を別キューへ回します。
+
+もう一点、guard で HTTP ステータスを見ているのは、サーバーが 404 や 503 を返しても、転送としては「成功」で `didFinishDownloadingTo` に届くためです。エラーページの HTML を画像パックとして保存してしまう事故は、この1つの guard で防げます。
+
+## アプリが終了していても完了を受け取る配線
+
+バックグラウンドセッションの真価は、アプリが終了した後の挙動にあります。転送が完了すると OS はアプリをバックグラウンドで再起動し、AppDelegate の `handleEventsForBackgroundURLSession` を呼びます。SwiftUI 構成の Rork Max アプリでは、`@UIApplicationDelegateAdaptor` で AppDelegate を差し込みます。
+
+```swift
+// AppDelegate.swift
+import UIKit
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        guard identifier == BackgroundDownloadManager.sessionIdentifier else {
+            completionHandler()
+            return
+        }
+        // すぐ呼ばず、保持しておく
+        BackgroundDownloadManager.shared.backgroundCompletionHandler = completionHandler
+        // 同じ identifier でセッションを再生成し delegate を配線し直す
+        _ = BackgroundDownloadManager.shared
+    }
+}
+
+@main
+struct MyApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    var body: some Scene {
+        WindowGroup { ContentView() }
+    }
+}
+```
+
+ここで受け取った completionHandler は、その場で呼んではいけません。溜まっていたイベント（完了した各タスクの delegate 呼び出し）がすべて流れ終わった合図である `urlSessionDidFinishEvents` の中で呼びます。
+
+```swift
+extension BackgroundDownloadManager {
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        DispatchQueue.main.async {
+            self.backgroundCompletionHandler?()
+            self.backgroundCompletionHandler = nil
+        }
+    }
+}
+```
+
+呼び忘れると、OS が「このアプリはバックグラウンド起動を無駄にする」と学習し、以後の起床が遅くなったりスナップショット更新が壊れたりします。復帰の配線は次の3手順で固定です。
+
+1. `handleEventsForBackgroundURLSession` で completionHandler を保持する（すぐ呼ばない）
+2. 同じ identifier でセッションを再生成し、溜まっていた delegate イベントを流し切る
+3. `urlSessionDidFinishEvents` の中で、メインスレッドから completionHandler を呼ぶ
+
+この順序は崩さないでください。
+
+なお、進捗表示のクロージャや ViewModel への参照は、アプリ終了で当然すべて消えています。フォアグラウンド復帰時には `session.getAllTasks { tasks in ... }` で現在のタスク一覧を問い直し、UI を実状態から再構築する設計にしておくと、復帰処理が一本道になります。
+
+## 失敗からの再開 — resumeData を保存する
+
+ネットワーク断やサーバー切断で失敗した場合、エラーの userInfo に再開用のデータが入っていることがあります。これを保存しておくと、次回は途中から再開できます。
+
+```swift
+func urlSession(_ session: URLSession, task: URLSessionTask,
+                didCompleteWithError error: Error?) {
+    guard let error = error as NSError? else { return }  // nil なら正常完了
+    if let resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+        saveResumeData(resumeData, for: task.originalRequest?.url)
+    } else {
+        scheduleRetry(for: task.originalRequest?.url)  // 最初からやり直し
+    }
+}
+
+func resumePendingDownloads() {
+    for (url, data) in loadAllResumeData() {
+        let task = session.downloadTask(withResumeData: data)
+        task.resume()
+        clearResumeData(for: url)
+    }
+}
+```
+
+resumeData が取れるかどうかはサーバー側にも依存します。Range リクエストと ETag に対応していないと部分再開は成立しません。手元の構成では、Cloudflare R2 に置いた静的ファイルはそのまま再開が効きました。自前 API 経由で配信している場合は、Range 対応を先に確認しておくと無駄がありません。
+
+## isDiscretionary の実測挙動 — 即時性を捨てて電池を取る
+
+`isDiscretionary = true` にすると、実行タイミングの裁量を OS に渡します。Wi-Fi と電源接続が揃うまで転送を保留し、電池と通信量を節約する挙動です。
+
+手元の実機（iOS 26)で20MB前後のパックを何度か流して観察したところ、discretionary な転送は日中の外出中はほぼ動かず、夜間の充電開始後にまとめて実行される傾向がはっきり出ました。即時性は完全に失われる代わりに、ユーザーの回線を一切消費しません。
+
+使い分けの目安は次の通りです。
+
+<table><thead><tr><th>ユースケース</th><th>isDiscretionary</th><th>理由</th></tr></thead><tbody><tr><td>ユーザーが「ダウンロード」を押した直後の転送</td><td>false</td><td>待たされると操作が壊れて見える</td></tr><tr><td>翌日以降に使う先読みコンテンツ</td><td>true</td><td>夜間充電時にまとめて落ちれば十分</td></tr><tr><td>アプリ更新に伴う差し替えアセット</td><td>true + earliestBeginDate</td><td>期限だけ切って裁量は OS に渡す</td></tr></tbody></table>
+
+私のアプリでは、ユーザー操作起点の転送を false、おすすめパックの先読みを true に分けています。即時性が要らない転送はためらわず true に倒すことを推奨します。ユーザーの通信量を守る選択は、長期運用でのレビュー評価に静かに効いてきます。フォアグラウンド限定ダウンロードだった頃は途中失敗からの再ダウンロード率が約30%ありましたが、バックグラウンドセッション化と resumeData 再開を入れてからは5%前後に落ち着いています。サポートへの「止まる」報告も、この変更以降は途絶えました。
+
+## Rork Max のプロンプトへどう落とすか
+
+Rork Max に最初の生成を任せる場合、プロンプトの粒度が結果を分けます。「バックグラウンドでもダウンロードできるようにして」だけでは、通常セッション + BGTaskScheduler の構成が返ってくることがあります。転送の主体を OS に移したいという意図まで書きます。
+
+```text
+画像パックのダウンロード機能を実装してください。
+- URLSessionConfiguration.background を使い、アプリがサスペンド・終了されても
+  nsurlsessiond 側で転送が継続する構成にする
+- completion handler 型 API は使わず、URLSessionDownloadDelegate で受ける
+- didFinishDownloadingTo では一時ファイルを同期的に Application Support へ移動する
+- AppDelegate に handleEventsForBackgroundURLSession を実装し、
+  urlSessionDidFinishEvents で completionHandler を呼ぶ
+- 失敗時は resumeData を保存し、次回起動時に再開する
+```
+
+生成後のレビューでは、本稿で挙げた3点（クロージャ API の混入・一時ファイルの非同期移動・completionHandler の呼び忘れ）を重点的に見てください。この3つはコンパイルが通ってしまうため、実機でアプリを本当に終了させるテストをしない限り表面化しません。シミュレータはバックグラウンド転送の再現が不完全なので、検証は必ず実機で行います。
+
+## まとめ — 次にやること
+
+まずは既存アプリのダウンロード処理が通常セッションのままか確認し、1本だけバックグラウンドセッションに載せ替えて、実機で「ダウンロード開始 → アプリをスワイプ終了 → 完了後の再起動」を通しで観察してみてください。delegate に print を仕込むだけで、アプリが終了していてもファイルが届く様子が体感できます。この一往復を見ておくと、以降の設計判断がぐっと速くなります。
+
+大きなファイルの逆方向、アップロードの再開設計については [Rork アプリで 1GB の動画・写真を確実にアップロードする](/articles/rork-dev/rork-large-file-upload-resumable-multipart-guide) が参考になります。定期実行タスクとの組み合わせでは [BGTaskScheduler.submit が Error Code=1 で失敗するときの切り分け手順](/articles/rork-dev/rork-ios-bgtaskscheduler-submit-error-code-1-unavailable-fix) も併せてどうぞ。ダウンロードしたデータをローカル DB と突き合わせる段では [SwiftData をオフライン優先で同期する設計](/articles/rork-dev/rork-max-swiftdata-offline-first-sync-conflict-resolution) が地続きのテーマになります。
+
+この仕組みが、みなさんのアプリのダウンロード体験を目立たないところで支えてくれることを願っています。

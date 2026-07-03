@@ -1,0 +1,223 @@
+---
+title: "Keeping Downloads Alive After Your Rork Max App Is Killed: Background URLSession Design and Relaunch Handling"
+slug: "rork-max-background-urlsession-download-relaunch-design"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-03T11:00"
+author: "Rork Lab"
+description: "How to design downloads in a Rork Max native Swift app so transfers continue in the OS daemon even after the app is suspended or terminated. Covers relaunch wiring, resumeData recovery, and measured isDiscretionary behavior with working code."
+tags: ["Rork Max", "URLSession", "Background Transfer", "Swift", "iOS", "Downloads"]
+highlights:
+  - "Walk away with a working Swift download foundation where transfers keep running in the OS daemon even after your app is suspended or killed"
+  - "Understand the correct wiring for handleEventsForBackgroundURLSession in a SwiftUI app, including when to hold and when to call the completion handler"
+  - "Avoid the production traps in advance: resumeData recovery, synchronous temp-file moves, and the measured real-world behavior of isDiscretionary"
+---
+
+When I started shipping high-resolution image packs in one of my wallpaper apps, a pattern of reviews appeared: "downloads stop halfway, every time." Digging in, the cause was mundane. Users tapped download, went back to the home screen, and roughly thirty seconds later iOS suspended the app — taking the transfer down with it. As an indie developer staring at server logs, all I could see was "client closed connection." It took me days to trace it back to the app's own lifecycle.
+
+The fix was architectural, not incremental. A standard URLSession lives and dies with your process. If you want a transfer to survive suspension — or outright termination — you have to hand the transfer itself to the operating system through a background session.
+
+Because Rork Max generates native Swift, this machinery is fully available to you. But if you write against it with the same habits you use for ordinary sessions, you will hit runtime crashes and silently vanishing files. What follows is the setup I actually run for delivering add-on content packs, walking through each design decision in order.
+
+## The Transfer Belongs to nsurlsessiond, Not Your App
+
+The essence of a background session is that the transfer's execution moves out of your process. The real worker is a system daemon called nsurlsessiond. Your app can be suspended, or jettisoned under memory pressure, and the bytes keep flowing.
+
+Here is how the two session types differ in practice.
+
+<table><thead><tr><th>Aspect</th><th>Standard session</th><th>Background session</th></tr></thead><tbody><tr><td>Where the transfer runs</td><td>Inside your app's process</td><td>nsurlsessiond (out of process)</td></tr><tr><td>After the app is suspended</td><td>Transfer is cut off</td><td>Transfer continues</td></tr><tr><td>After the app is terminated</td><td>Transfer is gone</td><td>Transfer continues; the app is relaunched on completion</td></tr><tr><td>Completion-handler APIs</td><td>Available</td><td><strong>Unavailable (runtime exception)</strong></td></tr><tr><td>Delegate</td><td>Optional</td><td>Required</td></tr><tr><td>dataTask</td><td>Available</td><td>Not supported in practice (download/upload tasks only)</td></tr></tbody></table>
+
+The last two rows are where most people trip first. Closure-based calls like `session.downloadTask(with: url) { location, response, error in ... }` throw the moment you invoke them on a background configuration. Since the task may finish while your app does not exist, there is nothing to hold that closure — every result must arrive through a delegate.
+
+## Creating the Session and Its Three Constraints
+
+Start with a singleton manager. Creating multiple sessions with the same identifier leads to undefined behavior, so keep construction in exactly one place.
+
+```swift
+// BackgroundDownloadManager.swift
+import Foundation
+
+final class BackgroundDownloadManager: NSObject {
+    static let shared = BackgroundDownloadManager()
+    static let sessionIdentifier = "com.example.app.asset-downloads"
+
+    /// Handed to us by the AppDelegate when the app is relaunched
+    var backgroundCompletionHandler: (() -> Void)?
+
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.background(
+            withIdentifier: Self.sessionIdentifier)
+        config.sessionSendsLaunchEvents = true  // wake the app after termination
+        config.isDiscretionary = false          // run immediately (more below)
+        config.allowsCellularAccess = true
+        return URLSession(configuration: config,
+                          delegate: self,
+                          delegateQueue: nil)
+    }()
+
+    func download(_ url: URL) {
+        let task = session.downloadTask(with: url)
+        // Telling the OS the expected size stabilizes its scheduling
+        task.countOfBytesClientExpectsToReceive = 20_000_000
+        task.resume()
+    }
+}
+```
+
+What this code buys you is the decoupling of a started download from your app's lifecycle. Three constraints to internalize:
+
+First, the delegate can only be supplied at initialization. There is no API to swap it later, which is why passing the singleton's self is the natural shape.
+
+Second, without `sessionSendsLaunchEvents = true`, the system will not relaunch your app when a transfer finishes after termination. It defaults to true, but I write it out to make the intent explicit.
+
+Third, identifiers must be unique within your app. If you want separate sessions per feature, give each its own identifier and its own independent delegate.
+
+## Move the Temp File Synchronously in didFinishDownloadingTo
+
+Completion arrives through the delegate's `didFinishDownloadingTo`. This is where the single most common data-loss bug lives: the temporary file at location is **deleted the instant this method returns**.
+
+```swift
+extension BackgroundDownloadManager: URLSessionDownloadDelegate {
+    func urlSession(_ session: URLSession,
+                    downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        // Always validate the HTTP status — a 404 HTML page arrives as a "success"
+        guard let response = downloadTask.response as? HTTPURLResponse,
+              (200...299).contains(response.statusCode) else {
+            return
+        }
+        guard let sourceURL = downloadTask.originalRequest?.url else { return }
+
+        let dest = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(sourceURL.lastPathComponent)
+
+        do {
+            try? FileManager.default.removeItem(at: dest)
+            // Synchronously, right here — no async detour
+            try FileManager.default.moveItem(at: location, to: dest)
+        } catch {
+            // Treat a failed move as a failed download; queue a retry
+        }
+    }
+}
+```
+
+I lost time to this one myself. I once wrapped the move in `Task { ... }` to keep the delegate snappy, and moveItem kept failing with "file does not exist" — because it ran after the method had returned and the system had reclaimed the temp file. Dispatching to a queue fails the same way. Do the move synchronously; push the heavy follow-up work (unpacking, thumbnail generation) to another queue afterwards.
+
+The status-code guard matters just as much. If your server returns a 404 or 503, the transfer still lands in `didFinishDownloadingTo` as a success. That one guard is the difference between shipping image packs and saving error-page HTML as if it were one.
+
+## Receiving Completion When the App No Longer Exists
+
+The real payoff of a background session shows after termination. When the transfer completes, the OS relaunches your app in the background and calls `handleEventsForBackgroundURLSession` on the app delegate. In a SwiftUI-based Rork Max app, you inject one with `@UIApplicationDelegateAdaptor`.
+
+```swift
+// AppDelegate.swift
+import UIKit
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        guard identifier == BackgroundDownloadManager.sessionIdentifier else {
+            completionHandler()
+            return
+        }
+        // Do not call it yet — hold on to it
+        BackgroundDownloadManager.shared.backgroundCompletionHandler = completionHandler
+        // Recreate the session with the same identifier so the delegate is rewired
+        _ = BackgroundDownloadManager.shared
+    }
+}
+
+@main
+struct MyApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    var body: some Scene {
+        WindowGroup { ContentView() }
+    }
+}
+```
+
+The completion handler you receive here must not be called immediately. It gets called inside `urlSessionDidFinishEvents`, which fires once all queued delegate events — one per finished task — have been delivered.
+
+```swift
+extension BackgroundDownloadManager {
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        DispatchQueue.main.async {
+            self.backgroundCompletionHandler?()
+            self.backgroundCompletionHandler = nil
+        }
+    }
+}
+```
+
+Forget to call it and the system learns that waking your app is wasted effort — future background launches get throttled and your app snapshot can go stale. Keep the three-step contract intact: hold the handler, process the events, then call it on the main thread.
+
+One more consequence of termination: every progress closure and view-model reference you had is gone. On foreground return, query `session.getAllTasks { tasks in ... }` and rebuild the UI from the actual task state. Designing recovery as "ask the session, then render" keeps the whole path to one straight line.
+
+## Recovering from Failure with resumeData
+
+When a transfer dies from a network drop or a server disconnect, the error's userInfo often carries resume data. Persist it, and the next attempt can continue from where it stopped.
+
+```swift
+func urlSession(_ session: URLSession, task: URLSessionTask,
+                didCompleteWithError error: Error?) {
+    guard let error = error as NSError? else { return }  // nil means clean finish
+    if let resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+        saveResumeData(resumeData, for: task.originalRequest?.url)
+    } else {
+        scheduleRetry(for: task.originalRequest?.url)  // start over
+    }
+}
+
+func resumePendingDownloads() {
+    for (url, data) in loadAllResumeData() {
+        let task = session.downloadTask(withResumeData: data)
+        task.resume()
+        clearResumeData(for: url)
+    }
+}
+```
+
+Whether resume data works also depends on your server: without Range request and ETag support, partial resume cannot happen. In my setup, static files on Cloudflare R2 resumed cleanly out of the box. If you serve downloads through your own API layer, verify Range support before investing in the resume path.
+
+## isDiscretionary, Measured: Trading Immediacy for Battery
+
+Setting `isDiscretionary = true` hands scheduling discretion to the OS. It defers the transfer until Wi-Fi and power are both available, conserving battery and cellular data.
+
+Running 20 MB packs repeatedly on a physical device (iOS 26), the pattern was unambiguous: discretionary transfers barely moved during the day while the phone was out and about, then executed in a batch shortly after evening charging began. You give up immediacy entirely; in exchange, you consume none of the user's cellular plan.
+
+My rule of thumb:
+
+<table><thead><tr><th>Use case</th><th>isDiscretionary</th><th>Why</th></tr></thead><tbody><tr><td>Transfer right after the user taps Download</td><td>false</td><td>A visible wait reads as a broken button</td></tr><tr><td>Prefetching content for tomorrow</td><td>true</td><td>Landing overnight on charge is good enough</td></tr><tr><td>Asset swaps tied to an app update</td><td>true + earliestBeginDate</td><td>Set the deadline, leave the timing to the OS</td></tr></tbody></table>
+
+In my own app, user-initiated transfers run with false and recommended-pack prefetches with true. Back when downloads were foreground-only, close to a third of them failed midway and had to restart from zero; after moving to background sessions with resumeData recovery, that rate settled in the low single digits — and the "downloads keep stopping" reviews stopped arriving.
+
+## Getting Rork Max to Generate This Correctly
+
+If you let Rork Max produce the first draft, prompt granularity decides what you get back. "Make downloads work in the background" can come back as a standard session bolted to BGTaskScheduler. Spell out that you want the transfer itself owned by the OS:
+
+```text
+Implement the image pack download feature.
+- Use URLSessionConfiguration.background so transfers continue in
+  nsurlsessiond even when the app is suspended or terminated
+- No completion-handler APIs; receive results via URLSessionDownloadDelegate
+- In didFinishDownloadingTo, move the temp file synchronously to
+  Application Support
+- Implement handleEventsForBackgroundURLSession in the AppDelegate and
+  call the completion handler from urlSessionDidFinishEvents
+- On failure, persist resumeData and resume on next launch
+```
+
+When reviewing the generated code, focus on the three traps from this article: closure APIs sneaking in, async temp-file moves, and a missing completion-handler call. All three compile cleanly and only surface when you genuinely terminate the app on hardware. The simulator does not reproduce background transfer faithfully, so validate on a physical device every time.
+
+## Where to Go Next
+
+Pick one download in your existing app that still uses a standard session, move it onto a background session, and watch the full loop on a device: start the download, swipe the app away, and observe the relaunch after completion. A few print statements in the delegate are enough to make the behavior tangible — and once you have seen a file arrive while your app was dead, the rest of the design decisions come quickly.
+
+For the opposite direction — large resumable uploads — see [Reliably Uploading 1GB Videos and Photos from a Rork App](/articles/rork-dev/rork-large-file-upload-resumable-multipart-guide). If you are combining this with periodic background work, [Diagnosing BGTaskScheduler.submit Failing with Error Code=1](/articles/rork-dev/rork-ios-bgtaskscheduler-submit-error-code-1-unavailable-fix) pairs well. And once downloaded data needs to reconcile with your local store, [Offline-First Sync with SwiftData](/articles/rork-dev/rork-max-swiftdata-offline-first-sync-conflict-resolution) continues the thread.
+
+I hope this saves you the days of log-reading it cost me.
