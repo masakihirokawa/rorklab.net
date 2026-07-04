@@ -1,0 +1,231 @@
+---
+title: "When Your Finance App's AI Keeps Dumping Everything Into 'Other' — Field Notes on Catching Silent Classification Drift"
+slug: "rork-ai-expense-classifier-silent-category-drift-confidence-field-notes"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-05T11:00"
+author: "Rork Lab"
+description: "An AI expense classifier in a Rork finance app can be accurate at launch and quietly decay over months until the monthly advice goes wrong. Here is how I instrumented confidence and category distribution to get ahead of the drift, with working code."
+tags: ["Rork", "AI", "finance-app", "Gemini", "observability", "classification-drift"]
+highlights:
+  - "Logging classification confidence per record and tracking the monthly decline in average confidence"
+  - "Quantifying category distribution drift as a distance to catch a bloating 'Other' bucket early"
+  - "Using the user correction rate as ground truth and gating advice generation on classifier health"
+---
+## The Classification Used to Be Right, Then the Advice Started to Slip
+
+I was running an AI finance app I had built on Rork as an indie developer. Snap a receipt, and Gemini pulls the amount, the store name, and a category; at month end it produces advice from your spending pattern. The first weeks felt great, and I used it every day myself.
+
+The trouble came months later, creeping in. One month the advice said "your food spending is steady," but my gut said the opposite — my wallet felt lighter than usual. I opened the data and found grocery runs scattered into "Other." The classifier was breaking.
+
+The way it broke was the nasty part. The app never crashed, never threw an error. It just slowly fattened "Other" while every real category thinned out — and the month-end advice, built on top of that classification, quietly went off target. The numbers came out cleanly every month; I simply could no longer trust them.
+
+As an indie developer running several apps myself, here are my notes on how I traced that silent decay and what instrumentation I added to recover, with the code I actually run. I am writing this for anyone building a Rork app that lets AI sort expenses or receipts, so you do not end up a step behind the way I did.
+
+## "Other" Fattens Up in Silence
+
+Before the cause, it is worth spelling out why I failed to notice. The classifier's failure was hard to see in two distinct ways.
+
+First, seen one record at a time, "Other" always looks like a defensible choice. Putting a genuinely ambiguous expense into "Other" is not wrong. The problem was that its frequency climbed month over month. A judgment that looks fine in isolation traced an abnormal trend in aggregate.
+
+Second, the classifier itself stayed quiet. The JSON Gemini returned carried a confidence value, but I only used it for the branch (below 0.5, ask the user) and never looked at it over time. Confidence was thrown away every single time, leaving no way to look back.
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>Seen one at a time</th><th>Seen in aggregate</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Assignment to "Other"</td><td>Looks reasonable</td><td><strong>Ratio rises each month</strong></td></tr>
+    <tr><td>Falling confidence</td><td>Waved through above the threshold</td><td>Average quietly trends down</td></tr>
+    <tr><td>Off-target advice</td><td>One line feels barely off</td><td>Systematically wrong vs. reality</td></tr>
+  </tbody>
+</table>
+
+Looking back, several triggers had stacked up. More users brought more unfamiliar store names; a model update shifted behavior slightly; seasonal items changed the vocabulary on receipts. None was a single blow. That is exactly why I needed something that measures the trend, not each record.
+
+## Log Classification Confidence, One Record at a Time
+
+The first move was to keep the confidence I had been throwing away. On every classification, I write the confidence, the category the AI chose, and whether the user later corrected it into a dedicated table. The idea is to accumulate a history of the classification's quality, not of the classification result itself.
+
+```typescript
+// lib/classificationLog.ts — keep a time series of classification quality
+import * as SQLite from 'expo-sqlite';
+
+const db = SQLite.openDatabaseSync('finance.db');
+
+export async function initClassificationLog(): Promise<void> {
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS classification_log (
+      id TEXT PRIMARY KEY,
+      expense_id TEXT NOT NULL,
+      ai_category TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      corrected_category TEXT,     -- where the user moved it (NULL if untouched)
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cl_created ON classification_log(created_at);
+  `);
+}
+
+export async function logClassification(entry: {
+  id: string; expenseId: string; aiCategory: string; confidence: number;
+}): Promise<void> {
+  await db.runAsync(
+    `INSERT INTO classification_log
+     (id, expense_id, ai_category, confidence, corrected_category, created_at)
+     VALUES (?, ?, ?, ?, NULL, ?)`,
+    [entry.id, entry.expenseId, entry.aiCategory, entry.confidence, new Date().toISOString()]
+  );
+}
+
+// when the user edits a category, record that fact after the fact
+export async function recordCorrection(expenseId: string, correctedTo: string): Promise<void> {
+  await db.runAsync(
+    `UPDATE classification_log SET corrected_category = ? WHERE expense_id = ?`,
+    [correctedTo, expenseId]
+  );
+}
+```
+
+The point is to keep confidence not only as branch fuel but as a record you can aggregate later. It may look right in the moment, but if the average confidence slides from 0.82 to 0.63 over three months, that is a clear sign the classifier has started to hesitate. One log tells you nothing; bundled together, they show the classifier's temperature.
+
+## Measure the Drift in Category Distribution
+
+Next after confidence, I measured the change in the category distribution itself. Between last month and this one, how much of the spending landed in each category — and when that shape shifts sharply, use it as a cue to ask whether behavior actually changed or the classification slipped.
+
+A distribution difference can be quantified as the distance between two ratio vectors. I used the total variation distance (the sum of absolute ratio differences per category, divided by two) because it is light to compute and intuitive. Zero means unchanged, one means a full swap.
+
+```typescript
+// lib/distributionDrift.ts — measure category distribution drift
+export type CategoryCounts = Record<string, number>;
+
+function toRatio(counts: CategoryCounts): Record<string, number> {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  const ratio: Record<string, number> = {};
+  for (const [k, v] of Object.entries(counts)) ratio[k] = v / total;
+  return ratio;
+}
+
+export function distributionDrift(prev: CategoryCounts, curr: CategoryCounts) {
+  const pr = toRatio(prev), cr = toRatio(curr);
+  const keys = new Set([...Object.keys(pr), ...Object.keys(cr)]);
+  let tvd = 0;                       // total variation distance
+  for (const k of keys) tvd += Math.abs((pr[k] ?? 0) - (cr[k] ?? 0));
+  tvd /= 2;
+
+  // watch "other" on its own too — broken classification pools here first
+  const otherJump = (cr['other'] ?? 0) - (pr['other'] ?? 0);
+  return {
+    drift: Number(tvd.toFixed(3)),
+    otherRatio: Number((cr['other'] ?? 0).toFixed(3)),
+    otherJump: Number(otherJump.toFixed(3)),
+    suspicious: tvd > 0.15 || (cr['other'] ?? 0) > 0.25 || otherJump > 0.08,
+  };
+}
+```
+
+Watching the "Other" ratio and its jump on their own, on top of the overall drift, comes from experience. When a classifier starts to hesitate, the slack pools into "Other" first. Even when the overall distribution has barely moved, an "Other" bucket that swells month over month was a cue to suspect classification decay rather than a change in spending. Keeping the value change (dining really did rise) and the sorting change (the classifier got lazy) as separate signals means I never have to wonder at month end whether it is a household story or an app story.
+
+## The Correction Rate Is the Hidden Truth
+
+Confidence and distribution are both views from inside the classifier. I wanted one more — an answer key from outside. That is the rate at which users correct a category: the correction rate.
+
+When a user moves "Other" to "Food," or relabels "Entertainment" as "Education," that action is the most trustworthy ground truth the classifier has. Track how often people correct it, with a denominator, and you can measure the AI's hits and misses from the outside, without leaning on its internal confidence.
+
+```typescript
+// lib/correctionRate.ts — measure accuracy from the outside via corrections
+import * as SQLite from 'expo-sqlite';
+const db = SQLite.openDatabaseSync('finance.db');
+
+export async function monthlyCorrectionRate(month: string): Promise<{
+  total: number; corrected: number; rate: number; byCategory: Record<string, number>;
+}> {
+  const rows = await db.getAllAsync<any>(
+    `SELECT ai_category, corrected_category FROM classification_log
+     WHERE created_at LIKE ?`, [`${month}%`]
+  );
+  const total = rows.length || 1;
+  const corrected = rows.filter(r => r.corrected_category && r.corrected_category !== r.ai_category).length;
+
+  // which category gets corrected most = where the classifier slips
+  const miss: Record<string, { n: number; wrong: number }> = {};
+  for (const r of rows) {
+    const c = r.ai_category;
+    miss[c] ??= { n: 0, wrong: 0 };
+    miss[c].n++;
+    if (r.corrected_category && r.corrected_category !== c) miss[c].wrong++;
+  }
+  const byCategory: Record<string, number> = {};
+  for (const [c, v] of Object.entries(miss)) byCategory[c] = Number((v.wrong / v.n).toFixed(2));
+
+  return { total: rows.length, corrected, rate: Number((corrected / total).toFixed(3)), byCategory };
+}
+```
+
+Split the correction rate by category and it names exactly where the classifier slips. In my case, "Other" and "shopping" stood out: the former was the dumping ground for hesitation, the latter wobbled at the border between food and non-food. I added judgment criteria to the prompt for just those two and made the confirmation UI's default suggestion smarter, and the next month's correction rate dropped clearly. What worked was not fixing every category uniformly, but naming the slipping spots with numbers.
+
+## Doubt Yourself Before Giving Advice
+
+With the measurements in place, the last thing I touched was the entrance to advice generation. I used to hand the aggregates to Gemini unconditionally once they were ready. Even with the classification broken, plausible advice would come out, grounded in broken numbers. That was the scariest failure of all.
+
+So I inserted a gate that judges classifier health before building advice. If confidence, drift, or correction rate is in the danger zone, the advice is replaced with a maintenance message — "the classification needs review this month" — and no ordinary budget advice is produced.
+
+```typescript
+// lib/adviceGate.ts — stop advice in a month the classification can't be trusted
+interface HealthInputs {
+  avgConfidence: number;   // average confidence that month
+  drift: number;           // distribution drift (total variation distance)
+  otherRatio: number;      // "Other" ratio
+  correctionRate: number;  // user correction rate
+}
+
+export function adviceGate(h: HealthInputs): { ok: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (h.avgConfidence < 0.65) reasons.push(`low average confidence (${h.avgConfidence})`);
+  if (h.drift > 0.15) reasons.push(`large distribution drift (${h.drift})`);
+  if (h.otherRatio > 0.25) reasons.push(`high "Other" ratio (${h.otherRatio})`);
+  if (h.correctionRate > 0.2) reasons.push(`high correction rate (${h.correctionRate})`);
+  // if any one is in the danger zone, do not build advice on broken numbers
+  return { ok: reasons.length === 0, reasons };
+}
+
+// usage: assemble the advice prompt only when the gate passes
+export function buildMonthlyAdvice(gate: ReturnType<typeof adviceGate>, summary: string): string {
+  if (!gate.ok) {
+    return `This month, expense classification accuracy dropped, so budget advice was held back. `
+      + `We recommend reviewing classification in settings (reasons: ${gate.reasons.join(' / ')}).`;
+  }
+  return summary; // in practice, pass summary to Gemini to generate advice
+}
+```
+
+Holding advice back gave me pause at first — it felt like withholding a feature. But advice built from wrong numbers does more harm than the feature does good. Rather than handing over the false comfort of "your food spending is steady," honestly saying "classification looks shaky this month, so I'll hold the advice" actually grew trust in the app. Honesty outlasts a feature count.
+
+## Fold It into Operations
+
+Here is how I place all of this across the app and the monthly batch, in order. The key is to measure health before aggregating, and to accumulate records before measuring health.
+
+<table>
+  <thead>
+    <tr><th>When</th><th>What runs</th><th>On danger</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Every classification</td><td>Log confidence + AI category to classification_log</td><td>Below 0.5 goes to the confirm UI</td></tr>
+    <tr><td>On user correction</td><td>Append corrected_category</td><td>Feed often-corrected stores into suggestion learning</td></tr>
+    <tr><td>Month-end batch</td><td>Aggregate avg confidence, drift, correction rate</td><td>Store as health</td></tr>
+    <tr><td>Before advice</td><td>Judge health via adviceGate</td><td>Swap in the maintenance message if in danger</td></tr>
+  </tbody>
+</table>
+
+One implementation note: the classification log and the finance data live in the same SQLite, but always in separate tables. The record of the spending itself and the record of how trustworthy the classification is serve entirely different purposes. The former is the user's money history; the latter is your AI's vital signs. Mix them, and finance-screen queries get heavy with classification metadata, and classification decay hides inside the household numbers. Split the outputs, and both stay light.
+
+One more: do not try to nail the confidence thresholds or drift limits perfectly up front. I placed provisional numbers and tuned them against the actual correction rate over two or three months. Thresholds set against what your users actually corrected fit reality far better than ones set by theory.
+
+## Wrapping Up
+
+What is truly frightening in an app that lets AI sort expenses is not the classification breaking loudly, but decaying quietly while keeping a correct face. A crash you notice. But the gentle rot of "Other" growing one record at a time only surfaces when the month-end advice goes off target — unless you have eyes that measure the trend.
+
+First, keep the confidence you were throwing away. Then measure category distribution drift and the bloat of "Other," and check from the outside with the user correction rate. Finally, refuse to build advice on broken numbers. It is not a flashy feature, but this measurement layer is the foundation for whether you can trust the numbers in an AI finance app at all.
+
+If you have a classifier running quietly right now, just start logging confidence in your next release. Three months later, a glance at the average will turn decay you could not see into numbers. I hope this helps your own build, and thank you for reading.

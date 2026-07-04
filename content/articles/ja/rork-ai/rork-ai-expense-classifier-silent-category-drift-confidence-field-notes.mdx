@@ -1,0 +1,233 @@
+---
+title: "家計アプリのAI分類が『その他』に飲まれていくとき — 静かに崩れる支出仕分けを計測して立て直す運用メモ"
+slug: "rork-ai-expense-classifier-silent-category-drift-confidence-field-notes"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-05T11:00"
+author: "Rork Lab"
+description: "Rork で作ったAI家計アプリの支出自動分類は、リリース直後は当たっていても数ヶ月かけて静かに精度が落ち、月末アドバイスまで狂わせます。確信度と分類分布を計測してドリフトを先回りする運用手順を、動くコードとともにまとめました。"
+tags: ["Rork", "AI", "finance-app", "Gemini", "observability", "classification-drift"]
+highlights:
+  - "分類の確信度を一件ずつ記録し、平均確信度の低下を月次で追う計測実装"
+  - "カテゴリ分布のドリフトを距離で数値化し『その他』の肥大を早期に検知する手順"
+  - "ユーザー訂正率を裏の正解として使い、助言生成の手前で分類の健全性を判定するゲート"
+---
+## 分類は当たっていたはずなのに、助言がずれ始めた
+
+Rork で組んだAI家計アプリを個人開発で運用していました。レシートを撮ると Gemini が金額と店名とカテゴリを抜き出し、月末には支出パターンから助言を出す。リリース直後の手応えは良く、私自身も毎日使っていました。
+
+異変は数ヶ月後、じわじわと来ました。ある月の助言が「食費は落ち着いています」と言うのに、実感は逆。財布はいつもより軽い。おかしいと思って中身を開くと、スーパーの買い物がいくつも「その他」に落ちていました。スーパーの支出が先月の 1.4 倍あるはずなのに、集計上の食費はむしろ減っている。分類が壊れていたのです。
+
+壊れ方が厄介でした。アプリはクラッシュせず、エラーも出さない。ただ、少しずつ「その他」が太り、各カテゴリの数字がやせていく。そして分類を土台にした月末助言が、静かに的外れになっていく。数字は毎月きちんと出ているのに、その数字が信用できなくなっていました。
+
+個人開発で複数のアプリを回している私自身の運用から、この静かな崩れをどう突き止め、どんな計測を足して立て直したのかを、動くコードとともに書き残しておきます。AI に支出やレシートを仕分けさせるアプリを Rork で作っている方に、同じ後手を踏んでほしくないという気持ちで書いています。
+
+## 「その他」が静かに太っていく
+
+原因を追う前に、なぜ気づけなかったのかを整理しておきます。分類器の故障は、二つの意味で見えにくいものでした。
+
+一つ目は、一件ごとに見れば「その他」は正しい選択肢に見えることです。判断に迷った支出を「その他」に入れるのは、間違いではありません。問題は、その頻度が月を追うごとに上がっていたこと。単発では正常に見える判断が、集計すると異常な傾向を描いていました。
+
+二つ目は、分類器自身が黙っていたことです。Gemini が返す JSON には確信度が入っていましたが、私はそれを分類の枝分かれ（0.5 以下ならユーザーに確認）にしか使っておらず、時系列で眺めていませんでした。確信度は毎回どこかに捨てられ、後から振り返る術がなかったのです。
+
+<table>
+  <thead>
+    <tr><th>症状</th><th>単発で見たとき</th><th>集計で見たとき</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>「その他」への割り当て</td><td>妥当に見える</td><td><strong>比率が月々上昇</strong></td></tr>
+    <tr><td>確信度の低下</td><td>境界値以上なら素通り</td><td>平均が静かに右肩下がり</td></tr>
+    <tr><td>助言の的外れ</td><td>一文だけなら違和感薄い</td><td>実感と体系的にずれる</td></tr>
+  </tbody>
+</table>
+
+分類が崩れた引き金は、後から見ればいくつも重なっていました。利用者が増えて未知の店名が増えたこと、モデル側の挙動が更新でわずかに変わったこと、季節商品でレシートの語彙が変わったこと。どれも一撃ではありません。だからこそ、一件ずつではなく傾向を測る仕組みが要りました。
+
+## 分類の確信度を一件ずつ記録する
+
+最初にやったのは、捨てていた確信度を残すことでした。分類のたびに、確信度と、AI が選んだカテゴリと、ユーザーが後で直したかどうかを、専用のテーブルに書き込みます。分類の結果そのものではなく、分類の「質」の履歴を貯める発想です。
+
+```typescript
+// lib/classificationLog.ts — 分類の質を時系列で残す
+import * as SQLite from 'expo-sqlite';
+
+const db = SQLite.openDatabaseSync('finance.db');
+
+export async function initClassificationLog(): Promise<void> {
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS classification_log (
+      id TEXT PRIMARY KEY,
+      expense_id TEXT NOT NULL,
+      ai_category TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      corrected_category TEXT,     -- ユーザーが直した先（直さなければ NULL）
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cl_created ON classification_log(created_at);
+  `);
+}
+
+export async function logClassification(entry: {
+  id: string; expenseId: string; aiCategory: string; confidence: number;
+}): Promise<void> {
+  await db.runAsync(
+    `INSERT INTO classification_log
+     (id, expense_id, ai_category, confidence, corrected_category, created_at)
+     VALUES (?, ?, ?, ?, NULL, ?)`,
+    [entry.id, entry.expenseId, entry.aiCategory, entry.confidence, new Date().toISOString()]
+  );
+}
+
+// ユーザーがカテゴリを手直ししたら、その事実を後追いで記録する
+export async function recordCorrection(expenseId: string, correctedTo: string): Promise<void> {
+  await db.runAsync(
+    `UPDATE classification_log SET corrected_category = ? WHERE expense_id = ?`,
+    [correctedTo, expenseId]
+  );
+}
+```
+
+ここで大事なのは、確信度を分岐の材料としてだけでなく、後から集計できる記録として残すことです。分類の瞬間には正しく見えても、平均確信度が三ヶ月かけて 0.82 から 0.63 へ下がっていれば、それは分類器が迷い始めた明確な兆候になります。一件のログでは何も分かりませんが、束ねると分類器の体温が見えてきます。
+
+## カテゴリ分布のドリフトを測る
+
+確信度の次に測ったのは、カテゴリの分布そのものの変化です。先月と今月で、支出がどのカテゴリにどれだけ振り分けられたか。その形が大きくずれたとき、実際に消費行動が変わったのか、それとも分類がずれたのかを問い直す合図にします。
+
+分布の違いは、二つの割合ベクトルの距離として数値化できます。私は計算が軽く直感的な、全変動距離（各カテゴリの割合差の絶対値の合計を2で割ったもの）を使いました。0 なら不変、1 なら完全な入れ替わりです。
+
+```typescript
+// lib/distributionDrift.ts — カテゴリ分布のドリフトを測る
+export type CategoryCounts = Record<string, number>;
+
+function toRatio(counts: CategoryCounts): Record<string, number> {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  const ratio: Record<string, number> = {};
+  for (const [k, v] of Object.entries(counts)) ratio[k] = v / total;
+  return ratio;
+}
+
+export function distributionDrift(prev: CategoryCounts, curr: CategoryCounts) {
+  const pr = toRatio(prev), cr = toRatio(curr);
+  const keys = new Set([...Object.keys(pr), ...Object.keys(cr)]);
+  let tvd = 0;                       // total variation distance
+  for (const k of keys) tvd += Math.abs((pr[k] ?? 0) - (cr[k] ?? 0));
+  tvd /= 2;
+
+  // 「その他」だけは単独でも見張る — 分類崩壊はここに溜まりやすい
+  const otherJump = (cr['other'] ?? 0) - (pr['other'] ?? 0);
+  return {
+    drift: Number(tvd.toFixed(3)),
+    otherRatio: Number((cr['other'] ?? 0).toFixed(3)),
+    otherJump: Number(otherJump.toFixed(3)),
+    suspicious: tvd > 0.15 || (cr['other'] ?? 0) > 0.25 || otherJump > 0.08,
+  };
+}
+```
+
+全体のドリフトに加えて「その他」の比率と増加幅を単独で見張っているのは、経験からです。分類器が迷い始めると、そのしわ寄せは真っ先に「その他」に溜まります。全体の分布がまだそれほど動いていなくても、「その他」だけが月々ふくらんでいれば、それは消費行動の変化ではなく分類の劣化を疑うべき合図でした。値の変化（本当に外食が増えた）と仕分けの変化（分類が投げやりになった）を分けて持つと、月末に「これは家計の話か、アプリの話か」で迷わずに済みます。
+
+## 訂正率という裏の正解
+
+確信度も分布も、分類器の内側から見た指標です。もう一つ、外側からの答え合わせがほしくなりました。それが、ユーザーがカテゴリを手直しした割合、すなわち訂正率です。
+
+利用者が「その他」を「食費」に直したり、「娯楽」を「教育」に付け替えたりする操作は、分類器にとって最も信頼できる正解データです。人が直した回数を分母付きで追えば、AI の当たり外れを、内部の確信度に頼らず外から測れます。
+
+```typescript
+// lib/correctionRate.ts — ユーザー訂正率で分類精度を外側から測る
+import * as SQLite from 'expo-sqlite';
+const db = SQLite.openDatabaseSync('finance.db');
+
+export async function monthlyCorrectionRate(month: string): Promise<{
+  total: number; corrected: number; rate: number; byCategory: Record<string, number>;
+}> {
+  const rows = await db.getAllAsync<any>(
+    `SELECT ai_category, corrected_category FROM classification_log
+     WHERE created_at LIKE ?`, [`${month}%`]
+  );
+  const total = rows.length || 1;
+  const corrected = rows.filter(r => r.corrected_category && r.corrected_category !== r.ai_category).length;
+
+  // どのカテゴリが直されやすいか = どこで分類器が滑っているか
+  const miss: Record<string, { n: number; wrong: number }> = {};
+  for (const r of rows) {
+    const c = r.ai_category;
+    miss[c] ??= { n: 0, wrong: 0 };
+    miss[c].n++;
+    if (r.corrected_category && r.corrected_category !== c) miss[c].wrong++;
+  }
+  const byCategory: Record<string, number> = {};
+  for (const [c, v] of Object.entries(miss)) byCategory[c] = Number((v.wrong / v.n).toFixed(2));
+
+  return { total: rows.length, corrected, rate: Number((corrected / total).toFixed(3)), byCategory };
+}
+```
+
+訂正率を category 別に割ると、どこで分類器が滑っているかが名指しでわかります。私の場合、「その他」と「shopping」の訂正率が突出していました。前者は迷いの捨て場、後者は食品と非食品の境目で揺れていた。この二つにだけプロンプトの判断基準を書き足し、確認 UI の初期候補を賢くしたところ、翌月の「その他」の訂正率は 18% から 9% へ下がりました。全カテゴリを一律に直そうとせず、滑っている場所を数字で名指しできたのが効きました。
+
+## 助言を出す前に、自分を疑う
+
+計測がそろって、最後に手を入れたのが助言生成の入口です。以前の私は、集計が出たら無条件に Gemini へ渡して助言を作らせていました。分類が崩れていても、崩れた数字を根拠に、もっともらしい助言が出てしまう。これが一番怖い失敗でした。
+
+そこで、助言を作る前に分類器の健全性を判定するゲートを一枚挟みました。確信度・ドリフト・訂正率のどれかが危険域なら、助言は「今月は分類の見直しが必要です」という保守メッセージに差し替え、通常の家計助言は出しません。
+
+```typescript
+// lib/adviceGate.ts — 分類が信用できない月は助言を止める
+interface HealthInputs {
+  avgConfidence: number;   // その月の平均確信度
+  drift: number;           // 分布ドリフト（total variation distance）
+  otherRatio: number;      // 「その他」比率
+  correctionRate: number;  // ユーザー訂正率
+}
+
+export function adviceGate(h: HealthInputs): { ok: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (h.avgConfidence < 0.65) reasons.push(`平均確信度が低い (${h.avgConfidence})`);
+  if (h.drift > 0.15) reasons.push(`分布ドリフトが大きい (${h.drift})`);
+  if (h.otherRatio > 0.25) reasons.push(`「その他」比率が高い (${h.otherRatio})`);
+  if (h.correctionRate > 0.2) reasons.push(`訂正率が高い (${h.correctionRate})`);
+  // 一つでも危険域なら、崩れた数字で助言を作らせない
+  return { ok: reasons.length === 0, reasons };
+}
+
+// 使い方: ゲートを通ったときだけ助言プロンプトを組み立てる
+export function buildMonthlyAdvice(gate: ReturnType<typeof adviceGate>, summary: string): string {
+  if (!gate.ok) {
+    return `今月は支出分類の精度が下がっているため、家計アドバイスの生成を見送りました。`
+      + `設定画面から分類の見直しをおすすめします（理由: ${gate.reasons.join(' / ')}）。`;
+  }
+  return summary; // 実際は summary を Gemini へ渡して助言を生成
+}
+```
+
+助言を止める、という判断には最初ためらいがありました。せっかくの機能を出し惜しみするように感じたからです。しかし、間違った数字から作った助言は、機能があることよりも害が大きい。「食費は落ち着いています」と嘘の安心を渡すくらいなら、「今月は分類があやしいので助言を控えます」と正直に言うほうが、アプリへの信頼はむしろ育ちました。誠実さは、機能の数より長く効きます。
+
+## 運用に組み込む
+
+これらをアプリ本体と月次バッチにどう配置しているかを、順序とともにまとめます。要点は、集計より先に健全性を測り、健全性より先に記録を貯めておくことです。
+
+<table>
+  <thead>
+    <tr><th>タイミング</th><th>処理</th><th>危険時の扱い</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>分類のたび</td><td>確信度・AIカテゴリを classification_log に記録</td><td>確信度0.5未満は確認UIへ</td></tr>
+    <tr><td>ユーザー訂正時</td><td>corrected_category を追記</td><td>訂正の多い店名を候補学習に回す</td></tr>
+    <tr><td>月末バッチ</td><td>平均確信度・ドリフト・訂正率を集計</td><td>ヘルスとして保存</td></tr>
+    <tr><td>助言生成の前</td><td>adviceGate で健全性判定</td><td>危険域なら保守メッセージへ差し替え</td></tr>
+  </tbody>
+</table>
+
+処理の骨格はこの順序です。ステップ1で分類のたびに確信度を記録し、ステップ2でユーザー訂正を追記し、ステップ3で月末に平均確信度とドリフトと訂正率を集計し、ステップ4で助言生成の手前にゲートを置く。順序を崩すと、記録が貯まる前に集計し、健全性を測る前に助言してしまいます。
+
+実装上の注意を一つ。分類ログと家計データは同じ SQLite に置いていますが、テーブルは必ず分けています。支出そのものの記録と、分類がどれだけ信用できるかの記録は、目的がまったく違うからです。前者はユーザーのお金の履歴、後者は自分の AI の体調記録。混ぜると、家計画面のクエリが分類メタ情報で重くなり、分類の劣化も家計の数字に埋もれます。出口を分けておくと、どちらも軽いまま保てます。
+
+もう一点、確信度のしきい値やドリフトの上限を理屈だけで決めるのは落とし穴でした。私はこれを、実際の訂正率と突き合わせて対処しています。最初から完璧に決めようとしないことです。私は数値を仮置きし、実際の訂正率と突き合わせながら二、三ヶ月かけて調整しました。しきい値は理屈で決めるより、自分のアプリの利用者が実際に何を直したかで決めるほうが、はるかに現実に合います。
+
+## まとめ
+
+AI に支出を仕分けさせるアプリで本当に怖いのは、分類が派手に壊れることではなく、正しい顔をしたまま静かに劣化していくことでした。クラッシュは気づけます。しかし「その他」が一件ずつ増えていく緩やかな崩れは、傾向を測る目を持たない限り、月末助言が的外れになって初めて表面化します。
+
+まず捨てていた確信度を残す。次にカテゴリ分布のドリフトと「その他」の肥大を測り、ユーザー訂正率で外側から答え合わせをする。そして崩れた数字からは助言を作らせない。派手な機能ではありませんが、この計測の層こそが、AI 家計アプリの数字を信用してよいかどうかの土台になります。
+
+もし今、静かに動いている分類器をお持ちなら、次のリリースで確信度をログに残すことだけ始めてみてください。三ヶ月後、その平均を眺めるだけで、見えていなかった劣化が数字になって現れます。実装の参考になれば幸いです。お読みいただきありがとうございました。
