@@ -1,0 +1,215 @@
+---
+title: "Changing a Table Without Wiping User Data in Rork's expo-sqlite — A PRAGMA user_version Migration Runner"
+slug: "rork-expo-sqlite-schema-migration-user-version-runner"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-05T11:15"
+updated: "2026-07-05T11:15"
+author: "Rork Lab"
+description: "A crash on launch, only for existing users: no such column. That is what happens when you ship a table-structure change to installs that still hold the old schema. Here is the expo-sqlite migration layer I put in every Rork app, built on PRAGMA user_version, with the full runner and the operational rules behind it."
+highlights:
+  - "You'll get the full TypeScript implementation of a migration runner that fills in every version in order using expo-sqlite's PRAGMA user_version"
+  - "You'll be able to tell an ADD COLUMN change apart from one that needs a 12-step table rebuild, so column drops, renames, and constraint changes ship safely"
+  - "You'll avoid the silent data loss that happens when foreign keys and transactions collide, by knowing when to turn foreign_keys off and how to verify with foreign_key_check"
+---
+
+Right after I shipped a new version, unfamiliar crashes started stacking up in Crashlytics: `no such column: added_at`. My simulator had never produced it once. The only devices going down were those that had updated from a previous version.
+
+The cause was quick to spot. The new code runs `SELECT id, wallpaper_id, added_at FROM favorites`. But the SQLite file on an existing user's device has no `added_at` column yet. Fresh installs are fine, because the app runs its `CREATE TABLE` on first launch and gets the new column. That is exactly why store review passed and my own testing passed. The gap only appears for people who updated while carrying the old schema on disk.
+
+On a server database, changing the schema means writing a migration and running it as part of the deploy. The SQLite file on the device needs the same discipline. I covered the key-value side of this in [a separate piece on local data migration for Rork apps](/articles/rork-dev/rork-local-data-schema-versioning-migration-design), but relational SQLite is a step trickier, because you are changing the table structure itself. Here is the ordered migration layer I run in Rork apps, with the full implementation.
+
+## Why SQLite migrations are trickier than AsyncStorage
+
+With AsyncStorage, you can reshape the parsed JSON in code right after you read it. The read boundary is a single point. SQLite is not like that. The schema — the table definitions — is baked into the file on the device, and the moment your code's expectations diverge from what the file actually holds, the query fails at runtime.
+
+On top of that, SQLite's `ALTER TABLE` is limited. You can add a column, but dropping a column, renaming one, or changing a constraint like `UNIQUE` or `NOT NULL` cannot be written as a single clean statement. You have to rebuild the whole table. If you do not know about this asymmetry and assume "I'll just ALTER TABLE it," you get stuck halfway through.
+
+There is a second trap: even within one app, the schema version differs from user to user. A device sitting on v1 can wake up half a year later and meet v4 code for the first time. So a migration has to be shaped so it can apply one step at a time and reach the latest schema no matter where it starts.
+
+## The whole design hinges on one integer: PRAGMA user_version
+
+SQLite ships with an integer field you can write into the database file header: `PRAGMA user_version`. Your app can use it as a marker for "how far along is this file's schema." A freshly created database reads 0.
+
+The logic is simple. Compare the latest version your app knows about (the number of migrations) with the file's `user_version`, apply only the missing steps in order, and bump `user_version` by one each time you apply a step. That alone makes every generation of device converge on the same target. You can also keep a version table inside the database, but `user_version` lives in the file and needs no extra query, so it is the option I reach for.
+
+## The migration runner — ordered application and transaction boundaries
+
+First, hold the migrations as an array of "the work needed to raise the schema to that version." This assumes expo-sqlite's newer async API (the `openDatabaseAsync` family).
+
+```typescript
+// db/migrations.ts
+import * as SQLite from 'expo-sqlite';
+
+// The array index maps "previous version -> this version."
+// index 0 is v0->v1, index 1 is v1->v2, and so on.
+type Migration = (db: SQLite.SQLiteDatabase) => Promise<void>;
+
+const MIGRATIONS: Migration[] = [
+  // --- v0 -> v1: initial schema ---
+  async (db) => {
+    await db.execAsync(`
+      CREATE TABLE favorites (
+        id           INTEGER PRIMARY KEY NOT NULL,
+        wallpaper_id TEXT NOT NULL UNIQUE
+      );
+    `);
+  },
+
+  // --- v1 -> v2: add a timestamp (ADD COLUMN is enough) ---
+  async (db) => {
+    await db.execAsync(
+      `ALTER TABLE favorites ADD COLUMN added_at INTEGER NOT NULL DEFAULT 0;`
+    );
+  },
+
+  // --- v2 -> v3: drop UNIQUE, move to a per-collection composite unique ---
+  async (db) => {
+    await rebuildFavoritesTable(db); // a change that needs a rebuild (below)
+  },
+];
+```
+
+Here is the runner itself. The key points are reading the version, applying steps in order, and sealing "apply" and "bump the version" inside a single transaction.
+
+```typescript
+// db/migrations.ts (continued)
+export async function migrate(db: SQLite.SQLiteDatabase): Promise<void> {
+  // Foreign keys must be off during migration.
+  // WARNING: this PRAGMA is ignored unless it runs OUTSIDE a transaction (see below).
+  await db.execAsync('PRAGMA foreign_keys = OFF');
+
+  try {
+    const row = await db.getFirstAsync<{ user_version: number }>(
+      'PRAGMA user_version'
+    );
+    let current = row?.user_version ?? 0;
+    const target = MIGRATIONS.length;
+
+    // If a newer DB is opened by older code, stop before writing anything.
+    // Proceeding silently here lets old code corrupt columns a newer version created.
+    if (current > target) {
+      throw new Error(
+        `DB schema v${current} is newer than app-supported v${target}.`
+      );
+    }
+
+    while (current < target) {
+      const next = current + 1;
+      // One migration = one transaction. If it fails midway, it all rolls back.
+      await db.withTransactionAsync(async () => {
+        await MIGRATIONS[current](db);
+        // Bump user_version inside the transaction so it is atomic with the change.
+        await db.execAsync(`PRAGMA user_version = ${next}`);
+      });
+      current = next;
+    }
+
+    // Finally, check that no rows with broken references remain.
+    const broken = await db.getAllAsync('PRAGMA foreign_key_check');
+    if (broken.length > 0) {
+      throw new Error(`foreign_key_check failed: ${broken.length} rows`);
+    }
+  } finally {
+    await db.execAsync('PRAGMA foreign_keys = ON');
+  }
+}
+```
+
+The `PRAGMA user_version = N` update is part of the transaction, so if the step fails it rolls back together with the change. That means the half-done state of "the migration ran but the version stayed old" cannot happen by construction. Call `await migrate(db)` once, right after you open the database on launch, and every generation of device lines up on the latest schema.
+
+## ADD COLUMN is easy — but drops, renames, and constraint changes?
+
+The procedure you need depends on the kind of change. Pinning down this distinction up front keeps you from stalling during implementation.
+
+<table>
+<thead>
+<tr><th>What you want to change</th><th>How</th><th>Rebuild?</th></tr>
+</thead>
+<tbody>
+<tr><td>Add one column</td><td><strong>ALTER TABLE ADD COLUMN</strong></td><td>No</td></tr>
+<tr><td>Insert a column anywhere but the end / reorder</td><td>Table rebuild</td><td>Yes</td></tr>
+<tr><td>Drop a column</td><td>Table rebuild (required if you support devices below SQLite 3.35)</td><td>Yes</td></tr>
+<tr><td>Rename a column</td><td>Table rebuild (when you prioritize compatibility)</td><td>Yes</td></tr>
+<tr><td>Change a UNIQUE / NOT NULL constraint</td><td>Table rebuild</td><td>Yes</td></tr>
+</tbody>
+</table>
+
+If `ADD COLUMN` is enough, one statement does it, as in v1 to v2. The thing to remember: if you add `NOT NULL`, you must also add `DEFAULT`. Existing rows have no value for the new column, so without a default the `ALTER` itself fails.
+
+## Running a rebuild safely, foreign keys and all
+
+The riskiest part of a rebuild is foreign keys. The moment you run `DROP TABLE favorites`, any foreign key in another table that references it is left dangling. With `foreign_keys` still ON, the rebuild can fail on the constraint, or worse, rows that lost their reference can sit there silently.
+
+That is why the official procedure asks for this order: `PRAGMA foreign_keys = OFF`, then a transaction, the rebuild, `PRAGMA foreign_key_check`, commit, and `PRAGMA foreign_keys = ON`. The easy thing to miss is the spec detail that **`PRAGMA foreign_keys` has no effect inside a transaction.** Trying to turn it off inside `withTransactionAsync` is ignored. That is exactly why the runner above flips `foreign_keys` outside the transaction, wrapping the whole loop. After turning it off, always confirm with `foreign_key_check` that no broken references remain before turning it back on.
+
+The rebuild function can then focus purely on table work, since the caller already handled foreign keys.
+
+```typescript
+async function rebuildFavoritesTable(db: SQLite.SQLiteDatabase) {
+  await db.execAsync(`
+    -- 1. Create the table with the new definition (drop UNIQUE, use a composite index)
+    CREATE TABLE favorites_new (
+      id           INTEGER PRIMARY KEY NOT NULL,
+      wallpaper_id TEXT    NOT NULL,
+      collection   TEXT    NOT NULL DEFAULT 'default',
+      added_at     INTEGER NOT NULL DEFAULT 0
+    );
+    -- 2. Copy over only the columns that carry across, naming them explicitly
+    INSERT INTO favorites_new (id, wallpaper_id, added_at)
+      SELECT id, wallpaper_id, added_at FROM favorites;
+    -- 3. Drop the old table and rename the new one into place
+    DROP TABLE favorites;
+    ALTER TABLE favorites_new RENAME TO favorites;
+    -- 4. Recreate indexes, triggers, and views against the new table
+    CREATE UNIQUE INDEX idx_fav_unique ON favorites (wallpaper_id, collection);
+  `);
+}
+```
+
+Naming the columns in `INSERT ... SELECT` is the point. `collection`, which exists only in the new table, is filled by its `DEFAULT 'default'`, and any column that lived only in the old table is dropped naturally by leaving it out of the SELECT. Write this as `SELECT *` and the moment column order shifts, values slide into the wrong column.
+
+## Test it by building an old-schema DB and running the migration
+
+The scary thing about this code is that a bug in it never reproduces on a fresh install. The crash I opened with was exactly that. So you write a test that deliberately builds an old-schema database and runs `migrate()` against it. expo-sqlite can open `:memory:`, so it runs fast on a device or simulator.
+
+```typescript
+// Deliberately build a v1-era DB and seed one row
+async function seedV1Database() {
+  const db = await SQLite.openDatabaseAsync(':memory:');
+  await db.execAsync(`
+    CREATE TABLE favorites (
+      id           INTEGER PRIMARY KEY NOT NULL,
+      wallpaper_id TEXT NOT NULL UNIQUE
+    );
+    PRAGMA user_version = 1;
+  `);
+  await db.runAsync(
+    'INSERT INTO favorites (wallpaper_id) VALUES (?)',
+    'sunset-01'
+  );
+  return db;
+}
+
+// Run migrate() against the v1 DB and confirm the data survived
+const db = await seedV1Database();
+await migrate(db);
+
+const rows = await db.getAllAsync('SELECT * FROM favorites');
+console.log(rows);
+// Expected output:
+// [{ id: 1, wallpaper_id: 'sunset-01', collection: 'default', added_at: 0 }]
+```
+
+Run it not just from v1 but from v0 (an empty DB) and v2 as well, and confirm they all converge on the same final shape. Checking that the row count did not shrink and that `added_at` and `collection` are filled correctly catches a missed column in the rebuild's `INSERT ... SELECT` early. On my pre-release checklist I keep the line "three old-schema generations x migrate() preserve the row count."
+
+## Three traps I hit in production
+
+The first is the promise that once a migration ships, you **never rewrite the past ones.** A device already on v2 will not run the v1-to-v2 function again. Fixing v1-to-v2 later never reaches that device. You always fix forward by appending a new version at the end.
+
+The second is adding only `NOT NULL` to `ALTER TABLE ADD COLUMN` and forgetting `DEFAULT`. Fresh installs pass through `CREATE TABLE` fine, while only the `ALTER` on devices with existing rows fails — again, the "only existing users crash" shape. When something smells like the crash I opened with, suspect the missing default first.
+
+The third was running a `CREATE TABLE IF NOT EXISTS` on launch, outside the migrations. With that in place, the schema gets created through a path separate from the `user_version` marker, and it becomes unclear which one is authoritative. I consolidated all table creation into the migration array, so the only thing that runs on launch is `migrate(db)`.
+
+The longer an app stays on the App Store and Google Play, the more devices on old schemas remain in the long tail. As an indie developer at Dolice, protecting each one of those users' data is what your review score rests on. Next time you change a schema, start by adding one line that reads `PRAGMA user_version`, so the app knows which generation its own data is on before it touches anything.

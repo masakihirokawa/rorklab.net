@@ -1,0 +1,244 @@
+---
+title: "Rork 製アプリの expo-sqlite で、テーブル構造を変えてもデータを消さない — PRAGMA user_version で作る順次マイグレーション"
+slug: "rork-expo-sqlite-schema-migration-user-version-runner"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-05T11:15"
+updated: "2026-07-05T11:15"
+author: "Rork Lab"
+description: "「no such column」で起動直後に落ちる。テーブル構造を変えた新バージョンを既存ユーザーに配ると起きる事故です。expo-sqlite の PRAGMA user_version を使い、カラム追加・テーブル再構築・外部キーを含むスキーマ変更をユーザーデータを守りながら順に適用する設計を、実装の全文と運用ルールとしてまとめました。"
+tags: ["Rork", "expo-sqlite", "データ移行", "SQLite", "長期運用"]
+highlights:
+  - "expo-sqlite の PRAGMA user_version を軸に、複数バージョンを順に埋めるマイグレーションランナーの完全な TypeScript 実装を手に入れられる"
+  - "ALTER TABLE で足りるカラム追加と、12ステップのテーブル再構築が要る変更を見分けられるようになり、カラム削除・改名・制約変更を安全に流せる"
+  - "外部キーとトランザクションが噛み合わずデータが欠ける事故を、foreign_keys を切る順番と foreign_key_check で未然に防げる"
+---
+
+新しいバージョンを配信した直後、Crashlytics に見覚えのないクラッシュが並びました。文面は `no such column: added_at`。手元のシミュレータでは一度も出ていません。落ちているのは、前のバージョンからアップデートしてきた既存ユーザーの端末だけでした。
+
+原因はすぐに分かりました。新しいコードは `SELECT id, wallpaper_id, added_at FROM favorites` を実行します。ところが既存ユーザーの端末にある SQLite ファイルには、`added_at` という列がまだありません。新規インストールのユーザーは、アプリが最初に `CREATE TABLE` を流すので新しい列を持っています。だからストア審査も、私自身のテストも通ってしまう。差が出るのは「前のスキーマのファイルを持ったまま更新した人」だけなのです。
+
+サーバーのデータベースなら、スキーマを変えるときにマイグレーションを書き、デプロイの一部として流します。端末の中の SQLite にも、同じ規律が要ります。キーバリューの移行については[アップデートでお気に入りを消さないために — ローカルデータ・マイグレーション設計](/articles/rork-dev/rork-local-data-schema-versioning-migration-design)で書きましたが、リレーショナルな SQLite はテーブル構造そのものを変えるぶん、扱いがもう一段やっかいです。ここでは Rork で作るアプリに入れている、expo-sqlite 向けの順次マイグレーション層を実装の全文とともに整理します。
+
+## SQLite のマイグレーションが AsyncStorage より厄介な理由
+
+AsyncStorage なら、保存した JSON を読み込んだ直後にコードで形を整えれば済みます。読み書きの境界が1箇所だからです。SQLite はそうはいきません。スキーマ（テーブルの定義）そのものが端末のファイルに焼き付いていて、コード側の期待とファイル側の実体がずれた瞬間に、クエリが実行時エラーで落ちます。
+
+しかも SQLite の `ALTER TABLE` は限定的です。列の追加はできますが、列の削除や改名、制約（`UNIQUE` や `NOT NULL`）の変更は、素直な一文では書けません。テーブルをまるごと作り直す手続きが必要になります。この非対称性を知らずに「とりあえず `ALTER TABLE` で」と考えると、途中で手が止まります。
+
+もう一つの落とし穴が、同じアプリでもユーザーごとにスキーマのバージョンがバラバラだという事実です。v1 のまま眠っていた端末が半年後に起動して、いきなり v4 のコードに出会うこともあります。だからマイグレーションは「1個ずつ順に適用でき、どのバージョンから始めても最新までたどり着ける」形でなければなりません。
+
+## 設計の起点は PRAGMA user_version という整数1つ
+
+SQLite には、データベースファイルのヘッダーに書き込める整数フィールドが最初から用意されています。`PRAGMA user_version` です。アプリはこの値を「このファイルのスキーマは今どこまで進んでいるか」を表す目盛りとして使えます。新規作成直後の DB では 0 です。
+
+やることは単純です。アプリが知っている最新バージョン（マイグレーションの本数）と、ファイルの `user_version` を比べ、足りないぶんだけ順に流し、流すたびに `user_version` を1つ進める。これだけで、どの世代の端末も同じゴールに収束します。テーブルの中に自前のバージョン管理テーブルを作る方法もありますが、`user_version` はファイルに内蔵されていて追加のクエリが要らないぶん、私はこちらを好みます。
+
+## マイグレーションランナーの実装 — 順次適用とトランザクション境界
+
+まずマイグレーションを「そのバージョンに上げるために流す処理」の配列として持ちます。expo-sqlite の新しい非同期 API（`openDatabaseAsync` 系）を前提にしています。
+
+```typescript
+// db/migrations.ts
+import * as SQLite from 'expo-sqlite';
+
+// 配列の index が「1つ前 → このバージョン」に対応します。
+// index 0 が v0→v1、index 1 が v1→v2 …と続きます。
+type Migration = (db: SQLite.SQLiteDatabase) => Promise<void>;
+
+const MIGRATIONS: Migration[] = [
+  // --- v0 → v1: 初期スキーマ ---
+  async (db) => {
+    await db.execAsync(`
+      CREATE TABLE favorites (
+        id           INTEGER PRIMARY KEY NOT NULL,
+        wallpaper_id TEXT NOT NULL UNIQUE
+      );
+    `);
+  },
+
+  // --- v1 → v2: 追加日時を持たせる（カラム追加は ALTER TABLE で足りる） ---
+  async (db) => {
+    await db.execAsync(
+      `ALTER TABLE favorites ADD COLUMN added_at INTEGER NOT NULL DEFAULT 0;`
+    );
+  },
+
+  // --- v2 → v3: UNIQUE を外し、コレクション単位の複合ユニークに作り替える ---
+  async (db) => {
+    await rebuildFavoritesTable(db); // 再構築が要る変更（後述）
+  },
+];
+```
+
+ランナー本体です。バージョンの読み取り、順次適用、そして「適用」と「バージョン更新」を1つのトランザクションに閉じ込めるのが要点です。
+
+```typescript
+// db/migrations.ts（続き）
+export async function migrate(db: SQLite.SQLiteDatabase): Promise<void> {
+  // 外部キーはマイグレーション中は必ず切ります。
+  // ⚠️ この PRAGMA はトランザクションの外で実行しないと無視されます（後述の落とし穴）。
+  await db.execAsync('PRAGMA foreign_keys = OFF');
+
+  try {
+    const row = await db.getFirstAsync<{ user_version: number }>(
+      'PRAGMA user_version'
+    );
+    let current = row?.user_version ?? 0;
+    const target = MIGRATIONS.length;
+
+    // 将来の DB を古いコードで開いた場合は、書き込ませずに止めます。
+    // ここで黙って進めると、新機能が作った列を旧コードが壊します。
+    if (current > target) {
+      throw new Error(
+        `DB schema v${current} is newer than app-supported v${target}.`
+      );
+    }
+
+    while (current < target) {
+      const next = current + 1;
+      // 1マイグレーション = 1トランザクション。途中で失敗したら丸ごと巻き戻します。
+      await db.withTransactionAsync(async () => {
+        await MIGRATIONS[current](db);
+        // user_version の更新もトランザクション内で行い、適用と不可分にします。
+        await db.execAsync(`PRAGMA user_version = ${next}`);
+      });
+      current = next;
+    }
+
+    // 参照の壊れた行が残っていないかを最後に検査します。
+    const broken = await db.getAllAsync('PRAGMA foreign_key_check');
+    if (broken.length > 0) {
+      throw new Error(`foreign_key_check failed: ${broken.length} rows`);
+    }
+  } finally {
+    await db.execAsync('PRAGMA foreign_keys = ON');
+  }
+}
+```
+
+`PRAGMA user_version = N` の更新はトランザクションの一部として扱われ、失敗すれば適用ごと巻き戻ります。つまり「マイグレーションは流れたのにバージョンだけ古いまま」という中途半端な状態が原理的に起きません。アプリ起動時、DB を開いた直後に一度だけ `await migrate(db)` を呼べば、あとはどの世代の端末も最新スキーマに揃います。
+
+## カラム追加は ALTER TABLE、では削除・改名・制約変更は？
+
+変更の種類によって、必要な手続きが違います。この見分けを最初に押さえておくと、実装で迷いません。
+
+<table>
+<thead>
+<tr><th>やりたい変更</th><th>方法</th><th>再構築の要否</th></tr>
+</thead>
+<tbody>
+<tr><td>列を1つ追加する</td><td><strong>ALTER TABLE ADD COLUMN</strong></td><td>不要</td></tr>
+<tr><td>列を末尾以外に足したい／並びを整えたい</td><td>テーブル再構築</td><td>必要</td></tr>
+<tr><td>列を削除する</td><td>テーブル再構築（SQLite 3.35 未満の端末を含めるなら必須）</td><td>必要</td></tr>
+<tr><td>列名を変える</td><td>テーブル再構築（互換性を優先する場合）</td><td>必要</td></tr>
+<tr><td>UNIQUE・NOT NULL などの制約を変える</td><td>テーブル再構築</td><td>必要</td></tr>
+</tbody>
+</table>
+
+`ADD COLUMN` で足りる変更なら、v1→v2 のように一文で済みます。ここで大事なのは `NOT NULL` を付けるなら必ず `DEFAULT` も付けることです。既存行にはその列の値がないので、デフォルトがないと `ALTER` 自体が失敗します。
+
+## テーブル再構築の12ステップを、外部キーごと安全に流す
+
+制約を変えるような再構築は、SQLite 公式が示す手順に沿って「新しいテーブルを作り、データを移し、旧テーブルを捨てて名前を引き継ぐ」流れで行います。外部キーはランナー側で既に切ってあるので、再構築関数はテーブル操作に集中できます。
+
+```sql
+-- rebuildFavoritesTable の中身（考え方）。foreign_keys は呼び出し側で OFF 済み。
+-- 1. 新しい定義でテーブルを作る（UNIQUE を外し、複合ユニークインデックスに寄せる）
+CREATE TABLE favorites_new (
+  id           INTEGER PRIMARY KEY NOT NULL,
+  wallpaper_id TEXT    NOT NULL,
+  collection   TEXT    NOT NULL DEFAULT 'default',
+  added_at     INTEGER NOT NULL DEFAULT 0
+);
+
+-- 2. 旧テーブルから、移せる列だけを SELECT して流し込む
+INSERT INTO favorites_new (id, wallpaper_id, added_at)
+SELECT id, wallpaper_id, added_at FROM favorites;
+
+-- 3. 旧テーブルを捨て、新テーブルを正式名にリネームする
+DROP TABLE favorites;
+ALTER TABLE favorites_new RENAME TO favorites;
+
+-- 4. インデックス・トリガー・ビューを新テーブルに対して作り直す
+CREATE UNIQUE INDEX idx_fav_unique ON favorites (wallpaper_id, collection);
+```
+
+TypeScript 側からは、この一連を1つの関数にまとめて呼びます。
+
+```typescript
+async function rebuildFavoritesTable(db: SQLite.SQLiteDatabase) {
+  await db.execAsync(`
+    CREATE TABLE favorites_new (
+      id           INTEGER PRIMARY KEY NOT NULL,
+      wallpaper_id TEXT    NOT NULL,
+      collection   TEXT    NOT NULL DEFAULT 'default',
+      added_at     INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO favorites_new (id, wallpaper_id, added_at)
+      SELECT id, wallpaper_id, added_at FROM favorites;
+    DROP TABLE favorites;
+    ALTER TABLE favorites_new RENAME TO favorites;
+    CREATE UNIQUE INDEX idx_fav_unique ON favorites (wallpaper_id, collection);
+  `);
+}
+```
+
+`INSERT ... SELECT` で列を明示しているのがポイントです。新テーブルにしか存在しない `collection` は `DEFAULT 'default'` が埋め、旧テーブルにしかない列は SELECT に含めないことで自然に捨てられます。ここを `SELECT *` で書くと、列の並びが変わった瞬間に値が別の列へずれ込みます。
+
+## foreign_keys を切る順番という落とし穴
+
+再構築で最も事故りやすいのが外部キーです。`DROP TABLE favorites` を実行した瞬間、そのテーブルを参照している他のテーブルの外部キーは宙に浮きます。`foreign_keys` が ON のままだと、参照制約に引っかかって再構築が失敗したり、逆に参照先を失った行が静かに残ったりします。
+
+だから公式手順は「`PRAGMA foreign_keys = OFF` → トランザクション → 再構築 → `PRAGMA foreign_key_check` → コミット → `PRAGMA foreign_keys = ON`」の順を求めます。ここで見落としやすいのが、**`PRAGMA foreign_keys` はトランザクションの内側では効かない**という仕様です。`withTransactionAsync` の中で切ろうとしても無視されます。先ほどのランナーで `foreign_keys` の切り替えをトランザクションの外、ループ全体を囲む位置に置いたのは、このためです。切ったあとは必ず `foreign_key_check` で壊れた参照が残っていないかを確かめてから ON に戻します。
+
+## マイグレーションをテストする — 旧スキーマの DB を作って流す
+
+このコードのこわいところは、バグっても新規インストールでは絶対に再現しない点です。冒頭のクラッシュがまさにそれでした。だから「わざと古いスキーマの DB を作り、そこに migrate() を流す」テストを書きます。expo-sqlite は `:memory:` を開けるので、実機やシミュレータ上で高速に回せます。
+
+```typescript
+// 旧世代（v1）の DB を意図的に作り、データを1件入れておく
+async function seedV1Database() {
+  const db = await SQLite.openDatabaseAsync(':memory:');
+  await db.execAsync(`
+    CREATE TABLE favorites (
+      id           INTEGER PRIMARY KEY NOT NULL,
+      wallpaper_id TEXT NOT NULL UNIQUE
+    );
+    PRAGMA user_version = 1;
+  `);
+  await db.runAsync(
+    'INSERT INTO favorites (wallpaper_id) VALUES (?)',
+    'sunset-01'
+  );
+  return db;
+}
+
+// v1 の DB に migrate() を流し、データが保持されているかを検証する
+const db = await seedV1Database();
+await migrate(db);
+
+const rows = await db.getAllAsync('SELECT * FROM favorites');
+console.log(rows);
+// 期待する出力:
+// [{ id: 1, wallpaper_id: 'sunset-01', collection: 'default', added_at: 0 }]
+```
+
+v1 だけでなく、v0（空の DB）・v2 の DB からも流して、いずれも同じ最終形に収束することを確かめます。行数が減っていないか、`added_at` や `collection` が正しく埋まっているかまで見ると、再構築の `INSERT ... SELECT` の取りこぼしを早い段階で捕まえられます。私はリリース前のチェックリストに「旧スキーマ3世代 × migrate() で件数が保持されること」を入れています。
+
+## 本番運用で踏んだ3つの落とし穴と、その回避策
+
+### 過去のマイグレーションを後から書き換えてしまう
+
+一つ目は、マイグレーションを一度公開したら**過去のぶんを二度と書き換えない**という約束です。すでに v2 を適用済みの端末は、v1→v2 の関数をもう実行しません。あとから v1→v2 を直しても、その端末には永遠に届きません。この事故を回避するには、修正を必ず新しいバージョンとして末尾に足す運用を徹底します。私はこのルールをチーム規約として推奨します。
+
+### NOT NULL に DEFAULT を付け忘れる
+
+二つ目は、`ALTER TABLE ADD COLUMN` に `NOT NULL` だけ付けて `DEFAULT` を忘れる事故です。新規インストールの `CREATE TABLE` では通るのに、既存行を持つ端末の `ALTER` だけが失敗し、また「既存ユーザーだけ落ちる」構図になります。冒頭のクラッシュと同じ匂いがする不具合に出会ったら、まずデフォルト値の有無を疑って対処します。
+
+### 起動時に CREATE TABLE を二重に流す
+
+三つ目は、マイグレーションの外で `CREATE TABLE IF NOT EXISTS` を起動時に流していたことです。これがあると、`user_version` の目盛りとは別の経路でスキーマが作られてしまい、どちらが正なのか分からなくなります。テーブルの生成はすべてマイグレーション配列の中に一本化し、起動時に走らせるのは `migrate(db)` だけにするのを推奨します。この一本化で、本番運用での「スキーマの出どころが二つある」という曖昧さを解決できます。
+
+App Store と Google Play に長く出しているアプリほど、古いスキーマの端末が裾野に残ります。個人開発では、その一人ひとりのデータを守れるかがレビュー評価に直結します。次にスキーマを変えるときは、まず `PRAGMA user_version` を読むコードを1行足して、今のアプリが「自分のデータが何世代目か」を知っている状態から始めてみてください。
