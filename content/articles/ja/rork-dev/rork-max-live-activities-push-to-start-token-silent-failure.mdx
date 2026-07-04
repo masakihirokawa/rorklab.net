@@ -1,0 +1,122 @@
+---
+title: "Rork Max のアプリでアプリを起動せずに Live Activity を出す — push-to-start トークンが無言で取れない時の設計"
+slug: "rork-max-live-activities-push-to-start-token-silent-failure"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-04T21:20"
+updated: "2026-07-04T21:20"
+author: "Rork Lab"
+description: "Rork Max が生成したネイティブ Swift アプリで、アプリを一度も開かずにサーバから Live Activity を開始したい。ところが push-to-start トークンが観測できず無言で失敗する——その原因と、トークンを確実に取り切る観測レイヤーの実装をまとめます。"
+tags: ["Rork Max", "Live Activities", "ActivityKit", "push-to-start", "Swift", "iOS"]
+highlights:
+  - "アプリを開かずにサーバから Live Activity を開始する push-to-start が、権限・Info.plist・トークン観測タスクのどこで無言に落ちているか log から切り分けられるようになります"
+  - "pushToStartTokenUpdates を起動直後から回し、トークンをサーバへ確実に届ける観測レイヤーを、そのまま Rork Max の生成コードへ足せる薄い実装として手に入ります"
+  - "開始と更新で別物になっている二種類のトークンの扱いを整理し、配信基盤側の topic 指定まで含めて実機で通す勘所がわかります"
+---
+
+配車が確定した瞬間に、ユーザーがアプリを開いていなくてもロック画面へ到着予定を出したい——そんな Live Activity をサーバ起点で始めたくて、Rork Max が生成したアプリに push-to-start を組み込もうとしたときの話です。iOS 17.2 以降なら、アプリを一度も前面に出さなくても、リモート通知だけで Live Activity を開始できます。ところが実装を入れても、サーバへ届くはずの開始用トークンがいつまでも空のまま。エラーも警告も出ず、ただトークンが観測されないだけでした。
+
+原因は `Activity.pushToStartTokenUpdates` を回すタスクが、実際にはトークンを一度も拾えていなかったことです。個人開発でロック画面まわりを触ると、この「実装は入っているのに無言でトークンが来ない」状態に最初に足を止められます。Dolice Labs で運用しているアプリでも、通知や配信基盤が絡む機能ほど実機でしか露見しない不具合が多く、慎重に切り分けてきました。ここでは Rork Max のネイティブアプリに、アプリ未起動から Live Activity を立ち上げる導線を最小差分で足す前提で、無言の失敗の切り分けと、そのまま使える観測レイヤーを順に見ていきます。
+
+## push-to-start と update は別のトークンで動く
+
+まず整理したいのは、Live Activity のリモート制御には性質の違う二種類のトークンが登場することです。ここを混同すると、片方が取れているのにもう片方で詰まって「なぜ動かない」に陥ります。
+
+### 開始トークンと更新トークンの役割
+
+一つ目が push-to-start トークンです。これは「まだ存在しない Live Activity を、アプリ未起動の状態から開始する」ための鍵で、`ActivityAuthorizationInfo` が有効なら、アプリごとに一つ観測できます。二つ目が各 Activity の update トークンで、こちらは既に始まっている個別の Activity を更新・終了するためのものです。
+
+push-to-start はアプリ単位、update は Activity 単位という粒度の違いがそのまま、配信基盤側の指定にも効いてきます。APNs へ送る際の `apns-topic` は、通常のプッシュ（`bundleId`）とは異なり、開始・更新ともに `{bundleId}.push-type.liveactivity` を使い、`apns-push-type: liveactivity` を付けます。ここが通常プッシュと同じ topic のままだと、トークンが正しくても配信段で無言に弾かれます。
+
+## まず「トークンが観測できているか」を log で確かめる
+
+原因を憶測で追う前に、私はトークン観測タスクが実際に値を吐いているかを実機の log で確認します。push-to-start は非同期シーケンスで届くため、タスクが起動していない・途中で解放された、というだけで無言に止まります。
+
+```swift
+import ActivityKit
+import os
+
+let laLog = Logger(subsystem: "net.rorklab.sample", category: "liveactivity")
+
+@MainActor
+final class LiveActivityBootstrap {
+    private var startTokenTask: Task<Void, Never>?
+
+    func begin() {
+        // 権限が無いと token は永遠に来ない
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+            laLog.error("live activities disabled by user")
+            return
+        }
+        observeStartTokens()
+    }
+
+    private func observeStartTokens() {
+        startTokenTask = Task {
+            for await tokenData in Activity<DeliveryAttributes>.pushToStartTokenUpdates {
+                let token = tokenData.map { String(format: "%02x", $0) }.joined()
+                laLog.info("push-to-start token: \(token.prefix(12))…")
+                await self.registerStartToken(token)   // サーバへ送る
+            }
+        }
+    }
+}
+```
+
+`pushToStartTokenUpdates` は `Activity` の型に対して静的に生えている点に注意が要ります。`DeliveryAttributes` は自分で定義した `ActivityAttributes` 準拠型で、この型に紐づくアプリ全体の開始トークンを観測します。log に token の断片が一度も出ないなら、原因はほぼ観測タスクの起動タイミングか権限のどちらかです。
+
+## トークン観測は「起動直後・恒久タスク」で回す
+
+最も多い無言の失敗が、観測タスクを画面表示のタイミングで起動していることです。push-to-start の目的は「アプリを開かせないこと」なので、ユーザーが画面を出すのを待っていては本末転倒で、そもそも起動直後にトークンを取り切ってサーバへ登録しておく必要があります。
+
+```swift
+extension LiveActivityBootstrap {
+    // App 起動直後（SwiftUI なら App.init / .task）で必ず呼ぶ
+    func registerStartToken(_ token: String) async {
+        var request = URLRequest(url: URL(string: "https://api.rorklab.example/latoken")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(["startToken": token])
+        do {
+            _ = try await URLSession.shared.data(for: request)
+            laLog.info("start token registered")
+        } catch {
+            laLog.error("register failed: \(error.localizedDescription)")
+        }
+    }
+}
+```
+
+ここで押さえたいのは、push-to-start トークンはアプリの再インストールや長期間の未起動でローテートされ得るという点です。観測タスクを一度きりで終わらせず、`for await` のループを恒久的に回し続けて、更新のたびにサーバ側を上書きする設計にしておくと、トークン失効による「昨日まで動いていたのに無言で止まった」を回避できます。私はこの観測を、通知権限やアカウント状態とは独立した恒久タスクとして分けて持たせることを推奨します。
+
+## サーバから開始通知を送るときの payload
+
+トークンが取れたら、サーバは APNs へ liveactivity タイプのプッシュを送ります。開始のときだけ `event` が `start` になり、`attributes-type` と `attributes` で初期状態を渡す必要があります。ここが通常の update payload と構造が違うため、update だけ実装して start を後回しにすると気づきにくい落とし穴になります。
+
+```json
+{
+  "aps": {
+    "timestamp": 1751630400,
+    "event": "start",
+    "content-state": { "etaMinutes": 8, "status": "en_route" },
+    "attributes-type": "DeliveryAttributes",
+    "attributes": { "orderId": "A-1024" },
+    "alert": { "title": "配達が始まりました", "body": "到着まであと8分です" }
+  }
+}
+```
+
+`attributes-type` の文字列は、アプリ側の `ActivityAttributes` 準拠型の名前と完全に一致していなければなりません。ここが1文字でもずれると、配信は届いているのに Activity が生成されず、これも無言の失敗になります。私は本番運用に入る前に、この型名をアプリとサーバのテンプレートで単一の定数から生成し、手打ちのずれが起きない運用にしています。
+
+## Rork Max の生成コードで自分の手が要る箇所
+
+Rork Max は ActivityKit の UI と `content-state` の構造までは自然言語からよく生成してくれます。一方で push-to-start を実機で成立させるには、コードの外側の設定を自分で埋める必要があります。私が毎回確認しているのは次の三点です。
+
+一つ目は Info.plist の `NSSupportsLiveActivities` を `YES` にすること。これが無いと Live Activity 自体が動きません。二つ目は、push-to-start を使うなら iOS 17.2 以降を対象にした分岐を入れること。`pushToStartTokenUpdates` は 17.2 で追加された API なので、下位バージョンでは `if #available` で通常起動へフォールバックさせます。三つ目が配信基盤側の topic 指定で、前述の `apns-topic` と `apns-push-type` を liveactivity 用に切り替えることです。ここは App Store 審査そのものには出ませんが、配信段の設定ミスは実機でしか表面化しないため、最初に固めておく価値があります。
+
+## 「無言でトークンが来ない」を切り分ける順番
+
+実機で詰まったら、私は次の順で当たります。まず `areActivitiesEnabled` が `true` か。ユーザーが設定で Live Activity を切っていれば、トークンは永遠に来ません。次に log の push-to-start token が起動直後に出ているか。出ていなければ観測タスクの起動位置を疑います。ここまで通ってサーバにトークンが届いているのに Activity が始まらないなら、原因は配信段——`apns-topic` か `attributes-type` の不一致——に絞れます。
+
+この切り分け順を先に固めておくと、Live Activity のように「UI・権限・配信基盤」が絡む機能でも、どの層の問題かを短時間で言い当てられます。次の一手としては、上の `LiveActivityBootstrap` を App 起動直後の `.task` へ組み込み、実機でアプリを完全に終了した状態からサーバの start プッシュを一発撃ってみてください。ロック画面に Activity が立ち上がるか、log のどこで止まるかで、残りの原因はほぼ確定します。
