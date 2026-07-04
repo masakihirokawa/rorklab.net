@@ -1,0 +1,172 @@
+---
+title: "Rork Max の健康アプリで、朝になると歩数が更新されない — HKObserverQuery が無言で止まる background delivery の設計"
+slug: "rork-max-healthkit-background-delivery-observer-query-silent-stop"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-04T21:00"
+updated: "2026-07-04T21:00"
+author: "Rork Lab"
+description: "Rork Max が生成したネイティブ Swift の健康アプリで、アプリを閉じている間の歩数や心拍が反映されない——その多くは HKObserverQuery の background delivery が無言で止まっていることが原因でした。切り分けと、そのまま組み込める観測レイヤーの実装をまとめます。"
+tags: ["Rork Max", "HealthKit", "background delivery", "HKObserverQuery", "Swift", "iOS"]
+highlights:
+  - "アプリを閉じている間だけデータが遅れる症状を、権限・background delivery 登録・observer の生存期間のどこで落ちているか log から切り分けられるようになります"
+  - "HKObserverQuery と HKAnchoredObjectQuery を組み合わせ、completionHandler を必ず呼ぶ観測レイヤーを、そのまま Rork Max の生成コードに足せる薄いラッパーとして手に入ります"
+  - "Rork Max が書ききれない Info.plist・Capabilities・バックグラウンド更新の実機制約を、どこで自分の手で補うかがわかります"
+---
+
+歩数を記録するだけの小さなアプリを Rork Max で組んだとき、シミュレータでは何の問題もありませんでした。手動でヘルスデータを流し込むと即座に画面へ反映されます。ところが実機に載せて数日使うと、朝アプリを開いた瞬間だけ前日夜からの歩数がごっそり欠けていて、しばらくすると帳尻が合う、という妙な挙動に気づきました。エラーは一切出ません。ただアプリを閉じている間の更新が届いていないだけでした。
+
+原因は `HKObserverQuery` の background delivery が、登録したつもりで実際には有効になっていなかったことです。個人開発でヘルスケア連携を扱うと、この「フォアグラウンドでは動くのに、閉じると静かに止まる」パターンに最初に足を取られます。Dolice Labs で運用している小さなアプリ群でも、この種の本番でしか露見しない不具合には何度も向き合ってきました。ここでは Rork Max が生成したネイティブアプリに、アプリが起きていない間もヘルスデータを拾い続ける観測レイヤーを最小差分で乗せる前提で、無言の失敗の切り分け方と、そのまま使える実装を順に見ていきます。
+
+## HealthKit のバックグラウンド更新が「三段構え」であること
+
+多くの人が `HKObserverQuery` を一つ張れば済むと考えますが、アプリを閉じた状態でも更新を受け取るには、独立した三つの仕組みを同時に満たす必要があります。ここを分けて捉えないと、どれか一つが欠けたまま「なぜか届かない」で止まります。
+
+### 権限・登録・observer の三段を分けて捉える
+
+一段目は権限です。読みたい型（歩数なら `HKQuantityType(.stepCount)`）に対して読み取り認可が下りていること。二段目は background delivery の登録で、`enableBackgroundDelivery(for:frequency:)` を型ごとに呼び、システムに「この型が変化したら起こしてくれ」と伝えること。三段目が observer query 本体で、変化の通知を受けて実際にデータを引きに行く役割です。
+
+### 無言の失敗が生まれる非対称性
+
+厄介なのは、権限が「読み取り」しか下りていない状態でも background delivery の登録 API がエラーを返さないことです。登録は成功したように見えるのに、通知が一度も来ない。この非対称性が無言の失敗の温床になっています。本番でだけ静かに欠ける不具合は、たいていこの手前で決まっています。
+
+## まず「どの段で落ちているか」を log で切り分ける
+
+原因を憶測で追うと時間を溶かします。私はいつも、三段のそれぞれに印字を仕込んで、どこまで到達しているかを実機の log で確認する手順から入ります。
+
+```swift
+import HealthKit
+import os
+
+let healthLog = Logger(subsystem: "net.rorklab.sample", category: "health")
+
+final class HealthObservation {
+    let store = HKHealthStore()
+    let stepType = HKQuantityType(.stepCount)
+
+    func bootstrap() async {
+        // 一段目: 権限
+        do {
+            try await store.requestAuthorization(toShare: [], read: [stepType])
+            healthLog.info("auth requested")
+        } catch {
+            healthLog.error("auth failed: \(error.localizedDescription)")
+            return
+        }
+
+        // 二段目: background delivery 登録
+        do {
+            try await store.enableBackgroundDelivery(for: stepType, frequency: .hourly)
+            healthLog.info("background delivery enabled")
+        } catch {
+            healthLog.error("bg delivery failed: \(error.localizedDescription)")
+        }
+
+        // 三段目: observer query
+        startObserver()
+    }
+}
+```
+
+`enableBackgroundDelivery` は `frequency` に `.immediate` を渡せますが、歩数のように頻繁に変わる型に即時配信を求めると、システムがスロットリングして結局間引かれます。私は歩数・移動距離のような累積系は `.hourly` に落ち着きました。心拍のワークアウト連動のような即応が要る型だけ `.immediate` を検討する、という使い分けを推奨します。実機ではこの方が堅いと考えています。
+
+## observer が「一度きりで死ぬ」問題を completionHandler で防ぐ
+
+三段目の observer query こそ、無言の失敗が最も起きる場所です。`HKObserverQuery` のハンドラには `completionHandler`（HealthKit 側では `HKObserverQueryCompletionHandler`）が渡されます。これを呼ばないと、システムは「まだ処理が終わっていない」と判断し、以後の background 起動を止めてしまいます。フォアグラウンドでは呼び忘れても動いてしまうため、リリースまで気づけません。
+
+```swift
+extension HealthObservation {
+    func startObserver() {
+        let query = HKObserverQuery(
+            sampleType: stepType,
+            predicate: nil
+        ) { [weak self] _, completionHandler, error in
+            guard let self else { completionHandler(); return }
+            if let error {
+                healthLog.error("observer error: \(error.localizedDescription)")
+                completionHandler()   // エラー時も必ず呼ぶ
+                return
+            }
+            // 実データの取得は anchored query に委譲
+            Task {
+                await self.fetchIncremental()
+                healthLog.info("observer fired, incremental fetched")
+                completionHandler()   // 取得完了後に呼ぶ
+            }
+        }
+        store.execute(query)
+    }
+}
+```
+
+ここでの要点は二つです。第一に、`completionHandler()` を成功・失敗・early return のすべての経路で必ず一度だけ呼ぶこと。第二に、observer 自体はデータを運んでこないという事実です。observer は「何かが変わった」という合図しか渡しません。呼び忘れという小さな罠の対処を先に固めておくと、後段の切り分けがずっと楽になります。実際の差分取得は別途 anchored query で行います。
+
+## 差分だけを取る HKAnchoredObjectQuery を組み合わせる
+
+observer が起きるたびに全期間を舐め直すと、バックグラウンドの実行時間をすぐ使い切ります。`HKAnchoredObjectQuery` は前回位置を表す `anchor` を返すので、それを保存しておけば次回は増えた分だけを引けます。この anchor の永続化を怠ると、毎回フル取得になり、結局スロットリングされて「たまに欠ける」症状に戻ります。
+
+```swift
+extension HealthObservation {
+    private var anchorKey: String { "health.anchor.stepCount" }
+
+    private func loadAnchor() -> HKQueryAnchor? {
+        guard let data = UserDefaults.standard.data(forKey: anchorKey) else { return nil }
+        return try? NSKeyedUnarchiver.unarchivedObject(
+            ofClass: HKQueryAnchor.self, from: data)
+    }
+
+    private func saveAnchor(_ anchor: HKQueryAnchor) {
+        let data = try? NSKeyedArchiver.archivedData(
+            withRootObject: anchor, requiringSecureCoding: true)
+        UserDefaults.standard.set(data, forKey: anchorKey)
+    }
+
+    func fetchIncremental() async {
+        await withCheckedContinuation { continuation in
+            let query = HKAnchoredObjectQuery(
+                type: stepType,
+                predicate: nil,
+                anchor: loadAnchor(),
+                limit: HKObjectQueryNoLimit
+            ) { [weak self] _, samples, _, newAnchor, error in
+                if let error {
+                    healthLog.error("anchored error: \(error.localizedDescription)")
+                }
+                if let newAnchor { self?.saveAnchor(newAnchor) }
+                let count = samples?.count ?? 0
+                healthLog.info("incremental samples: \(count)")
+                // ここで samples を自前のストアへ反映する
+                continuation.resume()
+            }
+            store.execute(query)
+        }
+    }
+}
+```
+
+anchor は `UserDefaults` でも十分ですが、App Group を使ってウィジェットと共有すると、ウィジェット側の表示も同じ差分基準で揃えられます。私は複数の小さなアプリを運用する中で、この anchor の保存先を最初から共有ストレージにしておくと後の拡張が楽だと感じています。
+
+## Rork Max の生成コードが書ききれない三つの穴
+
+Rork Max は Swift のクエリロジックまでは自然言語から十分に生成してくれます。しかし background delivery を実機で成立させるには、コードの外側にある設定を自分で埋める必要があり、ここが AI の生成物だけでは埋まりません。私が毎回手で確認しているのは次の三点です。
+
+### 1. Info.plist の利用目的文
+
+`NSHealthShareUsageDescription`（読み取り）と、書き込むなら `NSHealthUpdateUsageDescription` の両方を、審査で拒否されない具体的な文面で入れます。ここが空だと実機で権限ダイアログ自体が出ず、App Store 審査でも指摘されます。
+
+### 2. Capabilities の有効化
+
+HealthKit の capability を有効化し、background delivery を使うなら Background Modes ではなく HealthKit の設定側で有効になっていること（`enableBackgroundDelivery` の呼び出しと対になる）を確認します。
+
+### 3. ワークアウト連動の追加設定
+
+ワークアウト中の高頻度更新を受けたいなら、Background Modes の Workout processing を有効化します。歩数だけなら不要ですが、心拍のリアルタイム取得へ拡張する段で必ず必要になります。
+
+## 「閉じている間だけ欠ける」を再現テストする段取り
+
+この種の不具合はフォアグラウンドでは再現しません。私が使っている確認手順は、アプリを完全にバックグラウンドへ送り（ホーム画面へ戻す）、別途 iPhone のヘルスケアアプリやワークアウトで実データを増やし、数十分後にアプリを開いて log の `observer fired` が閉じている間に出ていたかを見る、というものです。
+
+もし `background delivery enabled` は出ているのに `observer fired` が閉じている間に一度も出ていなければ、原因は observer の登録タイミングにあることが多いです。observer query はアプリ起動のたびに `execute` し直す必要があり、`application(_:didFinishLaunchingWithOptions:)` 相当の早い段階で張り直していないと、システムからの background 起動時に query が存在せず取りこぼします。Rork Max の生成コードでは observer の起動が画面表示後になりがちなので、ここを起動直後へ引き上げるのが実機で効く一手です。AdMob やサブスクの計測をヘルスデータに紐づける拡張でも、この起動タイミングの前倒しが土台になります。
+
+次に手を動かすなら、まずは上の `HealthObservation` を起動直後に `bootstrap()` する形で組み込み、実機で一晩放置してから log を確認してみてください。三段のどこで切れているかが log から一目でわかる状態を先に作ることが、この無言の失敗を短時間で終わらせる近道になります。
