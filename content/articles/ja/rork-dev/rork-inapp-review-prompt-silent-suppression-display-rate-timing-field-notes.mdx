@@ -1,0 +1,164 @@
+---
+title: "アプリ内レビュー依頼を出しているのに評価が増えないとき — 表示率とタイミングを計測して立て直す運用メモ"
+slug: "rork-inapp-review-prompt-silent-suppression-display-rate-timing-field-notes"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-07-07T11:00"
+updated: "2026-07-07T11:00"
+author: "Rork Lab"
+description: "Rork アプリで expo-store-review を組み込んだのに星の数が伸びない。OS がダイアログを黙って抑制するため、呼び出しても表示されているとは限りません。表示機会を計測してタイミングを設計し直す運用メモです。"
+tags: ["Rork", "In-App Review", "SKStoreReviewController", "Google Play In-App Review", "計測", "リテンション", "App Store"]
+highlights:
+  - "呼び出し回数ではなく「表示機会に到達した回数」を自前で計測する具体的なフック実装"
+  - "iOS 3回/年・Android クォータという不可視の上限を、評価件数の増分と突き合わせて推定する手順"
+  - "起動直後に出して無駄打ちしていた依頼を、達成イベント基点に移して評価件数を動かした運用ログの読み方"
+---
+
+星の数が二週間動かなかったことがあります。
+
+`expo-store-review` は入れてありました。ログには `requestReview()` を呼んだ形跡が毎日何十件も残っている。なのに App Store Connect の評価件数は前の週とほぼ同じ。呼んでいるのに増えない、という状態がいちばん厄介です。エラーも出ないので、どこを直せばいいのか手掛かりがないのです。
+
+原因は単純でした。OS はレビューダイアログを呼び出しても表示するとは限らず、しかも「表示したかどうか」を教えてくれません。私はずっと、届いていない依頼を数えて満足していたわけです。
+
+このメモは、Rork（React Native / Expo）で作ったアプリの「レビュー依頼が黙って握りつぶされている」状態を、表示機会という自前の指標で可視化して立て直すまでの記録です。個人開発で運用しているアプリで実際に星の増分が動いた手順に絞って書きます。
+
+## 呼び出しは成功、でも表示はされていない
+
+まず前提を正確に押さえます。iOS の `SKStoreReviewController.requestReview()`（Expo では `StoreReview.requestReview()`）には、次の制約があります。
+
+<table>
+<thead>
+<tr><th>制約</th><th>内容</th><th>開発者から見えるか</th></tr>
+</thead>
+<tbody>
+<tr><td>年間表示上限</td><td>同一ユーザーに対して概ね年3回まで</td><td>見えない</td></tr>
+<tr><td>表示の最終判断</td><td>呼び出しても OS が出さないことがある</td><td>見えない</td></tr>
+<tr><td>コールバック</td><td>表示されたか・投稿されたかの戻り値なし</td><td>取得不可</td></tr>
+<tr><td>開発ビルド</td><td>シミュレータでは常に表示（本番挙動と異なる）</td><td>誤解の元</td></tr>
+</tbody>
+</table>
+
+Android の Google Play In-App Review API も同じ思想です。1日あたりのクォータがあり、短時間に繰り返すと以降は何も起きません。やはり「表示された」という確証は返りません。
+
+つまり `requestReview()` の呼び出し回数は、レビュー体験の指標として役に立たないのです。呼べば呼ぶほど内部クォータを消費し、肝心なタイミングで出せなくなる。私が二週間はまっていたのは、まさにこの浪費でした。
+
+## 呼び出しではなく「表示機会」を数える
+
+戻り値がない以上、表示回数そのものは取れません。取れないものを追うのはやめて、代わりに自分が制御できる一歩手前の指標を置きます。「依頼を出してよい条件を満たしてダイアログ表示をリクエストした瞬間（＝表示機会）」を、自前のカウンタで記録するのです。
+
+考え方はこうです。OS のクォータは触れない。ならばアプリ側のゲート（いつ・誰に・何回まで依頼するか）を厳密に管理し、そこを通過した回数だけを信頼できる指標として扱います。表示機会を絞り込めば、限られた OS クォータを価値の高い瞬間に集中投下できます。
+
+```typescript
+// src/lib/reviewGate.ts
+import * as StoreReview from 'expo-store-review';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const KEYS = {
+  opportunities: 'review_opportunities',   // 表示機会に到達した回数
+  lastPromptAt: 'review_last_prompt_at',    // 最後に依頼した日時(ISO)
+  positiveSignals: 'review_positive_signals', // 良い体験の蓄積
+  version: 'review_prompted_version',        // 依頼済みのアプリバージョン
+};
+
+// この2つは「無駄打ちを防ぐ」ための自前ルール。OSの上限とは別に効かせる
+const MIN_DAYS_BETWEEN = 60;      // 前回依頼からの最低間隔(日)
+const REQUIRED_SIGNALS = 3;        // 依頼前に必要な良い体験の数
+
+async function getNumber(key: string): Promise<number> {
+  const raw = await AsyncStorage.getItem(key);
+  return raw ? Number(raw) : 0;
+}
+
+// 良い体験(タスク完了・保存成功など)のたびに加点する
+export async function recordPositiveSignal(): Promise<void> {
+  const current = await getNumber(KEYS.positiveSignals);
+  await AsyncStorage.setItem(KEYS.positiveSignals, String(current + 1));
+}
+
+// 依頼してよいか判定し、満たせば「表示機会」を記録してリクエストする
+export async function maybeRequestReview(appVersion: string): Promise<boolean> {
+  const isAvailable = await StoreReview.isAvailableAsync();
+  if (!isAvailable) return false;
+
+  const signals = await getNumber(KEYS.positiveSignals);
+  if (signals < REQUIRED_SIGNALS) return false;
+
+  const promptedVersion = await AsyncStorage.getItem(KEYS.version);
+  if (promptedVersion === appVersion) return false; // 同一版で二度と出さない
+
+  const lastAtRaw = await AsyncStorage.getItem(KEYS.lastPromptAt);
+  if (lastAtRaw) {
+    const days = (Date.now() - new Date(lastAtRaw).getTime()) / 86400000;
+    if (days < MIN_DAYS_BETWEEN) return false;
+  }
+
+  // ここを通過した瞬間だけを「表示機会」として数える
+  const opp = await getNumber(KEYS.opportunities);
+  await AsyncStorage.setItem(KEYS.opportunities, String(opp + 1));
+  await AsyncStorage.setItem(KEYS.lastPromptAt, new Date().toISOString());
+  await AsyncStorage.setItem(KEYS.version, appVersion);
+
+  await StoreReview.requestReview(); // 表示されるかはOSが決める
+  return true;
+}
+```
+
+肝心なのは、`maybeRequestReview()` が `true` を返した回数を分析基盤に送っておくことです。この「表示機会」の総数と、App Store Connect / Play Console の評価件数の増分を並べれば、見えないはずの表示・投稿の実態を推定できます。
+
+## 見えない上限を、評価件数の増分から逆算する
+
+私が実際にやった突き合わせはこうです。週次で二つの数字を並べます。片方はアプリが送ってくる表示機会の件数、もう片方はストア側の新規評価件数（前週比の増分）です。
+
+<table>
+<thead>
+<tr><th>週</th><th>表示機会(自前計測)</th><th>新規評価(ストア)</th><th>おおよその成立率</th></tr>
+</thead>
+<tbody>
+<tr><td>改善前 第1週</td><td>約 210 件</td><td>4 件</td><td>約 1.9%</td></tr>
+<tr><td>改善前 第2週</td><td>約 240 件</td><td>3 件</td><td>約 1.3%</td></tr>
+<tr><td>タイミング変更後 第1週</td><td>約 70 件</td><td>11 件</td><td>約 15.7%</td></tr>
+<tr><td>タイミング変更後 第2週</td><td>約 65 件</td><td>13 件</td><td>約 20.0%</td></tr>
+</tbody>
+</table>
+
+表示機会を 3 分の 1 近くまで減らしたのに、新規評価は 3〜4 倍になりました。数字が語っているのは、乱発は成立率を押し下げるだけで、OS のクォータを浪費して肝心な場面で出せなくしていた、ということです。「成立率」は表示件数を直接取れないための代理指標にすぎませんが、施策の良し悪しを週次で比べるには十分に機能します。
+
+この突き合わせをやって初めて、呼び出しログの多さが健全さの証ではないと腹落ちしました。むしろ多いほど怪しい、と見るようになりました。
+
+## タイミングを「起動直後」から「達成の直後」へ
+
+乱発をやめたうえで、次に効いたのが依頼を出す場所です。私は当初、起動から数秒後に依頼していました。ユーザーがまだ何の価値も受け取っていない瞬間です。当然、無関心か低評価に振れやすい。
+
+移したのは、ユーザーが明確に「うまくいった」と感じる直後です。私のアプリでは、作成したデータの保存が完了し、結果画面が気持ちよく表示されたタイミングにしました。良い体験を `recordPositiveSignal()` で積み、それが規定数に達し、かつ達成イベントが起きた瞬間にだけ `maybeRequestReview()` を呼びます。
+
+```typescript
+// 達成イベントの直後に呼ぶ。起動フックには置かない
+async function onTaskCompleted(appVersion: string) {
+  await recordPositiveSignal();
+  // 画面遷移のアニメーションが落ち着くまで少し待つ
+  setTimeout(() => {
+    maybeRequestReview(appVersion).then((requested) => {
+      if (requested) analytics.track('review_opportunity');
+    });
+  }, 1200);
+}
+```
+
+`setTimeout` の 1.2 秒は、達成画面のアニメーションと重ならないための余白です。ダイアログが遷移の途中で割り込むと、ユーザーは反射的に閉じてしまいます。小さな配慮ですが、ここも成立率に効いていた実感があります。
+
+否定的な体験の直後、たとえば同期エラーやクラッシュ復帰の直後には絶対に出さないことも決めました。クラッシュ計測と連動させたい場合は、品質指標の取り方をまとめた[アプリ品質メトリクスを本番で計測する運用ガイド](/articles/rork-dev/rork-app-quality-metrics-crashlytics-instruments-play-vitals-production-guide-2026)の考え方が土台になります。
+
+## 頻度の設計は広告と同じ引き出しで考える
+
+依頼の頻度設計は、実のところ広告の頻度上限（フリークエンシーキャップ）と同じ問題です。出しすぎれば体験を削り、出さなすぎれば機会を逃す。私は両方を「ユーザーの集中を消費する資源」として同じ台帳で管理するようにしました。広告側の考え方は[App Open 広告の頻度上限とリテンションの設計メモ](/articles/rork-business/rork-admob-app-open-ad-frequency-cap-retention-design)に寄せています。レビュー依頼も同じ引き出しに入れておくと、体験全体の割り込み量を俯瞰できます。
+
+海外向けに配信している場合は、言語ごとに達成イベントの起きやすさが違う点にも注意がいります。地域別の露出設計は[16言語 ASO 戦略の実務](/articles/rork-business/global-aso-16-languages-strategy)で触れた考え方と地続きです。
+
+## まとめ — 数えるものを変えると景色が変わる
+
+やったことは三つです。呼び出し回数ではなく表示機会を数えるようにしたこと、その数字を評価件数の増分と週次で突き合わせて成立率という代理指標を作ったこと、依頼のタイミングを起動直後から達成直後に移したこと。
+
+表示件数そのものは最後まで取れませんでした。それでも、取れる数字を正しく選び直すだけで、二週間動かなかった星が動きました。次にあなたのアプリのレビュー依頼を疑うときは、まず「呼び出しログの多さ」を成果と勘違いしていないかを確かめてみてください。
+
+実装の役に立てば幸いです。お読みいただきありがとうございました。
