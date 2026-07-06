@@ -1,0 +1,194 @@
+---
+title: "The App Icon Badge Still Says 3 — Rebuilding Expo Badge Counts Around a Single Source of Truth"
+slug: "rork-expo-app-icon-badge-count-source-of-truth-resync-design"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-07-07T12:00"
+updated: "2026-07-07T12:00"
+author: "Rork Lab"
+description: "Why an Expo app's icon badge drifts out of sync with real unread counts and refuses to clear — and how to rebuild it around a single source of truth, with working recompute-and-sync code and the production pitfalls that bite you."
+tags: ["Expo", "React Native", "Notifications", "Badge", "Rork"]
+highlights:
+  - "If you've been stuck on 'the badge still shows 3 after I open the app' reports, you can ship a recompute-based sync today"
+  - "You'll replace the double bookkeeping of notification-set badges and app-set badges with one function derived purely from state"
+  - "You'll implement resync on foreground, on notification receipt, and across iOS/Android differences so the badge never drifts again"
+---
+
+A few weeks after release, review after review said the same thing: "the red badge stays on 3 and won't clear even when I open the app." This happened in a habit-tracking app I run as an indie developer. Open it and there are zero unread items, yet the home screen icon keeps insisting on "3." From the user's side, the app looks like it's lying.
+
+When I traced it, nothing in the code ever said "set the badge to 3." The badge was being incremented by the notifications themselves, and nobody owned the job of bringing it back down. This article breaks down why that mismatch happens and rebuilds the badge around a value recomputed from state, with the code that got mine to behave.
+
+## What actually makes the badge drift
+
+In an Expo (React Native) app, the badge count is written by two different actors that don't know about each other.
+
+One is the notification system. When a local or push notification carries a `badge` value, the OS rewrites the icon badge on delivery. The other is your app, which only changes the badge when you call `Notifications.setBadgeCountAsync()`.
+
+The trouble is that these two never coordinate. Every time a notification arrives, the OS bumps the badge, but when the user reads that item inside the app, nothing happens unless your code explicitly lowers the badge. What's left behind is the number the notifications piled up.
+
+Worse, the `badge` value baked into a notification is frozen at the moment that notification was scheduled. If your state changes while the user ignores the notification, a previously scheduled notification still fires with its stale `badge`. The badge reflects a snapshot from scheduling time, not the count right now.
+
+## Pick one source of truth
+
+You can't solve this while you're still thinking in terms of "who writes the badge." The whole problem is that more than one actor writes it.
+
+Flip the framing: define the badge count as something computed uniquely from app state. Unread notices, incomplete tasks, reminders awaiting review — gather whatever should surface on the badge into one function, and let only that function decide the truth. Stop relying on the `badge` field of notifications entirely.
+
+I built this the same way I once handled the ad-free state for AdMob: anything with several inputs must flow through a single composed function, and you never assemble the state anywhere else. A badge fits that shape perfectly.
+
+Start with a pure function that gathers the contributing state and returns a number.
+
+```typescript
+// badge/computeBadgeCount.ts
+// The one function that "computes" the badge from app state.
+// Never assemble a badge number anywhere else.
+
+import type { AppState } from "../store/types";
+
+export function computeBadgeCount(state: AppState): number {
+  // Only sum the things you want the badge to represent.
+  // e.g. unread notices + overdue incomplete reminders
+  const unreadNotices = state.notices.filter((n) => !n.read).length;
+  const dueReminders = state.reminders.filter(
+    (r) => !r.completed && r.dueAt <= Date.now()
+  ).length;
+
+  // Normalize at the end so we never emit a negative or NaN
+  const total = unreadNotices + dueReminders;
+  return Number.isFinite(total) && total > 0 ? total : 0;
+}
+```
+
+The function takes only store state as input and has no side effects. It's easy to test, and "what the badge means" now lives in exactly one place.
+
+## Sync the computed value to the OS
+
+Keep the code that pushes the number to the actual icon badge as a thin wrapper. This is also where you absorb the OS differences discussed below.
+
+```typescript
+// badge/syncBadge.ts
+import * as Notifications from "expo-notifications";
+import { computeBadgeCount } from "./computeBadgeCount";
+import type { AppState } from "../store/types";
+
+let lastApplied = -1; // remember the last value to skip redundant writes
+
+export async function syncBadge(state: AppState): Promise<number> {
+  const next = computeBadgeCount(state);
+
+  // If it matches the previous value, do nothing. Fewer native calls.
+  if (next === lastApplied) return next;
+
+  try {
+    const ok = await Notifications.setBadgeCountAsync(next);
+    // Some Android launchers return false. Don't swallow it silently.
+    if (ok) {
+      lastApplied = next;
+    }
+  } catch (e) {
+    // A transient native failure must not crash the app. Retry next sync.
+    console.warn("[badge] setBadgeCount failed", e);
+  }
+  return next;
+}
+```
+
+The `lastApplied` guard stops you from writing to native on every state change. Badge sync gets called often, so this small check quietly earns its keep.
+
+## Call it back on foreground and on receipt
+
+Choosing a source of truth is only half of it. Get the timing of "when to call it" wrong and you're back where you started. The moments the badge drifts are predictable: while the app is closed and a notification arrives, and when the user clears something inside the app.
+
+So call `syncBadge` at exactly three moments:
+
+1. When the app returns to the foreground (`AppState` transition to `active`)
+2. When a notification is received in the foreground (`addNotificationReceivedListener`)
+3. Whenever unread/incomplete state changes inside the app (after the store update)
+
+Register the first two once, at startup.
+
+```typescript
+// badge/registerBadgeSync.ts
+import { AppState, type AppStateStatus } from "react-native";
+import * as Notifications from "expo-notifications";
+import { syncBadge } from "./syncBadge";
+import { getState } from "../store"; // assume it returns the current AppState
+
+export function registerBadgeSync(): () => void {
+  // (1) recompute on foreground
+  const handleAppState = (next: AppStateStatus) => {
+    if (next === "active") {
+      void syncBadge(getState());
+    }
+  };
+  const sub = AppState.addEventListener("change", handleAppState);
+
+  // (2) when a notification lands in the foreground, override what the OS bumped
+  const received = Notifications.addNotificationReceivedListener(() => {
+    void syncBadge(getState());
+  });
+
+  // sync once right after launch, too
+  void syncBadge(getState());
+
+  // return an unsubscribe function for cleanup
+  return () => {
+    sub.remove();
+    received.remove();
+  };
+}
+```
+
+For the third trigger, put the call at the tail of whatever mutates state. Inside the function that marks a notice as read, for example, call `syncBadge(getState())` right after the update commits. Forget this and you get exactly the opening symptom: "I read it in the app but the badge won't go down."
+
+One more thing: stop setting the `badge` field when you schedule notifications. The whole premise is that the OS never touches the badge on its own. For the content and scheduling of notifications themselves, I've written separately about [keeping Expo scheduled local notifications resilient to time zones](/articles/rork-dev/rork-expo-local-notification-timezone-dst-resync-design).
+
+## Where iOS and Android diverge
+
+How much of the badge your app can actually control differs a lot by OS. Implement this without knowing that, and you'll fix one platform while the other stays broken.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>iOS</th><th>Android</th></tr>
+</thead>
+<tbody>
+<tr><td>Who owns the badge</td><td>OS supports icon badges natively</td><td>Launcher-dependent; the home app decides</td></tr>
+<tr><td>Permission</td><td>badge permission must be included at request time</td><td>Follows notification channel settings</td></tr>
+<tr><td>setBadgeCountAsync</td><td>Reliably applied</td><td>Returns true/false; false on unsupported launchers</td></tr>
+<tr><td>Setting 0</td><td>Badge clears</td><td>May linger on some launchers</td></tr>
+</tbody>
+</table>
+
+On iOS you must explicitly request badge permission at the point you ask for notification access.
+
+```typescript
+// iOS needs badge permission for badges. Include it in the request.
+await Notifications.requestPermissionsAsync({
+  ios: {
+    allowAlert: true,
+    allowSound: true,
+    allowBadge: true, // omit this and setBadgeCountAsync is ignored
+  },
+});
+```
+
+On Android, the realistic move is to give up the assumption that your app fully controls the badge. A meaningful share of launchers return `false` from `setBadgeCountAsync`. I decided to treat Android as "attempt the sync, but a failure is still the happy path," and made the in-app list UI the primary way to surface unread items. Once you frame the badge as a secondary hint, both the implementation and your peace of mind get easier. For handling the notification permission itself, I've collected notes on [implementing a soft-ask opt-in](/articles/rork-dev/rork-notification-soft-ask-opt-in).
+
+## Three pitfalls I hit in production
+
+The design is straightforward, but the details tripped me up in production. Here are ones I actually stepped on.
+
+First, I tried to trust the return of `getBadgeCountAsync()` and compute a diff — "current badge minus what was read." That misses any rewrite that came through notifications, so it always drifts. Never break the rule that the badge is always recomputed from state.
+
+Second, the ordering between store updates and the `syncBadge` call. I used optimistic updates that rewrote the UI first and persisted afterward, so `syncBadge` occasionally read stale state and briefly showed too high a number. Deciding to always call sync after the store commits cleared it up.
+
+Third, a missed reset on logout. A report came in that switching accounts left the previous user's badge count. The fix was one line — call `Notifications.setBadgeCountAsync(0)` at the end of the logout flow — but it reminded me that resetting state and resetting the badge are two different jobs.
+
+These are all the kind of bug you miss in a test environment, because you don't manually send notifications there. Building a verification step — pile up a few notifications on a real device, leave the app closed for a while, then open it — makes them far easier to reproduce. Reproducing the push path also benefits from the groundwork in [syncing Expo push tokens with your server](/articles/rork-dev/rork-expo-push-token-registration-refresh-server-lifecycle).
+
+## Wrapping up
+
+Start by searching your codebase and counting the calls to `setBadgeCountAsync`. If a notification's `badge` field and `setBadgeCountAsync` both coexist, that mix is the root of the drift. As a first step you can take today, write a single recompute function like `computeBadgeCount` and call it on foreground — that alone changes the behavior.
+
+The smaller the indicator, the more users treat it as a gauge of how trustworthy the app is. Fixing this one point noticeably softened the tone of my reviews, and it left me convinced that these quiet sync routines are worth designing with care. Thank you for reading.

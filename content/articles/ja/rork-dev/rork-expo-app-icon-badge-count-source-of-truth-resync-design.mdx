@@ -1,0 +1,194 @@
+---
+title: "アイコンのバッジが「3」のまま消えない — Expoアプリのバッジ数をSource of Truthで作り直す"
+slug: "rork-expo-app-icon-badge-count-source-of-truth-resync-design"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-07-07T12:00"
+updated: "2026-07-07T12:00"
+author: "Rork Lab"
+description: "Expoアプリのアイコンバッジが実際の未読と食い違い、消えなくなる原因を突き止め、バッジ数を状態から再計算して同期するSource of Truth設計を、動くコードと実運用の落とし穴つきで整理します。"
+tags: ["Expo", "React Native", "通知", "バッジ", "Rork"]
+highlights:
+  - "アイコンバッジが「3」のまま消えないユーザー報告に悩んでいた人が、その日のうちに再計算式の同期コードを手に入れられる"
+  - "通知が設定するバッジとアプリが設定するバッジの二重管理をやめ、状態から一意に決まる1本の関数へ統合できる"
+  - "フォアグラウンド復帰・通知受信・iOS/Androidの挙動差まで含めて、バッジが二度とズレない再同期設計を実装できる"
+---
+
+リリースから数週間後、レビュー欄に「アイコンの赤いバッジが3のまま、アプリを開いても消えない」という報告が並びました。私が個人開発で運営している習慣化アプリでの出来事です。中を開けば未読は0件なのに、ホーム画面のアイコンだけが「3」を主張し続ける。ユーザーからすれば、アプリが嘘をついているように見えます。
+
+原因を追ってみると、コードのどこにも「バッジを3にする」とは書いていませんでした。バッジを増やしていたのは通知そのもので、それを減らす責任を誰も持っていなかったのです。以下では、その食い違いがなぜ起きるのかを分解し、バッジ数を状態から再計算して同期する設計へ作り直すまでを、動くコードとともに追っていきます。
+
+## バッジが「ズレる」本当の原因
+
+Expo（React Native）アプリのバッジ数は、実は二つの主体が別々に書き込んでいます。
+
+一つは通知システムです。ローカル通知やプッシュ通知に `badge` の値が含まれていると、OSが受信時にアイコンバッジを自動で書き換えます。もう一つはアプリ本体で、`Notifications.setBadgeCountAsync()` を呼んだときだけ書き換わります。
+
+問題は、この二つが互いの存在を知らないことです。通知が届くたびにOSがバッジを1つ増やしても、ユーザーがアプリ内でその項目を読んだとき、アプリ側は「バッジを減らす」処理を明示的に呼ばない限り何もしません。結果として、通知が積み上げた数値だけが取り残されます。
+
+さらにやっかいなのは、通知を配信したときの `badge` 値が「その通知が来た瞬間の未読数」で固定される点です。ユーザーが通知を無視している間に状態が変わっても、過去に予約した通知の `badge` は古い数値のまま発火します。バッジは「今の未読数」ではなく「予約した時点のスナップショット」を映してしまうのです。
+
+## Source of Truth を1つに決める
+
+この問題は、バッジ数を「誰が書き込むか」で考えている限り解けません。書き込む主体が複数あることが原因だからです。
+
+発想を変えて、バッジ数は「アプリの状態から一意に計算されるもの」と定義し直します。未読の通知、未完了のタスク、確認待ちのリマインダー——アプリが持つ状態のうち、バッジに反映すべきものを1本の関数にまとめ、その関数だけがバッジの真実を決めます。通知の `badge` フィールドには一切頼りません。
+
+私はこの方針を、以前 AdMob の広告解放状態を扱ったときと同じ考え方で組みました。複数の判定材料があるものは、必ず1本の合成関数を経由させ、そこ以外では状態を組み立てない。バッジもまったく同じ構造で扱えます。
+
+まず、バッジに寄与する状態を集めて数値を返す純粋関数を用意します。
+
+```typescript
+// badge/computeBadgeCount.ts
+// アプリの状態からバッジ数を「計算」する唯一の関数。
+// ここ以外の場所でバッジ数を組み立ててはいけない。
+
+import type { AppState } from "../store/types";
+
+export function computeBadgeCount(state: AppState): number {
+  // バッジに反映したいものだけをここで合算する。
+  // 例: 未読のお知らせ + 期限切れの未完了リマインダー
+  const unreadNotices = state.notices.filter((n) => !n.read).length;
+  const dueReminders = state.reminders.filter(
+    (r) => !r.completed && r.dueAt <= Date.now()
+  ).length;
+
+  // 合計が負やNaNにならないよう最後に正規化する
+  const total = unreadNotices + dueReminders;
+  return Number.isFinite(total) && total > 0 ? total : 0;
+}
+```
+
+この関数はストアの状態だけを入力に取り、副作用を持ちません。テストも書きやすく、「バッジが何を意味するか」がコード1箇所に集約されます。
+
+## 計算した値をOSへ同期する
+
+計算した数値を実際のアイコンバッジへ反映する処理を、薄いラッパーとして分けます。ここでOSとの差異（後述）も吸収します。
+
+```typescript
+// badge/syncBadge.ts
+import * as Notifications from "expo-notifications";
+import { computeBadgeCount } from "./computeBadgeCount";
+import type { AppState } from "../store/types";
+
+let lastApplied = -1; // 同じ値の再設定を避けるためのメモ
+
+export async function syncBadge(state: AppState): Promise<number> {
+  const next = computeBadgeCount(state);
+
+  // 直前と同じ値なら何もしない。無駄なネイティブ呼び出しを減らす。
+  if (next === lastApplied) return next;
+
+  try {
+    const ok = await Notifications.setBadgeCountAsync(next);
+    // Androidの一部ランチャーはfalseを返す。ここでは失敗を握りつぶさず記録する。
+    if (ok) {
+      lastApplied = next;
+    }
+  } catch (e) {
+    // ネイティブ側の一時的な失敗はアプリを落とさない。次の同期でやり直す。
+    console.warn("[badge] setBadgeCount failed", e);
+  }
+  return next;
+}
+```
+
+`lastApplied` を挟むことで、状態更新のたびに毎回ネイティブへ書き込むのを防ぎます。バッジ同期は頻繁に呼ばれるので、この小さなガードが地味に効きます。
+
+## フォアグラウンド復帰と通知受信で必ず呼び直す
+
+Source of Truth を決めても、それを「いつ呼ぶか」を間違えると元の木阿弥です。バッジがズレる瞬間は決まっています。ユーザーがアプリを閉じている間に通知が届いたときと、アプリ内で未読を消化したときです。
+
+そこで、次の三つのタイミングで必ず `syncBadge` を呼びます。
+
+1. アプリがフォアグラウンドへ復帰したとき（`AppState` の `active` 遷移）
+2. フォアグラウンドで通知を受信したとき（`addNotificationReceivedListener`）
+3. アプリ内で未読・未完了の状態が変化したとき（ストアの更新後）
+
+1と2をアプリ起動時に一度だけ登録します。
+
+```typescript
+// badge/registerBadgeSync.ts
+import { AppState, type AppStateStatus } from "react-native";
+import * as Notifications from "expo-notifications";
+import { syncBadge } from "./syncBadge";
+import { getState } from "../store"; // 現在のAppStateを返す想定
+
+export function registerBadgeSync(): () => void {
+  // (1) フォアグラウンド復帰で再計算
+  const handleAppState = (next: AppStateStatus) => {
+    if (next === "active") {
+      void syncBadge(getState());
+    }
+  };
+  const sub = AppState.addEventListener("change", handleAppState);
+
+  // (2) 前面で通知を受け取ったら、OSが増やしたバッジを即座に上書きする
+  const received = Notifications.addNotificationReceivedListener(() => {
+    void syncBadge(getState());
+  });
+
+  // 起動直後にも一度だけ同期しておく
+  void syncBadge(getState());
+
+  // クリーンアップ用の解除関数を返す
+  return () => {
+    sub.remove();
+    received.remove();
+  };
+}
+```
+
+3のストア更新後の呼び出しは、状態を変える処理の末尾に置きます。たとえばお知らせを既読にする関数の中で、更新が確定した直後に `syncBadge(getState())` を呼びます。ここを忘れると「アプリ内で読んだのにバッジが減らない」という、まさに冒頭の症状が再発します。
+
+なお、通知の予約時に `badge` フィールドを指定するのはやめます。OSに勝手にバッジを触らせないことが、この設計の前提だからです。通知の中身とスケジューリングそのものについては、[Expoの定時ローカル通知をタイムゾーンに強くする設計](/articles/rork-dev/rork-expo-local-notification-timezone-dst-resync-design)で別途整理しています。
+
+## iOS と Android で挙動が違う点
+
+バッジは、OSごとに「どこまでアプリが制御できるか」が大きく異なります。ここを知らずに実装すると、片方のOSだけ直らないという状況にはまります。
+
+<table>
+<thead>
+<tr><th>観点</th><th>iOS</th><th>Android</th></tr>
+</thead>
+<tbody>
+<tr><td>バッジの主体</td><td>OSがアイコンバッジを標準サポート</td><td>ランチャー依存。表示するかはホームアプリ次第</td></tr>
+<tr><td>権限</td><td>通知許可時に badge 権限を含める必要あり</td><td>通知チャンネルの設定に従う</td></tr>
+<tr><td>setBadgeCountAsync</td><td>ほぼ確実に反映される</td><td>true/false を返し、非対応ランチャーでは false</td></tr>
+<tr><td>0を設定</td><td>バッジが消える</td><td>ランチャーによっては残ることがある</td></tr>
+</tbody>
+</table>
+
+iOS では通知許可を求める段階で、バッジ表示の権限を明示的に要求しておく必要があります。
+
+```typescript
+// バッジ表示にはiOSでbadge権限が要る。許可要求時に含めておく。
+await Notifications.requestPermissionsAsync({
+  ios: {
+    allowAlert: true,
+    allowSound: true,
+    allowBadge: true, // これを忘れるとsetBadgeCountAsyncが無視される
+  },
+});
+```
+
+Android は「バッジをアプリが完全に制御できる」という前提を捨てるのが現実的です。`setBadgeCountAsync` の戻り値が `false` になるランチャーが一定数あります。私は Android では「同期を試みるが、失敗しても正常系」と割り切り、アプリ内のリストUI側で未読を明示する導線を主役に据えました。バッジは補助表示だと位置づけると、実装も心理的にも楽になります。通知許可そのものの取り扱いは[通知のソフトアスク実装](/articles/rork-dev/rork-notification-soft-ask-opt-in)にまとめています。
+
+## 実装でつまずいた3つの落とし穴
+
+設計としては素直でも、本番運用では細部でつまずきました。私自身が実際に踏んだものを挙げます。
+
+第一に、`getBadgeCountAsync()` の戻り値を信頼して差分計算しようとして失敗しました。「現在のバッジ − 読んだ数」で新しい値を出す発想です。これは通知経由の書き換えを取りこぼすため必ずズレます。バッジは常に状態から再計算する、という原則を崩してはいけません。
+
+第二に、ストア更新と `syncBadge` の呼び出し順です。楽観的更新でUIを先に書き換え、あとから永続化する構成にしていたため、`syncBadge` が古い状態を読んで一瞬だけ多い数値を出す瞬間がありました。同期はストアが確定した後に呼ぶ、と決めて解消しました。
+
+第三に、ログアウト時のリセット漏れです。アカウントを切り替えたのに前のユーザーのバッジ数が残る、という報告がありました。ログアウト処理の最後に明示的に `Notifications.setBadgeCountAsync(0)` を呼ぶ一行を足すだけでしたが、状態のリセットとバッジのリセットは別物だと気づかされました。
+
+これらはいずれも、テスト環境では通知を手動で送らないため見逃しやすい種類のバグです。実機に通知を数件ため、アプリを閉じた状態で放置してから開く、という手順を検証フローに組み込むと再現しやすくなります。プッシュ経由の再現には[Expoのプッシュトークンをサーバーと同期する設計](/articles/rork-dev/rork-expo-push-token-registration-refresh-server-lifecycle)側の準備も役立ちます。
+
+## まとめ
+
+まず、アプリのコードを検索して `setBadgeCountAsync` の呼び出し箇所を数えてみてください。もし通知の `badge` フィールドと `setBadgeCountAsync` が混在しているなら、それがバッジのズレる根本です。今日できる最初の一歩として、`computeBadgeCount` に相当する再計算関数を1本だけ書き、フォアグラウンド復帰時に呼ぶところから始めるのがおすすめです。
+
+バッジのような小さな表示ほど、ユーザーはアプリの信頼性を測る物差しにします。私自身、この一点を直しただけでレビューのトーンが和らいだ経験があり、地味な同期処理こそ丁寧に設計する価値があると感じています。お読みいただきありがとうございました。
