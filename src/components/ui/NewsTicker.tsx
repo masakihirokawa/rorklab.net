@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PUBLISH — Rork Maxはコード署名やプロビジョニングを肩代わりし、2クリックでApp Storeへ申請できます",
-    "SIMULATOR — ブラウザ内のストリーミングシミュレータで実機に近い操作感を試せ、QRでTestFlightなしに実機インストールできます",
-    "MAX — Rork MaxはネイティブSwiftアプリを生成し、Claude Code・Claude Opus 4.6で駆動します",
-    "NATIVE — Rork MaxはAR/LiDAR・Metalの3D・ウィジェット・Live Activities・HealthKit・Core MLなどXcode相当の領域まで到達します",
-    "FUNDING — Rorkが$15Mを調達し、App Store起業家世代の後押しを掲げています",
-    "PRICE — 料金は無料から用意され、有料プランは月$25から、Rork Maxは月$200です",
+    "MAX — Rork MaxはネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — Rork MaxはAR/LiDAR・Metalの3D・ウィジェット・Dynamic Island・Live Activities・HealthKit・Core MLなどネイティブ機能を解放します",
+    "STACK — RorkはReact Native（Expo）でiOS/Androidのネイティブアプリを生成し、英語の説明だけで動くコードを書き出します",
+    "GROWTH — Rorkの月間アクセスは743,000件を超え、成長率は85%に達しています",
+    "PRICE — 料金は無料から始められ、有料プランは月$25から利用できます",
+    "TREND — Gartnerは2026年末までに新規アプリの75%がローコード/ノーコードで作られると予測しています",
   ],
   en: [
-    "PUBLISH — Rork Max handles code signing and provisioning so you can submit to the App Store in two clicks",
-    "SIMULATOR — A browser streaming simulator feels close to real hardware, and a QR code installs to your device without TestFlight",
-    "MAX — Rork Max generates native Swift apps, powered by Claude Code and Claude Opus 4.6",
-    "NATIVE — Rork Max reaches Xcode-class territory: AR/LiDAR, Metal 3D, widgets, Live Activities, HealthKit, and Core ML",
-    "FUNDING — Rork raised $15M to power the next generation of App Store entrepreneurs",
-    "PRICE — Plans start free, paid tiers from $25/month, and Rork Max at $200/month",
+    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — Rork Max unlocks native features: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, and Core ML",
+    "STACK — Rork builds native iOS and Android apps with React Native (Expo) from a plain-English description",
+    "GROWTH — Rork now attracts over 743,000 monthly visits, growing at an 85% rate",
+    "PRICE — Rork is free to start, with paid plans from $25/month",
+    "TREND — Gartner projects 75% of new apps will be built with low-code/no-code by the end of 2026",
   ],
 };
 
