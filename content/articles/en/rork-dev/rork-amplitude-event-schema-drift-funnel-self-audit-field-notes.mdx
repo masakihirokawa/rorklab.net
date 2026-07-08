@@ -1,0 +1,200 @@
+---
+title: "When Amplitude's Funnel Improved Overnight — Field Notes on Catching Event Schema Drift With a Self-Audit"
+slug: "rork-amplitude-event-schema-drift-funnel-self-audit-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T11:00"
+updated: "2026-07-09T11:00"
+author: "Rork Lab"
+description: "In a Rork-built app, the Amplitude funnel showed signup-to-purchase conversion jumping from 8% to 19% overnight, yet revenue stayed flat. The cause was a property-name drift that inflated the count. Field notes on measuring the drift with an event contract and a runtime validator, then tightening it in stages."
+tags: ["Amplitude", "analytics", "React Native", "event design", "data quality", "Expo", "funnel analysis"]
+highlights:
+  - "A concrete runtime validator that turns silent schema drift — events firing but lying — into a countable Event Contract Violation"
+  - "How I measured the contamination rate and walked a fake 19% conversion back to the real 8%"
+  - "A CI check that freezes the event contract so a Rork or Expo update can't quietly break it before release"
+---
+
+One morning the funnel showed signup-to-purchase conversion leaping from 8.1% to 19.4%. I had shipped nothing the night before. Something tightened in my chest. Then I checked Stripe — revenue had barely moved.
+
+Conversion doubled while deposits stayed flat. That gap is the classic tell that your event tracking has quietly broken.
+
+These are field notes on a schema drift I hit in a Rork-built React Native / Expo app instrumented with Amplitude — how I surfaced it with a runtime validator, measured the drift rate, and tightened it back in stages. This is not about installing the SDK. It is about what to do when the numbers start lying after you install it.
+
+## When numbers lie, the SDK throws nothing
+
+The awkward thing about product analytics is that nothing fails when it breaks. Write `track('Purchase Completed', { price: '¥580' })` and the SDK happily sends `price` as a string. Rows keep landing on the dashboard, looking perfectly ordinary.
+
+Tracing it back, the cause was simple. From one update onward, the purchase event's property drifted from `plan_id` to `planId` (camelCase). Amplitude treats those as two different properties. On top of that, a duplicated launch path was firing `Purchase Completed` twice, and the funnel segment I was reading counted totals rather than uniques — so the number inflated.
+
+Drift comes in more than one shape. The four I actually hit sort out like this.
+
+<table>
+<thead>
+<tr><th>Drift type</th><th>Symptom</th><th>Funnel impact</th></tr>
+</thead>
+<tbody>
+<tr><td>Property name drift</td><td><strong>plan_id</strong> and <strong>planId</strong> mixed</td><td>Filter conditions half-miss</td></tr>
+<tr><td>Type drift</td><td>price sometimes number, sometimes string</td><td>Sums and averages break</td></tr>
+<tr><td>Double firing</td><td>Same event on resume and on mount</td><td>Conversion reads higher than real</td></tr>
+<tr><td>Event name drift</td><td>Purchase Completed vs purchase_completed</td><td>One side vanishes from the funnel</td></tr>
+</tbody>
+</table>
+
+All of these look fine to the SDK. That is precisely why the correctness of measurement is something you have to measure yourself.
+
+## Declare the event contract first
+
+The turning point was fixing, in a single "contract," which events may fire and what properties they carry. Staring at scattered `track()` calls reveals nothing. You declare the intended shape first, then reconcile against it at runtime. The order matters.
+
+I wrote the contract as types. Since TypeScript types vanish at runtime, I derive both the type and the validation schema from one object.
+
+```typescript
+// analytics/contract.ts
+// Event contract — the source of truth for allowed events and properties
+export const EVENT_CONTRACT = {
+  'Purchase Completed': {
+    plan_id: 'string',
+    price: 'number',
+    currency: 'string',
+  },
+  'Registration Completed': {
+    auth_method: 'string', // 'email' | 'apple' | 'google'
+  },
+  'Paywall Viewed': {
+    source: 'string',
+  },
+} as const;
+
+export type EventName = keyof typeof EVENT_CONTRACT;
+export type PropSpec = Record<string, 'string' | 'number' | 'boolean'>;
+```
+
+The key decision is to treat any event name or property not in the contract as an error. To add a new event, you add it to the contract first. That small friction stops naming drift and missing properties at the entrance.
+
+## Turn drift into a violation event with a runtime validator
+
+I reconciled against the contract inside a thin wrapper that every call must pass through, instead of calling `track()` directly. When it detects a violation, it warns in development and, in production, sends the violation itself to Amplitude as a single `Event Contract Violation` event — turning drift from a vanishing defect into a measurable number.
+
+```typescript
+// analytics/trackSafe.ts
+import { track } from '@amplitude/analytics-react-native';
+import { EVENT_CONTRACT, EventName } from './contract';
+
+export function trackSafe(name: EventName, props: Record<string, unknown> = {}) {
+  const spec = EVENT_CONTRACT[name];
+  const violations: string[] = [];
+
+  if (!spec) {
+    // Event name not in contract = suspected naming drift
+    violations.push(`unknown_event:${name}`);
+  } else {
+    for (const [key, type] of Object.entries(spec)) {
+      if (!(key in props)) violations.push(`missing:${key}`);
+      else if (typeof props[key] !== type) {
+        violations.push(`type:${key}=${typeof props[key]}!=${type}`);
+      }
+    }
+    // Properties outside the contract (catches drift like planId)
+    for (const key of Object.keys(props)) {
+      if (!(key in spec)) violations.push(`extra:${key}`);
+    }
+  }
+
+  if (violations.length > 0) {
+    if (__DEV__) console.warn(`[contract] ${name}`, violations);
+    // Emit the violation as an event so we can aggregate the drift rate later
+    track('Event Contract Violation', {
+      event_name: name,
+      violations,
+      violation_count: violations.length,
+    });
+  }
+
+  track(name, props);
+}
+```
+
+Passing through this wrapper, a line like `trackSafe('Purchase Completed', { planId: 'pro', price: '¥580' })` records three violations: `extra:planId`, `missing:plan_id`, and `type:price=string!=number`. Drift becomes a visible row you can count on the dashboard.
+
+In the first week, `Event Contract Violation` reached 6.2% of all events. The top contributors were double firing (not `unknown`, but an inflator of totals) and mixed camelCase — exactly where the inflated conversion came from.
+
+## Make the drift rate a KPI and tighten in stages
+
+Trying to fix everything at once leaves you unsure where you started. I watched the drift rate — the share of events carrying a violation — as a single daily number, and worked down from the top offenders.
+
+<table>
+<thead>
+<tr><th>Point</th><th>Drift rate</th><th>Main cause</th><th>Action taken</th></tr>
+</thead>
+<tbody>
+<tr><td>Week 1</td><td>6.2%</td><td>Double firing, mixed camelCase</td><td>Applied contract and wrapper to all tracks</td></tr>
+<tr><td>Week 2</td><td>2.4%</td><td>Duplicate resume events</td><td>Single firing path, idempotency key</td></tr>
+<tr><td>Week 4</td><td>0.5%</td><td>Rare type drift (price as string)</td><td>Normalized amounts to number before send</td></tr>
+</tbody>
+</table>
+
+The double firing came from sending `App Opened` separately on `AppState` resume and on component mount. I consolidated the origin to one place and dropped short-window duplicates with an idempotency key.
+
+```typescript
+// analytics/dedupe.ts
+const recent = new Map<string, number>();
+const WINDOW_MS = 2000;
+
+export function isDuplicate(key: string): boolean {
+  const now = Date.now();
+  const last = recent.get(key);
+  recent.set(key, now);
+  if (last && now - last < WINDOW_MS) return true;
+  return false;
+}
+// Usage: put `if (isDuplicate('App Opened')) return;` just before trackSafe
+```
+
+Once the drift rate fell below 0.5%, funnel conversion settled back near 8.1%. The number dropped, and I felt relief instead of disappointment. An honest 8% is far more useful for the next move than a lying 19%.
+
+## Freeze the contract in CI before a Rork/Expo update breaks it
+
+Drift is not only human carelessness — tool updates cause it too. When you regenerate a screen in Rork, or an Expo SDK update shifts navigation behavior, firing paths slip quietly. So I promoted the contract into a check that a machine runs before release.
+
+The idea is simple: a small script that scans the source and counts whether bare `track(` calls — ones that bypass the contract — have crept back in.
+
+```typescript
+// scripts/check-tracking.ts (run in CI)
+import { readFileSync } from 'node:fs';
+import { globSync } from 'glob';
+
+const files = globSync('app/**/*.{ts,tsx}');
+let bareCalls = 0;
+for (const f of files) {
+  const src = readFileSync(f, 'utf8');
+  // Detect bare track( that does not go through trackSafe
+  const matches = src.match(/(?<!Safe|_)\btrack\(/g) ?? [];
+  if (matches.length) {
+    console.error(`bare track() in ${f}: ${matches.length}`);
+    bareCalls += matches.length;
+  }
+}
+if (bareCalls > 0) {
+  console.error(`\n${bareCalls} bare track() calls found. Route them through trackSafe.`);
+  process.exit(1);
+}
+console.log('tracking contract: clean');
+```
+
+Since adding this check, update-driven drift gets stopped ahead of time. In solo development, writing one of these unglamorous guards once pays back your future self. I have made a habit of building these "you'll notice when it breaks" mechanisms before the feature itself.
+
+When you want to reconcile external store inflows against in-app behavior, the thinking in [field notes on reconciling App Store Connect API daily totals](/articles/rork-dev/rork-asc-api-sales-report-gaps-jwt-expiry-reconciliation-field-notes) helps catch divergence between two measurement systems early. If you instrument the in-app review prompt, the same starting point applies as in [field notes on measuring the review prompt's display rate](/articles/rork-dev/rork-inapp-review-prompt-silent-suppression-display-rate-timing-field-notes): first turn "is it even shown" into a number.
+
+## The recovery order on one page
+
+If I met the same situation again, this is the sequence I would follow.
+
+1. Suspect the gap between conversion and real revenue (Stripe, etc.). The better the number looks, the more you should doubt the measurement.
+2. Declare the event contract first — fix allowed events and properties on one page.
+3. Surface violations as `Event Contract Violation` through a `trackSafe` wrapper.
+4. Watch the drift rate as one daily number and work down from the top offenders.
+5. Stop double firing with a single firing path and an idempotency key.
+6. Promote the contract into a CI check to stop update-driven drift ahead of release.
+
+Instrumentation isn't done when you install it; it becomes trustworthy only when you keep measuring whether it has drifted. It is not a flashy feature, but this quiet mechanism is what steadily holds up data-driven decisions. I hope it helps in your own build. Thank you for reading.

@@ -1,0 +1,200 @@
+---
+title: "Amplitude のファネルが一晩で改善したように見えたとき — イベントのスキーマ崩れを自己監査で炙り出す運用メモ"
+slug: "rork-amplitude-event-schema-drift-funnel-self-audit-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T11:00"
+updated: "2026-07-09T11:00"
+author: "Rork Lab"
+description: "Rork で作ったアプリの Amplitude ファネルで、課金転換率が8%から19%へ跳ね上がったのに売上が動かない。原因はプロパティ名の崩れによる二重計上でした。イベント契約と実行時バリデータで崩れを計測し、段階的に締め直した運用メモです。"
+tags: ["Amplitude", "アナリティクス", "React Native", "イベント設計", "データ品質", "Expo", "ファネル分析"]
+highlights:
+  - "イベントは飛んでいるのに数字が嘘をつく「スキーマ崩れ」を、実行時バリデータで違反イベントとして可視化する具体的な実装"
+  - "崩れ率（contamination rate）を計測し、8%→19%と跳ねた偽の転換率を実数に戻すまでの段階的な締め直し手順"
+  - "Rork/Expo のアップデートで壊れやすいイベント契約を CI で凍結し、リリース前に検出するチェックの組み方"
+---
+
+ある朝ダッシュボードを開くと、登録から課金までのファネルで転換率が 8.1% から 19.4% へ跳ね上がっていました。前夜に大きな施策を打った覚えはありません。胸のあたりが少しざわつきました。売上を確認すると、Stripe 側の数字はほとんど動いていません。
+
+転換率だけが二倍になり、入金は横ばい。この食い違いこそ、イベント計測が静かに壊れているときの典型的な兆候でした。
+
+この記事は、Rork で作った React Native / Expo アプリの Amplitude 計測で起きた「スキーマ崩れ」を、実行時のバリデータで炙り出し、崩れ率を計測しながら段階的に締め直した記録です。SDK の入れ方ではなく、入れた後に計測が嘘をつき始めたときにどう気づき、どう立て直すかに絞っています。
+
+## 数字が嘘をつくとき、SDK はエラーを出さない
+
+Amplitude を含むプロダクトアナリティクスの厄介なところは、壊れても例外が飛ばない点にあります。`track('Purchase Completed', { price: '¥580' })` と書いても、`price` が数値ではなく文字列でも、SDK はそのまま受け取って送信します。ダッシュボードには何食わぬ顔で行が増えていきます。
+
+このときファネルの内部で何が起きていたか、後から追ってみると単純でした。課金完了イベントのプロパティ名が、あるアップデートを境に `plan_id` から `planId`（キャメルケース）へ揺れていたのです。Amplitude は両者を別プロパティとして扱います。そしてファネルの定義側は古い `plan_id` を条件にしていたため、条件に合致しないイベントが「完了扱いされない」――のではなく、この件では逆に、重複した起動経路から `Purchase Completed` が二回飛んでいて、ユニークではなく総数で数えていた区間が水増しされていました。
+
+崩れは一種類ではありません。私が実際に踏んだものを整理すると、次の四つに分類できました。
+
+<table>
+<thead>
+<tr><th>崩れの種類</th><th>症状</th><th>ファネルへの影響</th></tr>
+</thead>
+<tbody>
+<tr><td>プロパティ名の揺れ</td><td><strong>plan_id</strong> と <strong>planId</strong> が混在</td><td>条件フィルタが半分すり抜ける</td></tr>
+<tr><td>型の崩れ</td><td>price が数値だったり文字列だったり</td><td>金額の集計・平均が壊れる</td></tr>
+<tr><td>二重発火</td><td>画面復帰とマウントで同じイベントが2回</td><td>転換率が実数より高く出る</td></tr>
+<tr><td>イベント名の表記揺れ</td><td>Purchase Completed と purchase_completed</td><td>片方がファネルから消える</td></tr>
+</tbody>
+</table>
+
+どれも SDK からは正常に見えます。だからこそ、計測の正しさは自分で計測しなければ守れない、というのがこの一件で腹落ちした点でした。
+
+## イベント契約を先に決める
+
+立て直しの起点は、飛ばしてよいイベントとそのプロパティを一枚の「契約」として固定することでした。コードのあちこちに散った `track()` を眺めても崩れは見えません。あるべき姿を先に宣言し、実行時にそこと突き合わせる。この順序が要です。
+
+契約は型として書きました。TypeScript の型は実行時には消えるため、型定義とバリデーション用のスキーマを一つのオブジェクトから導きます。
+
+```typescript
+// analytics/contract.ts
+// イベント契約 — 飛ばしてよいイベントとプロパティの正本
+export const EVENT_CONTRACT = {
+  'Purchase Completed': {
+    plan_id: 'string',
+    price: 'number',
+    currency: 'string',
+  },
+  'Registration Completed': {
+    auth_method: 'string', // 'email' | 'apple' | 'google'
+  },
+  'Paywall Viewed': {
+    source: 'string',
+  },
+} as const;
+
+export type EventName = keyof typeof EVENT_CONTRACT;
+export type PropSpec = Record<string, 'string' | 'number' | 'boolean'>;
+```
+
+ここで大切なのは、契約に載っていないイベント名やプロパティを「間違い」として扱うと決めることです。新しいイベントを足したいときは、まず契約に追記する。この一手間が、命名の揺れとプロパティの取りこぼしを入口で止めます。
+
+## 実行時バリデータで崩れを違反イベントに変える
+
+契約を突き合わせる場所は、`track()` を直接呼ばず、必ず通す薄いラッパーに置きました。ここで契約違反を検出したら、開発中は警告を出し、本番では違反そのものを `Event Contract Violation` という一つのイベントとして Amplitude に送ります。崩れを、消える不具合ではなく、計測可能な数字に変えるためです。
+
+```typescript
+// analytics/trackSafe.ts
+import { track } from '@amplitude/analytics-react-native';
+import { EVENT_CONTRACT, EventName } from './contract';
+
+export function trackSafe(name: EventName, props: Record<string, unknown> = {}) {
+  const spec = EVENT_CONTRACT[name];
+  const violations: string[] = [];
+
+  if (!spec) {
+    // 契約に無いイベント名 = 表記揺れの疑い
+    violations.push(`unknown_event:${name}`);
+  } else {
+    for (const [key, type] of Object.entries(spec)) {
+      if (!(key in props)) violations.push(`missing:${key}`);
+      else if (typeof props[key] !== type) {
+        violations.push(`type:${key}=${typeof props[key]}!=${type}`);
+      }
+    }
+    // 契約外プロパティ（planId のような揺れを捕まえる）
+    for (const key of Object.keys(props)) {
+      if (!(key in spec)) violations.push(`extra:${key}`);
+    }
+  }
+
+  if (violations.length > 0) {
+    if (__DEV__) console.warn(`[contract] ${name}`, violations);
+    // 崩れ率を後で集計するため、違反自体をイベント化する
+    track('Event Contract Violation', {
+      event_name: name,
+      violations,
+      violation_count: violations.length,
+    });
+  }
+
+  track(name, props);
+}
+```
+
+このラッパーを通すと、`trackSafe('Purchase Completed', { planId: 'pro', price: '¥580' })` のような一行が、`extra:planId`・`missing:plan_id`・`type:price=string!=number` の三つの違反として記録されます。崩れは目に見える行になり、ダッシュボードで数えられるようになります。
+
+導入初週、`Event Contract Violation` は全イベントの 6.2% に達していました。内訳の上位は二重発火（`unknown` ではないが総数の水増し要因）とキャメルケース混在で、跳ね上がった転換率の正体はここにありました。
+
+## 崩れ率を KPI にして締め直す
+
+一度に全部を直そうとすると、どこから手を付けたか分からなくなります。私は崩れ率（違反を含むイベントの割合）を一つの数字として毎日眺め、上位の違反から順に潰す進め方を採りました。
+
+<table>
+<thead>
+<tr><th>時点</th><th>崩れ率</th><th>主因</th><th>打った手</th></tr>
+</thead>
+<tbody>
+<tr><td>導入初週</td><td>6.2%</td><td>二重発火・キャメルケース混在</td><td>契約とラッパーを全 track に適用</td></tr>
+<tr><td>2週目</td><td>2.4%</td><td>復帰時イベントの重複</td><td>発火経路を1本化・冪等キー付与</td></tr>
+<tr><td>4週目</td><td>0.5%</td><td>まれな型崩れ（金額文字列）</td><td>金額を送出前に数値へ正規化</td></tr>
+</tbody>
+</table>
+
+二重発火は、`AppState` の復帰とコンポーネントのマウントで別々に `App Opened` を送っていたのが原因でした。発火の起点を一箇所に集約し、短時間の同一イベントには冪等キーを付けて弾くようにしました。
+
+```typescript
+// analytics/dedupe.ts
+const recent = new Map<string, number>();
+const WINDOW_MS = 2000;
+
+export function isDuplicate(key: string): boolean {
+  const now = Date.now();
+  const last = recent.get(key);
+  recent.set(key, now);
+  if (last && now - last < WINDOW_MS) return true;
+  return false;
+}
+// 使用: if (isDuplicate('App Opened')) return; の一行を trackSafe 前に置く
+```
+
+崩れ率が 0.5% を切ったところで、ファネルの転換率は 8.1% 近傍へ戻りました。数字が下がったのに、私はむしろ安心しました。嘘をつく 19% より、正直な 8% のほうが次の一手の役に立ちます。
+
+## Rork/Expo のアップデートで壊れる前に CI で凍結する
+
+崩れは人の不注意だけでなく、ツールの更新でも起きます。Rork で生成し直した画面や、Expo SDK の更新でナビゲーションの挙動が変わると、発火経路が静かにずれます。そこで契約を、リリース前に機械が検証するチェックへ格上げしました。
+
+やることは単純です。ソースを走査して、契約を通さない裸の `track(` 呼び出しが増えていないかを数えるだけの小さなスクリプトを CI に置きます。
+
+```typescript
+// scripts/check-tracking.ts（CI で実行）
+import { readFileSync } from 'node:fs';
+import { globSync } from 'glob';
+
+const files = globSync('app/**/*.{ts,tsx}');
+let bareCalls = 0;
+for (const f of files) {
+  const src = readFileSync(f, 'utf8');
+  // trackSafe を経由しない裸の track( を検出
+  const matches = src.match(/(?<!Safe|_)\btrack\(/g) ?? [];
+  if (matches.length) {
+    console.error(`bare track() in ${f}: ${matches.length}`);
+    bareCalls += matches.length;
+  }
+}
+if (bareCalls > 0) {
+  console.error(`\n${bareCalls} 件の裸 track() を検出。trackSafe 経由に統一してください。`);
+  process.exit(1);
+}
+console.log('tracking contract: clean');
+```
+
+このチェックを入れてから、アップデート起因の崩れは事前に止まるようになりました。個人開発では、こうした地味なガードを一度書いておくと、後の自分を助けてくれます。私はこの手の「壊れたら気づける仕掛け」を、機能そのものより先に用意する癖をつけています。
+
+ストア外部の流入と内部の行動を突き合わせたいときは、[Rork アプリの App Store Connect API 日次集計を突合する運用メモ](/articles/rork-dev/rork-asc-api-sales-report-gaps-jwt-expiry-reconciliation-field-notes) の考え方も併せると、二つの計測系のずれを早めに捕まえられます。アプリ内の評価導線を計測している方は、[アプリ内レビュー依頼の表示率を計測して立て直す運用メモ](/articles/rork-dev/rork-inapp-review-prompt-silent-suppression-display-rate-timing-field-notes) と同じく、まず「表示されているか」を数字にするところから始めるのが近道です。
+
+## 立て直しの順序を一枚にまとめる
+
+同じ状況に出会ったとき、私が次に辿る手順はこうです。
+
+1. 転換率と実売上（Stripe 等）の乖離を疑う。数字が良すぎるときほど計測を疑う
+2. イベント契約を先に宣言する。飛ばしてよいイベントとプロパティを一枚に固定する
+3. `trackSafe` ラッパーで契約違反を `Event Contract Violation` として可視化する
+4. 崩れ率を毎日の一つの数字として眺め、上位の違反から潰す
+5. 二重発火は発火経路の一本化と冪等キーで止める
+6. 契約を CI のチェックへ格上げし、アップデート起因の崩れを事前に止める
+
+計測は、入れて終わりではなく、崩れていないかを計測し続けて初めて信頼できるものになります。派手な機能ではありませんが、この地道な仕掛けが、データに基づく判断の土台を静かに支えてくれます。実装の参考になれば幸いです。お読みいただきありがとうございました。
