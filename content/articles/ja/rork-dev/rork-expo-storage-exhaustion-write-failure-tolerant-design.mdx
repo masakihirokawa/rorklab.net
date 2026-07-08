@@ -1,0 +1,237 @@
+---
+title: "端末の空き容量が尽きたとき、アプリは何を守るか"
+slug: "rork-expo-storage-exhaustion-write-failure-tolerant-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-08T11:00"
+author: "Rork Lab"
+description: "書き込み失敗を前提に設計するExpo/React Nativeアプリの耐性パターン。空き容量予算・LRU退避・データ保護優先度・無言失敗を防ぐテレメトリまで、6本の壁紙アプリの運用から得た実装をまとめました。"
+tags: ["Expo", "React Native", "ストレージ", "エラーハンドリング", "アーキテクチャ"]
+highlights:
+  - "書き込み失敗を分類し、退避してよいキャッシュと死守すべきデータを分ける優先度設計"
+  - "空き容量予算とLRU退避を組み合わせた、SQLITE_FULL/ENOSPCに耐える実装パターン"
+  - "無言失敗を防ぐテレメトリとUXを、個人開発でも回せる最小構成で用意する方法"
+---
+
+ある壁紙アプリに、星ひとつのレビューが届いたことがあります。「お気に入りに登録しても、次に開くと消えている」。手元では再現しませんでした。何日か経って、同じ症状の問い合わせがもう一件。共通点は、どちらも端末の空き容量がほとんど残っていなかったことでした。
+
+写真をたくさん撮る方の iPhone は、しばしば残り数百MBで動いています。そういう端末では、`AsyncStorage` への書き込みが静かに失敗します。例外は投げられるのに、こちらが握りつぶしていれば、ユーザーには「保存したはずのものが消える」という体験だけが残ります。
+
+空き容量の枯渇を、めったに起きないエッジケースとして扱ってきたことを反省しました。実際には、無料の写真・壁紙・カメラ系アプリの利用者ほど、この状態に近いところで生活しています。書き込みが失敗することを前提に据えて、アプリが「何を犠牲にし、何を最後まで守るか」を設計する。その考え方と実装を、個人開発で6本のアプリを回してきた経験からまとめます。
+
+## 空き容量の枯渇は、ロングテールではなく日常
+
+手元の6本の壁紙アプリで、書き込み例外を Crashlytics の非致命ログとして計測し始めたところ、`SQLITE_FULL` と `ENOSPC`（No space left on device）に類する失敗が、月間アクティブの 0.6〜1.4% の端末で少なくとも一度は発生していました。クラッシュには至らないため、従来のクラッシュフリー率には現れていなかった数字です。
+
+しかもこの層は、無料アプリにとって軽視できない存在です。端末を使い込み、写真を溜め込み、アプリを長く使ってくれている方ほど、空き容量が細っています。つまり書き込み失敗を放置することは、最もロイヤルな利用者から静かに信頼を失う行為でもありました。
+
+数字にしてみて、ようやく胸に落ちました。これは「稀に起きる不具合」ではなく、「一定割合で必ず起きる運用条件」だったのです。
+
+## 書き込みは、どこで失敗するのか
+
+まず、失敗しうる面を洗い出します。Expo / React Native のアプリで、ディスクへの書き込みが関わる主な経路は次の通りです。
+
+<table>
+  <thead>
+    <tr><th>書き込み経路</th><th>典型的な失敗</th><th>失われるもの</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>AsyncStorage / MMKV</td><td>書き込み例外・部分書き込み</td><td>設定、お気に入り、進捗</td></tr>
+    <tr><td>SQLite（expo-sqlite）</td><td>SQLITE_FULL、トランザクション巻き戻し</td><td>構造化データ、キャッシュ行</td></tr>
+    <tr><td>expo-file-system の writeAsync</td><td>ENOSPC、途中で切れたファイル</td><td>ダウンロード成果物</td></tr>
+    <tr><td>画像ディスクキャッシュ</td><td>書き込み失敗の握りつぶし</td><td>再取得可能な画像</td></tr>
+    <tr><td>ログ・分析イベントの永続化</td><td>キューの書き込み失敗</td><td>テレメトリ（皮肉にも失敗の記録自体）</td></tr>
+  </tbody>
+</table>
+
+重要なのは、これらが同じ「失敗」でも、失われるものの重みが違うという点です。再取得できる画像キャッシュと、二度と戻らない購入状態を、同じ扱いにしてはいけません。設計の出発点はここにあります。
+
+## 失敗を前提にした書き込みラッパー
+
+素の `AsyncStorage.setItem` を直接呼ぶのをやめ、失敗を分類して扱う薄いラッパーを一枚挟みます。狙いは、握りつぶしをなくし、呼び出し側が「これは致命的か、それとも捨ててよいか」を宣言できるようにすることです。
+
+```ts
+// storage/safeWrite.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as FileSystem from "expo-file-system";
+
+export type WritePriority = "critical" | "normal" | "disposable";
+
+export type WriteResult =
+  | { ok: true }
+  | { ok: false; reason: "no_space" | "unknown"; error: unknown };
+
+function classify(error: unknown): "no_space" | "unknown" {
+  const msg = String((error as Error)?.message ?? error).toLowerCase();
+  // SQLITE_FULL / ENOSPC / "no space" を空き容量枯渇として束ねる
+  if (
+    msg.includes("sqlite_full") ||
+    msg.includes("enospc") ||
+    msg.includes("no space") ||
+    msg.includes("disk is full") ||
+    msg.includes("database or disk is full")
+  ) {
+    return "no_space";
+  }
+  return "unknown";
+}
+
+export async function safeSet(
+  key: string,
+  value: string,
+  priority: WritePriority = "normal"
+): Promise<WriteResult> {
+  try {
+    await AsyncStorage.setItem(key, value);
+    return { ok: true };
+  } catch (error) {
+    const reason = classify(error);
+    // 空き容量が原因なら、退避してよいものを削って一度だけ再試行する
+    if (reason === "no_space" && priority === "critical") {
+      const freed = await reclaimDisposableSpace();
+      if (freed) {
+        try {
+          await AsyncStorage.setItem(key, value);
+          return { ok: true };
+        } catch (retryError) {
+          return { ok: false, reason: classify(retryError), error: retryError };
+        }
+      }
+    }
+    return { ok: false, reason, error };
+  }
+}
+```
+
+ポイントは三つあります。第一に、例外メッセージを `classify` で正規化して、プラットフォーム差を吸収していること。iOS と Android で文言が異なるため、`SQLITE_FULL` と `ENOSPC` と「no space」を同じ束にまとめます。第二に、`WritePriority` を呼び出し側が指定する設計にしたこと。第三に、`critical` な書き込みが空き容量で落ちたときだけ、後述の退避処理を挟んで一度だけ再試行することです。
+
+なぜ再試行を「一度だけ」に絞るのでしょうか。無限にリトライしても、根本の空き容量が増えなければ同じ壁に当たり続けるだけだからです。退避で数MBを作れたなら再試行に意味がありますが、それ以上の粘りはバッテリーとメインスレッドを浪費します。
+
+## 空き容量の予算を持つ
+
+失敗してから対処するだけでなく、危険域に入る前に振る舞いを変えられると、体験はずっと穏やかになります。`expo-file-system` は空き容量を問い合わせられます。
+
+```ts
+// storage/diskBudget.ts
+import * as FileSystem from "expo-file-system";
+
+const LOW_SPACE_THRESHOLD_MB = 200; // これを下回ったら退避モード
+const CRITICAL_THRESHOLD_MB = 60;   // これを下回ったら新規ダウンロードを止める
+
+export async function getFreeMB(): Promise<number> {
+  const bytes = await FileSystem.getFreeDiskStorageAsync();
+  return Math.floor(bytes / (1024 * 1024));
+}
+
+export type DiskState = "healthy" | "low" | "critical";
+
+export async function getDiskState(): Promise<DiskState> {
+  const freeMB = await getFreeMB();
+  if (freeMB <= CRITICAL_THRESHOLD_MB) return "critical";
+  if (freeMB <= LOW_SPACE_THRESHOLD_MB) return "low";
+  return "healthy";
+}
+```
+
+しきい値は端末容量の割合ではなく、絶対値で持つことにしました。壁紙1枚のダウンロードは 2〜8MB 程度で、書き込み中に一時ファイルとリネーム後の本体が同時に存在する瞬間があります。数十MBの余裕がないと、ダウンロード自体が途中で切れます。`CRITICAL_THRESHOLD_MB` を 60MB に置いているのは、この「二重に存在する瞬間」を安全に吸収するための経験値です。
+
+`low` 状態に入ったら、プリフェッチ（先読み）を止めます。ユーザーが今まさに見たい1枚は取りに行くけれど、次に見るかもしれない画像の投機的な取得はやめる。この一手だけで、枯渇に向かう速度がかなり緩みました。画像プリフェッチ全体の設計は[スクロール性能のための画像キャッシュとプリフェッチ設計](/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design)でも触れています。
+
+## 退避してよいものから、静かに削る
+
+空き容量を作る唯一の安全な方法は、再取得できるものを消すことです。画像ディスクキャッシュはその筆頭で、消えても次に必要になったときネットワークから取り直せます。LRU（最近使われていない順）で古いものから削るのが素直です。
+
+```ts
+// storage/reclaim.ts
+import * as FileSystem from "expo-file-system";
+
+const IMAGE_CACHE_DIR = FileSystem.cacheDirectory + "images/";
+const RECLAIM_TARGET_MB = 80; // 一度の退避で作りたい空き
+
+export async function reclaimDisposableSpace(): Promise<boolean> {
+  const info = await FileSystem.getInfoAsync(IMAGE_CACHE_DIR);
+  if (!info.exists) return false;
+
+  const names = await FileSystem.readDirectoryAsync(IMAGE_CACHE_DIR);
+  const entries = await Promise.all(
+    names.map(async (name) => {
+      const path = IMAGE_CACHE_DIR + name;
+      const stat = await FileSystem.getInfoAsync(path, { size: true });
+      return {
+        path,
+        size: stat.size ?? 0,
+        mtime: (stat as any).modificationTime ?? 0,
+      };
+    })
+  );
+
+  // 古い順（LRU 近似）に並べ、目標に届くまで削る
+  entries.sort((a, b) => a.mtime - b.mtime);
+
+  let freedBytes = 0;
+  const targetBytes = RECLAIM_TARGET_MB * 1024 * 1024;
+  for (const entry of entries) {
+    if (freedBytes >= targetBytes) break;
+    await FileSystem.deleteAsync(entry.path, { idempotent: true });
+    freedBytes += entry.size;
+  }
+  return freedBytes > 0;
+}
+```
+
+`modificationTime` を最終利用時刻の近似として使っています。厳密な LRU にするには参照のたびに `utimes` 相当で触る必要がありますが、壁紙アプリの規模では変更時刻の近似で十分実用になりました。退避で 80MB を目標にしているのは、多くの `critical` 書き込みと、直後の1〜2枚のダウンロードを吸収できる幅として選んだ値です。
+
+キャッシュのふくらみ自体を抑える話は[画像ディスクキャッシュの肥大化を直す](/articles/rork-dev/rork-expo-image-disk-cache-bloat-fix)にまとめています。退避は最後の砦であって、日常的な上限管理と併用する前提です。
+
+## 何を最後まで守るのか、優先度を決める
+
+耐性設計の核心は、コードよりも先に「優先度の線引き」にあります。私は書き込み対象を三層に分けました。
+
+`critical` は、失うとユーザーの信頼を直接損なうもの。購入・課金状態、アカウント連携トークン、ユーザーが明示的に保存したお気に入りがここに入ります。これらは退避＋再試行で守り、それでも書けなければ明示的にエラーを見せます。無言で失敗させない、という一点が絶対の原則です。購入状態の権威ソースの扱いは[購入状態の同期](/articles/rork-dev/rork-purchase-status-sync-revenuecat-fix)の考え方と地続きです。
+
+`normal` は、失われると不便だが致命的ではないもの。スクロール位置、下書き、閲覧履歴など。書けなければ諦めますが、次回の書き込み機会で回復を試みます。
+
+`disposable` は、いつでも捨ててよいもの。画像キャッシュ、先読み結果、集計前のイベント。ここは真っ先に退避の対象になります。
+
+この三層を明文化しておくと、新しい機能を足すたびに「これはどの層か」を一度考える習慣がつきます。設計判断が属人的な勘ではなく、共有された基準になる。破損した状態からの起動時復旧は[セーフモードと汚染状態のリセット](/articles/rork-dev/rork-expo-boot-loop-guard-safe-mode-poisoned-state-reset)と組み合わせると、より堅くなります。
+
+## 無言の失敗を、見えるようにする
+
+最後に、いちばん学びの大きかった部分です。書き込み失敗の本当の恐ろしさは、データが消えることそのものより、それが誰にも気づかれないことにあります。開発者にもユーザーにも見えないまま、静かに信頼だけが削れていきます。
+
+対策は二方向です。ユーザーには、`critical` な保存が失敗したときだけ、責めない言葉で状況を伝えます。「空き容量が少ないため保存できませんでした。写真や使わないアプリを整理すると保存できるようになります」といった、次の一歩を示すトーストです。頻繁に出すと逆効果なので、`critical` 失敗に限り、同一セッションで一度だけ。
+
+開発者には、テレメトリを送ります。とはいえ、空き容量が尽きている端末で、失敗の記録をディスクに書こうとするのは矛盾です。だから失敗イベントはメモリ上に保持し、次回のオンライン起動時に送信を試みる、軽量なインメモリのバッファにしました。
+
+```ts
+// telemetry/writeFailure.ts
+type FailureEvent = { key: string; reason: string; freeMB: number; at: number };
+const buffer: FailureEvent[] = [];
+
+export function recordWriteFailure(e: FailureEvent) {
+  buffer.push(e);
+  if (buffer.length > 50) buffer.shift(); // メモリも有限。上限を設ける
+}
+
+export async function flushWriteFailures(send: (e: FailureEvent[]) => Promise<void>) {
+  if (buffer.length === 0) return;
+  const batch = buffer.splice(0, buffer.length);
+  try {
+    await send(batch);
+  } catch {
+    // 送信に失敗したら戻す。ただし際限なくは溜めない
+    buffer.unshift(...batch.slice(0, 50));
+  }
+}
+```
+
+この計測を回して初めて、冒頭の「0.6〜1.4%」という数字が見えました。数字が見えると、どのしきい値をどう動かせばよいかも判断できます。可観測性がなければ、耐性設計は勘の産物にとどまります。非致命シグナルの拾い方は[クラッシュに至らない品質劣化の早期警告](/articles/rork-dev/rork-silent-failure-early-warning-non-crash-degradation-six-apps)にも通じる考え方です。
+
+## まとめ ── 次の一歩
+
+書き込み失敗への耐性は、派手な機能ではありません。けれど、最もロイヤルな利用者を静かに手放さないための、地味で確かな投資でした。
+
+もし今日ひとつだけ着手するなら、`critical` な書き込み――購入状態やお気に入り――が、失敗したときに無言で消えていないかを確認することをおすすめします。`try/catch` で握りつぶしている箇所を一つ見つけ、そこに分類と再試行、そして最小限のテレメトリを足す。その一点から、アプリはずっと誠実になります。
+
+私自身、この設計にたどり着くまでに星ひとつのレビューを何件か重ねてしまいました。同じ回り道を、この記事が少しでも省けたなら嬉しいです。お読みいただきありがとうございました。

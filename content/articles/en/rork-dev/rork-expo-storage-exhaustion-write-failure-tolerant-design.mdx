@@ -1,0 +1,237 @@
+---
+title: "When the Device Runs Out of Space, What Should Your App Protect?"
+slug: "rork-expo-storage-exhaustion-write-failure-tolerant-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-08T11:00"
+author: "Rork Lab"
+description: "Design Expo/React Native apps that assume writes can fail. Free-space budgets, LRU reclaim, data-protection tiers, and telemetry that surfaces silent failures — drawn from running six wallpaper apps."
+tags: ["Expo", "React Native", "Storage", "Error Handling", "Architecture"]
+highlights:
+  - "A priority model that separates caches you can drop from data you must never lose"
+  - "A concrete pattern that survives SQLITE_FULL and ENOSPC using a free-space budget plus LRU reclaim"
+  - "Telemetry and UX for silent write failures, sized so a solo developer can actually run it"
+---
+
+A wallpaper app of mine once got a one-star review: "I favorite an image, but it's gone the next time I open the app." I couldn't reproduce it. A few days later, a second report with the same symptom arrived. The common thread was that both devices had almost no free storage left.
+
+The iPhone of someone who takes a lot of photos often runs with a few hundred megabytes to spare. On a device like that, a write to `AsyncStorage` fails quietly. An exception is thrown, but if you swallow it, all the user is left with is the experience of saved things disappearing.
+
+I had been treating storage exhaustion as a rare edge case, and I was wrong. In practice, the people most likely to live near that edge are exactly the users of free photo, wallpaper, and camera apps. This article is about designing for the assumption that writes fail — deciding what your app sacrifices and what it defends to the very end, with the implementation code to back it up.
+
+## Storage Exhaustion Isn't a Long Tail — It's a Daily Condition
+
+Once I started logging write exceptions as Crashlytics non-fatals across my six wallpaper apps, failures resembling `SQLITE_FULL` and `ENOSPC` (No space left on device) showed up at least once on 0.6–1.4% of monthly active devices. Because they never became crashes, they were invisible to the crash-free rate I had been watching.
+
+And this segment matters to a free app. The users who have filled their device with photos and stuck with your app the longest are the ones with the least free space. Leaving write failures unhandled quietly erodes trust with your most loyal users.
+
+Seeing it as a number finally made it land. This wasn't an occasional bug — it was an operating condition that reliably occurs for a fixed share of users.
+
+## Where Do Writes Actually Fail?
+
+Start by mapping the surfaces that can fail. In an Expo / React Native app, the main paths that touch the disk are these.
+
+<table>
+  <thead>
+    <tr><th>Write path</th><th>Typical failure</th><th>What is lost</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>AsyncStorage / MMKV</td><td>Write exception, partial write</td><td>Settings, favorites, progress</td></tr>
+    <tr><td>SQLite (expo-sqlite)</td><td>SQLITE_FULL, transaction rollback</td><td>Structured data, cache rows</td></tr>
+    <tr><td>expo-file-system writeAsync</td><td>ENOSPC, truncated file</td><td>Downloaded artifacts</td></tr>
+    <tr><td>Image disk cache</td><td>Swallowed write failure</td><td>Re-fetchable images</td></tr>
+    <tr><td>Log / analytics persistence</td><td>Queue write failure</td><td>Telemetry (ironically, the record of the failure itself)</td></tr>
+  </tbody>
+</table>
+
+The key point is that even though these are all "failures," the weight of what's lost differs. A re-fetchable image cache and a purchase state that never comes back must not be treated the same way. That distinction is where the design begins.
+
+## A Write Wrapper That Assumes Failure
+
+Stop calling `AsyncStorage.setItem` directly, and slip a thin wrapper in front that classifies failures. The goals are to eliminate swallowed errors and to let the caller declare whether a write is critical or safe to drop.
+
+```ts
+// storage/safeWrite.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as FileSystem from "expo-file-system";
+
+export type WritePriority = "critical" | "normal" | "disposable";
+
+export type WriteResult =
+  | { ok: true }
+  | { ok: false; reason: "no_space" | "unknown"; error: unknown };
+
+function classify(error: unknown): "no_space" | "unknown" {
+  const msg = String((error as Error)?.message ?? error).toLowerCase();
+  // Bundle SQLITE_FULL / ENOSPC / "no space" together as space exhaustion
+  if (
+    msg.includes("sqlite_full") ||
+    msg.includes("enospc") ||
+    msg.includes("no space") ||
+    msg.includes("disk is full") ||
+    msg.includes("database or disk is full")
+  ) {
+    return "no_space";
+  }
+  return "unknown";
+}
+
+export async function safeSet(
+  key: string,
+  value: string,
+  priority: WritePriority = "normal"
+): Promise<WriteResult> {
+  try {
+    await AsyncStorage.setItem(key, value);
+    return { ok: true };
+  } catch (error) {
+    const reason = classify(error);
+    // If space is the cause, drop something disposable and retry exactly once
+    if (reason === "no_space" && priority === "critical") {
+      const freed = await reclaimDisposableSpace();
+      if (freed) {
+        try {
+          await AsyncStorage.setItem(key, value);
+          return { ok: true };
+        } catch (retryError) {
+          return { ok: false, reason: classify(retryError), error: retryError };
+        }
+      }
+    }
+    return { ok: false, reason, error };
+  }
+}
+```
+
+Three things matter here. First, `classify` normalizes the exception message so platform differences are absorbed — iOS and Android word it differently, so `SQLITE_FULL`, `ENOSPC`, and "no space" collapse into one bucket. Second, `WritePriority` is something the caller specifies. Third, only when a `critical` write fails on space do we run the reclaim step below and retry once.
+
+Why cap the retry at once? Because retrying endlessly just hits the same wall as long as the underlying space hasn't grown. If reclaim frees a few megabytes, a single retry is meaningful; anything more just burns battery and the main thread.
+
+## Keep a Free-Space Budget
+
+Reacting after a failure is fine, but changing behavior before you enter the danger zone makes the experience far gentler. `expo-file-system` lets you query free space.
+
+```ts
+// storage/diskBudget.ts
+import * as FileSystem from "expo-file-system";
+
+const LOW_SPACE_THRESHOLD_MB = 200; // below this, enter reclaim mode
+const CRITICAL_THRESHOLD_MB = 60;   // below this, stop new downloads
+
+export async function getFreeMB(): Promise<number> {
+  const bytes = await FileSystem.getFreeDiskStorageAsync();
+  return Math.floor(bytes / (1024 * 1024));
+}
+
+export type DiskState = "healthy" | "low" | "critical";
+
+export async function getDiskState(): Promise<DiskState> {
+  const freeMB = await getFreeMB();
+  if (freeMB <= CRITICAL_THRESHOLD_MB) return "critical";
+  if (freeMB <= LOW_SPACE_THRESHOLD_MB) return "low";
+  return "healthy";
+}
+```
+
+I chose to hold the thresholds as absolute values rather than a percentage of device capacity. Downloading a single wallpaper is roughly 2–8MB, and there's a moment during the write when both the temp file and the renamed final file exist at once. Without a few dozen megabytes of headroom, the download itself gets truncated. The 60MB `CRITICAL_THRESHOLD_MB` is an empirical value meant to absorb that "briefly doubled" moment safely.
+
+Once you're in the `low` state, stop prefetching. Fetch the one image the user wants to see right now, but drop the speculative fetch of images they might see next. That single change noticeably slowed the slide toward exhaustion. The broader prefetch design is covered in [image cache and prefetch design for scroll performance](/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design).
+
+## Delete the Disposable Things, Quietly
+
+The only safe way to create space is to delete things you can re-fetch. The image disk cache is the prime candidate — if it's gone, you pull it from the network again when it's next needed. Evicting oldest-first with an LRU approximation is the natural move.
+
+```ts
+// storage/reclaim.ts
+import * as FileSystem from "expo-file-system";
+
+const IMAGE_CACHE_DIR = FileSystem.cacheDirectory + "images/";
+const RECLAIM_TARGET_MB = 80; // space we want to free in one pass
+
+export async function reclaimDisposableSpace(): Promise<boolean> {
+  const info = await FileSystem.getInfoAsync(IMAGE_CACHE_DIR);
+  if (!info.exists) return false;
+
+  const names = await FileSystem.readDirectoryAsync(IMAGE_CACHE_DIR);
+  const entries = await Promise.all(
+    names.map(async (name) => {
+      const path = IMAGE_CACHE_DIR + name;
+      const stat = await FileSystem.getInfoAsync(path, { size: true });
+      return {
+        path,
+        size: stat.size ?? 0,
+        mtime: (stat as any).modificationTime ?? 0,
+      };
+    })
+  );
+
+  // Sort oldest-first (LRU approximation) and delete until we hit the target
+  entries.sort((a, b) => a.mtime - b.mtime);
+
+  let freedBytes = 0;
+  const targetBytes = RECLAIM_TARGET_MB * 1024 * 1024;
+  for (const entry of entries) {
+    if (freedBytes >= targetBytes) break;
+    await FileSystem.deleteAsync(entry.path, { idempotent: true });
+    freedBytes += entry.size;
+  }
+  return freedBytes > 0;
+}
+```
+
+I use `modificationTime` as an approximation of last-use time. A strict LRU would require touching each file on access, but at a wallpaper app's scale the modification-time approximation proved good enough in practice. The 80MB reclaim target is chosen as a band wide enough to absorb most `critical` writes plus the next one or two downloads that follow.
+
+Keeping the cache from ballooning in the first place is its own topic, covered in [fixing image disk cache bloat](/articles/rork-dev/rork-expo-image-disk-cache-bloat-fix). Reclaim is the last line of defense; it assumes you're also managing a routine size cap.
+
+## Decide the Priority: What Do You Defend to the End?
+
+The heart of resilience design is a priority line drawn before any code. I split write targets into three tiers.
+
+`critical` is anything whose loss directly damages user trust: purchase and entitlement state, account-linking tokens, and favorites the user explicitly saved. These get reclaim plus a retry, and if they still can't be written, we show an explicit error. Never fail silently — that is the one absolute rule. Treating purchase state as an authoritative source connects directly to the thinking in [syncing purchase state](/articles/rork-dev/rork-purchase-status-sync-revenuecat-fix).
+
+`normal` is anything whose loss is inconvenient but not fatal: scroll position, drafts, view history. If it can't be written, we give up but try to recover at the next write opportunity.
+
+`disposable` is anything safe to drop anytime: the image cache, prefetch results, pre-aggregation events. This is the first thing reclaim targets.
+
+Writing these three tiers down builds a habit of asking, for every new feature, "which tier is this?" The design decision becomes a shared standard rather than one person's gut call. Combined with startup recovery from a corrupted state, described in [safe mode and poisoned-state reset](/articles/rork-dev/rork-expo-boot-loop-guard-safe-mode-poisoned-state-reset), it gets sturdier still.
+
+## Make the Silent Failure Visible
+
+Here's the part I learned the most from. The real danger of a write failure isn't the data loss itself — it's that no one notices. Invisible to both the developer and the user, trust just quietly drains away.
+
+The response runs in two directions. For users, only when a `critical` save fails, communicate the situation in language that doesn't blame them. A toast that points to the next step: "We couldn't save because storage is low. Freeing up photos or unused apps will let saving work again." Showing it too often backfires, so limit it to `critical` failures, once per session.
+
+For developers, send telemetry. But writing a failure record to disk on a device that's already out of space is a contradiction. So failure events are held in memory and flushed on the next online launch — a lightweight in-memory buffer.
+
+```ts
+// telemetry/writeFailure.ts
+type FailureEvent = { key: string; reason: string; freeMB: number; at: number };
+const buffer: FailureEvent[] = [];
+
+export function recordWriteFailure(e: FailureEvent) {
+  buffer.push(e);
+  if (buffer.length > 50) buffer.shift(); // memory is finite too; cap it
+}
+
+export async function flushWriteFailures(send: (e: FailureEvent[]) => Promise<void>) {
+  if (buffer.length === 0) return;
+  const batch = buffer.splice(0, buffer.length);
+  try {
+    await send(batch);
+  } catch {
+    // On send failure, put them back — but don't hoard without bound
+    buffer.unshift(...batch.slice(0, 50));
+  }
+}
+```
+
+Only after running this measurement did the "0.6–1.4%" from the opening become visible. Once the number is visible, you can reason about which threshold to move and by how much. Without observability, resilience design stays a product of guesswork. The way of catching non-fatal signals shares its thinking with [early warning for non-crash quality degradation](/articles/rork-dev/rork-silent-failure-early-warning-non-crash-degradation-six-apps).
+
+## Wrapping Up — Your Next Step
+
+Resilience to write failures isn't a flashy feature. But it turned out to be a quiet, dependable investment in not silently losing your most loyal users.
+
+If you tackle just one thing today, I'd suggest checking whether your `critical` writes — purchase state and favorites — vanish silently when they fail. Find one place where a `try/catch` is swallowing the error, and add classification, a retry, and minimal telemetry there. From that single point, the app becomes far more honest.
+
+It took me a handful of one-star reviews to arrive at this design. If this article spares you even part of that detour, I'll be glad. Thank you for reading.
