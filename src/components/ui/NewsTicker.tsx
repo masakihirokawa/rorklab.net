@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "NATIVE — Rork MaxはAR/LiDAR・Metalの3D・ウィジェット・Dynamic Island・Live Activities・HealthKit・Core MLなどネイティブ機能を解放します",
-    "STACK — RorkはReact Native（Expo）でiOS/Androidのネイティブアプリを生成し、英語の説明だけで動くコードを書き出します",
-    "GROWTH — Rorkの月間アクセスは743,000件を超え、成長率は85%に達しています",
-    "PRICE — 料金は無料から始められ、有料プランは月$25から利用できます",
-    "TREND — Gartnerは2026年末までに新規アプリの75%がローコード/ノーコードで作られると予測しています",
+    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — Rork MaxではAR/LiDARスキャン・Metalによる3Dゲーム・ウィジェット・Dynamic Islandなどネイティブ機能を利用できます",
+    "APPLE — HealthKit・HomeKit・NFC・App Clips・オンデバイスCore MLといったAppleの高度な機能にもアクセスできます",
+    "RN — 標準のRorkはReact Native（Expo）でiOSとAndroidを単一プロンプトから生成します",
+    "PRICE — 無料で始められ、有料プランは月額$25から利用できます",
+    "GROWTH — Rorkは月間訪問743,000超・成長率85%に達し、$15Mの資金を調達しました",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — Rork Max unlocks native features: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, and Core ML",
-    "STACK — Rork builds native iOS and Android apps with React Native (Expo) from a plain-English description",
-    "GROWTH — Rork now attracts over 743,000 monthly visits, growing at an 85% rate",
-    "PRICE — Rork is free to start, with paid plans from $25/month",
-    "TREND — Gartner projects 75% of new apps will be built with low-code/no-code by the end of 2026",
+    "MAX — Rork Max builds native Swift apps instead of React Native for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — Rork Max unlocks native features like AR/LiDAR scanning, Metal 3D games, widgets, and Dynamic Island",
+    "APPLE — It also reaches advanced Apple capabilities such as HealthKit, HomeKit, NFC, App Clips, and on-device Core ML",
+    "RN — Standard Rork builds iOS and Android from a single prompt using React Native (Expo)",
+    "PRICE — Rork is free to start, with paid plans beginning at $25 per month",
+    "GROWTH — Rork now sees 743,000+ monthly visits, 85% growth, and recently raised $15M",
   ],
 };
 
