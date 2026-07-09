@@ -1,0 +1,285 @@
+---
+title: "生成のたびに崩れるレイヤ境界を、CIで守る — Rork製Expoアプリの依存ルール機械化"
+slug: "rork-layer-boundary-enforcement-dependency-cruiser-eslint-ci"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T11:00"
+author: "Rork Lab"
+description: "Rorkが生成したExpoアプリを長く運用すると、画面から直接APIクライアントを叩くimportが静かに増えていきます。ESLintのゾーン制約とdependency-cruiserで依存の向きを機械化し、CIで落とすまでの実装を残します。"
+tags: ["Rork", "Expo", "アーキテクチャ", "ESLint", "CI"]
+highlights:
+  - "レイヤ違反214件・循環依存17件を、baseline方式で新規ゼロに固定した手順"
+  - "ESLint no-restricted-imports のゾーン設定と dependency-cruiser ルールの実コード"
+  - "CI実行時間を38秒だけ増やして、差分のみ厳格化する段階導入の設計"
+---
+
+半年ぶりに触った画面コンポーネントの先頭で、`import { supabase } from "../../lib/supabaseClient"` という行を見つけました。
+
+その画面は本来、フックを経由してデータを受け取るはずのものでした。けれど生成と手直しを重ねるうちに、いつの間にか最短距離が選ばれていました。責める相手はいません。私自身が「今日はここだけ」と通した一行が、次の生成で参照され、さらに次の画面へ複製されていきます。
+
+個人開発でアプリを複数本抱えていると、この種の劣化は静かに進みます。レビューする人がいないのですから、当然といえば当然です。ならば、レビュアーの役割を機械に肩代わりしてもらうより他にありません。
+
+扱わないことを先に書いておきます。理想的なレイヤ構成の議論はしません。すでに App Store で配信中のアプリを、今の構成のまま「これ以上は崩さない」状態へ持っていく話に絞ります。
+
+## 「境界」を守る前に、境界を宣言する
+
+依存ルールを機械化するとき、最初につまずくのは「どこが境界なのか誰も書いていない」点でした。頭の中にはあるのに、ファイルには存在しません。
+
+私は既存のディレクトリ構成をそのまま採用し、依存の向きだけを一枚の表に落としました。新しい構成を発明せず、いま在るものに名前を付ける。これだけで作業量が大きく変わります。
+
+<table>
+  <thead>
+    <tr><th>レイヤ</th><th>実際のパス</th><th>importしてよい先</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>app（画面）</td><td><code>app/**</code></td><td>features, ui, shared</td></tr>
+    <tr><td>features（機能）</td><td><code>src/features/**</code></td><td>同一feature内, data, ui, shared</td></tr>
+    <tr><td>data（取得・永続化）</td><td><code>src/data/**</code></td><td>shared のみ</td></tr>
+    <tr><td>ui（見た目のみ）</td><td><code>src/ui/**</code></td><td>shared のみ</td></tr>
+    <tr><td>shared（型・定数・純関数）</td><td><code>src/shared/**</code></td><td>なし（葉）</td></tr>
+  </tbody>
+</table>
+
+ここで大事なのは、features 同士の横断を禁じている点です。Rork に「お気に入り画面にも通知バッジを出して」と頼むと、`features/favorites` から `features/notifications` を直に呼ぶコードが出てきます。動きます。動きますが、片方を作り直したい日に、もう片方が人質になります。
+
+横断が必要なら shared に型を、data にクエリを置く。判断が要る場面を、判断が要らない場面へ寄せていく作業です。
+
+## ESLint で「書けないようにする」
+
+まず効いたのは ESLint の `no-restricted-imports` でした。エディタ上で赤線が出るため、生成直後の私がその場で気づけます。CI で落ちるより一日早い。
+
+Flat Config でゾーンごとに設定します。
+
+```js
+// eslint.config.js
+import tseslint from "typescript-eslint";
+
+/** レイヤごとの禁止 import パターン */
+const layerRules = {
+  "src/data/**": ["@/features/*", "@/ui/*", "@/app/*"],
+  "src/ui/**": ["@/features/*", "@/data/*", "@/app/*"],
+  "src/shared/**": ["@/features/*", "@/data/*", "@/ui/*", "@/app/*"],
+  "app/**": ["@/data/*"], // 画面から直接データ層を触らせない
+};
+
+export default tseslint.config(
+  ...Object.entries(layerRules).map(([files, patterns]) => ({
+    files: [files],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: patterns.map((group) => ({
+            group: [group],
+            message: `${files} からこの層への import は許可されていません。shared 経由に置き換えてください。`,
+          })),
+        },
+      ],
+    },
+  })),
+);
+```
+
+`message` を丁寧に書く理由があります。半年後の私は、なぜ禁止されているかを覚えていません。エラーメッセージが唯一の設計ドキュメントとして残ります。実際、この一行があるかないかで、迂回の質が変わりました。メッセージがないと `// eslint-disable-next-line` が生えます。
+
+ただし ESLint だけでは足りません。`app/screens/Home.tsx` が `../../data/client` のような相対パスで抜けてくると、パターンによっては素通りします。そして循環依存は原理的に見えません。
+
+## dependency-cruiser で、向きと循環を見る
+
+`dependency-cruiser` はグラフとして依存を評価するため、循環と孤立を検出できます。ESLint が「一行の禁止」なら、こちらは「全体の形の禁止」に当たります。
+
+```js
+// .dependency-cruiser.js
+module.exports = {
+  forbidden: [
+    {
+      name: "no-circular",
+      severity: "error",
+      comment: "循環依存はテストもツリーシェイクも壊します",
+      from: {},
+      to: { circular: true },
+    },
+    {
+      name: "screen-to-data",
+      severity: "error",
+      comment: "画面はフック経由でのみデータへ到達すること",
+      from: { path: "^app/" },
+      to: { path: "^src/data/" },
+    },
+    {
+      name: "cross-feature",
+      severity: "error",
+      comment: "feature 間の直接参照を禁止（shared に寄せる）",
+      from: { path: "^src/features/([^/]+)/" },
+      to: {
+        path: "^src/features/([^/]+)/",
+        pathNot: "^src/features/$1/",
+      },
+    },
+    {
+      name: "ui-must-be-pure",
+      severity: "error",
+      from: { path: "^src/ui/" },
+      to: { path: "^(src/data|src/features)/" },
+    },
+  ],
+  options: {
+    doNotFollow: { path: "node_modules" },
+    tsPreCompilationDeps: true,
+    tsConfig: { fileName: "tsconfig.json" },
+    exclude: { path: "(^|/)(__tests__|\\.expo|android|ios)/" },
+  },
+};
+```
+
+`cross-feature` ルールの `$1` は from 側でキャプチャしたグループを指します。この後方参照のおかげで、feature 名を列挙せずに「自分以外の feature」を表現できます。feature が増えても設定は変わりません。
+
+`tsPreCompilationDeps: true` を入れると、型のみの import も辿ります。最初は外していました。型だけなら実行時に影響しないと考えたためです。けれど型経由で feature 同士が結ばれていると、片方を消す日に型エラーが連鎖します。実行時の依存より、むしろ心理的な障壁として重い。今は入れています。
+
+初回に走らせたときの出力を、そのまま貼っておきます。
+
+```text
+  error no-circular: src/features/wallpaper/store.ts →
+      src/features/wallpaper/selectors.ts →
+      src/features/wallpaper/store.ts
+  error screen-to-data: app/(tabs)/index.tsx → src/data/supabaseClient.ts
+  error cross-feature: src/features/favorites/BadgeRow.tsx →
+      src/features/notifications/useUnread.ts
+
+✘ 231 dependency violations (17 errors, 214 warnings). 892 modules, 2140 dependencies cruised.
+```
+
+231件。目を背けたくなる数字でした。ここで全部直そうとすると、その週末が消えます。
+
+## 231件を「今日は0件」にする — baseline という妥協
+
+過去の違反をすべて解消してから導入する、という順序は現実的ではありませんでした。私が採ったのは、既存違反を一覧として凍結し、それ以外を error にする方式です。
+
+```bash
+# 現状の違反をスナップショットとして保存する
+npx depcruise src app \
+  --config .dependency-cruiser.js \
+  --output-type err-long > .depcruise-baseline.txt
+
+# 以後は差分だけを見る
+npx depcruise src app --config .dependency-cruiser.js \
+  --output-type err-long > .depcruise-current.txt
+
+diff <(sort .depcruise-baseline.txt) <(sort .depcruise-current.txt) \
+  | grep '^>' && echo "新規違反あり" && exit 1
+```
+
+素朴ですが、これで十分に機能しました。新しく増えた違反だけが CI を落とします。既存の231件は、触ったついでに1件ずつ返済していきます。
+
+返済が進むと baseline を更新したくなりますが、更新は「減った時だけ」に限る運用にしました。増える方向の更新をコミットに混ぜないため、baseline の行数を検査する一行を足しています。
+
+```bash
+BASE=$(wc -l < .depcruise-baseline.txt)
+CUR=$(wc -l < .depcruise-current.txt)
+[ "$CUR" -le "$BASE" ] || { echo "違反が $((CUR - BASE)) 件増えました"; exit 1; }
+```
+
+## GitHub Actions への組み込みと、実際のコスト
+
+EAS Build のワークフローとは分け、Pull Request 時のみ走らせています。ビルドを待たずに結果が返ることに価値があります。
+
+```yaml
+# .github/workflows/boundaries.yml
+name: boundaries
+on:
+  pull_request:
+    paths: ["src/**", "app/**", "eslint.config.js", ".dependency-cruiser.js"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: ESLint (layer zones)
+        run: npx eslint "src/**/*.{ts,tsx}" "app/**/*.{ts,tsx}" --max-warnings=0
+      - name: dependency-cruiser (diff against baseline)
+        run: bash scripts/check-boundaries.sh
+      - name: Upload dependency graph
+        if: failure()
+        run: |
+          npx depcruise src app --config .dependency-cruiser.js \
+            --output-type dot | dot -T svg > graph.svg
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: dependency-graph, path: graph.svg }
+```
+
+落ちたときだけグラフを SVG で残す、という部分が地味に効きます。テキストの違反リストは「どの一行が悪いか」を教えますが、なぜその一行が生まれたかは教えてくれません。グラフを眺めると、たいてい原因は別の場所にあります。
+
+導入前後で計測した数字を残しておきます。私の環境（6本のアプリ、うち3本は同一 monorepo、GitHub Actions の ubuntu-latest）での値です。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>導入前</th><th>導入3週間後</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>循環依存</td><td>17件</td><td>0件</td></tr>
+    <tr><td>レイヤ違反（baseline）</td><td>214件</td><td>171件</td></tr>
+    <tr><td>新規違反（PR単位）</td><td>計測不能</td><td>0件</td></tr>
+    <tr><td>PR チェック時間</td><td>2分11秒</td><td>2分49秒</td></tr>
+    <tr><td>本番クラッシュ率</td><td>0.42%</td><td>0.31%</td></tr>
+  </tbody>
+</table>
+
+CI の増分は38秒でした。クラッシュ率は App Store のリリース版を Crashlytics で計測した値です。改善は循環依存の解消だけが理由とは言い切れません。同時期に別の修正も入れています。それでも、初期化順序に起因する `undefined is not a function` の再発が止まった事実は記録に値します。循環していたモジュールは、片方が読み込まれる前にもう片方を参照していました。
+
+## 生成AIに境界を教える — プロンプトではなく、ファイルに
+
+ここが、この仕組みを入れて最も報われた部分です。
+
+Rork や Claude Code に「data 層を画面から呼ばないでください」と毎回書いていた頃は、三回に一回は忘れられました。人間の私も忘れるのですから、無理もありません。
+
+いま私は、リポジトリ側に規約を置いています。
+
+```markdown
+<!-- ARCHITECTURE.md（生成AIが最初に読むファイル） -->
+## import の向き
+
+app → features → data → shared（逆流禁止）
+ui は shared のみに依存する純粋な層です。
+
+違反は `npm run boundaries` で検出できます。
+新しい画面を追加するときは、data を直接 import せず
+`src/features/<name>/use*.ts` にフックを作ってください。
+```
+
+そのうえで `package.json` に検証コマンドを一本置き、生成後に必ず走らせます。
+
+```json
+{
+  "scripts": {
+    "boundaries": "eslint src app --max-warnings=0 && bash scripts/check-boundaries.sh"
+  }
+}
+```
+
+指示を守らせるのではなく、守れたかどうかを一秒で確かめられるようにする。この順序に変えてから、手戻りが目に見えて減りました。生成物を信頼するかどうかという問いを、検証できるかどうかという問いに置き換えたわけです。
+
+失敗も書いておきます。当初、規約ファイルを `docs/architecture/layering.md` という深い場所に置いていました。読まれませんでした。ルートの `ARCHITECTURE.md` に移した週から、生成コードの違反が体感で半分以下になりました。ツールが読む場所と、人が置きたい場所は、必ずしも一致しません。
+
+## どこまで縛るか、という判断
+
+すべてを禁止すると、開発が止まります。私が最終的に error のまま残したのは、循環依存・画面からの data 直参照・feature 間の横断、この3つだけです。
+
+`ui` からの `shared` 参照の深さや、命名規約は warning に留めました。判断の余地が残る領域まで機械に委ねると、`eslint-disable` が増え、やがてルール自体が信用されなくなります。ルールの数ではなく、破られない数を数えたい。
+
+もし今から一つだけ入れるとしたら、迷わず `no-circular` をお勧めします。循環依存は症状が出るまで無症状で、出たときには初期化順序という最も再現しづらいエラーの形で現れます。本番運用に入ってから回避策を探すより、設定4行を先に置く方が安上がりです。baseline すら要りません。
+
+## 明日の一歩
+
+`npx depcruise src app --output-type err-long --validate` を、設定ファイルなしで一度走らせてみてください。`--init` で対話的に雛形も作れます。何件出るかを知るだけで、次に何を守るべきかが決まります。
+
+私も導入から三週間で、返済できたのは43件です。残り171件を眺めると気が重くなる日もありますが、少なくとも増えてはいません。増えていない、という状態を維持できることが、個人開発では何より大きいと感じています。
+
+拙い実装の記録ではありますが、同じように生成コードと長く付き合う方の参考になれば幸いです。お読みいただきありがとうございました。

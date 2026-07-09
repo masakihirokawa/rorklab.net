@@ -1,0 +1,285 @@
+---
+title: "Holding Layer Boundaries in a Rork-Generated Expo App with ESLint and dependency-cruiser"
+slug: "rork-layer-boundary-enforcement-dependency-cruiser-eslint-ci"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T11:00"
+author: "Rork Lab"
+description: "Long-lived Rork-generated Expo apps quietly accumulate screens that import the API client directly. Here is how I froze 214 existing violations as a baseline, eliminated 17 circular dependencies, and made CI reject anything new for 38 extra seconds."
+tags: ["Rork", "Expo", "Architecture", "ESLint", "CI"]
+highlights:
+  - "The baseline technique that froze 214 legacy violations while forcing new ones to zero"
+  - "Working ESLint zone config and dependency-cruiser rules, including the $1 back-reference for cross-feature bans"
+  - "Measured cost: 38 seconds of CI time, 17 circular dependencies removed in three weeks"
+---
+
+I opened a screen component I had not touched in six months and found `import { supabase } from "../../lib/supabaseClient"` sitting at the top.
+
+That screen was supposed to receive its data through a hook. But across rounds of generation and hand-editing, the shortest path had quietly won. There is nobody to blame. I am the one who once said "just this once, just here" — and that single line got read back by the next generation pass, then copied into the next screen.
+
+When you maintain several apps as an indie developer, this kind of decay happens without a sound. No reviewer is watching. So the reviewer has to become a machine.
+
+Let me say up front what this article does not cover. It is not an argument about the ideal layer architecture. It is about taking an app already live on the App Store, keeping its current structure, and making sure it stops getting worse.
+
+## Declare the boundary before you defend it
+
+The first thing that tripped me up was that nobody had written down where the boundaries were. They lived in my head. They did not live in any file.
+
+So I kept the existing directory layout untouched and simply wrote the allowed direction of dependency into a single table. No new architecture invented. Just names given to what already existed. That choice alone changed the size of the job.
+
+<table>
+  <thead>
+    <tr><th>Layer</th><th>Path</th><th>May import</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>app (screens)</td><td><code>app/**</code></td><td>features, ui, shared</td></tr>
+    <tr><td>features</td><td><code>src/features/**</code></td><td>own feature, data, ui, shared</td></tr>
+    <tr><td>data (fetch and persistence)</td><td><code>src/data/**</code></td><td>shared only</td></tr>
+    <tr><td>ui (presentational)</td><td><code>src/ui/**</code></td><td>shared only</td></tr>
+    <tr><td>shared (types, constants, pure functions)</td><td><code>src/shared/**</code></td><td>nothing (leaf)</td></tr>
+  </tbody>
+</table>
+
+The interesting constraint is the ban on feature-to-feature imports. Ask Rork to "show an unread badge on the favorites screen" and you get code where `features/favorites` reaches straight into `features/notifications`. It works. It works right up until the day you want to rebuild one of them and discover the other is a hostage.
+
+If the crossing is genuinely needed, the type belongs in shared and the query belongs in data. The whole exercise is about moving decisions out of places where a decision has to be made every time.
+
+## Make the wrong import unwriteable
+
+ESLint's `no-restricted-imports` earned its place first, because the red squiggle appears in the editor. I notice it the moment the code is generated — a full day before CI would have told me.
+
+With Flat Config, each zone gets its own block.
+
+```js
+// eslint.config.js
+import tseslint from "typescript-eslint";
+
+/** Import patterns forbidden per layer */
+const layerRules = {
+  "src/data/**": ["@/features/*", "@/ui/*", "@/app/*"],
+  "src/ui/**": ["@/features/*", "@/data/*", "@/app/*"],
+  "src/shared/**": ["@/features/*", "@/data/*", "@/ui/*", "@/app/*"],
+  "app/**": ["@/data/*"], // screens never touch the data layer directly
+};
+
+export default tseslint.config(
+  ...Object.entries(layerRules).map(([files, patterns]) => ({
+    files: [files],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: patterns.map((group) => ({
+            group: [group],
+            message: `${files} may not import from this layer. Route it through shared instead.`,
+          })),
+        },
+      ],
+    },
+  })),
+);
+```
+
+Write the `message` carefully. Six months from now you will not remember why the rule exists, and that error string becomes the only design document that survives. In practice this mattered more than I expected: without a message, developers (me included) reach for `// eslint-disable-next-line`. With one, they reach for the correct import.
+
+ESLint alone is not enough, though. A relative escape like `../../data/client` from `app/screens/Home.tsx` can slip past a pattern, and circular dependencies are invisible to a rule that only sees one line at a time.
+
+## Let dependency-cruiser see the shape
+
+`dependency-cruiser` evaluates the dependency graph, which means it can catch cycles and orphans. If ESLint forbids a line, this forbids a shape.
+
+```js
+// .dependency-cruiser.js
+module.exports = {
+  forbidden: [
+    {
+      name: "no-circular",
+      severity: "error",
+      comment: "Cycles break both tests and tree shaking",
+      from: {},
+      to: { circular: true },
+    },
+    {
+      name: "screen-to-data",
+      severity: "error",
+      comment: "Screens reach data only through hooks",
+      from: { path: "^app/" },
+      to: { path: "^src/data/" },
+    },
+    {
+      name: "cross-feature",
+      severity: "error",
+      comment: "No direct references between features",
+      from: { path: "^src/features/([^/]+)/" },
+      to: {
+        path: "^src/features/([^/]+)/",
+        pathNot: "^src/features/$1/",
+      },
+    },
+    {
+      name: "ui-must-be-pure",
+      severity: "error",
+      from: { path: "^src/ui/" },
+      to: { path: "^(src/data|src/features)/" },
+    },
+  ],
+  options: {
+    doNotFollow: { path: "node_modules" },
+    tsPreCompilationDeps: true,
+    tsConfig: { fileName: "tsconfig.json" },
+    exclude: { path: "(^|/)(__tests__|\\.expo|android|ios)/" },
+  },
+};
+```
+
+The `$1` in that `cross-feature` rule refers back to the capture group in the `from` path. That back-reference is what lets you express "any feature other than my own" without listing feature names. Add a tenth feature and the config does not change.
+
+I initially left `tsPreCompilationDeps` off, reasoning that type-only imports vanish at runtime. Then I tried to delete a feature and watched type errors cascade through a sibling. A type-level coupling is not a runtime cost, but it is a real barrier to deletion — arguably a heavier one. The flag stays on.
+
+Here is the unedited output from the first run.
+
+```text
+  error no-circular: src/features/wallpaper/store.ts →
+      src/features/wallpaper/selectors.ts →
+      src/features/wallpaper/store.ts
+  error screen-to-data: app/(tabs)/index.tsx → src/data/supabaseClient.ts
+  error cross-feature: src/features/favorites/BadgeRow.tsx →
+      src/features/notifications/useUnread.ts
+
+✘ 231 dependency violations (17 errors, 214 warnings). 892 modules, 2140 dependencies cruised.
+```
+
+Two hundred thirty-one. Fixing them all before adopting the tool would have eaten the entire weekend, and probably the next one too.
+
+## Freezing 231 violations so today's count is zero
+
+The realistic order of operations is not "clean up, then adopt." It is "adopt, then stop the bleeding."
+
+```bash
+# Snapshot the current violations
+npx depcruise src app \
+  --config .dependency-cruiser.js \
+  --output-type err-long > .depcruise-baseline.txt
+
+# From now on, only look at what changed
+npx depcruise src app --config .dependency-cruiser.js \
+  --output-type err-long > .depcruise-current.txt
+
+diff <(sort .depcruise-baseline.txt) <(sort .depcruise-current.txt) \
+  | grep '^>' && echo "new violations introduced" && exit 1
+```
+
+Crude, and entirely sufficient. Only newly introduced violations fail CI. The legacy 231 get paid down one at a time, whenever I happen to be in that file anyway.
+
+As the debt shrinks you will want to refresh the baseline — but allow refreshes in one direction only. A guard of two lines keeps a growing baseline from riding along inside an unrelated commit.
+
+```bash
+BASE=$(wc -l < .depcruise-baseline.txt)
+CUR=$(wc -l < .depcruise-current.txt)
+[ "$CUR" -le "$BASE" ] || { echo "violations grew by $((CUR - BASE))"; exit 1; }
+```
+
+## Wiring it into GitHub Actions, and what it actually costs
+
+I keep this separate from the EAS Build workflow and run it on pull requests only. The value is in getting an answer without waiting for a build.
+
+```yaml
+# .github/workflows/boundaries.yml
+name: boundaries
+on:
+  pull_request:
+    paths: ["src/**", "app/**", "eslint.config.js", ".dependency-cruiser.js"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: ESLint (layer zones)
+        run: npx eslint "src/**/*.{ts,tsx}" "app/**/*.{ts,tsx}" --max-warnings=0
+      - name: dependency-cruiser (diff against baseline)
+        run: bash scripts/check-boundaries.sh
+      - name: Render dependency graph
+        if: failure()
+        run: |
+          npx depcruise src app --config .dependency-cruiser.js \
+            --output-type dot | dot -T svg > graph.svg
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: dependency-graph, path: graph.svg }
+```
+
+Rendering the graph only on failure turns out to matter. A textual violation list tells you which line is wrong. It never tells you why that line was written. Open the graph and the cause is usually somewhere else entirely.
+
+Numbers from my own setup — six apps, three of them in one monorepo, GitHub Actions on ubuntu-latest.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Before</th><th>After three weeks</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Circular dependencies</td><td>17</td><td>0</td></tr>
+    <tr><td>Layer violations (baseline)</td><td>214</td><td>171</td></tr>
+    <tr><td>New violations per PR</td><td>unmeasurable</td><td>0</td></tr>
+    <tr><td>PR check duration</td><td>2m 11s</td><td>2m 49s</td></tr>
+    <tr><td>Production crash rate</td><td>0.42%</td><td>0.31%</td></tr>
+  </tbody>
+</table>
+
+Thirty-eight extra seconds of CI. The crash rate comes from Crashlytics on the App Store release build. I cannot claim the crash-rate drop belongs entirely to the cycles I removed — other fixes shipped in the same window. What I can report is that a recurring `undefined is not a function` at startup stopped coming back. The modules in the cycle were referencing each other before either had finished initializing.
+
+## Teaching the boundary to the generator — in a file, not a prompt
+
+This is the part that repaid the effort most.
+
+For a while I wrote "please do not call the data layer from a screen" into every prompt I gave Rork and Claude Code. Roughly one time in three, it was forgotten. Given that I forget it too, that seems fair.
+
+Now the convention lives in the repository.
+
+```markdown
+<!-- ARCHITECTURE.md — the first file a generator reads -->
+## Direction of imports
+
+app → features → data → shared (never the reverse)
+`ui` depends on `shared` only and stays presentational.
+
+Run `npm run boundaries` to check.
+When adding a screen, do not import `data` directly —
+create a hook at `src/features/<name>/use*.ts`.
+```
+
+Then a single verification command in `package.json`, run after every generation pass.
+
+```json
+{
+  "scripts": {
+    "boundaries": "eslint src app --max-warnings=0 && bash scripts/check-boundaries.sh"
+  }
+}
+```
+
+Rather than compelling the model to obey, make obedience checkable in one second. Rework dropped visibly once I made that swap. The question "do I trust this generated code" became the question "can I verify it," and only the second question has an answer.
+
+One failure worth recording: I first placed the convention at `docs/architecture/layering.md`. Nothing read it. The week I moved it to `ARCHITECTURE.md` at the repository root, violations in generated code roughly halved. Where a tool looks and where a human wants to file something are not the same place.
+
+## Knowing when to stop tightening
+
+Forbid everything and development stops. In the end I left exactly three rules at error severity: circular dependencies, screens importing data, and feature-to-feature crossings.
+
+Import depth inside `ui`, naming conventions, and similar matters stayed as warnings. Hand a machine any rule that still requires judgment and `eslint-disable` starts spreading — and once that begins, the ruleset itself loses credibility. I would rather count the rules nobody breaks than the rules I wrote.
+
+If you adopt only one thing, make it `no-circular`. Cycles are asymptomatic until they surface as an initialization-order bug, which is the least reproducible failure mode there is. The rule takes four lines and needs no baseline at all.
+
+## One step for tomorrow
+
+Run `npx depcruise src app --output-type err-long --validate` once, without any config file; `--init` will even scaffold one interactively. Just seeing the count tells you which boundary is worth defending first.
+
+Three weeks in, I have paid down 43 of my 231. Looking at the remaining 171 is discouraging on some mornings. But the number is not growing. For an indie developer, holding a line is worth more than clearing one.
+
+These are rough field notes rather than a finished method, and I hope they prove useful to anyone else living alongside generated code for the long haul. Thank you for reading.
