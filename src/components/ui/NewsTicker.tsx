@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "NATIVE — Rork MaxではAR/LiDARスキャン・Metalによる3Dゲーム・ウィジェット・Dynamic Islandなどネイティブ機能を利用できます",
-    "APPLE — HealthKit・HomeKit・NFC・App Clips・オンデバイスCore MLといったAppleの高度な機能にもアクセスできます",
-    "RN — 標準のRorkはReact Native（Expo）でiOSとAndroidを単一プロンプトから生成します",
-    "PRICE — 無料で始められ、有料プランは月額$25から利用できます",
-    "GROWTH — Rorkは月間訪問743,000超・成長率85%に達し、$15Mの資金を調達しました",
+    "ENGINE — Rork MaxはClaude CodeとClaude Opus 4.6を基盤に、ネイティブSwiftアプリを直接生成します",
+    "CORE ML — Rork MaxからCore MLの端末内推論・HealthKit・HomeKit・NFC・App Clipsといった機能に手が届きます",
+    "SEED — Rorkは2026年4月にLeft Lane Capital主導で$15Mのシードを調達し、Peak XVやa16z Speedrunが参加しました",
+    "M&A — Rorkはアプリビルダー Paperline を買収し、エンジニアリング人材の獲得を目的に買収を継続する方針です",
+    "MARKET — Gartnerは2026年末までに新規アプリの75%がローコードまたはノーコードで作られると予測しています",
+    "GROWTH — ノーコードAI市場は2024年の$4.9Bから2029年に$24.8Bへ、年38.2%の成長が見込まれています",
   ],
   en: [
-    "MAX — Rork Max builds native Swift apps instead of React Native for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — Rork Max unlocks native features like AR/LiDAR scanning, Metal 3D games, widgets, and Dynamic Island",
-    "APPLE — It also reaches advanced Apple capabilities such as HealthKit, HomeKit, NFC, App Clips, and on-device Core ML",
-    "RN — Standard Rork builds iOS and Android from a single prompt using React Native (Expo)",
-    "PRICE — Rork is free to start, with paid plans beginning at $25 per month",
-    "GROWTH — Rork now sees 743,000+ monthly visits, 85% growth, and recently raised $15M",
+    "ENGINE — Rork Max is powered by Claude Code and Claude Opus 4.6, generating native Swift apps directly",
+    "CORE ML — Rork Max reaches on-device Core ML inference alongside HealthKit, HomeKit, NFC, and App Clips",
+    "SEED — Rork raised a $15M seed led by Left Lane Capital in April 2026, joined by Peak XV and a16z Speedrun",
+    "M&A — Rork acquired the app builder Paperline and says it will stay acquisitive to bring in engineering talent",
+    "MARKET — Gartner expects 75% of new applications to be built with low-code or no-code tools by the end of 2026",
+    "GROWTH — The no-code AI platform market is projected to grow from $4.9B in 2024 to $24.8B by 2029",
   ],
 };
 
