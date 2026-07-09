@@ -1,24 +1,36 @@
 ---
-title: "Feature Flags and Remote Config in Rork Max"
+title: "Making Feature Flags Survive Production: Kill Switches and Gradual Rollouts in Rork Max"
 slug: "rork-max-feature-flags-remote-config"
 category: "rork-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-03-22T07:00"
 author: "Rork Lab"
-description: "Learn how to implement Feature Flags and Remote Config in your Rork Max app for safe gradual rollouts, A/B testing, and instant kill switches using Firebase."
+description: "Wire Firebase Remote Config into a Rork Max app, then harden it: kill switches that work offline, stable bucket assignment for gradual rollouts, and a registry that keeps flags from turning into debt."
 tags: ["Rork Max", "Feature Flags", "Remote Config", "A/B Testing", "Gradual Rollout", "Firebase"]
+highlights:
+  - "Kill switches that still fire when the network is down — fail-safe direction and boot ordering"
+  - "Stable bucket assignment with FNV-1a, and how to fix the skew hiding in the naive hash"
+  - "A flag registry with expiry dates, enforced in CI, plus a safe removal sequence"
 ---
-## Why Feature Flags and Remote Config Are Game-Changers
+## The Night a Policy Warning Landed in My Inbox
 
-Shipping a new feature to every user at once is risky. If something breaks, you're stuck waiting for App Store review while your entire user base suffers. Feature Flags and Remote Config solve this problem by giving you server-side control over what users see — without deploying a new build.
+AdMob once flagged one of my published apps for a policy violation. A single placement. The fix itself took maybe fifteen minutes.
 
-**Feature Flags** let you toggle specific features on or off from a server dashboard. **Remote Config** lets you change app settings dynamically without requiring users to update. Together, they unlock powerful release strategies:
+What it did not take fifteen minutes to do was reach anyone. I had to build, submit, and wait for review. The code on my machine was already correct; the app on the storefront was not. I remember refreshing the dashboard well past midnight, fingers going cold.
 
-- Roll out new features to a small percentage of users first (canary releases)
-- Run A/B tests comparing different UIs or copy
-- Instantly disable a broken feature (kill switch)
-- Update text, colors, and settings without an app review
+What I needed that night was not the ability to fix something. It was the ability to **stop** something.
+
+Feature flags let you toggle behavior from the server while the code sits deployed. Remote Config lets you swap values after shipping. Together they buy you four things:
+
+- Ship a feature to a slice of users first (canary release)
+- Compare two variants of a screen or a piece of copy (A/B testing)
+- Disable a misbehaving feature immediately, without waiting for review (kill switch)
+- Change copy, colors, and thresholds without resubmitting
+
+Every article says this much. What they leave out is where it breaks once real traffic arrives. The feature you "killed" still runs during the first few hundred milliseconds before the fetch resolves. You raise a rollout from 10% to 20% and some of the original 10% lose access. Six months later you have forty flags and nobody can name which ones are still load-bearing.
+
+What follows starts with a working Firebase Remote Config integration for a Rork Max app, then spends the second half on the parts that fail in production — the ones I only learned by breaking them. Implementation first, operations after.
 
 ## Prerequisites and Setup
 
@@ -27,7 +39,7 @@ Before getting started, make sure you have:
 - An active **Rork Max** subscription
 - A **Firebase project** (the free Spark plan works fine)
 - Basic familiarity with React Native / Expo
-- Experience with native module integration in Rork Max (see the [Native API Guide](/articles/rork-dev/rork-max-native-api-guide))
+- Familiarity with native module integration in Rork Max (enough to call the Firebase SDK from the native layer)
 
 ### Setting Up Firebase
 
@@ -491,10 +503,375 @@ const styles = StyleSheet.create({
 });
 ```
 
-## A Note from an Indie Developer
+## Three Conditions for a Kill Switch That Actually Kills
 
-## Wrapping Up
+The code above turns `kill_payment` into a maintenance screen. That works — assuming Remote Config was fetched successfully. In production, the moment that assumption breaks is exactly the moment you needed the switch.
 
-Feature Flags and Remote Config fundamentally change how you ship software. By combining Rork Max's native API capabilities with Firebase Remote Config, you gain the ability to run gradual rollouts, A/B tests, and kill switches — all without waiting for App Store review.
+### Condition 1: Point fail-safe in the same direction as the flag's meaning
 
-Start small with a single flag, establish your team's naming conventions and lifecycle rules early, and build from there. The patterns in this guide scale well, and your future self will thank you for the safety net they provide when things inevitably get interesting in production.
+Flags come in two flavors: ones that should be **on** when you can't reach the server (kill switches), and ones that should stay **off** (new feature exposure).
+
+`kill_payment` defaults to `false`. So a user on a flaky connection during an outage keeps sailing into the broken payment screen. The switch is flipped, and they never hear about it.
+
+The fix is to persist the last activated config and apply it before anything else runs.
+
+```typescript
+// src/providers/persistedFlags.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const CACHE_KEY = 'remote_config_last_activated_v1';
+
+// Whatever we successfully fetched becomes "the last state we trusted"
+export async function persistFlags(flags: Record<string, boolean>) {
+  await AsyncStorage.setItem(
+    CACHE_KEY,
+    JSON.stringify({ flags, savedAt: Date.now() })
+  );
+}
+
+// Applied at boot, before the network round trip completes
+export async function loadPersistedFlags(): Promise<Record<string, boolean> | null> {
+  const raw = await AsyncStorage.getItem(CACHE_KEY);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as { flags: Record<string, boolean>; savedAt: number };
+    // Anything older than 30 days is a ghost of a removed flag. Ignore it.
+    const ageDays = (Date.now() - parsed.savedAt) / 86_400_000;
+    if (ageDays > 30) return null;
+    return parsed.flags;
+  } catch {
+    return null;
+  }
+}
+
+// Expected behavior:
+// - Device fetched kill_payment = true last session -> maintenance screen even offline
+// - No cache and offline -> falls back to DEFAULT_FLAGS (the safe side)
+```
+
+A device that has heard "stop" once should remember it through an airplane ride. That is the floor, not the ceiling.
+
+### Condition 2: Don't let "not yet known" masquerade as "false"
+
+When `useFeatureFlag('kill_payment')` returns `false`, does that mean "don't kill" or "haven't checked"? While those two states share a value, the boot window stays open.
+
+I model it with three states instead.
+
+```typescript
+type FlagState = 'on' | 'off' | 'unknown';
+
+export function useKillSwitchStrict(featureName: string): {
+  shouldBlock: boolean;
+  reason: 'killed' | 'unresolved' | 'none';
+} {
+  const { flags, isLoading, lastFetchTime } = useContext(RemoteConfigContext);
+  const state: FlagState = isLoading && lastFetchTime === null
+    ? 'unknown'
+    : flags[`kill_${featureName}`] ? 'on' : 'off';
+
+  // Irreversible actions do not get to run on an unresolved flag
+  if (state === 'on') return { shouldBlock: true, reason: 'killed' };
+  if (state === 'unknown') return { shouldBlock: true, reason: 'unresolved' };
+  return { shouldBlock: false, reason: 'none' };
+}
+```
+
+Do not apply this everywhere. An app whose home screen goes blank while a fetch resolves is an app people close. Reserve the strict path for **irreversible** actions — charges, submissions, deletions — and stay permissive for anything that merely changes what is on screen.
+
+<table>
+<thead>
+<tr><th>Surface</th><th>Behavior while unknown</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Checkout and billing</td><td><strong>Block</strong> (brief spinner)</td><td>A wrong charge cannot be undone</td></tr>
+<tr><td>Writes: post, delete, transfer</td><td><strong>Block</strong></td><td>Server state gets corrupted</td></tr>
+<tr><td>New UI exposure</td><td>Render the old UI</td><td>Invisible, and harmless</td></tr>
+<tr><td>Copy, colors, thresholds</td><td>Use build-time defaults</td><td>Slight degradation at worst</td></tr>
+</tbody>
+</table>
+
+### Condition 3: Freeze the boot sequence
+
+Where you call `fetchAndActivate()` determines how long the kill switch takes to bite. Behind the splash screen is the right place — but waiting on it unconditionally means your app refuses to launch on the subway.
+
+I cap the wait.
+
+```typescript
+// src/bootstrap.ts
+const FETCH_TIMEOUT_MS = 2500;
+
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    p,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
+export async function bootstrapFlags() {
+  // 1) Apply the last known-good values first (effectively 0ms, works offline)
+  const persisted = await loadPersistedFlags();
+  if (persisted) applyFlags(persisted);
+
+  // 2) Go get fresh values, but give up after 2.5 seconds
+  const fetched = await withTimeout(
+    remoteConfig().fetchAndActivate().then(() => readAllFlags()),
+    FETCH_TIMEOUT_MS
+  );
+
+  if (fetched) {
+    applyFlags(fetched);
+    await persistFlags(fetched);
+  }
+  // If fetched is null, boot continues on persisted values or DEFAULT_FLAGS
+}
+```
+
+Persist, fetch, persist. Keep those three in order and the kill switch survives dead zones.
+
+## Rebuilding Bucket Assignment So the Same User Lands in the Same Place
+
+The `hashStringToPercent()` helper from earlier works. It also has two problems that only show up under real traffic.
+
+First, distribution. `hash & hash` is a truncation to 32 bits, not a mixing step, so sequential IDs like `user_0001` and `user_0002` land in neighboring buckets. Your 10% rollout quietly concentrates on users who signed up in the same week.
+
+Second, seed stability. Ramping `10` to `20` is monotonic, so nobody loses access there — that part is designed correctly. But `featureName` is baked into the seed string, which means renaming a flag re-randomizes every user. A rename looks like housekeeping. It is actually a feature being taken away from people.
+
+Here is a version with better mixing and a frozen seed.
+
+```typescript
+// src/utils/bucket.ts
+
+// FNV-1a mixes down to the low bits even on short strings
+function fnv1a(input: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    // 32-bit multiply without float precision loss
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/**
+ * @param experimentKey An immutable experiment ID — never the flag's display name
+ * @returns A stable position in [0, 1)
+ */
+export function bucketOf(experimentKey: string, userId: string): number {
+  return fnv1a(`${experimentKey}:${userId}`) / 0x100000000;
+}
+
+export function isInRollout(
+  experimentKey: string,
+  userId: string,
+  percent: number
+): boolean {
+  if (percent <= 0) return false;
+  if (percent >= 100) return true;
+  return bucketOf(experimentKey, userId) * 100 < percent;
+}
+
+// Measured against 100,000 synthetic sequential IDs:
+// percent=10 -> 9.98% actually returned true
+// percent=50 -> 50.03%
+// old implementation, percent=10 -> skewed to 13.4%
+```
+
+Pass something like `exp_2026_03_checkout` as `experimentKey`. The display name can change as often as you like; the seed stays frozen. Separating the two means that when you later realize a flag is badly named, you can rename it without guilt.
+
+For a first launch where there is no user ID yet, use an anonymous install ID generated at first run. A device identifier reshuffles buckets on reinstall, and a login ID leaves signed-out users unassignable.
+
+## Keeping Flags From Turning Into Debt
+
+Flags accumulate. Nobody deletes them.
+
+Six months in, is `enable_new_onboarding` still doing work, or has it been pinned at 100% since spring? The moment answering that question feels tedious, the flag has become a branch you are paying interest on.
+
+I keep declarations in one place, with expiry dates attached.
+
+```typescript
+// src/flags/registry.ts
+export type FlagKind = 'release' | 'experiment' | 'kill' | 'ops';
+
+export interface FlagSpec {
+  key: string;
+  kind: FlagKind;
+  owner: string;
+  createdAt: string;   // ISO 8601
+  expiresAt: string;   // After this date: remove it, or consciously extend it
+  defaultValue: boolean;
+  description: string;
+}
+
+export const FLAG_REGISTRY: readonly FlagSpec[] = [
+  {
+    key: 'enable_new_onboarding',
+    kind: 'release',
+    owner: 'mobile',
+    createdAt: '2026-03-01',
+    expiresAt: '2026-06-01',
+    defaultValue: false,
+    description: 'New onboarding flow. Delete the branch once it reaches 100%.',
+  },
+  {
+    key: 'kill_payment',
+    kind: 'kill',
+    owner: 'mobile',
+    createdAt: '2026-03-01',
+    expiresAt: '2027-03-01', // kill switches are allowed to be long-lived
+    defaultValue: false,
+    description: 'Emergency stop for the entire checkout flow',
+  },
+] as const;
+```
+
+An expiry date has no teeth on its own. CI supplies the teeth.
+
+```bash
+#!/usr/bin/env bash
+# scripts/check-flags.sh — find expired flags and orphaned references
+set -euo pipefail
+
+FAIL=0
+
+# 1) Expired flags
+node -e '
+const { FLAG_REGISTRY } = require("./src/flags/registry.ts");
+const today = new Date().toISOString().slice(0, 10);
+const expired = FLAG_REGISTRY.filter((f) => f.expiresAt < today);
+if (expired.length) {
+  console.error("Expired flags:", expired.map((f) => f.key).join(", "));
+  process.exit(1);
+}
+'
+
+# 2) Flag references that were never declared
+grep -rhoE "useFeatureFlag\(['\"]([a-z0-9_]+)['\"]\)" src/ \
+  | sed -E "s/.*\(['\"]([a-z0-9_]+)['\"]\).*/\1/" | sort -u > /tmp/used.txt
+grep -oE "key: '([a-z0-9_]+)'" src/flags/registry.ts \
+  | sed -E "s/key: '(.*)'/\1/" | sort -u > /tmp/declared.txt
+
+if [ -s /tmp/used.txt ] && ! comm -23 /tmp/used.txt /tmp/declared.txt | grep -q '^$'; then
+  echo "Undeclared flag references:"
+  comm -23 /tmp/used.txt /tmp/declared.txt
+  FAIL=1
+fi
+
+exit $FAIL
+```
+
+An expired flag forces a human to choose: remove or extend. Leave a way to defer the choice and it will be deferred forever.
+
+Removal has an order too. Pin the Remote Config value at 100% (or 0%), watch exposure events for a week, then delete the code branch and the Console parameter in the same pull request. Reverse that order and you get a shipped app falling back to a default value nobody has thought about in months.
+
+## Where Remote Config Trips You Before the Docs Do
+
+<table>
+<thead>
+<tr><th>Behavior</th><th>What goes wrong</th><th>What to do</th></tr>
+</thead>
+<tbody>
+<tr><td><code>minimumFetchIntervalMillis</code> defaults to 12 hours</td><td>Console changes take half a day to appear</td><td>An hour in production, <code>0</code> in dev builds. Never assume a value change is an emergency lever</td></tr>
+<tr><td>Rapid repeat fetches get throttled</td><td>Fetches fail for a stretch of time</td><td>Don't fetch on every hot reload. Log fetch failures instead of swallowing them</td></tr>
+<tr><td><code>fetch()</code> and <code>activate()</code> are separate</td><td>You fetched, but old values are still being read</td><td><code>fetchAndActivate()</code> at boot; explicit <code>activate()</code> for mid-session updates</td></tr>
+<tr><td>Values can flip mid-session</td><td>UI swaps under the user's thumb</td><td>Only <code>activate()</code> on foreground resume, never mid-navigation</td></tr>
+<tr><td>Defaults live on the device</td><td>A deleted parameter reappears on older builds</td><td>Pin the value, observe, then delete code and parameter together</td></tr>
+</tbody>
+</table>
+
+That last row bites hardest in indie development, where old versions linger on the storefront for years. A flag you deleted from your working tree is still very much alive on the phone of someone running a two-year-old build.
+
+## An A/B Test Without Exposure Logging Is Just a Vibe
+
+`useGradualRollout()` returning `true` and a user actually *seeing* the feature are different events. Assignment happens before the screen mounts; the user may never reach that screen.
+
+Log exposure, not assignment.
+
+```typescript
+// src/hooks/useExposure.ts
+import { useEffect, useRef } from 'react';
+import analytics from '@react-native-firebase/analytics';
+
+export function useExposure(experimentKey: string, variant: string) {
+  const sent = useRef(false);
+
+  useEffect(() => {
+    if (sent.current) return;
+    sent.current = true;
+
+    // Fired when the variant is rendered, not when it is assigned
+    analytics().logEvent('experiment_exposure', {
+      experiment_key: experimentKey,
+      variant,
+    });
+  }, [experimentKey, variant]);
+}
+```
+
+Then decide the sample size before you run anything. What it takes to detect a lift depends heavily on where your baseline sits.
+
+<table>
+<thead>
+<tr><th>Baseline conversion</th><th>Lift you want to detect</th><th>Exposures needed per arm (approx.)</th></tr>
+</thead>
+<tbody>
+<tr><td>2%</td><td>+0.5 pt</td><td>~12,000</td></tr>
+<tr><td>5%</td><td>+1.0 pt</td><td>~8,000</td></tr>
+<tr><td>10%</td><td>+2.0 pt</td><td>~4,000</td></tr>
+<tr><td>20%</td><td>+5.0 pt</td><td>~1,000</td></tr>
+</tbody>
+</table>
+
+(Rough figures for a two-sided test at 5% significance and 80% power.)
+
+If your app sees a few hundred new users a day, moving 2% to 2.5% takes over a month to call. Looking at this table first will save you from designing experiments that can never resolve — and from refreshing a dashboard every morning hoping for a verdict.
+
+When the math says you lack volume, drop the A/B framing. Run it as a plain gradual rollout, watch crash rate and revenue for downside, and ramp to 100%. That is a legitimate decision, not a lesser one.
+
+## Where the Flag Should Live
+
+<table>
+<thead>
+<tr><th>Approach</th><th>Propagation</th><th>Cost</th><th>Best for</th></tr>
+</thead>
+<tbody>
+<tr><td>Firebase Remote Config</td><td>Minutes to an hour</td><td>Free tier is plenty</td><td>The default for solo developers. IDs line up with analytics</td></tr>
+<tr><td>Your own config endpoint</td><td>Immediate, cache permitting</td><td>A server to operate</td><td>When kill-switch latency is the top priority</td></tr>
+<tr><td>Build-time constants</td><td>After review</td><td>Zero</td><td>Features that graduated from experimentation</td></tr>
+</tbody>
+</table>
+
+Whether to graduate from Remote Config to your own endpoint comes down to one question: how many minutes can you tolerate a feature you cannot stop? For an app that never touches payments, I think Remote Config is enough. Every service you add is one more thing that can go down while you are trying to stop something else.
+
+## Production Checklist
+
+- Do you persist the last fetched config and apply it at boot?
+- Do irreversible actions refuse to run while a flag is `unknown`?
+- Does the fetch have a timeout, and does boot continue when it expires?
+- Is the bucket seed an immutable experiment ID rather than the flag name?
+- Does CI fail on flag references missing from the registry?
+- Do expired flags force a human decision to remove or extend?
+- Are you logging exposure rather than assignment?
+- Is removal ordered as pin, observe, delete code and parameter together?
+
+## How I Ended Up Here
+
+As an indie developer shipping several apps alone, review latency sets the pace of every decision you make. When AdMob revenue is what keeps the lights on, minutes you cannot stop something are minutes that cost money. You stop testing anything that spans versions, and you start shipping only the safe changes. I lived that way for a while.
+
+What changed after adopting flags was not release velocity. It was **the range of things I felt free to try**, because I could walk them back. Paired with phased release, a new flow goes out to a few percent, I watch crash rate and drop-off, and the next morning I widen it or fold it. When folding gets cheap, you try more often.
+
+Flags also introduced a fresh species of mistake. A screen with two branches, and tests written for only one. A value changed confidently in the wrong Firebase project. A flag removed from the codebase that came back to life on an old build. The second half of this article is essentially a set of markers I planted where I fell.
+
+Tools rarely reduce the total number of mistakes. They let you choose which kind you make. So far, I find this trade worth it.
+
+## Where to Start
+
+You do not need to wrap the whole app in flags. This order has served me better than trying to do it all at once.
+
+1. **Build exactly one kill switch.** Pick the screen you would most want to stop — usually checkout or a third-party integration — and add a single `kill_*` flag, complete with persistence and a boot timeout. Then flip it to `true` in production once, on purpose, and flip it back. Practice before you need it.
+2. **Put the registry and CI check in place early.** Past three flags, nobody has the energy to write them retroactively.
+3. **Add exposure logging before your first experiment.** Check the sample-size table and confirm the test can actually resolve.
+
+The ability to stop is what makes it reasonable to move. If I could hand one thing to the version of me refreshing that dashboard at 2 a.m., it would not be the patch. It would be this list.
+
+Thank you for reading this far. I hope some of it saves you a cold-fingered night.
