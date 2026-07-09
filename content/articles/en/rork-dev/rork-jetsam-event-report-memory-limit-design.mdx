@@ -1,0 +1,312 @@
+---
+title: "The Termination That Never Shows Up as a Crash — Reading JetsamEvent in Rork Apps"
+slug: "rork-jetsam-event-report-memory-limit-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-10T11:15"
+author: "Rork Lab"
+description: "Crashlytics is silent, yet reviewers write that the app closes by itself. Most of the time the OS killed it for exceeding its memory limit. Here is how to read JetsamEvent reports and design an image-heavy app's memory budget from measured values."
+tags: ["Rork", "Rork Max", "Memory", "iOS", "Indie Development"]
+highlights:
+  - "How to convert rpages in a JetsamEvent report into MB and identify which process died at what size"
+  - "Measured limits from os_proc_available_memory(): 1,384 MB on an iPhone SE versus 2,099 MB on an iPhone 13"
+  - "Swift and React Native implementations that pin the image cache to 25% of the remaining memory budget"
+---
+
+For a while, one of my wallpaper apps collected App Store reviews saying the app closed on its own after a minute or two, while the Crashlytics dashboard stayed completely quiet. The only reproduction step anyone offered was "scroll a lot." Nothing happened on my own device, no matter how long I scrolled.
+
+The answer showed up when I opened Settings, then Privacy & Security, then Analytics & Improvements, then Analytics Data on a device, and found a stack of files named `JetsamEvent-2026-…`. The app had not crashed. iOS had killed it for using too much memory, which is why nothing ever reached the crash reporter.
+
+Apps built with Rork or Rork Max sit in exactly the same position. However tidy the generated code is, the memory ceiling iOS grants a process does not move. If anything, generated code tends to be generous with images and lists, which makes that ceiling easier to touch.
+
+## A Jetsam kill is not a crash
+
+iOS runs a mechanism called Jetsam. When system-wide memory gets tight, or when a single process exceeds its per-device limit, the kernel sends that process a `SIGKILL` and reclaims it.
+
+`SIGKILL` cannot be handled. That is the crux of the problem. Crashlytics and Sentry install signal and exception handlers to catch failures. A Jetsam kill gives them no opportunity to run, so nothing is recorded — and nothing appears under Crashes in App Store Connect either.
+
+Instead, these terminations land in MetricKit as `MXAppExitMetric`, specifically `cumulativeMemoryResourceLimitExitCount`. Plenty of indie developers never look there. I did not either.
+
+<table>
+<thead>
+<tr><th>Type of termination</th><th>Reaches the crash reporter?</th><th>Where to look</th></tr>
+</thead>
+<tbody>
+<tr><td>Exceptions and signals (SIGSEGV, etc.)</td><td>Yes</td><td>Crashlytics / Organizer &gt; Crashes</td></tr>
+<tr><td>Memory limit exceeded (Jetsam)</td><td><strong>No</strong></td><td>On-device Analytics Data / MetricKit</td></tr>
+<tr><td>Watchdog (slow launch)</td><td>Sometimes</td><td>Organizer &gt; Hangs, 0x8badf00d</td></tr>
+<tr><td>Reclaimed while backgrounded</td><td>No</td><td>Normal behavior. No action needed</td></tr>
+</tbody>
+</table>
+
+That last row matters more than it looks. I wrote up the staged-release approach itself in [a five-tier memory pressure release architecture for iOS](/articles/rork-dev/rork-ios-memory-pressure-5tier-release-architecture). Reclaiming a backgrounded app is ordinary iOS behavior. Trying to eliminate every JetsamEvent will sink you into pointless work. The ones worth chasing are the kills that happened **in the foreground**.
+
+## Reading a JetsamEvent report
+
+Pull the file out of Analytics Data on the device — the share button will hand it to AirDrop or Files. The contents are JSON-flavored text.
+
+Start with the header near the top.
+
+```text
+{"bug_type":"298","timestamp":"2026-06-14 21:03:11.42 +0900","os_version":"iPhone OS 26.1 (23B82)",
+ "incident_id":"…","pageSize":16384,"memoryStatus":{"compressorSize":98213,"memoryPages":{"active":41022,
+ "free":1290,"wired":38310}}}
+```
+
+A `bug_type` of 298 means Jetsam. Note `pageSize`: 16384, or 16 KB. Assuming 4096 throws every later conversion off by a factor of four. Devices from the A14 onward use 16 KB pages, so always read this field rather than hardcoding it.
+
+Then find the victim. The body is an array of process states, each shaped like this.
+
+```text
+{"uuid":"…","states":["frontmost"],"killDelta":0,"genCount":0,"age":133,"purgeable":0,
+ "fds":124,"coalition":312,"rpages":86214,"reason":"per-process-limit",
+ "name":"WallpaperApp","cpuTime":41.2,"idleDelta":0}
+```
+
+Three fields carry the signal.
+
+1. Whether `states` contains `frontmost` — if it does, the app vanished while the user was looking at it
+2. `reason` — `per-process-limit` means your app blew its own ceiling; `vm-pageshortage` means it got caught in a system-wide squeeze
+3. `rpages` — resident pages. Convert with `rpages × pageSize ÷ 1024 ÷ 1024`
+
+In this example, `86214 × 16384 ÷ 1048576 ≈ 1,347 MB`. The app hit the roughly 1,384 MB limit on an iPhone SE (3rd generation) and was killed.
+
+Doing that by hand gets old, so here is a script.
+
+```bash
+#!/usr/bin/env bash
+# jetsam-summary.sh — summarize .ips files pulled from Analytics Data
+# usage: ./jetsam-summary.sh ~/Downloads/JetsamEvent-*.ips
+for f in "$@"; do
+  python3 - "$f" <<'PY'
+import json, sys, re
+raw = open(sys.argv[1], encoding="utf-8").read()
+# the header line and the body are concatenated; split on the first newline
+head, body = raw.split("\n", 1) if "\n" in raw else (raw, "{}")
+page = json.loads(head).get("pageSize", 4096)
+ts   = json.loads(head).get("timestamp", "?")
+for m in re.finditer(r'\{"uuid".*?\}', body):
+    p = json.loads(m.group(0))
+    mb = p.get("rpages", 0) * page / 1048576
+    if p.get("reason") in ("per-process-limit", "vm-pageshortage") and mb > 100:
+        front = "FRONTMOST" if "frontmost" in p.get("states", []) else "background"
+        print(f'{ts}  {p["name"]:<22} {mb:8.1f} MB  {p["reason"]:<18} {front}')
+PY
+done
+```
+
+I ran it across 41 reports covering three weeks. Twelve were foreground `per-process-limit` kills, and eleven of those happened on the same screen — the wallpaper grid. From there it stopped being a mystery and became an implementation problem.
+
+## Do not guess the per-device limit
+
+The common trap is reasoning from installed RAM: "this iPhone has 6 GB, so I can probably use 3 GB." The Jetsam limit is not derived from installed memory. iOS sets it per device class, and the numbers are not published.
+
+So measure instead of guessing. Since iOS 13, `os_proc_available_memory()` returns how many more bytes the process can allocate.
+
+```swift
+import os
+
+/// How many more MB this process can allocate
+func availableMemoryMB() -> Double {
+    Double(os_proc_available_memory()) / 1_048_576.0
+}
+
+/// Called right after launch, this yields "limit minus current usage"
+func logMemoryBudget() {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    guard kr == KERN_SUCCESS else { return }
+    let usedMB  = Double(info.resident_size) / 1_048_576.0
+    let availMB = availableMemoryMB()
+    print(String(format: "used %.0f MB / avail %.0f MB / limit ≈ %.0f MB",
+                 usedMB, availMB, usedMB + availMB))
+}
+```
+
+Running it at launch on the devices I keep around produced this.
+
+<table>
+<thead>
+<tr><th>Device</th><th>Installed RAM</th><th>Measured limit at launch</th><th>Working ceiling (60%)</th></tr>
+</thead>
+<tbody>
+<tr><td>iPhone SE (3rd generation)</td><td>4 GB</td><td>≈ 1,384 MB</td><td>830 MB</td></tr>
+<tr><td>iPhone 13</td><td>4 GB</td><td>≈ 2,099 MB</td><td>1,260 MB</td></tr>
+<tr><td>iPad (9th generation)</td><td>3 GB</td><td>≈ 1,024 MB</td><td>614 MB</td></tr>
+</tbody>
+</table>
+
+Two devices with the same 4 GB differ by more than 700 MB. Had I reasoned from installed RAM, the SE would have been killed every time. These values also shift across OS releases, so treat the table as evidence that the spread exists, and take your own readings on your own devices.
+
+I settle on 60% as the working ceiling so the remaining 40% absorbs decode spikes — one full-size image expansion — and leaves room for the system photo picker and camera. Push it to 80% and the app dies the moment someone opens their photo library. I learned that the direct way.
+
+## Turning the limit into a design
+
+Feed the measured limit into the cache instead of hardcoding a number, so it tracks whatever device the app is running on.
+
+```swift
+import UIKit
+
+final class BudgetedImageCache {
+    static let shared = BudgetedImageCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    private init() {
+        applyBudget()
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            // halve on warning; purging everything invites a re-decode spike on scroll-back
+            self?.cache.totalCostLimit /= 2
+        }
+    }
+
+    /// Budget the cache at 25% of remaining memory, measured at launch
+    private func applyBudget() {
+        let availableBytes = os_proc_available_memory()
+        cache.totalCostLimit = Int(Double(availableBytes) * 0.25)
+    }
+
+    func store(_ image: UIImage, for key: String) {
+        // cost is pixels × 4 bytes (RGBA), not the file size on disk
+        let cost = Int(image.size.width * image.scale
+                     * image.size.height * image.scale * 4)
+        cache.setObject(image, forKey: key as NSString, cost: cost)
+    }
+
+    func image(for key: String) -> UIImage? {
+        cache.object(forKey: key as NSString)
+    }
+}
+```
+
+Passing the file size as `cost` is a mistake I see often. A 1.2 MB JPEG expands to roughly 4032 × 3024 × 4 ≈ 48.7 MB in memory, so the accounting is off by a factor of forty. I spent a while believing I had set a limit while the app kept dying.
+
+The same reasoning applies to Rork's standard React Native and Expo output. Make the cache ceiling of something like `react-native-fast-image` follow the device.
+
+```ts
+import { NativeModules, Platform } from 'react-native';
+
+/** assumes a small native bridge exposing os_proc_available_memory() */
+async function cacheBudgetBytes(): Promise<number> {
+  if (Platform.OS !== 'ios') return 128 * 1024 * 1024;
+  const avail: number = await NativeModules.MemoryBudget.availableBytes();
+  return Math.floor(avail * 0.25);
+}
+
+export async function configureImageCache() {
+  const budget = await cacheBudgetBytes();
+  // divide the budget by an average decoded size (12 MB here) to get a retention count
+  const maxImages = Math.max(8, Math.floor(budget / (12 * 1024 * 1024)));
+  return { maxImages, budgetMB: Math.round(budget / 1048576) };
+}
+```
+
+The pieces most easily overlooked on the React Native side are `windowSize` and `removeClippedSubviews` on `FlatList`. The defaults retain a generous band of off-screen cells. In a grid where each cell holds a high-resolution image, that alone can reach several hundred megabytes.
+
+## Where Rork Max output tends to touch the ceiling
+
+Having read through a number of SwiftUI files Rork Max produced, three places get my attention every time.
+
+### Full-size images handed to `Image(uiImage:)`
+
+Generated code often reads an image with `UIImage(contentsOfFile:)` and passes it straight to `Image`. The view may be 180 points across, but memory holds the original resolution. Insert an ImageIO downsampling step.
+
+```swift
+import ImageIO
+import UIKit
+
+func downsample(url: URL, to pointSize: CGSize, scale: CGFloat) -> UIImage? {
+    let srcOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, srcOptions) else { return nil }
+
+    let maxPixel = max(pointSize.width, pointSize.height) * scale
+    let options = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+    ] as CFDictionary
+
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, options) else { return nil }
+    return UIImage(cgImage: cg, scale: scale, orientation: .up)
+}
+```
+
+A grid cell drops from 48.7 MB to about 0.5 MB. The finer points of the downsampling options are covered in [thumbnail downsampling and scroll performance](/articles/app-dev/ios-thumbnail-downsampling-scroll-performance). That single change removed nearly all of my foreground Jetsam kills.
+
+### Holding an array of images in `@State` inside `LazyVGrid`
+
+Generated code likes `@State private var images: [UIImage] = []` and keeps every item. Memory then grows linearly with the item count. Hold only identifiers and pull the images through the cache.
+
+### Unbounded concurrent decoding inside `.task`
+
+Writing `.task { await load() }` on each cell of a `ForEach` means a fast scroll can kick off dozens of simultaneous decodes. Cap the concurrency.
+
+```swift
+actor DecodeLimiter {
+    private var running = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private let maxConcurrent: Int
+
+    init(maxConcurrent: Int = 3) { self.maxConcurrent = maxConcurrent }
+
+    func acquire() async {
+        if running < maxConcurrent { running += 1; return }
+        await withCheckedContinuation { waiters.append($0) }
+        running += 1
+    }
+
+    func release() {
+        running -= 1
+        if let next = waiters.first { waiters.removeFirst(); next.resume() }
+    }
+}
+```
+
+There is nothing principled about the number three. I tried two, three, and four on device, and three struck the best balance between scroll hitches and memory peaks. The right value depends on your device and decode size, so the mechanism matters more than the constant. The same instinct drives [degrading quality in stages under thermal and low power pressure with Rork Max](/articles/rork-dev/rork-max-thermal-low-power-adaptive-degradation).
+
+## Keep watching in production
+
+Do not stop at the fix. Collecting Analytics Data by hand from every device is not realistic, so let MetricKit report continuously.
+
+```swift
+import MetricKit
+
+final class MemoryExitObserver: NSObject, MXMetricManagerSubscriber {
+    static let shared = MemoryExitObserver()
+
+    func start() { MXMetricManager.shared.add(self) }
+
+    func didReceive(_ payloads: [MXMetricPayload]) {
+        for p in payloads {
+            guard let exit = p.applicationExitMetrics?.foregroundExitData else { continue }
+            let memKills = exit.cumulativeMemoryResourceLimitExitCount
+            let normal   = exit.cumulativeNormalAppExitCount
+            guard memKills > 0 else { continue }
+            // send to your own logging; the absolute count means little without a ratio
+            let rate = Double(memKills) / Double(max(normal + memKills, 1)) * 100
+            print(String(format: "foreground memory kills: %d (%.2f%%)", memKills, rate))
+        }
+    }
+}
+```
+
+Restricting this to `foregroundExitData` is the point. Counting background reclaims means the number never reaches zero.
+
+On the wallpaper app I run, I tracked that ratio weekly and stopped once it fell from 2.8% to the low 0.1% range. Chasing zero mattered less than the fact that reviews stopped mentioning the app closing by itself.
+
+## One thing to do next
+
+Add a single call to `os_proc_available_memory()` in your launch path and print the limit on the oldest device you own. It will almost certainly differ from what you assumed from installed RAM, often by close to a factor of two.
+
+The moment you see that gap, the right cache ceiling stops being an abstract question. Everything after that is a matter of dropping in the code above.
+
+Memory work is quiet, and nobody congratulates you for it. Still, someone who once wrote that the app closes by itself opens it again and nothing happens. That silence seems worth the effort. Thank you for reading.

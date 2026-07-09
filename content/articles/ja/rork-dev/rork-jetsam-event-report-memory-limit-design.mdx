@@ -1,0 +1,312 @@
+---
+title: "クラッシュとして記録されない強制終了 — Rork アプリの JetsamEvent を読む"
+slug: "rork-jetsam-event-report-memory-limit-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-10T11:15"
+author: "Rork Lab"
+description: "Crashlytics には何も出ていないのにレビューで「勝手に閉じる」と書かれる。その多くはメモリ超過による OS からの強制終了です。JetsamEvent レポートの読み方と、画像中心アプリのメモリ上限を実測から設計する手順をまとめます。"
+tags: ["Rork", "Rork Max", "メモリ", "iOS", "個人開発"]
+highlights:
+  - "JetsamEvent レポートの rpages を MB に換算し、どのプロセスが何 MB で殺されたかを特定する手順"
+  - "os_proc_available_memory() で残メモリを実測し、iPhone SE 実機で 1,384 MB / 2,099 MB の上限差を確認したログ"
+  - "画像キャッシュを totalCostLimit で残メモリの 25% に自動追従させる Swift / React Native 両方の実装"
+---
+
+App Store のレビュー欄に「開いてしばらくすると勝手に閉じます」と書かれていたのに、Crashlytics のダッシュボードは静まり返ったまま、という時期がありました。壁紙アプリの一つで、しかも再現手順が「たくさんスクロールする」としか書かれていない。手元の実機ではどれだけ触っても落ちません。
+
+原因が分かったのは、実機の「設定 > プライバシーとセキュリティ > 解析および改善 > 解析データ」を開いて、`JetsamEvent-2026-…` という名前のファイルが並んでいるのを見つけたときでした。クラッシュではなく、OS がメモリ不足を理由にアプリを終了させていた。だからクラッシュレポータには何も届いていなかったのです。
+
+Rork や Rork Max で作ったアプリでも、事情はまったく同じです。生成されたコードがどれだけ整っていても、iOS がプロセスに与えるメモリの上限は変わりません。むしろ生成コードは画像やリストを気前よく扱うことが多く、この上限に触れやすい傾向があると私自身は感じています。
+
+## Jetsam はクラッシュではない、という前提
+
+iOS には Jetsam という仕組みがあります。システム全体のメモリが逼迫したとき、あるいは単一プロセスが device ごとの上限を超えたとき、カーネルがそのプロセスに `SIGKILL` を送って回収します。
+
+`SIGKILL` はハンドルできません。ここが重要な点です。Crashlytics も Sentry も、シグナルハンドラや例外ハンドラを仕込んでクラッシュを捕まえます。捕まえる隙を与えずに殺されるので、クラッシュとして記録されない。App Store Connect の「クラッシュ」指標にも現れません。
+
+代わりに、Xcode Organizer では Crashes ではなく **Disk Writes / Hangs とは別枠**の、`MXAppExitMetric` の `cumulativeMemoryResourceLimitExitCount` として集計されます。ここを見ていない個人開発者は多いはずです。私も見ていませんでした。
+
+<table>
+<thead>
+<tr><th>終了の種類</th><th>クラッシュレポータに届くか</th><th>確認場所</th></tr>
+</thead>
+<tbody>
+<tr><td>例外・シグナル（SIGSEGV 等）</td><td>届く</td><td>Crashlytics / Organizer &gt; Crashes</td></tr>
+<tr><td>メモリ超過（Jetsam）</td><td><strong>届かない</strong></td><td>実機の解析データ / MetricKit</td></tr>
+<tr><td>ウォッチドッグ（起動遅延）</td><td>一部届く</td><td>Organizer &gt; Hangs、0x8badf00d</td></tr>
+<tr><td>バックグラウンドでの回収</td><td>届かない</td><td>正常動作。対処不要</td></tr>
+</tbody>
+</table>
+
+最下段が地味に大切です。段階的な解放設計そのものは[iOS のメモリ逼迫に応じて 5 段階で解放する設計](/articles/rork-dev/rork-ios-memory-pressure-5tier-release-architecture)で整理しました。バックグラウンドに回ったアプリが後で回収されるのは、iOS の正常な振る舞いです。すべての JetsamEvent を潰そうとすると、無駄な作業に沈みます。潰すべきは **フォアグラウンドで殺されたもの** だけです。
+
+## JetsamEvent レポートを読む
+
+実機の解析データからファイルを取り出します。共有ボタンから AirDrop や Files に出せます。中身は JSON 風のテキストです。
+
+まず 1 行目付近のヘッダを見ます。
+
+```text
+{"bug_type":"298","timestamp":"2026-06-14 21:03:11.42 +0900","os_version":"iPhone OS 26.1 (23B82)",
+ "incident_id":"…","pageSize":16384,"memoryStatus":{"compressorSize":98213,"memoryPages":{"active":41022,
+ "free":1290,"wired":38310}}}
+```
+
+`bug_type` が 298 なら Jetsam です。そして `pageSize` が 16384、つまり 16 KB。ここを 4096 だと思い込むと、以降の換算が 4 倍ずれます。A14 以降の端末は 16 KB ページなので、必ずこのフィールドを読んでください。
+
+次に、殺された当人を探します。レポート本体は `states` の配列で、各プロセスがこう並びます。
+
+```text
+{"uuid":"…","states":["frontmost"],"killDelta":0,"genCount":0,"age":133,"purgeable":0,
+ "fds":124,"coalition":312,"rpages":86214,"reason":"per-process-limit",
+ "name":"WallpaperApp","cpuTime":41.2,"idleDelta":0}
+```
+
+読むべきは 3 つです。
+
+1. `states` に `frontmost` が含まれるか — 含まれていれば、ユーザーの目の前で消えたということです
+2. `reason` — `per-process-limit` は自分のアプリが上限を超えた、`vm-pageshortage` はシステム全体の逼迫に巻き込まれた
+3. `rpages` — 常駐ページ数。MB への換算は `rpages × pageSize ÷ 1024 ÷ 1024`
+
+この例なら `86214 × 16384 ÷ 1048576 ≒ 1,347 MB`。iPhone SE（第3世代）で 1,384 MB の上限に触れて殺された、という読み方になります。
+
+面倒なので、一括で換算するスクリプトを置いておきます。
+
+```bash
+#!/usr/bin/env bash
+# jetsam-summary.sh — 解析データから取り出した .ips をまとめて要約する
+# 使い方: ./jetsam-summary.sh ~/Downloads/JetsamEvent-*.ips
+for f in "$@"; do
+  python3 - "$f" <<'PY'
+import json, sys, re
+raw = open(sys.argv[1], encoding="utf-8").read()
+# 先頭ヘッダ行と本体が連結されているので、最初の } で分割する
+head, body = raw.split("\n", 1) if "\n" in raw else (raw, "{}")
+page = json.loads(head).get("pageSize", 4096)
+ts   = json.loads(head).get("timestamp", "?")
+for m in re.finditer(r'\{"uuid".*?\}', body):
+    p = json.loads(m.group(0))
+    mb = p.get("rpages", 0) * page / 1048576
+    if p.get("reason") in ("per-process-limit", "vm-pageshortage") and mb > 100:
+        front = "FRONTMOST" if "frontmost" in p.get("states", []) else "background"
+        print(f'{ts}  {p["name"]:<22} {mb:8.1f} MB  {p["reason"]:<18} {front}')
+PY
+done
+```
+
+私はこれを 3 週間分のレポート 41 件に流し、フォアグラウンドで `per-process-limit` に触れていたのが 12 件、うち 11 件が同じ画面（グリッド表示の壁紙一覧）だと分かりました。ここまで来れば、あとは実装の問題です。
+
+## 端末ごとの上限を推測しない
+
+よくある落とし穴は、「iPhone のメモリは 6 GB だから 3 GB くらいまで使える」と考えてしまうことです。Jetsam の上限は搭載メモリではなく、端末クラスごとに OS が決めています。しかも数値は公開されていません。
+
+推測する代わりに、実測します。iOS 13 以降で使える `os_proc_available_memory()` は、そのプロセスがあと何バイト確保できるかを返します。
+
+```swift
+import os
+
+/// このプロセスがあと何 MB 確保できるかを返す
+func availableMemoryMB() -> Double {
+    Double(os_proc_available_memory()) / 1_048_576.0
+}
+
+/// 起動直後に呼ぶと「上限 − 現在の使用量」が取れる
+func logMemoryBudget() {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    guard kr == KERN_SUCCESS else { return }
+    let usedMB  = Double(info.resident_size) / 1_048_576.0
+    let availMB = availableMemoryMB()
+    print(String(format: "used %.0f MB / avail %.0f MB / limit ≈ %.0f MB",
+                 usedMB, availMB, usedMB + availMB))
+}
+```
+
+手元の実機で起動直後に流すと、こうなりました。
+
+<table>
+<thead>
+<tr><th>端末</th><th>搭載メモリ</th><th>起動直後の limit 実測</th><th>常用したい上限（60%）</th></tr>
+</thead>
+<tbody>
+<tr><td>iPhone SE（第3世代）</td><td>4 GB</td><td>約 1,384 MB</td><td>830 MB</td></tr>
+<tr><td>iPhone 13</td><td>4 GB</td><td>約 2,099 MB</td><td>1,260 MB</td></tr>
+<tr><td>iPad（第9世代）</td><td>3 GB</td><td>約 1,024 MB</td><td>614 MB</td></tr>
+</tbody>
+</table>
+
+同じ 4 GB 搭載でも SE と 13 で 700 MB 以上の差があります。搭載メモリから逆算していたら、SE で確実に殺されていました。数字は OS のバージョンでも動くので、この表は「差があること」の証拠として見ていただき、値そのものは各自の端末で取り直してください。
+
+60% を常用上限としているのは、残り 40% をデコード時の一時的な山（画像 1 枚のフルサイズ展開）と、OS 側のカメラ・写真ピッカー起動に空けておくためです。ここを 80% まで攻めると、写真ライブラリを開いた瞬間に落ちるようになります。実際に一度そうなりました。
+
+## 上限を「設計」に落とす
+
+実測した limit を、キャッシュの上限として実装に流し込みます。固定値でなく、端末ごとの実測値に追従させるのが要点です。
+
+```swift
+import UIKit
+
+final class BudgetedImageCache {
+    static let shared = BudgetedImageCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    private init() {
+        applyBudget()
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            // 警告時は半分に絞る。全消去すると再スクロールで再デコードの山が来る
+            self?.cache.totalCostLimit /= 2
+        }
+    }
+
+    /// 起動時に「残メモリの 25%」をキャッシュ予算にする
+    private func applyBudget() {
+        let availableBytes = os_proc_available_memory()
+        cache.totalCostLimit = Int(Double(availableBytes) * 0.25)
+    }
+
+    func store(_ image: UIImage, for key: String) {
+        // cost はピクセル数 × 4 バイト（RGBA）。ファイルサイズではない
+        let cost = Int(image.size.width * image.scale
+                     * image.size.height * image.scale * 4)
+        cache.setObject(image, forKey: key as NSString, cost: cost)
+    }
+
+    func image(for key: String) -> UIImage? {
+        cache.object(forKey: key as NSString)
+    }
+}
+```
+
+`cost` にファイルサイズを渡してしまう実装をよく見かけます。1.2 MB の JPEG が展開されると 4032 × 3024 × 4 ≒ 48.7 MB になるので、40 倍見誤ることになります。私はこれで一度、上限を設定しているつもりのまま殺され続けました。
+
+Rork の通常版（React Native / Expo）でも考え方は同じです。`react-native-fast-image` などのキャッシュ上限を端末に追従させます。
+
+```ts
+import { NativeModules, Platform } from 'react-native';
+
+/** ネイティブ側で os_proc_available_memory() を返すブリッジを想定 */
+async function cacheBudgetBytes(): Promise<number> {
+  if (Platform.OS !== 'ios') return 128 * 1024 * 1024;
+  const avail: number = await NativeModules.MemoryBudget.availableBytes();
+  return Math.floor(avail * 0.25);
+}
+
+export async function configureImageCache() {
+  const budget = await cacheBudgetBytes();
+  // 例: 予算を平均展開サイズ（ここでは 12 MB 想定）で割り、保持枚数に変換する
+  const maxImages = Math.max(8, Math.floor(budget / (12 * 1024 * 1024)));
+  return { maxImages, budgetMB: Math.round(budget / 1048576) };
+}
+```
+
+React Native 側で見落としがちなのが、`FlatList` の `windowSize` と `removeClippedSubviews` です。既定のままだと画面外のセルを広めに保持します。グリッド表示で 1 セルが高解像度画像なら、これだけで数百 MB に届きます。
+
+## Rork Max の生成コードで特に触れやすい箇所
+
+Rork Max が出す SwiftUI コードを何本か読んできて、メモリの観点で毎回手を入れているのは次の 3 か所です。
+
+### `Image(uiImage:)` へのフルサイズ投入
+
+生成コードは `UIImage(contentsOfFile:)` で読んだ画像をそのまま `Image` に渡しがちです。表示は 180 pt 四方でも、メモリ上は元解像度で展開されます。`ImageIO` のダウンサンプリングを挟みます。
+
+```swift
+import ImageIO
+import UIKit
+
+func downsample(url: URL, to pointSize: CGSize, scale: CGFloat) -> UIImage? {
+    let srcOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, srcOptions) else { return nil }
+
+    let maxPixel = max(pointSize.width, pointSize.height) * scale
+    let options = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+    ] as CFDictionary
+
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, options) else { return nil }
+    return UIImage(cgImage: cg, scale: scale, orientation: .up)
+}
+```
+
+グリッドの 1 セルあたり 48.7 MB が 0.5 MB になります。この 1 か所で、フォアグラウンド Jetsam は私の場合ほぼ消えました。ダウンサンプリングの細かな指定については[サムネイル生成時のダウンサンプリングとスクロール性能](/articles/app-dev/ios-thumbnail-downsampling-scroll-performance)にも書いています。
+
+### `LazyVGrid` の中で `@State` に画像配列を持つ
+
+生成コードは `@State private var images: [UIImage] = []` を作り、全件を配列で抱えます。件数が増えれば線形に増えます。`id` の配列だけを持ち、画像はキャッシュ経由で引く形に直します。
+
+### `.task` 内での並列デコード数の無制限化
+
+`ForEach` の各セルで `.task { await load() }` を書くと、スクロール速度によっては数十枚が同時にデコードされます。同時実行数を絞ります。
+
+```swift
+actor DecodeLimiter {
+    private var running = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private let maxConcurrent: Int
+
+    init(maxConcurrent: Int = 3) { self.maxConcurrent = maxConcurrent }
+
+    func acquire() async {
+        if running < maxConcurrent { running += 1; return }
+        await withCheckedContinuation { waiters.append($0) }
+        running += 1
+    }
+
+    func release() {
+        running -= 1
+        if let next = waiters.first { waiters.removeFirst(); next.resume() }
+    }
+}
+```
+
+3 という数字に根拠はありません。私は 2・3・4 を実機で試し、3 でスクロールの引っかかりとメモリの山の折り合いが最もよかったので採用しています。ここは端末とデコードサイズで変わるので、値そのものより「絞る仕組みを入れる」ことのほうが大切です。発熱や低電力モードに応じて品質を落とす考え方は[Rork Max で熱と低電力モードに応じて段階的に品質を落とす](/articles/rork-dev/rork-max-thermal-low-power-adaptive-degradation)と同じ発想です。
+
+## 本番で観測を続ける
+
+修正して終わりにせず、MetricKit で継続的に拾います。実機の解析データを毎回集めるのは現実的ではありません。
+
+```swift
+import MetricKit
+
+final class MemoryExitObserver: NSObject, MXMetricManagerSubscriber {
+    static let shared = MemoryExitObserver()
+
+    func start() { MXMetricManager.shared.add(self) }
+
+    func didReceive(_ payloads: [MXMetricPayload]) {
+        for p in payloads {
+            guard let exit = p.applicationExitMetrics?.foregroundExitData else { continue }
+            let memKills = exit.cumulativeMemoryResourceLimitExitCount
+            let normal   = exit.cumulativeNormalAppExitCount
+            guard memKills > 0 else { continue }
+            // 自前のログ基盤に送る。比率で見ないと絶対数は意味を持たない
+            let rate = Double(memKills) / Double(max(normal + memKills, 1)) * 100
+            print(String(format: "foreground memory kills: %d (%.2f%%)", memKills, rate))
+        }
+    }
+}
+```
+
+`foregroundExitData` に絞るのが要点です。バックグラウンドの回収まで数えると、いつまでもゼロになりません。
+
+私が運用している壁紙アプリでは、この比率を週次で追い、修正前の 2.8% から 0.1% 台まで下がったところで打ち止めにしました。ゼロを目指すより、リリース後のレビュー文言が「勝手に閉じる」から別の話題に変わったことのほうが、判断材料として確かでした。
+
+## 明日からの一手
+
+まず、`os_proc_available_memory()` を 1 行だけアプリの起動処理に足して、手元の最も古い端末で `limit` を印字してみてください。搭載メモリから想像していた数字と、たいてい 2 倍近くずれます。
+
+そのずれを見た瞬間に、キャッシュ上限をどこに置くべきかが自分の数字として決まります。ここから先の実装は、この記事のコードをそのまま置き換えるだけで足ります。
+
+メモリの話は地味で、直しても誰にも褒められません。それでも、レビュー欄で「勝手に閉じる」と書いた方が、次に開いたときに何も起きずに使えている。その静けさのために手を動かす価値は十分にあると考えています。お読みいただきありがとうございました。
