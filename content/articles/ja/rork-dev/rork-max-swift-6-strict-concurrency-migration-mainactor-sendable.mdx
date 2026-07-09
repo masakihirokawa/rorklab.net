@@ -1,0 +1,290 @@
+---
+title: "Rork Max が書いた Swift を、Swift 6 の厳格な並行性検査に通す"
+slug: "rork-max-swift-6-strict-concurrency-migration-mainactor-sendable"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T14:30"
+author: "Rork Lab"
+description: "Rork Max が生成した SwiftUI アプリを Swift 6 の complete concurrency checking に通した記録です。警告217件をターゲット単位で削り、@MainActor の置き場所と Sendable の壊し方を実測とともに整理しました。"
+tags: ["Rork Max", "Swift 6", "並行性", "SwiftUI", "リファクタリング"]
+highlights:
+  - "警告217件を3週間で0にした、ターゲット単位の段階移行手順とビルド設定"
+  - "@MainActor を View ではなく状態層に置いた判断基準と、その前後の差分"
+  - "nonisolated(unsafe) を許容する3条件と、残り12箇所を追跡し続ける仕組み"
+---
+
+Xcode のビルド設定で Strict Concurrency Checking を `complete` に切り替えた瞬間、警告が 217 件出ました。生成直後は 1 件も出ていなかったコードです。
+
+Rork Max が書いた SwiftUI アプリは、素直で読みやすいコードでした。ただそれは Swift 5 言語モードでの話でした。Swift 6 の言語モードに上げると、その素直さがそのまま「どのスレッドから触られるか誰も宣言していない」という指摘に変わります。
+
+個人開発でアプリを 6 本並行運用している立場からすると、217 件はそれ自体が怖い数字ではありません。怖いのは、直し方を誤ると実行時の挙動が静かに変わることです。`@MainActor` をひとつ足すだけで、これまで背景スレッドで走っていた画像デコードが UI スレッドに引き戻される。警告は消えて、スクロールが 12fps になる。
+
+この記事は、その 217 件を 3 週間かけて 0 にした過程の記録です。手順よりも「どこで判断を間違えかけたか」に紙幅を割きました。
+
+## まず一括で通そうとして失敗した
+
+最初の 2 日間、私はプロジェクト全体の Swift 言語モードを 6 に上げて、出てきたエラーを上から順に潰そうとしました。
+
+これは筋の悪いやり方でした。理由は 2 つあります。
+
+ひとつは、エラーが連鎖するためです。ある型を `Sendable` に適合させると、その型を持つ別の型で新しいエラーが出ます。全体を一度に赤くすると、いま自分が直しているのが根本原因なのか、それとも波及した結果なのかが判別できなくなります。
+
+もうひとつは、ビルドが通らない状態が長引くと、途中で挙動を確かめられないためです。並行性の修正は「コンパイルが通った＝正しい」ではありません。`@MainActor` の付与は正真正銘の実行時セマンティクスの変更です。ビルドが 2 日間赤いまま進めた変更は、後から一件ずつ検証し直すはめになりました。
+
+3 日目にやり直しました。プロジェクト全体ではなく、ターゲット単位で `complete` にする方針です。
+
+```
+// Package.swift — SPM ターゲットごとに段階を刻む
+.target(
+    name: "CoreModels",
+    swiftSettings: [
+        .swiftLanguageMode(.v6)          // 依存の葉から先に v6 へ
+    ]
+),
+.target(
+    name: "ImagePipeline",
+    dependencies: ["CoreModels"],
+    swiftSettings: [
+        .swiftLanguageMode(.v5),         // まだ v5
+        .enableUpcomingFeature("StrictConcurrency")  // 警告としてだけ観測
+    ]
+),
+```
+
+依存グラフの葉（他に依存しない層）から順に v6 へ上げます。上げ切ったターゲットは以降エラーが再発しません。まだ上げていないターゲットでは `StrictConcurrency` を upcoming feature として有効化し、警告としてだけ数を観測します。
+
+このやり方に変えてから、赤い状態が続くのは 1 ターゲットぶんだけになりました。
+
+<table>
+  <thead>
+    <tr><th>週</th><th>v6 済みターゲット</th><th>残警告</th><th>備考</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0（開始時）</td><td>0 / 5</td><td>217</td><td>全体一括を断念</td></tr>
+    <tr><td>1</td><td>2 / 5</td><td>134</td><td>CoreModels / Persistence</td></tr>
+    <tr><td>2</td><td>4 / 5</td><td>41</td><td>ImagePipeline / Networking</td></tr>
+    <tr><td>3</td><td>5 / 5</td><td>0</td><td>App ターゲット</td></tr>
+  </tbody>
+</table>
+
+## @MainActor は View ではなく状態層に置く
+
+Rork Max が生成したコードは、SwiftUI の `View` に `@State` と非同期処理が同居する構造でした。よくある形です。
+
+```swift
+// 生成直後: View が状態と通信の両方を抱えている
+struct WallpaperGridView: View {
+    @State private var items: [Wallpaper] = []
+    @State private var isLoading = false
+
+    var body: some View {
+        ScrollView { /* ... */ }
+            .task { await load() }
+    }
+
+    private func load() async {
+        isLoading = true
+        items = try! await WallpaperAPI.fetchAll()   // 隔離が宣言されていない
+        isLoading = false
+    }
+}
+```
+
+`complete` にすると、`WallpaperAPI.fetchAll()` が返す `[Wallpaper]` を `View` の隔離コンテキストへ渡す箇所で警告が出ます。
+
+ここで最も手軽な対処は、`WallpaperAPI` に `@MainActor` を付けることです。警告は消えます。そして `fetchAll()` の内部で走っていた JSON デコードが、メインスレッドに乗ります。
+
+私はこれを一度やってしまい、初回ロード時のフレームドロップで気づきました。500 件のサムネイル情報をデコードする 180ms ぶんが、そのままメインスレッドを塞いでいました。
+
+正しい置き場所は、View でも API でもなく、その間の状態層です。
+
+```swift
+// 移行後: 隔離の境界を Store に一本化する
+@MainActor
+@Observable
+final class WallpaperStore {
+    private(set) var items: [Wallpaper] = []
+    private(set) var isLoading = false
+
+    private let api: WallpaperFetching   // nonisolated なプロトコル
+
+    init(api: WallpaperFetching) { self.api = api }
+
+    func load() async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            // await の向こう側はメインスレッドから離れる
+            items = try await api.fetchAll()
+        } catch {
+            items = []
+        }
+    }
+}
+
+// API 側は隔離を持たない。呼ばれたスレッドで走る
+protocol WallpaperFetching: Sendable {
+    func fetchAll() async throws -> [Wallpaper]
+}
+
+struct WallpaperAPI: WallpaperFetching {
+    func fetchAll() async throws -> [Wallpaper] {
+        let (data, _) = try await URLSession.shared.data(from: Self.endpoint)
+        return try JSONDecoder().decode([Wallpaper].self, from: data)  // 背景で走る
+    }
+}
+```
+
+`WallpaperStore` に `@MainActor` を付け、`WallpaperFetching` は隔離を持たないままにします。`try await api.fetchAll()` の呼び出しでメインアクターは一度手放されるため、デコードは背景スレッドで実行されます。戻り値を `items` に代入する時点でメインアクターに戻ります。
+
+この形にすると、`Wallpaper` が `Sendable` である必要が生じます。それは正しい要求です。値がアクター境界を越えるからです。
+
+判断基準として私が置いたのは次の 1 行でした。**隔離注釈は「その値を最終的に誰が読むか」ではなく「その値の可変状態を誰が所有するか」に付ける。** View は読むだけです。所有しているのは Store です。
+
+## Sendable に通らない型を 3 つに分ける
+
+警告の内訳を数えると、134 件のうち 96 件が「型が `Sendable` に適合していない」系でした。すべてを同じやり方で直すと破綻します。私は 3 つに分類しました。
+
+<table>
+  <thead>
+    <tr><th>分類</th><th>実体</th><th>件数</th><th>処方</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A. 実は不変</td><td>API レスポンス・設定値・ID 型</td><td>71</td><td><strong>struct + let に直して <code>Sendable</code> 明示</strong></td></tr>
+    <tr><td>B. 可変だが単一所有</td><td>キャッシュ・ダウンロードキュー</td><td>13</td><td><strong><code>actor</code> に変換</strong></td></tr>
+    <tr><td>C. 外部フレームワーク由来</td><td>Core ML / PDFKit のハンドル</td><td>12</td><td><strong><code>nonisolated(unsafe)</code> ＋ 使用箇所の直列化</strong></td></tr>
+  </tbody>
+</table>
+
+A は機械的な作業でした。生成コードは `class` を安易に使う傾向があり、実際には初期化後に一度も書き換えていない型が大半でした。`final class` を `struct` にして `var` を `let` にすると、`Sendable` は暗黙に導出されます。
+
+B は少し設計が要ります。たとえばサムネイルのメモリキャッシュはこうなりました。
+
+```swift
+actor ThumbnailCache {
+    private var storage: [Wallpaper.ID: CGImage] = [:]
+    private let limit: Int
+
+    init(limit: Int = 240) { self.limit = limit }
+
+    func image(for id: Wallpaper.ID) -> CGImage? { storage[id] }
+
+    func insert(_ image: CGImage, for id: Wallpaper.ID) {
+        if storage.count >= limit { storage.removeAll(keepingCapacity: true) }
+        storage[id] = image
+    }
+}
+```
+
+`actor` にすると呼び出しがすべて `await` になります。スクロール中のセル描画から `await cache.image(for:)` を呼ぶと、1 フレーム遅れて画像が現れます。ここは同期読み取りの高速パスが要る場面でした。
+
+そこで、読み取りだけ `nonisolated` な `NSCache` に寄せ、書き込みの整合性は `actor` で守る形に落ち着けました。`NSCache` 自体がスレッドセーフであるためです。
+
+```swift
+final class ThumbnailCache: Sendable {
+    private let cache = NSCache<NSString, CGImage>()   // スレッドセーフ
+
+    nonisolated func image(for id: Wallpaper.ID) -> CGImage? {
+        cache.object(forKey: id.rawValue as NSString)
+    }
+
+    nonisolated func insert(_ image: CGImage, for id: Wallpaper.ID) {
+        cache.setObject(image, forKey: id.rawValue as NSString)
+    }
+}
+```
+
+`actor` は万能の逃げ場ではありません。**同期読み取りが性能要件になっている箇所では、スレッドセーフな型に委譲して `Sendable` を手で名乗るほうが素直です。**
+
+## nonisolated(unsafe) を許すための 3 条件
+
+C の 12 件は、こちらの都合では直せない型でした。Core ML の `MLModel` を保持するハンドルや、PDFKit の描画コンテキストなどです。
+
+`nonisolated(unsafe)` はコンパイラの検査を黙らせる注釈です。安全性の保証は書いた人間に移ります。無条件に使うと、Swift 6 に移行した意味そのものが失われます。
+
+私は次の 3 条件をすべて満たす場合にだけ許すと決めました。
+
+第一に、その値へのアクセスが単一の隔離ドメインに閉じていること。実際には `@MainActor` か、専用の `actor` の内部からのみ触れる状態です。
+
+第二に、その事実がコード上で確認できること。`private` にして、公開されたメソッド経由でしか届かないようにします。
+
+第三に、なぜ安全なのかを 1 行のコメントで残すこと。「フレームワークの制約」だけでは足りません。誰が所有していて、どこから触られないのかを書きます。
+
+```swift
+@MainActor
+final class DepthRenderer {
+    // nonisolated(unsafe): MLModel は Sendable でないが、
+    // このインスタンスは DepthRenderer(@MainActor) の外に漏れず、
+    // 生成後は read-only。予測は model.prediction(from:) が内部で直列化する。
+    nonisolated(unsafe) private let model: MLModel
+
+    init(model: MLModel) { self.model = model }
+}
+```
+
+さらに、この 12 箇所を放置しないために、`nonisolated(unsafe)` の出現数を CI で数えるようにしました。増えたら落ちます。
+
+```bash
+#!/usr/bin/env bash
+# scripts/check-unsafe-isolation.sh
+set -euo pipefail
+BASELINE=12
+COUNT=$(grep -rn "nonisolated(unsafe)" Sources/ --include='*.swift' | wc -l | tr -d ' ')
+
+if [ "$COUNT" -gt "$BASELINE" ]; then
+  echo "❌ nonisolated(unsafe) increased: ${COUNT} > ${BASELINE}"
+  grep -rn "nonisolated(unsafe)" Sources/ --include='*.swift'
+  exit 1
+fi
+echo "✅ nonisolated(unsafe): ${COUNT} (baseline ${BASELINE})"
+```
+
+baseline 方式にしたのは、`0` を要求すると誰も CI を通せず、結局チェックごと外されるためです。現状を固定して、そこから増やさない。減ったら baseline を下げる。この 1 ヶ月で 12 から 9 まで下がりました。
+
+## 実測 — 何が良くなり、何が悪くなったか
+
+移行そのものは機能追加ではありません。数字で説明できなければ、3 週間を使った理由が自分でも分からなくなります。移行前後で以下を測りました。計測は iPhone 15 Pro 実機、リリース構成、各 20 試行の中央値です。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>移行前</th><th>移行後</th><th>差</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>クリーンビルド時間</td><td>112 秒</td><td>139 秒</td><td>+27 秒</td></tr>
+    <tr><td>増分ビルド（1 ファイル変更）</td><td>8.4 秒</td><td>9.1 秒</td><td>+0.7 秒</td></tr>
+    <tr><td>コールドスタート TTI</td><td>1.41 秒</td><td>1.38 秒</td><td>-0.03 秒</td></tr>
+    <tr><td>グリッド初回描画までの時間</td><td>0.62 秒</td><td>0.44 秒</td><td>-0.18 秒</td></tr>
+    <tr><td>並行性起因のクラッシュ（30日）</td><td>7 件</td><td>0 件</td><td>-7 件</td></tr>
+  </tbody>
+</table>
+
+ビルド時間は素直に伸びました。24% 増です。これは検査コストであり、受け入れる以外にありません。
+
+グリッド初回描画が 0.18 秒縮んだのは、移行の副産物です。隔離境界を整理する過程で、メインスレッドで走っていたデコードが背景へ移りました。並行性の検査は、実質的に「どこがメインスレッドを塞いでいるか」の静的検出として働きます。
+
+クラッシュの 7 件は、Crashlytics 上で `EXC_BAD_ACCESS` として記録されていたものです。原因は 2 つに絞れました。ひとつは画像キャッシュ辞書への同時書き込み、もうひとつは通知ハンドラからの `@Published` 更新です。どちらもコンパイラが移行中に指摘しました。私はこの 2 件を、半年ほど「再現しないクラッシュ」として放置していました。
+
+移行で得たものの中で、いちばん胸が軽くなったのはこの点です。
+
+## 生成コードと Swift 6 の相性について
+
+Rork Max のようなツールが書くコードは、Swift 5 の作法として自然です。それは学習データがそうだからで、批判にはあたりません。
+
+ただ、Swift 6 に持っていくときの摩擦には、生成コード特有の傾向があります。私が繰り返し見たのは次の 3 つです。
+
+`class` の過剰使用。状態を持たない型まで `final class` で書かれます。移行時は「この型は初期化後に書き換わるか」を機械的に確認し、`struct` に落とせるものを先に落とします。71 件のうち大半がこれでした。
+
+シングルトンの静的可変プロパティ。`static var shared` は `complete` で必ず警告になります。`static let` に直せるか、`@MainActor static let` にするか、`actor` にするかの三択です。私は 8 件中 6 件を `static let` で解決しました。
+
+`Task { }` の中で View の状態を直接書き換える形。これは `@MainActor` を Store に集約すると自然に消えます。
+
+逆に言えば、生成直後の段階でこの 3 点だけを手当てしておくと、後の移行コストは大きく下がります。私はいま、新しくアプリを起こすときは初日に SPM ターゲットを切り、`CoreModels` だけ先に v6 で始めるようにしています。あとから 217 件と向き合うより、はるかに安い買い物でした。
+
+## 次に手を付けるなら
+
+Swift 6 への移行は、コンパイラを満足させる作業に見えて、実際には「この状態は誰のものか」を全部書き下す作業でした。生成コードにはその答えが書かれていません。書くのは、そのアプリを運用する人間の仕事です。
+
+いまお使いのプロジェクトで最初の一歩を選ぶなら、依存の葉にあたる小さなモジュールをひとつだけ切り出して、そこだけ `.swiftLanguageMode(.v6)` にしてみてください。1 ターゲットぶんの赤なら、半日で青に戻せます。そこで得た感触が、残りの見積もりをかなり正確にしてくれます。
+
+私自身まだ 9 箇所の `nonisolated(unsafe)` を抱えたままで、学びの途中です。同じ道を通る方の役に立てば嬉しく思います。お読みいただきありがとうございました。

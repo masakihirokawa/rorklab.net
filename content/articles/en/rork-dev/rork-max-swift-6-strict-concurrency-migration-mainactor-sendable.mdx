@@ -1,0 +1,290 @@
+---
+title: "Getting Rork Max's Swift Through Swift 6's Strict Concurrency Checking"
+slug: "rork-max-swift-6-strict-concurrency-migration-mainactor-sendable"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-09T14:30"
+author: "Rork Lab"
+description: "A field record of taking a Rork Max-generated SwiftUI app through Swift 6 complete concurrency checking: 217 warnings cleared target by target, where @MainActor actually belongs, and measured before/after numbers."
+tags: ["Rork Max", "Swift 6", "Concurrency", "SwiftUI", "Refactoring"]
+highlights:
+  - "The target-by-target migration path that took 217 warnings to zero in three weeks"
+  - "Why @MainActor belongs on the state layer rather than the View, with the before/after diff"
+  - "Three conditions for allowing nonisolated(unsafe), plus the CI baseline that keeps the remaining 12 from growing"
+---
+
+The moment I flipped Strict Concurrency Checking to `complete` in Xcode, 217 warnings appeared. The same code had produced exactly zero the day before.
+
+Rork Max writes clean, readable SwiftUI. That readability holds under the Swift 5 language mode. Raise the project to Swift 6 and the same clarity turns into a long list of "nobody has declared which thread touches this."
+
+Running six apps on the App Store as an indie developer, 217 is not a scary number by itself. What worries me is that the wrong fix silently changes runtime behavior. Add a single `@MainActor` and the image decoding that used to run on a background thread gets pulled onto the UI thread. The warning disappears. Your scroll drops to 12fps.
+
+This is the record of clearing those 217 warnings over three weeks. I've spent more of it on the places where I nearly made the wrong call than on the steps themselves.
+
+## The all-at-once attempt that failed
+
+For the first two days I raised the whole project to Swift 6 and worked down the error list from the top.
+
+That was the wrong shape of work, for two reasons.
+
+Errors cascade. Conform one type to `Sendable` and a new error surfaces in the type that holds it. When the entire project is red, you cannot tell whether the diagnostic in front of you is a root cause or a ripple from something three files away.
+
+And a build that stays broken for two days means you cannot check behavior along the way. Concurrency fixes are not "it compiles, therefore it's correct." Adding `@MainActor` is a genuine change to runtime semantics. Every change I made during those two red days had to be re-verified afterward, one at a time.
+
+On day three I started over, raising language mode per target rather than per project.
+
+```
+// Package.swift — advance one target at a time
+.target(
+    name: "CoreModels",
+    swiftSettings: [
+        .swiftLanguageMode(.v6)          // leaves of the dependency graph first
+    ]
+),
+.target(
+    name: "ImagePipeline",
+    dependencies: ["CoreModels"],
+    swiftSettings: [
+        .swiftLanguageMode(.v5),         // still v5
+        .enableUpcomingFeature("StrictConcurrency")  // observe as warnings only
+    ]
+),
+```
+
+Start at the leaves — the modules that depend on nothing. Once a target is on v6, errors never reappear there. Targets still on v5 enable `StrictConcurrency` as an upcoming feature, so the warning count stays visible without blocking the build.
+
+After that change, only one target was ever red at a time.
+
+<table>
+  <thead>
+    <tr><th>Week</th><th>Targets on v6</th><th>Warnings left</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0 (start)</td><td>0 / 5</td><td>217</td><td>Abandoned the big-bang attempt</td></tr>
+    <tr><td>1</td><td>2 / 5</td><td>134</td><td>CoreModels, Persistence</td></tr>
+    <tr><td>2</td><td>4 / 5</td><td>41</td><td>ImagePipeline, Networking</td></tr>
+    <tr><td>3</td><td>5 / 5</td><td>0</td><td>App target</td></tr>
+  </tbody>
+</table>
+
+## @MainActor belongs on the state layer, not the View
+
+The generated code put `@State` and async work together inside the `View`. A very common shape.
+
+```swift
+// As generated: the View owns both state and networking
+struct WallpaperGridView: View {
+    @State private var items: [Wallpaper] = []
+    @State private var isLoading = false
+
+    var body: some View {
+        ScrollView { /* ... */ }
+            .task { await load() }
+    }
+
+    private func load() async {
+        isLoading = true
+        items = try! await WallpaperAPI.fetchAll()   // no isolation declared
+        isLoading = false
+    }
+}
+```
+
+Under `complete`, the compiler flags the point where `[Wallpaper]` crosses into the View's isolation domain.
+
+The easiest fix is to annotate `WallpaperAPI` with `@MainActor`. The warning goes away — and the JSON decoding inside `fetchAll()` now runs on the main thread.
+
+I made that mistake once and caught it as a frame drop on first load. Decoding 500 thumbnail records took 180ms, and all 180ms sat on the main thread.
+
+The right place for the annotation is neither the View nor the API. It's the state layer between them.
+
+```swift
+// After: one isolation boundary, on the store
+@MainActor
+@Observable
+final class WallpaperStore {
+    private(set) var items: [Wallpaper] = []
+    private(set) var isLoading = false
+
+    private let api: WallpaperFetching   // a nonisolated protocol
+
+    init(api: WallpaperFetching) { self.api = api }
+
+    func load() async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            // main actor is released across the await
+            items = try await api.fetchAll()
+        } catch {
+            items = []
+        }
+    }
+}
+
+// The API declares no isolation. It runs wherever it's called from.
+protocol WallpaperFetching: Sendable {
+    func fetchAll() async throws -> [Wallpaper]
+}
+
+struct WallpaperAPI: WallpaperFetching {
+    func fetchAll() async throws -> [Wallpaper] {
+        let (data, _) = try await URLSession.shared.data(from: Self.endpoint)
+        return try JSONDecoder().decode([Wallpaper].self, from: data)  // off the main thread
+    }
+}
+```
+
+`WallpaperStore` carries `@MainActor`. `WallpaperFetching` carries none. The main actor is released across `try await api.fetchAll()`, so decoding happens on a background thread, and the assignment to `items` hops back.
+
+This forces `Wallpaper` to be `Sendable`, which is the correct demand — the value really does cross an actor boundary.
+
+The rule I settled on fits in one line. **Isolation annotations belong where mutable state is owned, not where the value is eventually read.** The View only reads. The store owns.
+
+## Sorting the non-Sendable types into three buckets
+
+Of the 134 warnings at the end of week one, 96 were some flavor of "type does not conform to `Sendable`." Treating them uniformly would have been a mistake. I split them three ways.
+
+<table>
+  <thead>
+    <tr><th>Bucket</th><th>What it actually is</th><th>Count</th><th>Treatment</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A. Secretly immutable</td><td>API responses, config, ID types</td><td>71</td><td><strong>Convert to <code>struct</code> with <code>let</code>; Sendable is inferred</strong></td></tr>
+    <tr><td>B. Mutable, single owner</td><td>Caches, download queues</td><td>13</td><td><strong>Turn into an <code>actor</code></strong></td></tr>
+    <tr><td>C. Framework-owned handles</td><td>Core ML, PDFKit</td><td>12</td><td><strong><code>nonisolated(unsafe)</code> plus serialized access</strong></td></tr>
+  </tbody>
+</table>
+
+Bucket A was mechanical. Generated code reaches for `class` readily, but most of those types were never mutated after `init`. Turning `final class` into `struct` and `var` into `let` gets `Sendable` for free.
+
+Bucket B needed a design decision. The thumbnail memory cache started here:
+
+```swift
+actor ThumbnailCache {
+    private var storage: [Wallpaper.ID: CGImage] = [:]
+    private let limit: Int
+
+    init(limit: Int = 240) { self.limit = limit }
+
+    func image(for id: Wallpaper.ID) -> CGImage? { storage[id] }
+
+    func insert(_ image: CGImage, for id: Wallpaper.ID) {
+        if storage.count >= limit { storage.removeAll(keepingCapacity: true) }
+        storage[id] = image
+    }
+}
+```
+
+Making it an `actor` turns every call site into an `await`. Calling `await cache.image(for:)` while rendering a scrolling cell means the image arrives one frame late. That path needed a synchronous fast read.
+
+So I moved the reads onto `NSCache`, which is already thread-safe, and declared `Sendable` by hand.
+
+```swift
+final class ThumbnailCache: Sendable {
+    private let cache = NSCache<NSString, CGImage>()   // thread-safe
+
+    nonisolated func image(for id: Wallpaper.ID) -> CGImage? {
+        cache.object(forKey: id.rawValue as NSString)
+    }
+
+    nonisolated func insert(_ image: CGImage, for id: Wallpaper.ID) {
+        cache.setObject(image, forKey: id.rawValue as NSString)
+    }
+}
+```
+
+`actor` is not a universal escape hatch. **Where a synchronous read is part of the performance contract, delegating to a thread-safe type and claiming `Sendable` yourself is the more honest answer.**
+
+## Three conditions for allowing nonisolated(unsafe)
+
+The 12 warnings in bucket C came from types I don't own — an `MLModel` handle, a PDFKit drawing context.
+
+`nonisolated(unsafe)` silences the checker. The safety argument moves from the compiler to you. Sprinkled freely, it dissolves the entire reason for migrating.
+
+I allow it only when all three of these hold.
+
+First, access to the value is confined to a single isolation domain — in practice, reachable only from inside a `@MainActor` type or a dedicated `actor`.
+
+Second, that confinement is verifiable from the code. Mark it `private` so it can only be reached through published methods.
+
+Third, a one-line comment records why it is safe. "Framework limitation" is not enough. Write down who owns it and who cannot touch it.
+
+```swift
+@MainActor
+final class DepthRenderer {
+    // nonisolated(unsafe): MLModel is not Sendable, but this instance never
+    // escapes DepthRenderer (@MainActor) and is read-only after init.
+    // model.prediction(from:) serializes internally.
+    nonisolated(unsafe) private let model: MLModel
+
+    init(model: MLModel) { self.model = model }
+}
+```
+
+To keep those 12 from quietly becoming 30, CI counts them.
+
+```bash
+#!/usr/bin/env bash
+# scripts/check-unsafe-isolation.sh
+set -euo pipefail
+BASELINE=12
+COUNT=$(grep -rn "nonisolated(unsafe)" Sources/ --include='*.swift' | wc -l | tr -d ' ')
+
+if [ "$COUNT" -gt "$BASELINE" ]; then
+  echo "❌ nonisolated(unsafe) increased: ${COUNT} > ${BASELINE}"
+  grep -rn "nonisolated(unsafe)" Sources/ --include='*.swift'
+  exit 1
+fi
+echo "✅ nonisolated(unsafe): ${COUNT} (baseline ${BASELINE})"
+```
+
+A baseline rather than zero, because a rule nobody can satisfy is a rule somebody deletes. Freeze the current number, never grow it, lower the baseline when the count drops. Mine went from 12 to 9 over the past month.
+
+## Measured results — what improved, what got worse
+
+A migration ships no features. Without numbers, three weeks becomes hard to justify even to yourself. Measurements below are on a physical iPhone 15 Pro, release configuration, median of 20 runs.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Before</th><th>After</th><th>Delta</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Clean build</td><td>112 s</td><td>139 s</td><td>+27 s</td></tr>
+    <tr><td>Incremental build (1 file)</td><td>8.4 s</td><td>9.1 s</td><td>+0.7 s</td></tr>
+    <tr><td>Cold start TTI</td><td>1.41 s</td><td>1.38 s</td><td>-0.03 s</td></tr>
+    <tr><td>Time to first grid paint</td><td>0.62 s</td><td>0.44 s</td><td>-0.18 s</td></tr>
+    <tr><td>Concurrency crashes (30 days)</td><td>7</td><td>0</td><td>-7</td></tr>
+  </tbody>
+</table>
+
+Build time grew, plainly — 24%. That is the cost of the checking, and there is nothing to do but accept it.
+
+The 0.18s improvement in first grid paint was a side effect. Straightening out the isolation boundaries moved decoding off the main thread. Strict concurrency checking doubles, in practice, as a static detector for "what is blocking your main thread."
+
+The seven crashes had been sitting in Crashlytics as `EXC_BAD_ACCESS`. Two causes: concurrent writes into the image cache dictionary, and a `@Published` update fired from a notification handler. The compiler pointed at both during the migration. I had been carrying them for roughly six months as "crashes I cannot reproduce," watching them tick up in the dashboards of two shipped apps.
+
+Of everything the migration gave back, that is the part that lifted the most weight.
+
+## How generated code and Swift 6 get along
+
+Code from a tool like Rork Max is idiomatic Swift 5. That is what the training data looks like, and it isn't a criticism.
+
+The friction on the way to Swift 6, though, has a distinct shape. Three patterns kept recurring.
+
+Overuse of `class`. Even stateless types arrive as `final class`. During migration, ask mechanically whether the type is ever mutated after `init`, and demote the ones that aren't. That covered most of the 71 in bucket A.
+
+Static mutable singletons. `static var shared` always warns under `complete`. The choice is `static let`, `@MainActor static let`, or an `actor`. Six of my eight became `static let`.
+
+`Task { }` blocks mutating View state directly. These disappear on their own once `@MainActor` lives on the store.
+
+Which means: patch those three the day the code is generated, and the migration bill drops sharply later. When I start a new app now, I split the SPM targets on day one and begin `CoreModels` on v6 immediately. Far cheaper than meeting 217 warnings a year in.
+
+## Where to start
+
+Migrating to Swift 6 looks like satisfying a compiler. It is really the work of writing down, everywhere, who owns which piece of state. Generated code does not contain that answer. Supplying it is the job of whoever operates the app.
+
+If you want a first step in your own project, carve out one small leaf module and set only that target to `.swiftLanguageMode(.v6)`. One target's worth of red can go green in an afternoon, and the feel of it will make the rest of your estimate far more honest.
+
+I'm still carrying nine `nonisolated(unsafe)` annotations of my own, so I'm very much still learning here. If this saves you a few of the wrong turns I took, I'd be glad.
