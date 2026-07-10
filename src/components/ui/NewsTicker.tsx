@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ENGINE — Rork MaxはClaude CodeとClaude Opus 4.6を基盤に、ネイティブSwiftアプリを直接生成します",
-    "CORE ML — Rork MaxからCore MLの端末内推論・HealthKit・HomeKit・NFC・App Clipsといった機能に手が届きます",
+    "MAX — Rork Maxはコード署名やプロビジョニングを肩代わりし、2クリックでApp Storeへ申請できます。公開にローカルMacは不要です",
+    "SIMULATOR — ブラウザ内のストリーミングシミュレータで操作感を試せ、QRを読めばTestFlightなしで実機に直接インストールできます",
+    "NATIVE — SwiftUI・ARKit・HealthKit・HomeKit・Core ML・Metalなど、React Nativeでは届かない領域までカバーします",
     "SEED — Rorkは2026年4月にLeft Lane Capital主導で$15Mのシードを調達し、Peak XVやa16z Speedrunが参加しました",
-    "M&A — Rorkはアプリビルダー Paperline を買収し、エンジニアリング人材の獲得を目的に買収を継続する方針です",
-    "MARKET — Gartnerは2026年末までに新規アプリの75%がローコードまたはノーコードで作られると予測しています",
-    "GROWTH — ノーコードAI市場は2024年の$4.9Bから2029年に$24.8Bへ、年38.2%の成長が見込まれています",
+    "GROWTH — 月間743,000訪問・成長率85%と報じられ、AIモバイルアプリ構築の裾野が広がっています",
+    "NOCODE — Gartnerは2026年末までに新規アプリの75%がローコード／ノーコードで作られると予測しています",
   ],
   en: [
-    "ENGINE — Rork Max is powered by Claude Code and Claude Opus 4.6, generating native Swift apps directly",
-    "CORE ML — Rork Max reaches on-device Core ML inference alongside HealthKit, HomeKit, NFC, and App Clips",
+    "MAX — Rork Max handles code signing and provisioning so you can submit to the App Store in two clicks, with no local Mac required",
+    "SIMULATOR — Try your app in an in-browser streaming simulator, then scan a QR code to install straight to your device without TestFlight",
+    "NATIVE — Coverage reaches SwiftUI, ARKit, HealthKit, HomeKit, Core ML, and Metal, going where React Native cannot",
     "SEED — Rork raised a $15M seed led by Left Lane Capital in April 2026, joined by Peak XV and a16z Speedrun",
-    "M&A — Rork acquired the app builder Paperline and says it will stay acquisitive to bring in engineering talent",
-    "MARKET — Gartner expects 75% of new applications to be built with low-code or no-code tools by the end of 2026",
-    "GROWTH — The no-code AI platform market is projected to grow from $4.9B in 2024 to $24.8B by 2029",
+    "GROWTH — Reported at 743,000 monthly visits with 85% growth, widening access to AI-built mobile apps",
+    "NOCODE — Gartner expects 75% of new applications to be built with low-code or no-code tools by the end of 2026",
   ],
 };
 
