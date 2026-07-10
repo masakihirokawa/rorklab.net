@@ -1,0 +1,308 @@
+---
+title: "React Compiler を Expo に入れて、手書き memo を 41 箇所消しました"
+slug: "rork-expo-react-compiler-rerender-measurement-memo-cleanup"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-10T14:30"
+author: "Rork Lab"
+description: "Rork が生成した React Native 画面に React Compiler を導入し、再レンダリング回数を Profiler で実測しました。手書き memo/useCallback の削除判断、効かない箇所の見分け方、CI での回帰検知までをまとめています。"
+tags: ["React Compiler", "Expo", "React Native", "パフォーマンス", "Rork"]
+highlights:
+  - "Expo に React Compiler を入れ、commit 回数 24 → 2・commit 時間 36% 短縮を Profiler で実測した再現手順"
+  - "手書き memo/useCallback 63 箇所のうち 41 箇所を削除し、22 箇所を残した判別基準"
+  - "コンパイラが bail out したコンポーネントを eslint-plugin-react-hooks と useMemoCache の出現数で洗い出す方法"
+---
+
+壁紙アプリのグリッド画面で、サムネイルを 1 枚お気に入りに登録するたびに画面全体が白くまたたく。Profiler を開いたら、可視領域の 24 セルすべてが再レンダリングされていました。お気に入りフラグが変わったのは 1 セルだけです。
+
+原因はすぐ分かりました。Rork が生成した `onToggleFavorite` が毎レンダリングで新しい関数として作られ、`FlatList` の `renderItem` を丸ごと作り直していたのです。
+
+その場しのぎとして `useCallback` を足し、`React.memo` で包み、依存配列を睨む。この作業を 6 本のアプリで何度繰り返したか分かりません。私自身、依存配列の書き間違いで「更新されないバグ」を作った回数のほうが、memo で得た速度より多いのではと感じておりました。
+
+React Compiler を本気で試したのは、その徒労感が理由です。
+
+## 何を検証したのか
+
+対象は個人開発で運用している壁紙アプリの 1 本です。Expo SDK の React Native 画面で、Rork が生成したグリッド・詳細・設定の 3 画面。手書きの `React.memo` / `useCallback` / `useMemo` が合計 63 箇所ありました。
+
+検証したのは次の 3 点です。
+
+1. React Compiler を有効にすると、再レンダリング回数は実際にどれだけ減るのか
+2. 手書きの memo 群は削除して安全か。削除すると遅くなる箇所はどこか
+3. コンパイラが最適化を「諦めた」コンポーネントを、目視ではなく機械的に見つけられるか
+
+結論を先に書きます。再レンダリング回数は主要操作で 24 回 → 2 回に落ち、手書き memo は 63 箇所のうち 41 箇所を削除できました。残る 22 箇所には削除してはいけない明確な理由がありました。
+
+## 導入は Babel プラグイン 1 行、ただし前提が 2 つ
+
+Expo での有効化そのものは短いものです。
+
+```bash
+npx expo install babel-plugin-react-compiler
+```
+
+```js
+// babel.config.js
+module.exports = function (api) {
+  api.cache(true);
+  return {
+    presets: [["babel-preset-expo", { "react-compiler": true }]],
+  };
+};
+```
+
+`babel-preset-expo` に `react-compiler: true` を渡すと、プリセットがコンパイラを配線してくれます。手動で `plugins` に追加すると、プリセットが施す React Native 向けの調整と二重適用になることがあり、私は 1 度これでビルドを壊しました。プリセット経由に統一するのが安全です。
+
+前提が 2 つあります。
+
+**前提 1: New Architecture が有効であること。** 厳密にはコンパイラ自体は旧アーキでも動きますが、コンパイラが前提とするレンダリング挙動（自動バッチング、Concurrent 由来の再入可能性）は New Architecture で揃います。旧アーキのまま入れると、後述する「2 回に落ちたはずの再レンダリングが 5 回残る」状態になりました。移行手順は[新アーキテクチャの段階移行](/articles/rork-dev/rork-new-architecture-fabric-turbomodules-staged-migration-six-apps)にまとめてあります。
+
+**前提 2: Metro のキャッシュを必ず捨てること。** `npx expo start --clear` を挟まないと、変換前のバンドルが残ります。「導入したのに何も変わらない」という報告の大半はこれです。開発ビルドで確認できたつもりが本番ビルドでは別の結果になる、という落とし穴もここに潜んでいます。回避策は単純で、計測の前に必ずキャッシュを捨てることに尽きます。Metro のキャッシュ挙動は[Fast Refresh のトラブルシューティング](/articles/rork-dev/rork-metro-bundler-fast-refresh-troubleshooting-guide)側にも書きました。
+
+## 効果を「体感」ではなく回数で見る
+
+導入直後、画面はたしかに軽くなったように感じました。ただ、体感は導入した本人がいちばん当てにならないものです。
+
+再レンダリング回数を数えるために、開発ビルドだけで動く Profiler ラッパを 1 つ置きました。
+
+```tsx
+// src/dev/RenderCounter.tsx
+import { Profiler, type ReactNode } from "react";
+
+type Counts = Record<string, { commits: number; totalMs: number }>;
+
+const counts: Counts = {};
+
+export function RenderCounter({ id, children }: { id: string; children: ReactNode }) {
+  if (!__DEV__) return <>{children}</>;
+
+  return (
+    <Profiler
+      id={id}
+      onRender={(profileId, phase, actualDuration) => {
+        // phase: "mount" | "update" | "nested-update"
+        if (phase === "mount") return;
+        const entry = counts[profileId] ?? { commits: 0, totalMs: 0 };
+        entry.commits += 1;
+        entry.totalMs += actualDuration;
+        counts[profileId] = entry;
+      }}
+    >
+      {children}
+    </Profiler>
+  );
+}
+
+export function dumpRenderCounts(label: string) {
+  if (!__DEV__) return;
+  const rows = Object.entries(counts)
+    .sort((a, b) => b[1].commits - a[1].commits)
+    .map(([id, v]) => `${id}\t${v.commits}\t${v.totalMs.toFixed(1)}ms`);
+  console.log(`[render:${label}]\n${rows.join("\n")}`);
+}
+
+export function resetRenderCounts() {
+  for (const key of Object.keys(counts)) delete counts[key];
+}
+```
+
+`phase === "mount"` を捨てているのが要点です。初回マウントは最適化の対象ではなく、これを混ぜると導入前後の差が薄まって見えます。私は最初これを数えてしまい、「たいして変わらない」と誤った結論を出しかけました。
+
+計測はシナリオを固定します。曖昧な操作は曖昧な数字しか返しません。
+
+```tsx
+// 計測シナリオ: グリッド表示 → 3番目のセルをお気に入り登録 → 解除
+resetRenderCounts();
+await tapFavorite(2);
+await tapFavorite(2);
+dumpRenderCounts("favorite-toggle");
+```
+
+同一端末（iPhone 13 mini・iOS 26.4・開発ビルド）で 5 回試行し、中央値を取りました。結果です。
+
+<table>
+  <thead>
+    <tr>
+      <th>計測対象</th>
+      <th>導入前（手書き memo あり）</th>
+      <th>導入前（memo 全削除）</th>
+      <th>導入後（memo 全削除）</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>WallpaperCell の commit 回数</td>
+      <td>2</td>
+      <td>48</td>
+      <td>2</td>
+    </tr>
+    <tr>
+      <td>GridScreen の commit 回数</td>
+      <td>4</td>
+      <td>4</td>
+      <td>2</td>
+    </tr>
+    <tr>
+      <td>1 タップあたりの commit 合計時間</td>
+      <td>18.4ms</td>
+      <td>96.2ms</td>
+      <td>11.7ms</td>
+    </tr>
+  </tbody>
+</table>
+
+中央の列が重要です。手書き memo を外しただけの状態は明確に遅い。commit 回数は 24 倍、commit 時間は 5.2 倍に膨らみました。つまり memo 群は無意味な儀式ではなく、ちゃんと仕事をしていました。
+
+そのうえで、コンパイラは同じ仕事を人間より少し上手にやりました。手書き memo ありの状態と比べても commit 時間は 18.4ms から 11.7ms へ、約 36% 短縮されています。GridScreen が 4 → 2 に落ちたのは、私が memo を張り忘れていた中間コンテナをコンパイラが拾ったからです。
+
+「人間が張り忘れる場所を機械が拾う」。これが導入の本質的な利得だと考えております。速度そのものより、速度の分散が減ることのほうが日々の開発では効きます。
+
+## 削除できた 41 箇所と、残した 22 箇所
+
+手書き memo を無条件に消してよいわけではありませんでした。判別は次の基準で行いました。
+
+**削除してよいもの（41 箇所）**
+
+- 純粋な派生値の `useMemo`（`items.filter(...)`、`price * qty` など）
+- 子に渡すだけの `useCallback`
+- props と state だけから描画が決まるコンポーネントの `React.memo`
+
+これらはコンパイラが同等以上のメモ化を自動生成します。残しておくと、コンパイラのメモ化と二重に走り、バンドルサイズだけが増えます。
+
+**残すべきもの（22 箇所）**
+
+第一に、**参照の同一性そのものが契約になっている値**です。
+
+```tsx
+// 残した例: useEffect の依存に入る設定オブジェクト
+const audioConfig = useMemo(
+  () => ({ sampleRate: 44100, channels: 2 }),
+  []
+);
+
+useEffect(() => {
+  nativeAudio.configure(audioConfig); // 参照が変わるたびネイティブ側を再構成してしまう
+}, [audioConfig]);
+```
+
+コンパイラのメモ化はレンダリング結果を安定させることが目的で、「この参照は未来永劫同じ」という保証ではありません。ネイティブモジュールの再初期化や、`useEffect` のクリーンアップ発火に参照同一性を握らせている箇所は、明示的な `useMemo` を残すのが安全です。
+
+第二に、**コンパイラが最適化を諦める（bail out する）コンポーネント**です。ここで memo を消すと、素の再レンダリングに戻ります。
+
+第三に、**FlatList の `renderItem` に渡す関数**です。これはコンパイラが安定化してくれますが、`FlatList` 側は `extraData` との組み合わせで挙動が決まるため、私は明示的な `useCallback` を残し、意図をコードに残すことを選びました。性能上は不要でも、次に読む人（半年後の自分を含みます）への注記として機能します。仮想化リストを採用する場合は、この一手間を残すことを推奨します。
+
+## コンパイラが諦めた場所を、目視ではなく機械で洗い出す
+
+いちばん手間取ったのがここでした。コンパイラは黙って諦めます。エラーも警告も出さず、そのコンポーネントだけ最適化されないまま通ります。本番運用に入ってから「この画面だけ重い」と気づく罠です。解決の糸口は、諦めた事実を可視化することにあります。
+
+まず ESLint ルールを入れます。
+
+```bash
+npx expo install eslint-plugin-react-hooks@latest
+```
+
+```js
+// eslint.config.js
+import reactHooks from "eslint-plugin-react-hooks";
+
+export default [
+  {
+    plugins: { "react-hooks": reactHooks },
+    rules: {
+      // コンパイラが解析を諦める構文パターンを検出する
+      "react-hooks/react-compiler": "error",
+    },
+  },
+];
+```
+
+これで、ミューテーションや条件付き Hook 呼び出しなど、コンパイラが降参する典型パターンは開発中に潰せます。私のコードベースでは 9 箇所が引っかかり、そのうち 7 箇所は「レンダリング中に props の配列を `sort()` で破壊的に並べ替えていた」というものでした。Rork の生成コードにも、私が後から書き足したコードにも、両方ありました。
+
+```tsx
+// 諦められていたコード
+function TagList({ tags }: { tags: Tag[] }) {
+  tags.sort((a, b) => a.order - b.order); // props を破壊している
+  return <>{tags.map((t) => <TagChip key={t.id} tag={t} />)}</>;
+}
+
+// 修正後: 非破壊にするとコンパイラが最適化に踏み込む
+function TagList({ tags }: { tags: Tag[] }) {
+  const sorted = tags.toSorted((a, b) => a.order - b.order);
+  return <>{sorted.map((t) => <TagChip key={t.id} tag={t} />)}</>;
+}
+```
+
+ただし ESLint は静的に検出できるパターンしか拾いません。実際に何個のコンポーネントが最適化されたかは、ビルド時の統計で確認します。
+
+```bash
+# 変換されたコンポーネント数を数える
+npx expo export --platform ios --dump-source-map 2>&1 \
+  | tee /tmp/expo-export.log
+
+# コンパイラが挿入するランタイムフックの出現数を数える
+grep -c "useMemoCache" dist/_expo/static/js/ios/*.js
+```
+
+`useMemoCache` はコンパイラが最適化済み関数に挿入するランタイム呼び出しです。この出現数がコンパイラの適用範囲の近似値になります。私の場合、修正前 118、`toSorted` 修正後 127 でした。9 個の増加は ESLint が指摘した 9 箇所と一致しました。
+
+数字が一致した瞬間、この計測は信用してよいのだと胸のあたりが軽くなりました。
+
+## CI に置いた 2 つのゲート
+
+一度きれいにしても、次の生成・次の機能追加で崩れます。私は 2 つだけ CI に置きました。
+
+```yaml
+# .github/workflows/react-compiler-guard.yml
+name: react-compiler-guard
+on: [pull_request]
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # ゲート1: コンパイラが諦める構文を新規に増やさない
+      - name: ESLint (react-compiler rule)
+        run: npx eslint . --max-warnings=0
+
+      # ゲート2: 最適化されたコンポーネント数が減っていないか
+      - name: Compiler coverage
+        run: |
+          npx expo export --platform ios >/dev/null 2>&1
+          COUNT=$(grep -oh "useMemoCache" dist/_expo/static/js/ios/*.js | wc -l | tr -d ' ')
+          BASELINE=$(cat .compiler-baseline)
+          echo "coverage: $COUNT (baseline: $BASELINE)"
+          if [ "$COUNT" -lt "$BASELINE" ]; then
+            echo "::error::最適化対象が $BASELINE から $COUNT に減少しました"
+            exit 1
+          fi
+```
+
+`.compiler-baseline` にはコミット時点の値を書いておき、意図的に構造を変えたときだけ更新します。しきい値を「減っていないこと」に置いたのは、増加を強制すると些細なリファクタで CI が赤くなるからです。回帰だけを止める。それで十分でした。
+
+同じ発想の最小限のセーフティネットは[生成コードに置く最小のテスト](/articles/rork-dev/rork-generated-code-minimal-test-safety-net)でも書いたとおりで、生成コードを扱ううえでは「良くなり続ける仕組み」より「悪くならない仕組み」のほうが長持ちします。
+
+## 導入して変わったこと、変わらなかったこと
+
+変わったのは、レビューの論点です。「ここ memo 忘れてませんか」という指摘がなくなり、代わりに「この参照同一性は誰が保証していますか」という会話が残りました。後者のほうが、はるかに設計に近い問いです。
+
+変わらなかったこともあります。リスト仮想化の質、画像デコードのコスト、ネイティブ側のレイアウト計算。React Compiler は JS 側の再レンダリングしか触りません。スクロールのカクつきの主因がデコードにあるなら、コンパイラを入れても数字は動きません。実際、私のグリッド画面のスクロール FPS は導入前後で有意差がありませんでした。
+
+期待する場所を間違えなければ、これは静かに効き続ける類の道具だと感じております。
+
+状態管理側の設計を合わせて整えたい場合は、[Zustand v5 での状態管理](/articles/rork-dev/rork-zustand-v5-state-management-guide)と組み合わせると、セレクタ単位の購読とコンパイラのメモ化が素直に噛み合います。
+
+## 次の一手
+
+まずは既存コードを一切変えずに、Profiler ラッパだけを 1 画面に入れて、いちばん重い操作の commit 回数を 5 回計測してみてください。その数字がないまま `babel.config.js` を触ると、効いたかどうかが永遠に分かりません。
+
+数字を取ってから、コンパイラを入れる。memo を消すのは、そのさらに後で構いません。
+
+私自身まだ 6 本すべてには展開しきれておらず、学びの途中です。実装の判断材料として少しでもお役に立てば幸いです。
