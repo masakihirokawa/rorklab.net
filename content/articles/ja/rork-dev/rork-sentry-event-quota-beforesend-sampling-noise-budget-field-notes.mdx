@@ -1,0 +1,259 @@
+---
+title: "Sentry のイベント枠を数日で使い切ったとき — 送る前にノイズを削って本当のエラーを残す運用メモ"
+slug: "rork-sentry-event-quota-beforesend-sampling-noise-budget-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-11T11:00"
+author: "Rork Lab"
+description: "Sentry のイベント枠が月初で尽きる原因はノイズの偏りです。beforeSend・サンプリング・グルーピングで送信前に量を絞り、重要なエラーだけを枠内に残す実装と、実際に送信量を測って立て直した運用手順をまとめました。"
+tags: ["Rork", "Sentry", "監視", "コスト最適化", "React Native", "エラー監視"]
+highlights:
+  - "イベント枠を食い潰す犯人を Sentry 側で特定する手順（1つの AbortError が全体の6割だった実例つき）"
+  - "beforeSend・sampleRate・ignoreErrors・fingerprint を組み合わせ、重要なエラーだけを残す実装コード"
+  - "サンプリング後も致命的エラーを必ず通す allowlist ガードと、週次で送信量を見直す運用メモ"
+---
+
+新しいバージョンを公開した翌朝、Sentry から一通のメールが届いていました。「今月のイベント枠の80%を消費しました」。その日はまだ7月の3日目でした。
+
+エラーが急に増えたわけではありません。アプリはいつも通り動いています。ただ、送信されるイベントの中身が、いつの間にか「同じ無害な例外の大量発生」で埋め尽くされていたのです。
+
+無料枠は月5,000イベント。私のアプリの一つは、その月のペースだと18,000イベントに届く勢いでした。枠を使い切れば、本当に見たい致命的なクラッシュがドロップされて記録されなくなります。監視を入れたのに、肝心なときに何も見えない。これは避けたい状況でした。
+
+ここで整理するのは、Rork（React Native / Expo）で作ったアプリの Sentry イベント量を「送る前に」絞り込む方法です。単にサンプリング率を下げるのではなく、ノイズだけを狙って削り、重要なエラーは必ず枠内に残す。その線引きの実装と、実際に送信量を測って立て直した手順を書きます。
+
+## イベント枠は「エラーの重要度」と無関係に減る
+
+最初に押さえておきたいのは、Sentry のイベント枠は「重要なエラー」と「どうでもいいログ」を区別せずに減っていくという事実です。
+
+星1レビューにつながる致命的クラッシュも、ユーザーが電波の悪い電車内でリロードして出た一過性の `AbortError` も、枠の上では同じ「1イベント」です。そして厄介なことに、量が多いのはたいてい後者です。
+
+<table>
+<thead>
+<tr><th>イベントの種類</th><th>ビジネス上の重要度</th><th>典型的な発生量</th></tr>
+</thead>
+<tbody>
+<tr><td>強制終了・未捕捉例外</td><td><strong>高</strong></td><td>少ない</td></tr>
+<tr><td>ネットワーク一過性エラー（AbortError・タイムアウト）</td><td>低〜中</td><td><strong>非常に多い</strong></td></tr>
+<tr><td>サードパーティ SDK の内部警告</td><td>低</td><td>多い</td></tr>
+<tr><td>パフォーマンストレース（tracesSampleRate 由来）</td><td>状況次第</td><td>設定次第で膨大</td></tr>
+</tbody>
+</table>
+
+私の場合、Discover でイベントを例外の型ごとに集計したところ、ひとつの `AbortError`（ユーザーが画面を離れたときの fetch 中断）が、その月の送信イベントの約61%を占めていました。これはクラッシュではありません。捕捉して握りつぶしてよい種類のものです。
+
+つまり、やるべきことはサンプリング率を一律に下げることではありません。**この61%を狙って落とし、残りはそのまま通す**ことです。
+
+## まず「何が枠を食っているか」を1クエリで見る
+
+対処の前に計測です。犯人を特定せずにサンプリング率を下げると、重要なエラーまで薄まってしまいます。
+
+Sentry の Discover（または Issues のソート）で、直近7日を対象に「イベント数の多い順」に並べます。見るのは次の3つです。
+
+<table>
+<thead>
+<tr><th>指標</th><th>読み取ること</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>issue ごとの events</strong></td><td>1つの issue が枠の何割を占めているか。上位3件で全体の大半なら、その3件を狙えばよい</td></tr>
+<tr><td><strong>events / users 比</strong></td><td>1ユーザーあたりの発生回数。比が極端に高い issue はループやリトライ暴走を疑う</td></tr>
+<tr><td><strong>transaction の量</strong></td><td>エラーではなくパフォーマンストレースが枠を食っている場合、ここが大きい</td></tr>
+</tbody>
+</table>
+
+このとき、`events / users` が「1ユーザーで数百件」のような issue があれば、それはリトライループがバックグラウンドで回り続けている可能性が高いです。ノイズを削る前に、まずそのループ自体を止めるべきサインです。ネットワーク層の設計は[不安定なネットワーク下の UX とエラー状態設計](/articles/rork-dev/rork-unstable-network-ux-error-state-design)の観点とも重なります。
+
+## tracesSampleRate と sampleRate は別物
+
+コードに入る前に、取り違えやすい2つの設定を分けておきます。ここを混同すると、エラーを絞ったつもりでパフォーマンストレースが枠を食い続けます。
+
+<table>
+<thead>
+<tr><th>設定</th><th>対象</th><th>推奨の考え方</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sampleRate</code></td><td>エラーイベント</td><td>基本は 1.0（エラーは原則すべて送る）。特定のノイズは beforeSend で個別に落とす</td></tr>
+<tr><td><code>tracesSampleRate</code></td><td>パフォーマンストレース</td><td>本番 0.05〜0.1。ここを 1.0 のまま公開すると枠を一気に消費する</td></tr>
+</tbody>
+</table>
+
+私が最初に枠を溶かしたときの原因の半分は、開発中に `tracesSampleRate: 1.0` のまま公開してしまったことでした。エラーではなくトレースが枠を食っていたのです。エラー側の `sampleRate` はむしろ下げず、ノイズだけを beforeSend で外科的に落とす。この役割分担が出発点になります。
+
+```javascript
+import * as Sentry from "@sentry/react-native";
+
+Sentry.init({
+  dsn: "https://YOUR_KEY@o0.ingest.sentry.io/YOUR_PROJECT",
+  environment: __DEV__ ? "development" : "production",
+  release: "app@1.4.0",
+
+  // エラーは原則すべて送る。ノイズは beforeSend で個別に落とす
+  sampleRate: 1.0,
+
+  // パフォーマンストレースは本番で大きく絞る（ここが枠を食う主因になりやすい）
+  tracesSampleRate: __DEV__ ? 1.0 : 0.05,
+
+  // 既知の無害なメッセージはそもそも送らない
+  ignoreErrors: [
+    "AbortError",
+    "Network request failed",
+    "TypeError: Network request failed",
+    /Non-Error promise rejection captured/,
+  ],
+});
+```
+
+`ignoreErrors` は文字列・正規表現でメッセージを前方一致的に弾く、いちばん手軽な入口です。ただしこれだけだと「本当は見たい Network エラー」まで一律に消えます。そこで、条件付きで判断できる `beforeSend` に進みます。
+
+## beforeSend でクライアント側で捨てる
+
+`beforeSend` は、イベントが Sentry に送られる直前に実行されるフックです。ここで `null` を返せば、そのイベントは送信されません。**枠を消費する前にクライアント側で捨てられる**のが大きい利点です。
+
+握りつぶしてよいノイズの条件を、意味のある単位で書きます。
+
+```javascript
+Sentry.init({
+  // ...前述の設定...
+  beforeSend(event, hint) {
+    const error = hint?.originalException;
+    const message =
+      (typeof error === "string" ? error : error?.message) || "";
+
+    // 1. ユーザーが画面を離れたことによる fetch 中断は無害
+    if (error?.name === "AbortError") {
+      return null;
+    }
+
+    // 2. オフライン起因のネットワーク失敗は、頻度が高く原因も明白なので落とす
+    //    （ただしオフライン以外のネットワーク失敗は残したいので条件を限定する）
+    if (
+      message.includes("Network request failed") &&
+      event.contexts?.app?.in_foreground === false
+    ) {
+      return null;
+    }
+
+    // 3. 特定サードパーティ SDK の内部警告は自分では直せないため落とす
+    const frames =
+      event.exception?.values?.[0]?.stacktrace?.frames || [];
+    const fromNoisySdk = frames.some((f) =>
+      (f.filename || "").includes("some-analytics-sdk")
+    );
+    if (fromNoisySdk) {
+      return null;
+    }
+
+    return event;
+  },
+});
+```
+
+ポイントは、`beforeSend` を「一律に減らす場所」ではなく「無害と判断できる根拠を書く場所」として使うことです。`AbortError` だから落とす、フォアグラウンドでないネットワーク失敗だから落とす——このように理由が言語化できるものだけを落とせば、後から読み返しても安全に判断できます。
+
+なお、React のコンポーネントツリー由来の未捕捉例外を Sentry に載せる方法は、[Error Boundary と未処理 Promise を本番で捕まえる設計](/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide)で扱った内容と組み合わせると、捕捉と抑制の両輪が揃います。
+
+## 恒常的なノイズは fingerprint でまとめる
+
+`beforeSend` で完全に消すほどではないけれど、大量に同じものが飛んでくる——そういうイベントは、消すのではなく **1つの issue にまとめる**のが有効です。Sentry はスタックトレースの差異で別 issue に分割しますが、`fingerprint` を指定すると強制的にグルーピングできます。
+
+```javascript
+beforeSend(event, hint) {
+  const error = hint?.originalException;
+  const message = error?.message || "";
+
+  // HTTP 5xx は、URL のクエリ差やリクエストIDでバラバラの issue に
+  // 分裂しがち。エンドポイント単位で1つにまとめる
+  if (message.startsWith("HTTP 5")) {
+    const endpoint = (error?.url || "unknown").split("?")[0];
+    event.fingerprint = ["http-5xx", endpoint];
+  }
+
+  return event;
+}
+```
+
+グルーピングそのものは枠の消費量を直接は減らしません。しかし、100件に分裂していた issue が1件に集約されると、「本当に多いのはどれか」が一目で分かるようになります。すると次にサンプリングや `beforeSend` で狙うべき対象がはっきりし、結果として無駄な送信を止める判断が速くなります。
+
+## Crashlytics 側は無制限だが、無限に見ていい訳ではない
+
+コスト観点でひとつ補足します。Firebase Crashlytics はイベント数に上限がなく、送信量そのものを気にする必要はありません。この点では気楽です。
+
+ただし「無制限だから全部送る」を続けると、今度はダッシュボード側がノイズで埋まります。非致命エラーを `recordError()` で無条件に記録し続けると、致命的クラッシュが件数の海に沈みます。
+
+```javascript
+import crashlytics from "@react-native-firebase/crashlytics";
+
+// 非致命エラーも「重大度」を属性として付けておくと、
+// 後からダッシュボードで絞り込める
+function recordNonFatal(error, severity = "warning") {
+  crashlytics().setAttribute("severity", severity);
+  crashlytics().recordError(error);
+}
+```
+
+枠の制約がない Crashlytics でも、「記録する前に重大度を判断する」姿勢は同じです。上限があるかどうかにかかわらず、ノイズを送らないことが結局は自分の可視性を守ります。この分類の考え方は[実行可能なクラッシュレポートと段階配信の運用](/articles/rork-dev/rork-crashlytics-actionable-crash-reports-staged-distribution-field-notes)とも地続きです。
+
+## サンプリング後も致命的エラーは必ず通す
+
+ノイズを削る作業でいちばん怖いのは、勢い余って重要なエラーまで落としてしまうことです。これを防ぐために、私は `beforeSend` の先頭に「必ず通す」ガードを置いています。
+
+```javascript
+const ALWAYS_SEND = new Set([
+  "PaymentError",       // 課金は絶対に見逃せない
+  "AuthTokenMissing",   // 認証破綻はユーザーを完全に止める
+  "DataCorruption",     // 保存データの破損は信頼を失う
+]);
+
+beforeSend(event, hint) {
+  const error = hint?.originalException;
+
+  // allowlist に該当するものは、他の抑制ルールより前に無条件で通す
+  if (error?.name && ALWAYS_SEND.has(error.name)) {
+    return event;
+  }
+
+  // ここから下に AbortError などの抑制ルールを書く
+  // ...
+  return event;
+}
+```
+
+抑制ルールは「疑わしきは残す」で設計します。落とすのは、無害だと理由をもって言い切れるものだけ。判断に迷うエラーは通す。枠を守ることより、見逃さないことを優先する。この順序を崩さない限り、サンプリングは安全な道具であり続けます。
+
+<Callout type="warning">
+`sampleRate` を 0.5 のように下げてエラーを一律に間引くと、発生頻度の低い致命的バグは「たまたまサンプリングで落ちて一度も記録されない」状態になり得ます。エラー側の一律サンプリングは最後の手段にし、まずは beforeSend でノイズを名指しで落とすことをおすすめします。
+</Callout>
+
+## 導入してからの数字（実体験メモ）
+
+これらを一つのアプリに入れて2週間ほど運用しました。個人開発なので、変更はすべて私自身が入れて、私自身の目で観測します。
+
+月あたりの送信イベントは、対策前のペースで約18,000件でした。内訳を Discover で見ると、`AbortError` が約61%、`tracesSampleRate: 1.0` 由来のトレースが枠圧迫のもう一方の柱でした。
+
+`tracesSampleRate` を 0.05 に下げ、`AbortError` とフォアグラウンド外のネットワーク失敗を `beforeSend` で落とした結果、送信ペースは約3,200件/月まで下がりました。無料枠の5,000件に対して6割強、という水準です。
+
+大事なのはここからで、削った後にわざとステージングで課金エラーを発生させ、`ALWAYS_SEND` の allowlist を通って Sentry に届くことを確認しました。ノイズは減ったが致命的エラーは通る——この2点を両方確認して、はじめて「枠を守れた」と言えます。数字が下がっただけで安心しないことが、この手の作業では一番の落とし穴だと感じています。
+
+<Callout type="info">
+リリースごとにノイズの傾向は変わります。新しい SDK を足したり、画面遷移の設計を変えたりすると、別の一過性エラーが上位に来ることがあります。私は週に一度、Discover の上位 issue を眺めて、`beforeSend` の抑制ルールを1〜2行だけ足す、という軽い見直しを習慣にしています。
+</Callout>
+
+## 週次トリアージに落とし込む
+
+最後に、これを単発の作業で終わらせないための最小の運用手順をまとめます。作り込みすぎず、5分で回せる粒度にしておくのがコツです。
+
+<table>
+<thead>
+<tr><th>頻度</th><th>やること</th><th>判断基準</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>週1回</strong></td><td>Discover で直近7日のイベント上位を確認</td><td>上位3件が全体の50%超なら対処対象</td></tr>
+<tr><td><strong>その場で</strong></td><td>無害と言い切れる issue を beforeSend に1行追加</td><td>「なぜ無害か」を理由込みで書けるか</td></tr>
+<tr><td><strong>リリース時</strong></td><td>tracesSampleRate と allowlist を確認</td><td>本番は 0.1 以下・課金/認証系は allowlist にあるか</td></tr>
+<tr><td><strong>月1回</strong></td><td>ステージングで致命的エラーを故意に発生させ疎通確認</td><td>allowlist 経由で Sentry に届くか</td></tr>
+</tbody>
+</table>
+
+監視の目的は、たくさん記録することではなく、必要なときに必要なエラーが残っていることです。ノイズを送る前に削る習慣は、無料枠の中でその状態を保つための、地味だけれど効く一手だと考えています。一律にサンプリング率を下げるより、私はこの「名指しで削る」やり方を好みます。理由を言語化できる分だけ、後から安心して読み返せるからです。
+
+まずは自分のプロジェクトの Discover を開き、直近7日で最も多い issue を1つ見つけてみてください。それが無害なら、`beforeSend` に一行足すだけで枠の消費はすぐに変わります。実装の参考になれば幸いです。お読みいただきありがとうございました。

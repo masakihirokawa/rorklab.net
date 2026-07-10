@@ -1,0 +1,258 @@
+---
+title: "When Sentry Burned Through Its Event Quota in Days — Trimming Noise Before It Ships"
+slug: "rork-sentry-event-quota-beforesend-sampling-noise-budget-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-11T11:00"
+author: "Rork Lab"
+description: "A Sentry quota that empties early in the month is almost always a noise problem, not an error surge. Here is how to shrink event volume before it ships — with beforeSend, sampling, and grouping — while keeping the errors that actually matter inside the quota."
+tags: ["Rork", "Sentry", "monitoring", "cost optimization", "React Native", "error tracking"]
+highlights:
+  - "How to find what is eating your Sentry quota (with a real case where one AbortError was 61% of all volume)"
+  - "Working code that combines beforeSend, sampleRate, ignoreErrors, and fingerprint to keep only the errors worth seeing"
+  - "An allowlist guard that always lets critical errors through after sampling, plus a weekly review routine"
+---
+
+The morning after I shipped a new build, an email from Sentry was waiting: "You have used 80% of your event quota this month." It was July 3rd.
+
+Errors had not spiked. The app was running fine. But the events flowing in had quietly filled up with the same harmless exception, fired thousands of times.
+
+The free tier is 5,000 events per month. At that pace, one of my apps was on track to hit 18,000. Once the quota is gone, the crashes I actually need to see get dropped and never recorded. Monitoring in place, blind exactly when it matters. That was the outcome I wanted to avoid.
+
+What follows is how I bring Sentry event volume under control for a Rork (React Native / Expo) app — before events ship, not after. Not by lowering the sample rate across the board, but by cutting noise on purpose while guaranteeing the important errors stay inside the quota. This is the line I draw in code, and the steps I used to measure volume and pull it back.
+
+## The quota shrinks regardless of severity
+
+The first thing to internalize: Sentry's quota does not distinguish an "important error" from a "throwaway log." Both count as one event.
+
+A fatal crash that earns a one-star review and a one-off `AbortError` from a user reloading on a flaky train connection are identical on the quota ledger. And the annoying part is that the high-volume one is almost always the latter.
+
+<table>
+<thead>
+<tr><th>Event type</th><th>Business importance</th><th>Typical volume</th></tr>
+</thead>
+<tbody>
+<tr><td>Hard crash / unhandled exception</td><td><strong>High</strong></td><td>Low</td></tr>
+<tr><td>Transient network errors (AbortError, timeouts)</td><td>Low to medium</td><td><strong>Very high</strong></td></tr>
+<tr><td>Third-party SDK internal warnings</td><td>Low</td><td>High</td></tr>
+<tr><td>Performance traces (from tracesSampleRate)</td><td>Depends</td><td>Huge if misconfigured</td></tr>
+</tbody>
+</table>
+
+When I grouped events by exception type in Discover, a single `AbortError` — a fetch aborted when the user left the screen — accounted for roughly 61% of the month's volume. That is not a crash. It is exactly the kind of thing you catch and swallow.
+
+So the job is not to lower the sample rate uniformly. It is to **target that 61% and drop it, while letting everything else through untouched.**
+
+## First, see what is eating the quota in one query
+
+Measure before you act. Lower the sample rate without identifying the culprit and you dilute the important errors too.
+
+In Discover (or by sorting Issues), scope to the last 7 days and order by event count. Look at three things.
+
+<table>
+<thead>
+<tr><th>Signal</th><th>What it tells you</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>events per issue</strong></td><td>How much of the quota one issue consumes. If the top three cover most of it, target those three</td></tr>
+<tr><td><strong>events / users ratio</strong></td><td>Occurrences per user. An extreme ratio suggests a loop or runaway retry</td></tr>
+<tr><td><strong>transaction volume</strong></td><td>If performance traces rather than errors are eating the quota, this is large</td></tr>
+</tbody>
+</table>
+
+If an issue shows "hundreds per user," a retry loop is probably spinning in the background. That is a signal to stop the loop itself before you trim any noise. Network-layer design overlaps with the thinking in [designing UX and error states under an unstable network](/articles/rork-dev/rork-unstable-network-ux-error-state-design).
+
+## tracesSampleRate and sampleRate are not the same
+
+Before the code, separate two settings that are easy to confuse. Mix them up and you think you have throttled errors while traces keep draining the quota.
+
+<table>
+<thead>
+<tr><th>Setting</th><th>Applies to</th><th>How to think about it</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sampleRate</code></td><td>Error events</td><td>Keep at 1.0 as a rule (send all errors). Drop specific noise individually in beforeSend</td></tr>
+<tr><td><code>tracesSampleRate</code></td><td>Performance traces</td><td>0.05 to 0.1 in production. Leaving this at 1.0 burns the quota fast</td></tr>
+</tbody>
+</table>
+
+Half of my first quota meltdown came from shipping with `tracesSampleRate: 1.0` left over from development. Traces, not errors, were eating the budget. Rather than lower the error `sampleRate`, drop only the noise surgically in beforeSend. That division of labor is the starting point.
+
+```javascript
+import * as Sentry from "@sentry/react-native";
+
+Sentry.init({
+  dsn: "https://YOUR_KEY@o0.ingest.sentry.io/YOUR_PROJECT",
+  environment: __DEV__ ? "development" : "production",
+  release: "app@1.4.0",
+
+  // Send all errors as a rule; drop noise individually in beforeSend
+  sampleRate: 1.0,
+
+  // Throttle performance traces hard in production (a common quota drain)
+  tracesSampleRate: __DEV__ ? 1.0 : 0.05,
+
+  // Never even send known harmless messages
+  ignoreErrors: [
+    "AbortError",
+    "Network request failed",
+    "TypeError: Network request failed",
+    /Non-Error promise rejection captured/,
+  ],
+});
+```
+
+`ignoreErrors` filters by message via strings or regex — the simplest entry point. But on its own it also drops network errors you may actually want. That is why we move on to `beforeSend`, where you can decide conditionally.
+
+## Drop it client-side in beforeSend
+
+`beforeSend` is a hook that runs right before an event is sent to Sentry. Return `null` and the event is never sent. The advantage is real: **you discard it before it consumes any quota.**
+
+Write the conditions for noise you are willing to swallow in meaningful units.
+
+```javascript
+Sentry.init({
+  // ...settings above...
+  beforeSend(event, hint) {
+    const error = hint?.originalException;
+    const message =
+      (typeof error === "string" ? error : error?.message) || "";
+
+    // 1. A fetch aborted because the user left the screen is harmless
+    if (error?.name === "AbortError") {
+      return null;
+    }
+
+    // 2. Offline-driven network failures are frequent and self-explanatory,
+    //    but keep non-offline network failures, so scope the condition
+    if (
+      message.includes("Network request failed") &&
+      event.contexts?.app?.in_foreground === false
+    ) {
+      return null;
+    }
+
+    // 3. Internal warnings from a specific third-party SDK you cannot fix
+    const frames =
+      event.exception?.values?.[0]?.stacktrace?.frames || [];
+    const fromNoisySdk = frames.some((f) =>
+      (f.filename || "").includes("some-analytics-sdk")
+    );
+    if (fromNoisySdk) {
+      return null;
+    }
+
+    return event;
+  },
+});
+```
+
+The point is to treat `beforeSend` not as "the place to reduce volume uniformly" but as "the place to write down why something is harmless." Drop it because it is an `AbortError`; drop it because it is a network failure while not in the foreground. When the reason is spelled out, the decision stays safe to reread later.
+
+Loading unhandled exceptions from the React component tree into Sentry pairs well with the [Error Boundary and unhandled promise design](/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide), so capture and suppression work together.
+
+## Group persistent noise with fingerprint
+
+Some events are not worth deleting outright, yet arrive in bulk. For those, **collapse them into one issue** rather than dropping them. Sentry splits by stack trace differences, but a `fingerprint` forces grouping.
+
+```javascript
+beforeSend(event, hint) {
+  const error = hint?.originalException;
+  const message = error?.message || "";
+
+  // 5xx tends to fragment into many issues via query-string or request-id
+  // differences. Collapse to one per endpoint
+  if (message.startsWith("HTTP 5")) {
+    const endpoint = (error?.url || "unknown").split("?")[0];
+    event.fingerprint = ["http-5xx", endpoint];
+  }
+
+  return event;
+}
+```
+
+Grouping itself does not directly cut quota usage. But when 100 fragmented issues collapse into one, "what is actually high-volume" becomes obvious at a glance. That makes the next sampling or `beforeSend` target clear, and the decision to stop wasteful sends comes faster.
+
+## Crashlytics has no cap, but that is not license to send everything
+
+One cost note. Firebase Crashlytics has no event limit, so raw volume is not a concern. That part is relaxing.
+
+But if you keep "unlimited means send it all," the dashboard fills with noise instead. Record non-fatals unconditionally with `recordError()` and the fatal crashes sink into a sea of counts.
+
+```javascript
+import crashlytics from "@react-native-firebase/crashlytics";
+
+// Tag non-fatals with a severity attribute so you can filter later
+function recordNonFatal(error, severity = "warning") {
+  crashlytics().setAttribute("severity", severity);
+  crashlytics().recordError(error);
+}
+```
+
+Even without a cap, the stance is the same: judge severity before you record. Limit or no limit, not sending noise is what protects your own visibility. This classification thinking is continuous with [running actionable crash reports and staged distribution](/articles/rork-dev/rork-crashlytics-actionable-crash-reports-staged-distribution-field-notes).
+
+## Always let critical errors through after sampling
+
+The scariest part of trimming noise is dropping an important error along with it. To prevent that, I put an "always send" guard at the very top of `beforeSend`.
+
+```javascript
+const ALWAYS_SEND = new Set([
+  "PaymentError",       // billing can never be missed
+  "AuthTokenMissing",   // auth failure stops the user completely
+  "DataCorruption",     // corrupted saved data breaks trust
+]);
+
+beforeSend(event, hint) {
+  const error = hint?.originalException;
+
+  // allowlisted names pass unconditionally, before any suppression rule
+  if (error?.name && ALWAYS_SEND.has(error.name)) {
+    return event;
+  }
+
+  // suppression rules for AbortError etc. go below
+  // ...
+  return event;
+}
+```
+
+Design suppression as "when in doubt, keep it." Only drop what you can state, with reasons, is harmless. Anything you hesitate over, send. Prioritize not missing errors over protecting the quota. As long as that ordering holds, sampling stays a safe tool.
+
+<Callout type="warning">
+Lowering `sampleRate` to something like 0.5 to thin errors uniformly means a low-frequency fatal bug can be "sampled out and never recorded once." Keep uniform error sampling as a last resort; drop noise by name in beforeSend first.
+</Callout>
+
+## The numbers after rolling it out (field notes)
+
+I ran this on one app for about two weeks. As an indie developer, I make every change myself and observe it myself.
+
+Monthly sends were on pace for about 18,000 before the changes. Breaking it down in Discover, `AbortError` was roughly 61%, and traces from `tracesSampleRate: 1.0` were the other pillar of pressure.
+
+After lowering `tracesSampleRate` to 0.05 and dropping `AbortError` plus non-foreground network failures in `beforeSend`, the pace fell to about 3,200 events per month — a little over 60% of the 5,000 free tier.
+
+What mattered came next: I deliberately triggered a payment error in staging and confirmed it passed the `ALWAYS_SEND` allowlist and reached Sentry. Noise down, fatal errors still through — you can only claim you protected the quota once both are verified. Not relaxing just because the number dropped is, I think, the biggest trap in this kind of work.
+
+<Callout type="info">
+Noise patterns shift with every release. Add a new SDK or change your navigation design, and a different transient error rises to the top. Once a week I glance at the top issues in Discover and add one or two lines to the `beforeSend` suppression rules — a light habit, not a project.
+</Callout>
+
+## Turn it into a weekly triage
+
+Finally, the minimal routine so this does not stay a one-off. Keep it coarse enough to run in five minutes.
+
+<table>
+<thead>
+<tr><th>Cadence</th><th>Do this</th><th>Criterion</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Weekly</strong></td><td>Check top events over the last 7 days in Discover</td><td>Act if the top 3 exceed 50% of total</td></tr>
+<tr><td><strong>On the spot</strong></td><td>Add one line to beforeSend for an issue you can call harmless</td><td>Can you state, with reasons, why it is harmless?</td></tr>
+<tr><td><strong>At release</strong></td><td>Verify tracesSampleRate and the allowlist</td><td>Production at or below 0.1; billing/auth in the allowlist</td></tr>
+<tr><td><strong>Monthly</strong></td><td>Deliberately trigger a fatal error in staging</td><td>Does it reach Sentry via the allowlist?</td></tr>
+</tbody>
+</table>
+
+The goal of monitoring is not to record a lot; it is to have the error you need still there when you need it. Trimming noise before it ships is a quiet but effective way to keep that state inside a free tier.
+
+Open your own project's Discover and find the single highest-volume issue over the last 7 days. If it is harmless, one line in `beforeSend` will change your consumption immediately. I hope this helps with your own setup. Thank you for reading.
