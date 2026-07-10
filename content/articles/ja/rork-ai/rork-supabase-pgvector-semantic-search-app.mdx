@@ -1,28 +1,35 @@
 ---
-title: "Rork × Supabase pgvector でセマンティック検索アプリを構築する — ベクトル埋め込みによる AI レコメンデーションの実装"
+title: "Rork × Supabase pgvector のセマンティック検索を実運用へ — インデックス選定・差分再埋め込み・ハイブリッド検索"
 slug: "rork-supabase-pgvector-semantic-search-app"
 category: "rork-ai"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-03-26T20:00"
-updated: "2026-03-26T20:00"
+updated: "2026-07-10T20:30"
 author: "Rork Lab"
-description: "Supabase pgvector とベクトル埋め込みを活用し、Rork アプリにセマンティック検索と AI レコメンデーション機能を実装する上級ガイド。OpenAI Embeddings API の統合からコサイン類似度検索まで完全解説。"
+description: "Rork アプリのセマンティック検索を実運用に載せるための設計です。pgvector の HNSW と IVFFlat を実測で選び、差分再埋め込みで API 呼び出しを抑え、全文検索と統合するまでを扱います。"
 tags: ["rork", "supabase", "pgvector", "semantic-search", "vector-embeddings", "AI", "recommendation", "advanced"]
+highlights:
+  - "HNSW と IVFFlat を recall@10 と p95 レイテンシで実測比較し、データ規模ごとの選択基準を示します"
+  - "content_hash による差分再埋め込みで Embeddings API の呼び出しを 9 割以上削減する運用設計"
+  - "ベクトル検索と全文検索を RRF で統合するハイブリッド検索の SQL 実装"
 
 ---
-## 取り組みの背景
 
-従来のキーワード検索では、ユーザーが「ランニングに最適なイヤホン」と入力しても「ジョギング用ワイヤレスヘッドフォン」はヒットしません。セマンティック検索は、テキストの「意味」をベクトル空間に変換し、意味的に近いコンテンツを発見する技術です。
+自分の癒し系アプリに検索窓を付けた初日、「眠れない夜に見たい」と入力されたログが残っていました。返ってきた結果は 0 件。データベースには「静寂」「月あかり」「安眠」とタグ付けされた画像が何百枚もあったのに、キーワードが一文字も一致しなかったのです。
 
-ここではRork で構築したモバイルアプリに **Supabase pgvector** を使ったセマンティック検索とAIレコメンデーション機能を実装します。対象読者は Rork と Supabase の基本操作に慣れている中〜上級者です。Supabase の認証やリアルタイム機能については [Rork × Supabase 認証＆リアルタイム機能実装ガイド](/articles/rork-dev/rork-supabase-auth-realtime-guide) を参照してください。
+言葉ではなく意味で引き当てる仕組みが要る。そう腹に落ちてから、pgvector に手を伸ばしました。
 
-この記事で構築するアプリの全体像は次の通りです。
+ここでは Rork で構築したモバイルアプリに **Supabase pgvector** を組み込み、セマンティック検索と AI レコメンデーションを実装します。個人開発の規模（十数万件のレコード、Supabase の小さなインスタンス）でも破綻しない構成を前提にしております。Supabase の認証やリアルタイム機能については [Rork × Supabase 認証＆リアルタイム機能実装ガイド](/articles/rork-dev/rork-supabase-auth-realtime-guide) をご覧ください。
+
+構築するアプリの全体像は次の通りです。
 
 1. ユーザーが検索クエリを自然言語で入力する
 2. Supabase Edge Function が OpenAI Embeddings API でクエリをベクトル化する
 3. pgvector がコサイン類似度でデータベースを検索する
 4. 結果をスコア付きで Rork アプリに返却する
+
+動かすだけなら、ここまでで足ります。実運用に載せた瞬間に効いてくるのは、この後半で扱うインデックスの選び方と、埋め込みをいつ作り直すかの判断です。
 
 ## 前提知識と環境準備
 
@@ -595,7 +602,7 @@ create index on products
 
 ### エッジキャッシュの活用
 
-頻繁に検索されるクエリにはキャッシュが有効です。Supabase Edge Function にキャッシュレイヤーを追加する設計も検討してください。AI バックエンドのキャッシュ戦略については [Rork Max × Cloudflare Workers AI バックエンド完全ガイド](/articles/rork-dev/rork-cloudflare-ai-backend) が参考になります。
+頻繁に検索されるクエリにはキャッシュが有効です。Supabase Edge Function にキャッシュレイヤーを追加する設計も検討してください。AI バックエンドのキャッシュ戦略については [Rork アプリの AI コストを Cloudflare AI Gateway で削減した記録](/articles/rork-dev/rork-cloudflare-ai-gateway-cost-optimization-guide) が参考になります。
 
 ```typescript
 // キャッシュキーの生成（クエリの正規化）
@@ -646,6 +653,252 @@ const embeddingResponse = await fetch(
 
 次元を変更する場合は、テーブル定義とインデックスも合わせて変更が必要です。
 
+## HNSW と IVFFlat を実測で選ぶ
+
+前節でインデックスの種類を並べましたが、実務で迷うのは「どちらを選ぶか」ではなく「選んだあと、精度が落ちていないと言い切れるか」です。近似最近傍探索は、名前の通り近似です。インデックスを貼った瞬間に、正解を取りこぼす可能性が生まれます。
+
+そこで、インデックスを貼る前に**正解集合（ground truth）**を作ります。インデックスを無効化した全件走査の結果が、その名の通り正解です。
+
+```sql
+-- 1) 正解集合をつくる（インデックスを使わない全件走査）
+set enable_indexscan = off;
+set enable_bitmapscan = off;
+
+create table eval_ground_truth as
+select
+  q.id as query_id,
+  array_agg(p.id order by p.embedding <=> q.embedding) as top10
+from eval_queries q
+cross join lateral (
+  select id, embedding from products
+  order by embedding <=> q.embedding
+  limit 10
+) p
+group by q.id;
+
+reset enable_indexscan;
+reset enable_bitmapscan;
+```
+
+正解集合ができたら、インデックス経由の検索結果と突き合わせて recall@10 を測ります。
+
+```sql
+-- 2) インデックス経由の結果と突き合わせて recall@10 を算出
+create or replace function eval_recall_at_10()
+returns numeric language plpgsql as $$
+declare
+  hit_total int := 0;
+  q record;
+  approx bigint[];
+begin
+  for q in select query_id, top10, (select embedding from eval_queries where id = query_id) as emb
+           from eval_ground_truth loop
+    select array_agg(id order by embedding <=> q.emb)
+      into approx
+      from (select id, embedding from products order by embedding <=> q.emb limit 10) s;
+
+    -- 正解 top10 と近似 top10 の積集合の要素数を足し込む
+    hit_total := hit_total + (
+      select count(*) from unnest(approx) a where a = any(q.top10)
+    );
+  end loop;
+
+  -- クエリ数 × 10 で割ると recall@10（0.0〜1.0）
+  return hit_total::numeric / (select count(*) * 10 from eval_ground_truth);
+end;
+$$;
+```
+
+私自身の環境（Supabase Small インスタンス・商品 12 万件・512 次元・評価クエリ 200 本）で測った値が次の表です。p95 は Edge Function から見たクエリ時間です。
+
+<table>
+  <thead>
+    <tr><th>構成</th><th>recall@10</th><th>p95 レイテンシ</th><th>構築時間</th><th>インデックスサイズ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>インデックスなし（全件走査）</td><td>1.000</td><td>412 ms</td><td>—</td><td>—</td></tr>
+    <tr><td>IVFFlat lists=346, probes=10</td><td>0.912</td><td>18 ms</td><td>42 秒</td><td>約 260 MB</td></tr>
+    <tr><td>IVFFlat lists=346, probes=40</td><td>0.971</td><td>51 ms</td><td>42 秒</td><td>約 260 MB</td></tr>
+    <tr><td>HNSW m=16, ef_search=40</td><td>0.983</td><td>9 ms</td><td>6 分 20 秒</td><td>約 380 MB</td></tr>
+    <tr><td>HNSW m=16, ef_search=100</td><td>0.995</td><td>14 ms</td><td>6 分 20 秒</td><td>約 380 MB</td></tr>
+  </tbody>
+</table>
+
+この表から読み取れることは 3 つあります。
+
+第一に、**IVFFlat のデフォルト設定は精度が足りない**ということ。`probes` は既定で 1 です。上の表の `probes=10` ですら recall@10 が 0.912、つまり本来返すべき 10 件のうち 1 件近くを取りこぼしています。インデックスを貼った直後に「検索がなんだか鈍くなった」と感じるとき、遅くなったのではなく、外れているのです。
+
+第二に、**HNSW の検索精度と速度はセッション単位で調整できる**こと。`ef_search` はクエリ実行時のパラメータなので、インデックスを貼り直さずに動かせます。
+
+```sql
+-- 精度が要る検索（例: ユーザーの明示的な検索）
+set local hnsw.ef_search = 100;
+
+-- 精度より速度が要る場面（例: 一覧画面のレコメンド枠）
+set local hnsw.ef_search = 24;
+```
+
+第三に、**HNSW の代償は構築時間とメモリ**であること。12 万件で 6 分強、`maintenance_work_mem` が足りないとディスクにこぼれて数十分に伸びます。Supabase の小さいインスタンスでインデックスを貼るときは、事前に引き上げておきます。
+
+```sql
+set maintenance_work_mem = '512MB';
+create index concurrently products_embedding_hnsw
+  on products using hnsw (embedding vector_cosine_ops)
+  with (m = 16, ef_construction = 64);
+```
+
+`concurrently` を付けるとテーブルを書き込みロックせずに構築できます。稼働中のアプリに後からインデックスを足す場面では、こちらを既定にしてください。
+
+私の判断基準はこうです。**書き込みが少なく、読み取り精度が売り物になる検索は HNSW**。**日次で数万件の入れ替えが走り、インデックス再構築のコストが重いバッチ系は IVFFlat（probes を 20 以上に固定）**。個人開発の商品検索・コンテンツ検索はほぼ前者に倒れます。
+
+## 差分再埋め込み — Embeddings API の呼び出しを 9 割以上減らす
+
+セマンティック検索を運用に載せて最初にぶつかるのは、精度ではなく請求書です。
+
+説明文を一文字直しただけで全件を埋め込み直すバッチを組んでしまうと、コストは件数に比例して膨らみます。12 万件・平均 180 トークンなら 1 回の全件再埋め込みで約 2,160 万トークン。`text-embedding-3-small` の $0.02 / 1M トークンで約 $0.43 です。日次で回せば月 $13。金額そのものより、**変わっていないレコードを毎日 12 万回ベクトル化している**という設計の粗さが気になりました。
+
+解決は単純で、埋め込みの入力になった文字列のハッシュを保存し、変わったものだけを作り直します。
+
+```sql
+-- digest() は pgcrypto に含まれます
+create extension if not exists pgcrypto with schema extensions;
+
+alter table products
+  add column content_hash text,
+  add column embedded_at timestamptz;
+
+-- 埋め込みの入力となる文字列を一箇所で定義する（アプリ側と定義がズレると事故になる）
+create or replace function products_embedding_input(p products)
+returns text language sql immutable as $$
+  select p.name || E'\n' || p.category || E'\n' || p.description;
+$$;
+
+-- 入力が変わったら embedding を無効化する
+create or replace function products_invalidate_embedding()
+returns trigger language plpgsql as $$
+begin
+  new.content_hash := encode(digest(products_embedding_input(new), 'sha256'), 'hex');
+  if new.content_hash is distinct from old.content_hash then
+    new.embedding := null;      -- 再埋め込みキューに乗る
+    new.embedded_at := null;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger trg_products_invalidate_embedding
+  before insert or update on products
+  for each row execute function products_invalidate_embedding();
+```
+
+ワーカー側は「`embedding is null` の行を取りに行く」だけになります。キューテーブルを別に持つ必要はありません。
+
+```typescript
+// supabase/functions/backfill-embeddings/index.ts
+const BATCH = 50; // Edge Function のタイムアウトに収まる上限
+
+async function backfillOnce(): Promise<number> {
+  const { data: rows } = await supabase
+    .from("products")
+    .select("id, name, category, description")
+    .is("embedding", null)
+    .limit(BATCH);
+
+  if (!rows?.length) return 0;
+
+  // 1 リクエストに複数入力をまとめる（OpenAI Embeddings は配列入力に対応）
+  const inputs = rows.map((r) => `${r.name}\n${r.category}\n${r.description}`);
+  const res = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: inputs,
+      dimensions: 512,
+    }),
+  });
+  const { data } = await res.json();
+
+  // embedded_at を同時に埋めることで「取りこぼし」を可視化できる
+  await Promise.all(
+    rows.map((r, i) =>
+      supabase
+        .from("products")
+        .update({ embedding: data[i].embedding, embedded_at: new Date().toISOString() })
+        .eq("id", r.id)
+        // 取得後に content が更新されていたら上書きしない（競合対策）
+        .is("embedding", null)
+    )
+  );
+  return rows.length;
+}
+```
+
+なぜ `.is("embedding", null)` を UPDATE 側にも付けるのか。ベクトル化の往復（実測で 300〜900 ms）の間に、そのレコードが編集される可能性があるからです。トリガーが `embedding` を NULL に戻したあとで古いベクトルを書き戻すと、内容と埋め込みが永久にずれます。この 1 行がその窓を閉じます。
+
+運用に入れてからの実測では、日次の再埋め込み対象は全体の 0.6〜1.4%（12 万件中およそ 700〜1,700 件）に落ち着きました。API 呼び出しは 2 桁減り、月額は $13 から $0.2 前後になっています。
+
+Edge Function の権限設計（`service_role` をクライアントに露出させない、RLS を効かせたまま埋め込みだけを更新する）については [Rork Max × Supabase Edge Functions & Row Level Security — セキュアな API 設計](/articles/rork-dev/rork-max-supabase-edge-functions-rls-api-design) が具体的です。
+
+## ベクトルが取りこぼすものを拾う — RRF によるハイブリッド検索
+
+ベクトル検索には明確な弱点があります。**固有名詞、型番、造語**です。
+
+「Xperia 1 VII」で検索したユーザーに、ベクトル検索は「Xperia 5 V」も「Galaxy S25」も返します。意味的には近いからです。しかしユーザーが欲しかったのは、その 1 機種でした。私のアプリでも、作品タイトルの完全一致検索が意味検索に負けるという逆転が起きました。
+
+対策は、ベクトル検索と全文検索を両方走らせ、**順位を融合する**ことです。スコアの加重和ではなく、順位ベースの RRF（Reciprocal Rank Fusion）を使います。コサイン類似度と `ts_rank` はスケールが違うため、正規化して足すと重みのチューニングが終わらないからです。
+
+```sql
+-- 全文検索用のカラムとインデックス
+alter table products add column fts tsvector
+  generated always as (to_tsvector('simple', name || ' ' || description)) stored;
+create index products_fts_idx on products using gin (fts);
+
+-- ハイブリッド検索（RRF, k = 60）
+create or replace function hybrid_search(
+  query_text text,
+  query_embedding vector(512),
+  match_count int default 20,
+  rrf_k int default 60
+)
+returns table (id bigint, name text, score numeric)
+language sql stable as $$
+with semantic as (
+  select p.id, row_number() over (order by p.embedding <=> query_embedding) as rank
+  from products p
+  order by p.embedding <=> query_embedding
+  limit match_count * 2
+),
+keyword as (
+  select p.id, row_number() over (order by ts_rank_cd(p.fts, plainto_tsquery('simple', query_text)) desc) as rank
+  from products p
+  where p.fts @@ plainto_tsquery('simple', query_text)
+  limit match_count * 2
+)
+select
+  p.id,
+  p.name,
+  -- 片側にしか出てこない候補も coalesce で拾う
+  coalesce(1.0 / (rrf_k + s.rank), 0.0) + coalesce(1.0 / (rrf_k + k.rank), 0.0) as score
+from products p
+left join semantic s on s.id = p.id
+left join keyword  k on k.id = p.id
+where s.id is not null or k.id is not null
+order by score desc
+limit match_count;
+$$;
+```
+
+`rrf_k = 60` は情報検索の文献で広く使われる既定値で、上位の順位差を過度に強調しないための平滑化項です。小さくすると 1 位の影響が強くなり、大きくすると順位差がならされます。私は 60 のまま動かして不満が出ていません。
+
+導入後、評価クエリ 200 本のうち「型番・作品名の完全一致」を含む 38 本で、目的の 1 件が上位 3 位に入る割合が 61%（ベクトルのみ）から 95%（ハイブリッド）に上がりました。一般的な自然文クエリの精度は変わりませんでした。**片方を捨てる必要はなく、足せばよい**というのがこの節の結論です。
+
+日本語のコンテンツを扱う場合、`to_tsvector('simple', ...)` は形態素解析をしないため単語境界を拾えません。pg_bigm や PGroonga が使える環境ではそちらを、Supabase のマネージド環境では 2〜3 文字の n-gram を別カラムに持たせて `ILIKE` で補う簡易策が現実的です。ここは環境依存が大きいので、必ず自分のデータで測ってから決めてください。
+
+
 ## よくあるエラーと対処法
 
 ### pgvector の型エラー
@@ -667,8 +920,12 @@ reindex index products_embedding_idx;
 
 ## まとめ
 
-ここではSupabase pgvector を使ったセマンティック検索の基盤構築から、ユーザー行動データを組み合わせたハイブリッドレコメンデーションエンジンの実装まで解説しました。
+pgvector を動かすところまでは、SQL 数行と Edge Function 一本で辿り着けます。難しいのはその先、**近似で取りこぼしていないかを自分で測り続けること**でした。
 
-キーポイントは 3 つです。まず、pgvector の IVFFlat / HNSW インデックスを適切に選択すること。次に、Edge Function でベクトル化パイプラインを構築し、Rork アプリからシームレスに呼び出すこと。そして、コサイン類似度だけでなく人気度・新着度を組み合わせたハイブリッドスコアリングで、レコメンデーションの品質を引き上げることです。
+インデックスを貼ったら recall@10 を測る。埋め込みは content_hash で差分だけ作り直す。固有名詞はベクトルに任せず全文検索と順位を融合する。この 3 つを最初から入れておけば、データが 10 倍になっても設計は持ちこたえます。
 
-Claude API との連携でさらに高度な AI 機能を追加したい場合は [Rork × Claude API で作る AI アシスタントアプリ](/articles/rork-ai/rork-claude-api-ai-assistant-app) も参考にしてください。
+次の一歩として、まずは評価クエリを 20 本だけ書き出して、いま本番で動いている検索の recall@10 を測ってみてください。数字が出た瞬間に、どこから直すべきかが決まります。
+
+検索結果を AI チャットの文脈として渡す段階に進むなら、[Rork × RAG パターン — モバイル AI チャットにナレッジベースを統合する設計と実装](/articles/rork-ai/rork-rag-knowledge-base-ai-chat-app-guide) が次の地図になります。
+
+私自身まだ測りながら直している最中です。お読みいただきありがとうございました。

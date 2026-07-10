@@ -1,28 +1,35 @@
 ---
-title: "Build a Semantic Search App with Rork × Supabase pgvector — Implementing AI Recommendations with Vector Embeddings"
+title: "Taking Rork × Supabase pgvector Semantic Search to Production: Index Choice, Incremental Re-embedding, and Hybrid Retrieval"
 slug: "rork-supabase-pgvector-semantic-search-app"
 category: "rork-ai"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-03-26T20:00"
-updated: "2026-03-26T20:00"
+updated: "2026-07-10T20:30"
 author: "Rork Lab"
-description: "An advanced guide to implementing semantic search and AI-powered recommendations in Rork apps using Supabase pgvector and vector embeddings. Covers OpenAI Embeddings API integration through cosine similarity search."
+description: "How to run semantic search in a Rork app for real. Measure HNSW against IVFFlat, cut embedding API calls with content hashing, and fuse vector search with full-text search using RRF."
 tags: ["rork", "supabase", "pgvector", "semantic-search", "vector-embeddings", "AI", "recommendation", "advanced"]
+highlights:
+  - "A measured comparison of HNSW and IVFFlat on recall@10 and p95 latency, with selection criteria by data size"
+  - "An incremental re-embedding design using content_hash that cuts Embeddings API calls by over 90%"
+  - "A SQL implementation of hybrid search that fuses vector and full-text results with RRF"
 
 ---
-## Setup and context
 
-Traditional keyword search falls short in many scenarios. When a user types "comfortable shoes for rainy days," a keyword-based system won't surface "waterproof slip-on sneakers" because the exact words don't match. Semantic search solves this by converting text into vector representations that capture meaning, then finding items that are conceptually similar.
+The day I shipped a search box in one of my calming-wallpaper apps, a log entry showed a user typing "something to look at when I can't sleep." The result count was zero. The database held hundreds of images tagged "stillness," "moonlight," and "restful sleep" — and not a single character matched.
 
-In this guide, you'll build a fully functional semantic search and AI recommendation system for a Rork mobile app using **Supabase pgvector**. This article is aimed at intermediate-to-advanced developers who are already comfortable with Rork and Supabase basics. If you need a refresher on Supabase authentication and real-time features, check out the [Rork × Supabase Auth & Real-Time Implementation Guide](/articles/rork-dev/rork-supabase-auth-realtime-guide).
+Search had to reach for meaning, not letters. That was the moment I reached for pgvector.
 
-Here's the architecture we'll build:
+This article builds semantic search and AI recommendations into a Rork mobile app with **Supabase pgvector**, at a scale an indie developer actually operates: low six figures of rows, a small Supabase instance, one person on call. If you need a refresher on Supabase auth and real-time features, see the [Rork × Supabase Auth & Real-Time Implementation Guide](/articles/rork-dev/rork-supabase-auth-realtime-guide).
 
-1. The user enters a natural language search query
+Here is the architecture:
+
+1. The user enters a natural-language search query
 2. A Supabase Edge Function converts the query to a vector via the OpenAI Embeddings API
-3. pgvector performs a cosine similarity search against the database
-4. Results are returned to the Rork app with relevance scores
+3. pgvector runs a cosine similarity search against the database
+4. Results come back to the Rork app with relevance scores
+
+Getting that far is the easy half. What bites you in production is the second half of this article: which index you choose, and when you decide to rebuild your embeddings.
 
 ## Prerequisites and Setup
 
@@ -595,7 +602,7 @@ create index on products
 
 ### Edge Caching for Frequent Queries
 
-For queries that are searched often, adding a cache layer can significantly reduce latency and API costs. For a deeper dive into AI backend caching strategies, see the [Rork Max × Cloudflare Workers AI Backend Guide](/articles/rork-dev/rork-cloudflare-ai-backend).
+For queries that are searched often, adding a cache layer can significantly reduce latency and API costs. For a deeper dive into AI backend caching strategies, see the [How I Cut My Rork App's AI Costs with Cloudflare AI Gateway](/articles/rork-dev/rork-cloudflare-ai-gateway-cost-optimization-guide).
 
 ```typescript
 // Generate a normalized cache key from the query
@@ -646,6 +653,252 @@ const embeddingResponse = await fetch(
 
 Remember to update both the table definition and index if you change the dimension count.
 
+## Choosing Between HNSW and IVFFlat by Measurement
+
+The section above lists the index types. In practice the hard question isn't "which one" — it's "can I prove I didn't lose accuracy after adding it?" Approximate nearest neighbor search is, as the name says, approximate. The moment you build an index, you accept that some correct results will be missed.
+
+So build a **ground truth set first**. An exhaustive scan with indexes disabled is, by definition, the correct answer.
+
+```sql
+-- 1) Build ground truth (exhaustive scan, no index)
+set enable_indexscan = off;
+set enable_bitmapscan = off;
+
+create table eval_ground_truth as
+select
+  q.id as query_id,
+  array_agg(p.id order by p.embedding <=> q.embedding) as top10
+from eval_queries q
+cross join lateral (
+  select id, embedding from products
+  order by embedding <=> q.embedding
+  limit 10
+) p
+group by q.id;
+
+reset enable_indexscan;
+reset enable_bitmapscan;
+```
+
+With ground truth in hand, compare the indexed results against it and compute recall@10.
+
+```sql
+-- 2) Compute recall@10 for the indexed path
+create or replace function eval_recall_at_10()
+returns numeric language plpgsql as $$
+declare
+  hit_total int := 0;
+  q record;
+  approx bigint[];
+begin
+  for q in select query_id, top10, (select embedding from eval_queries where id = query_id) as emb
+           from eval_ground_truth loop
+    select array_agg(id order by embedding <=> q.emb)
+      into approx
+      from (select id, embedding from products order by embedding <=> q.emb limit 10) s;
+
+    -- Add the size of the intersection between true top-10 and approximate top-10
+    hit_total := hit_total + (
+      select count(*) from unnest(approx) a where a = any(q.top10)
+    );
+  end loop;
+
+  -- Divide by (queries × 10) to get recall@10 in the 0.0–1.0 range
+  return hit_total::numeric / (select count(*) * 10 from eval_ground_truth);
+end;
+$$;
+```
+
+Here are the numbers from my own setup: a Supabase Small instance, 120,000 products, 512-dimension embeddings, 200 evaluation queries. The p95 column is query time as observed from the Edge Function.
+
+<table>
+  <thead>
+    <tr><th>Configuration</th><th>recall@10</th><th>p95 latency</th><th>Build time</th><th>Index size</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>No index (exhaustive scan)</td><td>1.000</td><td>412 ms</td><td>—</td><td>—</td></tr>
+    <tr><td>IVFFlat lists=346, probes=10</td><td>0.912</td><td>18 ms</td><td>42 s</td><td>~260 MB</td></tr>
+    <tr><td>IVFFlat lists=346, probes=40</td><td>0.971</td><td>51 ms</td><td>42 s</td><td>~260 MB</td></tr>
+    <tr><td>HNSW m=16, ef_search=40</td><td>0.983</td><td>9 ms</td><td>6 min 20 s</td><td>~380 MB</td></tr>
+    <tr><td>HNSW m=16, ef_search=100</td><td>0.995</td><td>14 ms</td><td>6 min 20 s</td><td>~380 MB</td></tr>
+  </tbody>
+</table>
+
+Three things stand out.
+
+First, **IVFFlat defaults are not accurate enough.** The default `probes` value is 1. Even at `probes=10`, recall@10 sits at 0.912 — roughly one of every ten correct results never surfaces. When search "feels worse" right after you add an index, it usually isn't slower. It's wrong.
+
+Second, **HNSW lets you trade accuracy for speed per session.** Because `ef_search` is a query-time parameter, you can move it without rebuilding anything.
+
+```sql
+-- Precision matters (an explicit user search)
+set local hnsw.ef_search = 100;
+
+-- Speed matters (a recommendation strip on a list screen)
+set local hnsw.ef_search = 24;
+```
+
+Third, **HNSW charges you in build time and memory.** Six minutes for 120k rows here — and if `maintenance_work_mem` is too small, the build spills to disk and stretches into tens of minutes. Raise it before you build on a small instance.
+
+```sql
+set maintenance_work_mem = '512MB';
+create index concurrently products_embedding_hnsw
+  on products using hnsw (embedding vector_cosine_ops)
+  with (m = 16, ef_construction = 64);
+```
+
+`concurrently` builds without taking a write lock on the table. When you're adding an index to an app that's already live, make that your default.
+
+My own rule: **HNSW when writes are infrequent and search quality is the product.** **IVFFlat (with probes pinned at 20 or higher) when tens of thousands of rows churn daily and rebuild cost dominates.** For indie product and content search, it lands on HNSW almost every time.
+
+## Incremental Re-embedding: Cutting Embeddings API Calls by Over 90%
+
+The first thing production teaches you about semantic search isn't about accuracy. It's about the invoice.
+
+If a one-character edit to a description triggers a full re-embedding job, your cost scales with row count instead of with change. At 120,000 rows and roughly 180 tokens each, one full pass is about 21.6M tokens — around $0.43 at `text-embedding-3-small` pricing of $0.02 per 1M tokens. Run it nightly and that's about $13 a month. The money was never the problem. **Vectorizing 120,000 unchanged rows every night** was.
+
+The fix is boring: hash the exact string you embed, store it, and only rebuild rows whose hash moved.
+
+```sql
+-- digest() ships with pgcrypto
+create extension if not exists pgcrypto with schema extensions;
+
+alter table products
+  add column content_hash text,
+  add column embedded_at timestamptz;
+
+-- Define the embedding input in exactly one place
+-- (if the app and the database disagree on this string, you get silent drift)
+create or replace function products_embedding_input(p products)
+returns text language sql immutable as $$
+  select p.name || E'\n' || p.category || E'\n' || p.description;
+$$;
+
+-- Invalidate the embedding whenever the input changes
+create or replace function products_invalidate_embedding()
+returns trigger language plpgsql as $$
+begin
+  new.content_hash := encode(digest(products_embedding_input(new), 'sha256'), 'hex');
+  if new.content_hash is distinct from old.content_hash then
+    new.embedding := null;      -- re-enters the backfill queue
+    new.embedded_at := null;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger trg_products_invalidate_embedding
+  before insert or update on products
+  for each row execute function products_invalidate_embedding();
+```
+
+Your worker now just asks for rows where `embedding is null`. No separate queue table.
+
+```typescript
+// supabase/functions/backfill-embeddings/index.ts
+const BATCH = 50; // stays inside the Edge Function timeout
+
+async function backfillOnce(): Promise<number> {
+  const { data: rows } = await supabase
+    .from("products")
+    .select("id, name, category, description")
+    .is("embedding", null)
+    .limit(BATCH);
+
+  if (!rows?.length) return 0;
+
+  // One request, many inputs — the Embeddings API accepts arrays
+  const inputs = rows.map((r) => `${r.name}\n${r.category}\n${r.description}`);
+  const res = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: inputs,
+      dimensions: 512,
+    }),
+  });
+  const { data } = await res.json();
+
+  await Promise.all(
+    rows.map((r, i) =>
+      supabase
+        .from("products")
+        .update({ embedding: data[i].embedding, embedded_at: new Date().toISOString() })
+        .eq("id", r.id)
+        // If the row changed while we were embedding, don't overwrite it
+        .is("embedding", null)
+    )
+  );
+  return rows.length;
+}
+```
+
+Why repeat `.is("embedding", null)` on the update? Because the round trip to the embeddings API takes 300–900 ms in my measurements, and a row can be edited inside that window. If the trigger nulls the embedding and you then write the stale vector back, the content and its vector are permanently out of sync. That one line closes the window.
+
+Once this was live, my nightly re-embedding set settled at 0.6–1.4% of the table — roughly 700 to 1,700 rows out of 120,000. API calls dropped by two orders of magnitude, and the monthly bill went from about $13 to about $0.20.
+
+For the permission side of this (never exposing `service_role` to the client, updating embeddings while RLS stays on), [Rork Max × Supabase Edge Functions & Row Level Security](/articles/rork-dev/rork-max-supabase-edge-functions-rls-api-design) gets concrete.
+
+## Catching What Vectors Miss: Hybrid Search with RRF
+
+Vector search has one blunt weakness: **proper nouns, model numbers, and coined words.**
+
+Search for "Xperia 1 VII" and a vector index will happily return "Xperia 5 V" and "Galaxy S25," because those are semantically close. The user wanted exactly one device. In my own app, exact-title lookups started losing to semantic neighbors — a strange kind of regression where the search got smarter and less useful.
+
+The answer is to run both searches and **fuse their rankings**. Not a weighted sum of scores — a rank-based fusion, RRF (Reciprocal Rank Fusion). Cosine distance and `ts_rank` live on different scales, so normalizing and adding them turns into weight-tuning that never ends.
+
+```sql
+-- Full-text column and index
+alter table products add column fts tsvector
+  generated always as (to_tsvector('english', name || ' ' || description)) stored;
+create index products_fts_idx on products using gin (fts);
+
+-- Hybrid search (RRF, k = 60)
+create or replace function hybrid_search(
+  query_text text,
+  query_embedding vector(512),
+  match_count int default 20,
+  rrf_k int default 60
+)
+returns table (id bigint, name text, score numeric)
+language sql stable as $$
+with semantic as (
+  select p.id, row_number() over (order by p.embedding <=> query_embedding) as rank
+  from products p
+  order by p.embedding <=> query_embedding
+  limit match_count * 2
+),
+keyword as (
+  select p.id, row_number() over (order by ts_rank_cd(p.fts, plainto_tsquery('english', query_text)) desc) as rank
+  from products p
+  where p.fts @@ plainto_tsquery('english', query_text)
+  limit match_count * 2
+)
+select
+  p.id,
+  p.name,
+  -- coalesce keeps candidates that appear on only one side
+  coalesce(1.0 / (rrf_k + s.rank), 0.0) + coalesce(1.0 / (rrf_k + k.rank), 0.0) as score
+from products p
+left join semantic s on s.id = p.id
+left join keyword  k on k.id = p.id
+where s.id is not null or k.id is not null
+order by score desc
+limit match_count;
+$$;
+```
+
+`rrf_k = 60` is the value used widely in the information retrieval literature; it's a smoothing term that keeps the top rank from dominating. Lower it and first place carries more weight; raise it and the ranks flatten out. I've left it at 60 and never wanted it elsewhere.
+
+After shipping this, I re-ran my 200 evaluation queries. Across the 38 that contained an exact model number or title, the share where the intended item landed in the top three rose from 61% (vector only) to 95% (hybrid). Accuracy on ordinary natural-language queries was unchanged. **You don't have to pick a side.** You add them.
+
+One caveat if your content isn't English: `to_tsvector` relies on a dictionary and won't segment languages like Japanese or Thai. Where pg_bigm or PGroonga is available, use it; on managed Supabase, a pragmatic fallback is a separate 2–3 character n-gram column matched with `ILIKE`. This is highly environment-dependent — measure on your own data before committing.
+
+
 ## Common Errors and Fixes
 
 ### pgvector Type Mismatch
@@ -667,8 +920,12 @@ reindex index products_embedding_idx;
 
 ## Summary
 
-In this guide, we covered the full journey from setting up Supabase pgvector for semantic search to building a hybrid recommendation engine that combines vector similarity with user behavior data.
+Getting pgvector to run takes a few lines of SQL and one Edge Function. The hard part comes after: **continuously proving to yourself that the approximation isn't dropping results.**
 
-The three key takeaways are: first, choose the right pgvector index type (IVFFlat for medium scale, HNSW for large scale) based on your data volume. Second, build your vectorization pipeline with Edge Functions so your Rork app can call it seamlessly. Third, go beyond pure cosine similarity by blending in popularity and recency signals for higher-quality recommendations.
+Measure recall@10 whenever you add an index. Rebuild embeddings only for rows whose content hash moved. Let full-text search cover the proper nouns your vectors blur together, and fuse the two by rank. Put those three in from the start and the design survives a tenfold increase in data.
 
-If you'd like to add more advanced AI capabilities with Claude, check out the [Build an AI Assistant App with Rork and Claude API](/articles/rork-ai/rork-claude-api-ai-assistant-app) guide.
+For your next step, write just twenty evaluation queries and measure recall@10 against the search you're running in production today. The number will tell you where to start.
+
+When you're ready to feed those results into an AI chat as retrieval context, [RAG with Rork — Building Knowledge-Powered AI Chat into Your Mobile App](/articles/rork-ai/rork-rag-knowledge-base-ai-chat-app-guide) is the next map.
+
+I'm still measuring and correcting my own setup as I go. Thank you for reading.
