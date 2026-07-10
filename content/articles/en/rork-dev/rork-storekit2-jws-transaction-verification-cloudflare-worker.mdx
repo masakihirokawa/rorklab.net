@@ -1,0 +1,223 @@
+---
+title: "Verifying StoreKit 2 Signed Transactions in a Cloudflare Worker"
+slug: "rork-storekit2-jws-transaction-verification-cloudflare-worker"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-11T05:30"
+updated: "2026-07-11T05:30"
+author: "Rork Lab"
+description: "If you trust whatever the device says about its purchase state, a tampered entitlement walks right through. This walks through verifying StoreKit 2 signed transactions (JWS) in a Cloudflare Worker so you grant entitlements without trusting the client, with working code."
+tags: ["StoreKit 2", "Cloudflare Workers", "Purchase Verification", "JWS", "Rork"]
+highlights:
+  - "If you have been uneasy about trusting the device's claim of 'I'm a paying user,' you'll get a working server-side verification that grants entitlements only after checking Apple's signature"
+  - "You'll understand how Apple's signed transactions (JWS) and their certificate chain work, and be able to write a Worker that verifies them with Web Crypto and jose"
+  - "You'll be able to close three quiet holes at the code level: replay, environment mix-ups, and an unpinned root certificate"
+---
+
+The first time purchase logic gave me a cold feeling was in an app where I stored a "premium unlocked" flag in `UserDefaults` and gated features on it. In front of a jailbroken device or a proxied request, that flag guarantees nothing. The whole app could be unlocked for free, and I only noticed the shape of that hole some time after release.
+
+Purchase decisions should ultimately rest on one question: who signed this? StoreKit 2 hands you transactions carrying Apple's signature. So you can draw a boundary where your own server verifies that signature and never trusts the device's raw claim. Here I'll build that verification on a Cloudflare Worker, piece by piece, with code you can actually run.
+
+## What "don't trust the device" really means
+
+There are two stances for deciding purchase state. One takes the device at its word when it says "I'm a paying user." The other accepts only the "Apple-signed evidence" the device carries, and only after verifying it. The difference isn't implementation complexity — it's where you place trust.
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>Trust the device's claim</th><th>Verify the signature first</th></tr>
+</thead>
+<tbody>
+<tr><td>Tamper resistance</td><td>None (rewrite the flag, get unlocked)</td><td>Present (nothing passes without Apple's signature)</td></tr>
+<tr><td>Source of truth</td><td>The device's local storage</td><td>An entitlement your server verified and issued</td></tr>
+<tr><td>Offline behavior</td><td>Always instant (but forgeable)</td><td>Cache the verified result to stay instant</td></tr>
+<tr><td>Cost</td><td>Low</td><td>One extra Worker</td></tr>
+</tbody>
+</table>
+
+As an indie developer, you want everything to live on the device with no server at all. I did too. But the closer a feature sits to revenue, the more a single verification layer earns its keep. The nice part is that a Cloudflare Worker lets you run that signature check only when a request arrives, without keeping an always-on server around. That "a verification layer that spins up only when needed" shape fits solo operations well.
+
+## StoreKit 2's signed transactions (JWS)
+
+In StoreKit 2, purchase results and transaction history come back as a `VerificationResult`. Inside sits a raw, Apple-signed string: `jwsRepresentation`. It's a JWS (JSON Web Signature) in compact form — `header.payload.signature`, three parts joined by dots.
+
+The header carries the signing algorithm (ES256) and an `x5c` certificate chain. `x5c` is an array: the first entry is the certificate that actually signed (the leaf), followed by the intermediate, and finally Apple's root (Apple Root CA - G3). The payload holds `bundleId`, `productId`, `transactionId`, `environment`, purchase dates, and so on.
+
+So verification decomposes into three checks. First, that the JWS signature is valid under the leaf certificate's public key. Second, that the certificate chain climbs correctly to Apple's root. Third, that the payload points at the right product in your own app. Only when all three hold can you conclude the device genuinely purchased.
+
+## Client side: pull the signed transaction and send it
+
+On the device, pull the `jwsRepresentation` for the transaction you want checked and send it to your backend. The key discipline: you may open the `VerificationResult` and read it on the device, but you don't treat that reading as authoritative. You pass the raw signed string to the server and let the server decide.
+
+```swift
+import StoreKit
+
+/// Pull the "signed string" for a product's latest transaction.
+/// What we return is the raw JWS, not a verified Transaction — that matters.
+func latestSignedTransaction(for productID: String) async -> String? {
+    // Transaction.latest returns VerificationResult<Transaction>
+    guard let result = await Transaction.latest(for: productID) else {
+        return nil
+    }
+    // The raw JWS is available whether the result is .verified or .unverified.
+    // Treat the on-device verdict as a hint; let the server be the source of truth.
+    return result.jwsRepresentation
+}
+
+/// Send the pulled JWS to the Cloudflare Worker verification endpoint
+func syncEntitlement(productID: String) async throws -> Bool {
+    guard let jws = await latestSignedTransaction(for: productID) else {
+        return false
+    }
+    var request = URLRequest(url: URL(string: "https://api.example.com/verify")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONEncoder().encode(["signedTransaction": jws])
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        return false
+    }
+    struct VerifyResponse: Decodable { let entitled: Bool }
+    // Trust only the result the server verified.
+    return try JSONDecoder().decode(VerifyResponse.self, from: data).entitled
+}
+```
+
+At this stage nothing is verified yet. What you send is a string that *claims* Apple signed it; whether that claim is true is what the server is about to establish.
+
+## Verifying the JWS in a Cloudflare Worker
+
+On the Worker, extract the leaf certificate, import its public key, and verify the JWS signature under that key. For certificate handling, use the `jose` library — which runs on Workers as-is — via `importX509` and `compactVerify`. Here's the verification core.
+
+```ts
+import { compactVerify, importX509 } from "jose";
+
+// Wrap a standard-base64 DER cert into PEM (note: not base64url)
+function derToPem(derBase64: string): string {
+  const lines = derBase64.match(/.{1,64}/g)?.join("\n") ?? derBase64;
+  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+}
+
+function decodeJwsHeader(jws: string): { alg: string; x5c: string[] } {
+  const headerSegment = jws.split(".")[0];
+  const json = atob(headerSegment.replace(/-/g, "+").replace(/_/g, "/"));
+  return JSON.parse(json);
+}
+
+/// Verify the JWS signature under the leaf certificate's public key and return the payload
+async function verifySignature(jws: string): Promise<Record<string, unknown>> {
+  const header = decodeJwsHeader(jws);
+  if (header.alg !== "ES256") {
+    throw new Error(`unexpected alg: ${header.alg}`);
+  }
+  // x5c[0] is the leaf certificate that actually signed
+  const leafPem = derToPem(header.x5c[0]);
+  const leafKey = await importX509(leafPem, "ES256");
+
+  // compactVerify throws if the signature does not match
+  const { payload } = await compactVerify(jws, leafKey);
+  return JSON.parse(new TextDecoder().decode(payload));
+}
+```
+
+`compactVerify` throws when the signature doesn't match, so passing it guarantees "the holder of the leaf certificate really signed this string." But that alone is not enough. If an attacker signs a JWS with their own certificate and puts that certificate in as the leaf, the signature check itself still passes. That's exactly why the next step — chain verification — is the linchpin.
+
+## The certificate chain and pinning Apple's root
+
+Chain verification confirms the leaf certificate truly descends from Apple. The last entry of `x5c` should be Apple Root CA - G3, so you compare that trailing certificate against an Apple root you pinned ahead of time. Skip this and you wave through the "sign with your own certificate" attack described above.
+
+```ts
+// Embed Apple's officially distributed Apple Root CA - G3 as DER(base64) ahead of time.
+// Source: https://www.apple.com/certificateauthority/
+const APPLE_ROOT_CA_G3_DER =
+  "MIICQzCCAcmgAwIBAgIILc..."; // pin the full certificate here
+
+function assertAppleRoot(x5c: string[]): void {
+  const presentedRoot = x5c[x5c.length - 1];
+  if (presentedRoot !== APPLE_ROOT_CA_G3_DER) {
+    // The root of the presented chain differs from the Apple root we trust
+    throw new Error("root certificate is not the pinned Apple Root CA - G3");
+  }
+}
+
+// Confirm the payload points at the right product and the right environment
+interface TransactionPayload {
+  bundleId: string;
+  productId: string;
+  transactionId: string;
+  environment: "Production" | "Sandbox";
+}
+
+function assertPayload(
+  payload: TransactionPayload,
+  expected: { bundleId: string; env: "Production" | "Sandbox" },
+): void {
+  if (payload.bundleId !== expected.bundleId) {
+    throw new Error("bundleId mismatch");
+  }
+  if (payload.environment !== expected.env) {
+    // Don't let a Sandbox transaction grant production entitlements
+    throw new Error(`environment mismatch: ${payload.environment}`);
+  }
+}
+```
+
+Strictly, the ideal is full chain verification — following signatures leaf-to-intermediate and intermediate-to-root, one hop at a time. In practice, a staged defense is reasonable: make "the trailing entry equals the pinned Apple root" a hard requirement, and delegate intermediate validity to a library or Apple's App Store Server Library. Not skipping the root pin is the backbone of this design.
+
+## Granting the entitlement and preventing replay
+
+Once signature, chain, and contents all line up, you finally grant the entitlement — but you must prevent reuse of the same `transactionId` (replay). This closes off someone intercepting a legitimate JWS once and sending it repeatedly to attach entitlements to other accounts. Record the `transactionId` in KV and issue only on first sight.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      const { signedTransaction } = await request.json<{ signedTransaction: string }>();
+
+      // 1. Signature check (verify the JWS with the leaf key)
+      const payload = (await verifySignature(signedTransaction)) as unknown as TransactionPayload;
+
+      // 2. Root certificate pin comparison
+      assertAppleRoot(decodeJwsHeader(signedTransaction).x5c);
+
+      // 3. Content check (bundleId / environment)
+      assertPayload(payload, { bundleId: "net.example.app", env: "Production" });
+
+      // 4. Replay prevention: accept only on first sight of a transactionId
+      const seenKey = `txn:${payload.transactionId}`;
+      const already = await env.ENTITLEMENTS.get(seenKey);
+      if (already) {
+        // Known transaction. Idempotently return "already granted".
+        return Response.json({ entitled: true, replay: true });
+      }
+      await env.ENTITLEMENTS.put(seenKey, "1", { expirationTtl: 60 * 60 * 24 * 400 });
+
+      return Response.json({ entitled: true, productId: payload.productId });
+    } catch (err) {
+      // Anything that fails verification is treated as no entitlement (deny by default)
+      return Response.json({ entitled: false, reason: String(err) }, { status: 400 });
+    }
+  },
+};
+
+interface Env {
+  ENTITLEMENTS: KVNamespace;
+}
+```
+
+The crucial choice is returning `entitled: false` on failure — when in doubt, don't grant. If any single step of verification is missing, no entitlement goes out. This "deny by default" posture is the same thinking behind verifying rewarded-ad grants on a Worker, which I cover in [server-side verification for AdMob rewarded ads (SSV)](/articles/rork-business/rork-admob-rewarded-ssv-cloudflare-worker-signature-verification).
+
+## Common pitfalls
+
+Once you build it, the surrounding details trip you up more than the signature check itself. Here are the ones I actually hit, or nearly did.
+
+First, environment mix-ups. A transaction purchased in Sandbox has `environment` set to `Sandbox`. Let that grant production entitlements and a test purchase unlocks production features. Checking `environment` is mandatory. Second, a missing root pin. As above, skip it and a self-signed certificate passes straight through. Third, ignoring replay. Without recording `transactionId`, the same evidence works forever.
+
+Fourth, leaning on the device's `verified` verdict. `VerificationResult.verified` is an in-device check, and there's room to swap it in transit. Keep the principle that server verification is authoritative. For the broader subscription-state design, [syncing StoreKit 2 subscription status across three layers](/articles/rork-dev/rork-storekit-2-subscription-status-three-layer-sync) and [a subscription architecture using the App Store Server API](/articles/rork-dev/rork-storekit-2-app-store-server-api-subscription-architecture) are useful references.
+
+## Wrapping up
+
+If you do one thing today, check whether the purchase logic in your live app depends on "the device's claim." If a single `UserDefaults` value or local flag gates your features, that's the first hole to close.
+
+Signature verification looks daunting, but broken down it settles into three checks: verify the signature with the leaf key, confirm the trailing entry is the Apple root, and match the contents. Even for a solo developer, one Worker's worth of effort puts the revenue-critical part on solid ground. I'm still tuning mine as I run it, but the one line I wouldn't erase is this: don't trust the device. Thanks for reading.

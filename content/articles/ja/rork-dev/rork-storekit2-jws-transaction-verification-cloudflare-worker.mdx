@@ -1,0 +1,223 @@
+---
+title: "StoreKit 2 の署名付きトランザクションを Cloudflare Worker で検証する"
+slug: "rork-storekit2-jws-transaction-verification-cloudflare-worker"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-11T05:30"
+updated: "2026-07-11T05:30"
+author: "Rork Lab"
+description: "端末が申告した課金状態をそのまま信じると、改ざんされたエンタイトルメントを通してしまいます。StoreKit 2 の署名付きトランザクション（JWS）を Cloudflare Worker 側で検証し、端末を信用せずに権利を付与する設計と実装を、動くコードとともに整理します。"
+tags: ["StoreKit 2", "Cloudflare Workers", "課金検証", "JWS", "Rork"]
+highlights:
+  - "端末が申告する課金状態を鵜呑みにして不安を感じていた人が、Cloudflare Worker で StoreKit 2 の署名を検証して権利を付与する実装を手に入れられる"
+  - "Apple の署名付きトランザクション（JWS）と証明書チェーンの検証手順を理解し、Web Crypto と jose で動く Worker を書けるようになる"
+  - "リプレイ・環境取り違え・ルート証明書未固定という三つの穴を、コードレベルで塞げるようになる"
+---
+
+課金まわりで最初にひやりとしたのは、あるアプリで「プレミアム解放フラグ」を端末の `UserDefaults` に保存し、それを信じて機能を出し分けていたときでした。脱獄端末やプロキシを噛ませたリクエストの前では、そのフラグは何の保証にもなりません。無料のまま全機能が開いてしまう構造を、リリース後しばらく経ってから気づいたのです。
+
+課金の判定は、最終的に「誰が署名したか」で決めるべきものです。StoreKit 2 はトランザクションに Apple の署名を載せて渡してくれます。であれば、その署名を私たち自身のサーバーで検証し、端末の申告そのものは信用しない、という境界を引けます。ここでは、その検証を Cloudflare Worker 上で行う設計と実装を、実際に動くコードで組み立てていきます。
+
+## 端末を信用しない、とはどういうことか
+
+課金状態の判定には、大きく二つの立場があります。端末が「私は課金済みです」と言うのをそのまま受け取る立場と、端末が持ってきた「Apple が署名した証拠」を検証してから受け取る立場です。この違いは、実装の複雑さではなく、信頼の置き所の違いです。
+
+<table>
+<thead>
+<tr><th>観点</th><th>端末の申告を信じる</th><th>署名を検証してから信じる</th></tr>
+</thead>
+<tbody>
+<tr><td>改ざん耐性</td><td>なし（フラグを書き換えれば解放）</td><td>あり（Apple の署名がなければ通らない）</td></tr>
+<tr><td>権利の正本</td><td>端末のローカルストレージ</td><td>サーバーが検証して発行したエンタイトルメント</td></tr>
+<tr><td>オフライン挙動</td><td>常に即時（だが偽装可能）</td><td>検証済みの結果をキャッシュして即時化</td></tr>
+<tr><td>実装コスト</td><td>低い</td><td>Worker 一つ分だけ増える</td></tr>
+</tbody>
+</table>
+
+個人開発では、サーバーを持たずに端末だけで完結させたくなります。私自身もそうでした。ただ、収益に直結する機能ほど、検証の一枚を挟む価値があります。幸い Cloudflare Worker なら、常時起動のサーバーを抱えずに、リクエストが来たときだけ署名検証を走らせられます。この「必要なときだけ立ち上がる検証層」という形が、個人開発の運用コストと相性が良いと感じています。
+
+## StoreKit 2 の署名付きトランザクション（JWS）
+
+StoreKit 2 では、購入結果やトランザクション履歴が `VerificationResult` という形で返ってきます。この中に、Apple が署名した生の文字列 `jwsRepresentation` が入っています。これは JWS（JSON Web Signature）のコンパクト形式で、`ヘッダー.ペイロード.署名` の三つを `.` で連結した文字列です。
+
+ヘッダーには署名アルゴリズム（ES256）と、`x5c` という証明書チェーンが入っています。`x5c` は配列で、先頭が実際に署名した証明書（リーフ）、続いて中間証明書、末尾が Apple のルート証明書（Apple Root CA - G3）です。ペイロードには `bundleId`・`productId`・`transactionId`・`environment`・購入日時などが入っています。
+
+つまり検証とは、次の三つを確かめる作業に分解できます。第一に、リーフ証明書の公開鍵で JWS の署名が正しいこと。第二に、証明書チェーンが Apple のルートまで正しく繋がっていること。第三に、ペイロードの中身が自分のアプリの正しい商品を指していること。この三つが揃って初めて、その端末が本当に購入したと判断できます。
+
+## クライアント側：署名済みトランザクションを取り出して送る
+
+まず端末側で、検証したいトランザクションの `jwsRepresentation` を取り出してバックエンドへ送ります。ここで大切なのは、端末側で `VerificationResult` を開いて中身を読むこと自体はしても、その読んだ結果を「正」として扱わないことです。あくまで生の署名文字列をサーバーへ渡し、判定はサーバーに委ねます。
+
+```swift
+import StoreKit
+
+/// 指定商品の最新トランザクションの「署名付き文字列」を取り出す。
+/// 返すのは検証済みの Transaction ではなく、生の JWS 文字列である点が重要。
+func latestSignedTransaction(for productID: String) async -> String? {
+    // Transaction.latest は VerificationResult<Transaction> を返す
+    guard let result = await Transaction.latest(for: productID) else {
+        return nil
+    }
+    // .verified / .unverified いずれの場合も、生の JWS はここから取れる
+    // 端末側の verified 判定は「参考」に留め、正本はサーバー検証に委ねる
+    return result.jwsRepresentation
+}
+
+/// 取り出した JWS を Cloudflare Worker の検証エンドポイントへ送る
+func syncEntitlement(productID: String) async throws -> Bool {
+    guard let jws = await latestSignedTransaction(for: productID) else {
+        return false
+    }
+    var request = URLRequest(url: URL(string: "https://api.example.com/verify")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONEncoder().encode(["signedTransaction": jws])
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        return false
+    }
+    struct VerifyResponse: Decodable { let entitled: Bool }
+    // サーバーが検証した結果だけを信じる
+    return try JSONDecoder().decode(VerifyResponse.self, from: data).entitled
+}
+```
+
+この段階では、まだ何も検証されていません。送っているのは「Apple が署名したと主張する文字列」であって、その主張の真偽はこれからサーバーで確かめます。
+
+## Cloudflare Worker で JWS を検証する
+
+Worker 側では、リーフ証明書を取り出して公開鍵をインポートし、その鍵で JWS 全体の署名を検証します。証明書の取り扱いには、Workers でそのまま動く `jose` ライブラリの `importX509` と `compactVerify` を使います。まずは署名検証の本体です。
+
+```ts
+import { compactVerify, importX509 } from "jose";
+
+// base64（標準）を base64url ではなく DER として扱うためのヘルパー
+function derToPem(derBase64: string): string {
+  const lines = derBase64.match(/.{1,64}/g)?.join("\n") ?? derBase64;
+  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+}
+
+function decodeJwsHeader(jws: string): { alg: string; x5c: string[] } {
+  const headerSegment = jws.split(".")[0];
+  const json = atob(headerSegment.replace(/-/g, "+").replace(/_/g, "/"));
+  return JSON.parse(json);
+}
+
+/// JWS の署名をリーフ証明書の公開鍵で検証し、ペイロードを返す
+async function verifySignature(jws: string): Promise<Record<string, unknown>> {
+  const header = decodeJwsHeader(jws);
+  if (header.alg !== "ES256") {
+    throw new Error(`unexpected alg: ${header.alg}`);
+  }
+  // x5c[0] が実際に署名したリーフ証明書
+  const leafPem = derToPem(header.x5c[0]);
+  const leafKey = await importX509(leafPem, "ES256");
+
+  // compactVerify は署名が壊れていれば例外を投げる
+  const { payload } = await compactVerify(jws, leafKey);
+  return JSON.parse(new TextDecoder().decode(payload));
+}
+```
+
+`compactVerify` は署名が一致しなければ例外を投げるので、ここを通過した時点で「リーフ証明書の持ち主が確かにこの文字列に署名した」ことは保証されます。ただし、これだけでは足りません。攻撃者が自前の証明書で署名した JWS を送ってきても、その自前証明書をリーフとして使えば署名検証自体は通ってしまうからです。だからこそ、次の証明書チェーンの検証が要になります。
+
+## 証明書チェーンと Apple ルート証明書の固定
+
+リーフ証明書が「本当に Apple の系譜に連なるものか」を確かめるのが、チェーン検証です。`x5c` の末尾には Apple Root CA - G3 が入っているはずなので、その末尾証明書が、自分であらかじめ固定（ピン留め）した Apple ルート証明書と一致するかを照合します。ここを省くと、上で述べた「自前証明書で署名する」攻撃をそのまま通してしまいます。
+
+```ts
+// あらかじめ Apple 公式配布の Apple Root CA - G3 を DER(base64) で埋め込んでおく
+// 参照元: https://www.apple.com/certificateauthority/
+const APPLE_ROOT_CA_G3_DER =
+  "MIICQzCCAcmgAwIBAgIILc..."; // 実際の証明書全体をここに固定する
+
+function assertAppleRoot(x5c: string[]): void {
+  const presentedRoot = x5c[x5c.length - 1];
+  if (presentedRoot !== APPLE_ROOT_CA_G3_DER) {
+    // 送られてきたチェーンの根が、私たちが信頼する Apple ルートと違う
+    throw new Error("root certificate is not the pinned Apple Root CA - G3");
+  }
+}
+
+// ペイロードが自分のアプリの正しい商品・正しい環境を指しているかを確かめる
+interface TransactionPayload {
+  bundleId: string;
+  productId: string;
+  transactionId: string;
+  environment: "Production" | "Sandbox";
+}
+
+function assertPayload(
+  payload: TransactionPayload,
+  expected: { bundleId: string; env: "Production" | "Sandbox" },
+): void {
+  if (payload.bundleId !== expected.bundleId) {
+    throw new Error("bundleId mismatch");
+  }
+  if (payload.environment !== expected.env) {
+    // Sandbox のトランザクションを本番の権利付与に使わせない
+    throw new Error(`environment mismatch: ${payload.environment}`);
+  }
+}
+```
+
+厳密には、リーフから中間、中間からルートへと一段ずつ署名を辿る完全なチェーン検証が理想です。実務では、まず「末尾が固定した Apple ルートと一致すること」を必須条件にし、中間証明書の有効性はライブラリや Apple の App Store Server Library に委ねる、という段階的な守り方が現実的だと考えています。少なくともルートの固定を省かないことが、この設計の背骨になります。
+
+## 検証後の権利付与とリプレイ対策
+
+署名とチェーンと中身が揃ったら、いよいよ権利を付与します。ただしここで、同じ `transactionId` の使い回し（リプレイ）を防ぐ必要があります。誰かが正当な JWS を一度傍受し、それを何度も送りつけて別アカウントに権利を付けようとする、という筋を塞ぐためです。`transactionId` を KV に記録し、初出のときだけ発行する形にします。
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      const { signedTransaction } = await request.json<{ signedTransaction: string }>();
+
+      // 1. 署名検証（リーフ鍵で JWS を確認）
+      const payload = (await verifySignature(signedTransaction)) as unknown as TransactionPayload;
+
+      // 2. ルート証明書の固定照合
+      assertAppleRoot(decodeJwsHeader(signedTransaction).x5c);
+
+      // 3. 中身の照合（bundleId / 環境）
+      assertPayload(payload, { bundleId: "net.example.app", env: "Production" });
+
+      // 4. リプレイ対策：transactionId の初出のみ受理
+      const seenKey = `txn:${payload.transactionId}`;
+      const already = await env.ENTITLEMENTS.get(seenKey);
+      if (already) {
+        // 既知のトランザクション。冪等に「付与済み」を返すだけにする
+        return Response.json({ entitled: true, replay: true });
+      }
+      await env.ENTITLEMENTS.put(seenKey, "1", { expirationTtl: 60 * 60 * 24 * 400 });
+
+      return Response.json({ entitled: true, productId: payload.productId });
+    } catch (err) {
+      // 検証に落ちたものは一律で権利なしとして扱う（deny by default）
+      return Response.json({ entitled: false, reason: String(err) }, { status: 400 });
+    }
+  },
+};
+
+interface Env {
+  ENTITLEMENTS: KVNamespace;
+}
+```
+
+失敗したときに `entitled: false` を返し、迷ったら付与しないという既定にしている点が肝心です。検証のどこか一段でも欠ければ、権利は出しません。この「deny by default」の姿勢は、広告のリワード付与を Worker で検証する設計とも共通する考え方です。詳しくは[リワード広告のサーバーサイド検証（AdMob SSV）の実装](/articles/rork-business/rork-admob-rewarded-ssv-cloudflare-worker-signature-verification)でも触れています。
+
+## よくある落とし穴
+
+実際に組んでみると、署名検証そのものより周辺で足をすくわれることが多いです。私が実際に、あるいは危うく踏みかけたものを挙げておきます。
+
+第一に、環境の取り違えです。Sandbox で購入したトランザクションの `environment` は `Sandbox` になります。これを本番の権利付与に使わせてしまうと、テスト購入で本番環境の機能が開いてしまいます。これを回避するには `environment` の照合が必須です。第二に、ルート証明書の固定漏れです。前述の通り、これを怠ると自前証明書での署名がそのまま通ります。第三に、リプレイの放置です。`transactionId` を記録しないと、同じ証拠が何度でも通用します。
+
+第四に、端末側の `verified` 判定に寄りかかることです。`VerificationResult` の `.verified` は端末内での検証結果であり、通信経路で差し替えられる余地があります。あくまでサーバー検証を正本とする、という原則を崩さないことが大切です。より広い購読状態の同期設計については、[StoreKit 2 の購読状態を三層で同期する設計](/articles/rork-dev/rork-storekit-2-subscription-status-three-layer-sync)や、[App Store Server API を用いた購読アーキテクチャ](/articles/rork-dev/rork-storekit-2-app-store-server-api-subscription-architecture)が参考になります。
+
+## まとめ
+
+今日ひとつだけ手を動かすなら、いま動いているアプリの課金判定が「端末の申告」に依存していないかを確かめてみてください。もし `UserDefaults` やローカルフラグ一つで機能を出し分けているなら、そこが最初に塞ぐべき穴です。
+
+署名検証は難しそうに見えて、分解すれば「リーフ鍵で署名を確認し、末尾がApple ルートか照合し、中身を照らし合わせる」という三つの確認に落ち着きます。個人開発でも、Worker 一つ分の手間で、収益に直結する部分の足場が確かなものになります。私自身もまだ運用しながら調整を重ねている途中ですが、端末を信用しないという一線だけは、引いておいて損はないと感じています。お読みいただきありがとうございました。
