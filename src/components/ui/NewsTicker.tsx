@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Maxはコード署名やプロビジョニングを肩代わりし、2クリックでApp Storeへ申請できます。公開にローカルMacは不要です",
-    "SIMULATOR — ブラウザ内のストリーミングシミュレータで操作感を試せ、QRを読めばTestFlightなしで実機に直接インストールできます",
-    "NATIVE — SwiftUI・ARKit・HealthKit・HomeKit・Core ML・Metalなど、React Nativeでは届かない領域までカバーします",
-    "SEED — Rorkは2026年4月にLeft Lane Capital主導で$15Mのシードを調達し、Peak XVやa16z Speedrunが参加しました",
-    "GROWTH — 月間743,000訪問・成長率85%と報じられ、AIモバイルアプリ構築の裾野が広がっています",
-    "NOCODE — Gartnerは2026年末までに新規アプリの75%がローコード／ノーコードで作られると予測しています",
+    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — AR/LiDAR、Metalによる3D、ウィジェット、Dynamic Island、Live Activities、HealthKit、NFC、Core MLまで踏み込めます",
+    "PUBLISH — App Storeへの公開を2クリックで実行でき、個人開発の申請作業を大きく短縮できます",
+    "SWIFT — 自然文で指示するだけで動くコードが生成され、iOS・Android・Webのアプリを素早く形にできます",
+    "GROWTH — Rorkは直近で1,500万ドルを調達。月間743,000訪問・成長率85%と伸びています",
+    "PRICING — 無料で開始でき、有料プランは月25ドルから。Rork Maxは月200ドルです",
   ],
   en: [
-    "MAX — Rork Max handles code signing and provisioning so you can submit to the App Store in two clicks, with no local Mac required",
-    "SIMULATOR — Try your app in an in-browser streaming simulator, then scan a QR code to install straight to your device without TestFlight",
-    "NATIVE — Coverage reaches SwiftUI, ARKit, HealthKit, HomeKit, Core ML, and Metal, going where React Native cannot",
-    "SEED — Rork raised a $15M seed led by Left Lane Capital in April 2026, joined by Peak XV and a16z Speedrun",
-    "GROWTH — Reported at 743,000 monthly visits with 85% growth, widening access to AI-built mobile apps",
-    "NOCODE — Gartner expects 75% of new applications to be built with low-code or no-code tools by the end of 2026",
+    "MAX — Rork Max builds native Swift apps instead of React Native, supporting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — It reaches AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, NFC, and on-device Core ML",
+    "PUBLISH — Two-click App Store publishing sharply shortens the submission work for solo developers",
+    "SWIFT — Describe your app in plain English and Rork generates working code for iOS, Android, and web",
+    "GROWTH — Rork recently raised $15M and now sees over 743,000 monthly visits with 85% growth",
+    "PRICING — It is free to start, with paid plans from $25/month and Rork Max at $200/month",
   ],
 };
 
