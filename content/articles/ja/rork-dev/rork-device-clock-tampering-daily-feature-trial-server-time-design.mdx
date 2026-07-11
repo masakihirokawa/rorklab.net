@@ -1,0 +1,197 @@
+---
+title: "端末の時計は動かせる — 日替わり機能とトライアル判定を時刻操作から守る設計"
+slug: "rork-device-clock-tampering-daily-feature-trial-server-time-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-11T11:00"
+author: "Rork Lab"
+description: "端末の時計を進めるだけで日替わり特典を先取りできてしまう——壁紙アプリのログで見つけた実例を起点に、壁時計・単調時計・サーバー時刻の3層で時刻源を使い分け、時計の巻き戻しにも耐える日替わりロジックとトライアル判定の設計をまとめました。"
+tags: ["Rork", "アプリ開発", "設計", "時刻同期", "サブスクリプション"]
+highlights:
+  - "壁時計・単調時計・サーバー時刻の3層モデルと、機能ごとにどの時刻源を選ぶかをまとめた判断表"
+  - "Cloudflare Worker の Date ヘッダを利用したサーバー時刻オフセット管理と、Expo でそのまま動く時刻プロバイダの実装"
+  - "時計を巻き戻した端末でも壊れない日替わり判定の書き方と、ローカル実装の無料トライアルを避けるべき理由"
+---
+
+日替わりで壁紙を1枚配信する機能のログを眺めていて、妙な行があることに気づきました。同じ端末が、1日のうちに「今日の壁紙」を3回受け取っています。
+
+原因は単純でした。端末の設定で日付を1日進めると、アプリは素直に「日付が変わった」と判断して翌日分を配ってしまう。戻してまた進めれば、何枚でも先取りできます。
+
+悪意と呼ぶほどのものではないのだと思います。ただ、この挙動を放置したまま「7日連続ログインで特典」や「無料トライアル期限」を同じ時計の上に載せると、影響はチケットの先取りでは済まなくなります。個人開発で複数のアプリを運用してきた経験から、端末時刻を信用しない設計を最初から入れておくことの価値を、私は強く感じております。
+
+Rork で生成したアプリも例外ではありません。生成されたコードの日付処理は `Date.now()` と `new Date()` を素直に使っており、端末の設定変更にそのまま追従します。今回は、この前提を踏まえた時刻まわりの設計をまとめていきます。
+
+## 端末時刻がずれる4つの経路と、そのとき壊れるもの
+
+まず、端末の壁時計（wall clock）が「正しい現在時刻」から離れる経路を整理しておきます。
+
+<table>
+<thead>
+<tr><th>経路</th><th>ずれ幅の目安</th><th>壊れやすい機能</th></tr>
+</thead>
+<tbody>
+<tr><td>ユーザーの手動変更</td><td>数分〜数年（意図的）</td><td>日替わり特典、連続ログイン、期限つきクーポン</td></tr>
+<tr><td>タイムゾーン移動・DST</td><td>±1〜14時間</td><td>「今日」の境界判定、通知のスケジュール</td></tr>
+<tr><td>NTP 同期の失敗・遅延</td><td>数秒〜数分</td><td>署名検証のタイムスタンプ照合、ログの並び順</td></tr>
+<tr><td>電池切れ・初期化直後</td><td>数日〜数年（過去方向）</td><td>証明書検証、キャッシュの有効期限判定</td></tr>
+</tbody>
+</table>
+
+運用中のアプリで計測してみると、サーバー時刻との乖離が5分を超える端末は全体の1%弱で常に存在していました。24時間以上ずれた端末も、月に数十台の規模で観測されます。ゼロにはなりません。ずれた端末は常にいる、という前提で設計する必要があります。
+
+意図的な変更に限っていえば、動機の大半は「待ち時間のスキップ」です。日替わり配布、リワード広告のクールダウン、体力回復。時間で価値を区切る機能を持つアプリほど、時計は動かされます。
+
+## 時刻の3層モデル — 壁時計・単調時計・サーバー時刻
+
+対策の骨格は、用途ごとに時刻源を使い分けることです。私は次の3層で考えるようにしております。
+
+<table>
+<thead>
+<tr><th>時刻源</th><th>取得方法</th><th>性質</th><th>向く用途</th></tr>
+</thead>
+<tbody>
+<tr><td>壁時計</td><td><code>Date.now()</code></td><td>ユーザーが自由に動かせる。表示用としては正しい</td><td>画面への時刻表示、ローカル通知の発火時刻</td></tr>
+<tr><td>単調時計</td><td><code>performance.now()</code>（プロセス内）</td><td>起動からの経過時間。巻き戻らないが、再起動でリセット</td><td>処理時間の計測、セッション内のクールダウン</td></tr>
+<tr><td>サーバー時刻</td><td>API 応答の <code>Date</code> ヘッダ等</td><td>改ざん不可。ただしオフライン時は取れない</td><td>日替わり判定、期限判定、特典付与</td></tr>
+</tbody>
+</table>
+
+ポイントは「壁時計が悪者なのではない」ということです。ユーザーへの表示や、端末の生活時間に合わせるローカル通知には、壁時計こそが正解です。壊れるのは、価値の付与や期限の判定を壁時計に任せたときだけです。
+
+単調時計は中間の存在です。React Native の `performance.now()` はプロセス内では巻き戻りませんが、アプリを完全終了すればリセットされます。「セッション内で60秒に1回まで」のような短いクールダウンには十分で、日をまたぐ判定には使えません。
+
+つまり、日替わりや期限のような「日をまたぐ価値の判定」は、サーバー時刻に寄せるしかない。次はその実装です。
+
+## サーバー時刻オフセットを管理する時刻プロバイダ
+
+専用の時刻 API を立てる必要はありません。すでにアプリが叩いているバックエンドの応答には、HTTP 標準の `Date` ヘッダが載っています。Cloudflare Worker でもそのまま返ります。これを使い、端末時計とのオフセットだけを保持します。
+
+```typescript
+// trustedClock.ts — サーバー時刻オフセットの管理
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const OFFSET_KEY = "trusted_clock_offset_ms";
+let offsetMs: number | null = null;
+
+// アプリ起動時・フォアグラウンド復帰時に呼ぶ
+export async function syncClock(endpoint: string): Promise<void> {
+  const started = performance.now();
+  const res = await fetch(endpoint, { method: "HEAD" });
+  const rtt = performance.now() - started;
+
+  const dateHeader = res.headers.get("date");
+  if (!dateHeader) return;
+
+  // 往復遅延の半分を補正に織り込む（片道遅延の近似）
+  const serverNow = new Date(dateHeader).getTime() + rtt / 2;
+  offsetMs = serverNow - Date.now();
+  await AsyncStorage.setItem(OFFSET_KEY, String(offsetMs));
+}
+
+// 信頼できる「現在時刻」。オフライン起動時は前回のオフセットで近似
+export async function trustedNow(): Promise<number> {
+  if (offsetMs === null) {
+    const stored = await AsyncStorage.getItem(OFFSET_KEY);
+    offsetMs = stored !== null ? Number(stored) : 0;
+  }
+  return Date.now() + offsetMs;
+}
+```
+
+`Date` ヘッダの精度は秒単位ですが、日替わり判定の用途には十分すぎるほどです。手元の計測では、Worker への HEAD リクエストは往復60〜120ms 程度で、補正後の誤差は±1秒に収まりました。ミリ秒精度が欲しい用途は、そもそもこの仕組みの守備範囲ではありません。
+
+見落としやすいのがオフライン時の扱いです。保存済みオフセットを足しても、端末の時計自体が動かされていれば `trustedNow()` も一緒にずれます。そのため、オフライン時のオフセットは「参考値」に格下げし、価値の付与はオンライン確認を必須にします。付与だけサーバー確認、閲覧はローカル判定、という非対称にすると体験を損ねません。
+
+## 日替わり判定は「巻き戻し検出」とセットで設計する
+
+サーバー時刻で「今日」を決めても、もう1つ穴が残ります。オフライン中に時計を戻し、キャッシュ済みの判定をやり直させる経路です。ここは単調性の検査で塞ぎます。
+
+```typescript
+// dailyGate.ts — 巻き戻し検出つきの日替わり判定
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { trustedNow } from "./trustedClock";
+
+const LAST_CLAIM_KEY = "daily_last_claim";
+
+// JST など、サービスの基準タイムゾーンで日付キーを作る
+function dayKey(epochMs: number): string {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Tokyo",
+  }).format(new Date(epochMs)); // "2026-07-11" 形式
+}
+
+export async function canClaimDaily(): Promise<boolean> {
+  const now = await trustedNow();
+  const raw = await AsyncStorage.getItem(LAST_CLAIM_KEY);
+  if (!raw) return true;
+
+  const last = JSON.parse(raw) as { at: number; day: string };
+
+  // 単調性の検査: 前回受領時刻より過去に戻っていたら拒否
+  if (now < last.at - 60_000) return false;
+
+  return dayKey(now) !== last.day;
+}
+
+export async function recordClaim(): Promise<void> {
+  const now = await trustedNow();
+  await AsyncStorage.setItem(
+    LAST_CLAIM_KEY,
+    JSON.stringify({ at: now, day: dayKey(now) })
+  );
+}
+```
+
+設計上の判断が2つあります。
+
+1つ目は、日付の境界をユーザーのタイムゾーンではなく、サービスの基準タイムゾーン（この例では JST）に固定していることです。時差の移動で「今日」が2回来ることを防ぎます。海外移動の多いユーザーには特典が最大14時間遅れて見えることがありますが、二重付与よりは説明しやすい挙動だと私は考えております。
+
+2つ目は、巻き戻し検出に60秒の許容幅を持たせていることです。NTP の正規の補正で数秒戻ることは普通にあり、そこで特典を止めるとサポートの手間だけが増えます。「正規の補正は通し、意図的な巻き戻しだけ弾く」ための緩衝です。
+
+なお、連続ログインのような機能では、検出時にストリークをゼロに戻す「罰する」実装を避けています。時計異常の相当数は悪意なしに起きるためです。付与を1日待ってもらうだけに留めると、レビュー欄が荒れません。
+
+## トライアルとサブスク判定に端末時計を使ってはいけない
+
+ここまでの仕組みがあっても、私は無料トライアルをローカルタイマーで自作しません。理由は単純で、価値が大きいものほど攻撃の動機も大きくなるからです。日替わり壁紙の先取りと、月額課金の回避では、守るべき水準が違います。
+
+幸い、課金まわりには最初からサーバー署名つきの時刻が用意されています。StoreKit 2 のトランザクションに入っている購入日時・失効日時は Apple のサーバーが署名した値で、端末の時計をどう動かしても書き換えられません。判定は署名済みの値だけで行い、端末時計は関与させない。これが原則です。
+
+無料トライアルも、自作タイマーではなく App Store のお試しオファー（introductory offer）に載せれば、期限管理ごと Apple 側に寄せられます。RevenueCat を使っている場合も権利判定はサーバー側で行われるため、考えることは「オフライン時にキャッシュをどこまで信頼するか」だけに絞られます。この時間窓の設計は [RevenueCat のオフライン権利キャッシュを信頼する時間窓の設計](/articles/rork-dev/rork-revenuecat-offline-entitlement-cache-trust-window-expo) に、購読状態の同期全体は [StoreKit 2 のサブスク状態を3層同期で安定させる設計](/articles/rork-dev/rork-storekit-2-subscription-status-three-layer-sync) にまとめております。
+
+逆に、ローカル通知の発火時刻のように「端末の生活時間」に合わせるべきものまでサーバー時刻に寄せると、今度はタイムゾーン移動で通知が深夜に鳴ります。この使い分けは [ローカル通知をタイムゾーンと夏時間に追従させる再同期の設計](/articles/rork-dev/rork-expo-local-notification-timezone-dst-resync-design) で扱った話とちょうど表裏の関係にあります。
+
+## 時刻操作は手元で再現できる — テスト手順
+
+時刻まわりの設計は、リリース前に手元で崩してみるのがいちばん確実です。私が出荷前に通しているシナリオを載せておきます。
+
+<table>
+<thead>
+<tr><th>シナリオ</th><th>操作</th><th>期待する挙動</th></tr>
+</thead>
+<tbody>
+<tr><td>前進での先取り</td><td>設定で日付を+1日 → 特典取得 → 日付を戻す</td><td>2回目の取得が拒否される</td></tr>
+<tr><td>巻き戻し</td><td>特典取得後に日付を-1日</td><td>再取得できない。アプリがクラッシュしない</td></tr>
+<tr><td>タイムゾーン移動</td><td>タイムゾーンを UTC-10 に変更</td><td>「今日」が二重に来ない</td></tr>
+<tr><td>オフライン起動</td><td>機内モードでコールドスタート</td><td>閲覧は可能、付与はオンライン要求</td></tr>
+<tr><td>再起動リセット</td><td>特典取得 → アプリ完全終了 → 再起動</td><td>単調時計リセット後も判定が維持される</td></tr>
+</tbody>
+</table>
+
+Android は adb から直接操作できるため、CI に近い形で自動化もできます。
+
+```bash
+# 自動時刻同期を切ってから任意の時刻に変更
+adb shell settings put global auto_time 0
+adb shell date 071220302026.00   # 7月12日 20:30 に設定
+```
+
+iOS シミュレータは OS の日付変更ができないため、実機で「設定 > 一般 > 日付と時刻」の自動設定を切って確認します。この一手間を惜しんで出荷し、翌週にログで気づく——というのが冒頭の私でした。
+
+## まとめ — 時刻源の選択は一度決めれば終わる
+
+時刻の設計は、機能ごとに毎回悩む類のものではありません。「表示と通知は壁時計、セッション内の間隔は単調時計、価値と期限はサーバー時刻」という割り当てを一度プロジェクトの規約にしてしまえば、以後は迷いなく書けます。
+
+Rork で生成したコードに対しては、`Date.now()` の使用箇所を検索し、価値の付与・期限の判定に触れている行だけを `trustedNow()` に置き換えるところから始めるのが現実的です。私自身の手元のアプリではこの置き換えが12箇所で、作業は半日ほどで終わりました。
+
+日替わり機能を持つアプリをお作りでしたら、リリース前に上のテスト表だけでも通してみてください。時計を1日進めるだけの操作で、設計の穴は驚くほど素直に姿を現します。

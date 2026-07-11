@@ -1,0 +1,197 @@
+---
+title: "The Device Clock Can Be Moved — Protecting Daily Features and Trial Logic from Time Tampering"
+slug: "rork-device-clock-tampering-daily-feature-trial-server-time-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-11T11:00"
+author: "Rork Lab"
+description: "Advancing the device clock by one day was enough to claim tomorrow's daily wallpaper today. Starting from that log entry, this article lays out a three-layer time model — wall clock, monotonic clock, server time — and shows how to build daily-reward and trial logic that survives clock rollbacks."
+tags: ["Rork", "App Development", "Architecture", "Time Sync", "Subscriptions"]
+highlights:
+  - "A three-layer time model (wall clock, monotonic clock, server time) with a decision table mapping each feature to the right time source"
+  - "A trusted-clock provider for Expo that manages a server-time offset using nothing but the HTTP Date header from a Cloudflare Worker"
+  - "Rollback-resistant daily-claim logic, plus the reasons a locally implemented free trial is a design mistake rather than a coding one"
+---
+
+While reading through the delivery logs for a daily-wallpaper feature, I noticed something odd: the same device had claimed "today's wallpaper" three times in a single day.
+
+The cause turned out to be embarrassingly simple. Move the device date forward one day in Settings, and the app happily concludes a new day has arrived and hands over tomorrow's image. Roll it back, move it forward again, and you can collect as many as you like.
+
+I doubt there was much malice involved. But leave this behavior in place and then build "7-day login streaks" or "free trial expiration" on the same clock, and the damage stops being a few wallpapers claimed early. Having operated several apps as a solo developer, I now treat distrust of the device clock as something worth designing in from day one.
+
+Apps generated with Rork are no exception. The generated date handling uses `Date.now()` and `new Date()` in the straightforward way, which means it follows whatever the user sets in the device settings. This article works through the time-handling architecture I use to close that gap.
+
+## Four Ways the Device Clock Drifts, and What Breaks
+
+Start with the paths by which a device's wall clock ends up away from the true current time.
+
+<table>
+<thead>
+<tr><th>Path</th><th>Typical drift</th><th>What breaks</th></tr>
+</thead>
+<tbody>
+<tr><td>Manual change by the user</td><td>Minutes to years (deliberate)</td><td>Daily rewards, login streaks, time-limited coupons</td></tr>
+<tr><td>Timezone travel and DST</td><td>±1 to 14 hours</td><td>"Today" boundary logic, notification scheduling</td></tr>
+<tr><td>Failed or delayed NTP sync</td><td>Seconds to minutes</td><td>Signature timestamp checks, log ordering</td></tr>
+<tr><td>Dead battery or factory reset</td><td>Days to years (backward)</td><td>Certificate validation, cache expiry checks</td></tr>
+</tbody>
+</table>
+
+Measuring this across apps in production, devices more than 5 minutes away from server time consistently hovered just under 1% of the fleet. Devices off by more than 24 hours showed up at a rate of dozens per month. The number never reaches zero. The design assumption has to be that skewed devices are always present.
+
+For deliberate changes specifically, the motive is almost always the same: skipping a wait. Daily drops, rewarded-ad cooldowns, stamina recovery. The more an app slices value by time, the more its users move their clocks.
+
+## A Three-Layer Time Model: Wall Clock, Monotonic Clock, Server Time
+
+The backbone of the fix is assigning a different time source to each job. I think of it as three layers.
+
+<table>
+<thead>
+<tr><th>Source</th><th>How to read it</th><th>Properties</th><th>Right for</th></tr>
+</thead>
+<tbody>
+<tr><td>Wall clock</td><td><code>Date.now()</code></td><td>Freely movable by the user; correct for display</td><td>On-screen times, local notification fire times</td></tr>
+<tr><td>Monotonic clock</td><td><code>performance.now()</code> (per process)</td><td>Elapsed time since launch; never rewinds, resets on restart</td><td>Duration measurement, in-session cooldowns</td></tr>
+<tr><td>Server time</td><td>HTTP <code>Date</code> header on API responses</td><td>Tamper-proof, but unavailable offline</td><td>Daily boundaries, expirations, granting value</td></tr>
+</tbody>
+</table>
+
+The key insight is that the wall clock is not the villain. For anything shown to the user, or for local notifications that should follow the device's lived time, the wall clock is exactly right. Things only break when granting value or judging expiration is delegated to it.
+
+The monotonic clock sits in between. React Native's `performance.now()` never moves backward within a process, but a full app kill resets it. That makes it fine for short cooldowns like "once per 60 seconds within a session" and useless for anything that crosses a day boundary.
+
+Which leaves one conclusion: any judgment about value that spans days has to lean on server time. So let's build that.
+
+## A Trusted-Clock Provider Backed by a Server-Time Offset
+
+You do not need a dedicated time API. Every response from a backend you already call carries the standard HTTP `Date` header — Cloudflare Workers return it out of the box. The trick is to store only the offset between server time and the device clock.
+
+```typescript
+// trustedClock.ts — managing a server-time offset
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const OFFSET_KEY = "trusted_clock_offset_ms";
+let offsetMs: number | null = null;
+
+// Call on app launch and on foreground return
+export async function syncClock(endpoint: string): Promise<void> {
+  const started = performance.now();
+  const res = await fetch(endpoint, { method: "HEAD" });
+  const rtt = performance.now() - started;
+
+  const dateHeader = res.headers.get("date");
+  if (!dateHeader) return;
+
+  // Fold in half the round trip as a one-way latency estimate
+  const serverNow = new Date(dateHeader).getTime() + rtt / 2;
+  offsetMs = serverNow - Date.now();
+  await AsyncStorage.setItem(OFFSET_KEY, String(offsetMs));
+}
+
+// A trustworthy "now". Falls back to the stored offset when offline
+export async function trustedNow(): Promise<number> {
+  if (offsetMs === null) {
+    const stored = await AsyncStorage.getItem(OFFSET_KEY);
+    offsetMs = stored !== null ? Number(stored) : 0;
+  }
+  return Date.now() + offsetMs;
+}
+```
+
+The `Date` header only has second-level precision, which is far more than a daily boundary needs. In my measurements, a HEAD request to a Worker completed in roughly 60–120 ms round trip, and the corrected clock landed within ±1 second of server time. If a feature genuinely needs millisecond precision, this mechanism was never the right tool for it anyway.
+
+The easy thing to miss is the offline case. Adding a stored offset does not help if the device clock itself has been moved — `trustedNow()` moves right along with it. So while offline, the offset gets demoted to a hint: reading cached content stays local, but granting anything of value requires an online check. That asymmetry — grant online, view locally — keeps the experience intact without leaving the door open.
+
+## Daily-Claim Logic Needs Rollback Detection as a Set
+
+Even with server time deciding what "today" is, one hole remains: going offline, rolling the clock back, and replaying a cached judgment. That hole gets closed with a monotonicity check.
+
+```typescript
+// dailyGate.ts — daily claim with rollback detection
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { trustedNow } from "./trustedClock";
+
+const LAST_CLAIM_KEY = "daily_last_claim";
+
+// Build the day key in the service's reference timezone
+function dayKey(epochMs: number): string {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Tokyo",
+  }).format(new Date(epochMs)); // "2026-07-11"
+}
+
+export async function canClaimDaily(): Promise<boolean> {
+  const now = await trustedNow();
+  const raw = await AsyncStorage.getItem(LAST_CLAIM_KEY);
+  if (!raw) return true;
+
+  const last = JSON.parse(raw) as { at: number; day: string };
+
+  // Monotonicity check: reject if time moved behind the last claim
+  if (now < last.at - 60_000) return false;
+
+  return dayKey(now) !== last.day;
+}
+
+export async function recordClaim(): Promise<void> {
+  const now = await trustedNow();
+  await AsyncStorage.setItem(
+    LAST_CLAIM_KEY,
+    JSON.stringify({ at: now, day: dayKey(now) })
+  );
+}
+```
+
+Two design decisions are worth spelling out.
+
+First, the day boundary is pinned to the service's reference timezone rather than the user's. That prevents "today" from arriving twice on a long flight. A traveling user might see the daily drop arrive up to 14 hours late, but in my experience that is a far easier behavior to explain than a double grant.
+
+Second, the rollback check carries a 60-second tolerance. Legitimate NTP corrections routinely step the clock back a few seconds, and blocking rewards over that only generates support email. The buffer lets normal corrections through while still catching deliberate rewinds.
+
+For streak-style features, I also avoid the punitive version of this — resetting the streak to zero on any anomaly. A large share of clock weirdness happens with no malice at all. Making the user wait one extra day is enough, and it keeps the review section calm.
+
+## Never Use the Device Clock for Trials or Subscription Status
+
+Even with all of the above in place, I do not build free trials on a local timer. The reasoning is blunt: the more value something protects, the stronger the incentive to attack it. Claiming tomorrow's wallpaper early and dodging a monthly subscription are different threat levels, and they deserve different mechanisms.
+
+Fortunately, the billing stack already ships with server-signed time. The purchase and expiration dates inside a StoreKit 2 transaction are signed by Apple's servers; no amount of fiddling with the device clock rewrites them. The rule is to judge entitlement using signed values only and keep the device clock out of the loop entirely.
+
+Free trials belong on App Store introductory offers, which move expiry management to Apple's side as well. If you use RevenueCat, entitlement checks are already server-side, and the only real question left is how long to trust the cached entitlement while offline — I've written about that trust window in [designing the trust window for RevenueCat's offline entitlement cache](/articles/rork-dev/rork-revenuecat-offline-entitlement-cache-trust-window-expo), and about the broader state model in [keeping StoreKit 2 subscription status stable with three-layer sync](/articles/rork-dev/rork-storekit-2-subscription-status-three-layer-sync).
+
+The inverse mistake exists too: pushing things that should follow the device's lived time — like local notification fire times — onto server time, which gets you notifications ringing at 3 a.m. after a timezone change. That trade-off is the mirror image of what I covered in [re-syncing local notifications across timezone and DST changes](/articles/rork-dev/rork-expo-local-notification-timezone-dst-resync-design).
+
+## Time Tampering Reproduces on Your Desk — a Test Procedure
+
+The most reliable way to validate this design is to break it yourself before release. Here are the scenarios I run before shipping.
+
+<table>
+<thead>
+<tr><th>Scenario</th><th>Steps</th><th>Expected behavior</th></tr>
+</thead>
+<tbody>
+<tr><td>Fast-forward claim</td><td>Set date +1 day → claim → set date back</td><td>Second claim is rejected</td></tr>
+<tr><td>Rollback</td><td>Claim, then set date −1 day</td><td>No re-claim; app does not crash</td></tr>
+<tr><td>Timezone travel</td><td>Switch timezone to UTC−10</td><td>"Today" does not arrive twice</td></tr>
+<tr><td>Offline launch</td><td>Cold start in airplane mode</td><td>Viewing works; granting requires online</td></tr>
+<tr><td>Restart reset</td><td>Claim → force-kill app → relaunch</td><td>Judgment survives the monotonic clock reset</td></tr>
+</tbody>
+</table>
+
+Android can be driven from adb, which makes semi-automated checks practical:
+
+```bash
+# Disable automatic time sync, then set an arbitrary time
+adb shell settings put global auto_time 0
+adb shell date 071220302026.00   # July 12, 20:30
+```
+
+The iOS Simulator cannot change the OS date, so this runs on a physical device with Settings > General > Date & Time set to manual. Skipping that one chore and shipping anyway — then finding out from the logs a week later — is exactly how this article started.
+
+## Closing: Pick Time Sources Once, Then Stop Deciding
+
+Time handling is not something to re-litigate per feature. Decide the assignment once as a project convention — wall clock for display and notifications, monotonic clock for in-session intervals, server time for value and expirations — and every subsequent feature writes itself.
+
+For a Rork-generated codebase, the practical starting point is a search for `Date.now()` call sites, replacing only the lines involved in granting value or judging expiration with `trustedNow()`. In my app that came to 12 call sites and about half a day of work.
+
+If your app has any daily feature at all, run the test table above before your next release. Moving the clock forward a single day exposes the gaps in a design more honestly than any code review I've sat through.
