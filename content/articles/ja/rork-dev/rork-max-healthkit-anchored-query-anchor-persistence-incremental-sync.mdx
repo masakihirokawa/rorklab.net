@@ -1,0 +1,211 @@
+---
+title: "HealthKitの差分同期でデータを取りこぼす — HKAnchoredObjectQueryのアンカーを設計する"
+slug: "rork-max-healthkit-anchored-query-anchor-persistence-incremental-sync"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-13T05:25"
+updated: "2026-07-13T05:25"
+author: "Rork Lab"
+description: "HealthKitの差分同期で歩数や睡眠が二重に数えられたり欠けたりする原因は、HKQueryAnchorの永続化設計にあります。newAnchorとdeletedObjectsを正しく扱い、再インストールやバックグラウンド更新をまたいでも整合するローカル取り込みの実装を、動くSwiftコードでまとめました。"
+tags: ["Rork Max", "HealthKit", "Swift", "iOS", "個人開発"]
+highlights:
+  - "差分同期で歩数や睡眠が二重計上・取りこぼしになる原因を、アンカーの永続化設計から根本的に直せるようになる"
+  - "HKAnchoredObjectQueryのnewAnchorとdeletedObjectsを正しく扱う、動くSwiftコードを手に入れられる"
+  - "再インストールやバックグラウンド更新をまたいでも数字がずれない、冪等なローカル取り込み設計に応用できる"
+---
+
+睡眠と歩数を読み込む癒し系アプリに「昨日との差分だけ取り込む」処理を足した翌朝、テスト端末の週間グラフが二重になっていました。夜間のバックグラウンド更新と、朝アプリを開いたときの取得が、同じサンプルを二度数えていたのです。原因は取得方法ではなく、取得の続きをどこから始めるかを示す印、つまりアンカーの持ち方にありました。
+
+`HKSampleQuery` で毎回すべてを取り直せば重複はしませんが、健康データは1日で数百件に増えることもあり、起動のたびに全件を舐めるのは電池にも速度にも優しくありません。そこで差分取得の `HKAnchoredObjectQuery` に切り替えるのですが、この API は「返ってきたアンカーを次回に渡す」という約束を守って初めて正しく動きます。約束の破り方には典型的なパターンがあり、私自身も個人開発でひととおり踏みました。ここではその設計を、動くコードとともに整理します。
+
+## なぜ全件取得をやめると事故が起きるのか
+
+`HKAnchoredObjectQuery` は「前回のアンカー以降に追加・削除されたサンプルだけ」を返します。裏を返せば、アンカーを渡さなければ毎回すべてが「新規」として返ってきます。ここで多いのが、アンカーをメモリ上の変数にだけ持ち、アプリを再起動すると `nil` に戻る作りです。すると再起動のたびに全件が新規扱いになり、ローカル側で素朴に加算していれば二重計上、置換していれば無駄な全書き換えが起きます。
+
+もう一つの落とし穴が削除です。ユーザーがヘルスケアアプリで手入力の歩数を消しても、差分取得を歩数の追加だけで組んでいると、ローカルには古い値が残り続けます。差分同期は「増えた分」と「消えた分」の両方を受け取って初めて、ヘルスケア側と一致します。
+
+<table>
+<thead>
+<tr><th>取得方法</th><th>毎回のコスト</th><th>削除の反映</th><th>アンカー管理</th></tr>
+</thead>
+<tbody>
+<tr><td>HKSampleQuery で全件</td><td>高い（件数に比例）</td><td>全置換なら反映される</td><td>不要</td></tr>
+<tr><td>HKAnchoredObjectQuery（アンカー未永続化）</td><td>実質全件（毎回新規扱い）</td><td>初回のみ</td><td>不完全</td></tr>
+<tr><td>HKAnchoredObjectQuery（アンカー永続化）</td><td>低い（差分のみ）</td><td>deletedObjectsで反映</td><td>必須</td></tr>
+</tbody>
+</table>
+
+つまり差分同期の正しさは、ほぼアンカーの持ち方で決まります。
+
+## HKAnchoredObjectQuery が返す3つの値を扱う
+
+このクエリの結果ハンドラには、追加されたサンプル・削除されたオブジェクト・新しいアンカーの3つが渡されます。まずこの3つを受け取り、ローカル取り込みへ渡す骨組みを作ります。
+
+```swift
+import HealthKit
+
+final class StepSyncEngine {
+    private let store = HKHealthStore()
+    private let type = HKQuantityType(.stepCount)
+
+    // 前回の続きから取り込む。初回は anchor が nil。
+    func syncIncremental(completion: @escaping (Result<Void, Error>) -> Void) {
+        let anchor = AnchorStore.load(for: type)  // 永続化から復元（後述）
+
+        let query = HKAnchoredObjectQuery(
+            type: type,
+            predicate: nil,
+            anchor: anchor,
+            limit: HKObjectQueryNoLimit
+        ) { [weak self] _, newSamples, deletedObjects, newAnchor, error in
+            guard let self else { return }
+            if let error { completion(.failure(error)); return }
+
+            // 3つを1つの取り込み単位として渡す（順序が大事）
+            self.ingest(
+                added: (newSamples as? [HKQuantitySample]) ?? [],
+                deleted: deletedObjects ?? []
+            )
+
+            // 取り込みが成功した「後で」アンカーを保存する
+            if let newAnchor {
+                AnchorStore.save(newAnchor, for: self.type)
+            }
+            completion(.success(()))
+        }
+        store.execute(query)
+    }
+}
+```
+
+ここで意図的にしているのは、アンカーの保存を取り込みの後に置くことです。取り込みが例外で失敗したのにアンカーだけ進めてしまうと、その差分は二度と返ってきません。「取り込めた分までしかアンカーを進めない」——この順序が差分同期の安全弁になります。
+
+## アンカーをどこに、どう保存するか
+
+`HKQueryAnchor` はそのままでは保存できないので、`NSKeyedArchiver` で `Data` に変換します。健康データはタイプごとに独立して増減するため、アンカーもタイプ単位で別々に持つのが安全です。歩数と睡眠を1つのアンカーで共有すると、片方の取得エラーがもう片方の続きを壊します。
+
+```swift
+enum AnchorStore {
+    private static let defaults = UserDefaults.standard
+
+    private static func key(for type: HKObjectType) -> String {
+        "hk.anchor.\(type.identifier)"  // タイプごとに分離
+    }
+
+    static func load(for type: HKObjectType) -> HKQueryAnchor? {
+        guard let data = defaults.data(forKey: key(for: type)) else { return nil }
+        return try? NSKeyedUnarchiver.unarchivedObject(
+            ofClass: HKQueryAnchor.self, from: data
+        )
+    }
+
+    static func save(_ anchor: HKQueryAnchor, for type: HKObjectType) {
+        guard let data = try? NSKeyedArchiver.archivedData(
+            withRootObject: anchor, requiringSecureCoding: true
+        ) else { return }
+        defaults.set(data, forKey: key(for: type))
+    }
+}
+```
+
+保存先の選択には設計判断が要ります。個人開発の小さな健康アプリでは `UserDefaults` で十分ですが、機微な健康データの取り込み状態を厳格に扱いたい場合はファイル保護属性付きの保存先を選ぶこともあります。ここで意識したいのは、保存先の永続性の違いがそのまま「アンカーがどこまで生き残るか」に直結する点です。
+
+<table>
+<thead>
+<tr><th>保存先</th><th>アプリ削除で消えるか</th><th>向く用途</th></tr>
+</thead>
+<tbody>
+<tr><td>UserDefaults</td><td>消える</td><td>再インストール時は全件取り直しでよいアプリ</td></tr>
+<tr><td>ファイル（Documents）</td><td>消える</td><td>大量サンプルをローカルに保持する設計</td></tr>
+<tr><td>Keychain</td><td>残る場合がある</td><td>再インストール後も続きから取りたい場合（要注意）</td></tr>
+</tbody>
+</table>
+
+## 削除を取りこぼさない
+
+`deletedObjects` には `HKDeletedObject` が入っており、持っている情報は基本的に `uuid` だけです。ローカル側をこの `uuid` で引けるようにしておかないと、削除を反映できません。ここが差分同期を後付けする際に最も見落とされる部分です。ローカルのレコードは、必ずサンプルの `uuid` を主キーとして保存しておきます。
+
+```swift
+extension StepSyncEngine {
+    func ingest(added: [HKQuantitySample], deleted: [HKDeletedObject]) {
+        // 1. 削除を先に反映（同一バッチ内の add→delete 逆転を避ける）
+        for object in deleted {
+            LocalStore.remove(uuid: object.uuid)
+        }
+        // 2. 追加は uuid をキーに upsert（冪等）
+        for sample in added {
+            let steps = sample.quantity.doubleValue(for: .count())
+            LocalStore.upsert(
+                uuid: sample.uuid,          // HealthKit 側の一意キー
+                start: sample.startDate,
+                value: steps
+            )
+        }
+    }
+}
+```
+
+削除を先に処理するのは、同じ同期バッチの中で「追加してすぐ削除された」サンプルが両方入ってくる可能性があるからです。追加を先にすると、削除で消したはずのレコードが後から復活する順序事故が起きえます。
+
+## 初回同期とリセットの境界
+
+初回は `AnchorStore.load` が `nil` を返し、全件が新規として流れてきます。ここでローカルを空にしてから取り込む、という前提が崩れると初回から二重になります。私はこの初回パスを、通常の差分パスと明示的に分けて書くようにしています。分岐を曖昧にすると、後から読んだときにどちらの経路を通るのか追えなくなるためです。
+
+```swift
+extension StepSyncEngine {
+    func syncOrBootstrap(completion: @escaping (Result<Void, Error>) -> Void) {
+        if AnchorStore.load(for: type) == nil {
+            LocalStore.clearAll(for: type)  // 初回は必ず空から
+        }
+        syncIncremental(completion: completion)
+    }
+}
+```
+
+再インストール後の挙動も、保存先の選択とセットで決めておきます。`UserDefaults` はアプリ削除で消えるため、再インストール直後は自然と初回パスに入り、全件を取り直します。これは多くの健康アプリにとって望ましい挙動です。逆に Keychain にアンカーを置くと、再インストール後もアンカーが残っていてローカルは空、という非対称が生まれ、差分だけ取れてグラフがスカスカになることがあります。永続化の強さは、必ずしも正しさと一致しません。
+
+## background delivery と長時間クエリの併用
+
+`HKAnchoredObjectQuery` には `updateHandler` を設定でき、これを付けるとクエリを止めずに以降の変更を受け取り続けます。バックグラウンド更新と組み合わせるときは、`HKObserverQuery` で起こされたタイミングで新しいアンカー付きクエリを一度だけ実行する形にすると、状態が追いやすくなります。
+
+```swift
+extension StepSyncEngine {
+    func startContinuousSync() {
+        let anchor = AnchorStore.load(for: type)
+        let query = HKAnchoredObjectQuery(
+            type: type, predicate: nil, anchor: anchor,
+            limit: HKObjectQueryNoLimit
+        ) { [weak self] _, added, deleted, newAnchor, _ in
+            self?.apply(added, deleted, newAnchor)
+        }
+        // 初回結果の後も変更を受け取り続ける
+        query.updateHandler = { [weak self] _, added, deleted, newAnchor, _ in
+            self?.apply(added, deleted, newAnchor)
+        }
+        store.execute(query)
+    }
+
+    private func apply(_ added: [HKSample]?, _ deleted: [HKDeletedObject]?,
+                       _ newAnchor: HKQueryAnchor?) {
+        ingest(added: (added as? [HKQuantitySample]) ?? [], deleted: deleted ?? [])
+        if let newAnchor { AnchorStore.save(newAnchor, for: type) }
+    }
+}
+```
+
+注意したいのは、`updateHandler` を使う継続クエリと、`HKObserverQuery` で毎回起動する使い捨てクエリを二重に走らせないことです。両方が同じアンカーを別々に進めると、片方が進めたアンカーをもう片方が知らないまま古いアンカーで上書きし、取りこぼしが生まれます。バックグラウンド更新の設計そのものは、HealthKitの[background deliveryでHKObserverQueryが無言で止まる問題](/articles/rork-dev/rork-max-healthkit-background-delivery-observer-query-silent-stop)に詳しくまとめています。継続クエリを採るか、起動ごとの使い捨てを採るか、どちらか一方に寄せるのが安全です。
+
+## 冪等な取り込みが最後の砦になる
+
+ここまでの設計をすべて正しく組んでも、想定外の経路でアンカーが飛ぶことはあります。OSの更新、ヘルスケア側の再構築、開発中の手動リセット——差分の前提が崩れる場面は現実に起きます。だからこそ、取り込みそのものを冪等にしておくことが最後の砦になります。`uuid` を主キーにした `upsert` は、同じサンプルが二度流れてきても結果を変えません。アンカーの永続化で「二度取らない」ことを目指しつつ、取り込みの冪等性で「二度取っても壊れない」ことを担保する。この二段構えにしておくと、健康データのグラフが静かに壊れる事故をかなり防げます。
+
+本番運用に入れる前に、私は次の3点を必ず確認します。
+
+1. アンカーの保存先が意図した永続性になっているか（UserDefaults か、再インストールを跨ぐ Keychain か）を確認する
+2. ローカルレコードの主キーが `uuid` になっていて、削除を反映できる状態かを確認する
+3. 継続クエリと使い捨てクエリを二重に走らせていないかを確認し、片方に寄せる
+
+この3点はどれも、一度事故が起きてから気づくと原因の切り分けに時間を取られる部分です。順序事故を避けるためにも、取り込みの順序（削除→追加）とアンカー保存の順序（取り込み後）を先に固定してしまうことを個人的には推奨します。小さな健康アプリであれば、私は保存先を UserDefaults に寄せ、再インストール時は素直に全件から作り直す設計を好みます。永続性を欲張らないほうが、結果として整合を保ちやすいと感じています。
+
+歩数や睡眠のように、ユーザーが毎日眺める数字を扱うアプリでは、一度ずれたグラフは信頼を大きく損ないます。私自身、癒しをうたうアプリで数字が二重になっていたときの気まずさは忘れられません。まずは手元のアプリで、アンカーを保存している場所と、ローカルレコードの主キーが `uuid` になっているかを確認してみてください。この二点が揃っていれば、差分同期の土台はできています。

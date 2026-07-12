@@ -1,0 +1,203 @@
+---
+title: "Losing HealthKit Data on Incremental Sync — Designing HKQueryAnchor Persistence"
+slug: "rork-max-healthkit-anchored-query-anchor-persistence-incremental-sync"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-13T05:25"
+updated: "2026-07-13T05:25"
+author: "Rork Lab"
+description: "When step or sleep data double-counts or goes missing on incremental HealthKit sync, the root cause is usually HKQueryAnchor persistence. Here is a working Swift design that handles newAnchor and deletedObjects correctly and stays consistent across reinstalls and background updates."
+tags: ["Rork Max", "HealthKit", "Swift", "iOS", "indie developer"]
+highlights:
+  - "You can trace step and sleep double-counting or gaps back to anchor persistence and fix it at the root"
+  - "You will get working Swift code that handles HKAnchoredObjectQuery's newAnchor and deletedObjects correctly"
+  - "You can apply an idempotent local ingestion design that stays consistent across reinstalls and background updates"
+---
+
+The morning after I added an incremental "only pull what changed since yesterday" step to a calming wellness app, the weekly chart on my test device was doubled. The overnight background update and the fetch that ran when I opened the app were counting the same samples twice. The cause was not the fetch method — it was how I was holding the marker that says where to resume: the anchor.
+
+If you re-fetch everything with `HKSampleQuery` each time, you never duplicate, but health data can grow to hundreds of records a day, and sweeping all of it on every launch is unkind to both battery and speed. So you switch to `HKAnchoredObjectQuery` for incremental fetches — but that API only works correctly if you keep its promise: hand the returned anchor back on the next run. There are a few classic ways to break that promise, and as an indie developer I have stepped on most of them. Here is the design, with code that runs.
+
+## Why turning off full fetches invites accidents
+
+`HKAnchoredObjectQuery` returns only the samples added or deleted since the anchor you pass in. The flip side: if you pass no anchor, everything comes back as "new" every single time. The most common mistake is holding the anchor only in an in-memory variable that resets to `nil` when the app restarts. Now every restart treats the entire history as new, and if your local store naively adds those up, you double-count; if it replaces, you rewrite everything for nothing.
+
+The other trap is deletions. When a user removes a manually entered step count in the Health app, an incremental pipeline built only around additions leaves the stale value in your local store forever. Incremental sync only matches Health once it receives both what was added and what was removed.
+
+<table>
+<thead>
+<tr><th>Fetch method</th><th>Per-run cost</th><th>Deletions reflected</th><th>Anchor management</th></tr>
+</thead>
+<tbody>
+<tr><td>HKSampleQuery, full history</td><td>High (scales with count)</td><td>Yes, if you fully replace</td><td>Not needed</td></tr>
+<tr><td>HKAnchoredObjectQuery, anchor not persisted</td><td>Effectively full every run</td><td>First run only</td><td>Incomplete</td></tr>
+<tr><td>HKAnchoredObjectQuery, anchor persisted</td><td>Low (deltas only)</td><td>Via deletedObjects</td><td>Required</td></tr>
+</tbody>
+</table>
+
+In other words, the correctness of incremental sync is almost entirely decided by how you hold the anchor.
+
+## Handling the three values the query returns
+
+The query's results handler hands you three things: the newly added samples, the deleted objects, and the new anchor. Start by receiving all three and passing them into a single ingestion step.
+
+```swift
+import HealthKit
+
+final class StepSyncEngine {
+    private let store = HKHealthStore()
+    private let type = HKQuantityType(.stepCount)
+
+    // Resume from last time. On the first run, anchor is nil.
+    func syncIncremental(completion: @escaping (Result<Void, Error>) -> Void) {
+        let anchor = AnchorStore.load(for: type)  // restore from disk (below)
+
+        let query = HKAnchoredObjectQuery(
+            type: type,
+            predicate: nil,
+            anchor: anchor,
+            limit: HKObjectQueryNoLimit
+        ) { [weak self] _, newSamples, deletedObjects, newAnchor, error in
+            guard let self else { return }
+            if let error { completion(.failure(error)); return }
+
+            // Treat the three as one ingestion unit (order matters)
+            self.ingest(
+                added: (newSamples as? [HKQuantitySample]) ?? [],
+                deleted: deletedObjects ?? []
+            )
+
+            // Save the anchor only AFTER ingestion succeeds
+            if let newAnchor {
+                AnchorStore.save(newAnchor, for: self.type)
+            }
+            completion(.success(()))
+        }
+        store.execute(query)
+    }
+}
+```
+
+The deliberate choice here is placing the anchor save after ingestion. If ingestion throws but you advance the anchor anyway, that delta never comes back. "Never advance the anchor past what you actually ingested" is the safety valve of incremental sync.
+
+## Where and how to persist the anchor
+
+`HKQueryAnchor` cannot be stored as-is, so archive it into `Data` with `NSKeyedArchiver`. Because each health type grows and shrinks independently, it is safest to keep a separate anchor per type. Sharing one anchor across steps and sleep means a fetch error on one breaks the resume point of the other.
+
+```swift
+enum AnchorStore {
+    private static let defaults = UserDefaults.standard
+
+    private static func key(for type: HKObjectType) -> String {
+        "hk.anchor.\(type.identifier)"  // isolated per type
+    }
+
+    static func load(for type: HKObjectType) -> HKQueryAnchor? {
+        guard let data = defaults.data(forKey: key(for: type)) else { return nil }
+        return try? NSKeyedUnarchiver.unarchivedObject(
+            ofClass: HKQueryAnchor.self, from: data
+        )
+    }
+
+    static func save(_ anchor: HKQueryAnchor, for type: HKObjectType) {
+        guard let data = try? NSKeyedArchiver.archivedData(
+            withRootObject: anchor, requiringSecureCoding: true
+        ) else { return }
+        defaults.set(data, forKey: key(for: type))
+    }
+}
+```
+
+Choosing the storage location is a design decision. For a small wellness app built by an indie developer, `UserDefaults` is plenty; if you want stricter handling of the ingestion state for sensitive health data, you might pick a file-protected location instead. What matters is that the durability of the store maps directly onto how long the anchor survives.
+
+<table>
+<thead>
+<tr><th>Storage</th><th>Cleared on app delete?</th><th>Good for</th></tr>
+</thead>
+<tbody>
+<tr><td>UserDefaults</td><td>Yes</td><td>Apps fine with a full re-fetch on reinstall</td></tr>
+<tr><td>File (Documents)</td><td>Yes</td><td>Designs that hold many samples locally</td></tr>
+<tr><td>Keychain</td><td>May survive</td><td>Resuming after reinstall (handle with care)</td></tr>
+</tbody>
+</table>
+
+## Not losing deletions
+
+`deletedObjects` contains `HKDeletedObject` values, and the only information you can rely on is the `uuid`. Unless your local store can be looked up by that `uuid`, you cannot reflect a deletion. This is the piece most often missed when incremental sync is bolted on later. Always store your local records with the sample's `uuid` as the primary key.
+
+```swift
+extension StepSyncEngine {
+    func ingest(added: [HKQuantitySample], deleted: [HKDeletedObject]) {
+        // 1. Apply deletions first (avoid add->delete inversion within a batch)
+        for object in deleted {
+            LocalStore.remove(uuid: object.uuid)
+        }
+        // 2. Upsert additions keyed by uuid (idempotent)
+        for sample in added {
+            let steps = sample.quantity.doubleValue(for: .count())
+            LocalStore.upsert(
+                uuid: sample.uuid,          // HealthKit's unique key
+                start: sample.startDate,
+                value: steps
+            )
+        }
+    }
+}
+```
+
+Deletions go first because a single sync batch can contain a sample that was added and then deleted. Process additions first and you risk an ordering accident where a record you meant to delete comes back to life.
+
+## The boundary between first sync and reset
+
+On the first run, `AnchorStore.load` returns `nil` and the whole history flows in as new. If your assumption that the local store starts empty breaks here, you double from the very first sync. I keep this first-run path explicitly separate from the normal delta path, because a blurry branch makes it impossible to tell later which route the code took.
+
+```swift
+extension StepSyncEngine {
+    func syncOrBootstrap(completion: @escaping (Result<Void, Error>) -> Void) {
+        if AnchorStore.load(for: type) == nil {
+            LocalStore.clearAll(for: type)  // first run always starts empty
+        }
+        syncIncremental(completion: completion)
+    }
+}
+```
+
+Decide reinstall behavior together with the storage choice. Because `UserDefaults` is cleared on delete, a fresh reinstall naturally falls into the first-run path and re-fetches everything — desirable for most health apps. Put the anchor in the Keychain instead and you can get an asymmetry: the anchor survives reinstall while the local store is empty, so you pull only deltas and the chart shows up nearly blank. Stronger persistence is not the same as more correct.
+
+## Combining background delivery with a long-running query
+
+`HKAnchoredObjectQuery` accepts an `updateHandler`; set it and the query keeps running, delivering later changes without stopping. When you combine this with background updates, running one fresh anchored query per `HKObserverQuery` wake-up keeps the state easy to follow.
+
+```swift
+extension StepSyncEngine {
+    func startContinuousSync() {
+        let anchor = AnchorStore.load(for: type)
+        let query = HKAnchoredObjectQuery(
+            type: type, predicate: nil, anchor: anchor,
+            limit: HKObjectQueryNoLimit
+        ) { [weak self] _, added, deleted, newAnchor, _ in
+            self?.apply(added, deleted, newAnchor)
+        }
+        // Keep receiving changes after the first results
+        query.updateHandler = { [weak self] _, added, deleted, newAnchor, _ in
+            self?.apply(added, deleted, newAnchor)
+        }
+        store.execute(query)
+    }
+
+    private func apply(_ added: [HKSample]?, _ deleted: [HKDeletedObject]?,
+                       _ newAnchor: HKQueryAnchor?) {
+        ingest(added: (added as? [HKQuantitySample]) ?? [], deleted: deleted ?? [])
+        if let newAnchor { AnchorStore.save(newAnchor, for: type) }
+    }
+}
+```
+
+The thing to watch is not running a continuous query with an `updateHandler` and a throwaway query launched per `HKObserverQuery` wake-up at the same time. If both advance the same anchor separately, one overwrites the other's progress with a stale anchor and you lose samples. The background side of this is covered in detail in [why HKObserverQuery goes silent during background delivery](/articles/rork-dev/rork-max-healthkit-background-delivery-observer-query-silent-stop). Commit to one model — a continuous query, or a throwaway per launch — not both.
+
+## Idempotent ingestion is the last line of defense
+
+Even with all of this built correctly, anchors can vanish through paths you did not plan for: an OS update, a Health rebuild, a manual reset during development. Situations where the delta assumption collapses do happen. That is exactly why making ingestion itself idempotent is the last line of defense. An `upsert` keyed by `uuid` does not change the result if the same sample flows through twice. Aim to "never fetch twice" through anchor persistence, and guarantee "no damage even if you fetch twice" through idempotent ingestion. With this two-layer setup, you can prevent a surprising number of quietly broken health charts.
+
+In apps handling numbers a user looks at daily — steps, sleep — a chart that drifts once costs a lot of trust. I still remember the awkwardness of finding doubled numbers in an app that promised calm. Start by checking two things in your own app: where the anchor is saved, and whether your local record's primary key is the `uuid`. If those two line up, the foundation of incremental sync is already in place.
