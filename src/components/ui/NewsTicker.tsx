@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "NATIVE — AR/LiDAR、Metalによる3D、ウィジェット、Dynamic Island、Live Activities、HealthKit、NFC、Core MLまで踏み込めます",
-    "PUBLISH — App Storeへの公開を2クリックで実行でき、個人開発の申請作業を大きく短縮できます",
-    "SWIFT — 自然文で指示するだけで動くコードが生成され、iOS・Android・Webのアプリを素早く形にできます",
-    "GROWTH — Rorkは直近で1,500万ドルを調達。月間743,000訪問・成長率85%と伸びています",
-    "PRICING — 無料で開始でき、有料プランは月25ドルから。Rork Maxは月200ドルです",
+    "MAX — Rork MaxはClaude CodeとClaude Opus 4.6を基盤に、React NativeではなくネイティブSwiftアプリを直接生成します",
+    "APPLE — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでAppleエコシステム全体を対象にします",
+    "WORKFLOW — 実運用ではAIに足場を作らせ、状態管理とデータ層は自分で書き直す分担に落ち着いてきたという声が目立ちます",
+    "SEED — 4月にLeft Lane Capital主導で$15Mのシードを調達しました（Peak XV・True Ventures・a16z Speedrunが参加）",
+    "PAPERLINE — アプリビルダーPaperlineを買収。エンジニア人材の獲得へ今後も買収を続ける方針です",
+    "REVIEW — 3ヶ月使ったユーザーの再訪レビューが増え、得意・不得意と向く用途の見極めが進んでいます",
   ],
   en: [
-    "MAX — Rork Max builds native Swift apps instead of React Native, supporting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — It reaches AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, NFC, and on-device Core ML",
-    "PUBLISH — Two-click App Store publishing sharply shortens the submission work for solo developers",
-    "SWIFT — Describe your app in plain English and Rork generates working code for iOS, Android, and web",
-    "GROWTH — Rork recently raised $15M and now sees over 743,000 monthly visits with 85% growth",
-    "PRICING — It is free to start, with paid plans from $25/month and Rork Max at $200/month",
+    "MAX — Rork Max is built on Claude Code and Claude Opus 4.6, generating native Swift apps directly instead of React Native",
+    "APPLE — Rork Max targets the whole Apple ecosystem: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "WORKFLOW — In practice, users settle into letting the AI scaffold while they rewrite the state management and data layer themselves",
+    "SEED — Rork raised a $15M seed led by Left Lane Capital in April, with Peak XV, True Ventures, and a16z Speedrun joining",
+    "PAPERLINE — Rork acquired app builder Paperline and says it will stay acquisitive to bring in engineering talent",
+    "REVIEW — Three-month revisit reviews are growing, clarifying where the tool shines and where it doesn't",
   ],
 };
 
