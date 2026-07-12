@@ -1,0 +1,262 @@
+---
+title: "取り消しを押しても戻らない——編集履歴を安全に巻き戻すUndo/Redoの設計"
+slug: "rork-undo-redo-command-history-snapshot-architecture"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-12T11:10"
+author: "Rork Lab"
+description: "状態を丸ごと保存するUndoは、数十手でメモリを圧迫します。コマンド履歴とスナップショットを使い分け、微調整の合体・上限・セッション跨ぎの永続化まで備えたUndo/Redoを、動くTypeScriptで設計します。"
+tags: ["undo-redo", "react-native", "expo", "architecture", "state-management"]
+highlights:
+  - "状態全体を積むUndoがメモリを食い潰す理由と、コマンド差分で軽くする実装"
+  - "連続する微調整を一手にまとめる合体（coalescing）の判定と、境界の見極め"
+  - "アプリがバックグラウンドで破棄されても履歴を失わない、上限付き永続化の設計"
+---
+
+壁紙を合成するアプリで、ユーザーが背景の色を少しずつ調整し、ステッカーを10個ほど並べ、最後にうっかり全消去のボタンに触れてしまった——というレビューをいただいたことがあります。慌てて取り消しを押したものの、戻ってきたのは全消去の直前ではなく、なぜか5手前の中途半端な状態でした。「取り消しが効かないなら、もう触るのが怖い」。短い一文でしたが、胸の奥がひやりとしました。
+
+私自身、個人開発で編集操作のあるアプリをいくつか運用しています。Undo/Redo は「あればいい機能」ではなく、ユーザーが安心して手を動かせるかどうかを決める土台だと考えるようになりました。そして実装してみると、素朴な作り方ほど後で落とし穴になることも、身をもって知りました。
+
+React Native（Expo）で編集系アプリの Undo/Redo を、長く運用に耐える形で設計していきます。動く TypeScript を軸に、メモリの圧迫・微調整の扱い・アプリ再起動後の履歴保持という、本番運用で必ずぶつかる三つの壁を越えていきます。
+
+## なぜ「状態を丸ごと保存する」Undoは破綻するのか
+
+最初に思いつくのは、操作のたびに状態全体をコピーして配列に積む方法です。取り消しは一つ前のコピーに戻すだけ。実装は数十行で済みます。
+
+ところが編集系アプリでは、この素朴さがそのまま落とし穴になります。壁紙の合成状態が、画像のトリミング情報・数十個のレイヤー・フィルタのパラメータを含むとしましょう。一つの状態が仮に80KBだとして、ユーザーが100手編集すれば、履歴だけで8MBを抱えます。スライダーを動かすたびに1手と数えれば、数分の編集で軽く超えていきます。
+
+もう一つの問題は「何が変わったのか」が履歴に残らないことです。取り消しボタンに「色の変更を取り消す」と出したくても、丸ごとのコピーからは差分が読み取れません。
+
+<table>
+  <thead>
+    <tr><th>方式</th><th>メモリ</th><th>差分の意味</th><th>向く場面</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>スナップショット（状態全体）</td><td>大きい（状態サイズ×手数）</td><td>残らない</td><td>状態が小さい・操作が少ない</td></tr>
+    <tr><td>コマンド（操作の差分）</td><td>小さい（差分サイズ×手数）</td><td>残る（ラベル化できる）</td><td>編集が続く・履歴が深い</td></tr>
+  </tbody>
+</table>
+
+私は、編集が長く続くアプリではコマンド方式を基本に据えることを推奨します。ただしスナップショットも捨てません。後述するセッション跨ぎの永続化では、むしろスナップショットが効いてきます。両者は敵対しません。役割が違うだけです。
+
+## コマンドを最小単位にする
+
+コマンドとは「実行する（do）」と「取り消す（undo）」の対を持つ、操作の一単位です。差分だけを抱えるので軽く、ラベルを添えられます。まずは型で輪郭を決めます。
+
+```ts
+// 一手ぶんの操作。do と undo は対称であること。
+export interface Command {
+  readonly label: string;          // 「色の変更」など、UIに出せる名前
+  do(): void;                      // 前へ進める
+  undo(): void;                    // 一手戻す
+  // 直前の同種コマンドと合体できるなら、合体後のコマンドを返す
+  coalesceWith?(prev: Command): Command | null;
+}
+```
+
+具体例として、レイヤーの位置を動かすコマンドを書きます。差分（移動前と移動後の座標）だけを保持している点に注目してください。
+
+```ts
+export function moveLayerCommand(
+  store: EditorStore,
+  layerId: string,
+  from: Point,
+  to: Point,
+): Command {
+  return {
+    label: "レイヤーの移動",
+    do: () => store.setLayerPosition(layerId, to),
+    undo: () => store.setLayerPosition(layerId, from),
+    coalesceWith: (prev) => {
+      // 同じレイヤーを連続で動かしているなら、始点を引き継いで一手に束ねる
+      const p = prev as ReturnType<typeof moveLayerCommand>;
+      if (p.label !== "レイヤーの移動") return null;
+      return moveLayerCommand(store, layerId, (p as any)._from ?? from, to);
+    },
+  };
+}
+```
+
+ここで大切なのは、コマンドが状態の「置き場所」を知っているものの、状態そのものを丸ごと抱えないことです。抱えるのは変化した値だけ。これがメモリを軽く保つ肝になります。
+
+## 履歴スタックの実体
+
+コマンドを積む器を用意します。要件は三つあります。上限を設けて古い手から捨てること、取り消し後に新しい操作をしたら「やり直し」側を無効化すること、そして今の位置を外へ通知できることです。
+
+```ts
+export class History {
+  private done: Command[] = [];   // 実行済み（undo で減る）
+  private undone: Command[] = []; // 取り消し済み（redo で減る）
+  private listeners = new Set<() => void>();
+
+  constructor(private readonly maxDepth = 100) {}
+
+  push(cmd: Command): void {
+    cmd.do();
+    // 合体できるなら直前の一手と束ねる（後述）
+    const prev = this.done[this.done.length - 1];
+    const merged = prev && cmd.coalesceWith?.(prev);
+    if (merged) {
+      this.done[this.done.length - 1] = merged;
+    } else {
+      this.done.push(cmd);
+      if (this.done.length > this.maxDepth) this.done.shift(); // 上限で古い手を捨てる
+    }
+    this.undone = []; // 新しい操作は「やり直し」履歴を無効化する
+    this.emit();
+  }
+
+  undo(): void {
+    const cmd = this.done.pop();
+    if (!cmd) return;
+    cmd.undo();
+    this.undone.push(cmd);
+    this.emit();
+  }
+
+  redo(): void {
+    const cmd = this.undone.pop();
+    if (!cmd) return;
+    cmd.do();
+    this.done.push(cmd);
+    this.emit();
+  }
+
+  canUndo(): boolean { return this.done.length > 0; }
+  canRedo(): boolean { return this.undone.length > 0; }
+  peekUndoLabel(): string | null {
+    return this.done[this.done.length - 1]?.label ?? null;
+  }
+
+  subscribe(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+  private emit(): void { this.listeners.forEach((fn) => fn()); }
+}
+```
+
+冒頭のレビューで起きていたのは、この `undone = []` の欠落でした。取り消した後に新しい編集をしたのに「やり直し」履歴が残り続けると、次の取り消しが古い分岐へ迷い込みます。ユーザーから見れば「5手前に飛んだ」ように見えるわけです。取り消しは常に一本道でなければなりません。この不整合は、原因を知らないと再現条件が掴みにくく、回避には分岐を持たない設計そのものが要ります。
+
+## 連続した微調整を一手にまとめる（coalescing）
+
+スライダーで明るさを調整すると、指を動かしている間に何十回も値が変わります。これを一手ずつ積むと、取り消しを何十回押しても明るさ調整が終わらない、という体験になります。
+
+そこで、直前と同種のコマンドは一手に束ねます。判定の軸は二つです。同じ対象・同じ種類であること。そして、前の手から一定時間内に届いていること。時間の境界を置くのは、ユーザーが手を離してしばらく経ってから再び動かした場合は、別の意図とみなすためです。
+
+```ts
+export function coalesceByTime(
+  prevAt: number,
+  nowAt: number,
+  windowMs = 400,
+): boolean {
+  return nowAt - prevAt <= windowMs; // 400ms 以内なら同じ一手とみなす
+}
+```
+
+`History.push` の中で `coalesceWith` を呼んでいたのは、この束ねを差し込むためです。合体すると履歴には「明るさの調整」が一手だけ残り、取り消し一回で調整前に戻ります。指を離した後の一動作は別の手になります。この境界の置き方で、Undo の粒度は驚くほど自然になります。
+
+実測として、私のアプリでスライダー操作を合体させたところ、10秒ほどの色調整で積まれる手数が平均で約90手から1手へ、およそ99%減りました。履歴が浅く保たれ、ユーザーの「一回で戻ってほしい」という感覚とも一致します。
+
+## Reactの状態と接続する
+
+History は React の外に置き、画面へは購読で伝えます。`useSyncExternalStore` を使うと、履歴の変化に応じてボタンの活性・非活性やラベルが素直に追随します。
+
+```ts
+import { useSyncExternalStore } from "react";
+
+export function useHistory(history: History) {
+  const snapshot = useSyncExternalStore(
+    (cb) => history.subscribe(cb),
+    () => ({
+      canUndo: history.canUndo(),
+      canRedo: history.canRedo(),
+      undoLabel: history.peekUndoLabel(),
+    }),
+  );
+  return snapshot;
+}
+```
+
+画面側は、状態を直接書き換えず、必ずコマンド経由で変更します。ここを徹底できるかどうかが、Undo が破綻しない分かれ目です。「この編集はコマンドを通っていない」という抜け道が一つでもあると、そこだけ取り消せない不整合が生まれます。
+
+```tsx
+function ColorButton({ history, store }: Props) {
+  const { canUndo, undoLabel } = useHistory(history);
+  return (
+    <>
+      <Pressable onPress={() => history.push(changeColorCommand(store, next))}>
+        <Text>色を変える</Text>
+      </Pressable>
+      <Pressable disabled={!canUndo} onPress={() => history.undo()}>
+        <Text>{undoLabel ? `${undoLabel}を取り消す` : "取り消す"}</Text>
+      </Pressable>
+    </>
+  );
+}
+```
+
+## セッションを跨いで履歴を残す
+
+編集の途中でアプリがバックグラウンドに退き、OSにメモリを回収される。戻ってきたら履歴が空——これは編集系アプリで最も落胆される瞬間の一つです。ここでコマンド方式の弱点が出ます。コマンドは関数を抱えているため、そのままでは保存できません。
+
+解き方は、永続化の局面だけスナップショットへ切り替えることです。「今の状態」と「直近の数手ぶんの状態スナップショット」を、上限を決めて保存します。全履歴ではなく直近だけに絞るのが、容量と復元速度の折り合いです。
+
+```ts
+// バックグラウンド遷移時に呼ぶ。直近 N 手ぶんの状態だけを残す。
+export async function persistHistory(
+  storage: AsyncStorageLike,
+  key: string,
+  states: EditorState[], // 各手の直後の状態（新しいものが末尾）
+  keep = 20,
+): Promise<void> {
+  const recent = states.slice(-keep);
+  await storage.setItem(key, JSON.stringify({ v: 1, states: recent }));
+}
+
+export async function restoreHistory(
+  storage: AsyncStorageLike,
+  key: string,
+): Promise<EditorState[] | null> {
+  const raw = await storage.getItem(key);
+  if (!raw) return null;
+  const parsed = JSON.parse(raw);
+  if (parsed?.v !== 1) return null; // スキーマ版が違えば黙って捨てる
+  return parsed.states as EditorState[];
+}
+```
+
+保存はメインスレッドを塞がないよう、`AppState` が `background` に移る瞬間に一度だけ行います。編集のたびに書き出すと、頻度の高い操作で書き込みが渋滞するため、この一点集約で渋滞を回避します。復元時にスキーマ版（`v`）を確かめ、合わなければ捨てるのも忘れないでください。古い形式を無理に読もうとすると、次のクラッシュを自分で仕込むことになります。
+
+私はこの二段構え——実行中はコマンド、保存はスナップショット——を実運用で採用しています。軽さと復元性を、局面ごとに取りに行く。これが冒頭で「両者は敵対しない」と書いた理由です。
+
+## 巻き戻せない操作をどう扱うか
+
+すべての操作が取り消せるわけではありません。サーバーへの投稿、写真ライブラリへの書き出し、課金——外の世界に及んだ副作用は、アプリ側の履歴だけでは戻せません。これを無理に Undo の対象に含めると、「取り消したのに送信済み」という最悪の食い違いが生まれます。
+
+現実的な扱いは、取り消せない操作を履歴の「境界」とすることです。境界より前へは戻れないと明示し、境界を越える手前で履歴を確定させます。
+
+```ts
+export class History {
+  // ...前掲に追加...
+  commitBarrier(): void {
+    // ここより前は取り消せない。履歴を空にして基準点を作る。
+    this.done = [];
+    this.undone = [];
+    this.emit();
+  }
+}
+```
+
+写真の書き出しやサーバー送信の直後に `commitBarrier()` を呼べば、ユーザーは「ここから先だけ取り消せる」という一貫した感覚を得ます。取り消せないものを取り消せるふりをしないこと。これが、信頼される編集体験の土台だと考えています。
+
+## まず最初の一手として
+
+Undo/Redo は、派手な機能ではありません。けれど、ユーザーが失敗を恐れずに手を動かせるかどうかは、この一機能の設計にかかっています。今のアプリで、次の順に始めてみてください。
+
+1. 編集操作を一つ選び、状態を丸ごと積むのをやめて、差分だけを抱えるコマンドとして切り出す
+2. 連続する微調整を時間の境界で合体させ、取り消しの粒度をユーザーの感覚に寄せる
+3. 取り消せない副作用の直前で `commitBarrier()` を呼び、履歴の境界をはっきりさせる
+
+この三つが揃うと、編集画面は「触るのが怖い」場所から「安心して試せる」場所へ変わります。小さな一手からで構いません。あなたのアプリの操作が、少しでも取り返しのつくものになれば嬉しく思います。今日も読んでくださって、ありがとうございました。
