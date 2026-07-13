@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはClaude CodeとClaude Opus 4.6を基盤に、React NativeではなくネイティブSwiftアプリを直接生成します",
-    "APPLE — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでAppleエコシステム全体を対象にします",
-    "WORKFLOW — 実運用ではAIに足場を作らせ、状態管理とデータ層は自分で書き直す分担に落ち着いてきたという声が目立ちます",
-    "SEED — 4月にLeft Lane Capital主導で$15Mのシードを調達しました（Peak XV・True Ventures・a16z Speedrunが参加）",
-    "PAPERLINE — アプリビルダーPaperlineを買収。エンジニア人材の獲得へ今後も買収を続ける方針です",
-    "REVIEW — 3ヶ月使ったユーザーの再訪レビューが増え、得意・不得意と向く用途の見極めが進んでいます",
+    "RORKMAX — Rork MaxはReact Nativeではなく純粋なSwiftコードを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまで見据えた真のネイティブアプリを作れます",
+    "APPLE — 2026年のRorkはAppleエコシステムのネイティブ強化が明確なテーマになっています",
+    "EXPO — 通常の生成はReact NativeとExpoが土台。作業後には本物のプロジェクト構造とコードが残り、そのまま手で育てられます",
+    "FUNDING — Rorkは直近で1,500万ドルを調達し、月間743,000訪問・85%成長という新たなバイラルを得ています",
+    "PRICING — 無料で始められ、有料プランは月額25ドルから。Rork Maxは月額200ドルです",
+    "CROSS — iOS・Android・Webを単一のプロンプトから生成し、フォローアップの微調整で仕上げられます",
   ],
   en: [
-    "MAX — Rork Max is built on Claude Code and Claude Opus 4.6, generating native Swift apps directly instead of React Native",
-    "APPLE — Rork Max targets the whole Apple ecosystem: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "WORKFLOW — In practice, users settle into letting the AI scaffold while they rewrite the state management and data layer themselves",
-    "SEED — Rork raised a $15M seed led by Left Lane Capital in April, with Peak XV, True Ventures, and a16z Speedrun joining",
-    "PAPERLINE — Rork acquired app builder Paperline and says it will stay acquisitive to bring in engineering talent",
-    "REVIEW — Three-month revisit reviews are growing, clarifying where the tool shines and where it doesn't",
+    "RORKMAX — Rork Max generates pure Swift instead of React Native, enabling true native apps across iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
+    "APPLE — Rork's 2026 direction has a clear theme of native empowerment across the Apple ecosystem",
+    "EXPO — Standard builds run on React Native and Expo, so you're left with a real project structure and code you can keep working on",
+    "FUNDING — Rork recently raised $15M and now sees over 743,000 monthly visits with 85% growth",
+    "PRICING — Rork is free to start, with paid plans from $25/month and Rork Max at $200/month",
+    "CROSS — Rork builds iOS, Android, and web from a single prompt, finished off with a bit of follow-up tweaking",
   ],
 };
 
