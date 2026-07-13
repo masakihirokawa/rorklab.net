@@ -1,297 +1,278 @@
 ---
-title: "Building Stripe Subscriptions with Rork Max — No-Code In-App Billing at Scale"
+title: "Taking Rork Max × Stripe Subscriptions to Production — Webhook Idempotency, State Transitions, and Reconciliation"
 slug: "rork-max-stripe-subscription"
 category: "rork-dev"
-level: "intermediate"
+level: "advanced"
 date: "2026-03-14T14:00"
 author: "Rork Lab"
-description: "A complete guide to implementing Stripe subscriptions in Rork Max. Build production-ready in-app billing without complex backend code—from customer setup to renewal and cancellation."
+premium: true
+description: "Beyond the basic setup: the Stripe subscription failures that only surface in production—duplicate webhooks, out-of-order events, subscription state machines, and keeping your database in sync with Stripe—each with working implementation code."
 tags: ["rork-max", "stripe", "subscription", "in-app-billing", "payments"]
-premium: false
+highlights:
+  - "An idempotency pattern that absorbs duplicate and out-of-order webhook deliveries using an event-ID ledger"
+  - "Handling the full subscription state machine (past_due, incomplete) plus a reconciliation job that treats Stripe as the source of truth"
+  - "Local verification with the Stripe CLI and a break-even table that accounts for processing fees"
 ---
 
-## Setup and context
+## Everything passed in test mode—then a duplicate-charge email arrived
 
-Building a SaaS application or subscription-based service requires robust payment processing and subscription management. However, the complexity of implementing these features often consumes significant development time, pulling attention away from core product work.
+The scariest part of shipping subscriptions isn't the checkout flow. It's the email that lands a few days after you've ticked every box in test mode: "I was charged twice." Running membership billing on my own projects as an indie developer, this is the lesson that stuck with me hardest. Wiring up the payment flow is straightforward. What's hard is that your code quietly assumes Stripe events arrive exactly once, in order—and neither of those things is guaranteed.
 
-Rork Max solves this problem. By integrating with Stripe, developers can build production-ready subscription systems in hours rather than weeks—without wrestling with complex backend logic or API integrations.
+Stripe can deliver the same event more than once. Network timing can land `subscription.updated` before `subscription.created`. While you're clicking through test mode by hand, none of this happens. It only happens in production, once real users arrive and retries and timeouts become routine.
 
-This guide walks you through implementing a practical, scalable subscription system using Rork Max and Stripe. Whether you're launching a premium tier, tiered pricing model, or entirely subscription-based product, you'll learn the exact steps to get from zero to production.
+This article covers the basic Rork Max + Stripe setup, then focuses on the layer that only breaks in production. If your integration already works, skip ahead to "Making webhooks idempotent."
 
 ## Prerequisites
 
-Before diving into this guide, make sure you have:
+Before you start, make sure you have:
 
-- **A Rork Max account** with basic platform familiarity. If you're new, start with our [Stripe payment integration guide](/articles/rork-dev/rork-stripe-payment-integration).
-- **An active Stripe account** with API access. You'll need your publishable and secret keys.
-- **Comfort with REST APIs** and JSON data structures.
-- **A database** to store customer and subscription data. We'll cover Supabase and Firebase options in the [backend guide](/articles/rork-dev/supabase-firebase-backend).
+- **A Rork Max account** with basic familiarity. New to it? Begin with the [Stripe payment integration guide](/articles/rork-dev/rork-stripe-payment-integration).
+- **A Stripe account** with access to your publishable and secret keys.
+- **Comfort with REST APIs and JSON**, which you'll need to follow the signature verification and event handling.
+- **A database** for user and subscription data—Supabase or Firebase both work ([backend guide](/articles/rork-dev/supabase-firebase-backend)).
 
-## Setting Up Stripe
+## Preparing Stripe
 
-Before building anything in Rork Max, you need to configure your products and pricing in Stripe.
+Before building in Rork Max, set up products, prices, and keys in Stripe.
 
-### 1. Create Products and Plans
+### Create products and prices
 
-Start by defining what you're selling.
+1. Open **Products** under **Catalog**
+2. Click **Add product**, enter a name (e.g., "Pro Plan") and description
+3. Under **Add price**, set the amount, billing period (monthly), and recurring
 
-1. Log into your Stripe dashboard
-2. Navigate to **Products** under **Catalog**
-3. Click **Add product**
-4. Enter a product name (e.g., "Pro Plan") and description
-5. Click **Add price** and configure:
-   - **Price**: e.g., $99/month
-   - **Billing period**: Monthly
-   - **Recurring**: Yes
+When you need to change a price later, don't edit the existing price object—create a new one and switch to it. That keeps the prices your current subscribers reference intact.
 
-Create multiple plans (Starter, Pro, Enterprise) by repeating this process.
+### API keys and the webhook signing secret
 
-### 2. Get Your API Keys
+Under **Developers** → **API Keys**, copy your publishable and secret keys. Then note the location of the signing secret (it starts with `whsec_`) in the **Webhooks** section. That signing secret is what later verifies a request genuinely came from Stripe.
 
-Rork Max needs your Stripe API credentials.
+## Connecting Rork Max and designing tables
 
-1. Go to **Developers** → **API Keys**
-2. Copy your **Publishable key** and **Secret key**
-3. Note the **Webhook signing secret** location—you'll need it later
+### Connect Stripe
 
-## Configuring Rork Max
+In Rork Max, go to **Integrations** → **Payment Services** → **Stripe**, paste your secret key, and connect.
 
-### 1. Connect Stripe
+### Subscription tables
 
-Link your Stripe account to Rork Max.
-
-1. Open your Rork Max dashboard
-2. Navigate to **Integrations** → **Payment Services**
-3. Select **Stripe** and click **Connect**
-4. Paste your Stripe secret key
-5. Click **Confirm**
-
-### 2. Create a Subscriptions Table
-
-Store subscription data in your database.
+Store subscription state in your database—but do not make the database your source of truth. The truth always lives in Stripe; your database is a projection of it. Deciding this up front makes the reconciliation logic later far simpler.
 
 ```sql
--- Example: Supabase
+-- Supabase example
 CREATE TABLE subscriptions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   stripe_subscription_id TEXT UNIQUE NOT NULL,
   stripe_customer_id TEXT NOT NULL,
   plan_id TEXT NOT NULL,
-  status TEXT NOT NULL, -- 'active', 'past_due', 'canceled', 'incomplete'
-  current_period_start TIMESTAMP NOT NULL,
+  status TEXT NOT NULL, -- 'active','trialing','past_due','canceled','incomplete'
   current_period_end TIMESTAMP NOT NULL,
   cancel_at_period_end BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Expected output:
--- CREATE TABLE (no errors)
+-- Event ledger: powers webhook idempotency
+CREATE TABLE stripe_events (
+  event_id TEXT PRIMARY KEY,        -- Stripe's evt_xxx
+  type TEXT NOT NULL,
+  processed_at TIMESTAMP DEFAULT NOW()
+);
 ```
 
-### 3. Build Webhook Handler
+That `stripe_events` table is the heart of this article. Making the event ID the primary key lets a database uniqueness constraint reject duplicate deliveries for you.
 
-Stripe sends real-time events (payment success, subscription updates, cancellations). Your webhook endpoint listens for these.
+## Making webhooks idempotent
+
+This is the core of running in production. A naively written handler that receives the same `invoice.payment_succeeded` twice will award points or log a charge twice. The fix is simple in concept: before doing anything, check whether this event ID has already been processed, and if so, return 200 immediately and do nothing.
 
 ```javascript
-// Rork Max Webhook Handler
+// Rork Max Webhook Handler (idempotent)
 // Endpoint: /webhooks/stripe
 
 exports.handler = async (event) => {
   const sig = event.headers['stripe-signature'];
-  const body = event.body;
 
-  // Verify the event came from Stripe
-  const stripeEvent = stripe.webhooks.constructEvent(
-    body,
-    sig,
-    process.env.STRIPE_WEBHOOK_SECRET
-  );
+  // 1. Verify signature against the RAW body (parsed JSON fails)
+  let stripeEvent;
+  try {
+    stripeEvent = stripe.webhooks.constructEvent(
+      event.body, sig, process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    // Return 400 on failure. A 200 tells Stripe to STOP retrying.
+    return { statusCode: 400, body: `Signature verification failed` };
+  }
 
-  // Handle different event types
-  switch (stripeEvent.type) {
-    case 'customer.subscription.updated':
-      const updatedSub = stripeEvent.data.object;
-      await updateSubscriptionInDB(updatedSub);
-      break;
+  // 2. Idempotency guard: already processed -> return 200, do nothing
+  const inserted = await insertEventIfNew(stripeEvent.id, stripeEvent.type);
+  if (!inserted) {
+    return { statusCode: 200, body: JSON.stringify({ duplicate: true }) };
+  }
 
-    case 'customer.subscription.deleted':
-      const deletedSub = stripeEvent.data.object;
-      await cancelSubscriptionInDB(deletedSub);
-      break;
-
-    case 'invoice.payment_succeeded':
-      const invoice = stripeEvent.data.object;
-      await logPaymentSuccess(invoice);
-      break;
-
-    default:
-      console.log(`Unhandled event type: ${stripeEvent.type}`);
+  // 3. Handle by type (side effects only happen here)
+  try {
+    switch (stripeEvent.type) {
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated':
+        await upsertSubscription(stripeEvent.data.object);
+        break;
+      case 'customer.subscription.deleted':
+        await markCanceled(stripeEvent.data.object);
+        break;
+      case 'invoice.payment_failed':
+        await handlePaymentFailed(stripeEvent.data.object);
+        break;
+    }
+  } catch (e) {
+    // On failure, remove from ledger and let Stripe's retry re-deliver
+    await deleteEvent(stripeEvent.id);
+    return { statusCode: 500, body: 'processing failed' };
   }
 
   return { statusCode: 200, body: JSON.stringify({ received: true }) };
 };
 
-// Expected output:
-// On successful webhook: { statusCode: 200, body: '{"received":true}' }
+// insertEventIfNew: returns true only when the row is newly inserted
+async function insertEventIfNew(id, type) {
+  const res = await db.query(
+    `INSERT INTO stripe_events (event_id, type) VALUES ($1, $2)
+     ON CONFLICT (event_id) DO NOTHING RETURNING event_id`,
+    [id, type]
+  );
+  return res.rowCount === 1; // 1 = new, 0 = duplicate
+}
 ```
 
-Register the webhook endpoint in Stripe:
+Three decisions live here. Returning `400` on a failed signature matters because a `200` tells Stripe the request was accepted and it stops retrying. Placing the idempotency guard *before* the side effects keeps duplicates from ever reaching them. And when processing fails, we delete the ledger row and return `500` so Stripe's automatic retry re-processes it. Leave the row in place and return `500`, and the next retry is wrongly treated as "already processed" and never runs.
 
-1. Go to **Developers** → **Webhooks**
-2. Click **Add an endpoint**
-3. Enter your Rork Max endpoint URL (e.g., `https://yourapp.rorklab.app/webhooks/stripe`)
-4. Select events to listen for:
-   - `customer.subscription.updated`
-   - `customer.subscription.deleted`
-   - `invoice.payment_succeeded`
-   - `invoice.payment_failed`
-5. Click **Add endpoint**
+### Guard against out-of-order events
 
-## Implementing Subscription Features
-
-### 1. Creating Subscriptions
-
-Implement the flow for users to start a subscription.
+`subscription.updated` can arrive before `subscription.created`. The defense is to not trust the individual event's payload too much—inside `upsertSubscription`, always re-fetch the latest state from Stripe. Treat the event as a "something changed" signal and pull the actual values via the API.
 
 ```javascript
-// Rork Max Component
-// Subscribe User to Plan
+async function upsertSubscription(subObject) {
+  // Fetch the latest from Stripe, not the values in the event
+  const sub = await stripe.subscriptions.retrieve(subObject.id);
 
-async function createSubscription(userId, planId, paymentMethodId) {
-  try {
-    // 1. Get or create Stripe Customer
-    let customerId = await getCustomerIdFromDB(userId);
+  // Period fields moved to the item in newer API versions
+  const periodEnd = sub.items.data[0]?.current_period_end
+    ?? sub.current_period_end;
 
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: user.email,
-        metadata: { userId: userId }
-      });
-      customerId = customer.id;
-      await saveCustomerIdToDB(userId, customerId);
-    }
+  await db.query(
+    `INSERT INTO subscriptions
+       (user_id, stripe_subscription_id, stripe_customer_id, plan_id, status, current_period_end, cancel_at_period_end)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     ON CONFLICT (stripe_subscription_id) DO UPDATE
+       SET status=$5, current_period_end=$6, cancel_at_period_end=$7, updated_at=NOW()`,
+    [sub.metadata.userId, sub.id, sub.customer, sub.items.data[0].price.id,
+     sub.status, new Date(periodEnd * 1000), sub.cancel_at_period_end]
+  );
+}
+```
 
-    // 2. Create subscription
-    const subscription = await stripe.subscriptions.create({
-      customer: customerId,
-      items: [{ price: planId }],
-      payment_method: paymentMethodId,
-      default_payment_method: paymentMethodId,
-      expand: ['latest_invoice.payment_intent']
-    });
+Watch how `current_period_end` is read. As of API version 2025-03-31, Stripe moved `current_period_start` / `current_period_end` off the subscription object and onto the subscription item. Copy an older tutorial's code verbatim and you'll get `undefined` in production, breaking your "next billing date" display. Reading the item first with the body as a fallback keeps you safe even when accounts run mixed API versions.
 
-    // 3. Store in database
-    await saveSubscriptionToDB({
-      user_id: userId,
-      stripe_subscription_id: subscription.id,
-      stripe_customer_id: customerId,
-      plan_id: planId,
-      status: subscription.status,
-      current_period_start: new Date(subscription.current_period_start * 1000),
-      current_period_end: new Date(subscription.current_period_end * 1000)
-    });
+## Handling the subscription state machine
 
-    // 4. Return success response
-    return {
-      success: true,
-      subscription_id: subscription.id,
-      status: subscription.status
-    };
+If you decide access with a simple "is status active?" check, the payment-failure path will break you. A Stripe subscription is a state machine, and you need to understand at least these transitions.
 
-  } catch (error) {
-    console.error('Subscription creation failed:', error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+<table>
+  <thead>
+    <tr><th>Status</th><th>Meaning</th><th>How your app should treat it</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>trialing</strong></td><td>In free trial</td><td>Grant access; show trial end date</td></tr>
+    <tr><td><strong>active</strong></td><td>Billing normally</td><td>Grant access</td></tr>
+    <tr><td><strong>past_due</strong></td><td>Payment failed, retrying</td><td>Grant a grace window; prompt to update payment</td></tr>
+    <tr><td><strong>incomplete</strong></td><td>Initial payment unfinished</td><td>Do not grant yet</td></tr>
+    <tr><td><strong>canceled</strong></td><td>Canceled</td><td>Grant until period end, then stop</td></tr>
+  </tbody>
+</table>
+
+Concentrate the decision—"is this a state we grant access for?"—in one place. Scatter it and you'll fix one copy and forget another, leaving permissions inconsistent.
+
+```javascript
+const GRANT_STATES = new Set(['trialing', 'active', 'past_due']);
+
+function canAccess(subscription) {
+  if (GRANT_STATES.has(subscription.status)) return true;
+  // A scheduled cancellation still has access until period end
+  if (subscription.status === 'canceled'
+      && subscription.current_period_end > Date.now() / 1000) {
+    return true;
   }
+  return false;
 }
-
-// Expected output:
-// Success: { success: true, subscription_id: 'sub_xxxxx', status: 'active' }
-// Error: { success: false, error: 'Error message' }
 ```
 
-### 2. Changing and Canceling Plans
+Not cutting off `past_due` immediately gives the customer room to update their card. Make this too strict and a temporary decline costs you a good, long-standing subscriber. Pair it with Stripe's billing settings (Smart Retries and dunning emails) and keep access alive through the few days of retries—that's the practical middle ground.
 
-Let users upgrade, downgrade, or cancel their subscriptions.
+## Create, change, and cancel
+
+The basic operations are below. For plan changes, make the proration behavior explicit.
 
 ```javascript
-// Change plan
-async function updateSubscriptionPlan(subscriptionId, newPriceId) {
-  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-
-  const updated = await stripe.subscriptions.update(subscriptionId, {
-    items: [{
-      id: subscription.items.data[0].id,
-      price: newPriceId
-    }],
-    proration_behavior: 'create_prorations' // Enable prorating
+// Change plan (with proration)
+async function updatePlan(subscriptionId, newPriceId) {
+  const sub = await stripe.subscriptions.retrieve(subscriptionId);
+  return stripe.subscriptions.update(subscriptionId, {
+    items: [{ id: sub.items.data[0].id, price: newPriceId }],
+    proration_behavior: 'create_prorations'
   });
-
-  return { success: true, subscription: updated };
 }
 
-// Cancel immediately
-async function cancelSubscriptionImmediate(subscriptionId) {
-  const cancelled = await stripe.subscriptions.del(subscriptionId);
-  return { success: true, subscription: cancelled };
-}
-
-// Cancel at end of billing period
-async function cancelSubscriptionAtPeriodEnd(subscriptionId) {
-  const cancelled = await stripe.subscriptions.update(subscriptionId, {
+// Cancel at period end (a scheduled cancel, not an immediate stop)
+async function cancelAtPeriodEnd(subscriptionId) {
+  return stripe.subscriptions.update(subscriptionId, {
     cancel_at_period_end: true
   });
-  return { success: true, subscription: cancelled };
 }
 ```
 
-### 3. Subscription Management Dashboard
+I'd avoid immediate cancellation (`stripe.subscriptions.cancel`) as a rule. Users strongly resent losing features mid-period after they've paid, and it adds refund handling on top. Scheduling a period-end cancel with `cancel_at_period_end: true`—and offering a path to reconsider in the meantime—is gentler on churn, too.
 
-Build a customer-facing dashboard where users view and manage their subscription.
+## Verify locally with the Stripe CLI
 
-Using Rork Max's canvas editor, add:
+Running your webhook for the first time in production is risky. The Stripe CLI forwards real events to your local server, letting you reproduce duplicates and failure cases.
 
-- **Current plan display**: Plan name and monthly cost
-- **Billing cycle**: Next billing date (`current_period_end`)
-- **Change plan button**: Upgrade or downgrade
-- **Payment method management**: Update card details
-- **Cancel button**: With confirmation dialog
-- **Billing history**: Invoice list and download links
+```bash
+# Forward events to your local endpoint (prints a signing secret)
+stripe listen --forward-to localhost:3000/webhooks/stripe
+
+# In another terminal, fire any event
+stripe trigger invoice.payment_failed
+stripe trigger customer.subscription.deleted
+```
+
+Set the `whsec_` that `stripe listen` prints into your local environment before testing. The quickest way to test the idempotency guard is to `trigger` the same event twice and confirm the second returns `duplicate: true`. Ship only after this, and you'll head off the email from the intro.
+
+## Break-even, with fees factored in
+
+Subscriptions are often described as "revenue = retention × price," but what actually lands in your account is heavily shaped by processing fees—and the smaller and more frequent the charge, the more the fee ratio bites. Using a rough domestic-card rate (3.6%), here's the fee and net per plan:
+
+<table>
+  <thead>
+    <tr><th>Monthly price</th><th>Fee (3.6%)</th><th>Net / charge</th><th>Charges for ¥1,000 margin</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>¥500</td><td>¥18</td><td>¥482</td><td>~2.1</td></tr>
+    <tr><td>¥1,000</td><td>¥36</td><td>¥964</td><td>~1.1</td></tr>
+    <tr><td>¥3,000</td><td>¥108</td><td>¥2,892</td><td>~0.35</td></tr>
+  </tbody>
+</table>
+
+What the table shows is that on low-priced plans, the cost of failed retries and chargebacks erodes profit more than the fee's absolute size does. That's exactly why how you handle `past_due` and dunning isn't merely a courtesy—it's tied directly to revenue. Sitting with these numbers, I keep concluding that keeping an already-paying user comfortable for as long as possible matters more than building the next feature.
 
 ## Troubleshooting
 
-### Common Issues
+**Webhooks aren't arriving**: Check the registered URL, then read the response codes in Stripe's **Webhooks** → **Events** log. A run of `400`s points at signature verification; `500`s point at your processing code.
 
-**Webhooks aren't being received**
+**Signature verification always fails**: Confirm you're verifying against the raw request body, not parsed JSON. If middleware auto-parses to JSON, this single point fails every time.
 
-- Verify the webhook URL is correctly registered in Stripe
-- Check the **Events** log in Stripe's Webhooks section for errors
-- Confirm your webhook secret is properly set in your environment variables
+**Access lingers after cancellation**: `canAccess` granting until `current_period_end` may be correct behavior. If it persists past period end, check whether the `subscription.deleted` handler is erroring.
 
-**Payment declined when creating subscription**
+## Close the last gap with a reconciliation job
 
-- Ensure the payment method is valid (use Stripe test cards in development)
-- Check that customer billing details are complete
-- Review Stripe's fraud detection settings—legitimate payments may be blocked
+However carefully you write your webhooks, a delivery can still be lost entirely. As a final safety net, run a once-a-day reconciliation job that treats Stripe as the truth and compares it against your database. It catches drift—`active` in Stripe but still `past_due` in your DB, or the reverse—and corrects it. That single job quietly resolves most of those hard-to-reproduce "permissions are sometimes wrong" bugs.
 
-**Proration not calculating when changing plans**
-
-- Verify `proration_behavior` is set to `create_prorations`
-- Check that proration is enabled in your Stripe billing settings
-
-## Conclusion
-
-Combining Rork Max with Stripe lets you build complex subscription systems without the complexity. Following this guide gives you:
-
-- Secure subscription infrastructure
-- Real-time event handling via webhooks
-- Scalable customer management
-- Proper error handling and edge cases
-
-Subscription business models create stable, predictable revenue and deeper customer relationships. Use Rork Max to focus on what matters—delivering value to users.
-
-Ready to launch? Start with a single plan, test thoroughly with Stripe's test mode, and scale from there. Your users (and your revenue) will thank you.
+A subscription isn't something you build and walk away from; it's the work of keeping a quiet system running. Stumble once in production and the meaning of each small decision here really sinks in. If this article spares you even one of those first stumbles, I'll be glad. Thank you for reading.
