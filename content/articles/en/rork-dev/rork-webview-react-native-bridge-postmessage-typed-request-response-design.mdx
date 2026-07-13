@@ -1,0 +1,246 @@
+---
+title: "postMessage Is Fire-and-Forget — Designing a Correlated Request/Response Bridge Between a WebView and React Native"
+slug: "rork-webview-react-native-bridge-postmessage-typed-request-response-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-13T14:30"
+author: "Rork Lab"
+description: "postMessage between a WebView and React Native is one-way, so you never learn whether the work you asked for actually succeeded. Here is a typed request/response bridge, with correlation IDs and timeouts, built in working TypeScript."
+tags: ["WebView", "React Native", "Rork", "Bridge", "TypeScript"]
+highlights:
+  - "A design that turns one-way postMessage into an awaitable call using correlation IDs"
+  - "Cleaning up every request left dangling by a 5s timeout, unmounts, and reloads"
+  - "Origin checks and a type allowlist so an embedded web page is never trusted blindly"
+---
+
+## I could not tell whether the save had really finished
+
+I had built a small app in Rork, as an indie developer, and embedded an existing web-based markdown editor inside a WebView. When the native "Save" button was pressed, `injectedJavaScript` pulled the editor's content and sent it to my own backend. That part worked within an hour.
+
+The trouble showed up when a user closed the screen right after tapping Save. The content had not been retrieved yet, but a "saved" toast still appeared. On slow devices, the opposite happened and the same content was submitted twice. Tracing it, I realized the cause was a single thing: `window.ReactNativeWebView.postMessage` is a one-way channel, and there is no built-in way to know whether the work you asked for actually succeeded.
+
+This article shares the request/response bridge I built to close that gap — one that ties each send to its reply with a correlation ID, so on the native side you can simply write `await bridge.call(...)`.
+
+## Why postMessage is fire-and-forget
+
+WebView communication in React Native looks bidirectional, but it is really two independent one-way pipes. From native to web, you push a JavaScript string with `injectedJavaScript` or `webviewRef.injectJavaScript()`. From web to native, you call `window.ReactNativeWebView.postMessage(string)` and receive it in the native `onMessage`.
+
+Those two pipes have nothing that links a request to its reply. When native injects "give me the content," the framework does not tell you which of the messages that later arrive at `onMessage` corresponds to that request. With a single message type this is fine. But once you add save, fetch, validate, and "where is the scroll position" as distinct operations, you can no longer tell which reply belongs to which request, and state gets tangled.
+
+An HTTP request and its response line up because a TCP connection or an HTTP/2 stream ID binds them. postMessage has none of that. So give it one yourself — a correlation ID. That was the starting point of the design.
+
+## Fix the envelope
+
+First, freeze the shape of the strings exchanged on both sides. Put the payload inside an envelope, and write a correlation ID and a kind onto the envelope. Four kinds — request, response, error, and a fire-and-forget event — are all expressed by one type.
+
+```ts
+// bridge/protocol.ts — shared type between native and web
+export type BridgeKind = "request" | "response" | "error" | "event";
+
+export interface BridgeEnvelope<T = unknown> {
+  v: 1;              // protocol version, for breaking changes
+  id: string;        // correlation ID (same on request and response)
+  kind: BridgeKind;
+  type: string;      // an operation name like "editor.getContent"
+  payload?: T;
+  error?: { code: string; message: string };
+}
+
+// allowlist of operation names (drop unknown types)
+export const ALLOWED_TYPES = [
+  "editor.getContent",
+  "editor.setContent",
+  "editor.isDirty",
+  "viewport.scrollTo",
+] as const;
+export type AllowedType = (typeof ALLOWED_TYPES)[number];
+```
+
+The reason `v` exists is to avoid clashing with a stale WebView cache after you later change the payload shape. I once left it out, and on the first launch after an app update the old HTML was read from cache, the envelope was interpreted differently, and the bridge went silent. A single version number at least lets you notice "I cannot interpret this." I recommend adding `v` from the very start.
+
+## Native side: make an awaitable call
+
+The heart of it lives on the native side. When you send a request, mint a unique ID and stash that ID's Promise resolver in a "pending" map. When a reply arrives, look up the map by the envelope's ID and resolve it. That turns the send into something you can `await`.
+
+```ts
+// bridge/useWebViewBridge.ts
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import type { WebView, WebViewMessageEvent } from "react-native-webview";
+import { ALLOWED_TYPES, type BridgeEnvelope } from "./protocol";
+
+interface Pending {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export function useWebViewBridge(allowedOrigin: string) {
+  const ref = useRef<WebView>(null);
+  const pending = useRef(new Map<string, Pending>());
+  const seq = useRef(0);
+
+  const call = useCallback(
+    <T = unknown>(type: string, payload?: unknown, timeoutMs = 5000): Promise<T> => {
+      const web = ref.current;
+      if (!web) return Promise.reject(new Error("webview-not-ready"));
+
+      const id = `${Date.now()}-${seq.current++}`;
+      const envelope: BridgeEnvelope = { v: 1, id, kind: "request", type, payload };
+
+      return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.current.delete(id);
+          reject(new Error(`bridge-timeout: ${type}`));
+        }, timeoutMs);
+
+        pending.current.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+        // wrap JSON in JSON and hand it to the web receiver
+        web.injectJavaScript(
+          `window.__bridgeReceive(${JSON.stringify(JSON.stringify(envelope))});true;`
+        );
+      });
+    },
+    []
+  );
+
+  const onMessage = useCallback((e: WebViewMessageEvent) => {
+    // origin check: only accept messages from the expected URL
+    if (e.nativeEvent.url && !e.nativeEvent.url.startsWith(allowedOrigin)) return;
+
+    let env: BridgeEnvelope;
+    try {
+      env = JSON.parse(e.nativeEvent.data);
+    } catch {
+      return; // ignore malformed strings
+    }
+    if (env.v !== 1 || !ALLOWED_TYPES.includes(env.type as never)) return;
+
+    const p = pending.current.get(env.id);
+    if (!p) return; // no matching request (already timed out, etc.)
+    clearTimeout(p.timer);
+    pending.current.delete(env.id);
+
+    if (env.kind === "error") {
+      p.reject(new Error(env.error?.message ?? "bridge-error"));
+    } else {
+      p.resolve(env.payload);
+    }
+  }, [allowedOrigin]);
+
+  // on unmount, settle every request left in the air
+  useEffect(() => {
+    const map = pending.current;
+    return () => {
+      map.forEach((p) => {
+        clearTimeout(p.timer);
+        p.reject(new Error("bridge-unmounted"));
+      });
+      map.clear();
+    };
+  }, []);
+
+  return useMemo(() => ({ ref, call, onMessage }), [call, onMessage]);
+}
+```
+
+The string passed to `injectJavaScript` runs `JSON.stringify` twice on purpose, so the envelope is embedded safely as "a JavaScript expression whose value is a JSON string." Stringify it only once and any quote or newline inside the payload breaks the expression, causing a silent syntax error on the web side. Wrap it twice, and `JSON.parse` once on the web side. Deciding this asymmetry up front makes everything after it easier.
+
+## Web side: a receiver and a reply
+
+Inside the web page (the WebView content), provide a single entry point `window.__bridgeReceive` for native requests, look up a handler per type, pack the result into an envelope, and reply. The essential move is to reuse the request's ID as the reply's ID.
+
+```html
+<!-- bridge-web.js loaded by the HTML inside the WebView -->
+<script>
+(function () {
+  const handlers = {
+    "editor.getContent": async () => ({ markdown: window.editor.getValue() }),
+    "editor.setContent": async (p) => { window.editor.setValue(p.markdown); return { ok: true }; },
+    "editor.isDirty": async () => ({ dirty: window.editor.isDirty() }),
+  };
+
+  function send(env) {
+    window.ReactNativeWebView.postMessage(JSON.stringify(env));
+  }
+
+  window.__bridgeReceive = async function (raw) {
+    let req;
+    try { req = JSON.parse(raw); } catch { return; }
+    if (req.v !== 1 || req.kind !== "request") return;
+
+    const handler = handlers[req.type];
+    if (!handler) {
+      send({ v: 1, id: req.id, kind: "error", type: req.type,
+             error: { code: "unknown_type", message: req.type } });
+      return;
+    }
+    try {
+      const payload = await handler(req.payload);
+      send({ v: 1, id: req.id, kind: "response", type: req.type, payload });
+    } catch (err) {
+      send({ v: 1, id: req.id, kind: "error", type: req.type,
+             error: { code: "handler_failed", message: String(err && err.message || err) } });
+    }
+  };
+})();
+</script>
+```
+
+Now the native side reads cleanly. `EDITOR_ORIGIN` is a constant that holds the origin of the embedded web page. Retrieve the content reliably before saving, and only show the toast once success comes back. The double-submit and race that opened this article dissolve naturally under `await`.
+
+```tsx
+const bridge = useWebViewBridge(EDITOR_ORIGIN);
+
+async function handleSave() {
+  try {
+    const { markdown } = await bridge.call<{ markdown: string }>("editor.getContent");
+    await saveToBackend(markdown);   // only here is the save actually complete
+    showToast("Saved");
+  } catch (e) {
+    // timeout / unmounted / handler_failed all funnel here
+    showToast("Could not save. Please try again");
+  }
+}
+```
+
+## How to clean up requests left in the air
+
+The most overlooked part of a request/response design is settling the case where no reply comes back. Without it, unresolved Promises pile up in the pending map and quietly corrupt memory and state. I always close three boundaries.
+
+1. Timeout. In the code above, each request arms a `setTimeout` and rejects, then removes itself from the map, if no reply arrives in time. The default is five seconds, but heavy operations such as fetching a large document can extend it at the call site.
+2. Unmount. When a screen transition destroys the WebView, in-flight requests never return. The `useEffect` cleanup rejects every pending entry and empties the map. With this in place, a late reply arriving right after a transition no longer crashes anything.
+3. Reload. When the WebView reloads — via `onContentProcessDidTerminate` or a manual reload — `window.__bridgeReceive` is rebuilt and every earlier request vanishes. Detect the reload, reject the pending set, and let the call site retry if needed.
+
+Never leaving "no reply" unhandled, always treating it as a failure, was the line between a flaky bridge and a stable one. In this case an explicit error is far easier for the call site to branch on than silence.
+
+## Do not trust the embedded web too much
+
+A bridge also opens a window from an external web page to native capabilities. Even if the embedded HTML is under your control, the external scripts it loads and any page it navigates to may not be. At a minimum I recommend keeping to three rules.
+
+<table>
+  <thead>
+    <tr><th>Defense</th><th>Purpose</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Origin check</td><td>Inspect <code>nativeEvent.url</code> in <code>onMessage</code> and drop messages from anything but the expected origin</td></tr>
+    <tr><td>Type allowlist</td><td>Never run a <code>type</code> not in <code>ALLOWED_TYPES</code>; the handler side also rejects unknown types with an error reply</td></tr>
+    <tr><td>Untrust the payload</td><td>Never hand a received value straight to <code>eval</code> or a query; validate its shape before use</td></tr>
+  </tbody>
+</table>
+
+The most dangerous pattern is taking an incoming string and putting it directly into `injectJavaScript` to send back to the web. If a crafted payload turns into an expression, that is arbitrary script execution. Always wrap the envelope with `JSON.stringify` and pass it as a value. That one habit narrows the injection surface considerably.
+
+Cases where a WebView renders blank only in production need a different lens. If that symptom sounds familiar, it is worth checking [how to isolate a WebView that goes blank in production](/articles/rork-dev/rork-webview-blank-screen-not-loading-troubleshooting) as well, to rule out loading problems that sit before the bridge.
+
+## Bidirectional: same envelope when the web calls native
+
+Everything above was native-initiated, but the reverse — the web asking native for a photo picker or haptics — fits the same envelope. Give the web side its own sequence counter and pending map, and in the native `onMessage` branch on `kind: "request"` to look up a handler. The roles become symmetric, so once you write one direction you can copy it into the other.
+
+While one direction is enough, use only the fire-and-forget `kind: "event"`, and promote to request/response only what actually needs a reply. Keeping this progression avoids adding more round trips than you need.
+
+## A one-way channel can be repaired while staying one-way
+
+A WebView bridge can become "communication you can wait on" through one small promise — a correlation ID — without writing a complex native module. The two essentials were fixing the envelope shape first, and always settling a request that never returns as a failure.
+
+I struggled with tangled state myself when I first used postMessage naively, but after adding the envelope and timeouts, WebView-related bug reports nearly stopped coming. If you live with an embedded web page for the long haul in personal development, I hope this helps a little. Thank you for reading.

@@ -1,0 +1,246 @@
+---
+title: "WebViewのpostMessageは投げたら終わり — 相関IDで要求と応答を結ぶブリッジを設計する"
+slug: "rork-webview-react-native-bridge-postmessage-typed-request-response-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-13T14:30"
+author: "Rork Lab"
+description: "WebView と React Native の postMessage は片道通信で、送った処理が成功したのか分かりません。相関IDと応答を組み込んだ要求・応答型ブリッジを、動く TypeScript コードで設計します。"
+tags: ["WebView", "React Native", "Rork", "ブリッジ", "TypeScript"]
+highlights:
+  - "postMessage の片道性を相関IDで補い、Promise で待てる呼び出しに変える設計"
+  - "タイムアウト5秒・アンマウント・リロードで宙に浮く要求を漏れなく片付ける実装"
+  - "オリジン検証と型ホワイトリストで、埋め込んだ Web を信頼しすぎない防御"
+---
+
+## 送ったはずの保存が、本当に終わったのか分からなかった
+
+Rork で作った個人開発アプリに、既存の Web 版マークダウンエディタを WebView で埋め込んだときのことです。ネイティブ側の「保存」ボタンを押すと、`injectedJavaScript` でエディタの本文を取り出して自前のバックエンドへ送る。その設計自体は数十分で動きました。
+
+問題は、保存ボタンを押した直後にユーザーが画面を閉じたときでした。本文がまだ取り出せていないのに保存完了のトーストが出る。逆に、通信が遅い端末では二重送信が起きる。原因を追ううちに、根っこは一つだと気づきました。`window.ReactNativeWebView.postMessage` は投げたら終わりの片道通信で、送った処理が成功したのかを知る仕組みが最初から無いのです。
+
+ここでは、この片道性を埋めるために私が組んだ要求・応答型のブリッジを共有します。相関IDで送信と応答を結びつけ、ネイティブ側からは `await bridge.call(...)` と書けるようにする設計です。
+
+## postMessage が「投げたら終わり」である理由
+
+React Native の WebView 通信は、双方向に見えて実際には独立した二本の片道パイプです。ネイティブから Web へは `injectedJavaScript` あるいは `webviewRef.injectJavaScript()` で JavaScript 文字列を流し込む。Web からネイティブへは `window.ReactNativeWebView.postMessage(string)` を呼び、ネイティブ側の `onMessage` で受け取る。
+
+この二本には、要求と応答を紐づける仕組みがありません。ネイティブが「本文をくれ」と流し込んだ JavaScript の実行結果が、あとから `onMessage` に届いたメッセージのどれに対応するのか、フレームワークは教えてくれないのです。メッセージが一種類だけなら気になりません。ところが保存・取得・検証・スクロール位置の問い合わせと種類が増えると、届いた文字列がどの要求への返事なのか判別できず、状態が混線します。
+
+HTTP のリクエストとレスポンスが対応づくのは、TCP コネクションや HTTP/2 のストリームIDが両者を結んでいるからです。postMessage にはそれが無い。ならば、自分で相関IDを持たせればよい。これが設計の出発点でした。
+
+## 封筒（エンベロープ）を決める
+
+まず、両側でやり取りする文字列の形を固定します。本文（payload）を封筒に入れ、封筒に相関IDと種別を書く。要求・応答・エラー・ネイティブへの通知の四種類を一つの型で表現します。
+
+```ts
+// bridge/protocol.ts — ネイティブ・Web で共有する型定義
+export type BridgeKind = "request" | "response" | "error" | "event";
+
+export interface BridgeEnvelope<T = unknown> {
+  v: 1;              // プロトコルバージョン。破壊的変更に備える
+  id: string;        // 相関ID（要求と応答で同一）
+  kind: BridgeKind;
+  type: string;      // "editor.getContent" のような操作名
+  payload?: T;
+  error?: { code: string; message: string };
+}
+
+// 許可する操作名のホワイトリスト（未知の type は捨てる）
+export const ALLOWED_TYPES = [
+  "editor.getContent",
+  "editor.setContent",
+  "editor.isDirty",
+  "viewport.scrollTo",
+] as const;
+export type AllowedType = (typeof ALLOWED_TYPES)[number];
+```
+
+`v` を持たせているのは、後日 payload の形を変えたときに古い WebView キャッシュと衝突しないためです。私はこれを一度省いて、アプリ更新後の初回起動で古い HTML がキャッシュから読まれ、封筒の解釈がずれて沈黙する事故を起こしました。バージョン番号一つで、少なくとも「解釈できない」と気づけます。私はこの `v` を最初から入れておくことを推奨します。
+
+## ネイティブ側：Promise で待てる call を作る
+
+核心はネイティブ側です。要求を送るときに一意なIDを採番し、そのIDに対応する Promise の解決関数を「保留中マップ」に控えておく。応答が届いたら、封筒のIDでマップを引いて解決する。これで `await` できる呼び出しになります。
+
+```ts
+// bridge/useWebViewBridge.ts
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import type { WebView, WebViewMessageEvent } from "react-native-webview";
+import { ALLOWED_TYPES, type BridgeEnvelope } from "./protocol";
+
+interface Pending {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export function useWebViewBridge(allowedOrigin: string) {
+  const ref = useRef<WebView>(null);
+  const pending = useRef(new Map<string, Pending>());
+  const seq = useRef(0);
+
+  const call = useCallback(
+    <T = unknown>(type: string, payload?: unknown, timeoutMs = 5000): Promise<T> => {
+      const web = ref.current;
+      if (!web) return Promise.reject(new Error("webview-not-ready"));
+
+      const id = `${Date.now()}-${seq.current++}`;
+      const envelope: BridgeEnvelope = { v: 1, id, kind: "request", type, payload };
+
+      return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.current.delete(id);
+          reject(new Error(`bridge-timeout: ${type}`));
+        }, timeoutMs);
+
+        pending.current.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+        // JSON を JSON にくるみ、Web 側の受信口へ渡す
+        web.injectJavaScript(
+          `window.__bridgeReceive(${JSON.stringify(JSON.stringify(envelope))});true;`
+        );
+      });
+    },
+    []
+  );
+
+  const onMessage = useCallback((e: WebViewMessageEvent) => {
+    // オリジン検証：想定した URL からのメッセージだけ受ける
+    if (e.nativeEvent.url && !e.nativeEvent.url.startsWith(allowedOrigin)) return;
+
+    let env: BridgeEnvelope;
+    try {
+      env = JSON.parse(e.nativeEvent.data);
+    } catch {
+      return; // 壊れた文字列は無視
+    }
+    if (env.v !== 1 || !ALLOWED_TYPES.includes(env.type as never)) return;
+
+    const p = pending.current.get(env.id);
+    if (!p) return; // 対応する要求が無い＝タイムアウト済み等
+    clearTimeout(p.timer);
+    pending.current.delete(env.id);
+
+    if (env.kind === "error") {
+      p.reject(new Error(env.error?.message ?? "bridge-error"));
+    } else {
+      p.resolve(env.payload);
+    }
+  }, [allowedOrigin]);
+
+  // アンマウント時に宙に浮いた要求を全て片付ける
+  useEffect(() => {
+    const map = pending.current;
+    return () => {
+      map.forEach((p) => {
+        clearTimeout(p.timer);
+        p.reject(new Error("bridge-unmounted"));
+      });
+      map.clear();
+    };
+  }, []);
+
+  return useMemo(() => ({ ref, call, onMessage }), [call, onMessage]);
+}
+```
+
+`injectJavaScript` に渡す文字列で `JSON.stringify` を二重に掛けているのは、封筒を「JSON文字列を値に持つ JavaScript 式」として安全に埋め込むためです。ここを一重で済ませると、payload に含まれる引用符や改行が式を壊し、Web 側で構文エラーになって沈黙します。二重に包み、Web 側で一度 `JSON.parse` する。この非対称を最初に決めておくと、あとが楽になります。
+
+## Web 側：受信口と応答
+
+Web（WebView 内）には、ネイティブからの要求を受ける入口 `window.__bridgeReceive` を一つ用意し、type ごとにハンドラを引いて結果を封筒に詰めて返します。要求のIDをそのまま応答のIDに使うのが肝心です。
+
+```html
+<!-- WebView 内の HTML に読み込む bridge-web.js -->
+<script>
+(function () {
+  const handlers = {
+    "editor.getContent": async () => ({ markdown: window.editor.getValue() }),
+    "editor.setContent": async (p) => { window.editor.setValue(p.markdown); return { ok: true }; },
+    "editor.isDirty": async () => ({ dirty: window.editor.isDirty() }),
+  };
+
+  function send(env) {
+    window.ReactNativeWebView.postMessage(JSON.stringify(env));
+  }
+
+  window.__bridgeReceive = async function (raw) {
+    let req;
+    try { req = JSON.parse(raw); } catch { return; }
+    if (req.v !== 1 || req.kind !== "request") return;
+
+    const handler = handlers[req.type];
+    if (!handler) {
+      send({ v: 1, id: req.id, kind: "error", type: req.type,
+             error: { code: "unknown_type", message: req.type } });
+      return;
+    }
+    try {
+      const payload = await handler(req.payload);
+      send({ v: 1, id: req.id, kind: "response", type: req.type, payload });
+    } catch (err) {
+      send({ v: 1, id: req.id, kind: "error", type: req.type,
+             error: { code: "handler_failed", message: String(err && err.message || err) } });
+    }
+  };
+})();
+</script>
+```
+
+これで、ネイティブ側は次のように書けます。`EDITOR_ORIGIN` は埋め込む Web のオリジンを表す定数です。保存の前に本文を確実に取り出し、成功を待ってからトーストを出す。冒頭で悩んだ二重送信も競合も、`await` で自然に解けます。
+
+```tsx
+const bridge = useWebViewBridge(EDITOR_ORIGIN);
+
+async function handleSave() {
+  try {
+    const { markdown } = await bridge.call<{ markdown: string }>("editor.getContent");
+    await saveToBackend(markdown);   // ここまで来て初めて保存完了
+    showToast("保存しました");
+  } catch (e) {
+    // timeout / unmounted / handler_failed が全てここに集まる
+    showToast("保存できませんでした。もう一度お試しください");
+  }
+}
+```
+
+## 宙に浮く要求をどう片付けるか
+
+要求・応答型で最も見落とされがちなのが、応答が返らないケースの後始末です。ここを設計しないと、保留中マップに解決されない Promise が積もり、メモリと状態が静かに壊れていきます。私は次の三つの境界を必ず塞ぐようにしています。
+
+1. タイムアウト。上のコードでは要求ごとに `setTimeout` を仕掛け、時間内に応答が無ければ `reject` してマップから消します。既定は5秒ですが、大きな本文の取得など重い操作は呼び出し側で延ばせるようにしておきます。
+2. アンマウント。画面遷移で WebView が消えると、実行中の要求は永遠に返りません。`useEffect` のクリーンアップで保留中を全て `reject` し、マップを空にします。これを入れておくと、遷移直後に届いた古い応答でクラッシュすることもなくなります。
+3. リロード。WebView が `onContentProcessDidTerminate` や手動リロードで再読込されると、`window.__bridgeReceive` は作り直され、それ以前の要求は消滅します。リロードを検知したら保留中を `reject` し、必要なら呼び出し側で再試行させます。
+
+「返ってこない」を放置せず、必ず失敗として扱うのが安定運用の分かれ目でした。この場合は沈黙よりも明示的なエラーのほうが、呼び出し側の分岐をずっと書きやすくします。
+
+## 埋め込んだ Web を信頼しすぎない
+
+ブリッジは、外部の Web にネイティブ機能への窓口を開ける行為でもあります。埋め込む HTML が自分の管理下にあっても、そこが読み込む外部スクリプトや、遷移した先のページまで安全とは限りません。私は最低限、次の三点を守ることを推奨します。
+
+<table>
+  <thead>
+    <tr><th>防御</th><th>目的</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>オリジン検証</td><td><code>onMessage</code> で <code>nativeEvent.url</code> を確認し、想定したオリジン以外からのメッセージを捨てる</td></tr>
+    <tr><td>型ホワイトリスト</td><td><code>ALLOWED_TYPES</code> に無い <code>type</code> は実行しない。ハンドラ側でも未知の type はエラー応答で弾く</td></tr>
+    <tr><td>payload の非信頼化</td><td>受け取った値は <code>eval</code> やクエリに直接渡さず、必ず形を検証してから使う</td></tr>
+  </tbody>
+</table>
+
+とりわけ危ういのは、届いた文字列をそのまま `injectJavaScript` に載せて Web へ送り返すような実装です。相手が細工した payload が式に化けると、任意のスクリプト実行につながります。封筒は必ず `JSON.stringify` で包み、値として渡す。この一手で、注入の入口をかなり狭められます。
+
+WebView が本番でだけ真っ白になる、といった描画側の切り分けは別の観点が必要になります。その症状に心当たりがあれば、[WebViewが本番で真っ白になるときの切り分け手順](/articles/rork-dev/rork-webview-blank-screen-not-loading-troubleshooting)も併せて確認いただくと、ブリッジ以前の読み込み問題を除外できます。
+
+## 双方向：Web からネイティブを呼ぶときも同じ封筒で
+
+ここまではネイティブ発の要求でしたが、逆向き（Web が写真選択やハプティクスをネイティブに頼む）も同じエンベロープで統一できます。Web 側に採番と保留中マップを持たせ、ネイティブ側の `onMessage` で `kind: "request"` を判定してハンドラを引く。役割が対称になるので、一度片方を書けばもう片方は写して作れます。
+
+一方向で足りるうちは `kind: "event"` の一方通行だけ使い、応答が要るものだけ要求・応答に上げる。この段階的な使い分けにしておくと、必要以上に往復を増やさずに済みます。
+
+## 片道通信は、片道のまま補える
+
+WebView のブリッジは、複雑なネイティブモジュールを書かなくても、相関IDという小さな約束一つで「待てる通信」に変えられます。要点は、封筒の形を先に固定すること、そして返ってこない要求を必ず失敗として片付けることの二つでした。
+
+私自身、最初は postMessage を素朴に使って状態の混線に悩みましたが、封筒とタイムアウトを入れてからは WebView 由来の不具合報告がほとんど来なくなりました。埋め込みの Web と長く付き合う個人開発の現場で、少しでも参考になれば嬉しいです。お読みいただきありがとうございました。
