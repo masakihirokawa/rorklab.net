@@ -1,0 +1,232 @@
+---
+title: "Adding a Single Zod Validation Boundary to Rork's Generated Fetch Code"
+slug: "rork-generated-fetch-zod-validation-boundary-layer"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-14T05:27"
+updated: "2026-07-14T05:27"
+author: "Rork Lab"
+description: "The network code Rork generates implicitly trusts the shape of the response. When the API shifts, the screen quietly goes blank. Here is how to slip a single Zod parse layer between the generated UI and the network to make failures predictable, with numbers from real operation."
+tags: ["Rork", "React Native", "zod", "API", "Error Handling"]
+highlights:
+  - "If your screen kept going silently blank whenever the API changed shape, you can add a validation boundary today that makes failures predictable"
+  - "You will get the concrete implementation and code to slip a Zod parse layer between the network and the UI without rewriting the generated code"
+  - "You will learn where to place the boundary so regeneration never wipes it out"
+---
+
+One morning, on one of the apps I build and run on my own, a single list screen was reported as blank. The crash logs showed nothing. It had not crashed. The data just would not appear.
+
+The cause was on the server. The day before, the `price` field in the API response had changed from a number to a string. The fetch code Rork had generated treated that field as a number, exactly as it was written. The type mismatch went unnoticed until runtime, and only the rendering quietly stopped.
+
+This "silent way of breaking" in generated network code is unavoidable once you run several apps as an indie developer. I've stepped on this same rake more than once across the apps I ship on the App Store and Google Play. Rather than rewriting all of the generated code, what follows is a minimal approach: slipping a single validation boundary between the network and the UI.
+
+## Why generated fetch code breaks silently
+
+When an AI builder like Rork writes fetch code, it infers the response shape from your prompt or a single sample. What it produces usually looks like this:
+
+```typescript
+// A typical fetch Rork tends to generate
+async function getProducts() {
+  const res = await fetch("https://api.example.com/products");
+  const data = await res.json();
+  // data.items is "supposed" to be an array — but nothing guarantees it
+  return data.items.map((item) => ({
+    id: item.id,
+    name: item.name,
+    price: item.price, // "supposed" to be a number
+  }));
+}
+```
+
+This code works the moment it is generated. The problem is that the response shape is frozen to "the assumption at that moment."
+
+If the API renames `items` to `results`, `data.items.map` becomes `undefined.map` and throws. If `price` becomes a string, it does not throw at all — a price calculation quietly turns into `NaN`, or a comparison silently goes wrong. The latter is the nastier one. Bugs that crash get noticed; bugs that quietly produce wrong answers survive in production for a long time.
+
+TypeScript's type annotations will not protect you from this mismatch. Types are a compile-time promise; they do not inspect the JSON that arrives from the server at runtime. Data from beyond the boundary can always betray its declared type.
+
+## The idea: slip in just one validation boundary
+
+One option is "don't trust the generated code, rewrite all of it by hand." But that dilutes the point of using Rork. After about three months of using it, my honest takeaway is that letting the AI handle the scaffolding (the skeleton and layout of a screen) while I personally handle the critical seams is the realistic division of labor.
+
+One of those critical seams is the boundary between the network and the UI.
+
+The idea is simple. Between the generated fetch and the UI component, you slip in exactly one layer that inspects the response and converts it into a trustworthy shape. Any data that passes through this layer can be handled downstream with confidence. Whatever happens inside the layer (the communication with the server), the UI only ever receives one of two things: validated data, or a handleable error.
+
+Zod, which validates schemas at runtime, fits this boundary well. Many people have used Zod for form input validation; here we point the same idea at the API response side. I cover the input side in [rebuilding Rork's generated form screens with react-hook-form and zod](/en/articles/rork-dev/rork-form-validation-react-hook-form-zod-keyboard-ux). This article is the opposite direction: the data coming from the server.
+
+## Write the Zod schema as a "contract for the response"
+
+First, define the shape the API is supposed to return as a schema, in one place. This becomes the contract exchanged between the UI and the server.
+
+```typescript
+// schemas/product.ts — keep the response contract in one place
+import { z } from "zod";
+
+export const ProductSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  // z.coerce.number() pulls strings like "1200" toward a number
+  // Even if the server wobbles on type, the UI always receives a number
+  price: z.coerce.number(),
+});
+
+export const ProductListSchema = z.object({
+  items: z.array(ProductSchema),
+});
+
+// Derive the type from the schema — no double bookkeeping with a hand-written interface
+export type Product = z.infer<typeof ProductSchema>;
+```
+
+Using `z.infer` derives the type from a single schema, so you no longer maintain a hand-written `interface` in parallel. Keeping the contract in one place pays off later during maintenance.
+
+The docs describe `z.coerce.number()` as coercion to a number, but in real operation it works as a cushion that absorbs type wobble on the server side. Whether `price` is `1200` or `"1200"`, the UI always receives a `number`. That said, as I explain below, coercing everything is not the answer.
+
+## Slip in the boundary without breaking the generated fetch
+
+Once the contract exists, you rewrite the generated fetch only minimally. Rather than changing the logic significantly, the basic move is to add one line that runs the response through the schema.
+
+```typescript
+// api/products.ts — add a single parse boundary to the generated code
+import { ProductListSchema, type Product } from "../schemas/product";
+
+export async function getProducts(): Promise<Product[]> {
+  const res = await fetch("https://api.example.com/products");
+  if (!res.ok) {
+    throw new ApiError(`products fetch failed: ${res.status}`);
+  }
+  const json = await res.json();
+
+  // This is the boundary — only inspected data proceeds
+  const parsed = ProductListSchema.parse(json);
+  return parsed.items;
+}
+```
+
+The diff is tiny. Instead of touching `data.items.map(...)` directly, you pass it once through `ProductListSchema.parse(json)`.
+
+This one move fundamentally changes behavior. If `items` disappears or `price` takes an unexpected shape, `parse` throws right there. The place where things break moves from "deep inside the UI render" to "this one line at the network boundary." The time it takes to locate the cause shrinks noticeably.
+
+## Turn "silent blank" into "handleable error"
+
+Using `parse` at the boundary makes it throw. But an unexpected exception in the UI layer breaks the screen in its own way. So closer to the UI, use `safeParse` and receive success or failure as a value.
+
+```typescript
+// hooks/useProducts.ts — treat success/failure as state with safeParse
+import { useState, useEffect } from "react";
+import { ProductListSchema, type Product } from "../schemas/product";
+
+type Result =
+  | { status: "loading" }
+  | { status: "ready"; products: Product[] }
+  | { status: "error"; reason: "network" | "shape" };
+
+export function useProducts(): Result {
+  const [result, setResult] = useState<Result>({ status: "loading" });
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch("https://api.example.com/products");
+        const json = await res.json();
+        const parsed = ProductListSchema.safeParse(json);
+
+        if (!alive) return;
+        if (!parsed.success) {
+          // Shape differs from the contract — this is where you finally notice
+          logShapeMismatch(parsed.error);
+          setResult({ status: "error", reason: "shape" });
+          return;
+        }
+        setResult({ status: "ready", products: parsed.data.items });
+      } catch {
+        if (alive) setResult({ status: "error", reason: "network" });
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  return result;
+}
+```
+
+The point is that `reason` distinguishes "communication failure" from "shape difference." These two have completely different causes and remedies. A network failure often clears up on retry, while a shape difference needs a fix on the code side or the server side. You can show different messages in the UI, and more importantly, you can tell them apart while operating the app.
+
+In `logShapeMismatch`, `parsed.error` tells you which field diverged from the contract. Logging this lets you notice an API change immediately rather than after the fact. For keeping personal data out of those logs, see [logging design for Rork apps: what to keep and how to redact PII](/en/articles/rork-dev/rork-structured-logging-pii-redaction-design). For catching non-crashing errors in general, I've written it up in [killing the silent crash in Rork-generated apps](/en/articles/rork-dev/rork-error-boundary-unhandled-promise-production-guide).
+
+## Design a home that survives regeneration
+
+Here is a pitfall specific to AI builders. If you write the boundary code in the same file as the generated fetch, then when you ask it to rebuild that screen, your hard-won validation layer gets overwritten along with everything else.
+
+I got burned by exactly this at first. I carefully added `parse` to a screen, then regenerated it with "change the color scheme" — and the boundary was gone, reverted to the original naive fetch.
+
+The remedy is to physically separate the validation boundary from "the place the AI touches." Concretely, split it like this:
+
+<table>
+<thead>
+<tr><th>Location</th><th>Contents</th><th>Regeneration target</th></tr>
+</thead>
+<tbody>
+<tr><td><code>schemas/</code></td><td>Zod schemas (the contract)</td><td>Off-limits</td></tr>
+<tr><td><code>api/</code></td><td>fetch + parse boundary functions</td><td>Off-limits</td></tr>
+<tr><td><code>app/</code> screens</td><td>UI and the <code>useProducts</code> call</td><td>OK to regenerate</td></tr>
+</tbody>
+</table>
+
+Keep the screen side down to just calling the hook, and treat `schemas/` and `api/` as directories you never let the AI regenerate. That way, no matter how many times you rebuild the UI, the contract and the boundary survive. This notion of a coexistence boundary between generated and hand-written code echoes [designing an API response contract that never breaks old binaries](/en/articles/rork-dev/rork-one-backend-two-runtimes-api-contract-versioning).
+
+## Handling partially valid data
+
+In real operation, "partly broken" happens more often than "all broken." Something like 3 out of 100 items missing `price`. Here, using `parse` throws away all 100 for the sake of 3.
+
+Whether that is desirable depends on the nature of the app. On a screen dealing with money, I'd recommend stopping everything if even one item looks suspicious. On a screen you just browse, in that case showing 97 items minus the 3 broken ones is kinder.
+
+If you choose the latter, inspect each element and drop only the broken ones.
+
+```typescript
+// Exclude only the broken elements, show the healthy ones
+function parseLenient(json: unknown): Product[] {
+  const outer = z.object({ items: z.array(z.unknown()) }).safeParse(json);
+  if (!outer.success) return [];
+
+  const products: Product[] = [];
+  for (const raw of outer.data.items) {
+    const one = ProductSchema.safeParse(raw);
+    if (one.success) {
+      products.push(one.data);
+    } else {
+      // Record how many you dropped — don't shrink the list silently
+      logDroppedItem(one.error);
+    }
+  }
+  return products;
+}
+```
+
+What matters here is logging how many you dropped. Silently shrinking the list is its own "silent way of breaking." If you know how many were dropped and why, you can decide later how to fix the contract.
+
+Strict and stop everything, or lenient and show part of it. This decision should be made consciously by whoever designs the boundary — it is not something to leave to the generated code.
+
+## What actually changed after adopting this
+
+Across the several apps I run, I added this boundary starting with the main list screens that depend on external APIs. Two things changed in practice, before and after.
+
+The first is investigation time. Previously, tracing where a response-driven bug broke inside the UI took tens of minutes. After adding the boundary, because the `shape` error log carries the field name, forming a hypothesis takes a few minutes.
+
+The second is when I notice. In the first three weeks after adding the boundary, I detected two unexpected response-format changes from the logs first, rather than from user reports. One was the `price` type wobble above; the other was an optional field that began behaving as if required one day. In both cases I could act before the screen went blank.
+
+I've written about self-auditing similar schema drift on the analytics side in [when Amplitude's funnel improved overnight](/en/articles/rork-dev/rork-amplitude-event-schema-drift-funnel-self-audit-field-notes), and the same "surface the silent drift early" mindset works at the network boundary too.
+
+The boundary is not a cure-all. It adds the chore of maintaining schemas, and it costs time up front to write the contract. Even so, I would rather notice reliably at one line of boundary than be quietly wrong. In indie development, the bug you cannot notice is the most expensive one.
+
+The first step is to not start big. Try it in this order:
+
+1. Pick just one screen that leans hardest on an external API
+2. Write that screen's response shape into `schemas/` as a Zod schema
+3. Add a single line of `parse` to the generated fetch, and reduce the screen to just calling the hook
+
+Even one boundary changes the view the next time the API shifts.
