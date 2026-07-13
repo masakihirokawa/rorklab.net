@@ -1,0 +1,191 @@
+---
+title: "Detox と Maestro の E2E が全部緑なのに本番でクラッシュが出ていたとき — 自動リトライが握りつぶした不安定テストをフレーク率で炙り出す運用メモ"
+slug: "rork-e2e-flaky-test-green-masking-retry-quarantine-flake-rate-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-13T11:00"
+author: "Rork Lab"
+description: "E2Eが全部緑なのに本番クラッシュが出る。原因は自動リトライがフレークを握りつぶしていたこと。テスト単位でフレーク率を計測し、隔離とリトライ予算で本物の失敗だけを残す運用メモです。"
+tags: ["rork-max", "e2e-testing", "detox", "maestro", "ci-cd", "flaky-test", "quality-assurance"]
+highlights:
+  - "リトライ跨ぎの合否を JUnit XML から拾い、テスト単位でフレーク率を出す Node スクリプト"
+  - "単一テスト20%以上で隔離する quarantine 運用と、1ビルド3回までのリトライ予算での歯止め"
+  - "緑が信用できなくなる前に気づくための、CI ゲートと週次レビューの落としどころ"
+---
+ある朝、CI のチェックはすべて緑でした。E2E スイートも 42 本すべて pass。そのまま OTA を配信した数時間後、決済（Stripe 連携）完了画面でのクラッシュレポートが届きます。しかもその動線は、E2E で毎回テストしているはずの流れでした。
+
+緑だったのに、通っていなかった。
+
+ログを遡って理由が分かったとき、正直なところ胸のあたりが重くなりました。原因はテストコードのバグでも、アプリの新しい不具合でもありません。**自動リトライが、不安定なテストの赤を静かに握りつぶしていた**のです。決済フローのテストは3回に1回ほど失敗していて、CI はそれを3回まで再実行し、たまたま通った1回を「緑」として記録し続けていました。
+
+このメモは、その「信用できない緑」に気づき、フレーク（不安定なテスト）を計測して隔離し、本物の失敗だけをリリースの歯止めに残すまでの運用記録です。Rork や Rork Max で生成したアプリに Detox / Maestro の E2E を載せている個人開発者向けに、私自身が手元のアプリ群で踏んだ順番のまま書いています。
+
+## 緑が緑でなくなる仕組み — リトライは失敗を消しゴムにする
+
+多くの E2E ランナーは、不安定さへの対処として自動リトライを備えています。Detox の Jest 連携なら `jest.retryTimes(2)`、Maestro なら CI 側で `retry` を回す構成が定番です。
+
+リトライ自体は悪ではありません。実機・エミュレータの E2E は、アニメーションの完了待ちやネットワークの揺らぎで、コードが正しくても落ちることがあります。問題は、**リトライの結果を「最終的に通ったか」だけで記録してしまう**ことにあります。
+
+3回リトライして1回通れば緑。この記録方法だと、次の2つが区別できません。
+
+<table>
+<thead><tr><th>状態</th><th>3回の結果</th><th>記録</th><th>本当の意味</th></tr></thead>
+<tbody>
+<tr><td>安定して健全</td><td>○ ○ ○</td><td>緑</td><td>問題なし</td></tr>
+<tr><td>フレーク（不安定）</td><td>× × ○</td><td>緑</td><td><strong>いつ本番で落ちてもおかしくない</strong></td></tr>
+</tbody>
+</table>
+
+下の行が落とし穴です。表向きは緑なので誰も気づきません。けれど失敗率 67% のテストは、テスト環境より条件の悪い実機（App Store 配信版）で、いつか本物の赤に変わります。私の決済フローがまさにこれでした。
+
+大事な発想の転換は、**合否を二値でなく「試行の履歴」として持つ**ことです。最終結果だけを見るのをやめ、リトライを跨いだ各試行の○×を残せば、フレークは数字になって見えてきます。
+
+## フレーク率を計測する — JUnit XML を試行単位で読む
+
+Detox（Jest）も Maestro も、JUnit 形式の XML を吐けます。ここに各テストの `<testcase>` と、失敗時の `<failure>` が入ります。リトライを別々の実行として出力させれば、試行の履歴を機械的に集計できます。
+
+まず、リトライを「上書き」でなく「追記」で残す設定にします。GitHub Actions で Maestro を回す場合、リトライごとにレポートを別ファイルへ出すのが確実です。
+
+```yaml
+# .github/workflows/e2e.yml（抜粋）
+- name: Run Maestro E2E (3 attempts, keep every report)
+  run: |
+    for attempt in 1 2 3; do
+      maestro test .maestro/ \
+        --format junit \
+        --output "reports/e2e-attempt-${attempt}.xml" || true
+    done
+  # || true で途中失敗しても全試行を回し切る。合否判定は後段の集計に委ねる
+```
+
+ポイントは `|| true` です。ここで失敗即中断にすると、フレークの「×」が記録される前にジョブが止まってしまいます。判定をランナーから引き剥がし、集計スクリプトへ移すのが要点です。
+
+次に、複数の XML を読んでテスト単位のフレーク率を出す Node スクリプトです。依存は軽量な XML パーサ1つだけにしています。
+
+```javascript
+// scripts/flake-rate.mjs
+import { readdirSync, readFileSync } from "node:fs";
+import { XMLParser } from "fast-xml-parser";
+
+const DIR = "reports";
+const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+
+// テスト名 -> { runs: 総試行数, fails: 失敗回数 }
+const stats = new Map();
+
+for (const file of readdirSync(DIR).filter((f) => f.endsWith(".xml"))) {
+  const xml = parser.parse(readFileSync(`${DIR}/${file}`, "utf8"));
+  const suites = [].concat(xml.testsuites?.testsuite ?? xml.testsuite ?? []);
+  for (const suite of suites) {
+    for (const tc of [].concat(suite.testcase ?? [])) {
+      const name = `${tc["@_classname"] ?? ""} › ${tc["@_name"]}`;
+      const rec = stats.get(name) ?? { runs: 0, fails: 0 };
+      rec.runs += 1;
+      if (tc.failure || tc.error) rec.fails += 1; // 1試行でも赤なら失敗として計上
+      stats.set(name, rec);
+    }
+  }
+}
+
+const rows = [...stats.entries()]
+  .map(([name, { runs, fails }]) => ({ name, runs, fails, rate: fails / runs }))
+  .filter((r) => r.fails > 0 && r.fails < r.runs) // 全部通る/全部落ちるは除外＝フレークのみ
+  .sort((a, b) => b.rate - a.rate);
+
+for (const r of rows) {
+  console.log(`${(r.rate * 100).toFixed(0).padStart(3)}%  ${r.fails}/${r.runs}  ${r.name}`);
+}
+process.exitCode = 0; // 計測は常に成功で返す。ゲート判定は別ジョブが担う
+```
+
+`r.fails > 0 && r.fails < r.runs` の条件が肝心です。全試行で落ちるものは本物の失敗（別で赤にすべき）、全試行で通るものは健全。**その中間、つまり「通ったり落ちたりする」ものだけがフレーク**です。ここを取り違えると、本物のバグをフレーク扱いで見逃します。
+
+手元の6アプリで初めて回したとき、フレーク率トップは決済フローの 67%（3試行中2失敗）でした。次点がプッシュ通知の許諾ダイアログ待ちで 40% ほど。数字にして初めて、握りつぶされていた不安定さの輪郭が見えました。
+
+## フレークを隔離する — リリースは止めず、放置もしない
+
+フレークが見つかったとき、二つの誘惑があります。ひとつは「赤なんだから即修正するまでリリース停止」。もうひとつは「どうせたまに落ちるだけだから無視」。どちらも極端で、私はどちらでも失敗しました。
+
+前者はファネルを止めます。フレークの修正には根本原因の調査が要り、半日で終わらないことも珍しくありません。その間リリースを止めるのは、収益にも開発の勢いにも良くありません。後者は今回のクラッシュそのものです。
+
+落としどころが **quarantine（隔離）** でした。フレークと判定したテストを専用のタグへ移し、リリースゲートからは外す。ただし毎回計測は続け、隔離リストが増えていないかを監視します。
+
+Maestro ならフローにタグを付けて実行対象を分けられます。
+
+```yaml
+# .maestro/checkout_flow.yaml
+appId: com.example.rorkapp
+tags:
+  - quarantine   # ゲートから外すが、計測は続ける
+---
+- launchApp
+- tapOn: "カートに進む"
+- tapOn: "購入を確定"
+- assertVisible: "ご注文ありがとうございました"
+```
+
+CI 側では、ゲート用の本流と隔離分を分けて回します。
+
+```yaml
+# ゲート: quarantine を除外。ここが赤ならリリースを止める
+- run: maestro test .maestro/ --exclude-tags quarantine --format junit --output reports/gate.xml
+# 観測: quarantine のみ。赤でもリリースは止めないが、フレーク率は記録する
+- run: maestro test .maestro/ --include-tags quarantine --format junit --output reports/quarantine.xml || true
+```
+
+隔離は逃げではありません。**「本物の赤」と「不安定な赤」を分けて、前者だけをリリースの門番にする**ための整理です。門番が信用できる赤しか出さなくなると、緑がふたたび意味を取り戻します。
+
+## リトライは残す、ただし予算をつける
+
+リトライを全廃するのは非現実的です。実機 E2E に揺らぎはつきものですから。残しつつ暴走を回避する工夫が、**リトライ予算**です。
+
+考え方はシンプルで、「1スイートあたり、リトライで救ってよい回数の上限」を決めます。上限を超えたら、たとえ最終的に緑でも、そのビルドは黄信号として扱います。握りつぶしの総量に天井をつけるわけです。
+
+<table>
+<thead><tr><th>指標</th><th>手元の目安</th><th>超えたときの扱い</th></tr></thead>
+<tbody>
+<tr><td>スイート全体のフレーク率</td><td>5% 未満</td><td>週次レビューで原因調査を起票</td></tr>
+<tr><td>単一テストのフレーク率</td><td>20% 以上で隔離</td><td>quarantine タグへ移動</td></tr>
+<tr><td>1ビルドのリトライ救済回数</td><td>3 回まで</td><td>超過で黄信号・マージは可だが要確認</td></tr>
+<tr><td>隔離テストの累計本数</td><td>スイートの 10% 未満</td><td>超過は E2E 設計の見直し合図</td></tr>
+</tbody>
+</table>
+
+この数字は絶対値ではなく、私が手元のアプリで回しながら痛みの少なかった線です。大事なのは値そのものより、**「どこを超えたら手を動かすか」を事前に決めておく**ことでした。閾値が言語化されていないと、フレークは「まあ今回は」の積み重ねで永遠に放置されます。
+
+隔離の累計本数を監視するのも同じ理由です。隔離は一時避難であって永住地ではありません。10% を超えたら、それは個別テストの問題ではなく、待機の書き方やテスト設計そのものを見直す合図だと受け止めています。
+
+## 週次レビューに載せる — 数字を腐らせない
+
+計測とゲートを組んでも、レポートを誰も見なければ隔離リストは静かに肥大します。私は週に一度、フレーク率のトップ5と隔離本数の推移だけを見る短いレビューを回しています。
+
+集計を Markdown で吐いておくと、その週の状況が一目で分かります。
+
+```javascript
+// scripts/flake-report.mjs（flake-rate.mjs の集計結果を受け取り整形）
+export function toMarkdown(rows, quarantinedCount, suiteSize) {
+  const top = rows.slice(0, 5);
+  const lines = [
+    `## E2E フレークレポート`,
+    `隔離中: ${quarantinedCount} 本 / 全 ${suiteSize} 本（${((quarantinedCount / suiteSize) * 100).toFixed(0)}%）`,
+    ``,
+    `| テスト | フレーク率 | 失敗/試行 |`,
+    `|---|---|---|`,
+    ...top.map((r) => `| ${r.name} | ${(r.rate * 100).toFixed(0)}% | ${r.fails}/${r.runs} |`),
+  ];
+  return lines.join("\n");
+}
+```
+
+このレポートを見る習慣ができてから、フレークは「気づいたら増えていたもの」から「今週どう動いたか分かるもの」に変わりました。決済フローのフレークは、待機を固定時間の `sleep` から要素の可視化待ち（`assertVisible` によるポーリング）へ書き換えることで、67% から数%まで落ち着きました。原因の多くは、アプリの不具合ではなく**テスト側の待ち方の雑さ**だったのです。
+
+E2E の設計そのものを見直したい段階の方には、主要動線に絞って Maestro を導入する手順をまとめた[リリース前の手動テストで消耗する前に — Rork アプリの主要動線を Maestro で自動E2E化する](/articles/rork-dev/rork-maestro-e2e-test-critical-flows-ci)が土台になります。CI への組み込みは[Rork × GitHub Actions で CI/CD を構築する](/articles/rork-dev/rork-github-actions-eas-build-cicd)、生成コードへ最小限の安全網を張る発想は[Rork が生成した画面に、壊さないための最小限の自動テストを足す](/articles/rork-dev/rork-generated-code-minimal-test-safety-net)が近いところにあります。
+
+## まとめ — 次の一歩
+
+もし今、E2E がいつも緑なのに本番のクラッシュが減らないなら、まず**リトライを跨いだ試行の履歴を残す設定に変える**ところから始めてみてください。上書きをやめて追記にするだけで、握りつぶされていたフレークが数字になります。
+
+緑を信じられる状態は、テストを増やすことではなく、**赤の意味を一種類に保つこと**で守られます。フレークを隔離し、本物の失敗だけを門番に残す。その整理が、リリースの安心を静かに支えてくれます。
+
+実装の参考になれば幸いです。私自身まだ手探りの部分もありますが、共に品質を積み上げていけたら嬉しいです。

@@ -1,0 +1,192 @@
+---
+title: "Your Detox and Maestro E2E Suite Was All Green — but the Retries Were Hiding a Flaky Test That Crashed in Production"
+slug: "rork-e2e-flaky-test-green-masking-retry-quarantine-flake-rate-field-notes"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-13T11:00"
+author: "Rork Lab"
+description: "Your E2E suite is green, yet production still crashes. The culprit: auto-retries quietly swallowing flaky failures. Field notes on measuring per-test flake rate, quarantining, and keeping only real failures as release gates."
+tags: ["rork-max", "e2e-testing", "detox", "maestro", "ci-cd", "flaky-test", "quality-assurance"]
+highlights:
+  - "A small Node script that reads JUnit XML across retries and computes per-test flake rate"
+  - "A quarantine workflow (isolate at 20% flake rate) plus a retry budget capped at 3 rescues per build"
+  - "CI gates and a weekly review cadence that keep green trustworthy again"
+---
+One morning every CI check was green. All 42 E2E tests passed. A few hours after I shipped the OTA update, a crash report landed on the payment confirmation screen — a flow the E2E suite tests on every single run.
+
+Green, but not actually passing.
+
+When I traced the logs and found the reason, my chest tightened a little. It wasn't a bug in the test code, nor a fresh defect in the app. **Auto-retries had been quietly swallowing a flaky test's red.** The checkout test failed roughly one in three runs, CI re-ran it up to three times, and it kept recording the one lucky pass as "green."
+
+These are field notes on noticing that untrustworthy green, measuring flakiness, quarantining it, and leaving only real failures as the thing that gates a release. They're written for indie developers running Detox or Maestro E2E on apps built with Rork or Rork Max — in the order I actually worked through it across my own handful of apps.
+
+## How green stops meaning green — retries as an eraser
+
+Most E2E runners ship auto-retry to cope with instability. With Detox on Jest it's `jest.retryTimes(2)`; with Maestro it's a `retry` loop on the CI side. Both are common.
+
+Retries aren't evil in themselves. On-device and emulator E2E can fail for reasons that have nothing to do with your code — an animation that hasn't settled, a network hiccup. The real problem is recording **only whether the test eventually passed**.
+
+Retry three times, pass once, mark it green. That recording scheme can't tell these two apart:
+
+<table>
+<thead><tr><th>State</th><th>Three attempts</th><th>Recorded as</th><th>What it really means</th></tr></thead>
+<tbody>
+<tr><td>Stable and healthy</td><td>○ ○ ○</td><td>Green</td><td>Fine</td></tr>
+<tr><td>Flaky</td><td>× × ○</td><td>Green</td><td><strong>Could break in production any day</strong></td></tr>
+</tbody>
+</table>
+
+The second row is the trap. It looks green, so nobody notices. But a test failing 67% of the time will, on a real device under worse conditions than your test rig, eventually turn into a genuine red. My checkout flow was exactly that.
+
+The mental shift that helped: **treat pass/fail not as a boolean but as a history of attempts.** Stop looking only at the final result. Keep the outcome of each attempt across retries, and flakiness turns into a number you can see.
+
+## Measuring flake rate — read JUnit XML per attempt
+
+Both Detox (Jest) and Maestro can emit JUnit-format XML, with a `<testcase>` per test and a `<failure>` on failure. If you make each retry its own report, you can aggregate the attempt history mechanically.
+
+First, keep retries by *appending* rather than *overwriting*. When running Maestro on GitHub Actions, the reliable move is writing each retry to a separate file.
+
+```yaml
+# .github/workflows/e2e.yml (excerpt)
+- name: Run Maestro E2E (3 attempts, keep every report)
+  run: |
+    for attempt in 1 2 3; do
+      maestro test .maestro/ \
+        --format junit \
+        --output "reports/e2e-attempt-${attempt}.xml" || true
+    done
+  # "|| true" lets all attempts run to completion even after a failure;
+  # the pass/fail decision moves to the aggregation step below
+```
+
+The `|| true` matters. Fail-fast here would stop the job before the flaky "×" is ever recorded. The point is to pull the verdict out of the runner and hand it to an aggregation script.
+
+Here's a Node script that reads all the XML files and computes a per-test flake rate. Its only dependency is one lightweight XML parser.
+
+```javascript
+// scripts/flake-rate.mjs
+import { readdirSync, readFileSync } from "node:fs";
+import { XMLParser } from "fast-xml-parser";
+
+const DIR = "reports";
+const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+
+// test name -> { runs: total attempts, fails: failed attempts }
+const stats = new Map();
+
+for (const file of readdirSync(DIR).filter((f) => f.endsWith(".xml"))) {
+  const xml = parser.parse(readFileSync(`${DIR}/${file}`, "utf8"));
+  const suites = [].concat(xml.testsuites?.testsuite ?? xml.testsuite ?? []);
+  for (const suite of suites) {
+    for (const tc of [].concat(suite.testcase ?? [])) {
+      const name = `${tc["@_classname"] ?? ""} › ${tc["@_name"]}`;
+      const rec = stats.get(name) ?? { runs: 0, fails: 0 };
+      rec.runs += 1;
+      if (tc.failure || tc.error) rec.fails += 1; // any red attempt counts as a failure
+      stats.set(name, rec);
+    }
+  }
+}
+
+const rows = [...stats.entries()]
+  .map(([name, { runs, fails }]) => ({ name, runs, fails, rate: fails / runs }))
+  .filter((r) => r.fails > 0 && r.fails < r.runs) // drop all-pass and all-fail; keep only flaky
+  .sort((a, b) => b.rate - a.rate);
+
+for (const r of rows) {
+  console.log(`${(r.rate * 100).toFixed(0).padStart(3)}%  ${r.fails}/${r.runs}  ${r.name}`);
+}
+process.exitCode = 0; // measurement always succeeds; a separate job owns the gate
+```
+
+The condition `r.fails > 0 && r.fails < r.runs` is the crux. A test that fails on every attempt is a real failure (it should go red elsewhere); one that passes on every attempt is healthy. **Only the middle — passes sometimes, fails sometimes — is flaky.** Get this wrong and you'll wave a genuine bug through as "just flaky."
+
+The first time I ran this across six apps, the top flake was the checkout flow at 67% (two failures in three attempts). Next was waiting on the push-notification permission dialog, around 40%. Only as numbers did the shape of the swallowed instability finally show.
+
+## Quarantining flaky tests — don't block the release, don't ignore it either
+
+When you find a flaky test, two temptations appear. One: "it's red, so freeze releases until it's fixed." Two: "it only fails sometimes, so ignore it." Both are extremes, and I failed with each.
+
+The first stalls the funnel. Fixing a flake means root-cause work that often doesn't wrap up in half a day, and freezing releases the whole time is bad for both revenue and momentum. The second *is* the crash I described.
+
+The middle ground was **quarantine.** Move the tests you've judged flaky to a dedicated tag and pull them out of the release gate — but keep measuring them every run, and watch that the quarantine list isn't growing.
+
+Maestro lets you tag flows and split what runs.
+
+```yaml
+# .maestro/checkout_flow.yaml
+appId: com.example.rorkapp
+tags:
+  - quarantine   # excluded from the gate, but still measured
+---
+- launchApp
+- tapOn: "Go to cart"
+- tapOn: "Confirm purchase"
+- assertVisible: "Thank you for your order"
+```
+
+On CI, run the gated mainline and the quarantined set separately.
+
+```yaml
+# Gate: exclude quarantine. A red here blocks the release.
+- run: maestro test .maestro/ --exclude-tags quarantine --format junit --output reports/gate.xml
+# Observe: quarantine only. A red here doesn't block, but the flake rate is recorded.
+- run: maestro test .maestro/ --include-tags quarantine --format junit --output reports/quarantine.xml || true
+```
+
+Quarantine isn't an escape hatch. It's the act of **separating "real red" from "unstable red" and letting only the former guard the release.** Once the gatekeeper emits nothing but red you can trust, green recovers its meaning.
+
+## Keep retries — but give them a budget
+
+Removing retries entirely isn't realistic; on-device E2E carries real jitter. Keeping them without letting them run wild is what a **retry budget** is for.
+
+The idea is simple: set a ceiling on how many failures retries are allowed to rescue per suite. Cross the ceiling and the build is amber — even if it ends up green. You're putting a cap on the total volume of swallowing.
+
+<table>
+<thead><tr><th>Metric</th><th>My working target</th><th>What happens if exceeded</th></tr></thead>
+<tbody>
+<tr><td>Suite-wide flake rate</td><td>Under 5%</td><td>File a root-cause task in the weekly review</td></tr>
+<tr><td>Single-test flake rate</td><td>Quarantine at 20%+</td><td>Move to the quarantine tag</td></tr>
+<tr><td>Retry rescues per build</td><td>Up to 3</td><td>Amber above that — merge allowed but check first</td></tr>
+<tr><td>Total quarantined tests</td><td>Under 10% of the suite</td><td>Above it, revisit the E2E design itself</td></tr>
+</tbody>
+</table>
+
+These aren't absolute values — they're the lines that hurt least as I ran my own apps. What mattered wasn't the numbers so much as **deciding in advance where crossing a line means you pick up the keyboard.** Without a written threshold, flakiness gets nursed forever, one "well, just this once" at a time.
+
+Watching the total quarantine count is the same logic. Quarantine is temporary shelter, not a permanent address. Past 10%, I read it not as a per-test problem but as a signal to revisit how tests wait and how they're designed.
+
+## Put it in a weekly review — don't let the numbers rot
+
+Even with measurement and gates in place, if nobody reads the report the quarantine list quietly swells. I run a short weekly review that looks only at the top five flake rates and the trend in quarantine count.
+
+Emitting the summary as Markdown makes the week's state legible at a glance.
+
+```javascript
+// scripts/flake-report.mjs (takes the aggregation from flake-rate.mjs and formats it)
+export function toMarkdown(rows, quarantinedCount, suiteSize) {
+  const top = rows.slice(0, 5);
+  const lines = [
+    `## E2E flake report`,
+    `Quarantined: ${quarantinedCount} of ${suiteSize} (${((quarantinedCount / suiteSize) * 100).toFixed(0)}%)`,
+    ``,
+    `| Test | Flake rate | Fails/Attempts |`,
+    `|---|---|---|`,
+    ...top.map((r) => `| ${r.name} | ${(r.rate * 100).toFixed(0)}% | ${r.fails}/${r.runs} |`),
+  ];
+  return lines.join("\n");
+}
+```
+
+Once reading this became a habit, flakiness went from "something that grew when I wasn't looking" to "something I can see moving week to week." The checkout flake settled from 67% to low single digits once I rewrote its wait from a fixed-time `sleep` to polling on element visibility (`assertVisible`). Most of the cause wasn't an app defect — it was **sloppy waiting on the test side.**
+
+If you're at the stage of rethinking the E2E design itself, starting narrow with your critical flows in [Before manual pre-release testing wears you down — automating your Rork app's critical flows as Maestro E2E](/articles/rork-dev/rork-maestro-e2e-test-critical-flows-ci) is a solid base. For wiring it into CI, [Building CI/CD for Rork with GitHub Actions](/articles/rork-dev/rork-github-actions-eas-build-cicd) is next door, and the mindset of adding a minimal safety net to generated code lives in [Adding a minimal automated safety net to the screens Rork generated](/articles/rork-dev/rork-generated-code-minimal-test-safety-net).
+
+## Wrapping up — your next step
+
+If your E2E is always green yet production crashes aren't going down, start by **changing your setup to keep the history of attempts across retries.** Switching from overwrite to append alone turns the swallowed flakes into numbers.
+
+A green you can trust isn't protected by adding more tests — it's protected by **keeping "red" to a single meaning.** Quarantine the flakes; leave only real failures at the gate. That bit of tidying is what quietly holds up your confidence in a release.
+
+I hope it helps with your own setup. I'm still feeling my way through parts of this myself, and I'd be glad to keep building quality alongside you.
