@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORKMAX — Rork MaxはReact Nativeではなく純粋なSwiftコードを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまで見据えた真のネイティブアプリを作れます",
-    "APPLE — 2026年のRorkはAppleエコシステムのネイティブ強化が明確なテーマになっています",
-    "EXPO — 通常の生成はReact NativeとExpoが土台。作業後には本物のプロジェクト構造とコードが残り、そのまま手で育てられます",
-    "FUNDING — Rorkは直近で1,500万ドルを調達し、月間743,000訪問・85%成長という新たなバイラルを得ています",
-    "PRICING — 無料で始められ、有料プランは月額25ドルから。Rork Maxは月額200ドルです",
-    "CROSS — iOS・Android・Webを単一のプロンプトから生成し、フォローアップの微調整で仕上げられます",
+    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、Appleエコシステム全体を対象にします",
+    "DEVICES — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまで、一つの記述から広げられます",
+    "NATIVE — AR・LiDARスキャン、Metalによる3Dゲーム、ウィジェット、Dynamic Island、オンデバイスCore MLを解放します",
+    "SEED — RorkはLeft Lane Capital主導の$15Mシードを調達し、Peak XVやa16z Speedrunも参加しました",
+    "PAPERLINE — アプリビルダーPaperlineを買収し、エンジニアリング人材の獲得を続ける姿勢です",
+    "MARKET — 月間743,000訪問超。Gartnerは2026年末までに新規アプリの75%がローコード/ノーコードで作られると見込みます",
   ],
   en: [
-    "RORKMAX — Rork Max generates pure Swift instead of React Native, enabling true native apps across iPhone, iPad, Watch, TV, Vision Pro, and iMessage",
-    "APPLE — Rork's 2026 direction has a clear theme of native empowerment across the Apple ecosystem",
-    "EXPO — Standard builds run on React Native and Expo, so you're left with a real project structure and code you can keep working on",
-    "FUNDING — Rork recently raised $15M and now sees over 743,000 monthly visits with 85% growth",
-    "PRICING — Rork is free to start, with paid plans from $25/month and Rork Max at $200/month",
-    "CROSS — Rork builds iOS, Android, and web from a single prompt, finished off with a bit of follow-up tweaking",
+    "MAX — Rork Max builds native Swift apps instead of React Native, targeting the whole Apple ecosystem",
+    "DEVICES — From one description it spans iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — It unlocks AR and LiDAR scanning, 3D games with Metal, Home Screen widgets, Dynamic Island, and on-device Core ML",
+    "SEED — Rork raised a $15M seed led by Left Lane Capital, joined by Peak XV and a16z Speedrun",
+    "PAPERLINE — Rork acquired the app builder Paperline and plans to stay acquisitive for engineering talent",
+    "MARKET — With 743,000+ monthly visits, and Gartner expects 75% of new apps to be low-code or no-code by end of 2026",
   ],
 };
 
