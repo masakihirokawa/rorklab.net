@@ -1,0 +1,198 @@
+---
+title: "Rorkの癒しアプリにスリープタイマーを付けたら、フェードアウトが実際の音とズレた話"
+slug: "rork-sleep-timer-audio-fade-playback-position-driven"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-15T05:26"
+updated: "2026-07-15T05:26"
+author: "Rork Lab"
+description: "Rorkが生成するスリープタイマーは、壁時計のsetIntervalで音量を下げます。数値上は30分でも、実際の音はもっと早く消えたり不自然に途切れたりします。フェードを再生位置で駆動し直す実装と、対数カーブ・停止処理・画面ロック時の限界までを実運用の視点でまとめました。"
+tags: ["Rork", "expo-av", "スリープタイマー", "React Native", "音声処理", "癒しアプリ"]
+highlights:
+  - "Rorkが吐くsetIntervalフェードがなぜ実際の音とズレるかを理解し、再生位置で駆動する正しい実装に置き換えられる"
+  - "線形に音量を下げると不自然に速く消えて聞こえる理由と、対数カーブで自然なフェードにする具体的な計算を手に入れられる"
+  - "画面ロック中はJSのフェードが止まるという限界を正しく知り、事前フェード済みのテール音源で確実に消す現実解を選べる"
+---
+
+個人開発で Relaxing Healing という癒し系アプリを長く運営していると、「音が消える瞬間」の設計がアプリの印象を大きく左右することを何度も実感してきました。眠りに落ちる直前、音がプツッと切れれば人は目を覚まします。だからこそスリープタイマーのフェードアウトは、地味ですが最後の一手として重要な機能です。
+
+先日、新しい癒しアプリの試作をRorkで進めていたとき、このスリープタイマーで数時間つまずきました。シミュレータでは30分後にきれいに音が消えていくのに、実機で試すと「思ったより早く音が小さくなる」「最後の数秒だけ急に途切れる」という違和感が残ります。原因を追ってみると、Rorkが生成したコードには音声フェード特有の落とし穴がいくつも重なっていました。同じジャンルのアプリを作る方が必ずぶつかる部分なので、直し方を整理しておきます。
+
+## Rorkが生成するスリープタイマーの典型形
+
+「30分後に音量をゆっくり下げて停止するスリープタイマーを付けて」とRorkに依頼すると、多くの場合こういうコードが返ってきます。
+
+```javascript
+// Rorkが生成しやすいパターン
+const FADE_MS = 30_000; // 最後の30秒でフェード
+const TICK_MS = 200;
+
+function startSleepTimer(sound, totalMinutes) {
+  const stopAt = Date.now() + totalMinutes * 60_000;
+
+  const id = setInterval(async () => {
+    const remaining = stopAt - Date.now();
+    if (remaining <= 0) {
+      await sound.stopAsync();
+      clearInterval(id);
+      return;
+    }
+    if (remaining <= FADE_MS) {
+      const volume = remaining / FADE_MS; // 1.0 → 0.0
+      await sound.setVolumeAsync(volume);
+    }
+  }, TICK_MS);
+
+  return id;
+}
+```
+
+一見すると正しく見えます。`Date.now()` で残り時間を測り、フェード区間に入ったら線形に音量を下げる。動かすと確かに音は小さくなっていきます。けれど、このコードは3つの層で実際の音とズレます。
+
+## 壁時計で測ると、なぜ実際の音とズレるのか
+
+第一の問題は、`setInterval` が壁時計（wall clock）を基準にしていることです。`setInterval(fn, 200)` はぴったり200msごとには呼ばれません。JSスレッドが画像のデコードやリスト描画で忙しければ、200msの間隔は250msにも400msにも伸びます。フェードのように「なめらかさ」が命の処理では、この揺らぎがそのまま音量のガタつきになります。
+
+第二に、`sound.setVolumeAsync()` は非同期です。200msごとに `await` を挟むと、ネイティブ側への反映が詰まったときにコールバックが積み上がり、音量の更新が飛び飛びになります。
+
+そして第三に、最も見落とされやすいのが「音声の再生位置」と「壁時計」が同じ速度で進むとは限らないことです。オーディオセッションが割り込み（電話・他アプリの音）から復帰したとき、あるいはループの継ぎ目で僅かに再バッファが起きたとき、実際に鳴っている音の位置は壁時計から遅れます。壁時計だけを見ていると、音はまだ鳴っているのにタイマーが先に「終わり」と判断し、フェードの途中で急に切れてしまうのです。
+
+<table>
+  <thead>
+    <tr><th>観点</th><th>壁時計 setInterval</th><th>再生位置ドリブン</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>基準にする時間</td><td>Date.now()</td><td>実際の再生位置 positionMillis</td></tr>
+    <tr><td>JSが重いとき</td><td>間隔が伸びて音量がガタつく</td><td>次の更新で正しい音量に追従</td></tr>
+    <tr><td>割り込み復帰後</td><td>音と時間がズレて途中で切れる</td><td>音の位置に同期し続ける</td></tr>
+    <tr><td>フェードの決定性</td><td>累積誤差で毎回ぶれる</td><td>位置から一意に決まる</td></tr>
+  </tbody>
+</table>
+
+## 直し方の核心は「壁時計をやめて、再生位置でフェードを決める」
+
+考え方を反転させます。「あと何ミリ秒か」を壁時計で数えるのではなく、「今、音がどこまで再生されたか」から目標音量を逆算します。expo-av の `setOnPlaybackStatusUpdate` は、再生中に `positionMillis`（現在の再生位置）を継続的に渡してくれます。これはネイティブのオーディオクロックに紐づいているため、JSスレッドの混み具合や割り込みの影響を受けにくい、より信頼できる時間軸です。
+
+フェードを「関数」として定義するのがポイントです。ある再生位置に対して、音量はただ一つに決まる。累積計算をやめれば、途中で誤差が積もることもありません。
+
+```javascript
+import { Audio } from 'expo-av';
+
+// 停止したい再生位置(ms)と、フェード開始位置(ms)から目標音量を返す純粋関数
+function volumeForPosition(positionMillis, stopAtMillis, fadeMillis) {
+  const fadeStart = stopAtMillis - fadeMillis;
+  if (positionMillis <= fadeStart) return 1.0;      // まだフェード前
+  if (positionMillis >= stopAtMillis) return 0.0;   // フェード完了
+  const progress = (positionMillis - fadeStart) / fadeMillis; // 0 → 1
+  const remaining = 1 - progress;                    // 1 → 0
+  return remaining;
+}
+```
+
+この関数は再生位置だけを入力にとり、外部の状態を持ちません。テストも書きやすく、同じ位置なら必ず同じ音量を返します。壁時計版が抱えていた「累積誤差」「非同期の詰まり」「音とのズレ」が、この一点で消えます。
+
+## onPlaybackStatusUpdateから目標音量を反映する
+
+純粋関数ができたら、あとは再生位置が来るたびに音量へ反映するだけです。ループ再生している場合は、経過した総再生時間を自前で積算します。
+
+```javascript
+export function attachSleepTimer(sound, { totalMinutes, fadeSeconds = 30 }) {
+  const stopAtMillis = totalMinutes * 60_000;
+  const fadeMillis = fadeSeconds * 1000;
+
+  let elapsed = 0;
+  let lastPosition = 0;
+  let stopped = false;
+
+  // 更新頻度を上げてフェードをなめらかに（既定は約500ms間隔）
+  sound.setProgressUpdateIntervalMillis(100);
+
+  sound.setOnPlaybackStatusUpdate(async (status) => {
+    if (!status.isLoaded || stopped) return;
+
+    // ループで位置が巻き戻ったら、1周ぶんを加算
+    if (status.positionMillis < lastPosition) {
+      elapsed += lastPosition;
+    }
+    lastPosition = status.positionMillis;
+    const played = elapsed + status.positionMillis;
+
+    const target = volumeForPosition(played, stopAtMillis, fadeMillis);
+    await sound.setVolumeAsync(shape(target));
+
+    if (played >= stopAtMillis) {
+      stopped = true;
+      await sound.pauseAsync();
+    }
+  });
+}
+```
+
+ここで大切なのは、`stopped` フラグで二重発火を防いでいる点です。`onPlaybackStatusUpdate` は短い間隔で何度も呼ばれるため、停止条件を満たした瞬間にガードして回避しないと、`pauseAsync` が連続で走ったり、停止後に音量更新が飛んできたりします。実機で「一度消えたのに一瞬だけ鳴り直す」という不可解な挙動の多くは、この二重発火が原因です。
+
+## 線形フェードが「不自然に速く消える」理由
+
+`volumeForPosition` は残り時間を線形に返します。ところが、この線形の音量をそのまま使うと、多くの人が「最初は大きいままなのに、最後で急に消えた」と感じます。ここには人間の聴覚特性が関わっています。
+
+人間が感じる音の大きさ（ラウドネス）は、振幅に対しておおよそ対数的です。振幅を50%まで下げても、体感の音量は半分にはならず、もっと大きく聞こえます。つまり振幅を線形に下げても、耳には「上の方でずっと粘って、下で一気に落ちる」ように感じられるのです。
+
+対策として、目標音量に軽いカーブをかけます。残り割合を二乗すると、序盤で音量が早めに下がり始め、体感上のフェードがなめらかになります。
+
+```javascript
+// 線形の音量を、体感でなめらかなカーブに整える
+function shape(linearVolume) {
+  // 二乗カーブ: 序盤で下がり始め、耳に自然なフェードアウトになる
+  return linearVolume * linearVolume;
+}
+```
+
+私自身、Relaxing Healing でフェードの手触りを詰めていったときも、最終的に落ち着いたのは単純な線形ではなくこの種のカーブでした。数式としては地味ですが、眠りに向かう体験の質を左右する一行です。私の場合は二乗が最も自然に感じましたが、より緩やかにしたければ三乗、キリッと落としたければ指数関数に差し替えると、ジャンルに合わせて調整できます。個人的には、まず二乗から試すことをお勧めします。
+
+## 停止を確定させ、次の再生に持ち越さない
+
+フェードが終わって音を止めたあと、意外と忘れられがちなのが「音量を元に戻す」処理です。`setVolumeAsync(0)` のまま停止すると、次にユーザーが再生ボタンを押したとき無音のまま始まり、「壊れた」と受け取られます。停止処理では、必ず音量を1.0へ戻してから片付けます。
+
+```javascript
+async function finalizeSleepTimer(sound) {
+  await sound.pauseAsync();
+  await sound.setPositionAsync(0);
+  await sound.setVolumeAsync(1.0); // 次の再生のために戻す
+  sound.setOnPlaybackStatusUpdate(null); // コールバックを外す
+}
+```
+
+コールバックを `null` で外すのも忘れないでください。外し忘れると、画面を離れたあともクロージャが生き続け、古い `sound` インスタンスを掴んだままメモリに残ります。癒しアプリのように長時間起動しっぱなしで使われるアプリでは、この小さな取りこぼしが積み重なって、数時間後のクラッシュにつながることがあります。
+
+## 画面ロック中の限界と、私が選んだ現実解
+
+ここまでの実装は、アプリが前面にある間は狙いどおりに動きます。けれど正直に書いておくと、iPhoneの画面をロックした状態でのフェードは、JSだけでは信頼しきれません。バックグラウンド再生自体は `Audio.setAudioModeAsync({ staysActiveInBackground: true, playsInSilentModeIOS: true })` と `UIBackgroundModes` の `audio` 指定で継続しますが、画面ロック中はJSスレッドが抑制され、`onPlaybackStatusUpdate` のコールバックが期待どおりの間隔で呼ばれない時間帯が生じます。スリープタイマーは「寝ながら画面を消して使う」機能なので、これは避けて通れない現実です。
+
+私が試作で最終的に選んだのは、フェードをコードだけに背負わせないという判断でした。具体的には、通常のループ音源とは別に「フェードアウト済みのテール音源」を用意しておき、停止予定時刻の手前で本編を止め、テール音源へ切り替えて最後まで鳴らし切ります。テールは単なる音声ファイルなので、画面がロックされていてもオーディオエンジンが最後まで確実に再生してくれます。コードでリアルタイムに音量を操作する不確実さを、素材づくりの側で吸収するわけです。
+
+<table>
+  <thead>
+    <tr><th>状況</th><th>JS音量フェード</th><th>事前フェード済みテール音源</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>前面（画面オン）</td><td>なめらかに動く</td><td>不要（本編で十分）</td></tr>
+    <tr><td>画面ロック中</td><td>コールバックが止まり途切れる</td><td>音声として確実に鳴り切る</td></tr>
+    <tr><td>実装コスト</td><td>低い</td><td>音源を1本用意する手間</td></tr>
+  </tbody>
+</table>
+
+前面での体感を高めるのはJSの位置ドリブンなフェード、確実に消し切るのは事前フェード済みのテール。私はこの二段構えに落ち着いてから、実機での違和感はほぼ消えました。音の途切れやループの継ぎ目そのものについては、[Rorkで癒し系アプリのアンビエントサウンドを実装して詰まった3つのこと](/articles/rork-dev/rork-healing-app-ambient-loop-audio-design-pitfalls)で別途整理しているので、あわせて読んでいただけると全体像がつかめると思います。
+
+なお、新しめのExpoプロジェクトで `expo-audio` を使う場合も考え方は同じです。`player.currentTime` を再生位置として使い、`player.volume` に整形した音量を代入すれば、位置ドリブンの設計はそのまま移せます。
+
+## まとめ
+
+まずは手元のスリープタイマーが壁時計の `setInterval` で書かれていないかを確認してみてください。もしそうなら、次の順序で置き換えるのが最初の一歩です。
+
+1. 再生位置から音量を返す純粋関数 `volumeForPosition` を用意する
+2. `onPlaybackStatusUpdate` の再生位置を入力に、`setVolumeAsync` へ音量を反映する
+3. 画面ロック時の確実さは、事前フェード済みのテール音源で補う
+
+この3ステップだけで、実機での違和感の大半は消えるはずです。
+
+音の消え際は、コードの正しさと素材の作り込みが交わる場所だと感じています。私自身まだ手触りを詰めている途中ですが、同じジャンルでアプリを育てている方と、こうした細部を共有していけたら嬉しいです。お読みいただきありがとうございました。

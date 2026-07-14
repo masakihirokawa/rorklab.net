@@ -1,0 +1,192 @@
+---
+title: "My Rork sleep timer faded out on time — but the sound didn't"
+slug: "rork-sleep-timer-audio-fade-playback-position-driven"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-15T05:26"
+updated: "2026-07-15T05:26"
+author: "Rork Lab"
+description: "Rork writes sleep-timer fades against the wall clock with setInterval. The numbers say 30 minutes, but the real audio fades early or cuts out abruptly. Here is how to drive the fade from the actual playback position, why a logarithmic curve sounds natural, and the honest limit of JS fades when the screen is locked."
+tags: ["Rork", "expo-av", "sleep timer", "React Native", "audio", "healing app"]
+highlights:
+  - "Understand why Rork's setInterval fade drifts away from the real audio, and replace it with a playback-position-driven implementation you can trust"
+  - "Get the concrete math for why a linear volume ramp sounds like it drops too fast, and how a logarithmic curve fixes the perceived fade"
+  - "Learn the real limit of JS fades once the screen is locked, and the pragmatic fix of a pre-faded tail asset that always plays to the end"
+---
+
+After years of running a healing app called Relaxing Healing, I have learned that the moment the sound disappears shapes how the whole app feels. If the audio cuts off with a click right as someone is falling asleep, they wake up. That is why the sleep-timer fade-out, unglamorous as it is, matters as the final touch.
+
+While prototyping a new healing app in Rork recently, I lost a few hours to exactly this feature. In the simulator the sound faded away beautifully after 30 minutes, but on a real device it felt off — the volume dropped sooner than expected, and the last few seconds cut out sharply. Tracing it back, Rork's generated code stacked up several classic audio-fade pitfalls. Anyone building in this genre will hit the same wall, so here is how I untangled it.
+
+## What Rork generates for a sleep timer
+
+Ask Rork to "add a sleep timer that slowly lowers the volume after 30 minutes and stops," and you usually get something like this.
+
+```javascript
+// A pattern Rork tends to generate
+const FADE_MS = 30_000; // fade over the last 30 seconds
+const TICK_MS = 200;
+
+function startSleepTimer(sound, totalMinutes) {
+  const stopAt = Date.now() + totalMinutes * 60_000;
+
+  const id = setInterval(async () => {
+    const remaining = stopAt - Date.now();
+    if (remaining <= 0) {
+      await sound.stopAsync();
+      clearInterval(id);
+      return;
+    }
+    if (remaining <= FADE_MS) {
+      const volume = remaining / FADE_MS; // 1.0 -> 0.0
+      await sound.setVolumeAsync(volume);
+    }
+  }, TICK_MS);
+
+  return id;
+}
+```
+
+It looks correct. It measures the remaining time with `Date.now()` and ramps the volume down linearly once the fade window opens. And the volume does go down. But this code drifts away from the real audio in three separate layers.
+
+## Why measuring against the wall clock drifts
+
+The first problem is that `setInterval` is anchored to the wall clock. `setInterval(fn, 200)` does not fire at exactly 200ms. If the JS thread is busy decoding images or rendering a list, that 200ms stretches to 250ms or 400ms. For something like a fade, where smoothness is the whole point, that jitter turns directly into an uneven volume ramp.
+
+Second, `sound.setVolumeAsync()` is asynchronous. Awaiting it every 200ms means that when the native side backs up, the callbacks pile on top of each other and the volume updates arrive in bursts.
+
+Third, and most easily missed: the audio's playback position and the wall clock do not necessarily advance at the same rate. When the audio session recovers from an interruption (a phone call, another app's sound), or when a loop seam triggers a tiny rebuffer, the position of the sound you actually hear falls behind the wall clock. Watching only the wall clock, the timer decides "we're done" while sound is still playing, and it cuts out mid-fade.
+
+<table>
+  <thead>
+    <tr><th>Aspect</th><th>Wall-clock setInterval</th><th>Position-driven</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Time reference</td><td>Date.now()</td><td>actual positionMillis</td></tr>
+    <tr><td>When JS is busy</td><td>interval stretches, volume jitters</td><td>next update snaps to the right volume</td></tr>
+    <tr><td>After an interruption</td><td>sound and time diverge, cuts out early</td><td>stays in sync with the sound</td></tr>
+    <tr><td>Determinism</td><td>accumulated error, drifts each run</td><td>volume is a pure function of position</td></tr>
+  </tbody>
+</table>
+
+## The fix: stop counting the wall clock, derive volume from playback position
+
+Flip the model. Instead of counting "how many milliseconds are left" on the wall clock, compute the target volume from "how far the audio has actually played." expo-av's `setOnPlaybackStatusUpdate` continuously hands you `positionMillis`, the current playback position. Because it is tied to the native audio clock, it is a far more reliable timeline, largely immune to how busy the JS thread is.
+
+The key is to define the fade as a pure function: for any playback position, the volume is uniquely determined. Once you drop the running accumulation, the error can no longer pile up.
+
+```javascript
+import { Audio } from 'expo-av';
+
+// Pure function: given the stop position and fade length, return the target volume
+function volumeForPosition(positionMillis, stopAtMillis, fadeMillis) {
+  const fadeStart = stopAtMillis - fadeMillis;
+  if (positionMillis <= fadeStart) return 1.0;      // before the fade
+  if (positionMillis >= stopAtMillis) return 0.0;   // fade complete
+  const progress = (positionMillis - fadeStart) / fadeMillis; // 0 -> 1
+  const remaining = 1 - progress;                    // 1 -> 0
+  return remaining;
+}
+```
+
+This function takes only the playback position and holds no external state. It is easy to test, and the same position always yields the same volume. The accumulated error, the async pile-up, and the drift from the real sound all disappear at this single point.
+
+## Applying the target volume from onPlaybackStatusUpdate
+
+With the pure function in place, all that's left is to apply the volume every time a new position arrives. For looping playback, accumulate the total elapsed playback time yourself.
+
+```javascript
+export function attachSleepTimer(sound, { totalMinutes, fadeSeconds = 30 }) {
+  const stopAtMillis = totalMinutes * 60_000;
+  const fadeMillis = fadeSeconds * 1000;
+
+  let elapsed = 0;
+  let lastPosition = 0;
+  let stopped = false;
+
+  // Raise the update rate so the fade is smooth (default is roughly 500ms)
+  sound.setProgressUpdateIntervalMillis(100);
+
+  sound.setOnPlaybackStatusUpdate(async (status) => {
+    if (!status.isLoaded || stopped) return;
+
+    // When a loop wraps the position back, add one full pass
+    if (status.positionMillis < lastPosition) {
+      elapsed += lastPosition;
+    }
+    lastPosition = status.positionMillis;
+    const played = elapsed + status.positionMillis;
+
+    const target = volumeForPosition(played, stopAtMillis, fadeMillis);
+    await sound.setVolumeAsync(shape(target));
+
+    if (played >= stopAtMillis) {
+      stopped = true;
+      await sound.pauseAsync();
+    }
+  });
+}
+```
+
+The important detail here is the `stopped` flag that guards against double firing. `onPlaybackStatusUpdate` runs many times at short intervals, so unless you guard the instant the stop condition is met, `pauseAsync` can run repeatedly, or a volume update can slip in after the stop. That "it went quiet, then briefly played again" behavior on a real device is usually this double fire.
+
+## Why a linear fade sounds like it drops too fast
+
+`volumeForPosition` returns the remaining time linearly. But if you feed that linear volume straight in, most people feel that "it stayed loud, then suddenly vanished at the end." Human hearing is the reason.
+
+Perceived loudness is roughly logarithmic against amplitude. Halving the amplitude to 0.5 does not halve the perceived volume — it still sounds much louder than half. So a linear amplitude ramp sounds to the ear like it lingers up high and then collapses at the bottom.
+
+The fix is a gentle curve on the target volume. Squaring the remaining fraction makes the volume start dropping earlier, which smooths out the perceived fade.
+
+```javascript
+// Reshape linear volume into something that feels smooth
+function shape(linearVolume) {
+  // Squared curve: starts dropping earlier, feels like a natural fade-out
+  return linearVolume * linearVolume;
+}
+```
+
+When I was dialing in the fade feel for Relaxing Healing as an indie developer, what I settled on in the end was this kind of curve, not a plain linear ramp. It is a modest bit of math, but it is one line that shapes the experience of drifting off to sleep. Cube it for something gentler, or swap in an exponential for a crisper drop, to match your genre.
+
+## Finalize the stop so it doesn't carry into the next play
+
+After the fade ends and the sound stops, the step people forget is restoring the volume. If you stop while still at `setVolumeAsync(0)`, the next time the user hits play it starts silent, and that reads as "broken." Always restore the volume to 1.0 before cleaning up.
+
+```javascript
+async function finalizeSleepTimer(sound) {
+  await sound.pauseAsync();
+  await sound.setPositionAsync(0);
+  await sound.setVolumeAsync(1.0); // restore for the next play
+  sound.setOnPlaybackStatusUpdate(null); // detach the callback
+}
+```
+
+Do not forget to detach the callback with `null`. If you leave it attached, the closure lives on after you navigate away, holding a stale `sound` instance in memory. In a healing app that stays open for hours, that small leak accumulates and can crash the app much later.
+
+## The honest limit when the screen is locked
+
+Everything above works as intended while the app is in the foreground. But to be honest, a JS-driven fade cannot be fully trusted once the iPhone screen is locked. Background playback itself continues with `Audio.setAudioModeAsync({ staysActiveInBackground: true, playsInSilentModeIOS: true })` and the `audio` entry in `UIBackgroundModes`, but while the screen is locked the JS thread is throttled, and there are stretches where `onPlaybackStatusUpdate` does not fire at the interval you expect. Since a sleep timer is used precisely with the screen off, this is unavoidable.
+
+What I settled on in the prototype was to not put the whole fade on code. Concretely, I prepare a separate "pre-faded tail" asset alongside the normal looping sound. Just before the scheduled stop, I halt the main track and switch to the tail asset, which plays to the very end. Because the tail is just an audio file, the audio engine plays it all the way through even with the screen locked. The uncertainty of manipulating volume in real time from code is absorbed on the asset side instead.
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>JS volume fade</th><th>Pre-faded tail asset</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Foreground (screen on)</td><td>runs smoothly</td><td>not needed</td></tr>
+    <tr><td>Screen locked</td><td>callbacks stall, cuts out</td><td>plays to the end reliably</td></tr>
+    <tr><td>Implementation cost</td><td>low</td><td>one extra audio file to prepare</td></tr>
+  </tbody>
+</table>
+
+Raise the foreground feel with the JS position-driven fade; guarantee the actual silence with the pre-faded tail. Once I settled on this two-layer approach, the on-device discomfort essentially went away. For the loop seam and the click between loops themselves, I wrote up a separate piece, [three things that tripped me up building ambient sound for a healing app in Rork](/en/articles/rork-dev/rork-healing-app-ambient-loop-audio-design-pitfalls), which fills in the rest of the picture.
+
+If you are on a newer Expo project using `expo-audio`, the idea is the same: use `player.currentTime` as the playback position and assign the shaped value to `player.volume`, and the position-driven design carries over directly.
+
+## Wrapping up
+
+Start by checking whether your current sleep timer is written against a wall-clock `setInterval`. If it is, the first step is to introduce a pure function like `volumeForPosition` and derive the volume from the `onPlaybackStatusUpdate` position. You can cover the locked-screen reliability afterward with a tail asset.
+
+The way a sound ends feels like the place where correct code and carefully crafted assets meet. I am still refining the feel of it myself, and I would be glad to compare these small details with anyone growing an app in the same genre.
