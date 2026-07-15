@@ -1,0 +1,289 @@
+---
+title: "On-Device Image Classification: TFLite on React Native or Core ML on Rork Max — How I Chose After Building Both"
+slug: "rork-on-device-image-classification-tflite-vs-coreml-selection-criteria"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-15T14:00"
+author: "Rork Lab"
+description: "Adding on-device image classification means choosing between TFLite on React Native and Core ML on Rork Max. I built the same feature both ways, measured the end-to-end breakdown, and worked out what the decision actually hinges on."
+tags: ["Rork Max", "Core ML", "TensorFlow Lite", "On-Device AI", "React Native", "Expo", "Image Recognition"]
+highlights:
+  - "Why preprocessing and data handoff dominate the timeline instead of inference, plus a probe you can drop in to get the breakdown on your own device"
+  - "The two routes for shipping TFLite (via tfjs versus via JSI) and the exact place where one of them stalls"
+  - "A decision table for when the jump from $25/month to $200/month is actually justified, derived from feature requirements rather than benchmarks"
+---
+
+Pick a photo, and the app decides on its own whether it is a night scene, a sky, or an abstract pattern — entirely on the device. When I went to add that small classifier to a wallpaper app, what stopped me was not the choice of model.
+
+Do I bolt TensorFlow Lite onto the React Native (Expo) project that regular Rork produces? Or do I lean on the native Swift that Rork Max emits and go with Core ML?
+
+The pricing gap matters too. Regular Rork starts free with paid plans at $25/month; Rork Max is $200/month. For a solo developer, that spread is not pocket change.
+
+So I built the same feature both ways. What I learned is that the thing I had been trying to compare — inference engine speed — was the wrong variable entirely.
+
+## Three questions I settled before writing any code
+
+Deciding these first matters. Skip them and you end up picking whichever one happened to work.
+
+1. **Can the user wait for a result?** Snapping one photo and classifying it is a different problem from tracking a live camera preview.
+2. **Will I keep swapping the model?** Shipping one off-the-shelf classifier is not the same as retraining on my own data and pushing updates.
+3. **What else on the device will I want to reach for?** Six months out, will widgets or the deeper parts of the photo library start looking tempting?
+
+That third question turned out to be the one that decided it.
+
+## On React Native, "use TFLite" is not a single path
+
+Start with the React Native (Expo) foundation that regular Rork generates. The first fork appears immediately.
+
+You can go through the TensorFlow.js React Native bindings, or you can hit native TFLite directly over JSI. Both are "using TFLite," and they feel nothing alike in practice.
+
+<table>
+  <thead>
+    <tr><th>Aspect</th><th>Via tfjs-react-native</th><th>Direct over JSI (react-native-fast-tflite and friends)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>How the image travels</td><td>File to Base64 string to Uint8Array to tensor</td><td>ArrayBuffer passed with close to zero copying</td></tr>
+    <tr><td>Where preprocessing lives</td><td>In JS — resize and normalize are tensor ops</td><td>Pushed to native or a frame processor</td></tr>
+    <tr><td>Ease of setup</td><td>Testable in Expo Go</td><td>Requires a development build</td></tr>
+    <tr><td>Where it bites</td><td>Base64 round trip, GC pressure, leaked tensors</td><td>Mismatched model input specs and dtypes</td></tr>
+  </tbody>
+</table>
+
+Convenience won at first, so I built the tfjs route. It works. It genuinely works. But there was a beat of hesitation between pressing the shutter and seeing a result, and it never went away.
+
+### The easy path, and the thing that kept nagging
+
+```typescript
+// utils/classifyViaTfjs.ts
+import * as tf from '@tensorflow/tfjs';
+import { decodeJpeg } from '@tensorflow/tfjs-react-native';
+import * as FileSystem from 'expo-file-system';
+
+// The image becomes a *string* and then gets read back. Remember this line.
+export async function classifyViaTfjs(model: tf.GraphModel, uri: string) {
+  const b64 = await FileSystem.readAsStringAsync(uri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
+  const bytes = tf.util.encodeString(b64, 'base64');
+  const image = decodeJpeg(new Uint8Array(bytes.buffer));
+
+  // Down to 224x224, normalize to -1..1, add the batch dimension
+  const input = tf.tidy(() =>
+    tf.image.resizeBilinear(image, [224, 224]).div(127.5).sub(1).expandDims(0)
+  );
+
+  const logits = model.predict(input) as tf.Tensor;
+  const probs = await logits.data();
+
+  // tidy cannot span an await, so anything created outside it is yours to free
+  tf.dispose([image, input, logits]);
+
+  return probs;
+}
+```
+
+The `tf.tidy` wrapper reclaims intermediate tensors in one sweep. It cannot cross an `await`, though, so `decodeJpeg` output and `predict` output still need an explicit `dispose`. Miss that and memory starts visibly climbing somewhere around the fortieth image.
+
+The reason this deserves care: a leak like this is invisible during the ten images you test with. It shows up when a user scrolls an album for a while.
+
+But the real problem was not the leak — it was how the image traveled. File to Base64 string, across the JS bridge, back to a Uint8Array. A 2MB photo becomes roughly a 2.7MB string the moment you Base64 it.
+
+Inference was fast, and I was still waiting. That told me what to measure.
+
+## On Rork Max, Core ML is not faster at inference — it has a shorter runway
+
+Rork Max emits native Swift rather than React Native. The same classification, written with Vision and Core ML:
+
+```swift
+// ImageClassifier.swift
+import CoreML
+import Vision
+
+final class ImageClassifier {
+    private let request: VNCoreMLRequest
+
+    init(model: MLModel) throws {
+        let vnModel = try VNCoreMLModel(for: model)
+        request = VNCoreMLRequest(model: vnModel)
+        // Let Vision handle resize and normalization. Not writing it yourself is the point.
+        request.imageCropAndScaleOption = .centerCrop
+    }
+
+    /// Takes a CGImage as-is — no Base64, no intermediate file
+    func classify(_ cgImage: CGImage) throws -> [(String, Float)] {
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+
+        guard let results = request.results as? [VNClassificationObservation] else {
+            return []
+        }
+        return results.prefix(5).map { ($0.identifier, $0.confidence) }
+    }
+}
+```
+
+That it is fewer lines is beside the point. What matters is that `VNImageRequestHandler` accepts a `CGImage` directly.
+
+All the resizing, normalizing, and batch-dimension juggling I hand-wrote on the React Native side is Vision's job here. The preprocessing did not disappear — **it stopped crossing a process boundary.**
+
+One thing Core ML does not fix: the first run is still a different animal. Model compilation and graph setup land on that first inference, so the very first image after launch is noticeably slow. Where you choose to pay that cost is a design question, and it runs alongside what I covered in [Designing On-Device Core ML So Launch Weight and Thermals Do Not Break It](/articles/app-dev/rork-max-coreml-cold-start-thermal-budget-design).
+
+## Measure the same feature both ways, or you are not comparing anything
+
+Compare on inference time alone and you will decide wrong. What a user feels is everything between finger-on-shutter and screen-changes.
+
+So I put identical measurement points in both. React Native first.
+
+```typescript
+// utils/latencyProbe.ts
+type Stage = 'capture' | 'read' | 'decode' | 'preprocess' | 'infer' | 'postprocess';
+
+export class LatencyProbe {
+  private marks: Array<[Stage, number]> = [];
+  private t0 = 0;
+
+  start() {
+    this.marks = [];
+    this.t0 = performance.now();
+  }
+
+  /// Just record when each stage finished — deltas come later
+  mark(stage: Stage) {
+    this.marks.push([stage, performance.now()]);
+  }
+
+  /// Per-stage milliseconds plus the total
+  report(): { breakdown: Record<string, number>; totalMs: number } {
+    const breakdown: Record<string, number> = {};
+    let prev = this.t0;
+
+    for (const [stage, at] of this.marks) {
+      breakdown[stage] = Math.round((at - prev) * 10) / 10;
+      prev = at;
+    }
+    return { breakdown, totalMs: Math.round((prev - this.t0) * 10) / 10 };
+  }
+}
+```
+
+Call `mark` at each seam:
+
+```typescript
+const probe = new LatencyProbe();
+probe.start();
+
+const photo = await cameraRef.current.takePictureAsync({ quality: 0.5, skipProcessing: true });
+probe.mark('capture');
+
+const b64 = await FileSystem.readAsStringAsync(photo.uri, { encoding: FileSystem.EncodingType.Base64 });
+probe.mark('read');
+
+const image = decodeJpeg(new Uint8Array(tf.util.encodeString(b64, 'base64').buffer));
+probe.mark('decode');
+
+const input = tf.tidy(() => tf.image.resizeBilinear(image, [224, 224]).div(127.5).sub(1).expandDims(0));
+probe.mark('preprocess');
+
+const logits = model.predict(input) as tf.Tensor;
+const probs = await logits.data();
+probe.mark('infer');
+
+const top5 = toTop5(probs);
+probe.mark('postprocess');
+
+console.log(probe.report());
+// Example: { breakdown: { capture: 118.4, read: 96.2, decode: 141.7, preprocess: 28.9, infer: 19.6, postprocess: 3.1 }, totalMs: 407.9 }
+```
+
+On the Swift side, name the same intervals with `os_signpost` and Instruments gives you the identical granularity.
+
+```swift
+import os
+
+let log = OSLog(subsystem: "net.rorklab.classifier", category: .pointsOfInterest)
+
+os_signpost(.begin, log: log, name: "decode")
+let cgImage = try decodeImage(from: data)
+os_signpost(.end, log: log, name: "decode")
+
+os_signpost(.begin, log: log, name: "infer")
+let results = try classifier.classify(cgImage)
+os_signpost(.end, log: log, name: "infer")
+```
+
+### Reading the breakdown
+
+Here is one run from my setup. **These numbers move a lot with device, model, and image size, so please take your own on real hardware.** What is worth your attention is not the absolute values but the shape — which stage dominates.
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>What happens</th><th>Via tfjs</th><th>What JSI / Core ML does to it</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>capture</td><td>Shoot, write file</td><td>~120ms</td><td>Comparable — little to gain here</td></tr>
+    <tr><td>read</td><td>Read file, Base64 encode</td><td>~95ms</td><td><strong>The stage disappears</strong></td></tr>
+    <tr><td>decode</td><td>JPEG decode</td><td>~140ms</td><td>Runs native, drops sharply</td></tr>
+    <tr><td>preprocess</td><td>Resize, normalize</td><td>~30ms</td><td>Absorbed by Vision</td></tr>
+    <tr><td>infer</td><td>The actual inference</td><td>~20ms</td><td>About the same</td></tr>
+    <tr><td>postprocess</td><td>Format the top 5</td><td>~3ms</td><td>About the same</td></tr>
+  </tbody>
+</table>
+
+Inference was roughly 5% of the total. Everything else went into moving the image around.
+
+Which means shrinking the model from 14MB to 3.5MB with quantization takes 20ms down to 13ms. Nobody feels that. What you feel is `read` and `decode` going away.
+
+Seen from here, quantization changes meaning. For me it is no longer a speed tactic — it is an app-size tactic. That framing lines up with [Machine Learning Optimization on Rork Max — Core ML Integration, Per-Device Tuning, Quantization and Size Reduction](/articles/rork-dev/rork-max-machine-learning-coreml-optimization-complete-guide).
+
+## Fix things in the order that pays
+
+Once you have the breakdown, the order writes itself. Even staying on React Native, this is how far I got.
+
+1. **Stop the Base64 round trip.** Move to a JSI-backed library and hand over the `ArrayBuffer`. The `read` stage vanishes.
+2. **Shoot smaller.** If you are downscaling to 224×224, there is no reason to capture 12MP. Beyond `quality` on `takePictureAsync`, use a smaller preset where you can.
+3. **Push decode native.** A frame processor means never writing the file at all.
+4. **Hide the runway.** Run one dummy inference at startup so the first-run cost lands outside any user interaction.
+
+Number four is unglamorous and moved perceived speed more than anything else on the list. The first run costs a few hundred extra milliseconds no matter what. If it is unavoidable, pay it somewhere nobody is looking.
+
+Do all four and the hesitation largely disappears on React Native. Which is the real point: **only requirements that survive all four are a reason to consider Rork Max.**
+
+## $200/month is not justified by image classification alone
+
+Back to money. Regular Rork is free to start, $25/month paid. Rork Max is $200/month. That is $175/month, $2,100 a year.
+
+Honestly, if all you want is one image classifier, I found that gap hard to justify. The four fixes above bring React Native comfortably into usable territory.
+
+What changes the answer is question three — what else on the device will you want to touch — coming back "something."
+
+<table>
+  <thead>
+    <tr><th>What you want</th><th>React Native (Expo) + TFLite</th><th>Rork Max (Swift) + Core ML</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Classify one captured photo</td><td>Plenty usable once tuned</td><td>Cleanly fast, but weigh it against the gap</td></tr>
+    <tr><td>Track a live camera preview per frame</td><td>Frame processor required, real build-out</td><td>Fits Vision well, less friction</td></tr>
+    <tr><td>Surface results in widgets or Live Activities</td><td>Hard to reach</td><td>Native territory, treated as such</td></tr>
+    <tr><td>Tie into the deep photo library, AR, or LiDAR</td><td>Lots of hand-built bridging</td><td>In scope from day one</td></tr>
+    <tr><td>Ship the same code to Android</td><td><strong>Its single biggest strength</strong></td><td>Apple ecosystem only</td></tr>
+    <tr><td>Keep updating your own model</td><td>Rich TFLite tooling and conversion path</td><td>Adds a Core ML conversion step</td></tr>
+  </tbody>
+</table>
+
+My wallpaper app had to ship to Android from the same code, so I stayed on React Native. Had it been Apple-only with classification results going into a widget, I would have taken Rork Max without hesitating.
+
+Treating these as a premium tier and a basic tier leads you astray. The generated foundation is genuinely different — Swift versus React Native — so the criterion is not price. It is how far into Apple's own capabilities you intend to go.
+
+If you do end up owning a Core ML model yourself, the conversion and operational side is laid out in [Rork and Core ML: Custom Model Development and On-Device AI](/articles/rork-ai/rork-core-ml-custom-model-on-device-ai-guide).
+
+## The decision, in one line
+
+Count the device features you will want six months from now. Zero means React Native. One or more means Rork Max.
+
+Raw classification speed contributed almost nothing to that call, because inference was 5% of the timeline. The time I spent stalled, trying to choose on speed, was the genuinely wasted part.
+
+Measure the breakdown first — your device, your image sizes. The moment the dominant stage shows itself, the path narrows to one on its own. Mine turned out to be `read` and `decode`, and the answer was never "switch engines." It was "stop turning the image into a string."
+
+The probe is above. Thanks for reading.

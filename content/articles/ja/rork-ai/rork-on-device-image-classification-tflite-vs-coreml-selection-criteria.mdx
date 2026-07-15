@@ -1,0 +1,291 @@
+---
+title: "オンデバイス画像認識、React Native の TFLite か Rork Max の Core ML か — 同じ題材で両方組んで決めた選び方"
+slug: "rork-on-device-image-classification-tflite-vs-coreml-selection-criteria"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-15T14:00"
+author: "Rork Lab"
+description: "端末内で画像を分類する機能を、React Native に TFLite を積んで作るか、Rork Max のネイティブ Swift と Core ML で作るか。同じ題材を両方で組み、端から端までの内訳を測って選び方を整理しました。"
+tags: ["Rork Max", "Core ML", "TensorFlow Lite", "オンデバイスAI", "React Native", "Expo", "画像認識"]
+highlights:
+  - "推論そのものより前処理と受け渡しが支配的になる理由と、その内訳を自分の端末で取るための計測ハーネス"
+  - "TFLite を積む2つのルート（tfjs 経由と JSI 経由）の実装差と、片方で詰まる具体的な箇所"
+  - "月25ドルと月200ドルの差が正当化される条件を、機能要件から逆算して判断する表"
+---
+
+写真を1枚選ぶと、それが夜景なのか、空なのか、抽象的なパターンなのかを、端末の中だけで判定したい。壁紙アプリに小さな分類機能を足そうとしたとき、手が止まったのはモデル選びではありませんでした。
+
+React Native（Expo）側に TensorFlow Lite を積むのか。Rork Max が吐くネイティブ Swift で Core ML に寄せるのか。詰まったのはそこです。
+
+料金にも差があります。通常の Rork は無料から始められて有料が月25ドル、Rork Max は月200ドル。個人開発の財布には、決して軽い差ではありません。
+
+結局、両方を同じ題材で組んでみました。そこで分かったのは、私が比べるべきだったのは推論エンジンの速さではなかった、ということです。
+
+## 比べる前に置いた3つの問い
+
+手を動かす前に、判断を分ける問いを3つだけ決めました。これを決めずに実装に入ると、「動いた方」を選んでしまいます。
+
+1. **その機能は、推論結果が出るまでユーザーを待たせてよいか** — 撮影して1枚判定するのか、カメラのプレビューに追従するのか
+2. **モデルは自分で差し替え続けるか** — 出来合いの分類器を1つ積むだけなのか、自前データで再学習して更新し続けるのか
+3. **画像以外に、その端末の何を触りたくなるか** — 半年後にウィジェットや写真ライブラリの深い部分へ手が伸びないか
+
+この3問めが、後から効いてきました。
+
+## React Native 側 — TFLite を積むルートは1本ではありません
+
+まず通常の Rork が吐く React Native（Expo）の土台に TFLite を積みます。ここで最初の分かれ道があります。
+
+TensorFlow.js の React Native バインディングを経由するルートと、ネイティブの TFLite を JSI で直接叩くルート。同じ「TFLite を使う」でも、実装の手触りがまったく別物です。
+
+<table>
+  <thead>
+    <tr><th>観点</th><th>tfjs-react-native 経由</th><th>JSI 直結（react-native-fast-tflite 系）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>画像の渡し方</td><td>ファイル → Base64 文字列 → Uint8Array → テンソル</td><td>ArrayBuffer をゼロコピーに近い形で受け渡し</td></tr>
+    <tr><td>前処理の置き場</td><td>JS 側（リサイズ・正規化もテンソル演算）</td><td>ネイティブ側／フレームプロセッサに寄せられる</td></tr>
+    <tr><td>導入の容易さ</td><td>Expo Go でも試しやすい</td><td>開発ビルドが必要</td></tr>
+    <tr><td>詰まりやすい箇所</td><td>Base64 の往復と GC、テンソルの解放漏れ</td><td>モデルの入力仕様と型の食い違い</td></tr>
+  </tbody>
+</table>
+
+私は最初、手軽さに引かれて tfjs 経由で組みました。動きます。動きますが、シャッターを押してから結果が出るまで、一拍置かれる感触が残りました。
+
+### 手軽な方のコード、そして残った引っかかり
+
+```typescript
+// utils/classifyViaTfjs.ts
+import * as tf from '@tensorflow/tfjs';
+import { decodeJpeg } from '@tensorflow/tfjs-react-native';
+import * as FileSystem from 'expo-file-system';
+
+// 画像を「文字列」に変換してから読み戻す — ここが後で効いてきます
+export async function classifyViaTfjs(model: tf.GraphModel, uri: string) {
+  const b64 = await FileSystem.readAsStringAsync(uri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
+  const bytes = tf.util.encodeString(b64, 'base64');
+  const image = decodeJpeg(new Uint8Array(bytes.buffer));
+
+  // 224x224 に落として -1〜1 に正規化し、バッチ次元を足す
+  const input = tf.tidy(() =>
+    tf.image.resizeBilinear(image, [224, 224]).div(127.5).sub(1).expandDims(0)
+  );
+
+  const logits = model.predict(input) as tf.Tensor;
+  const probs = await logits.data();
+
+  // tidy の外で作ったテンソルは自分で捨てます。ここを忘れると数十枚で膨らみます
+  tf.dispose([image, input, logits]);
+
+  return probs;
+}
+```
+
+`tf.tidy` を挟んでいるのは、中間テンソルをまとめて回収するためです。ただし `tidy` は非同期処理を跨げないので、`decodeJpeg` の結果や `predict` の出力は自分で `dispose` する必要があります。ここを落とすと、数十枚流したあたりからメモリが目に見えて膨らみます。
+
+なぜ気をつけるかというと、この手のリークは「開発中の10枚」では絶対に見えないからです。見えるのは、ユーザーがアルバムを延々スクロールした後です。
+
+そして肝心の引っかかりは、リークではなく画像の渡し方の方にありました。ファイルを Base64 文字列にして、JS のブリッジを通して、また Uint8Array に戻す。2MB の写真なら、Base64 化した時点で約2.7MB の文字列がメモリに乗ります。
+
+推論は速いのに、待たされる。この時点で、私が測るべき対象がはっきりしました。
+
+## Rork Max 側 — Core ML が短いのは推論ではなく助走です
+
+Rork Max は React Native ではなくネイティブ Swift を生成します。同じ分類を Vision と Core ML で書くと、こうなります。
+
+```swift
+// ImageClassifier.swift
+import CoreML
+import Vision
+
+final class ImageClassifier {
+    private let request: VNCoreMLRequest
+
+    init(model: MLModel) throws {
+        let vnModel = try VNCoreMLModel(for: model)
+        request = VNCoreMLRequest(model: vnModel)
+        // リサイズと正規化を Vision に任せます。自前で書かない、が要点です
+        request.imageCropAndScaleOption = .centerCrop
+    }
+
+    /// CGImage をそのまま渡します。Base64 も中間ファイルも経由しません
+    func classify(_ cgImage: CGImage) throws -> [(String, Float)] {
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        try handler.perform([request])
+
+        guard let results = request.results as? [VNClassificationObservation] else {
+            return []
+        }
+        return results.prefix(5).map { ($0.identifier, $0.confidence) }
+    }
+}
+```
+
+行数が減ったこと自体は、大した話ではありません。効いているのは `VNImageRequestHandler` に `CGImage` を直接渡せる点です。
+
+React Native 側で私が苦労していたリサイズ・正規化・バッチ次元の追加は、Vision が引き受けます。前処理のコードが消えたのではなく、**前処理がプロセス境界を跨がなくなった**ということです。
+
+もう一つ、初回だけは別物である点は Core ML でも変わりません。モデルのコンパイルと計算グラフの準備が初回推論に乗るので、起動直後の1枚だけが目に見えて遅くなります。この助走をどこで踏むかは設計の問題で、[オンデバイス Core ML を、起動の重さとサーマルで破綻させない設計](/articles/app-dev/rork-max-coreml-cold-start-thermal-budget-design) で扱っている論点と地続きです。
+
+## 同じ題材で測る — 内訳を取らないと比較になりません
+
+「どちらが速いか」を推論時間だけで比べると、判断を間違えます。ユーザーが体感するのは、指がシャッターに触れてから画面が変わるまでの全部だからです。
+
+そこで両方に同じ計測点を置きました。まず React Native 側。
+
+```typescript
+// utils/latencyProbe.ts
+type Stage = 'capture' | 'read' | 'decode' | 'preprocess' | 'infer' | 'postprocess';
+
+export class LatencyProbe {
+  private marks: Array<[Stage, number]> = [];
+  private t0 = 0;
+
+  start() {
+    this.marks = [];
+    this.t0 = performance.now();
+  }
+
+  /// 各段の「終わった時刻」を積むだけ。差分は後で取ります
+  mark(stage: Stage) {
+    this.marks.push([stage, performance.now()]);
+  }
+
+  /// 段ごとの所要 ms と合計を返します
+  report(): { breakdown: Record<string, number>; totalMs: number } {
+    const breakdown: Record<string, number> = {};
+    let prev = this.t0;
+
+    for (const [stage, at] of this.marks) {
+      breakdown[stage] = Math.round((at - prev) * 10) / 10;
+      prev = at;
+    }
+    return { breakdown, totalMs: Math.round((prev - this.t0) * 10) / 10 };
+  }
+}
+```
+
+使う側は、段の切れ目で `mark` を呼ぶだけです。
+
+```typescript
+const probe = new LatencyProbe();
+probe.start();
+
+const photo = await cameraRef.current.takePictureAsync({ quality: 0.5, skipProcessing: true });
+probe.mark('capture');
+
+const b64 = await FileSystem.readAsStringAsync(photo.uri, { encoding: FileSystem.EncodingType.Base64 });
+probe.mark('read');
+
+const image = decodeJpeg(new Uint8Array(tf.util.encodeString(b64, 'base64').buffer));
+probe.mark('decode');
+
+const input = tf.tidy(() => tf.image.resizeBilinear(image, [224, 224]).div(127.5).sub(1).expandDims(0));
+probe.mark('preprocess');
+
+const logits = model.predict(input) as tf.Tensor;
+const probs = await logits.data();
+probe.mark('infer');
+
+const top5 = toTop5(probs);
+probe.mark('postprocess');
+
+console.log(probe.report());
+// 出力例: { breakdown: { capture: 118.4, read: 96.2, decode: 141.7, preprocess: 28.9, infer: 19.6, postprocess: 3.1 }, totalMs: 407.9 }
+```
+
+Swift 側は `os_signpost` で同じ区間に名前を付ければ、Instruments で同じ粒度の内訳が取れます。
+
+```swift
+import os
+
+let log = OSLog(subsystem: "net.rorklab.classifier", category: .pointsOfInterest)
+
+os_signpost(.begin, log: log, name: "decode")
+let cgImage = try decodeImage(from: data)
+os_signpost(.end, log: log, name: "decode")
+
+os_signpost(.begin, log: log, name: "infer")
+let results = try classifier.classify(cgImage)
+os_signpost(.end, log: log, name: "infer")
+```
+
+### 内訳の読み方
+
+手元の計測例を1つ置きます。**数値は端末・モデル・画像サイズで大きく動くので、必ずご自身の実機で取り直してください。** ここで見ていただきたいのは絶対値ではなく、どの段が支配的かという形の方です。
+
+<table>
+  <thead>
+    <tr><th>段</th><th>やっていること</th><th>tfjs 経由の例</th><th>JSI／Core ML 側で起きること</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>capture</td><td>撮影・ファイル書き出し</td><td>約120ms</td><td>同等（ここは差がつきにくい）</td></tr>
+    <tr><td>read</td><td>ファイル読み出し・Base64 化</td><td>約95ms</td><td><strong>段ごと消える</strong></td></tr>
+    <tr><td>decode</td><td>JPEG デコード</td><td>約140ms</td><td>ネイティブ側で実行され大幅に短縮</td></tr>
+    <tr><td>preprocess</td><td>リサイズ・正規化</td><td>約30ms</td><td>Vision に吸収される</td></tr>
+    <tr><td>infer</td><td>推論そのもの</td><td>約20ms</td><td>ほぼ同等</td></tr>
+    <tr><td>postprocess</td><td>上位5件の整形</td><td>約3ms</td><td>ほぼ同等</td></tr>
+  </tbody>
+</table>
+
+推論は全体の5%ほどでした。残りは、画像をどう運ぶかに費やされていたということです。
+
+つまり量子化でモデルを14MBから3.5MBに縮めても、20msが13msになるだけ。体感は変わりません。効くのは `read` と `decode` を消すことです。
+
+この気づきの後で見ると、量子化の位置づけも変わります。私にとって量子化はもう速度対策ではなく、アプリサイズ対策の手段です。この整理は [Rork Max の Machine Learning 最適化 — Core ML 統合・端末別パフォーマンス調整・量子化からサイズ削減まで](/articles/rork-dev/rork-max-machine-learning-coreml-optimization-complete-guide) の観点とも噛み合います。
+
+## 効いた順に直す
+
+内訳が取れると、直す順番が決まります。React Native 側に留まる前提でも、ここまでは詰められました。
+
+1. **Base64 の往復をやめる** — JSI 直結のライブラリに寄せ、`ArrayBuffer` を直接渡します。`read` が段ごと消えます
+2. **撮影解像度を落とす** — 224×224 に縮めるなら、12MP で撮る必要はありません。`takePictureAsync` の `quality` だけでなく、可能なら小さいプリセットで撮ります
+3. **デコードをネイティブへ寄せる** — フレームプロセッサを使えば、そもそもファイルに書き出さずに済みます
+4. **助走を隠す** — 起動直後にダミー画像で1回推論を回し、初回の重さをユーザーの操作の外に追い出します
+
+4番めは地味ですが、体感への効き目が最も大きい部類でした。初回だけ数百ms余計にかかるのは避けられません。避けられないなら、見えない場所で払っておく。
+
+ここまでやれば、React Native 側でも「一拍待たされる」感触はかなり消えます。逆に言えば、**ここまでやっても届かない要件だけが、Rork Max を検討する理由になります。**
+
+## 月200ドルが正当化されるのは、画像認識単体ではありません
+
+費用の話に戻ります。通常の Rork は無料開始・有料が月25ドル、Rork Max は月200ドル。差は月175ドル、年で2,100ドルです。
+
+正直なところ、画像分類を1つ載せたいだけなら、この差は正当化しにくいと感じました。上に書いた4つの手当てで、React Native 側でも実用の範囲に入るからです。
+
+私の場合、この種のアプリは AdMob の広告収益で回しています。月175ドルの固定費は、その収益から先に引かれる数字です。だから問いは「速くなるか」ではなく「その固定費を毎月払い続ける理由があるか」に変わります。分類が0.3秒速くなることに、年2,100ドルの値札は付きませんでした。
+
+判断が変わるのは、3つめの問い — その端末の他に何を触りたくなるか — に「ある」と答えたときでした。
+
+<table>
+  <thead>
+    <tr><th>やりたいこと</th><th>React Native（Expo）＋TFLite</th><th>Rork Max（Swift）＋Core ML</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>撮影した1枚を分類する</td><td>手当てすれば十分実用</td><td>素直に速いが、差額に見合うかは要検討</td></tr>
+    <tr><td>カメラのプレビューに毎フレーム追従</td><td>フレームプロセッサ必須・作り込みが要る</td><td>Vision との相性が良く消耗が少ない</td></tr>
+    <tr><td>ウィジェットや Live Activities に結果を出す</td><td>届きにくい</td><td>ネイティブ領域として扱える</td></tr>
+    <tr><td>写真ライブラリの深い部分・AR・LiDAR と絡める</td><td>橋渡しの自作が増える</td><td>最初から射程に入る</td></tr>
+    <tr><td>Android も同じコードで出す</td><td><strong>これが最大の強み</strong></td><td>Apple エコシステム前提</td></tr>
+    <tr><td>モデルを自前で更新し続ける</td><td>TFLite の資産・変換ツールが豊富</td><td>Core ML 形式への変換工程が挟まる</td></tr>
+  </tbody>
+</table>
+
+私の壁紙アプリの場合、App Store と Google Play の両方へ同じコードで出す前提があったので、React Native 側に留まりました。もしこれが Apple 専用で、しかもウィジェットに分類結果を出したい要件だったなら、迷わず Rork Max を選んだと思います。
+
+上位版と下位版だと捉えると、判断を誤ります。生成される土台そのものが Swift と React Native で別物である以上、選ぶ基準は価格ではなく、作りたいものがどこまで Apple の機能に踏み込むかです。
+
+なお Core ML 側でモデルを自前で持つ場合の変換や運用は、[Rork × Core ML カスタムモデル開発 × オンデバイスAI](/articles/rork-ai/rork-core-ml-custom-model-on-device-ai-guide) に整理があります。
+
+## 決め方を1行にすると
+
+半年後に触りたくなる端末機能を数えて、それがゼロなら React Native、1つでもあるなら Rork Max。
+
+画像認識そのものの速さは、この判断にほとんど寄与しませんでした。推論は全体の5%だったからです。速さで選ぼうとして手が止まっていた時間が、いま思えば一番の無駄でした。
+
+まず内訳を測ってください。自分の端末で、自分の画像サイズで。支配的な段が見えた瞬間に、選ぶべき道は自然と一本に絞られます。私の場合はそれが `read` と `decode` で、答えは「エンジンを乗り換える」ではなく「画像を文字列にするのをやめる」でした。
+
+計測の道具は上に置いた通りです。お読みいただきありがとうございました。
