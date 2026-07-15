@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、Appleエコシステム全体を対象にします",
-    "DEVICES — iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまで、一つの記述から広げられます",
-    "NATIVE — AR・LiDARスキャン、Metalによる3Dゲーム、ウィジェット、Dynamic Island、オンデバイスCore MLを解放します",
-    "SEED — RorkはLeft Lane Capital主導の$15Mシードを調達し、Peak XVやa16z Speedrunも参加しました",
-    "PAPERLINE — アプリビルダーPaperlineを買収し、エンジニアリング人材の獲得を続ける姿勢です",
-    "MARKET — 月間743,000訪問超。Gartnerは2026年末までに新規アプリの75%がローコード/ノーコードで作られると見込みます",
+    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでを対象にします",
+    "APIS — SwiftUI・ARKit・HealthKit・HomeKit・Core ML・MetalといったネイティブAPIに手が届き、AR/LiDARスキャンやオンデバイス機械学習も扱えます",
+    "CLOUD — Swiftコードを書き、クラウド上のMacでコンパイルし、実機タッチ入力に対応したライブシミュレータをストリーミングします",
+    "SUBMIT — 実機インストール用、あるいはApp Store提出用のビルドまで用意されます",
+    "SEED — Rorkは4月にLeft Lane Capital主導の$15Mシードを調達しました。Peak XVとa16z Speedrunも参加しています",
+    "PRICE — 無料で始められ（週5プロンプト前後）、有料プランは$25/月から。Rork Maxは$200/月です",
   ],
   en: [
-    "MAX — Rork Max builds native Swift apps instead of React Native, targeting the whole Apple ecosystem",
-    "DEVICES — From one description it spans iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — It unlocks AR and LiDAR scanning, 3D games with Metal, Home Screen widgets, Dynamic Island, and on-device Core ML",
-    "SEED — Rork raised a $15M seed led by Left Lane Capital, joined by Peak XV and a16z Speedrun",
-    "PAPERLINE — Rork acquired the app builder Paperline and plans to stay acquisitive for engineering talent",
-    "MARKET — With 743,000+ monthly visits, and Gartner expects 75% of new apps to be low-code or no-code by end of 2026",
+    "MAX — Rork Max builds native Swift apps rather than React Native, spanning iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "APIS — It reaches native Apple APIs including SwiftUI, ARKit, HealthKit, HomeKit, Core ML, and Metal, so AR/LiDAR scanning and on-device ML are in scope",
+    "CLOUD — Rork Max writes Swift, compiles it on cloud-hosted Macs, and streams a live simulator that accepts real touch input",
+    "SUBMIT — From there it prepares the build for device install or App Store submission",
+    "SEED — Rork raised a $15M seed led by Left Lane Capital in April, joined by Peak XV and a16z Speedrun",
+    "PRICE — It's free to start at roughly 5 prompts a week, paid plans begin at $25/month, and Rork Max runs $200/month",
   ],
 };
 
