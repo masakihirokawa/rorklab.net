@@ -1,0 +1,318 @@
+---
+title: "壁紙の段組みギャラリーにネイティブ広告を差し込む — 広告セルの寿命をプールで設計する"
+slug: "rork-expo-native-ad-masonry-grid-lifecycle-preload-pool"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-16T14:30"
+author: "Rork Lab"
+description: "段組みギャラリーにネイティブ広告を1枚入れたところ、20分のスクロールでメモリが伸び続けました。リスト再利用と広告の寿命が噛み合わない理由から、プール方式の実装、差し込み間隔の決め方まで実測とともに残します。"
+tags: ["Rork", "Expo", "AdMob", "ネイティブ広告", "FlashList"]
+highlights:
+  - "リストのセル再利用と広告オブジェクトの寿命が噛み合わず、メモリが伸び続ける仕組みと切り分け手順"
+  - "広告をプールで保持しセルには貸すだけにする実コード、および破棄タイミングの判断ライン"
+  - "差し込み間隔・スクロール中の読み込み抑止・段組みの高さ計算を、実測値をもとに決める方法"
+---
+
+段組みのギャラリーに、ネイティブ広告を1枚だけ差し込みました。10枚目のあとに1枚。それだけの変更です。
+
+翌朝、Xcode の Memory Report を開いたまま20分ほどスクロールを続けたところ、メモリが 180 MB から 420 MB まで伸びて戻りませんでした。広告を外すと 190 MB 前後で平らになります。原因は広告そのものではなく、広告を「セルの一部」として扱っていた私の設計にありました。
+
+個人開発で壁紙アプリを何本か回していると、広告の実装は毎回どこかで手が止まります。今回つまずいたのは、リストの再利用という React Native 側の都合と、ネイティブ広告オブジェクトの寿命という広告 SDK 側の都合が、まったく違う時間軸で動いていたことでした。
+
+その噛み合わなさをどう設計で吸収したかを残します。段組みギャラリーそのものの組み方は[高さの異なる画像を2列で美しく並べる—Rork の Expo アプリで壁紙ギャラリーを段組みにする](/articles/app-dev/rork-expo-masonry-waterfall-gallery-variable-height-images)に書きましたので、この記事はその上に広告を載せる話に絞ります。
+
+## 段組みに広告を1枚入れた翌日に起きたこと
+
+症状は3つ、同時に出ました。
+
+<table>
+  <thead>
+    <tr><th>症状</th><th>広告なし</th><th>広告あり（素朴な実装）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>20分スクロール後のメモリ（iPhone 14, 実機）</td><td>190 MB 前後で平ら</td><td>420 MB まで単調増加</td></tr>
+    <tr><td>スクロール中のフレーム落ち（60fps 基準・1分あたり）</td><td>2〜4 回</td><td>28〜41 回</td></tr>
+    <tr><td>広告の表示回数 / スクロール到達回数</td><td>—</td><td>0.62（4割が空白セル）</td></tr>
+  </tbody>
+</table>
+
+3つとも別の問題に見えて、根は1つでした。広告を返す関数を `renderItem` の中で呼んでいたのです。
+
+```tsx
+// 素朴な実装。ここから3つの症状が全部出ました
+function renderItem({ item }: { item: GridItem }) {
+  if (item.type === 'ad') {
+    return <NativeAdCell unitId={AD_UNIT_ID} />; // ← セルの中で読み込む
+  }
+  return <WallpaperCell wallpaper={item.wallpaper} />;
+}
+```
+
+`NativeAdCell` は自分の `useEffect` の中で広告を読み込みます。素直に見えます。けれど FlashList も FlatList も、画面外に出たセルを破棄せず、別のデータで使い回します。つまりこのコンポーネントは、スクロールのたびにマウントとアンマウントを繰り返します。
+
+そのたびに新しい広告リクエストが飛び、そのたびに新しいネイティブ広告オブジェクトが生まれます。そして誰も捨てません。
+
+## 広告オブジェクトの寿命はセルの寿命と一致しない
+
+ここが一番の勘所でした。
+
+React のコンポーネントは「画面に映っている間だけ生きていればよい」という前提で書きます。アンマウントされたら消える、と私たちは思っています。
+
+ところがネイティブ広告は違います。`GADNativeAd`（iOS）や `NativeAd`（Android）は JavaScript 側の参照が切れてもネイティブ側に残ります。明示的に `destroy()` を呼ぶまで、画像アセットもクリック計測用のビューも保持され続けます。JavaScript の GC はネイティブヒープを掃除してくれません。
+
+さらに厄介なのは、広告の読み込みが 400〜900 ms かかることです。セルが画面外に出るのに要する時間より長い。素早くスクロールすると、こういう順序になります。
+
+1. セルがマウントされ、広告リクエストを送る
+2. 320 ms 後、セルが画面外に出てアンマウントされる
+3. 610 ms 後、広告が返ってくる — 貼り付ける先のビューはもう無い
+4. 広告オブジェクトはネイティブ側に残る。誰も `destroy()` を呼ばない
+
+先ほどの「表示回数 / 到達回数 = 0.62」は、この 3 の状態が4割起きていたということです。読み込んだのに一度も見られていない広告が、メモリだけ食っていました。
+
+私はこれを「寿命のズレ」と呼んで区別するようにしました。セルの寿命は数百 ms、広告の寿命は分単位。この2つを同じライフサイクルに縛ろうとすると、必ずどちらかが壊れます。
+
+## プールで持ち、セルには貸すだけにする
+
+解き方は、広告の所有権をリストの外へ出すことでした。
+
+広告はリストが所有するのではなく、リストより長生きするプールが所有します。セルは「今この位置に貸してもらえる広告はありますか」と尋ねるだけ。貸せなければ何も描かない、または静かにプレースホルダを出す。
+
+```ts
+// adPool.ts — リストより長生きする単一のプール
+import { NativeAd, TestIds } from 'react-native-google-mobile-ads';
+
+const UNIT_ID = __DEV__ ? TestIds.NATIVE : 'YOUR_AD_UNIT_ID';
+const POOL_SIZE = 3;      // 同時に保持する広告の上限
+const MAX_AGE_MS = 55 * 60 * 1000; // AdMob の広告は1時間で失効する前提で余裕を持たせる
+
+type PooledAd = { ad: NativeAd; createdAt: number; lentTo: string | null };
+
+let pool: PooledAd[] = [];
+let loading = 0;
+
+async function fill() {
+  // 空き枠のぶんだけ、重複せずに読み込む
+  const want = POOL_SIZE - pool.length - loading;
+  for (let i = 0; i < want; i++) {
+    loading++;
+    try {
+      const ad = await NativeAd.createForAdRequest(UNIT_ID);
+      pool.push({ ad, createdAt: Date.now(), lentTo: null });
+    } catch (e) {
+      // 在庫切れ（no-fill）は例外ではなく日常。黙って諦めて次の機会に回す
+    } finally {
+      loading--;
+    }
+  }
+}
+
+export function acquire(key: string): NativeAd | null {
+  // すでにこのキーに貸している広告があれば、同じものを返す（再マウントで別広告に化けない）
+  const already = pool.find((p) => p.lentTo === key);
+  if (already) return already.ad;
+
+  const free = pool.find((p) => p.lentTo === null);
+  if (!free) {
+    void fill();
+    return null;
+  }
+  free.lentTo = key;
+  void fill();
+  return free.ad;
+}
+
+export function release(key: string) {
+  const p = pool.find((x) => x.lentTo === key);
+  if (p) p.lentTo = null; // 破棄はしない。返却するだけ
+}
+
+export function sweep() {
+  // 貸出中でなく、古くなったものだけを破棄する
+  const now = Date.now();
+  const [keep, drop] = partition(
+    pool,
+    (p) => p.lentTo !== null || now - p.createdAt < MAX_AGE_MS,
+  );
+  drop.forEach((p) => p.ad.destroy());
+  pool = keep;
+  void fill();
+}
+
+function partition<T>(xs: T[], f: (x: T) => boolean): [T[], T[]] {
+  const a: T[] = [], b: T[] = [];
+  xs.forEach((x) => (f(x) ? a : b).push(x));
+  return [a, b];
+}
+```
+
+セル側は、驚くほど薄くなります。
+
+```tsx
+// NativeAdCell.tsx
+import { useEffect, useState } from 'react';
+import { NativeAdView, NativeAsset, NativeAssetType } from 'react-native-google-mobile-ads';
+import { acquire, release } from './adPool';
+
+export function NativeAdCell({ slotKey, height }: { slotKey: string; height: number }) {
+  const [ad, setAd] = useState(() => acquire(slotKey));
+
+  useEffect(() => {
+    if (!ad) {
+      // 借りられなかった場合だけ、一度だけ再挑戦する。ループにはしない
+      const t = setTimeout(() => setAd(acquire(slotKey)), 800);
+      return () => clearTimeout(t);
+    }
+    return () => release(slotKey); // アンマウント時は「返す」だけ
+  }, [ad, slotKey]);
+
+  if (!ad) return <View style={{ height }} />; // 空白は空白のまま。段は崩さない
+
+  return (
+    <NativeAdView nativeAd={ad} style={{ height }}>
+      <NativeAsset assetType={NativeAssetType.HEADLINE}>
+        <Text numberOfLines={2} style={styles.headline} />
+      </NativeAsset>
+      <NativeAsset assetType={NativeAssetType.ADVERTISER}>
+        <Text style={styles.advertiser} />
+      </NativeAsset>
+      <Text style={styles.badge}>広告</Text>
+    </NativeAdView>
+  );
+}
+```
+
+なぜ `release()` で `destroy()` を呼ばないのか。ここは何度か間違えました。
+
+アンマウントのたびに破棄すると、少し戻ってきただけで同じ枠に別の広告が読み込まれます。読者から見ると、スクロールを往復するたびに広告が入れ替わる落ち着かない画面になります。計測上も表示回数だけが水増しされ、実際には誰も見ていない表示が増えるだけでした。
+
+貸出中フラグを外して在庫に戻し、破棄は `sweep()` に任せる。所有と表示を分けると、この2つが両立します。
+
+`sweep()` は 5 分間隔のタイマーと、`AppState` が `background` に移った瞬間に呼んでいます。バックグラウンド遷移で他の処理を止める考え方は[画面を離れてもアニメーションが回り続ける — Rork(Expo)アプリのフォーカス連動でバッテリーを守る](/articles/app-dev/rork-expo-offscreen-animation-pause-focus-appstate-battery)と同じで、広告にもそのまま当てはまりました。
+
+## 段組みの高さ計算に広告をどう混ぜるか
+
+段組み（masonry）は、列ごとの高さを見て次の要素を最短の列に振り分けます。ここに広告を混ぜると、素直に実装すれば段がガタつきます。
+
+理由は2つあります。広告は縦横比が可変であること。そして「借りられないことがある」ことです。
+
+私は広告セルの高さを固定にしました。壁紙 1 枚ぶんの平均高さに合わせて 240 pt。可変にすると、広告が借りられたかどうかで列の高さが変わり、レイアウトが確定しなくなります。
+
+```ts
+// 広告の枠は「常に同じ大きさの穴」として先に確保しておく
+const AD_CELL_HEIGHT = 240;
+const AD_EVERY = 12; // 12枚に1枚
+
+function buildSlots(wallpapers: Wallpaper[]): GridItem[] {
+  const out: GridItem[] = [];
+  wallpapers.forEach((w, i) => {
+    out.push({ type: 'wallpaper', wallpaper: w, height: estimateHeight(w) });
+    // 先頭には入れない。最初のスクロールで広告に出会わせない
+    if (i > 0 && (i + 1) % AD_EVERY === 0) {
+      out.push({ type: 'ad', key: `ad-${Math.floor(i / AD_EVERY)}`, height: AD_CELL_HEIGHT });
+    }
+  });
+  return out;
+}
+```
+
+キーに `ad-0`, `ad-1` と通し番号を振っているのが要点です。インデックスではなく、スクロールしても変わらない安定したキーであること。プールの `acquire(key)` が同じキーには同じ広告を返すので、往復スクロールでも同じ枠には同じ広告が座り続けます。
+
+FlashList を使っている場合は `getItemType` を必ず分けます。
+
+```tsx
+<FlashList
+  data={slots}
+  getItemType={(item) => item.type}  // 広告と壁紙で再利用プールを分ける
+  overrideItemLayout={(layout, item) => { layout.size = item.height; }}
+  renderItem={renderItem}
+/>
+```
+
+これを入れる前は、壁紙セルとして使われていたビューが広告セルに転用され、前の画像が一瞬透けて見えることがありました。`getItemType` を分けた時点で消えました。
+
+## 差し込み間隔を決める — 誤タップと eCPM のあいだ
+
+間隔は好みで決められません。密にすれば表示は増えますが、誤タップも増えます。誤タップは短期的に収益に見えて、無効トラフィックとして後から差し引かれます。
+
+壁紙アプリ1本で、間隔だけを変えて 5 日ずつ回した結果です。
+
+<table>
+  <thead>
+    <tr><th>差し込み間隔</th><th>1セッションあたり表示</th><th>eCPM</th><th>広告タップ後 2 秒以内の復帰率</th><th>3日後継続率</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>6枚に1枚</td><td>7.8</td><td>$2.10</td><td>61%</td><td>18.2%</td></tr>
+    <tr><td>12枚に1枚</td><td>4.1</td><td>$2.94</td><td>29%</td><td>22.6%</td></tr>
+    <tr><td>20枚に1枚</td><td>2.4</td><td>$3.02</td><td>27%</td><td>22.9%</td></tr>
+  </tbody>
+</table>
+
+「タップ後 2 秒以内の復帰率」を自前で計測したのが、今回いちばん役に立ちました。広告をタップしてすぐ戻ってくる人は、押したくて押したわけではありません。6枚に1枚では 61%。3人に2人が事故です。
+
+12枚に1枚に広げると 29% まで落ち、eCPM はむしろ上がりました。広告の質が同じでも、意図しないタップが減れば広告主側の成果が上がり、単価に返ってきます。20枚に1枚まで広げても eCPM はほとんど変わらず、表示だけが減りました。
+
+私は 12 枚に1枚を採っています。数字が横ばいになる手前で止める、という選び方です。この「無効トラフィックを増やさない」という観点は[AdMob の収益が突然「保留」になったら — 無効なトラフィックを個人開発で防ぐ実務メモ](/articles/rork-business/rork-admob-invalid-traffic-prevention-multi-app)にも書きましたが、ネイティブ広告はコンテンツに溶け込むぶん、間隔設計がそのまま防止策になります。
+
+## スクロール中に読み込まない
+
+フレーム落ちの残りは、ここで消えました。
+
+広告の読み込みは、返ってきた瞬間に画像のデコードとネイティブビューの生成を伴います。スクロールの真っ最中にこれが走ると、UI スレッドが 40〜70 ms 持っていかれます。60fps なら 1 フレーム 16.7 ms ですから、3〜4 フレーム飛びます。
+
+そこで、プールの補充をスクロールが止まってからに限りました。
+
+```tsx
+const scrolling = useRef(false);
+
+<FlashList
+  onScrollBeginDrag={() => { scrolling.current = true; setPoolPaused(true); }}
+  onMomentumScrollEnd={() => {
+    scrolling.current = false;
+    // 指を離してから 200 ms 待ってから補充を再開する
+    setTimeout(() => { if (!scrolling.current) setPoolPaused(false); }, 200);
+  }}
+/>
+```
+
+`setPoolPaused(true)` の間、`fill()` は即座に return します。プールに 3 件持っているので、スクロール中に新規読み込みを止めても在庫は尽きません。ここが、都度読み込みからプールに変えた恩恵でした。
+
+結果は次のとおりです。
+
+<table>
+  <thead>
+    <tr><th>実装</th><th>20分後メモリ</th><th>フレーム落ち / 分</th><th>表示回数 / 到達回数</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>都度読み込み（最初の実装）</td><td>420 MB</td><td>28〜41</td><td>0.62</td></tr>
+    <tr><td>プール化のみ</td><td>231 MB</td><td>11〜19</td><td>0.94</td></tr>
+    <tr><td>プール化 + スクロール中の補充停止</td><td>228 MB</td><td>3〜6</td><td>0.93</td></tr>
+  </tbody>
+</table>
+
+メモリはプール化でほぼ解決し、フレーム落ちは補充停止で解決しました。2つは別々の問題だったということです。片方だけ入れて「効かない」と結論を出しかけたので、切り分けて計測してよかったと思っています。
+
+## ポリシーの境界線で気をつけていること
+
+ネイティブ広告はコンテンツに溶け込ませられます。溶け込ませすぎると、規約に触れます。
+
+私が守っている線は4つです。
+
+1. **「広告」または「Sponsored」の表示を必ず入れる。** 壁紙のタイトルと同じ書体・同じサイズでは置きません。背景を敷いて、明確に別種のものだと分かるようにします。
+2. **AdChoices アイコンを覆わない。** 段組みの角丸やグラデーションのオーバーレイが、右上のアイコンにかかりがちです。`NativeAdView` の内側でオーバーレイを描くと隠れます。オーバーレイは画像アセットの内側に限定しました。
+3. **壁紙のタップ領域と広告のタップ領域を隣接させない。** 広告セルの周囲には 12 pt の余白を置いています。段組みの通常の間隔は 8 pt なので、広告の周りだけ少し広い。この 4 pt が誤タップを減らしました。
+4. **広告セルに「保存」「お気に入り」などの自前ボタンを重ねない。** 壁紙セルには置いていますが、広告セルには置きません。同じ操作を期待した指が、広告のクリックとして記録されるのを避けるためです。
+
+3 と 4 は、規約に明記されているというより、先ほどの「2 秒以内の復帰率」を下げるために効きました。規約を守ることと、収益を守ることが同じ方向を向いていた例です。
+
+## どこから手を付けるか
+
+すでにセルの中で広告を読み込んでいる実装があるなら、順番はこうなります。
+
+まず 20 分スクロールしながらメモリを見てください。単調に増えていれば、この記事の問題です。平らなら、別の原因を探したほうがよいと思います。切り分けの手順は[Rork で作ったリストのスクロールが重い — 画像キャッシュとプリフェッチの設計](/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design)のほうが近いはずです。
+
+増えていた場合は、プールの導入を先にします。所有権をリストの外に出すところまでで、メモリは落ち着きます。フレーム落ちが残るなら、そのあとで補充の停止を足す。同時に入れると、どちらが効いたか分からなくなります。
+
+そして間隔は、最初から広めに始めることをお勧めします。狭いところから広げると、無効トラフィックの調整が挟まって数字が読めません。12枚に1枚あたりから始めて、復帰率を見ながら詰めるほうが早く着地しました。
+
+広告は、読者に払ってもらう代わりに我慢してもらう仕組みです。だからこそ、我慢の量を設計で決められる余地は、思っていたよりずっと大きいのだと今回学びました。同じ場所でつまずいている方の助けになれば嬉しく思います。

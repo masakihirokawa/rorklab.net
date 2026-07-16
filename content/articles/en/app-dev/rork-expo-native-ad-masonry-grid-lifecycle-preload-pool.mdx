@@ -1,0 +1,314 @@
+---
+title: "Placing Native Ads in a Masonry Wallpaper Grid: Designing the Lifetime of an Ad Cell"
+slug: "rork-expo-native-ad-masonry-grid-lifecycle-preload-pool"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-16T14:30"
+author: "Rork Lab"
+description: "One native ad in a masonry gallery pushed memory from 180 MB to 420 MB over twenty minutes of scrolling. Here is why cell recycling and ad object lifetime never line up, the pool-based implementation that fixed it, and how I picked the insertion interval from measured numbers."
+tags: ["Rork", "Expo", "AdMob", "Native Ads", "FlashList"]
+highlights:
+  - "Why list cell recycling and native ad object lifetime run on different clocks, and how to isolate the resulting memory growth"
+  - "A pool that owns the ads and only lends them to cells, with the full implementation and the rule for when to actually destroy one"
+  - "Choosing insertion interval, pausing refills during scroll, and sizing ad slots in a masonry layout — all from measured field data"
+---
+
+I added exactly one native ad to a masonry gallery. One slot after every tenth wallpaper. That was the whole change.
+
+The next morning I left Xcode's Memory Report open and scrolled for twenty minutes. Memory climbed from 180 MB to 420 MB and never came back down. Remove the ad and it flattens out around 190 MB. The ad itself was not the problem. My decision to treat the ad as part of a cell was.
+
+Running a handful of wallpaper apps on my own, ad integration is where I stall every single time. What caught me here was that list recycling — a React Native concern — and native ad object lifetime — an ad SDK concern — operate on completely different clocks.
+
+This is how I absorbed that mismatch in the design. The masonry layout itself is covered in [Laying Out Variable-Height Images in Two Columns: A Masonry Wallpaper Gallery in a Rork Expo App](/articles/app-dev/rork-expo-masonry-waterfall-gallery-variable-height-images), so here I will stay on the ads.
+
+## Three symptoms, one root cause
+
+They showed up together.
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>Without ads</th><th>With ads (naive)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Memory after 20 min of scrolling (iPhone 14, device)</td><td>Flat around 190 MB</td><td>Monotonic climb to 420 MB</td></tr>
+    <tr><td>Dropped frames per minute (60fps target)</td><td>2–4</td><td>28–41</td></tr>
+    <tr><td>Impressions / slots reached</td><td>—</td><td>0.62 (four in ten were blank)</td></tr>
+  </tbody>
+</table>
+
+Three separate-looking problems, one cause: I was requesting the ad from inside `renderItem`.
+
+```tsx
+// The naive version. All three symptoms came from here.
+function renderItem({ item }: { item: GridItem }) {
+  if (item.type === 'ad') {
+    return <NativeAdCell unitId={AD_UNIT_ID} />; // loads inside the cell
+  }
+  return <WallpaperCell wallpaper={item.wallpaper} />;
+}
+```
+
+`NativeAdCell` loads its ad in its own `useEffect`. It reads fine. But neither FlashList nor FlatList destroys a cell that scrolls off screen — it reuses the view with different data. So this component mounts and unmounts constantly as you scroll.
+
+Every mount fires a new ad request. Every request produces a new native ad object. Nobody throws any of them away.
+
+## Ad lifetime and cell lifetime are not the same clock
+
+This was the part I had wrong.
+
+We write React components assuming they only need to live while they are on screen. Unmount, and they are gone. That is the mental model.
+
+Native ads do not work that way. A `GADNativeAd` on iOS or a `NativeAd` on Android survives on the native side even after the JavaScript reference drops. Image assets and click-tracking views stay alive until something explicitly calls `destroy()`. JavaScript's garbage collector does not sweep the native heap for you.
+
+Worse, an ad takes 400–900 ms to load — longer than it takes a cell to leave the screen. Scroll quickly and the order becomes:
+
+1. The cell mounts and sends an ad request.
+2. 320 ms later the cell scrolls off and unmounts.
+3. 610 ms later the ad arrives — there is no view left to attach it to.
+4. The ad object stays resident. Nobody calls `destroy()`.
+
+That "0.62 impressions per slot reached" number is step 3 happening forty percent of the time. Ads that loaded, were never seen, and only cost memory.
+
+I started calling this the lifetime gap. A cell lives for a few hundred milliseconds; an ad lives for minutes. Tie them to the same lifecycle and one of them will break.
+
+## Let a pool own the ads and lend them to cells
+
+The fix was to move ownership of the ad out of the list.
+
+The list does not own the ad. A pool that outlives the list does. A cell simply asks, "is there an ad I can borrow for this position?" If not, it draws nothing — or a quiet placeholder.
+
+```ts
+// adPool.ts — a single pool that outlives the list
+import { NativeAd, TestIds } from 'react-native-google-mobile-ads';
+
+const UNIT_ID = __DEV__ ? TestIds.NATIVE : 'YOUR_AD_UNIT_ID';
+const POOL_SIZE = 3;               // ads held at once
+const MAX_AGE_MS = 55 * 60 * 1000; // AdMob ads expire after an hour; leave headroom
+
+type PooledAd = { ad: NativeAd; createdAt: number; lentTo: string | null };
+
+let pool: PooledAd[] = [];
+let loading = 0;
+
+async function fill() {
+  const want = POOL_SIZE - pool.length - loading;
+  for (let i = 0; i < want; i++) {
+    loading++;
+    try {
+      const ad = await NativeAd.createForAdRequest(UNIT_ID);
+      pool.push({ ad, createdAt: Date.now(), lentTo: null });
+    } catch (e) {
+      // No-fill is routine, not exceptional. Give up quietly and retry later.
+    } finally {
+      loading--;
+    }
+  }
+}
+
+export function acquire(key: string): NativeAd | null {
+  // If this key already borrowed an ad, hand back the same one
+  const already = pool.find((p) => p.lentTo === key);
+  if (already) return already.ad;
+
+  const free = pool.find((p) => p.lentTo === null);
+  if (!free) {
+    void fill();
+    return null;
+  }
+  free.lentTo = key;
+  void fill();
+  return free.ad;
+}
+
+export function release(key: string) {
+  const p = pool.find((x) => x.lentTo === key);
+  if (p) p.lentTo = null; // return it; do not destroy it
+}
+
+export function sweep() {
+  const now = Date.now();
+  const [keep, drop] = partition(
+    pool,
+    (p) => p.lentTo !== null || now - p.createdAt < MAX_AGE_MS,
+  );
+  drop.forEach((p) => p.ad.destroy());
+  pool = keep;
+  void fill();
+}
+
+function partition<T>(xs: T[], f: (x: T) => boolean): [T[], T[]] {
+  const a: T[] = [], b: T[] = [];
+  xs.forEach((x) => (f(x) ? a : b).push(x));
+  return [a, b];
+}
+```
+
+The cell gets surprisingly thin.
+
+```tsx
+// NativeAdCell.tsx
+import { useEffect, useState } from 'react';
+import { NativeAdView, NativeAsset, NativeAssetType } from 'react-native-google-mobile-ads';
+import { acquire, release } from './adPool';
+
+export function NativeAdCell({ slotKey, height }: { slotKey: string; height: number }) {
+  const [ad, setAd] = useState(() => acquire(slotKey));
+
+  useEffect(() => {
+    if (!ad) {
+      // If nothing was available, retry once. Never loop.
+      const t = setTimeout(() => setAd(acquire(slotKey)), 800);
+      return () => clearTimeout(t);
+    }
+    return () => release(slotKey); // on unmount, just give it back
+  }, [ad, slotKey]);
+
+  if (!ad) return <View style={{ height }} />; // leave the gap; keep the columns stable
+
+  return (
+    <NativeAdView nativeAd={ad} style={{ height }}>
+      <NativeAsset assetType={NativeAssetType.HEADLINE}>
+        <Text numberOfLines={2} style={styles.headline} />
+      </NativeAsset>
+      <NativeAsset assetType={NativeAssetType.ADVERTISER}>
+        <Text style={styles.advertiser} />
+      </NativeAsset>
+      <Text style={styles.badge}>Sponsored</Text>
+    </NativeAdView>
+  );
+}
+```
+
+Why doesn't `release()` call `destroy()`? I got this wrong more than once.
+
+Destroy on every unmount and a small scroll back up loads a different ad into the same slot. From the reader's side, ads shuffle every time you move up and down — restless and cheap-feeling. In the numbers, it only inflated impression counts with impressions nobody actually looked at.
+
+Clear the lending flag, return it to inventory, and let `sweep()` handle destruction. Separating ownership from display lets both behave.
+
+I call `sweep()` on a five-minute timer and the moment `AppState` goes to `background`. That is the same instinct as [Your Animation Keeps Running After You Leave the Screen — Focus-Aware Battery Savings in a Rork (Expo) App](/articles/app-dev/rork-expo-offscreen-animation-pause-focus-appstate-battery), and it transferred to ads unchanged.
+
+## Fitting an ad into masonry height math
+
+Masonry places each item into whichever column is currently shortest. Drop an ad in naively and the columns wobble.
+
+Two reasons: ad aspect ratio varies, and sometimes there is nothing to borrow.
+
+I fixed the ad cell height. 240 pt, matched to the average height of one wallpaper. Make it variable and column heights depend on whether an ad was available — the layout stops being deterministic.
+
+```ts
+// Reserve the ad slot as a hole of constant size, decided up front
+const AD_CELL_HEIGHT = 240;
+const AD_EVERY = 12; // one ad every twelve wallpapers
+
+function buildSlots(wallpapers: Wallpaper[]): GridItem[] {
+  const out: GridItem[] = [];
+  wallpapers.forEach((w, i) => {
+    out.push({ type: 'wallpaper', wallpaper: w, height: estimateHeight(w) });
+    // never at the very top — don't greet people with an ad
+    if (i > 0 && (i + 1) % AD_EVERY === 0) {
+      out.push({ type: 'ad', key: `ad-${Math.floor(i / AD_EVERY)}`, height: AD_CELL_HEIGHT });
+    }
+  });
+  return out;
+}
+```
+
+The numbered keys — `ad-0`, `ad-1` — are the important detail. Not an index; a stable identity that survives scrolling. Because `acquire(key)` returns the same ad for the same key, a slot keeps the same ad even when you scroll past it and back.
+
+With FlashList, always split the recycling pools:
+
+```tsx
+<FlashList
+  data={slots}
+  getItemType={(item) => item.type}  // separate recycle pools for ads and wallpapers
+  overrideItemLayout={(layout, item) => { layout.size = item.height; }}
+  renderItem={renderItem}
+/>
+```
+
+Before this, views that had been wallpaper cells were reused as ad cells, and the previous image occasionally flashed through. Splitting `getItemType` ended it immediately.
+
+## Choosing the interval: mis-taps versus eCPM
+
+You cannot pick the interval by taste. Tighter means more impressions and more accidental taps. Accidental taps look like revenue for a while, then get clawed back as invalid traffic.
+
+Five days per setting, one wallpaper app, interval as the only variable:
+
+<table>
+  <thead>
+    <tr><th>Interval</th><th>Impressions / session</th><th>eCPM</th><th>Return within 2 s of an ad tap</th><th>D3 retention</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Every 6</td><td>7.8</td><td>$2.10</td><td>61%</td><td>18.2%</td></tr>
+    <tr><td>Every 12</td><td>4.1</td><td>$2.94</td><td>29%</td><td>22.6%</td></tr>
+    <tr><td>Every 20</td><td>2.4</td><td>$3.02</td><td>27%</td><td>22.9%</td></tr>
+  </tbody>
+</table>
+
+Instrumenting "returned within 2 seconds of tapping an ad" myself was the most useful thing I did here. Someone who taps an ad and bounces straight back did not mean to tap it. At every 6, that was 61% — two out of three taps were accidents.
+
+Widening to every 12 dropped it to 29%, and eCPM went up rather than down. Same ad quality; fewer unintended taps means better advertiser outcomes, which comes back as price. Going all the way to every 20 barely moved eCPM and simply cost impressions.
+
+I run every 12. The rule I use is to stop just before the numbers flatten. That invalid-traffic lens is the same one in [When Your AdMob Earnings Suddenly Get Deducted: Preventing Invalid Traffic as a Solo Developer](/articles/rork-business/rork-admob-invalid-traffic-prevention-multi-app) — and with native ads, which blend into content by design, the interval *is* the prevention measure.
+
+## Do not load while the finger is moving
+
+The remaining dropped frames disappeared here.
+
+When an ad arrives, it decodes images and builds native views right then. If that lands mid-scroll, it takes 40–70 ms of the UI thread. At 60fps a frame is 16.7 ms, so three or four frames vanish.
+
+So I refill the pool only once scrolling stops.
+
+```tsx
+const scrolling = useRef(false);
+
+<FlashList
+  onScrollBeginDrag={() => { scrolling.current = true; setPoolPaused(true); }}
+  onMomentumScrollEnd={() => {
+    scrolling.current = false;
+    // resume 200 ms after the finger lifts and motion settles
+    setTimeout(() => { if (!scrolling.current) setPoolPaused(false); }, 200);
+  }}
+/>
+```
+
+While paused, `fill()` returns immediately. With three ads held, pausing new loads during a scroll never empties the shelf. That headroom is exactly what the pool bought me.
+
+<table>
+  <thead>
+    <tr><th>Implementation</th><th>Memory at 20 min</th><th>Dropped frames / min</th><th>Impressions / slots reached</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Load per cell (first attempt)</td><td>420 MB</td><td>28–41</td><td>0.62</td></tr>
+    <tr><td>Pool only</td><td>231 MB</td><td>11–19</td><td>0.94</td></tr>
+    <tr><td>Pool + paused refill during scroll</td><td>228 MB</td><td>3–6</td><td>0.93</td></tr>
+  </tbody>
+</table>
+
+The pool solved memory. Pausing solved frames. Two different problems. I nearly shipped one of them alone and concluded it "didn't work" — measuring them apart was worth the extra day.
+
+## Where I hold the policy line
+
+Native ads are meant to blend into content. Blend too far and you cross a line.
+
+Four rules I keep:
+
+1. **Always label it.** "Sponsored" or "Ad," never in the same typeface and size as a wallpaper title. I put a background behind it so it reads as a different kind of thing.
+2. **Never cover the AdChoices icon.** Rounded corners and gradient overlays love to creep over that top-right icon. Draw an overlay inside `NativeAdView` and it hides the icon — so I confine overlays to the image asset itself.
+3. **Do not place ad tap targets adjacent to wallpaper tap targets.** Ad cells get 12 pt of surrounding margin where the grid normally uses 8 pt. Those 4 pt measurably reduced mis-taps.
+4. **No custom buttons on ad cells.** Wallpaper cells have save and favourite buttons; ad cells get none. A finger expecting the same control should never register as an ad click.
+
+Rules 3 and 4 are less about the letter of the policy and more about that 2-second return rate. Staying compliant and protecting revenue happened to point the same direction.
+
+## Where to start
+
+If you already load ads inside cells, do this in order.
+
+Scroll for twenty minutes and watch memory. If it climbs monotonically, this article is your problem. If it stays flat, look elsewhere — [When Rork-Built Lists Stutter: Designing Image Caching and Prefetch](/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design) is probably closer to what you need.
+
+If it climbs, introduce the pool first. Moving ownership out of the list is enough to settle memory. Only then add the scroll pause if frames still drop. Ship both together and you will not know which one worked.
+
+And start wide on the interval. Tightening upward drags invalid-traffic adjustments into your data and the numbers stop being readable. Beginning around one in twelve and tightening while watching the return rate got me to an answer faster.
+
+An ad is what readers tolerate instead of paying. That framing is why the amount of tolerance you ask for turned out to be far more designable than I had assumed. If you are stuck at the same spot, I hope some of this helps.
