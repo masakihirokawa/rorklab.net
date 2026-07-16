@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでを対象にします",
-    "APIS — SwiftUI・ARKit・HealthKit・HomeKit・Core ML・MetalといったネイティブAPIに手が届き、AR/LiDARスキャンやオンデバイス機械学習も扱えます",
-    "CLOUD — Swiftコードを書き、クラウド上のMacでコンパイルし、実機タッチ入力に対応したライブシミュレータをストリーミングします",
-    "SUBMIT — 実機インストール用、あるいはApp Store提出用のビルドまで用意されます",
-    "SEED — Rorkは4月にLeft Lane Capital主導の$15Mシードを調達しました。Peak XVとa16z Speedrunも参加しています",
-    "PRICE — 無料で始められ（週5プロンプト前後）、有料プランは$25/月から。Rork Maxは$200/月です",
+    "FREETRY — Rorkが「Rork Maxを期間限定で無料で試せるようにした」とXで告知しました。$200/月のプランに、費用を先に払わずに触れる機会です",
+    "ONESHOT — Rork MaxはiPhone・Watch・iPad・TV・Vision Pro向けのアプリをほぼワンショットで生成すると謳い、ARと3Dを使うものまで対象に挙げています",
+    "XCODE — 「Xcodeを置き換えるWebサイト」を掲げ、実機インストールは1クリック、App Store提出は2クリック。裏側はSwiftとClaude Code、Opusです",
+    "PAPERLINE — Rorkはアプリビルダーの Paperline を買収し、エンジニアリング人材の獲得に向けて今後も買収を続ける方針を示しています",
+    "SKILLS — GitHubのapp-store-connect-cli-skillsが7月9日に更新。提出まわりの開発者ツールに手が入り続けています",
+    "MARKET — Gartnerは2026年末までに新規アプリの75%がローコードまたはノーコードで作られると見込んでいます。2020年は25%未満でした",
   ],
   en: [
-    "MAX — Rork Max builds native Swift apps rather than React Native, spanning iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "APIS — It reaches native Apple APIs including SwiftUI, ARKit, HealthKit, HomeKit, Core ML, and Metal, so AR/LiDAR scanning and on-device ML are in scope",
-    "CLOUD — Rork Max writes Swift, compiles it on cloud-hosted Macs, and streams a live simulator that accepts real touch input",
-    "SUBMIT — From there it prepares the build for device install or App Store submission",
-    "SEED — Rork raised a $15M seed led by Left Lane Capital in April, joined by Peak XV and a16z Speedrun",
-    "PRICE — It's free to start at roughly 5 prompts a week, paid plans begin at $25/month, and Rork Max runs $200/month",
+    "FREETRY — Rork announced on X that Rork Max is free to try for a limited time, a chance to touch the $200/month tier without paying up front",
+    "ONESHOT — Rork Max claims to one-shot almost any app for iPhone, Watch, iPad, TV, and Vision Pro, including builds that lean on AR and 3D",
+    "XCODE — Positioned as a website that replaces Xcode: one click to install on device, two clicks to publish to the App Store, powered by Swift, Claude Code, and Opus",
+    "PAPERLINE — Rork acquired the app builder Paperline and says it will stay acquisitive to bring in engineering talent",
+    "SKILLS — Rork's app-store-connect-cli-skills repo was updated on July 9, a sign the submission tooling keeps getting attention",
+    "MARKET — Gartner expects 75% of new applications to be built with low-code or no-code tools by the end of 2026, up from under 25% in 2020",
   ],
 };
 
