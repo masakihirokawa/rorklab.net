@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FREETRY — Rorkが「Rork Maxを期間限定で無料で試せるようにした」とXで告知しました。$200/月のプランに、費用を先に払わずに触れる機会です",
-    "ONESHOT — Rork MaxはiPhone・Watch・iPad・TV・Vision Pro向けのアプリをほぼワンショットで生成すると謳い、ARと3Dを使うものまで対象に挙げています",
-    "XCODE — 「Xcodeを置き換えるWebサイト」を掲げ、実機インストールは1クリック、App Store提出は2クリック。裏側はSwiftとClaude Code、Opusです",
-    "PAPERLINE — Rorkはアプリビルダーの Paperline を買収し、エンジニアリング人材の獲得に向けて今後も買収を続ける方針を示しています",
-    "SKILLS — GitHubのapp-store-connect-cli-skillsが7月9日に更新。提出まわりの開発者ツールに手が入り続けています",
-    "MARKET — Gartnerは2026年末までに新規アプリの75%がローコードまたはノーコードで作られると見込んでいます。2020年は25%未満でした",
+    "TOOLING — Rorkの開発者向けリポジトリが動き続けています。rork-xcodeが7月16日、rork-deviceが7月15日、rork-plistが7月13日に更新されました",
+    "OPUS46 — RorkでClaude Opus 4.6が稼働しています。Rork MaxはClaude Codeを土台にアプリを組み立てる設計です",
+    "SIM — ブラウザ上で動くクラウドのiOSシミュレータを備え、実機へのインストールは1クリック、App Storeへの提出は2クリックと案内されています",
+    "MAX — Rork MaxはReact Nativeではなく純粋なSwiftを出力します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro、そしてiMessageまでが射程です",
+    "NATIVE — HealthKit、ARKitとLiDAR、NFC、Dynamic Island、Live Activities、Metalによる3D、Core MLのオンデバイス推論まで扱えます",
+    "SEED — RorkはLeft Lane Capitalが主導する1,500万ドルのシードラウンドを実施し、Peak XVとa16z Speedrunが参加しました",
   ],
   en: [
-    "FREETRY — Rork announced on X that Rork Max is free to try for a limited time, a chance to touch the $200/month tier without paying up front",
-    "ONESHOT — Rork Max claims to one-shot almost any app for iPhone, Watch, iPad, TV, and Vision Pro, including builds that lean on AR and 3D",
-    "XCODE — Positioned as a website that replaces Xcode: one click to install on device, two clicks to publish to the App Store, powered by Swift, Claude Code, and Opus",
-    "PAPERLINE — Rork acquired the app builder Paperline and says it will stay acquisitive to bring in engineering talent",
-    "SKILLS — Rork's app-store-connect-cli-skills repo was updated on July 9, a sign the submission tooling keeps getting attention",
-    "MARKET — Gartner expects 75% of new applications to be built with low-code or no-code tools by the end of 2026, up from under 25% in 2020",
+    "TOOLING — Rork's developer repos keep moving: rork-xcode was updated on July 16, rork-device on July 15, and rork-plist on July 13",
+    "OPUS46 — Claude Opus 4.6 is live in Rork, and Rork Max is built to assemble apps on top of Claude Code",
+    "SIM — A cloud iOS simulator runs in the browser, with one click to install on a device and two clicks to publish to the App Store",
+    "MAX — Rork Max emits pure Swift rather than React Native, reaching iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and even iMessage",
+    "NATIVE — That opens up HealthKit, ARKit and LiDAR, NFC, Dynamic Island, Live Activities, 3D through Metal, and on-device inference with Core ML",
+    "SEED — Rork raised a $15M seed led by Left Lane Capital, with Peak XV and a16z Speedrun joining the round",
   ],
 };
 
