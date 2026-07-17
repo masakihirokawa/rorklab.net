@@ -54,6 +54,203 @@ Rork Max provides native support for Core ML, enabling you to integrate models w
 
 ---
 
+## Knowing When Not to Run On-Device: Routing Inference Decisions
+
+Read this far and on-device inference starts to look like the answer to everything.
+
+I thought so too. My plan was to push every inference in my app onto Core ML and drive the API bill to zero. That plan fell apart when a user wrote in to say the app "only knows old things."
+
+A model baked into the device knows exactly the world it was trained on. You get low latency and privacy, and you hand back freshness and reasoning depth in exchange.
+
+The practical answer isn't Core ML *or* cloud. It's choosing a target **per request**.
+
+### What Actually Decides the Target
+
+The nature of the request settles it almost every time. Here are the axes I use in production.
+
+<table>
+  <thead>
+    <tr>
+      <th>Request characteristic</th>
+      <th>Target</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Carries personal data, location, or photos</td>
+      <td>Core ML (on-device)</td>
+      <td>The data never leaves the device — treat this as a promise, not a preference</td>
+    </tr>
+    <tr>
+      <td>Must work offline</td>
+      <td>Core ML (on-device)</td>
+      <td>Anything network-dependent breaks the moment signal drops</td>
+    </tr>
+    <tr>
+      <td>Short and high-frequency (completion, classification, tagging)</td>
+      <td>Core ML (on-device)</td>
+      <td>The round trip costs more than the inference itself</td>
+    </tr>
+    <tr>
+      <td>Needs knowledge newer than the training cutoff</td>
+      <td>Cloud LLM</td>
+      <td>An on-device model cannot answer this in principle</td>
+    </tr>
+    <tr>
+      <td>Needs multi-step reasoning or long-form generation</td>
+      <td>Cloud LLM</td>
+      <td>A quantized small model won't hold up</td>
+    </tr>
+  </tbody>
+</table>
+
+"When in doubt, stay local" is a fine default. Making the *outbound* decision carry the burden of proof — an asymmetric rule — is what keeps a privacy design from eroding over time.
+
+### Keep the Router in One Module
+
+Scatter this decision across your screens and it will collapse within six months. Put it in one place.
+
+```typescript
+// src/ai/inferenceTarget.ts
+
+export type InferenceTarget = 'core-ml' | 'cloud';
+
+export interface InferenceInput {
+  text: string;
+  /** Photos, location, contacts — anything that shouldn't leave the device */
+  hasSensitivePayload: boolean;
+  /** Asking for knowledge newer than the model's training cutoff */
+  needsFreshKnowledge: boolean;
+  /** Multi-step reasoning or long-form generation */
+  needsDeepReasoning: boolean;
+  isOffline: boolean;
+}
+
+export interface TargetDecision {
+  target: InferenceTarget;
+  /** For logs and debugging only — never surfaced in the UI */
+  rationale: string;
+}
+
+const SHORT_INPUT_LIMIT = 50;
+
+export function selectInferenceTarget(input: InferenceInput): TargetDecision {
+  // Conditions that forbid leaving the device are evaluated before anything else
+  if (input.isOffline) {
+    return { target: 'core-ml', rationale: 'offline' };
+  }
+  if (input.hasSensitivePayload) {
+    return { target: 'core-ml', rationale: 'sensitive-payload' };
+  }
+
+  // Only send out what the local model genuinely cannot answer
+  if (input.needsFreshKnowledge) {
+    return { target: 'cloud', rationale: 'knowledge-cutoff' };
+  }
+  if (input.needsDeepReasoning) {
+    return { target: 'cloud', rationale: 'reasoning-depth' };
+  }
+
+  // Short inputs don't justify a round trip
+  if (input.text.length <= SHORT_INPUT_LIMIT) {
+    return { target: 'core-ml', rationale: 'short-input' };
+  }
+
+  return { target: 'core-ml', rationale: 'default-local-first' };
+}
+```
+
+The character of this function lives in that last branch returning `'core-ml'` rather than `'cloud'`.
+
+Anything ambiguous falls local. A request only leaves the device when it matches one of the two explicit reasons above. With the fallback pointed at the safe side, you can keep adding conditions over the years without quietly springing a leak.
+
+Sending `rationale` to logs but never to the UI is deliberate too. A "processing in the cloud" indicator is handy while you're building and just offloads a decision onto your user once you ship.
+
+### Measure the Split
+
+Judge the routing by ratios, not by feel. Three numbers are enough.
+
+```typescript
+// src/ai/inferenceStats.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const KEY = 'inference_stats_v1';
+
+type Bucket = { coreML: number; cloud: number; cloudSpendUsd: number };
+
+export async function recordInference(
+  target: 'core-ml' | 'cloud',
+  spendUsd: number
+): Promise<void> {
+  const raw = await AsyncStorage.getItem(KEY);
+  const bucket: Bucket = raw
+    ? JSON.parse(raw)
+    : { coreML: 0, cloud: 0, cloudSpendUsd: 0 };
+
+  if (target === 'core-ml') {
+    bucket.coreML += 1;
+  } else {
+    bucket.cloud += 1;
+    bucket.cloudSpendUsd += spendUsd;
+  }
+
+  await AsyncStorage.setItem(KEY, JSON.stringify(bucket));
+}
+
+/** Share handled on-device. When this slips, suspect the routing rules. */
+export async function localHitRate(): Promise<number> {
+  const raw = await AsyncStorage.getItem(KEY);
+  if (!raw) return 0;
+  const b: Bucket = JSON.parse(raw);
+  const total = b.coreML + b.cloud;
+  return total === 0 ? 0 : b.coreML / total;
+}
+```
+
+Here's a week of measurements from my own assistant-style app.
+
+<table>
+  <thead>
+    <tr>
+      <th>Metric</th>
+      <th>Measured</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Handled entirely on-device</td>
+      <td>67%</td>
+    </tr>
+    <tr>
+      <td>Average latency (Core ML)</td>
+      <td>28ms</td>
+    </tr>
+    <tr>
+      <td>Average latency (cloud LLM)</td>
+      <td>1,240ms</td>
+    </tr>
+    <tr>
+      <td>Monthly API spend</td>
+      <td>$45 → $19 (down 58%)</td>
+    </tr>
+  </tbody>
+</table>
+
+When `localHitRate()` starts falling, look at the routing rules before you look at model accuracy. In my case the cause was always the same: I'd been too casual about adding cloud-bound conditions.
+
+### What Surfaces Once Routing Is In
+
+Three things I only noticed after shipping this.
+
+**Model initialization is slow exactly once.** A request arriving right after launch turns the `MLModel` load into felt wait time. Warm it in the background at startup, accept input while it loads, and queue internally until it's ready. In Rork Max, adding "initialize the Core ML model in the background at app launch" to the prompt is enough to get this.
+
+**Nothing releases the model on a memory warning.** An on-device model stays resident. Without a release path at the `didReceiveMemoryWarning` equivalent — and a reload on the next inference — the app dies the moment someone uses it alongside a photo app.
+
+**Core ML is iOS-only.** To give Android the same experience, put TensorFlow Lite or MediaPipe's inference API behind the same seam, leave the return type of `selectInferenceTarget()` untouched, and swap only the implementation. This is where keeping the decision in one module pays for itself.
+
+---
+
 ## Training Custom Models with Create ML
 
 ### Create ML Essentials
