@@ -1,0 +1,372 @@
+---
+title: "The Update That Failed Because a Profile Expired Three Months Ago"
+slug: "rork-signing-asset-expiry-audit-automation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-17T11:00"
+author: "Rork Lab"
+description: "Apple signing assets expire quietly and nothing tells you. Here is how to count the days left with the App Store Connect API and put the audit on a weekly Cloudflare Workers cron."
+tags: ["Rork", "Rork Max", "App Store Connect API", "Certificates", "Operations"]
+highlights:
+  - "What actually breaks when a certificate expires — and the widely misunderstood case that does not"
+  - "A dependency-free Node.js script that reads expiry dates straight from the App Store Connect API"
+  - "A weekly Cloudflare Workers cron that only speaks up when something is genuinely close to lapsing"
+---
+
+I opened an old app to make a small fix. The build succeeded. Submission stopped cold. The provisioning profile had expired three months earlier.
+
+The expiry itself was not the problem. The problem was that **nothing existed to tell me it had happened**. Certificates and profiles lapse in silence. The next person to attempt a build finds out — and that person is always in a hurry.
+
+Rork and Rork Max deepen this blind spot. Compilation happens in the cloud, submission takes two clicks, and the whole thing feels frictionless. Meanwhile your signing assets sit inside your own Apple Developer account, aging where you cannot see them.
+
+Running several apps in parallel as a solo developer, I could not hold "which profile on which app expires when" in my head. So I handed the counting to a machine.
+
+## What Expires, and What Actually Breaks
+
+Get the mechanics right before designing a response. Misreading this table leads to panic over problems that do not exist.
+
+<table>
+  <thead>
+    <tr>
+      <th>Asset</th>
+      <th>Typical lifetime</th>
+      <th>What happens at expiry</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Apple Distribution certificate</strong></td>
+      <td>~3 years</td>
+      <td>You cannot sign new builds. Shipped apps keep running</td>
+    </tr>
+    <tr>
+      <td><strong>Apple Development certificate</strong></td>
+      <td>~1 year</td>
+      <td>Device debugging signatures stop working</td>
+    </tr>
+    <tr>
+      <td><strong>App Store provisioning profile</strong></td>
+      <td>~1 year</td>
+      <td>You cannot produce submission builds. Shipped apps are unaffected</td>
+    </tr>
+    <tr>
+      <td><strong>Ad Hoc / Development profile</strong></td>
+      <td>~1 year</td>
+      <td>Builds distributed with it <strong>stop launching</strong></td>
+    </tr>
+    <tr>
+      <td><strong>APNs auth key (.p8)</strong></td>
+      <td>No expiry</td>
+      <td>Never lapses. Only rotate on loss or exposure</td>
+    </tr>
+    <tr>
+      <td><strong>App Store Connect API key</strong></td>
+      <td>No expiry</td>
+      <td>Never lapses. Rotate on personnel change or exposure</td>
+    </tr>
+  </tbody>
+</table>
+
+The two bolded rows are where the confusion lives.
+
+**Apps already distributed through the App Store do not stop working when your certificate or profile expires.** Apple validates signatures at review and distribution time, not on every launch on every device. Get this backwards and you will respond to an emergency that is not happening.
+
+Ad Hoc and development-signed builds behave differently. There, the profile expiry is enforced on-device, and your testers really do find the app refusing to open.
+
+So the practical damage sorts out like this:
+
+- **Live apps**: no user impact — but you cannot fix anything until signing is restored
+- **Internal or tester builds**: real impact, on the expiry date, with no warning
+- **An urgent bug fix**: the worst pairing. You rebuild your signing chain exactly when you have no time for it
+
+I went three months without noticing precisely because nothing broke. The absence of damage is what removed every opportunity to find out.
+
+## Who Holds the Keys in Rork and Rork Max
+
+Worth pinning down, because a vague answer here becomes "surely Rork handles that for me."
+
+<table>
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th>Where signing assets live</th>
+      <th>What remains yours to manage</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Rork (React Native + Expo) via EAS Build</td>
+      <td>Expo's servers (remote credentials)</td>
+      <td>The certificates in your Apple account, and the slot limit</td>
+    </tr>
+    <tr>
+      <td>Rork Max (cloud Mac compilation)</td>
+      <td>Auto-generated through an API key Rork holds</td>
+      <td>The key's role, plus auditing what got generated</td>
+    </tr>
+    <tr>
+      <td>Local Xcode archive</td>
+      <td>Your local keychain</td>
+      <td>Everything, backups included</td>
+    </tr>
+  </tbody>
+</table>
+
+Whichever path you take, **the certificates and profiles themselves live in your Apple Developer account. They are your assets.** Build services merely issue and fetch them on your behalf. The slot limit fills up in your account. The clock runs down in your account.
+
+Automatic generation is convenient. Convenience is not the same thing as awareness. I have written more on where these boundaries fall in [the Rork Max and Expo responsibility split](/articles/rork-dev/rork-max-swift-expo-responsibility-boundary-design), if that context is useful.
+
+## Counting the Days with the App Store Connect API
+
+Apple exposes certificates and profiles over its API, so you can count for yourself.
+
+You need three things:
+
+1. **A Team Key** (App Store Connect → Users and Access → Integrations → App Store Connect API)
+2. **Your Issuer ID** (the UUID shown at the top of that same screen)
+3. **The `.p8` private key file** (downloadable exactly once, at creation)
+
+One caveat. API keys come in Individual and Team flavours, and **certificate and profile endpoints require a Team Key**. An insufficient role returns `403 FORBIDDEN` even for read-only calls, so give the key an Admin-level role.
+
+### The Token Trap Everyone Hits Once
+
+App Store Connect uses ES256 JWTs. There is a pothole here that catches most first implementations.
+
+Hand an EC key to Node's `crypto.createSign()` and the signature comes back **DER-encoded**. ES256 in a JWT requires the **raw 64-byte R‖S concatenation (IEEE P1363)**. Base64URL the DER bytes and your request returns a flat `401 UNAUTHORIZED` — correct key, correct payload, silent rejection.
+
+`dsaEncoding: "ieee-p1363"` fixes it. That single option costs people an afternoon, so it goes near the top here.
+
+```js
+// audit-signing.mjs — no dependencies (Node.js 18+)
+import { createSign } from "node:crypto";
+import { readFileSync } from "node:fs";
+
+const ISSUER_ID = process.env.ASC_ISSUER_ID;   // e.g. 57246542-96fe-1a63-e053-0824d011072a
+const KEY_ID = process.env.ASC_KEY_ID;         // e.g. 2X9R4HXF34
+const PRIVATE_KEY = readFileSync(process.env.ASC_P8_PATH, "utf8");
+
+const base64url = (input) =>
+  Buffer.from(input).toString("base64")
+    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+function createToken() {
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = { alg: "ES256", kid: KEY_ID, typ: "JWT" };
+  const payload = {
+    iss: ISSUER_ID,
+    iat: now,
+    exp: now + 15 * 60, // 20 minutes is the ceiling; 15 leaves room
+    aud: "appstoreconnect-v1",
+  };
+
+  const signingInput =
+    `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+
+  // The whole point. Omit dsaEncoding and you get DER, and then a 401.
+  const signature = createSign("SHA256")
+    .update(signingInput)
+    .sign({ key: PRIVATE_KEY, dsaEncoding: "ieee-p1363" });
+
+  return `${signingInput}.${base64url(signature)}`;
+}
+```
+
+`exp` cannot exceed 20 minutes from issuance. Reach for longer and the token is rejected, so just mint a fresh one per run.
+
+### Fetching the Lists
+
+With a token in hand, two endpoints do the rest. Narrowing `fields[...]` keeps responses small and readable.
+
+```js
+const API = "https://api.appstoreconnect.apple.com/v1";
+
+async function fetchAll(path, token) {
+  const items = [];
+  let url = `${API}${path}`;
+
+  while (url) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status} ${path}\n${body}`);
+    }
+
+    const json = await res.json();
+    items.push(...json.data);
+    url = json.links?.next ?? null; // don't drop paginated results
+  }
+
+  return items;
+}
+
+const daysLeft = (iso) =>
+  Math.floor((new Date(iso) - Date.now()) / 86_400_000);
+
+async function audit() {
+  const token = createToken();
+
+  const certificates = await fetchAll(
+    "/certificates?fields[certificates]=name,certificateType,expirationDate&limit=200",
+    token,
+  );
+
+  const profiles = await fetchAll(
+    "/profiles?fields[profiles]=name,profileType,profileState,expirationDate&limit=200",
+    token,
+  );
+
+  const rows = [
+    ...certificates.map((c) => ({
+      kind: "certificate",
+      name: c.attributes.name,
+      type: c.attributes.certificateType,
+      state: "-",
+      days: daysLeft(c.attributes.expirationDate),
+    })),
+    ...profiles.map((p) => ({
+      kind: "profile",
+      name: p.attributes.name,
+      type: p.attributes.profileType,
+      state: p.attributes.profileState, // ACTIVE / INVALID
+      days: daysLeft(p.attributes.expirationDate),
+    })),
+  ];
+
+  return rows.sort((a, b) => a.days - b.days); // soonest first
+}
+
+const rows = await audit();
+for (const r of rows) {
+  const mark = r.days <= 14 ? "🔴" : r.days <= 60 ? "🟡" : "  ";
+  console.log(
+    `${mark} ${String(r.days).padStart(5)}d  ${r.kind.padEnd(11)} ${r.type.padEnd(26)} ${r.name}`,
+  );
+}
+```
+
+Run across my six apps, it printed this:
+
+```
+🔴    -87d  profile     IOS_APP_ADHOC              Ad Hoc — wallpaper-legacy
+🔴     11d  profile     IOS_APP_STORE              App Store — relax-sounds
+🟡    52d  profile     IOS_APP_STORE              App Store — wallpaper-hd
+      210d  profile     IOS_APP_STORE              App Store — affirmation
+      688d  certificate DISTRIBUTION               Apple Distribution: Masaki H.
+```
+
+That top row expired 87 days ago. It belongs to an app I no longer ship, so it cost me nothing. But lining everything up is exactly how the things you stopped seeing become visible again.
+
+Watch `profileState` too. A profile can have days remaining and still be `INVALID` — revoking the certificate it hangs off invalidates it immediately. Sorting on days alone will miss that, so read the state alongside the number.
+
+## Running It Weekly on Cloudflare Workers
+
+A script you run by hand is a script that stops existing the moment you stop running it. I was not going to remember a maintenance script for an app I touch twice a year.
+
+So it went onto a Cloudflare Workers cron. I already keep other operational jobs there, which made the marginal cost near zero.
+
+Web Crypto builds the same JWT, and `sign()` returns raw R‖S natively — no DER problem to work around this time.
+
+```js
+// worker.js
+async function createToken(env) {
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToArrayBuffer(env.ASC_P8),
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "ES256", kid: env.ASC_KEY_ID, typ: "JWT" };
+  const payload = {
+    iss: env.ASC_ISSUER_ID,
+    iat: now,
+    exp: now + 15 * 60,
+    aud: "appstoreconnect-v1",
+  };
+
+  const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+
+  // Web Crypto ECDSA returns IEEE P1363 already
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    new TextEncoder().encode(signingInput),
+  );
+
+  return `${signingInput}.${b64url(new Uint8Array(signature))}`;
+}
+
+export default {
+  async scheduled(event, env, ctx) {
+    const rows = await audit(await createToken(env));
+    const urgent = rows.filter((r) => r.days <= 60);
+
+    if (urgent.length === 0) return; // quiet weeks stay quiet
+
+    const lines = urgent.map(
+      (r) => `• ${r.days}d — ${r.type} / ${r.name}`,
+    );
+
+    await fetch(env.WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: `[Signing asset audit]\n${lines.join("\n")}`,
+      }),
+    });
+  },
+};
+```
+
+The `wrangler.toml` side is one line:
+
+```toml
+[triggers]
+crons = ["0 0 * * 1"] # Mondays at 00:00 UTC
+```
+
+Load the `.p8` contents with `wrangler secret put ASC_P8`. Put it in a config file and it lives in your repository forever.
+
+Sixty days is deliberate. **Thirty is too late.** Renewing a certificate forces profile regeneration, which forces a rebuild — a chain that takes weeks to work through when development happens in the gaps between other commitments.
+
+The silence matters as much as the threshold. **Nothing is sent when nothing is close.** A weekly "all clear" goes unread by the third week. I want the notification to mean something on the day it arrives.
+
+## Renew in the Right Order
+
+Once a warning lands, sequence matters. Get it wrong and you do the work twice.
+
+1. **Check the certificate first.** Profiles hang off certificates. Regenerating a profile against a certificate that is about to expire buys you nothing
+2. **Free a slot before you need one.** Apple caps you at two distribution certificates. Creating the replacement early requires room to create it in
+3. **Regenerate profiles** against the new certificate. Rork Max and EAS usually handle this step for you
+4. **Push one build all the way through.** Nothing is confirmed until a submission actually completes
+
+On step two: revoking the old certificate frees the slot, but **every Ad Hoc build signed with it stops launching that instant**. App Store distribution is untouched. If testers are holding builds, plan the swap before you revoke.
+
+I settled on: create the new certificate before the old one lapses, revoke the old one, use the new one on the next submission. Its real virtue is that no decision gets made while I am in a hurry.
+
+## Where This Falls Short
+
+Being straight about the limits.
+
+This audit only sees **what lives in your Apple Developer account**. It cannot see EAS remote credential state, or whatever Rork holds internally. When those drift apart, the API returns Apple's view of the truth and says nothing about the build service's inconsistency.
+
+It also **reports; it does not renew**. I considered automating renewal and backed off. Reissuing signing material is hard to undo, and at solo-developer scale, leaving a human in the loop is the better trade.
+
+If the reissue itself is what breaks, [the EAS Build certificate and submission troubleshooting notes](/articles/rork-dev/rork-max-eas-build-certificate-submission-complete-troubleshooting) cover the failures symptom by symptom.
+
+## One Thing Worth Doing This Week
+
+If there is an app you have not touched in a while.
+
+Issue one Team Key and run the script above, once. Fifteen minutes, give or take. You will probably see a red row or two. I did.
+
+Decide about the cron afterwards, once you have seen what was hiding. Start by finding out how many days are actually left.
+
+I spent about three years telling myself I would organise this eventually, right up until I built it. If you are stalled in the same place, I hope this gets you moving.

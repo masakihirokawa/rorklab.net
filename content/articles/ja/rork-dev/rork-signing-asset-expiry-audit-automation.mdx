@@ -1,0 +1,372 @@
+---
+title: "半年ぶりのアップデートで署名が切れていた — Rork アプリの証明書とプロファイルを機械的に見張る"
+slug: "rork-signing-asset-expiry-audit-automation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-17T11:00"
+author: "Rork Lab"
+description: "Apple の署名アセットは静かに期限を迎えます。App Store Connect API で証明書とプロファイルの残日数を機械的に棚卸しし、Cloudflare Workers の定期実行で先回りする設計をまとめました。"
+tags: ["Rork", "Rork Max", "App Store Connect API", "証明書", "運用設計"]
+highlights:
+  - "証明書とプロファイルの有効期間の違いと、切れたときに「壊れるもの」と「壊れないもの」の線引き"
+  - "依存を持たない Node.js スクリプトで App Store Connect API から残日数を取得する完全な実装"
+  - "Cloudflare Workers の Cron Triggers で週次棚卸しを回し、失効前に手を打つ運用設計"
+---
+
+半年ぶりに古いアプリへ小さな修正を入れようとした日のことです。ビルドは通り、提出の直前で止まりました。プロビジョニングプロファイルの期限が、三ヶ月前に切れていました。
+
+困ったのは、切れていたこと自体ではありません。**切れたことに誰も気づく仕組みがなかった**ことです。証明書もプロファイルも、期限が来たその日には何も鳴りません。次にビルドを出そうとした人間が、そこで初めて知る。
+
+Rork や Rork Max を使っていると、この盲点はさらに深くなります。クラウド側でコンパイルされ、2クリックで提出まで進む体験は快適です。その快適さの裏で、署名アセットは自分の Apple Developer アカウントの中に、見えないまま静かに歳を取っています。
+
+個人開発で複数のアプリを並行させていると、「どのアプリの、どのプロファイルが、いつ切れるのか」は頭の中に収まりません。ならば機械に数えさせるのが筋だと考えました。
+
+## 何が切れて、何が壊れるのか
+
+対処を設計する前に、期限の実像を正確に掴んでおきます。ここを誤解したまま慌てると、必要のない作業に時間を使うことになります。
+
+<table>
+  <thead>
+    <tr>
+      <th>アセット</th>
+      <th>有効期間の目安</th>
+      <th>期限が来たときに起きること</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Apple Distribution 証明書</strong></td>
+      <td>約3年</td>
+      <td>新しいビルドに署名できなくなる。配布済みアプリは動き続ける</td>
+    </tr>
+    <tr>
+      <td><strong>Apple Development 証明書</strong></td>
+      <td>約1年</td>
+      <td>実機デバッグ用の署名ができなくなる</td>
+    </tr>
+    <tr>
+      <td><strong>App Store 用プロビジョニングプロファイル</strong></td>
+      <td>約1年</td>
+      <td>提出用ビルドが作れなくなる。配布済みアプリは影響を受けない</td>
+    </tr>
+    <tr>
+      <td><strong>Ad Hoc / Development プロファイル</strong></td>
+      <td>約1年</td>
+      <td>そのプロファイルで配ったビルドが<strong>起動しなくなる</strong></td>
+    </tr>
+    <tr>
+      <td><strong>APNs 認証キー（.p8）</strong></td>
+      <td>期限なし</td>
+      <td>期限では失効しない。紛失時の再発行のみ考慮する</td>
+    </tr>
+    <tr>
+      <td><strong>App Store Connect API キー</strong></td>
+      <td>期限なし</td>
+      <td>期限では失効しない。担当者の離任・漏洩時にローテーションする</td>
+    </tr>
+  </tbody>
+</table>
+
+最も誤解されやすいのが、太字にした2行の差です。
+
+**App Store から配信済みのアプリは、証明書やプロファイルが切れても止まりません。** Apple の配信基盤が署名を検証するのは審査・配信の時点であり、ユーザーの端末で毎回証明書の有効期限を見にいくわけではないためです。ここを取り違えると、「ユーザーのアプリが全部落ちる」という存在しない緊急事態に反応してしまいます。
+
+一方、Ad Hoc やデベロッパー署名で配ったビルドは違います。こちらは端末側でプロファイルの期限が効くため、テスターの手元で本当に起動しなくなります。
+
+つまり、期限切れの実害はこう整理できます。
+
+- **配信中のアプリ**: 実害なし。ただし「直したいときに直せない」状態になる
+- **社内配布・テスター配布**: 実害あり。期限日に動作が止まる
+- **緊急のバグ修正**: 最悪の組み合わせ。急いでいるときに限って署名から作り直すことになる
+
+私が三ヶ月気づかなかったのも、実害が出ていなかったからです。実害が出ないからこそ、気づく機会がありませんでした。
+
+## Rork / Rork Max では誰が署名を持っているのか
+
+責任の所在を押さえておきます。ここが曖昧だと、「Rork が面倒を見てくれているはず」という期待に乗ったまま放置してしまいます。
+
+<table>
+  <thead>
+    <tr>
+      <th>経路</th>
+      <th>署名アセットの保管場所</th>
+      <th>自分が管理すべきもの</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Rork（React Native + Expo）→ EAS Build</td>
+      <td>Expo のサーバー側（リモートクレデンシャル）</td>
+      <td>Apple Developer アカウント側の証明書実体・上限枚数</td>
+    </tr>
+    <tr>
+      <td>Rork Max（クラウド Mac でのコンパイル）</td>
+      <td>Rork 側が預かる API キー経由で自動生成</td>
+      <td>API キーの権限と、生成された証明書・プロファイルの棚卸し</td>
+    </tr>
+    <tr>
+      <td>手元の Xcode でアーカイブ</td>
+      <td>ローカルのキーチェーン</td>
+      <td>全て。バックアップ含む</td>
+    </tr>
+  </tbody>
+</table>
+
+どの経路を通っても、**証明書とプロファイルの実体は Apple Developer アカウントの中にあり、それは自分の資産です**。ビルドサービスは代理で発行・取得しているに過ぎません。上限枚数を使い切るのも、期限を迎えるのも、自分のアカウントで起きます。
+
+自動生成は便利ですが、便利さは把握の代わりにはなりません。Rork Max の責任境界については [Rork Max と Expo の責任境界の設計](/articles/rork-dev/rork-max-swift-expo-responsibility-boundary-design) でも整理しておりますので、併せてご覧いただければ幸いです。
+
+## App Store Connect API で残日数を数える
+
+見張る仕組みを作ります。Apple は証明書とプロファイルの一覧を API で公開しているため、自前で数えられます。
+
+必要なものは3つです。
+
+1. **Team Key**（App Store Connect の「ユーザとアクセス」→「統合」→「App Store Connect API」で発行）
+2. **Issuer ID**（同じ画面の上部に表示される UUID）
+3. **`.p8` の秘密鍵ファイル**（発行時に一度だけダウンロードできます）
+
+ここで一つ注意があります。API キーには Individual Key と Team Key があり、**証明書・プロファイル系のエンドポイントには Team Key が必要**です。加えて、ロールが不足していると `403 FORBIDDEN` が返ります。閲覧目的でも Admin 相当のロールを持つ Team Key を用意するのが確実です。
+
+### 認証トークンの生成でつまずく場所
+
+App Store Connect API の認証は ES256 の JWT です。ここに、多くの実装が一度は踏む落とし穴があります。
+
+Node.js の `crypto.createSign()` に EC 鍵を渡して署名すると、既定では **DER 形式**のシグネチャが返ります。しかし JWT の ES256 が要求するのは **R と S を連結した 64 バイトの生の形式（IEEE P1363）**です。DER のまま Base64URL に載せると、リクエストは黙って `401 UNAUTHORIZED` を返します。鍵もペイロードも正しいのに通らない、という状態になります。
+
+`dsaEncoding: "ieee-p1363"` を指定すれば解決します。この1行のために半日を溶かす人が少なくないため、先に書いておきます。
+
+```js
+// audit-signing.mjs — 外部依存なしで動きます（Node.js 18 以降）
+import { createSign } from "node:crypto";
+import { readFileSync } from "node:fs";
+
+const ISSUER_ID = process.env.ASC_ISSUER_ID;   // 例: 57246542-96fe-1a63-e053-0824d011072a
+const KEY_ID = process.env.ASC_KEY_ID;         // 例: 2X9R4HXF34
+const PRIVATE_KEY = readFileSync(process.env.ASC_P8_PATH, "utf8");
+
+const base64url = (input) =>
+  Buffer.from(input).toString("base64")
+    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+function createToken() {
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = { alg: "ES256", kid: KEY_ID, typ: "JWT" };
+  const payload = {
+    iss: ISSUER_ID,
+    iat: now,
+    exp: now + 15 * 60, // 上限は 20 分。余裕を持って 15 分にしています
+    aud: "appstoreconnect-v1",
+  };
+
+  const signingInput =
+    `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+
+  // ここが要点。dsaEncoding を省くと DER になり 401 が返ります
+  const signature = createSign("SHA256")
+    .update(signingInput)
+    .sign({ key: PRIVATE_KEY, dsaEncoding: "ieee-p1363" });
+
+  return `${signingInput}.${base64url(signature)}`;
+}
+```
+
+`exp` の上限は発行時刻から20分です。長く取ろうとすると弾かれますので、スクリプトの実行ごとに作り直す前提で構いません。
+
+### 一覧を取得して残日数に変換する
+
+トークンができれば、あとは2つのエンドポイントを読むだけです。`fields[...]` で必要な項目だけを指定すると、レスポンスが小さくなり読みやすくなります。
+
+```js
+const API = "https://api.appstoreconnect.apple.com/v1";
+
+async function fetchAll(path, token) {
+  const items = [];
+  let url = `${API}${path}`;
+
+  while (url) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status} ${path}\n${body}`);
+    }
+
+    const json = await res.json();
+    items.push(...json.data);
+    url = json.links?.next ?? null; // ページングを取りこぼさない
+  }
+
+  return items;
+}
+
+const daysLeft = (iso) =>
+  Math.floor((new Date(iso) - Date.now()) / 86_400_000);
+
+async function audit() {
+  const token = createToken();
+
+  const certificates = await fetchAll(
+    "/certificates?fields[certificates]=name,certificateType,expirationDate&limit=200",
+    token,
+  );
+
+  const profiles = await fetchAll(
+    "/profiles?fields[profiles]=name,profileType,profileState,expirationDate&limit=200",
+    token,
+  );
+
+  const rows = [
+    ...certificates.map((c) => ({
+      kind: "certificate",
+      name: c.attributes.name,
+      type: c.attributes.certificateType,
+      state: "-",
+      days: daysLeft(c.attributes.expirationDate),
+    })),
+    ...profiles.map((p) => ({
+      kind: "profile",
+      name: p.attributes.name,
+      type: p.attributes.profileType,
+      state: p.attributes.profileState, // ACTIVE / INVALID
+      days: daysLeft(p.attributes.expirationDate),
+    })),
+  ];
+
+  return rows.sort((a, b) => a.days - b.days); // 期限が近い順
+}
+
+const rows = await audit();
+for (const r of rows) {
+  const mark = r.days <= 14 ? "🔴" : r.days <= 60 ? "🟡" : "  ";
+  console.log(
+    `${mark} ${String(r.days).padStart(5)}日  ${r.kind.padEnd(11)} ${r.type.padEnd(26)} ${r.name}`,
+  );
+}
+```
+
+私の環境で6アプリ分を流した結果は、こうなりました。
+
+```
+🔴    -87日  profile     IOS_APP_ADHOC              Ad Hoc — wallpaper-legacy
+🔴     11日  profile     IOS_APP_STORE              App Store — relax-sounds
+🟡    52日  profile     IOS_APP_STORE              App Store — wallpaper-hd
+      210日  profile     IOS_APP_STORE              App Store — affirmation
+      688日  certificate DISTRIBUTION               Apple Distribution: Masaki H.
+```
+
+一番上の Ad Hoc プロファイルは、87日前に切れていました。使わなくなった古いアプリのもので、実害はありません。ただ、こうして並べて初めて「実害がないから見えていなかったもの」が姿を現します。
+
+`profileState` が `INVALID` になっている行にも注意が必要です。期限が残っていても、紐づく証明書を失効させるとプロファイルは無効化されます。残日数だけを見ていると取りこぼしますので、状態と併せて判断してください。
+
+## 週次で回す — Cloudflare Workers の Cron Triggers
+
+手で実行するスクリプトは、実行しなくなった時点で存在しないのと同じです。半年に一度しか触らないアプリのために、半年に一度スクリプトを思い出せるとは思えませんでした。
+
+そこで Cloudflare Workers の定期実行に載せました。私は他の運用も Workers に寄せているため、追加コストがかからないのが選定の理由です。週1回の実行は1日あたり10万リクエストの無料枠に対して0.001% にも届かず、実費は $0 のまま収まっています。
+
+Workers の Web Crypto でも同じ JWT を作れます。`sign()` が返すのは元から生の R||S 形式なので、Node.js のときのような DER の問題はありません。
+
+```js
+// worker.js
+async function createToken(env) {
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToArrayBuffer(env.ASC_P8),
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "ES256", kid: env.ASC_KEY_ID, typ: "JWT" };
+  const payload = {
+    iss: env.ASC_ISSUER_ID,
+    iat: now,
+    exp: now + 15 * 60,
+    aud: "appstoreconnect-v1",
+  };
+
+  const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+
+  // Web Crypto の ECDSA は最初から IEEE P1363 形式を返します
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    new TextEncoder().encode(signingInput),
+  );
+
+  return `${signingInput}.${b64url(new Uint8Array(signature))}`;
+}
+
+export default {
+  async scheduled(event, env, ctx) {
+    const rows = await audit(await createToken(env));
+    const urgent = rows.filter((r) => r.days <= 60);
+
+    if (urgent.length === 0) return; // 静かな週は何も送らない
+
+    const lines = urgent.map(
+      (r) => `・${r.days}日 — ${r.type} / ${r.name}`,
+    );
+
+    await fetch(env.WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: `【署名アセット棚卸し】\n${lines.join("\n")}`,
+      }),
+    });
+  },
+};
+```
+
+`wrangler.toml` は1行で済みます。
+
+```toml
+[triggers]
+crons = ["0 0 * * 1"] # 毎週月曜 09:00 JST（UTC 00:00）
+```
+
+`.p8` の中身は必ず `wrangler secret put ASC_P8` で登録してください。設定ファイルに書くとリポジトリに残ります。
+
+閾値は60日を推奨します。**30日では遅い**からです。証明書の再発行がプロファイルの再生成を呼び、それがビルドの作り直しを呼ぶ、という連鎖が起きます。仕事や制作の合間に手を入れる個人開発では、その連鎖を消化するのに数週間かかることが普通にあります。
+
+そして、**期限内なら何も送らない**設計にしました。毎週「異常なし」が届く通知は、三週目には読まれなくなります。届いたときにだけ意味がある通知にしておきたいと考えました。
+
+## 更新の順序を間違えない
+
+警告が届いたあとの手順です。順序を守らないと、二度手間になります。
+
+1. **証明書を先に確認する** — プロファイルは証明書に紐づいています。証明書が切れかけているのにプロファイルだけ更新しても、更新後のプロファイルはすぐ無効になります
+2. **証明書の上限を先に空ける** — Apple Distribution 証明書はアカウントあたり2枚までです。切れる前に新しい1枚を作りたければ、枠が空いている必要があります
+3. **プロファイルを再生成する** — 新しい証明書に紐づけ直します。Rork Max や EAS を使っている場合は、この工程が自動で走ることが多いです
+4. **ビルドを1本通す** — 実際に提出まで進めて初めて、通ったと言えます
+
+2番目について補足します。古い証明書を失効（revoke）させると枠は空きますが、**その証明書で署名した Ad Hoc ビルドはその時点で起動しなくなります**。App Store で配信中のアプリには影響しません。テスターに配っているビルドがある場合は、差し替えの段取りを先に決めてから失効させてください。
+
+私は「切れる前に新しい枚数を作り、古い方を失効させ、次の提出で新しい方を使う」という順序に落ち着きました。急いでいる最中に判断しないで済むのが、この順序の一番の利点です。
+
+## この設計に残っている限界
+
+正直に書いておきます。
+
+この棚卸しが見ているのは、**Apple Developer アカウントの中にあるものだけ**です。EAS のリモートクレデンシャルの状態や、Rork 側が内部で保持しているものまでは見えません。両者に食い違いが生じた場合、API 経由の一覧は「Apple 側から見た正」を返すだけで、ビルドサービス側の不整合は検出できません。
+
+そして、この仕組みは**期限を教えてくれるだけで、更新はしてくれません**。自動更新まで踏み込むことも考えましたが、署名の再発行は取り返しがつきにくい操作です。人間が判断する余地を残しておく方が、個人開発の規模には合っていると考えました。
+
+証明書やプロファイルの再発行そのものでつまずいた場合は、[EAS Build の証明書と提出まわりのつまずき](/articles/rork-dev/rork-max-eas-build-certificate-submission-complete-troubleshooting) に症状別の対処をまとめてあります。
+
+## 今週やっておくこと
+
+もし手元に、しばらく更新していないアプリがあるなら。
+
+Team Key を1本発行して、上のスクリプトを一度だけ流してみてください。所要は15分ほどです。おそらく、赤い行が1つか2つ出ます。私の場合もそうでした。
+
+見えていなかったものが並んだあとで、Cron に載せるかどうかを決めれば十分です。まずは、いま何日残っているのかを知るところから。
+
+私自身、この仕組みを作るまでは「そのうち整理しよう」と思いながら三年ほど過ごしておりました。同じ場所で立ち止まっている方の助けになれば嬉しく思います。お読みいただきありがとうございました。
