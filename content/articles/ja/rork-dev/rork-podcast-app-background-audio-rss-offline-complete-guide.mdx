@@ -1,14 +1,18 @@
 ---
-title: "Rork でポッドキャストアプリを作る実装ガイド：バックグラウンド再生・RSS 取得・オフラインダウンロードを本番レベルで動かす"
+title: "Rork のポッドキャストアプリを本番運用へ — expo-audio への移行・割り込みからの復帰・ダウンロード再開"
 slug: "rork-podcast-app-background-audio-rss-offline-complete-guide"
 category: "rork-dev"
 level: "advanced"
-premium: false
+premium: true
 date: "2026-05-05T11:15"
-updated: "2026-05-05T11:15"
+updated: "2026-07-17T20:30"
 author: "Rork Lab"
-description: "Rork でポッドキャストアプリを本番レベルで構築する完全実装ガイド。expo-av によるバックグラウンド再生・RSS フィード解析・オフラインダウンロード・ロック画面対応まで、動作するコードで丁寧に解説します。"
-tags: ["ポッドキャスト", "バックグラウンド再生", "RSS", "expo-av", "オフライン", "Rork", "React Native"]
+description: "Rork のポッドキャストアプリを実運用に耐えさせるための実装メモ。SDK 55 で消える expo-av からの移行、着信割り込みからの復帰、中断されたダウンロードの再開、iCloud バックアップと容量予算の設計まで、動くコードで扱います。"
+tags: ["ポッドキャスト", "バックグラウンド再生", "expo-audio", "expo-av", "オフライン", "Rork", "React Native"]
+highlights:
+  - "SDK 55 で削除される expo-av から expo-audio へ移す対応表と、Android で interruptionMode が効かない既知の制約"
+  - "中断されたダウンロードを resumeData で再開する実装。完了判定にファイルの存在を使わない理由と HTTP 206 の扱い"
+  - "着信・イヤホン抜去・容量逼迫という3つの割り込みに耐える設計と、実機で1分ずつ試せる検証5項目"
 
 ---
 ポッドキャストアプリを Rork で作ろうと決めたとき、最初に「あれ、思っていたより難しい」と感じた方は少なくないのではないでしょうか。音楽プレイヤーとの違いは、RSS フィードを解析してエピソードを動的に取得しなければならない点、そしてアプリをバックグラウンドに下げた後も音声が途切れてはならない点にあります。
@@ -141,6 +145,120 @@ export function useAudioSession() {
 このフックをルートコンポーネント（`app/_layout.tsx`）で呼び出します。アプリ起動時に一度だけ実行すれば十分です。
 
 Android では `shouldDuckAndroid: false` が重要です。`true` にすると、他のアプリが音声を再生したとき（例: 着信音）に音量が下がるだけで再生が続きます。ポッドキャストアプリとしては、他の音声が割り込んだときは一時停止する方が自然な動作です。
+
+## expo-av には期限がある — expo-audio へどう移すか
+
+ここまでのコードは `expo-av` を前提にしています。動きます。ただ、2026年に新しく組むなら、この前提はもう長くは持ちません。
+
+Expo は `expo-av` の Audio・Video API を非推奨とし、それぞれ `expo-audio`・`expo-video` に置き換えました。SDK 54 では `expo-av` はまだ動くものの公式 SDK の一部ではなくなり、SDK 55 で削除されます（[Expo ドキュメント: Audio (expo-av)](https://docs.expo.dev/versions/v54.0.0/sdk/audio-av/)）。
+
+つまり、いま `expo-av` で組んだポッドキャストアプリは、次の次のメジャーアップグレードで必ず書き換えを迫られます。
+
+私はこれを「あとで直す」の箱に入れない方を選びました。理由は単純で、音声再生はこのアプリの中枢だからです。中枢の書き換えを、UI 改修や課金導入と同じ週に抱えたくありません。移行は、他に壊れているものが何もない時期にやるのが一番安く済みます。
+
+### 何が変わるか
+
+<table>
+<thead>
+<tr><th>項目</th><th>expo-av</th><th>expo-audio</th></tr>
+</thead>
+<tbody>
+<tr><td>再生オブジェクト</td><td><code>Audio.Sound.createAsync()</code> で命令的に生成</td><td><code>useAudioPlayer()</code> フックで宣言的に取得</td></tr>
+<tr><td>状態の購読</td><td><code>setOnPlaybackStatusUpdate</code> のコールバック</td><td><code>useAudioPlayerStatus(player)</code> がレンダリングに直結</td></tr>
+<tr><td>バックグラウンド継続</td><td><code>staysActiveInBackground: true</code></td><td><code>shouldPlayInBackground: true</code></td></tr>
+<tr><td>サイレントモード</td><td><code>playsInSilentModeIOS: true</code></td><td><code>playsInSilentMode: true</code>（プラットフォーム接尾辞が消えた）</td></tr>
+<tr><td>割り込み方針</td><td><code>interruptionModeIOS</code> と <code>interruptionModeAndroid</code> を別々に</td><td><code>interruptionMode: 'doNotMix'</code> の1本に統合</td></tr>
+<tr><td>解放</td><td><code>unloadAsync()</code> を手で呼ぶ</td><td>フックのライフサイクルに追従</td></tr>
+</tbody>
+</table>
+
+表の最終行が、実は移行の最大の見返りです。この記事の後半で「Sound をアンロードし忘れてメモリリークが起きる」という失敗を扱いますが、`expo-audio` ではその失敗の余地自体がかなり狭くなります。手で管理していたものが、フックの寿命に乗るからです。
+
+### 移行後の Audio セッション初期化
+
+```typescript
+// hooks/useAudioSession.ts（expo-audio 版）
+import { setAudioModeAsync } from 'expo-audio';
+import { useEffect } from 'react';
+
+export function useAudioSession() {
+  useEffect(() => {
+    setAudioModeAsync({
+      // バックグラウンドでも再生を継続する（iOS では UIBackgroundModes と対で必要）
+      shouldPlayInBackground: true,
+      // サイレントスイッチが入っていても鳴らす
+      playsInSilentMode: true,
+      // 他アプリの音声と混ぜない。ロック画面のコントロールを掴むためにも必要
+      interruptionMode: 'doNotMix',
+    }).catch((error) => {
+      // 初期化に失敗しても再生自体は試みる価値がある。落とさずログに残す
+      console.error('Failed to configure audio mode:', error);
+    });
+  }, []);
+}
+```
+
+`app.json` の `UIBackgroundModes: ["audio"]` は移行後も必要です。ここは変わりません。バックグラウンド再生が「2箇所の設定の積」であるという構造は、ライブラリが変わっても残ります。
+
+### 移行後のプレイヤー
+
+```typescript
+// components/EpisodePlayer.tsx（expo-audio 版）
+import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
+import { View, Text, Pressable } from 'react-native';
+import { Episode } from '../types/podcast';
+
+export function EpisodePlayer({ episode }: { episode: Episode }) {
+  // ローカルにあればローカルを、なければリモートを再生する
+  const source = episode.localPath ?? episode.audioUrl;
+  const player = useAudioPlayer(source);
+  const status = useAudioPlayerStatus(player);
+
+  const toggle = () => {
+    if (status.playing) {
+      player.pause();
+    } else {
+      player.play();
+    }
+  };
+
+  return (
+    <View>
+      <Text>{episode.title}</Text>
+      <Pressable onPress={toggle}>
+        <Text>{status.playing ? '一時停止' : '再生'}</Text>
+      </Pressable>
+      <Text>
+        {Math.floor(status.currentTime)} / {Math.floor(status.duration ?? 0)} 秒
+      </Text>
+    </View>
+  );
+}
+```
+
+`setOnPlaybackStatusUpdate` でコールバックを登録し、その中で `setState` を呼んでいた部分が丸ごと消えます。`useAudioPlayerStatus` が返す値がそのまま描画に使えるためです。行数以上に、追いかけるべき状態の本数が減ります。
+
+### 移行時に踏んだ段差
+
+ひとつ注意点があります。Android では `setAudioModeAsync` が受け取ったオブジェクトのうち `shouldPlayInBackground` と `shouldRouteThroughEarpiece` だけを反映し、`interruptionMode` が効かないという報告が上がっています（[expo/expo #34473](https://github.com/expo/expo/issues/34473)）。
+
+iOS で意図どおりに割り込みが働いたからといって、Android で同じ挙動になるとは限りません。移行後は、実機で着信を鳴らして確かめる工程を必ず挟んでください。シミュレータでは再現しない類の差です。
+
+### 移すか、留まるか
+
+<table>
+<thead>
+<tr><th>状況</th><th>判断</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>これから新規に作る</td><td>最初から <code>expo-audio</code></td><td>移行コストがゼロの唯一の瞬間</td></tr>
+<tr><td>SDK 52 以前で稼働中・改修予定なし</td><td>据え置き</td><td>動いているものを触らない判断も正当</td></tr>
+<tr><td>SDK 54 へ上げる予定がある</td><td>同じスプリントで移行</td><td>SDK 更新の検証工数に相乗りできる</td></tr>
+<tr><td>録音機能も持っている</td><td>録音を先に検証</td><td><code>useAudioRecorder</code> の API 差が再生より大きい</td></tr>
+</tbody>
+</table>
+
+以降のコードは `expo-av` のまま記述します。既存アプリを読み替えながら移行する方が多いと考えたためです。読むときは、上の対応表を横に置いていただければと思います。
 
 ## RSS フィードからエピソード一覧を取得する
 
@@ -419,6 +537,190 @@ const styles = StyleSheet.create({
 });
 ```
 
+## ダウンロードは中断される前提で組む
+
+先ほどの `downloadEpisode` は、電波が切れずに最後まで届いた場合にだけ正しく動きます。実際のポッドキャストの音声ファイルは 30MB から 100MB。地下鉄に入れば途中で切れます。アプリを畳めば OS がプロセスを止めます。
+
+`createDownloadResumable` という名前は、再開できることを示しています。ただ、その再開は自動では起きません。再開に必要なデータを自分で保存しておかない限り、次に開いたときは 0 バイトからやり直しになります。
+
+### SDK 54 で import の場所が変わっている
+
+先に、移行に関わる話をひとつ。SDK 54 で `expo-file-system` のデフォルトエクスポートが新しいオブジェクト指向 API に差し替わり、これまでの `documentDirectory` や `createDownloadResumable` は `expo-file-system/legacy` へ移されました（[Expo Blog: Expo File System gets a major upgrade in SDK 54](https://expo.dev/blog/expo-file-system)）。
+
+```typescript
+// SDK 53 まで
+import * as FileSystem from 'expo-file-system';
+
+// SDK 54 以降で、これまでの書き方をそのまま動かす場合
+import * as FileSystem from 'expo-file-system/legacy';
+```
+
+SDK 54 へ上げた直後に「`FileSystem.documentDirectory` が `undefined` になった」という形で表面化します。原因が import 一行だと分かるまでに時間を取られやすい部類です。まず import を `/legacy` に向けて動作を戻し、新 API への移行は別の機会に切り離すのが穏当だと考えています。
+
+### 再開データを永続化する
+
+`DownloadResumable` は `pauseAsync()` を呼んだ時点で `resumeData` を持ちます。これを `savable()` でシリアライズして保存し、次回はそこから復元します。
+
+```typescript
+// lib/downloadManager.ts
+import * as FileSystem from 'expo-file-system/legacy';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Episode } from '../types/podcast';
+
+const DOWNLOAD_DIR = FileSystem.documentDirectory + 'podcasts/';
+const RESUME_KEY = (id: string) => `download:resume:${id}`;
+
+type Snapshot = {
+  url: string;
+  fileUri: string;
+  options: FileSystem.DownloadOptions;
+  resumeData?: string;
+};
+
+/**
+ * 再開可能なダウンロードを開始または再開する。
+ * 中断済みのスナップショットがあればそこから継ぎ、なければ新規に始める。
+ */
+export async function startOrResumeDownload(
+  episode: Episode,
+  onProgress: (progress: number) => void
+): Promise<string> {
+  await ensureDownloadDir();
+
+  const safeId = episode.id.replace(/[^a-zA-Z0-9-_]/g, '_');
+  const ext = episode.audioUrl.split('.').pop()?.split('?')[0] ?? 'mp3';
+  const localPath = DOWNLOAD_DIR + `${safeId}.${ext}`;
+
+  const existing = await FileSystem.getInfoAsync(localPath);
+  if (existing.exists && !(await AsyncStorage.getItem(RESUME_KEY(episode.id)))) {
+    // 完了済み（中断スナップショットが残っていない = 最後まで届いた）
+    onProgress(1.0);
+    return localPath;
+  }
+
+  const onWrite = (p: FileSystem.DownloadProgressData) => {
+    if (p.totalBytesExpectedToWrite > 0) {
+      onProgress(Math.min(p.totalBytesWritten / p.totalBytesExpectedToWrite, 1.0));
+    }
+  };
+
+  const saved = await AsyncStorage.getItem(RESUME_KEY(episode.id));
+  const snapshot: Snapshot | null = saved ? JSON.parse(saved) : null;
+
+  const downloadResumable = snapshot
+    ? new FileSystem.DownloadResumable(
+        snapshot.url,
+        snapshot.fileUri,
+        snapshot.options,
+        onWrite,
+        snapshot.resumeData
+      )
+    : FileSystem.createDownloadResumable(
+        episode.audioUrl,
+        localPath,
+        { headers: { 'User-Agent': 'PodcastApp/1.0' } },
+        onWrite
+      );
+
+  const result = snapshot
+    ? await downloadResumable.resumeAsync()
+    : await downloadResumable.downloadAsync();
+
+  if (!result) {
+    // 中断された。再開データを残して、次回に引き継ぐ
+    await AsyncStorage.setItem(
+      RESUME_KEY(episode.id),
+      JSON.stringify(downloadResumable.savable())
+    );
+    throw new DownloadInterrupted(episode.id);
+  }
+
+  if (result.status !== 200 && result.status !== 206) {
+    // 部分応答(206)は再開時の正常系。それ以外の異常はファイルごと捨てる
+    await FileSystem.deleteAsync(localPath, { idempotent: true });
+    await AsyncStorage.removeItem(RESUME_KEY(episode.id));
+    throw new Error(`ダウンロードに失敗しました: HTTP ${result.status}`);
+  }
+
+  // 完走したのでスナップショットを消す。これが「完了」の唯一の印になる
+  await AsyncStorage.removeItem(RESUME_KEY(episode.id));
+  return result.uri;
+}
+
+export class DownloadInterrupted extends Error {
+  constructor(public episodeId: string) {
+    super(`Download interrupted: ${episodeId}`);
+    this.name = 'DownloadInterrupted';
+  }
+}
+```
+
+設計上の要点をひとつだけ挙げるなら、「完了の判定にファイルの存在を使わない」ことです。
+
+中断されたファイルもディスク上には存在します。サイズを見ても、サーバが `Content-Length` を返さない配信では期待値と比べられません。そこで、再開スナップショットが AsyncStorage に残っているかどうかを完了の判定に使っています。残っていれば未完、消えていれば完了。真実の在り処を1箇所に寄せる、という一般則をそのまま当てています。
+
+### 206 を異常扱いしない
+
+元のコードは `result.status !== 200` を失敗としていました。再開したダウンロードはサーバから `206 Partial Content` を返されるため、この条件のままでは再開が成功した瞬間に例外になります。
+
+再開を実装したのに動かない、という相談のかなりの割合がここでした。再開を入れるなら、ステータスコードの許容範囲も同時に広げてください。
+
+### 中断からの復帰をアプリの起動に組み込む
+
+```typescript
+// app/_layout.tsx の中で一度だけ
+import { useEffect } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+export function useResumePendingDownloads() {
+  useEffect(() => {
+    const resumeAll = async () => {
+      const keys = await AsyncStorage.getAllKeys();
+      const pending = keys.filter((k) => k.startsWith('download:resume:'));
+
+      // 一斉に再開すると帯域を食い合う。1本ずつ直列で戻す
+      for (const key of pending) {
+        const episodeId = key.replace('download:resume:', '');
+        try {
+          await resumeSingle(episodeId);
+        } catch {
+          // 1本の失敗で残りを止めない。次回起動でまた拾える
+        }
+      }
+    };
+
+    resumeAll();
+  }, []);
+}
+```
+
+再開は直列にしています。並列にすると、帯域を分け合った結果どれも完了せず、進捗バーだけが4本並んで動く、という体験になります。ユーザーが待っているのは「全部が少しずつ進むこと」ではなく「1本が終わること」です。
+
+### 孤児ファイルを回収する
+
+再開スナップショットが何らかの理由で消え、ファイルだけが残ることがあります。アプリの削除・再インストールを跨がない限り、これは静かにストレージを食い続けます。
+
+```typescript
+/**
+ * ダウンロード済みでもなく、再開待ちでもないファイルを掃除する。
+ * 起動時ではなく、設定画面を開いたときなど、余裕のある場面で呼ぶ
+ */
+export async function sweepOrphans(knownEpisodeIds: string[]): Promise<number> {
+  const files = await FileSystem.readDirectoryAsync(DOWNLOAD_DIR);
+  const alive = new Set(knownEpisodeIds.map((id) => id.replace(/[^a-zA-Z0-9-_]/g, '_')));
+
+  let removed = 0;
+  for (const name of files) {
+    const base = name.replace(/\.[^.]+$/, '');
+    if (!alive.has(base)) {
+      await FileSystem.deleteAsync(DOWNLOAD_DIR + name, { idempotent: true });
+      removed += 1;
+    }
+  }
+  return removed;
+}
+```
+
 ## Zustand で再生状態を一元管理する
 
 Zustand で再生状態を一元管理することで、どの画面からでも同じプレイヤーを操作できます。これはポッドキャストアプリのように「エピソードリスト画面で再生しながら別の画面に遷移する」ような使い方に欠かせない設計です。
@@ -517,6 +819,91 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
 }));
 ```
 
+## 割り込みから戻ってこられるか
+
+バックグラウンド再生が動き始めると、次に来る報告はたいてい「電話に出たら、切った後も音が戻ってこない」です。
+
+iOS の音声セッションは、着信・アラーム・他アプリの再生といった割り込みを受けると、こちらの再生を止めます。ここまでは正常です。問題は、割り込みが終わったあとに誰が再開するのかが決まっていない点にあります。
+
+OS は「割り込みが終わった」ことを伝えますが、勝手に再開はしません。ネイティブでは `AVAudioSession` の interruption 通知を受け、`shouldResume` オプションを見て自分で `play()` を呼び直します。`expo-av` にはこの通知をそのまま受け取る口がありません。
+
+### AppState と再生状態の突き合わせで代替する
+
+完全な代替にはなりませんが、実用上はこれで大半が拾えます。
+
+```typescript
+// hooks/useInterruptionRecovery.ts
+import { useEffect, useRef } from 'react';
+import { AppState, AppStateStatus } from 'react-native';
+import { usePlayerStore } from '../store/playerStore';
+
+export function useInterruptionRecovery() {
+  // 「ユーザーが再生を意図していたか」を保持する。OS の再生状態とは別物
+  const intendedToPlay = useRef(false);
+
+  useEffect(() => {
+    const unsubscribe = usePlayerStore.subscribe((state) => {
+      // ユーザー操作による再生・一時停止のときだけ意図を更新する
+      if (state.lastChangeSource === 'user') {
+        intendedToPlay.current = state.isPlaying;
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    const handleChange = async (next: AppStateStatus) => {
+      if (next !== 'active') return;
+
+      const { sound, isPlaying, resume } = usePlayerStore.getState();
+      if (!sound) return;
+
+      const status = await sound.getStatusAsync();
+      if (!status.isLoaded) return;
+
+      // 「鳴らすつもりだったのに、OS 側では止まっている」= 割り込みで落とされた
+      if (intendedToPlay.current && !status.isPlaying && !isPlaying) {
+        await resume();
+      }
+    };
+
+    const sub = AppState.addEventListener('change', handleChange);
+    return () => sub.remove();
+  }, []);
+}
+```
+
+肝は `intendedToPlay` を「OS の再生状態」と切り離して持っている点です。
+
+`isPlaying` をそのまま復帰の根拠にすると、ユーザーが自分で一時停止してホーム画面に戻り、戻ってきた瞬間に勝手に再生が始まる、という最悪の挙動になります。止めたいから止めたのです。意図と状態は、別の変数で持たなければ区別できません。
+
+### ヘッドホンを抜いたとき
+
+もうひとつ、審査でも指摘されうる挙動があります。イヤホンを抜いた瞬間に、音がスピーカーから鳴り出す。カフェや電車の中で起きると、実害があります。
+
+iOS はルート変更時にこちらの再生を一時停止しますが、`expo-av` の設定次第では素通りします。`interruptionModeIOS: INTERRUPTION_MODE_IOS_DO_NOT_MIX` を入れておくことは、ロック画面のコントロールを掴むためだけでなく、この事故を防ぐ側面もあります。
+
+`expo-audio` では `interruptionMode: 'doNotMix'` が同じ役割を担います。ただし前述のとおり Android 側の反映には報告済みの制約があるため、Android 実機での確認は省けません。
+
+### 検証は実機で、この順に
+
+シミュレータでは着信もヘッドホンの抜き差しも再現できません。実機で次の順に触るのが最短だと考えています。
+
+<table>
+<thead>
+<tr><th>#</th><th>操作</th><th>期待する挙動</th><th>よくある実際</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>再生中に画面ロック</td><td>再生が続く</td><td>数秒で止まる（<code>UIBackgroundModes</code> 漏れ）</td></tr>
+<tr><td>2</td><td>再生中に着信を受けて切る</td><td>切った後に再生が戻る</td><td>止まったまま（割り込み復帰の未実装）</td></tr>
+<tr><td>3</td><td>自分で一時停止 → ホーム → 戻る</td><td>止まったまま</td><td>勝手に再生が始まる（意図と状態の混同）</td></tr>
+<tr><td>4</td><td>再生中にイヤホンを抜く</td><td>一時停止する</td><td>スピーカーから鳴り出す</td></tr>
+<tr><td>5</td><td>再生中に別アプリで動画を再生</td><td>こちらが止まる</td><td>両方鳴る（<code>doNotMix</code> 未設定）</td></tr>
+</tbody>
+</table>
+
+この5つは、どれも1分で試せます。そして、5つ全部を通る実装は、私の経験では最初から書けたことがありません。毎回どれかで落ちます。だからこそ、リリース前のチェックリストとして手元に置いておく価値があると考えています。
+
 ## 再生速度変更 UI の実装
 
 ```typescript
@@ -559,6 +946,195 @@ const styles = StyleSheet.create({
   activeLabel: { color: '#fff' },
 });
 ```
+
+## 続きから聴けるようにする
+
+ポッドキャストアプリを音楽プレイヤーと分けている機能を1つだけ挙げるなら、再生位置の記憶だと思います。
+
+1時間の対談を、通勤の往路で 20 分、復路で 25 分、翌朝に残りを聴く。この使い方が成立しなければ、ユーザーは戻ってきません。そして再生位置の保存は、素直に書くとほぼ確実に失敗します。
+
+### 毎秒書くと、書き込みが詰まる
+
+`setOnPlaybackStatusUpdate` は、既定でおよそ 500ms ごとに呼ばれます。ここで AsyncStorage に書くと、1時間の再生で 7,200 回の書き込みが走ります。
+
+```typescript
+// ❌ 状態更新のたびに永続化する
+sound.setOnPlaybackStatusUpdate((status) => {
+  if (!status.isLoaded) return;
+  AsyncStorage.setItem(`pos:${episodeId}`, String(status.positionMillis));
+});
+```
+
+体感できるほど重くはならないことも多く、だからこそ気づかないまま出荷されます。ただ、書き込みが詰まった状態でアプリを畳むと、最後の書き込みが完了しないことがあります。「聴いていたのに位置が戻る」という報告の一因がここです。
+
+### 間引いて書き、要所で必ず書く
+
+```typescript
+// lib/positionStore.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const KEY = (id: string) => `pos:${id}`;
+const SAVE_INTERVAL_MS = 5000;
+// 終わり際まで聴いたエピソードは、次回は先頭から始める
+const NEAR_END_THRESHOLD_MS = 30_000;
+
+let lastSavedAt = 0;
+
+export async function savePosition(
+  episodeId: string,
+  positionMillis: number,
+  durationMillis: number,
+  options: { force?: boolean } = {}
+): Promise<void> {
+  const now = Date.now();
+  if (!options.force && now - lastSavedAt < SAVE_INTERVAL_MS) return;
+  lastSavedAt = now;
+
+  // 最後まで聴き切った扱いなら、位置を消して「完了」にする
+  if (durationMillis > 0 && durationMillis - positionMillis < NEAR_END_THRESHOLD_MS) {
+    await AsyncStorage.removeItem(KEY(episodeId));
+    return;
+  }
+
+  await AsyncStorage.setItem(KEY(episodeId), String(Math.floor(positionMillis)));
+}
+
+export async function loadPosition(episodeId: string): Promise<number> {
+  const raw = await AsyncStorage.getItem(KEY(episodeId));
+  return raw ? Number(raw) : 0;
+}
+```
+
+そして、間引いた分を取り戻す場所を用意します。
+
+```typescript
+// app/_layout.tsx
+import { AppState } from 'react-native';
+import { usePlayerStore } from '../store/playerStore';
+import { savePosition } from '../lib/positionStore';
+
+AppState.addEventListener('change', (next) => {
+  if (next === 'active') return;
+
+  // 畳まれる・落とされる瞬間だけは、間引きを無視して必ず書く
+  const { currentEpisode, positionMillis, durationMillis } = usePlayerStore.getState();
+  if (currentEpisode) {
+    savePosition(currentEpisode.id, positionMillis, durationMillis, { force: true });
+  }
+});
+```
+
+5秒ごとの間引き保存に加えて、`background` へ移る瞬間に `force: true` で1回。この2段構えにすると、最悪でも失う位置は5秒以内に収まり、通常の離脱では1秒も失いません。
+
+### 終わり際の30秒を「完了」にする理由
+
+`NEAR_END_THRESHOLD_MS` で、残り30秒を切ったエピソードは位置を保存せず消しています。
+
+エピソードの末尾は、たいてい次回予告やクレジットです。ここで止めた人は「聴き終えた」のであって「途中」ではありません。にもかかわらず位置を残すと、次に開いたとき残り10秒から再生が始まり、ユーザーは自分で先頭に戻す操作を強いられます。
+
+閾値は 30 秒と決め打ちにしていますが、これは番組の長さによって妥当性が変わります。5分のエピソードで残り30秒は「1割残っている」ことになる。長さに対する比率と、絶対秒数の小さい方を採るのが実際には近いと考えています。この種の判断は、数字を1つ置いて終わりにせず、自分の番組の長さの分布を見て決める方が納得のいく結果になります。
+
+## ロック画面に何も出ないという相談
+
+冒頭のアーキテクチャで「ロック画面対応」を挙げました。ここで正直にお伝えしておかなければならないことがあります。
+
+`expo-av` には、ロック画面に曲名・番組名・アートワーク・スキップボタンを表示するための API がありません。iOS の Now Playing 情報は `MPNowPlayingInfoCenter`、リモート操作は `MPRemoteCommandCenter` が担いますが、`expo-av` はそのどちらも公開していません。
+
+音声セッションを掴んでいるので、ロック画面に最低限の再生・一時停止は現れます。しかし、番組名は出ません。アートワークも出ません。「30秒進む」「15秒戻る」も出ません。ポッドキャストアプリで最も使われるボタンが、ちょうど出ない部分に入っています。
+
+### ここが分岐点になる
+
+<table>
+<thead>
+<tr><th>作るもの</th><th>妥当な選択</th><th>根拠</th></tr>
+</thead>
+<tbody>
+<tr><td>自分用・社内用の音声プレイヤー</td><td><code>expo-audio</code> のまま</td><td>ロック画面の作り込みが要件でない</td></tr>
+<tr><td>数分の音声を再生する補助機能</td><td><code>expo-audio</code> のまま</td><td>ロック画面から操作する場面が来ない</td></tr>
+<tr><td>公開するポッドキャスト・音楽アプリ</td><td><code>react-native-track-player</code></td><td>Now Playing・スキップ秒数・キューが要件になる</td></tr>
+<tr><td>Rork で骨格を作って育てる</td><td>骨格は Expo、再生層だけ差し替え</td><td>生成コードの資産を捨てずに済む</td></tr>
+</tbody>
+</table>
+
+最後の行が、Rork を使う場合の現実解だと考えています。
+
+Rork に「RSS を読んでエピソード一覧を出し、再生画面へ遷移する」と伝えれば、画面・ナビゲーション・型定義・状態管理の骨格は数分で出てきます。その骨格の価値は本物です。捨てる必要はありません。
+
+差し替えるのは再生層だけです。この記事で Zustand ストアを噛ませ、再生の実体を `playerStore` の内側に押し込めているのは、そのためでもあります。UI は `usePlayerStore` としか話しません。中身が `expo-av` でも `react-native-track-player` でも、画面側のコードは変わらない。
+
+生成 AI が書いた骨格の上で、差し替える可能性が高い1箇所だけを境界で包んでおく。これは私が Rork や Claude Code で骨格を出させるときに、毎回やっていることです。全部を自分で書き直すのは遅すぎるし、全部を生成のまま使うと後で身動きが取れなくなる。境界を1本引くのが、ちょうど中間の落とし所になります。
+
+## 保存領域が溢れる日のために
+
+この記事の後半に「`cacheDirectory` ではなく `documentDirectory` を使う」という項目があります。翌日エピソードが消えている問題への対処として、これは正しい。ただ、これだけでは足りません。
+
+`documentDirectory`（iOS の Documents）は、iCloud バックアップの対象です。ここに 2GB のエピソードが溜まると、その 2GB がユーザーの iCloud バックアップを圧迫します。無料枠 5GB の人にとっては、それだけで写真のバックアップが止まりかねない量です。
+
+そして Apple のデータ保存ガイドラインは、再ダウンロードできるコンテンツを Documents に無印で置くことを想定していません。再取得可能なデータは Caches に置くか、バックアップ除外の印を付けることが求められます。ポッドキャストのエピソードは、まさに「サーバから再取得できるデータ」です。
+
+### 消える場所と、膨らむ場所の間
+
+<table>
+<thead>
+<tr><th>置き場所</th><th>OS に消されるか</th><th>iCloud バックアップ</th><th>ポッドキャストに向くか</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cacheDirectory</code></td><td>容量逼迫時に消される</td><td>対象外</td><td>×（ユーザーが意図して保存したものが消える）</td></tr>
+<tr><td><code>documentDirectory</code>（無印）</td><td>消されない</td><td>対象</td><td>△（バックアップを圧迫する）</td></tr>
+<tr><td><code>documentDirectory</code> + 除外印</td><td>消されない</td><td>対象外</td><td>◎（ただし Expo の公開 API では印を付けられない）</td></tr>
+</tbody>
+</table>
+
+三段目が理想で、そして三段目は `expo-file-system` の公開 API だけでは実現できません。`isExcludedFromBackup` を立てるにはネイティブ側に触れる必要があり、config plugin を書くか、対応するライブラリを挟むことになります。
+
+### 印を付けられないなら、量を管理する
+
+config plugin を書くのが重いと感じるなら、もうひとつの道があります。バックアップに乗ることを受け入れた上で、乗る量に上限を設ける。
+
+```typescript
+// lib/storageBudget.ts
+import * as FileSystem from 'expo-file-system/legacy';
+
+const DOWNLOAD_DIR = FileSystem.documentDirectory + 'podcasts/';
+const BUDGET_BYTES = 1.5 * 1024 * 1024 * 1024; // 1.5GB を上限とする
+
+type Entry = { path: string; size: number; lastPlayedAt: number };
+
+/**
+ * 上限を超えた分だけ、最後に聴いた時刻が古い順に消す。
+ * 再生中のエピソードは保護する
+ */
+export async function evictIfOverBudget(
+  entries: Entry[],
+  protectedPath?: string
+): Promise<string[]> {
+  const total = entries.reduce((sum, e) => sum + e.size, 0);
+  if (total <= BUDGET_BYTES) return [];
+
+  // 古く聴いたものから捨てる。未再生(lastPlayedAt = 0)は最後まで残す
+  const candidates = entries
+    .filter((e) => e.path !== protectedPath && e.lastPlayedAt > 0)
+    .sort((a, b) => a.lastPlayedAt - b.lastPlayedAt);
+
+  const evicted: string[] = [];
+  let freed = 0;
+
+  for (const entry of candidates) {
+    if (total - freed <= BUDGET_BYTES) break;
+    await FileSystem.deleteAsync(entry.path, { idempotent: true });
+    freed += entry.size;
+    evicted.push(entry.path);
+  }
+
+  return evicted;
+}
+```
+
+並び替えの条件に注目してください。未再生のエピソード（`lastPlayedAt === 0`）を候補から除いています。
+
+ユーザーがダウンロードしたのは、これから聴くためです。まだ聴いていないものを容量のために消すのは、ダウンロードという操作の意味を裏切ります。逆に、聴き終わったエピソードは消してよい。同じ「自動削除」でも、どちらから消すかで体験は正反対になります。
+
+そして、自動で消した事実は必ずユーザーに見せてください。設定画面に使用量と「聴き終わった○件を自動削除しました」の一行があるだけで、「勝手に消えた」が「そういう仕組みだった」に変わります。技術的には同じ削除です。伝えるかどうかだけが違います。
 
 ## よくある実装ミスとその修正パターン
 
@@ -638,14 +1214,32 @@ App Store Connect の審査では、バックグラウンドモードを使っ�
 
 expo-av が内部的に使用しますが、明示的に宣言しておくことで Google Play の審査でのポリシー違反指摘を防げます。
 
-プライバシーポリシーや権限まわりの詳細は、[アプリのプライバシーとデータ保護ガイド](/articles/rork-dev/rork-app-privacy-data-protection-guide)もご覧いただけると幸いです。
+プライバシーポリシーの書き方については、[Rorkで作ったアプリのプライバシーポリシー](/articles/rork-business/rork-app-privacy-policy-template-app-store-2026)もご覧いただけると幸いです。ダウンロード履歴や再生履歴を保存する以上、記載の対象になります。
 
-## 全体を振り返って：今日から始められる一歩
+## 本番に出す前に、ここだけは
 
-ポッドキャストアプリに必要な技術要素は複数ありますが、実装の核心は「バックグラウンド再生の設定を `app.json` と `setAudioModeAsync` の2箇所で行う」という点に集約されます。ここさえ理解できれば、後はデータ管理と UI の問題になります。
+ポッドキャストアプリの実装で難しいのは、個々の技術要素ではありません。RSS の解析も、ダウンロードも、再生も、単体なら難しくない。難しいのは、それらが「中断される」「割り込まれる」「消される」という前提の下で、それでも壊れないように組むことです。
 
-まずは RSS フィードを1つ取得してエピソード一覧を表示するところから始めてみてください。Rork の AI に「この TypeScript 型定義を使って、RSS URL を受け取ってエピソードリストを表示する画面を作って」と伝えるだけで、UI の骨格はすぐに生成できます。
+この記事で扱った判断を、もう一度並べておきます。
 
-基本的なオーディオ再生の仕組みについては、[expo-av を使った音楽プレイヤーの実装ガイド](/articles/rork-dev/rork-audio-player-app-tutorial)も合わせてご覧いただけると、今回の実装との違いがより鮮明になると思います。また、オフラインデータの取り扱い全般については、[Rork アプリのオフライン対応ガイド](/articles/rork-dev/rork-offline-support)も参考にしていただけると幸いです。
+<table>
+<thead>
+<tr><th>論点</th><th>この記事の立場</th></tr>
+</thead>
+<tbody>
+<tr><td>expo-av か expo-audio か</td><td>新規なら <code>expo-audio</code>。SDK 55 で <code>expo-av</code> は消える</td></tr>
+<tr><td>ダウンロードの完了判定</td><td>ファイルの存在ではなく、再開スナップショットの不在で判定する</td></tr>
+<tr><td>割り込みからの復帰</td><td>「ユーザーの意図」を OS の再生状態と別の変数で持つ</td></tr>
+<tr><td>ロック画面のメタデータ</td><td>公開アプリなら <code>react-native-track-player</code>。再生層だけ境界で包む</td></tr>
+<tr><td>ダウンロードの保存先</td><td><code>documentDirectory</code> + 容量予算。聴き終わったものから消す</td></tr>
+<tr><td>再生位置の保存</td><td>5秒間引き + 離脱時に強制保存の2段構え</td></tr>
+</tbody>
+</table>
 
-音声アプリ開発をさらに深く
+もし1つだけ今日試すとしたら、前述の実機チェック5項目を通してみてください。着信を受けて切る。イヤホンを抜く。自分で止めてから戻る。すでに動いているアプリをお持ちなら、5分で2つか3つは見つかるはずです。私はいつも見つけます。
+
+Rork で骨格を出させる場合も、順番は同じだと考えています。まず RSS を1本読んで一覧を出す。次に再生を1本通す。そこまで動いてから、中断・割り込み・容量の3つを1つずつ潰していく。最初から全部を指示すると、生成されたコードのどこが自分の要件を満たしていないのか、判断できなくなります。
+
+基本的なオーディオ再生の仕組みについては、[Rork で音楽プレイヤーアプリを作る](/articles/rork-dev/rork-audio-player-app-tutorial)も合わせてご覧いただけると、今回の実装との違いがより鮮明になると思います。オフラインデータの設計全般については、[Rork Max で実装するオフライン・ファースト・アーキテクチャ](/articles/rork-dev/rork-max-offline-first-architecture)が、今回のダウンロード管理の考え方を別の角度から補ってくれるはずです。
+
+音声を扱うアプリは、ユーザーが画面を見ていない時間が最も長いアプリでもあります。見えないところで壊れないことに、ほとんどの手間がかかる。地味ですが、そこに手を掛けた分だけ、ユーザーは静かに使い続けてくれます。私自身まだ学びの途中ですが、共に手を動かしていけたら嬉しいです。
