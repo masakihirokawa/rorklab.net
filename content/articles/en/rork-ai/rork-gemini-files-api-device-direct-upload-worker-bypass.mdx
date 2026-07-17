@@ -1,0 +1,444 @@
+---
+title: "The Three-Minute Video That Kept Failing — Moving Rork's Gemini Uploads Off the Worker"
+slug: "rork-gemini-files-api-device-direct-upload-worker-bypass"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-17T14:00"
+author: "Rork Lab"
+description: "How I rerouted video uploads to the Gemini Files API from a Cloudflare Workers relay to a direct device-to-Google path — why the 128MB isolate limit breaks the relay, how to hand out a resumable upload URL without leaking your API key, and how resolution and frame rate actually decide the bill."
+tags: ["Rork", "Gemini", "Files API", "Video Analysis", "Cloudflare Workers", "Expo", "Indie Dev"]
+highlights:
+  - "Why loading a video into a Worker's arrayBuffer collides with the 128MB isolate ceiling, and the upload path that removes the problem instead of tuning around it"
+  - "Working Worker and Expo code that keeps the API key server-side while the video travels straight from the device to Google"
+  - "Using low media resolution and a lower fps to cut roughly 300 tokens per second of video down to roughly 100, and when that trade costs you the answer"
+---
+
+A 28-second clip shot on my iPhone went through every time. The analysis came back looking exactly like I wanted.
+
+Then I asked a friend to record three minutes of footage, and the upload simply stopped coming back. No useful error. Just a long pause and eventually a 500.
+
+I spent the first hour suspecting the model. Wrong format, maybe, or a video too long for the request. The logs said otherwise: the thing was dying well before it ever reached Gemini. What had broken was not the inference. It was the pipe.
+
+## Twenty-eight seconds passes, three minutes stalls
+
+The setup was reasonable enough, as these things go.
+
+An Expo app picks a video, posts it as multipart to a Cloudflare Worker, and the Worker relays it to the Gemini Files API. I did not want the API key sitting inside the app bundle, so I put a server in the middle. As an indie developer who would rather not run a backend at all, I found Workers a tempting place to land.
+
+The Worker looked like this.
+
+```typescript
+// ❌ The original — the whole video lands in the Worker's heap
+async function handleVideoUpload(request: Request, env: Env): Promise<Response> {
+  const formData = await request.formData();
+  const videoFile = formData.get('video') as File;
+
+  // Every byte of the video is materialized here
+  const arrayBuffer = await videoFile.arrayBuffer();
+
+  const initResponse = await fetch(`${UPLOAD_URL}?key=${env.GEMINI_API_KEY}`, {
+    method: 'POST',
+    headers: {
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': arrayBuffer.byteLength.toString(),
+      'X-Goog-Upload-Header-Content-Type': videoFile.type,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ file: { display_name: videoFile.name } }),
+  });
+
+  const uploadUri = initResponse.headers.get('X-Goog-Upload-URL');
+
+  // ...and then every byte gets shipped a second time
+  return fetch(uploadUri!, {
+    method: 'POST',
+    headers: {
+      'Content-Length': arrayBuffer.byteLength.toString(),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: arrayBuffer,
+  });
+}
+```
+
+One line did all the damage: `await videoFile.arrayBuffer()`.
+
+## The video was passing straight through the Worker
+
+A Cloudflare Worker isolate is capped at 128MB of memory, covering the JavaScript heap and any WebAssembly allocations. Paying for the Workers plan does not raise it. And the cap applies per isolate, not per invocation — which matters more than it first sounds.
+
+Meanwhile the request body limit on the Free plan is 100MB. So the platform will happily accept a video it has no room to hold.
+
+Here is what my phone actually produces.
+
+<table>
+  <thead>
+    <tr><th>Capture setting</th><th>Length</th><th>Measured size</th><th>Result after arrayBuffer</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1080p / 30fps</td><td>28s</td><td>~52MB</td><td>Passes</td></tr>
+    <tr><td>1080p / 30fps</td><td>1m 10s</td><td>~130MB</td><td>413</td></tr>
+    <tr><td>720p / 30fps</td><td>3m</td><td>~96MB</td><td>Intermittent 500</td></tr>
+    <tr><td>4K / 60fps</td><td>30s</td><td>~190MB</td><td>413</td></tr>
+  </tbody>
+</table>
+
+The three-minute 720p clip was the nastiest of the four. At 96MB it slips under the body limit and gets accepted. But once those 96MB are on the heap, a single video owns most of the 128MB budget. Add one concurrent request sharing that isolate and you are over.
+
+That is why it failed *intermittently*. Testing alone, it worked. With a few people touching it at once, it fell over. I could not reproduce it on demand because the bug needed company.
+
+And even on the runs that succeeded, the shape was wasteful. The bytes climb from the phone to Cloudflare, then climb again from Cloudflare to Google. The same payload crosses the network twice while the Worker burns CPU time doing nothing but holding it. The only thing that relay bought me was hiding the API key.
+
+Hiding a key does not require moving the video.
+
+## Hand out the destination, not the pipe
+
+Resumable upload in the Files API happens in two stages.
+
+Stage one sends metadata only, using the `start` command, and the response comes back with an `X-Goog-Upload-URL` header. Stage two sends the actual bytes to that URL.
+
+The useful property is in that URL. The destination you get back carries its own session token embedded in the URL itself. Stage two needs no API key at all.
+
+Which means only stage one has to live on the server. The key stays put, the device receives a single-use destination, and the video goes from the phone straight to Google without touching Cloudflare.
+
+```typescript
+// ✅ The Worker only issues a destination. No video bytes pass through it.
+interface Env {
+  GEMINI_API_KEY: string;
+  SESSIONS: KVNamespace;
+}
+
+const MAX_BYTES = 2 * 1024 * 1024 * 1024; // Files API caps a single file at 2GB
+
+async function issueUploadUrl(request: Request, env: Env): Promise<Response> {
+  const { sizeBytes, mimeType, userId } = await request.json<{
+    sizeBytes: number;
+    mimeType: string;
+    userId: string;
+  }>();
+
+  // Reject before issuing. Letting someone upload 2GB and then saying no wastes their data plan.
+  if (!Number.isInteger(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_BYTES) {
+    return Response.json({ error: 'invalid_size' }, { status: 400 });
+  }
+  if (!['video/mp4', 'video/quicktime'].includes(mimeType)) {
+    return Response.json({ error: 'unsupported_type' }, { status: 415 });
+  }
+
+  // Issuing a destination is effectively reserving an analysis, so meter it per user
+  const quotaKey = `upload_quota:${userId}:${new Date().toISOString().slice(0, 10)}`;
+  const used = Number((await env.SESSIONS.get(quotaKey)) ?? '0');
+  if (used >= 20) {
+    return Response.json({ error: 'daily_quota_exceeded' }, { status: 429 });
+  }
+
+  const initResponse = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${env.GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(sizeBytes),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ file: { display_name: `v_${Date.now()}` } }),
+    }
+  );
+
+  const uploadUrl = initResponse.headers.get('X-Goog-Upload-URL');
+  if (!uploadUrl) {
+    return Response.json({ error: 'init_failed' }, { status: 502 });
+  }
+
+  await env.SESSIONS.put(quotaKey, String(used + 1), { expirationTtl: 86400 });
+
+  // The session token lives in this URL. The API key never leaves the Worker.
+  return Response.json({ uploadUrl, sizeBytes });
+}
+```
+
+Taking `sizeBytes` from the client may look sloppy. It is self-reported, and nothing stops someone from lying.
+
+But a lie here only hurts the liar. Send more bytes than declared and Google rejects them; send fewer and the finalize never completes. What the server is protecting is the key and the issuance count, not the honesty of a number. I made peace with that distinction.
+
+The per-user daily quota exists because issuing a destination is, in practice, a reservation for one analysis. For enforcing the actual spend ceiling at runtime, I wrote up a three-layer approach in [Enforcing AI Cost Ceilings at Runtime](/articles/rork-dev/rork-ai-runtime-budget-enforcement-architecture).
+
+## Sending straight from the device
+
+The app side gets simpler: request a destination, then send the file to it.
+
+The classic React Native trap here is `FormData`. Reach for a `Blob` the way you would in a browser and nothing works — React Native wants an object with `uri`, `type`, and `name`.
+
+Except this time it is not multipart at all. Stage two of a resumable upload just wants raw bytes in the body. Expo's upload task will stream a file straight from disk, which means the video never enters the JS heap on the device either. That turns out to matter as much on the phone as it did on the Worker.
+
+```typescript
+// app/lib/uploadVideo.ts
+import * as FileSystem from 'expo-file-system';
+import * as ImagePicker from 'expo-image-picker';
+
+const API_BASE = 'https://your-worker.example.workers.dev';
+
+export type UploadResult = { fileUri: string; sizeBytes: number };
+
+export async function pickAndUploadVideo(
+  userId: string,
+  onProgress?: (ratio: number) => void
+): Promise<UploadResult | null> {
+  const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+  if (!permission.granted) return null;
+
+  const picked = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ['videos'],
+    quality: 1,
+  });
+  if (picked.canceled || !picked.assets[0]) return null;
+
+  const asset = picked.assets[0];
+  const info = await FileSystem.getInfoAsync(asset.uri);
+  if (!info.exists) return null;
+
+  const sizeBytes = info.size ?? 0;
+  const mimeType = asset.mimeType ?? 'video/mp4';
+
+  // Step 1: ask the server for a destination
+  const issued = await fetch(`${API_BASE}/api/upload-url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sizeBytes, mimeType, userId }),
+  });
+  if (!issued.ok) {
+    const { error } = await issued.json();
+    throw new Error(`Could not get an upload destination (${error})`);
+  }
+  const { uploadUrl } = await issued.json();
+
+  // Step 2: device to Google, directly. The Worker is not in this path.
+  const task = FileSystem.createUploadTask(
+    uploadUrl,
+    asset.uri,
+    {
+      httpMethod: 'POST',
+      uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+      headers: {
+        'Content-Length': String(sizeBytes),
+        'X-Goog-Upload-Offset': '0',
+        'X-Goog-Upload-Command': 'upload, finalize',
+      },
+    },
+    (p) => onProgress?.(p.totalBytesSent / p.totalBytesExpectedToSend)
+  );
+
+  const response = await task.uploadAsync();
+  if (!response || response.status >= 300) {
+    throw new Error(`Upload failed (${response?.status})`);
+  }
+
+  const body = JSON.parse(response.body) as {
+    file: { uri: string; state: string };
+  };
+  return { fileUri: body.file.uri, sizeBytes };
+}
+```
+
+`BINARY_CONTENT` is the load-bearing choice. Switch it to `MULTIPART` and boundary strings wrap the payload, and Google can no longer read it as a video. It fails quietly, which cost me an evening.
+
+Honest progress reporting came free with the change. Relaying through the Worker, the progress bar hit 100% the moment the upload to Cloudflare finished — and then the user stared at a full bar for another 40 seconds on a three-minute video while Cloudflare pushed the bytes to Google. Now the bar tracks the last byte.
+
+## How long ACTIVE takes scales with the video
+
+A finished upload is not a usable file. The Files API marks freshly uploaded content as `PROCESSING`, and `generateContent` cannot reference it until the state turns `ACTIVE`.
+
+My original code waited in a fixed loop: 2 seconds, ten times. Twenty seconds total.
+
+Fine for 28 seconds of footage. Not fine for three minutes. This was the second reason short clips felt reliable — a fixed loop manufactures confidence on small inputs and quietly collapses on large ones.
+
+If the wait scales with the video, the budget should too.
+
+```typescript
+// workers/src/waitForActive.ts
+type FileState = 'PROCESSING' | 'ACTIVE' | 'FAILED';
+
+export async function waitForActive(
+  fileName: string,
+  durationSec: number,
+  env: Env
+): Promise<void> {
+  // Measured around one sixth of the video's length; allow 3x headroom, floor at 15s
+  const budgetMs = Math.max(15_000, Math.ceil(durationSec / 6) * 3 * 1000);
+  const deadline = Date.now() + budgetMs;
+
+  let waitMs = 1_000;
+  while (Date.now() < deadline) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${env.GEMINI_API_KEY}`
+    );
+    const { state } = await res.json<{ state: FileState }>();
+
+    if (state === 'ACTIVE') return;
+    if (state === 'FAILED') throw new Error('file_processing_failed');
+
+    await new Promise((r) => setTimeout(r, waitMs));
+    waitMs = Math.min(waitMs * 1.6, 8_000); // back off, cap at 8s
+  }
+  throw new Error(`file_not_active_within_${budgetMs}ms`);
+}
+```
+
+Backing off is partly a cost decision. Polling is not billed, but it spends Worker CPU time and subrequests. One-second polling across three minutes means 180 calls, which walks you toward the subrequest ceiling for no benefit. Starting at one second and capping at eight brought a three-minute wait down to roughly 30 calls.
+
+Checking for `FAILED` explicitly matters more than it looks. Corrupt files and unsupported codecs land there. If you only watch the clock, a heavy video and a broken video produce the same error message — and one of them gets better if you wait while the other never will. Blur that line and you have built a retry button that can be pressed forever.
+
+## A fileUri expires in 48 hours
+
+Files uploaded through the Files API are deleted automatically after 48 hours. While they exist you can read metadata, but you cannot download them back.
+
+I filed that away as irrelevant. The analysis runs seconds after the upload; who needs 48 hours?
+
+Then I added a re-ask feature — open a past result, ask a different question about the same footage. I stored the `fileUri` on the device and reused it. Everything worked beautifully until the next morning, when history entries started returning 403.
+
+A `fileUri` is not an identifier. It is a 48-hour lease. Conflate the two and you ship something that works perfectly through launch day and starts generating support mail on day two.
+
+So I split what gets stored.
+
+<table>
+  <thead>
+    <tr><th>What</th><th>Where</th><th>Lifetime</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Analysis text</td><td>Device + server</td><td>Permanent</td><td>This is the thing the user actually wanted</td></tr>
+    <tr><td>Local video URI</td><td>Device only</td><td>Until they delete it</td><td>The source for a re-upload</td></tr>
+    <tr><td>fileUri</td><td>KV</td><td>Expires at 47h</td><td>Only good for follow-ups inside the window</td></tr>
+  </tbody>
+</table>
+
+The KV TTL is 47 hours rather than 48 on purpose. A matching TTL creates a window where KV still has the reference but Google has already dropped the file. Giving up an hour moves the expiry decision entirely to my side of the line — better to treat it as gone than to fetch it and catch a 403.
+
+Inside the window, follow-up questions skip the upload entirely. Outside it, the app quietly re-uploads from the copy still sitting on the device. Either way the user just asked again.
+
+## Resolution and frame rate decide the bill
+
+With the path sorted out, cost was next.
+
+Video token consumption turned out to be far more legible than I assumed. By default the API samples one frame per second and spends roughly 300 tokens per second of video. Drop `media_resolution` to low and each frame costs 66 tokens, which — with audio at about 32 tokens per second and some metadata — lands near 100 tokens per second of video.
+
+That is a 3x spread. A model with a 1M context window can take about an hour of video at default resolution, or three hours at low.
+
+I had started writing my own frame-decimation code. I did not need it. `videoMetadata` accepts an `fps` argument, and `startOffset` / `endOffset` will clip a range server-side.
+
+```typescript
+// workers/src/analyze.ts
+type Intent = 'quick_summary' | 'form_coaching' | 'lecture_notes';
+
+interface VideoPlan {
+  model: string;
+  mediaResolution: 'MEDIA_RESOLUTION_LOW' | 'MEDIA_RESOLUTION_MEDIUM';
+  fps: number;
+}
+
+// Branch on what you need to see — not on how long the video is
+function planFor(intent: Intent): VideoPlan {
+  switch (intent) {
+    case 'quick_summary':
+      // Knowing what is on screen is enough; static scenes survive 0.5fps
+      return { model: 'gemini-flash-latest', mediaResolution: 'MEDIA_RESOLUTION_LOW', fps: 0.5 };
+    case 'lecture_notes':
+      // Only needs to catch the moment a slide changes
+      return { model: 'gemini-flash-latest', mediaResolution: 'MEDIA_RESOLUTION_LOW', fps: 1 };
+    case 'form_coaching':
+      // Joint angles live in single frames. Decimate here and the conclusion changes.
+      return { model: 'gemini-pro-latest', mediaResolution: 'MEDIA_RESOLUTION_MEDIUM', fps: 4 };
+  }
+}
+
+export async function analyze(
+  fileUri: string,
+  intent: Intent,
+  clip: { startSec?: number; endSec?: number },
+  env: Env
+) {
+  const plan = planFor(intent);
+
+  const body = {
+    contents: [
+      {
+        parts: [
+          {
+            fileData: { fileUri, mimeType: 'video/mp4' },
+            videoMetadata: {
+              fps: plan.fps,
+              ...(clip.startSec !== undefined && { startOffset: `${clip.startSec}s` }),
+              ...(clip.endSec !== undefined && { endOffset: `${clip.endSec}s` }),
+            },
+          },
+          { text: PROMPTS[intent] },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 2048,
+      mediaResolution: plan.mediaResolution,
+    },
+  };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${plan.model}:generateContent?key=${env.GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  return res.json();
+}
+```
+
+Notice that `planFor` branches on intent rather than duration. That was a deliberate reversal.
+
+I used to decide by length: under 30 seconds, analyze precisely; over three minutes, go coarse. But looking at a five-second swing coarsely tells you nothing, and studying a ten-minute lecture in high resolution adds nothing either. Length drives the bill; it has no bearing on the precision the task needs. Confuse the two and you overpay on short clips while missing the point on long ones.
+
+Clipping earned its keep immediately. A swing analysis really only needs about two seconds. Let the user record thirty and cut the range server-side: pulling the relevant window at 4fps came out cheaper than scanning the whole thing at 1fps, and more accurate.
+
+For the broader cost picture, [How I Cut My Rork App's AI Costs from $350 to $35/Month](/articles/rork-dev/rork-cloudflare-ai-gateway-cost-optimization-guide) covers the caching layer, and [When Your Rork Hybrid AI Quietly Drifts to the Cloud](/articles/rork-ai/rork-hybrid-ai-router-silent-cloud-drift-cost-regression-instrumentation-field-notes) covers routing drift.
+
+## What was left after the rewiring
+
+Same three-minute 720p clip, measured before and after.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Worker relay</th><th>Direct from device</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Upload success rate (3 concurrent)</td><td>62%</td><td>100%</td></tr>
+    <tr><td>Pick to analysis start</td><td>~71s</td><td>~44s</td></tr>
+    <tr><td>Worker CPU time per video</td><td>~3,900ms</td><td>~12ms</td></tr>
+    <tr><td>Largest workable file</td><td>~60MB in practice</td><td>2GB (Files API cap)</td></tr>
+    <tr><td>Progress reporting</td><td>Stalls after relay</td><td>Continuous</td></tr>
+  </tbody>
+</table>
+
+The CPU time going from ~3,900ms to ~12ms is the number that settled it for me. Issuing a destination is not much work. Which means that for every video, the old design spent nearly four seconds carrying bytes without making a single decision about them.
+
+There were losses too, and they belong in the record.
+
+With video no longer crossing the Worker, I cannot inspect it server-side anymore. Things I could have rejected by reading the bytes now go through. For now I accept that. As a solo indie developer, detecting bad input from the analysis output is more realistic than running content inspection on a server I do not want to operate. For other subject matter, that trade would not hold.
+
+The other loss: low media resolution stops reading fine print. On lecture slides it caught the body text and dropped the footnotes. Fine for summaries, disqualifying if you promise a transcript of the whiteboard. The 3x discount is charging you for something.
+
+## Ask whether the video needs to pass through at all
+
+If I were adding video analysis to a Rork app today, the first thing I wrote would not be the relay handler. It would be a one-sentence answer to "what is this server protecting?"
+
+For me the answer was the API key. That was the entire list. Routing video through a Worker to protect a key was like rerouting a delivery truck through my living room because that is where I keep the spare key.
+
+If you have this running already, pull up your Worker logs and look at CPU time for a single upload. If it reads in the thousands of milliseconds, most of those milliseconds are probably spent making no decisions at all.
+
+For handling footage straight from the camera, [Rork × Vision Camera v4](/articles/rork-dev/rork-vision-camera-v4-frame-processor-production-guide) covers that side, and [LLM Streaming in Rork Apps](/articles/rork-dev/rork-llm-streaming-sse-realtime-ai-response-complete-guide) covers showing results before they finish.
+
+I resent that three-minute video more times than I want to admit before the path made sense. If it saves someone else the same detour, it was worth writing down.

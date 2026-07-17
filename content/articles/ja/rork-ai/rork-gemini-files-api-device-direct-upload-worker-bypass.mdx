@@ -1,0 +1,444 @@
+---
+title: "3分の動画だけが失敗する — Rork の動画解析をワーカー経由から端末直送に引き直す"
+slug: "rork-gemini-files-api-device-direct-upload-worker-bypass"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-07-17T14:00"
+author: "Rork Lab"
+description: "Gemini Files API に動画を渡す経路を、Cloudflare Workers 中継から端末直送へ引き直した記録です。128MB のメモリ上限に当たる仕組み、resumable upload の発行だけをサーバーに残す実装、解像度とフレームレートで請求を決める判断までをまとめます。"
+tags: ["Rork", "Gemini", "Files API", "動画解析", "Cloudflare Workers", "Expo", "個人開発"]
+highlights:
+  - "動画を Worker の arrayBuffer に載せた瞬間に 128MB のメモリ上限へ当たる仕組みと、端末直送に切り替えるまでの経路設計"
+  - "resumable upload の開始だけをサーバーに残し、API キーを配らずに端末から直接送る Worker / Expo 両側の実装コード"
+  - "media_resolution を low に落とし fps を下げることで、動画1秒あたりのトークンを約300から約100へ削る判断基準"
+---
+
+手元の iPhone で撮った 28 秒のテスト動画は、何度送っても通りました。解析結果も期待どおりに返ってきます。
+
+ところが友人に頼んで撮ってもらった 3 分の動画を送った途端、アップロードが返ってこなくなりました。エラーメッセージらしいメッセージもなく、しばらく待つと 500 が返るだけです。
+
+最初はモデル側の問題を疑いました。動画が長すぎるのか、フォーマットが違うのか。ログを追って分かったのは、そもそも Gemini に届く前の段階で落ちていたということです。落ちていたのは推論ではなく、動画の通り道でした。
+
+## 28 秒は通るのに、3 分で止まる
+
+当時の構成は、素直といえば素直なものでした。
+
+Expo アプリで動画を選び、Cloudflare Workers に multipart で送り、Worker が Gemini の Files API へ中継します。API キーをアプリに埋め込みたくなかったので、サーバーを1枚挟んでいたわけです。個人開発でバックエンドを持たずに済ませたいとき、Workers は魅力的な選択肢でした。
+
+Worker 側のコードは、こんな形をしていました。
+
+```typescript
+// ❌ 当時の実装 — 動画がまるごと Worker のメモリに載る
+async function handleVideoUpload(request: Request, env: Env): Promise<Response> {
+  const formData = await request.formData();
+  const videoFile = formData.get('video') as File;
+
+  // ここで動画の全バイトが Worker のヒープに展開される
+  const arrayBuffer = await videoFile.arrayBuffer();
+
+  const initResponse = await fetch(`${UPLOAD_URL}?key=${env.GEMINI_API_KEY}`, {
+    method: 'POST',
+    headers: {
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': arrayBuffer.byteLength.toString(),
+      'X-Goog-Upload-Header-Content-Type': videoFile.type,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ file: { display_name: videoFile.name } }),
+  });
+
+  const uploadUri = initResponse.headers.get('X-Goog-Upload-URL');
+
+  // 受け取った全バイトを、そのまま Google へ送り直す
+  return fetch(uploadUri!, {
+    method: 'POST',
+    headers: {
+      'Content-Length': arrayBuffer.byteLength.toString(),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: arrayBuffer,
+  });
+}
+```
+
+`await videoFile.arrayBuffer()` の一行が、すべてでした。
+
+## 動画がワーカーを通り抜けていた
+
+Cloudflare Workers は、1 つの isolate あたり 128MB のメモリを上限としています。これは JavaScript のヒープと WebAssembly の確保分を合わせた値で、有料プランに上げても増えません。しかも上限は「1リクエストあたり」ではなく「isolate あたり」です。
+
+一方で、リクエストボディのサイズ上限は Free プランで 100MB あります。つまり「100MB の動画は受け取れてしまうが、それをメモリに展開する余地はない」という構造になっていました。
+
+iPhone で撮った動画のサイズを測ってみると、こうです。
+
+<table>
+  <thead>
+    <tr><th>撮影設定</th><th>長さ</th><th>実測サイズ</th><th>arrayBuffer 後の挙動</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1080p / 30fps</td><td>28秒</td><td>約 52MB</td><td>通る</td></tr>
+    <tr><td>1080p / 30fps</td><td>1分10秒</td><td>約 130MB</td><td>413 が返る</td></tr>
+    <tr><td>720p / 30fps</td><td>3分</td><td>約 96MB</td><td>断続的に 500</td></tr>
+    <tr><td>4K / 60fps</td><td>30秒</td><td>約 190MB</td><td>413 が返る</td></tr>
+  </tbody>
+</table>
+
+3 分の 720p が最も厄介でした。96MB はボディ上限の 100MB を下回るので受理されます。けれど 96MB をヒープに載せた時点で、128MB のうち大半を1本の動画が占めます。同じ isolate に別のリクエストが相乗りしていれば、そこで超えます。
+
+だから「断続的に」失敗していたのです。手元で1人で試している間は通り、複数人が同時に触ると落ちる。再現条件が掴めなかった理由がここにありました。
+
+さらに、通ったところで無駄が残ります。動画は端末から Cloudflare へ上り、Cloudflare から Google へもう一度上る。同じバイト列が 2 回ネットワークを流れ、その往復のあいだ Worker の CPU 時間を占有し続けます。中継する意味があったのは API キーを隠すことだけでした。
+
+キーを隠したいだけなら、動画そのものを通す必要はありません。
+
+## 署名済みのアップロード先だけを配る
+
+Files API の resumable upload は、2 段構えになっています。
+
+第1段の `start` コマンドでメタデータだけを送ると、レスポンスヘッダに `X-Goog-Upload-URL` が返ります。第2段では、その URL に対してファイル本体を送ります。
+
+ここで効いてくるのが、この URL の性質です。返ってくるアップロード先には、そのセッション固有のトークンが URL 自体に埋め込まれています。第2段のリクエストに API キーは要りません。
+
+つまり、第1段だけをサーバーに残せば十分です。キーはサーバーに留まり、端末が受け取るのは1回きりの宛先だけ。動画は Cloudflare を経由せず、端末から Google へ直接上がります。
+
+```typescript
+// ✅ Worker は「宛先の発行」だけを担う。動画のバイトは一切通らない
+interface Env {
+  GEMINI_API_KEY: string;
+  SESSIONS: KVNamespace;
+}
+
+const MAX_BYTES = 2 * 1024 * 1024 * 1024; // Files API の1ファイル上限は 2GB
+
+async function issueUploadUrl(request: Request, env: Env): Promise<Response> {
+  const { sizeBytes, mimeType, userId } = await request.json<{
+    sizeBytes: number;
+    mimeType: string;
+    userId: string;
+  }>();
+
+  // サイズと形式は「宛先を出す前」に弾く。上げきってから断るのは端末の帯域を捨てる行為
+  if (!Number.isInteger(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_BYTES) {
+    return Response.json({ error: 'invalid_size' }, { status: 400 });
+  }
+  if (!['video/mp4', 'video/quicktime'].includes(mimeType)) {
+    return Response.json({ error: 'unsupported_type' }, { status: 415 });
+  }
+
+  // 宛先の発行そのものがコストになるので、ユーザー単位で回数を絞る
+  const quotaKey = `upload_quota:${userId}:${new Date().toISOString().slice(0, 10)}`;
+  const used = Number((await env.SESSIONS.get(quotaKey)) ?? '0');
+  if (used >= 20) {
+    return Response.json({ error: 'daily_quota_exceeded' }, { status: 429 });
+  }
+
+  const initResponse = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${env.GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(sizeBytes),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ file: { display_name: `v_${Date.now()}` } }),
+    }
+  );
+
+  const uploadUrl = initResponse.headers.get('X-Goog-Upload-URL');
+  if (!uploadUrl) {
+    return Response.json({ error: 'init_failed' }, { status: 502 });
+  }
+
+  await env.SESSIONS.put(quotaKey, String(used + 1), { expirationTtl: 86400 });
+
+  // この URL にはセッショントークンが埋まっている。API キーは渡らない
+  return Response.json({ uploadUrl, sizeBytes });
+}
+```
+
+`sizeBytes` を端末から受け取っている点に、少し引っかかるかもしれません。自己申告の値です。
+
+ただ、ここで嘘をつかれても被害は端末側に返ります。申告より大きいバイト列を送れば Google 側で拒否され、小さければ finalize が成立しません。サーバーが守りたいのはキーと発行回数であって、バイト数の正しさではありません。私はこの割り切りで十分だと考えています。
+
+日次のクォータをユーザー単位で持たせているのは、宛先の発行が実質的に「解析1回分の予約」だからです。実行時のコスト上限そのものについては、[AI 機能のコスト上限を実行時に強制する設計](/articles/rork-dev/rork-ai-runtime-budget-enforcement-architecture) で三層に分けて書いています。
+
+## 端末から直接送る
+
+アプリ側は、発行された宛先へ動画を送るだけになります。
+
+React Native でここを書くとき、最初につまずくのが `FormData` です。ブラウザの感覚で `Blob` を渡そうとすると動きません。React Native では `uri` / `type` / `name` を持つオブジェクトを渡します。
+
+ただ今回は multipart ですらありません。resumable upload の第2段は、ボディに生のバイト列を置くだけです。そして Expo の `FileSystem.uploadAsync` は、ファイルパスを渡せばストリームで送ってくれます。動画を JavaScript のメモリに読み込まずに済むのは、端末側でも同じく重要です。
+
+```typescript
+// app/lib/uploadVideo.ts
+import * as FileSystem from 'expo-file-system';
+import * as ImagePicker from 'expo-image-picker';
+
+const API_BASE = 'https://your-worker.example.workers.dev';
+
+export type UploadResult = { fileUri: string; sizeBytes: number };
+
+export async function pickAndUploadVideo(
+  userId: string,
+  onProgress?: (ratio: number) => void
+): Promise<UploadResult | null> {
+  const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+  if (!permission.granted) return null;
+
+  const picked = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ['videos'],
+    quality: 1,
+  });
+  if (picked.canceled || !picked.assets[0]) return null;
+
+  const asset = picked.assets[0];
+  const info = await FileSystem.getInfoAsync(asset.uri);
+  if (!info.exists) return null;
+
+  const sizeBytes = info.size ?? 0;
+  const mimeType = asset.mimeType ?? 'video/mp4';
+
+  // Step 1: 宛先だけをサーバーからもらう
+  const issued = await fetch(`${API_BASE}/api/upload-url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sizeBytes, mimeType, userId }),
+  });
+  if (!issued.ok) {
+    const { error } = await issued.json();
+    throw new Error(`宛先の発行に失敗しました (${error})`);
+  }
+  const { uploadUrl } = await issued.json();
+
+  // Step 2: 端末から Google へ直接送る。Worker は経由しない
+  const task = FileSystem.createUploadTask(
+    uploadUrl,
+    asset.uri,
+    {
+      httpMethod: 'POST',
+      uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+      headers: {
+        'Content-Length': String(sizeBytes),
+        'X-Goog-Upload-Offset': '0',
+        'X-Goog-Upload-Command': 'upload, finalize',
+      },
+    },
+    (p) => onProgress?.(p.totalBytesSent / p.totalBytesExpectedToSend)
+  );
+
+  const response = await task.uploadAsync();
+  if (!response || response.status >= 300) {
+    throw new Error(`アップロードに失敗しました (${response?.status})`);
+  }
+
+  const body = JSON.parse(response.body) as {
+    file: { uri: string; state: string };
+  };
+  return { fileUri: body.file.uri, sizeBytes };
+}
+```
+
+`BINARY_CONTENT` を選んでいるのが要点です。`MULTIPART` にすると境界文字列とヘッダが本体を包んでしまい、Google 側は動画として解釈できません。ここは黙って失敗するので、気づくまで時間を取られました。
+
+進捗コールバックが素直に取れるのも、直送に変えて得られた副産物でした。中継していた頃は、Worker に送り終えた時点で進捗が 100% になってしまい、そこから Google への転送が終わるまでユーザーには何も見えませんでした。3 分の動画で 40 秒近く「完了したのに進まない」時間が生まれていたわけです。今は最後の1バイトまで実際の進捗が出ます。
+
+## ACTIVE を待つ時間は、動画の長さに比例する
+
+アップロードが完了しても、まだ解析は投げられません。Files API はアップロード直後のファイルを `PROCESSING` として扱い、`ACTIVE` になるまで `generateContent` から参照できません。
+
+元の実装では、ここを 2 秒間隔・最大 10 回の固定ループで待っていました。20 秒です。
+
+28 秒の動画なら十分でした。3 分の動画では足りません。これも「短い動画では通る」現象の一因になっていました。固定ループは、短い動画で成功体験を作り、長い動画で静かに崩れます。
+
+待ち時間は動画の長さに応じて伸びるので、上限も動画の長さから決めるのが素直です。
+
+```typescript
+// workers/src/waitForActive.ts
+type FileState = 'PROCESSING' | 'ACTIVE' | 'FAILED';
+
+export async function waitForActive(
+  fileName: string,
+  durationSec: number,
+  env: Env
+): Promise<void> {
+  // 実測では概ね「動画長の 1/6 前後」で ACTIVE になった。3倍の余裕を持たせ、下限は 15 秒
+  const budgetMs = Math.max(15_000, Math.ceil(durationSec / 6) * 3 * 1000);
+  const deadline = Date.now() + budgetMs;
+
+  let waitMs = 1_000;
+  while (Date.now() < deadline) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${env.GEMINI_API_KEY}`
+    );
+    const { state } = await res.json<{ state: FileState }>();
+
+    if (state === 'ACTIVE') return;
+    if (state === 'FAILED') throw new Error('file_processing_failed');
+
+    await new Promise((r) => setTimeout(r, waitMs));
+    waitMs = Math.min(waitMs * 1.6, 8_000); // 指数バックオフ・上限8秒
+  }
+  throw new Error(`file_not_active_within_${budgetMs}ms`);
+}
+```
+
+固定間隔をやめて指数バックオフにしたのは、コストの話でもあります。ポーリング自体は課金されませんが、Worker の CPU 時間とサブリクエスト数は消費します。1 秒間隔で 3 分待てば 180 回叩くことになり、Workers のサブリクエスト上限に近づきます。1 秒から始めて 8 秒で頭打ちにすると、3 分の待機でも 30 回程度に収まりました。
+
+`FAILED` を明示的に見ているのも意図があります。破損した動画や未対応コーデックはここで `FAILED` になりますが、状態を見ずにタイムアウトだけで扱うと「重い動画」と「壊れた動画」が同じエラーとしてユーザーに出ます。前者は待てば通る、後者は何度待っても通りません。この2つを混ぜると、リトライボタンが無限に押される画面ができあがります。
+
+## file_uri は 48 時間で消える
+
+Files API にアップロードしたファイルは 48 時間で自動的に削除されます。保存されている間もダウンロードはできず、参照できるのはメタデータだけです。
+
+この仕様を、最初は軽く見ていました。解析はアップロード直後に走るのだから、48 時間もあれば十分だと。
+
+問題が出たのは「もう一度解析する」機能を足したときです。ユーザーが解析結果の画面を開き直して、別の観点で問い直せるようにしたかった。素直に `fileUri` を端末に保存して再利用しようとしたところ、翌日に開いた履歴からは 403 が返るようになりました。
+
+`fileUri` は、恒久的な識別子ではありません。48 時間の有効期限を持つ一時的な参照です。ここを混同すると、リリース直後は問題なく、2 日目からサポート問い合わせが増える、という嫌な壊れ方をします。
+
+対処としては、保存するものを分けました。
+
+<table>
+  <thead>
+    <tr><th>保存するもの</th><th>置き場所</th><th>寿命</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>解析結果のテキスト</td><td>端末 + サーバー</td><td>恒久</td><td>ユーザーが本当に欲しいのはこれ</td></tr>
+    <tr><td>動画のローカル URI</td><td>端末のみ</td><td>ユーザーが消すまで</td><td>再アップロードの素になる</td></tr>
+    <tr><td>fileUri</td><td>KV</td><td>47時間で失効</td><td>期限内の追加質問だけに使う</td></tr>
+  </tbody>
+</table>
+
+KV の TTL を 48 時間ではなく 47 時間にしているのは、境界で「KV には残っているが Google 側では消えている」時間帯を作らないためです。1 時間分は捨てて、失効の判定を KV 側に寄せました。存在しないものを取りに行って 403 を受けるより、最初から無いことにするほうが分岐が減ります。
+
+期限内なら `fileUri` を使い回せるので、追加の質問はアップロードなしで投げられます。期限を過ぎていれば、端末に残っている動画から静かに上げ直す。ユーザーから見れば、どちらも「もう一度聞いた」だけです。
+
+## 解像度とフレームレートで、請求は決まる
+
+経路の話が片づくと、次はコストです。
+
+動画のトークン消費は、素朴に思っていたよりずっと分かりやすい構造をしていました。既定では 1 秒あたり 1 フレームがサンプリングされ、動画 1 秒あたり約 300 トークンを消費します。`media_resolution` を `low` にすると 1 フレーム 66 トークンになり、音声の 32 トークン毎秒などと合わせて、動画 1 秒あたり約 100 トークンまで落ちます。
+
+3 倍の差です。そして 1M コンテキストのモデルなら、既定で 1 時間、`low` なら 3 時間の動画を扱えます。
+
+自前でフレームを間引く実装を書きかけていたのですが、その必要はありませんでした。`videoMetadata` に `fps` を渡せばサンプリング間隔は API 側で変えられますし、`startOffset` と `endOffset` で区間を切り出すこともできます。
+
+```typescript
+// workers/src/analyze.ts
+type Intent = 'quick_summary' | 'form_coaching' | 'lecture_notes';
+
+interface VideoPlan {
+  model: string;
+  mediaResolution: 'MEDIA_RESOLUTION_LOW' | 'MEDIA_RESOLUTION_MEDIUM';
+  fps: number;
+}
+
+// 「何を見たいか」で解像度とフレームレートを決める。動画の長さでは決めない
+function planFor(intent: Intent): VideoPlan {
+  switch (intent) {
+    case 'quick_summary':
+      // 何が映っているか分かればよい。静的な場面が続くので 0.5fps で足りる
+      return { model: 'gemini-flash-latest', mediaResolution: 'MEDIA_RESOLUTION_LOW', fps: 0.5 };
+    case 'lecture_notes':
+      // スライドが切り替わる瞬間を拾えればよい
+      return { model: 'gemini-flash-latest', mediaResolution: 'MEDIA_RESOLUTION_LOW', fps: 1 };
+    case 'form_coaching':
+      // 一瞬の関節角度を見る。ここだけは間引くと結論が変わる
+      return { model: 'gemini-pro-latest', mediaResolution: 'MEDIA_RESOLUTION_MEDIUM', fps: 4 };
+  }
+}
+
+export async function analyze(
+  fileUri: string,
+  intent: Intent,
+  clip: { startSec?: number; endSec?: number },
+  env: Env
+) {
+  const plan = planFor(intent);
+
+  const body = {
+    contents: [
+      {
+        parts: [
+          {
+            fileData: { fileUri, mimeType: 'video/mp4' },
+            videoMetadata: {
+              fps: plan.fps,
+              ...(clip.startSec !== undefined && { startOffset: `${clip.startSec}s` }),
+              ...(clip.endSec !== undefined && { endOffset: `${clip.endSec}s` }),
+            },
+          },
+          { text: PROMPTS[intent] },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 2048,
+      mediaResolution: plan.mediaResolution,
+    },
+  };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${plan.model}:generateContent?key=${env.GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  return res.json();
+}
+```
+
+`planFor` が動画の長さではなく「何を見たいか」で分岐している点は、意識して変えたところです。
+
+以前は「30 秒以下なら精密に、3 分超えなら粗く」と長さで決めていました。けれど 5 秒のスイング動画を粗く見ても意味がなく、10 分の講義を精密に見ても得るものは増えません。長さは請求額に効くだけで、必要な精度とは関係がありません。ここを取り違えていると、短い動画に過剰な精度を払い、長い動画で肝心なものを取りこぼします。
+
+区間指定を足したのは、実利がありました。スイング解析で本当に見たいのは 2 秒ほどです。ユーザーには 30 秒撮ってもらい、こちらで区間を切る。3 分の練習動画から該当箇所だけを 4fps で見れば、全体を 1fps で見るより安く、かつ精度は上がりました。
+
+コスト側の設計をもう少し広く見たい方は、[Rork アプリの AI コストを月 ¥50,000 から ¥5,000 に削減させた Cloudflare AI Gateway 設計](/articles/rork-dev/rork-cloudflare-ai-gateway-cost-optimization-guide) でキャッシュ層の話を書いています。経路が意図せずクラウドへ偏る現象については [Rork のハイブリッドAIが知らぬ間にクラウドへ偏って課金が膨らんでいたとき](/articles/rork-ai/rork-hybrid-ai-router-silent-cloud-drift-cost-regression-instrumentation-field-notes) が近い話です。
+
+## 引き直したあとに残ったもの
+
+同じ 3 分・720p の動画で、前後を測り直しました。
+
+<table>
+  <thead>
+    <tr><th>指標</th><th>Worker 中継</th><th>端末直送</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>アップロード成功率（同時3人）</td><td>62%</td><td>100%</td></tr>
+    <tr><td>選択から解析開始まで</td><td>約 71 秒</td><td>約 44 秒</td></tr>
+    <tr><td>Worker の CPU 時間 / 1本</td><td>約 3,900ms</td><td>約 12ms</td></tr>
+    <tr><td>扱える最大サイズ</td><td>実質 60MB 前後</td><td>2GB（Files API 上限）</td></tr>
+    <tr><td>進捗表示</td><td>中継後に停止</td><td>最後まで連続</td></tr>
+  </tbody>
+</table>
+
+Worker の CPU 時間が 3,900ms から 12ms になったのが、いちばん納得のいく数字でした。宛先を発行するだけなら、それ以上の仕事はありません。動画を通していた頃は、Worker が何の判断もしないまま 4 秒近くバイト列を運んでいたことになります。
+
+一方で、正直に書いておくと、失ったものもあります。
+
+動画が Worker を通らなくなったので、サーバー側で動画そのものを検査できなくなりました。以前ならバイト列を見て弾けたはずのものが、今は通ります。今のところ、これは受け入れています。個人開発のアプリで、動画の中身をサーバーで検査する仕組みを持つより、解析結果側で不適切な入力を検出するほうが現実的だと判断しました。ただ、扱う題材によっては、この割り切りは成立しないはずです。
+
+もうひとつ。`media_resolution` を `low` に倒すと、細かい文字が読めなくなります。講義動画のスライドで、本文は拾えても脚注は落ちました。要約が目的なら問題ありません。ただ、板書の書き起こしを謳うなら `low` は選べません。文字を読ませる機能を選ぶ場合は、素直に既定の解像度をお勧めします。3 倍の差には、それだけの理由があります。
+
+## 動画を通す必要が、本当にあるか
+
+もし今、動画解析を Rork アプリに足すなら、最初に書くのは Worker の中継処理ではありません。「このサーバーは何を守っているのか」を1行で言えるかどうかを先に確かめます。
+
+私の場合、答えは「API キー」でした。それだけでした。キーを守るために動画を通していたのは、鍵を隠すために荷物ごと自分の家を経由させていたようなものです。
+
+手元に動くコードがあるなら、Worker のログで CPU 時間を1本分だけ見てみてください。数千 ms が出ているなら、そのミリ秒のほとんどは、何の判断もしていない時間かもしれません。
+
+カメラから撮った動画をその場で扱う設計は [Rork × Vision Camera v4](/articles/rork-dev/rork-vision-camera-v4-frame-processor-production-guide) に、解析結果を待たせずに出す実装は [Rork アプリで LLM ストリーミングを実装する](/articles/rork-dev/rork-llm-streaming-sse-realtime-ai-response-complete-guide) にまとめています。
+
+私自身、この経路にたどり着くまでに 3 分の動画を何十回と送り直しました。同じところで止まっている方の遠回りが、少しでも短くなれば嬉しいです。
