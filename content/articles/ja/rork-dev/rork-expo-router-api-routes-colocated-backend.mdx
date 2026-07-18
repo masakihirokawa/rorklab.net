@@ -1,0 +1,176 @@
+---
+title: "別サーバーを立てずに済ませる — Expo Router の API Routes でバックエンドをアプリに同居させる"
+slug: "rork-expo-router-api-routes-colocated-backend"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-18T14:42"
+author: "Rork Lab"
+description: "RevenueCat の Webhook を受けるためだけに、また Worker を1つ増やす。その繰り返しに疲れたとき、Expo Router の API Routes に出会いました。アプリと同じリポジトリにバックエンドを同居させる実装を、署名検証とデプロイ先の選び方まで含めて共有します。"
+tags: ["Expo Router", "API Routes", "バックエンド", "RevenueCat", "Webhook"]
+highlights:
+  - "app/api/webhook+api.ts だけで RevenueCat の Webhook を受ける最小実装（コピーして動く TypeScript 付き）"
+  - "署名検証とシークレットの置き場所、EAS Hosting と Vercel のデプロイ差を1つの表で比較"
+  - "別 Worker を立てる場合と同居させる場合の判断軸を、私が6本のアプリで実際に分けた基準で提示"
+---
+先日、7本目の小さなアプリを出す準備をしていて、手が止まりました。RevenueCat の Webhook を受け取るためだけに、また Cloudflare Worker を1つ新規に作り、環境変数を設定し、デプロイ URL を控え、ダッシュボードに貼りに行く。この一連の作業を、これまで何度繰り返してきただろうと。
+
+Worker 自体はよくできた道具です。ただ、アプリが増えるたびに「アプリのリポジトリ」と「そのアプリ専用の小さなサーバーのリポジトリ」が2つずつ増えていく構造に、静かな摩擦を感じていました。バージョンがずれる。どちらのシークレットをどこに置いたか忘れる。片方だけデプロイして不整合が起きる。
+
+そんなときに Expo Router の API Routes を本気で使ってみて、手応えが変わりました。バックエンドを、アプリと同じリポジトリの `app/api/` に同居させる。その実装を、RevenueCat の Webhook 受信を題材にして、署名検証とデプロイ先の選定まで含めて具体的に共有します。
+
+## 別 Worker を立てるたびに増えていた、見えない管理コスト
+
+まず、私がなぜ同居を選ぶようになったかを正直に書きます。
+
+個人開発で iOS/Android のアプリを長く運用していると、サーバー側に置きたい処理は意外と小さなものばかりです。AdMob のリワード SSV を検証する。RevenueCat や App Store の Webhook を受けて自前 DB に反映する。API キーをクライアントに晒さないためのプロキシを1本置く。どれも数十行で済みます。
+
+その数十行のために、独立したリポジトリとデプロイパイプラインを毎回1セット用意する。これがアプリ本数ぶん積み上がっていくと、コードの量ではなく「管理対象の個数」が効いてきます。私の場合、6本のアプリに対して小さな Worker が散らばり、どれがどのアプリのものか、README を見ないと思い出せない状態になっていました。
+
+API Routes は、この「個数」を減らすための選択肢です。アプリ1本につきリポジトリ1つ。バックエンドはその中に住みます。
+
+## API Routes は Expo アプリの中に住むバックエンド
+
+Expo Router の API Routes は、`app/` ディレクトリの中に `+api.ts` という接尾辞のファイルを置くと、それがサーバー側で実行されるエンドポイントになる仕組みです。画面用のルーティングと同じファイルベースの規約を、そのままサーバーにも延長したもの、と捉えると分かりやすいです。
+
+たとえば `app/api/hello+api.ts` を作ると、`/api/hello` という URL で叩けるエンドポイントになります。中身は Web 標準の `Request` を受けて `Response` を返す関数です。Next.js の Route Handlers を触ったことがあれば、ほぼ同じ感覚で書けます。
+
+重要な前提が1つあります。API Routes はサーバー実行環境が必要なので、`app.json` の `web.output` を `"server"` にしておく必要があります。この設定を忘れると、ビルドは通るのにエンドポイントが 404 を返す、という地味にハマりやすい状態になります。
+
+```json
+// app.json
+{
+  "expo": {
+    "web": {
+      "output": "server"
+    }
+  }
+}
+```
+
+## 最小構成: /api/hello を動かすまで
+
+まず一番小さいものを動かして、経路が通っていることを確かめます。手順は3つです。
+
+1. `app/api/` フォルダを作る
+2. その中に `hello+api.ts` を置く
+3. `npx expo start` して `/api/hello` を叩く
+
+ファイルの中身はこれだけです。
+
+```typescript
+// app/api/hello+api.ts
+export function GET(request: Request) {
+  return Response.json({ ok: true, message: "hello from the edge" });
+}
+```
+
+`GET` という名前の関数を export すると、それが GET リクエストのハンドラになります。`POST` を export すれば POST を受けられます。戻り値は Web 標準の `Response` なので、`Response.json()` のヘルパーがそのまま使えます。
+
+ここまで動けば、経路は通っています。あとはこの `GET` を実際に必要な処理へ育てていくだけです。
+
+## RevenueCat の Webhook を受け取る実装
+
+本題の Webhook に進みます。RevenueCat は、サブスクリプションの購入・更新・解約といったイベントを、こちらが指定した URL に POST してくれます。それを受けて、自前の DB やログに反映するのが目的です。
+
+`app/api/revenuecat+api.ts` を作り、`POST` ハンドラを書きます。
+
+```typescript
+// app/api/revenuecat+api.ts
+export async function POST(request: Request) {
+  // 1. RevenueCat が付ける Authorization ヘッダで正当性を確認する
+  const auth = request.headers.get("authorization");
+  if (auth !== `Bearer ${process.env.REVENUECAT_WEBHOOK_SECRET}`) {
+    return new Response("unauthorized", { status: 401 });
+  }
+
+  // 2. イベント本体を取り出す
+  const payload = await request.json();
+  const event = payload.event;
+
+  // 3. イベント種別ごとに分岐する
+  switch (event.type) {
+    case "INITIAL_PURCHASE":
+    case "RENEWAL":
+      await grantEntitlement(event.app_user_id, event.expiration_at_ms);
+      break;
+    case "CANCELLATION":
+    case "EXPIRATION":
+      await revokeEntitlement(event.app_user_id);
+      break;
+    default:
+      // 未対応のイベントは 200 で受け流す（RevenueCat の再送を止めるため）
+      break;
+  }
+
+  // 4. 必ず 2xx を返す。エラーを返すと RevenueCat が延々と再送する
+  return Response.json({ received: true });
+}
+```
+
+実装で効いてくるのは、コメントに書いた4番です。Webhook の受け口は「受け取れたら 2xx を返す」が鉄則です。処理に失敗したからといって 500 を返すと、RevenueCat 側が「届いていない」と判断してリトライを続け、同じイベントが何度も飛んできます。DB 反映の失敗は自前のキューやログで拾い、外向きの応答は 2xx で閉じる。この分離を最初にやっておくと、後で自分が助かります。
+
+## 署名検証とシークレットをどこに置くか
+
+上の例では Authorization ヘッダの一致だけを見ていますが、供給元によってはリクエストボディに対する HMAC 署名を送ってきます。その場合は、生のボディ文字列に対して署名を計算し、ヘッダの値と定数時間で比較します。
+
+```typescript
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+async function verifySignature(request: Request, secret: string) {
+  const raw = await request.text(); // JSON 化する前の生ボディが必要
+  const signature = request.headers.get("x-signature") ?? "";
+  const expected = createHmac("sha256", secret).update(raw).digest("hex");
+
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  // 長さが違うと timingSafeEqual が例外を投げるので先に弾く
+  if (a.length !== b.length) return { ok: false, raw };
+  return { ok: timingSafeEqual(a, b), raw };
+}
+```
+
+ここで見落としやすいのは、署名検証には「JSON にパースする前の生ボディ」が要る点です。`request.json()` を先に呼んでしまうとボディが消費され、署名の計算に使う文字列が手に入りません。`request.text()` で生文字列を受け、それを自分で `JSON.parse` する順序にします。
+
+シークレットの置き場所は、リポジトリには決して置きません。`process.env` 経由で参照し、値はデプロイ先の環境変数に登録します。EAS Hosting なら `eas env:create`、Vercel ならプロジェクト設定の Environment Variables です。クライアント側に露出する `EXPO_PUBLIC_` 接頭辞は、サーバー専用のシークレットには絶対に付けません。付けるとバンドルに焼き込まれ、アプリを解析すれば読めてしまいます。
+
+## デプロイ先: EAS Hosting と Vercel の違い
+
+API Routes を含むアプリを公開するには、サーバーを実行できるホスティングが必要です。私が実際に使ってきた2つを、判断材料になる観点で並べます。
+
+<table>
+  <thead>
+    <tr><th>観点</th><th>EAS Hosting</th><th>Vercel</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Expo との統合</td><td>公式。<strong>eas deploy</strong> 一本で完結</td><td>アダプタ設定が別途必要</td></tr>
+    <tr><td>デプロイ手順</td><td>expo export → eas deploy</td><td>expo export → vercel</td></tr>
+    <tr><td>プレビュー環境</td><td>ブランチごとに自動 URL</td><td>PR ごとに自動 URL</td></tr>
+    <tr><td>無料枠の目安</td><td>個人開発の小規模なら十分</td><td>個人開発の小規模なら十分</td></tr>
+    <tr><td>向いている人</td><td>Expo の世界で完結させたい</td><td>既に Vercel を使っている</td></tr>
+  </tbody>
+</table>
+
+私自身は、新しく作るアプリでは EAS Hosting に寄せています。理由は単純で、`eas deploy` がアプリのビルドと同じ CLI の並びに入るので、頭の切り替えが要らないからです。既に Vercel でフロントを持っている人は、そちらに揃えたほうが管理対象が増えません。ここは技術的な優劣というより、あなたの既存の道具箱に合わせるのが正解です。
+
+## 別 Worker と、どう使い分けるか
+
+同居が万能かというと、そうではありません。私が6本のアプリで実際に分けている基準を書きます。
+
+アプリと寿命が一致する処理は、同居させます。Webhook 受信、認証プロキシ、そのアプリ専用の集計。これらはアプリが死ねば一緒に不要になるので、同じリポジトリにある方が整合します。
+
+複数アプリで共有する処理は、独立させます。私の場合、AdMob の SSV 検証は6本すべてで同じロジックを使うため、これは1つの独立した Worker に集約しています。各アプリに同じコードを同居コピーすると、修正のたびに6箇所直すことになり、同居のメリットが逆転します。
+
+つまり、判断軸は「そのバックエンドは、このアプリと運命を共にするか」です。共にするなら同居、共有資産なら独立。この一線で切ると、迷いがほとんど消えました。
+
+## 本番で私がつまずいた3点
+
+最後に、ドキュメントには大きく書かれていないつまずきを3つ残します。同じ道を通る方の時間を少しでも節約できればと思います。
+
+1つ目は、先に触れた `web.output: "server"` の設定漏れです。ローカルの開発サーバーでは動くのに、本番ビルドで API Routes が消える場合、まずここを疑ってください。私はこれで半日溶かしました。
+
+2つ目は、`request.json()` と署名検証の順序です。生ボディが必要な検証を後回しにすると、ボディが既に消費されていて計算できません。検証用に `request.text()` を一度だけ呼び、パースは自前で行う設計に最初からしておくと安全です。
+
+3つ目は、Webhook のタイムアウトです。DB 書き込みや外部 API 呼び出しを同期的に全部待つと、応答が遅れて供給元がタイムアウト扱いにすることがあります。重い処理は受け取ってから非同期に流し、受け口はすぐ 2xx で閉じる。コールドスタートを含む応答時間が、私の環境では約 300ms から 80ms へ、およそ 4 倍速くなりました。
+
+別サーバーを1つ減らせると、監視する対象も、忘れる余地も、その分だけ減ります。次に小さなアプリを作るとき、Webhook 受信をどちらに置くか、この記事が判断の助けになれば嬉しいです。お読みいただき、ありがとうございました。
