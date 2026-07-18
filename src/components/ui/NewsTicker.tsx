@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "TOOLING — Rorkの開発者向けリポジトリが動き続けています。rork-xcodeが7月16日、rork-deviceが7月15日、rork-plistが7月13日に更新されました",
-    "OPUS46 — RorkでClaude Opus 4.6が稼働しています。Rork MaxはClaude Codeを土台にアプリを組み立てる設計です",
-    "SIM — ブラウザ上で動くクラウドのiOSシミュレータを備え、実機へのインストールは1クリック、App Storeへの提出は2クリックと案内されています",
-    "MAX — Rork MaxはReact Nativeではなく純粋なSwiftを出力します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro、そしてiMessageまでが射程です",
-    "NATIVE — HealthKit、ARKitとLiDAR、NFC、Dynamic Island、Live Activities、Metalによる3D、Core MLのオンデバイス推論まで扱えます",
-    "SEED — RorkはLeft Lane Capitalが主導する1,500万ドルのシードラウンドを実施し、Peak XVとa16z Speedrunが参加しました",
+    "RORKMAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
+    "NATIVE — Rork MaxはAR/LiDARやMetalの3D、ウィジェット、Dynamic Island、Live Activities、HealthKit、HomeKit、NFC、Core MLなど、React Nativeでは届かない機能を解放します",
+    "PUBLISH — 2クリックでのApp Store公開に対応し、生成から公開までの手数が大きく減りました",
+    "SIM — ブラウザ内のストリーミングiOSシミュレータで、XcodeやMacを用意せずに実機に近いApple環境でテストできます",
+    "STANDARD — 標準のRorkは自然言語でアプリを記述すると、React Native（Expo）の動くコードを生成します",
+    "PRICING — 料金は無料で始められ、有料プランは月25ドルから、Rork Maxは月200ドルです",
   ],
   en: [
-    "TOOLING — Rork's developer repos keep moving: rork-xcode was updated on July 16, rork-device on July 15, and rork-plist on July 13",
-    "OPUS46 — Claude Opus 4.6 is live in Rork, and Rork Max is built to assemble apps on top of Claude Code",
-    "SIM — A cloud iOS simulator runs in the browser, with one click to install on a device and two clicks to publish to the App Store",
-    "MAX — Rork Max emits pure Swift rather than React Native, reaching iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and even iMessage",
-    "NATIVE — That opens up HealthKit, ARKit and LiDAR, NFC, Dynamic Island, Live Activities, 3D through Metal, and on-device inference with Core ML",
-    "SEED — Rork raised a $15M seed led by Left Lane Capital, with Peak XV and a16z Speedrun joining the round",
+    "RORKMAX — Rork Max builds native Swift apps instead of React Native, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "NATIVE — Rork Max unlocks capabilities React Native can't reach: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, HomeKit, NFC, and Core ML",
+    "PUBLISH — Two-click App Store publishing cuts the steps between generating an app and shipping it",
+    "SIM — A browser-based streaming iOS simulator lets you test in a real Apple environment without Xcode or a Mac",
+    "STANDARD — Standard Rork turns a plain-English description into working React Native (Expo) code",
+    "PRICING — It's free to start, paid plans begin at $25/month, and Rork Max is $200/month",
   ],
 };
 
