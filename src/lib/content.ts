@@ -63,6 +63,7 @@ export function getArticles(locale: string): ArticleMeta[] {
     description: entry.description || "",
     tags: entry.tags || [],
     premium: entry.premium || false,
+    noindex: entry.noindex || false,
   }));
 }
 
@@ -90,6 +91,7 @@ export function getArticle(
       description: entry.description || "",
       tags: entry.tags || [],
       premium: entry.premium || false,
+      noindex: entry.noindex || false,
       highlights: entry.highlights || undefined,
     },
     content: "",
