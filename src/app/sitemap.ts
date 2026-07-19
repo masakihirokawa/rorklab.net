@@ -79,7 +79,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   }
 
   // Article pages with actual dates and alternates
-  const jaArticles = _jaArts;
+  const jaArticles = _jaArts.filter((a) => !a.noindex);
 
   // --- Deduplicate article lastmod (prevent batch-generation signal) ---
   // Articles sharing the same frontmatter date get incremental minute offsets
