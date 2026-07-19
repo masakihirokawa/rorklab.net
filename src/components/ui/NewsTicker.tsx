@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RORKMAX — Rork MaxはReact NativeではなくネイティブSwiftアプリを生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageに対応します",
-    "NATIVE — Rork MaxはAR/LiDARやMetalの3D、ウィジェット、Dynamic Island、Live Activities、HealthKit、HomeKit、NFC、Core MLなど、React Nativeでは届かない機能を解放します",
-    "PUBLISH — 2クリックでのApp Store公開に対応し、生成から公開までの手数が大きく減りました",
-    "SIM — ブラウザ内のストリーミングiOSシミュレータで、XcodeやMacを用意せずに実機に近いApple環境でテストできます",
-    "STANDARD — 標準のRorkは自然言語でアプリを記述すると、React Native（Expo）の動くコードを生成します",
-    "PRICING — 料金は無料で始められ、有料プランは月25ドルから、Rork Maxは月200ドルです",
+    "MAX — Rork MaxはReact Nativeを介さず純粋なSwiftアプリを生成します。iPhoneからVision Proまで対応し、HealthKitやCore MLなどネイティブ機能にも届きます",
+    "TRIAL — Rork Maxの期間限定無料トライアルが案内されています。月200ドルのプランに費用先払いなしで触れる機会ですので、題材を決めて試すのがおすすめです",
+    "STYLE — 長期利用レビューでは、雛形はAIに生成させ状態管理とデータ層は自分で書く分担が語られています。機能が増えるほどコード構造の把握が効いてきます",
+    "PLAN — 料金選びは「そのプランでリリースまで届くか」で考える視点が示されています。届くなら有料でも安く、届かないなら無料枠でも高くつきます",
+    "REPO — 開発者向けリポジトリの更新が続いています。rork-xcodeやrork-deviceなど、提出と実機まわりの足回りが手入れされています",
+    "MARKET — Gartnerは2026年末までに新規アプリの75%がローコード・ノーコードで作られると予測しています。2020年の25%未満から大きな伸びです",
   ],
   en: [
-    "RORKMAX — Rork Max builds native Swift apps instead of React Native, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "NATIVE — Rork Max unlocks capabilities React Native can't reach: AR/LiDAR, Metal 3D, widgets, Dynamic Island, Live Activities, HealthKit, HomeKit, NFC, and Core ML",
-    "PUBLISH — Two-click App Store publishing cuts the steps between generating an app and shipping it",
-    "SIM — A browser-based streaming iOS simulator lets you test in a real Apple environment without Xcode or a Mac",
-    "STANDARD — Standard Rork turns a plain-English description into working React Native (Expo) code",
-    "PRICING — It's free to start, paid plans begin at $25/month, and Rork Max is $200/month",
+    "MAX — Rork Max generates pure Swift apps instead of React Native, covering iPhone through Vision Pro and reaching native features like HealthKit and Core ML",
+    "TRIAL — Rork Max has a limited-time free trial, a chance to try the $200/month tier without paying upfront — best used with a concrete project in mind",
+    "STYLE — Long-term reviews describe a split that works: let the AI generate scaffolding while you own state management and the data layer as features pile up",
+    "PLAN — A useful lens for pricing: does this plan get you to a shipped release? If it does, even paid tiers are cheap; if not, even the free tier is expensive",
+    "REPO — Rork's developer tooling repos keep moving, with rork-xcode and rork-device seeing recent updates around submission and device workflows",
+    "MARKET — Gartner projects 75% of new apps will be built with low-code or no-code by the end of 2026, up from under 25% in 2020",
   ],
 };
 
