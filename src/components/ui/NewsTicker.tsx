@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはReact Nativeを介さず純粋なSwiftアプリを生成します。iPhoneからVision Proまで対応し、HealthKitやCore MLなどネイティブ機能にも届きます",
-    "TRIAL — Rork Maxの期間限定無料トライアルが案内されています。月200ドルのプランに費用先払いなしで触れる機会ですので、題材を決めて試すのがおすすめです",
-    "STYLE — 長期利用レビューでは、雛形はAIに生成させ状態管理とデータ層は自分で書く分担が語られています。機能が増えるほどコード構造の把握が効いてきます",
-    "PLAN — 料金選びは「そのプランでリリースまで届くか」で考える視点が示されています。届くなら有料でも安く、届かないなら無料枠でも高くつきます",
-    "REPO — 開発者向けリポジトリの更新が続いています。rork-xcodeやrork-deviceなど、提出と実機まわりの足回りが手入れされています",
-    "MARKET — Gartnerは2026年末までに新規アプリの75%がローコード・ノーコードで作られると予測しています。2020年の25%未満から大きな伸びです",
+    "MAX — Rork MaxはApple エコシステム全体に向けたネイティブSwiftアプリを生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでが射程です",
+    "WATCH — ウォッチやVision Proまで一続きで出せる点は、個人開発の届く範囲を素直に広げてくれます。まずは小さなコンパニオンアプリから試すのが現実的です",
+    "CREDIT — クレジットは毎月1日にリセットされ、繰り越しはありません。月初にまとめて試し月末に仕上げる進め方は噛み合わないため、週ごとに使い切る配分が向いています",
+    "FREE — 無料プランは月35クレジット（1日5回）です。プラットフォームの感触を掴み、簡単なプロトタイプを作るところまでが現実的な範囲になります",
+    "PLAN — Junior（月25ドル）はアイデア検証とデモまで、Senior（月100ドル）がMVPを作り込む現実的な線とされています",
+    "FUND — Rorkはa16zから280万ドルを調達し、月間74.3万訪問・成長率85%と伝えられています。モバイル特化のAIアプリビルダーとして選択肢に入れやすくなりました",
   ],
   en: [
-    "MAX — Rork Max generates pure Swift apps instead of React Native, covering iPhone through Vision Pro and reaching native features like HealthKit and Core ML",
-    "TRIAL — Rork Max has a limited-time free trial, a chance to try the $200/month tier without paying upfront — best used with a concrete project in mind",
-    "STYLE — Long-term reviews describe a split that works: let the AI generate scaffolding while you own state management and the data layer as features pile up",
-    "PLAN — A useful lens for pricing: does this plan get you to a shipped release? If it does, even paid tiers are cheap; if not, even the free tier is expensive",
-    "REPO — Rork's developer tooling repos keep moving, with rork-xcode and rork-device seeing recent updates around submission and device workflows",
-    "MARKET — Gartner projects 75% of new apps will be built with low-code or no-code by the end of 2026, up from under 25% in 2020",
+    "MAX — Rork Max builds native Swift apps for the whole Apple ecosystem: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "WATCH — Being able to ship all the way out to Apple Watch and Vision Pro genuinely widens what a solo developer can reach — a small companion app is a good first test",
+    "CREDIT — Credits reset on the 1st of each month and do not roll over, so spreading usage across weeks works better than saving it all for a month-end push",
+    "FREE — The free plan gives 35 credits a month (5 per day) — enough to get a feel for the platform and put together a simple prototype",
+    "PLAN — Junior ($25/mo) is enough to validate an idea and build a demo, while Senior ($100/mo) is the realistic tier for building out a full MVP",
+    "FUND — Rork raised $2.8 million from a16z and now sees over 743,000 monthly visits with 85% growth, making it easier to consider for mobile-first AI app building",
   ],
 };
 
