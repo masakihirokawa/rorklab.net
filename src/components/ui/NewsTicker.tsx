@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはApple エコシステム全体に向けたネイティブSwiftアプリを生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまでが射程です",
-    "WATCH — ウォッチやVision Proまで一続きで出せる点は、個人開発の届く範囲を素直に広げてくれます。まずは小さなコンパニオンアプリから試すのが現実的です",
-    "CREDIT — クレジットは毎月1日にリセットされ、繰り越しはありません。月初にまとめて試し月末に仕上げる進め方は噛み合わないため、週ごとに使い切る配分が向いています",
-    "FREE — 無料プランは月35クレジット（1日5回）です。プラットフォームの感触を掴み、簡単なプロトタイプを作るところまでが現実的な範囲になります",
-    "PLAN — Junior（月25ドル）はアイデア検証とデモまで、Senior（月100ドル）がMVPを作り込む現実的な線とされています",
-    "FUND — Rorkはa16zから280万ドルを調達し、月間74.3万訪問・成長率85%と伝えられています。モバイル特化のAIアプリビルダーとして選択肢に入れやすくなりました",
+    "MAX — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage向けのネイティブSwiftアプリを生成し、2クリックでApp Store公開まで進められます",
+    "CHOOSE — 標準RorkはReact Native (Expo)でiOS/Androidのクロスプラットフォーム、Rork Maxはネイティブ。作るものがどのプラットフォームに届くかで選ぶのが分かりやすいです",
+    "PRICE — 無料で開始でき、有料プランは$25/月〜です。Rork Maxは上位プロダクトとして位置づけられています",
+    "CREDIT — クレジット制は繰り越しがないため、月初にまとめず、週単位で区切って使い切る配分の方が噛み合います",
+    "WORKFLOW — AIに全コードを書かせる段階から、スキャフォールドを生成させ状態管理・データ層は自分で書き直す使い方へ。修正を速く回すほどコード構造の内在化が効いてきます",
+    "SIM — ブラウザ内のストリーミングiOSシミュレータで、XcodeやMacを用意せずに実機に近いApple環境でテストできます",
   ],
   en: [
-    "MAX — Rork Max builds native Swift apps for the whole Apple ecosystem: iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "WATCH — Being able to ship all the way out to Apple Watch and Vision Pro genuinely widens what a solo developer can reach — a small companion app is a good first test",
-    "CREDIT — Credits reset on the 1st of each month and do not roll over, so spreading usage across weeks works better than saving it all for a month-end push",
-    "FREE — The free plan gives 35 credits a month (5 per day) — enough to get a feel for the platform and put together a simple prototype",
-    "PLAN — Junior ($25/mo) is enough to validate an idea and build a demo, while Senior ($100/mo) is the realistic tier for building out a full MVP",
-    "FUND — Rork raised $2.8 million from a16z and now sees over 743,000 monthly visits with 85% growth, making it easier to consider for mobile-first AI app building",
+    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, with 2-click App Store publishing",
+    "CHOOSE — Standard Rork ships cross-platform iOS/Android via React Native (Expo); Rork Max goes native. Pick based on where your app needs to run",
+    "PRICE — It's free to start, with paid plans from $25/month. Rork Max sits above that as the premium product",
+    "CREDIT — Credits don't roll over, so spreading usage week by week works better than saving it all for the start of the month",
+    "WORKFLOW — Reviews point toward generating a scaffold, then rewriting state and data layers yourself — internalizing structure speeds up iteration as features stack up",
+    "SIM — An in-browser streaming iOS simulator lets you test in a near-real Apple environment without Xcode or a Mac",
   ],
 };
 
