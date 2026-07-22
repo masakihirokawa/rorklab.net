@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはiPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage向けのネイティブSwiftアプリを生成し、2クリックでApp Store公開まで進められます",
-    "CHOOSE — 標準RorkはReact Native (Expo)でiOS/Androidのクロスプラットフォーム、Rork Maxはネイティブ。作るものがどのプラットフォームに届くかで選ぶのが分かりやすいです",
-    "PRICE — 無料で開始でき、有料プランは$25/月〜です。Rork Maxは上位プロダクトとして位置づけられています",
-    "CREDIT — クレジット制は繰り越しがないため、月初にまとめず、週単位で区切って使い切る配分の方が噛み合います",
-    "WORKFLOW — AIに全コードを書かせる段階から、スキャフォールドを生成させ状態管理・データ層は自分で書き直す使い方へ。修正を速く回すほどコード構造の内在化が効いてきます",
-    "SIM — ブラウザ内のストリーミングiOSシミュレータで、XcodeやMacを用意せずに実機に近いApple環境でテストできます",
+    "MAX — Rork MaxはApple全プラットフォーム向けにネイティブSwiftを出力します。ゲーム・ウィジェット・Live Activitiesといった、React Nativeからは扱いづらかった領域がここで開きます",
+    "FUND — a16zから280万ドルを調達しました。月間74万3,000訪問・成長率85%という数字が出ており、モバイル特化という賭けが機能していることを示しています",
+    "NICHE — BoltやLovableがWeb中心なのに対し、Rorkはモバイル専業です。Macを持たずにiOS公開まで到達できる点は、個人開発では実務的な意味が大きい部分です",
+    "COST — 無料で始められ、有料プランは月25ドルからです。UIの細かい反復調整とクレジット消費が実運用でのボトルネックとして挙がっています",
+    "EAS — Expo SDK 55のEAS UpdateがHermesバイトコードの差分配信に対応し、更新サイズが75%小さくなりました。バックグラウンドでの適用がほぼ即座になっています",
+    "OTA — EAS Updateには段階的ロールアウト、republishによるロールバック、OTAで足りるか本体ビルドが必要かを自動判定するfingerprintツールが揃っています",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, with 2-click App Store publishing",
-    "CHOOSE — Standard Rork ships cross-platform iOS/Android via React Native (Expo); Rork Max goes native. Pick based on where your app needs to run",
-    "PRICE — It's free to start, with paid plans from $25/month. Rork Max sits above that as the premium product",
-    "CREDIT — Credits don't roll over, so spreading usage week by week works better than saving it all for the start of the month",
-    "WORKFLOW — Reviews point toward generating a scaffold, then rewriting state and data layers yourself — internalizing structure speeds up iteration as features stack up",
-    "SIM — An in-browser streaming iOS simulator lets you test in a near-real Apple environment without Xcode or a Mac",
+    "MAX — Rork Max generates native Swift for every Apple platform, opening up games, widgets, and Live Activities — territory React Native never handled comfortably",
+    "FUND — Rork raised $2.8M from a16z. With 743,000 monthly visits and 85% growth, the bet on going mobile-only appears to be working",
+    "NICHE — Where Bolt and Lovable center on the web, Rork is mobile-exclusive. Reaching an iOS release without owning a Mac matters a great deal for solo developers",
+    "COST — It's free to start, with paid plans from $25/month. UI iteration and credit consumption remain the practical bottlenecks in day-to-day use",
+    "EAS — EAS Update in Expo SDK 55 ships Hermes bytecode diffs, cutting update size by 75% and making background application nearly instant",
+    "OTA — EAS Update also offers percentage rollouts, republish for rolling back a bad update, and a fingerprint tool that detects whether a change needs OTA or a full build",
   ],
 };
 
