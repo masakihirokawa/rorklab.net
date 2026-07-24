@@ -1,0 +1,285 @@
+---
+title: "Collapsing Duplicate Requests Into One: A Reference-Counted Single-Flight Layer"
+slug: "rork-single-flight-request-coalescing-refcount-abort-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-24T14:00"
+author: "Rork Lab"
+description: "When several components fire the same API call at launch, you get a burst of identical requests. Here is a single-flight layer that shares one in-flight promise instead, avoiding the trap of handing out a failed promise forever and the trap of one caller's abort cancelling everyone, with the real network numbers alongside."
+tags: ["Rork", "React Native", "API", "Performance", "Architecture"]
+highlights:
+  - "A single-flight layer that collapses duplicate GETs at startup by sharing one in-flight promise"
+  - "The trap where a rejected promise keeps getting handed to every future caller, and why you must delete on settle"
+  - "A reference-counted AbortController so one caller's unmount does not cancel the shared request for everyone"
+---
+
+Late one night I attached a network inspector to a freshly released wallpaper app and opened it. Rows with the same URL stacked up one after another. `/me/entitlements`, four times inside roughly 200ms. Same payload, same JSON coming back.
+
+Something tightened in my chest. Four times the wasted traffic would have been bad enough, but right after three concurrent 401s hit, a handful of users were being logged out for no clear reason. Three requests noticed the expired token at the same moment, each fired its own refresh, and the one that finished last invalidated the token the earlier one had already issued.
+
+The cause was not a single screen. Home, the favorites badge, the paywall gate — separate components were each running the same fetch independently, "because I need it." None of them knew the one next door was already reaching for the same thing.
+
+What I want to walk through is the design that folds these simultaneous, identical requests into a single in-flight one. It comes from the code I actually run across six apps on one shared networking base, added the morning after that night. The mechanism is not complicated. But written naively, it has two traps you will always hit, and it only becomes usable once you clear both.
+
+## Why the same request fires several times
+
+In a React Native app, each component's `useEffect` runs the moment the screen mounts. When several components that need the same data appear at once, each issues its own `fetch`.
+
+The fetch code Rork generates usually lives entirely inside a component. It looks like this.
+
+```ts
+function useEntitlements() {
+  const [data, setData] = useState<Entitlements | null>(null);
+  useEffect(() => {
+    fetch(`${API}/me/entitlements`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then(setData);
+  }, []);
+  return data;
+}
+```
+
+Call this hook from three components and `fetch` runs three times. Each hook sees only its own local state; there is nowhere shared that answers "is the same fetch already in flight?"
+
+My first thought was to add a cache. But on the very first launch the cache is empty. Everyone decides "there is nothing cached" at nearly the same instant and all rush to fetch. The cache fills only after everyone has already sent, too late to help. What needed protecting was not "storing the result" but "sharing the single in-flight request."
+
+## The core of single-flight: share the in-flight promise
+
+There is one thing to do. If a fetch for a given key is already in flight, do not issue a new `fetch` — return the in-flight promise as is. This is single-flight, or request coalescing.
+
+The minimal form is just this.
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+
+function coalesce<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const promise = run();
+  inflight.set(key, promise as Promise<unknown>);
+  return promise;
+}
+```
+
+The key is a string that uniquely names what you are fetching. Combining method and path, like `GET /me/entitlements`, reads clearly. Called four times with the same key, `run()` actually runs only the first time.
+
+So far, straightforward. The problem is when to delete the entry from the `Map`. That is where the first trap lives.
+
+## Trap one: handing out a failed promise forever
+
+The code above never deletes anything. Whether the fetch succeeds or fails, its promise stays in `inflight`.
+
+If it stays after success, the next caller receives the old result. That is effectively a cache with no expiry — an unintended freeze of freshness.
+
+The failure case is nastier. Once the network drops and the promise rejects, that rejected promise sits in the `Map`. From then on, everyone calling with the same key gets this "already-failed" promise. Even after signal recovers, they keep seeing the same error until the app restarts. I personally burned half a day reproducing this behavior.
+
+Intuitively you want to "cache the result." But single-flight's job is only to fold the in-flight moment together. Storing results belongs to a different layer, a TTL cache, kept separate. Drawing that line was the crux.
+
+The fix is to delete the entry the instant it settles, whether it resolved or rejected.
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+
+function coalesce<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const promise = run().finally(() => {
+    // Always delete, on success or failure alike.
+    // Forget this and a settled-failed promise keeps being handed out.
+    inflight.delete(key);
+  });
+  inflight.set(key, promise as Promise<unknown>);
+  return promise;
+}
+```
+
+Placing it in `finally` matters. Put it only in `then` and it never fires on reject. That "does not clear on reject" was precisely the shape of the incident.
+
+## Trap two: one caller's abort cancels everyone
+
+In React, the convention is to abort an in-flight request when a component unmounts — use an `AbortController` and call `abort()` in the cleanup.
+
+Combined with single-flight, the naive version bites. If you pass each caller's own `AbortController` into the one shared request, the moment the first component to unmount calls `abort()`, the fetch for everyone still waiting is cancelled too.
+
+Flip tabs quickly and the remaining screen fills with "request aborted." That is a counter-intuitive way to break: aborting is each component's own business, yet the shared single request gets dragged along by it.
+
+The solution is reference counting. Create exactly one `AbortController` for the shared request and count how many callers are waiting. Actually abort only when nobody is waiting anymore.
+
+```ts
+type Entry<T> = {
+  promise: Promise<T>;
+  controller: AbortController;
+  refs: number;
+};
+
+const inflight = new Map<string, Entry<unknown>>();
+
+export function coalesce<T>(
+  key: string,
+  run: (signal: AbortSignal) => Promise<T>,
+): { promise: Promise<T>; release: () => void } {
+  let entry = inflight.get(key) as Entry<T> | undefined;
+
+  if (!entry) {
+    const controller = new AbortController();
+    const promise = run(controller.signal).finally(() => {
+      inflight.delete(key); // trap-one fix: always delete on settle
+    });
+    entry = { promise, controller, refs: 0 };
+    inflight.set(key, entry as Entry<unknown>);
+  }
+
+  entry.refs += 1;
+
+  const release = () => {
+    entry!.refs -= 1;
+    // Abort only when no one is waiting AND we are still the current entry
+    if (entry!.refs <= 0 && inflight.get(key) === entry) {
+      entry!.controller.abort();
+      inflight.delete(key);
+    }
+  };
+
+  return { promise: entry.promise, release };
+}
+```
+
+The `inflight.get(key) === entry` check is there so that an old entry's `release` does not mistakenly delete a newer entry created later. I dropped that one line once and lost time chasing a rare mix-up. It is unglamorous but non-negotiable.
+
+## Wiring it into React: useCoalescedQuery
+
+With the coalescer in place, the hook just calls it. Fetch on mount, `release` on unmount, and swallow the abort that comes from your own `release`.
+
+```ts
+import { useEffect, useRef, useState } from "react";
+import { coalesce } from "./request-coalescer";
+
+type State<T> =
+  | { status: "loading" }
+  | { status: "success"; data: T }
+  | { status: "error"; error: unknown };
+
+export function useCoalescedQuery<T>(
+  key: string | null,
+  fetcher: (signal: AbortSignal) => Promise<T>,
+): State<T> {
+  const [state, setState] = useState<State<T>>({ status: "loading" });
+  const fetcherRef = useRef(fetcher);
+  fetcherRef.current = fetcher; // always the latest per render
+
+  useEffect(() => {
+    if (key === null) return;
+    let alive = true;
+    setState({ status: "loading" });
+
+    const { promise, release } = coalesce(key, (signal) =>
+      fetcherRef.current(signal),
+    );
+
+    promise.then(
+      (data) => {
+        if (alive) setState({ status: "success", data: data as T });
+      },
+      (error) => {
+        // Ignore aborts that came from our own release
+        if (alive && (error as { name?: string }).name !== "AbortError") {
+          setState({ status: "error", error });
+        }
+      },
+    );
+
+    return () => {
+      alive = false;
+      release();
+    };
+  }, [key]);
+
+  return state;
+}
+```
+
+The fetcher takes the `signal` and passes it straight to `fetch`.
+
+```ts
+async function fetchEntitlements(signal: AbortSignal) {
+  const res = await fetch(`${API}/me/entitlements`, {
+    headers: { Authorization: `Bearer ${await getToken()}` },
+    signal,
+  });
+  if (!res.ok) throw new Error(`entitlements ${res.status}`);
+  return (await res.json()) as Entitlements;
+}
+```
+
+Now, as long as you pass the same `key`, no matter how many components call it, the actual network request is folded to one.
+
+## What you must not coalesce: writes
+
+Coalescing works only for reads — where calling repeatedly yields the same result. Get this wrong and you lose data silently.
+
+I once thought I could prevent a double-tapped submit button with single-flight, and wrote this.
+
+```ts
+// Do not do this
+coalesce("POST /posts", (signal) => createPost(draft, signal));
+```
+
+The second tap receives the first tap's in-flight promise. It looks like duplicate creation was prevented. But the different draft the second tap was holding never got sent — it vanished. One of the user's actions was quietly thrown away.
+
+Preventing duplicate writes belongs to idempotency keys, not to coalescing. That separation becomes clear when you set it beside the companion piece on hardening network calls, [Hardening API Calls in a Rork App: Token Refresh, Retries, and Idempotency](/articles/rork-dev/rork-api-client-token-refresh-retry-idempotency-design). Single-flight removes duplicate reads; idempotency keys neutralize duplicate writes. They protect fundamentally different things.
+
+## Calming the token-refresh thundering herd
+
+The mysterious logouts at the start were exactly where this read-side folding helps. Several requests notice the expired token at once and each fires a refresh. A refresh looks like a write, but in the sense of "obtain one new access token from the same refresh token," folding the concurrent runs into one and sharing the result is the correct move.
+
+Coalesce the refresh itself under a fixed key.
+
+```ts
+function refreshAccessToken() {
+  const { promise } = coalesce("auth:refresh", async (signal) => {
+    const res = await fetch(`${API}/auth/refresh`, {
+      method: "POST",
+      body: JSON.stringify({ refresh: getRefreshToken() }),
+      signal,
+    });
+    if (!res.ok) throw new Error(`refresh ${res.status}`);
+    return (await res.json()) as { access: string };
+  });
+  // Never call release here: we do not want a waiting caller to abort the
+  // refresh. The finally on settle still cleans the entry up.
+  return promise;
+}
+```
+
+By not calling `release`, a waiting caller's whim can no longer cancel the refresh. Even with three overlapping 401s, exactly one refresh goes out. Everyone shares that single result and retries with the new token. Logouts from token mix-ups stopped happening after this.
+
+## The numbers I saw in production
+
+I observed before and after on the one app with the most users out of the six. The averages are over 20 cold starts (launching from a fully terminated state).
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>Before</th><th>After</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>/me/entitlements</code> at launch</td><td>4 on average</td><td>1</td></tr>
+    <tr><td><code>/auth/refresh</code> on concurrent 401</td><td>up to 3</td><td>1</td></tr>
+    <tr><td>Total requests at startup</td><td>11 on average</td><td>6 on average</td></tr>
+    <tr><td>Unexpected logout reports (per week)</td><td>a few</td><td>0</td></tr>
+  </tbody>
+</table>
+
+More than the drop in request count, the last row mattered most to me. The hard-to-trace logouts were gone. A fault that had been happening out of the user's sight closed with a single move — folding requests together. I was quietly relieved.
+
+## Where to start
+
+First, attach a network inspector right after launch and look for the same URL repeated. If it is, that is your first target. Entitlements, user profile, remote config — reads referenced from several screens are usually the candidates.
+
+The coalescer fits in one file. You do not need to rewrite all existing fetch code at once. Swap only the reads that are firing in duplicate onto `coalesce`, and as long as you keep the two points — deleting in `finally` and the reference count — it quietly starts to help.
+
+I am still working on my own networking base. I hope this is of some use to anyone facing the same problem. Thank you for reading.

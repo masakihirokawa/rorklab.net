@@ -1,0 +1,285 @@
+---
+title: "同じ通信が同時に何本も飛ぶのを1本に束ねる — 参照カウント付きシングルフライト層の設計"
+slug: "rork-single-flight-request-coalescing-refcount-abort-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-24T14:00"
+author: "Rork Lab"
+description: "起動直後に同じ API へ何本ものリクエストが同時に飛ぶ多重フェッチを、進行中の Promise を共有して1本に束ねる設計です。失敗した Promise を配り続けてしまう罠、呼び出し側の中断が全体を巻き込む罠を避ける、参照カウント付きシングルフライト層の実装を、実際の通信ログとともに残します。"
+tags: ["Rork", "React Native", "API", "パフォーマンス", "アーキテクチャ"]
+highlights:
+  - "起動時に同一 GET が多重に飛ぶのを、進行中の Promise を共有して1本へ束ねるシングルフライト層の実装"
+  - "失敗した Promise が次回以降の呼び出しにも配られ続ける罠と、settle 時に必ず消す書き方"
+  - "呼び出し側1つの中断が共有リクエスト全体を巻き込まないための、参照カウント付き AbortController"
+---
+
+夜、リリース直後の壁紙アプリをネットワークインスペクタにつないで開いた瞬間、同じ URL の行が続けざまに並びました。`/me/entitlements` が、わずか 200ms ほどのあいだに 4 本。どれも中身は同じで、返ってくる JSON も同じでした。
+
+胸の奥がざわつきました。無駄な通信が 4 倍になるだけならまだしも、同じ端末で 3 本の 401 が重なった直後、ユーザーの何人かが不意にログアウトさせられていたのです。トークンの期限切れに対して 3 本が同時に更新をかけ、後から完了した更新が先に発行されたトークンを無効化していました。
+
+原因は 1 画面ではありませんでした。ホーム、お気に入りバッジ、課金ゲート — 別々のコンポーネントが、それぞれ「自分が必要だから」と同じ取得を独立に走らせていただけです。誰も、隣がすでに同じものを取りにいっていることを知りませんでした。
+
+取り上げたいのは、この「同時多発する同一リクエスト」を、進行中の 1 本に束ねる設計です。個人開発で 6 本のアプリを同じ通信基盤で回している中で、あの夜のあとに実際へ入れて運用しているコードをもとにしています。難しい仕組みではありません。けれど、素直に書くと必ず踏む罠が二つあり、そこを抜けて初めて実用になります。
+
+## なぜ同じリクエストが同時に飛ぶのか
+
+React Native のアプリでは、画面がマウントされた瞬間に各コンポーネントの `useEffect` が走ります。同じデータを必要とする複数のコンポーネントが同時に現れると、それぞれが独立に `fetch` を発行します。
+
+Rork が生成する取得コードは、たいていコンポーネントの内側で完結しています。次のような形です。
+
+```ts
+function useEntitlements() {
+  const [data, setData] = useState<Entitlements | null>(null);
+  useEffect(() => {
+    fetch(`${API}/me/entitlements`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then(setData);
+  }, []);
+  return data;
+}
+```
+
+このフックを 3 つのコンポーネントが呼べば、`fetch` は 3 本走ります。各フックは自分のローカル状態しか見ておらず、「同じ取得がすでに進行中かどうか」を共有する場所がどこにもありません。
+
+キャッシュを挟めばいいのでは、と最初は考えました。けれど、初回の起動直後はキャッシュが空です。全員がほぼ同時に「キャッシュが無い」と判断し、そろって取得に走ります。キャッシュが埋まるのは全員が投げ終えた後で、間に合いません。守るべきは「結果の保存」ではなく、「進行中の 1 本を共有すること」でした。
+
+## シングルフライトの核 — 進行中の Promise を共有する
+
+やることは一つです。あるキーに対する取得がすでに進行中なら、新しい `fetch` を投げず、進行中の Promise をそのまま返す。これをシングルフライト、あるいはリクエストのコアレッシング（束ねること）と呼びます。
+
+最小の形はこれだけです。
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+
+function coalesce<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const promise = run();
+  inflight.set(key, promise as Promise<unknown>);
+  return promise;
+}
+```
+
+キーは「何を取りにいくか」を一意に表す文字列にします。`GET /me/entitlements` のように、メソッドとパスを組み合わせるのが分かりやすい形です。同じキーで 4 回呼ばれても、`run()` が実際に走るのは最初の 1 回だけになります。
+
+ここまでは素直です。問題は、この `Map` からいつエントリを消すか。ここに最初の罠があります。
+
+## 罠その一 — 失敗した Promise を配り続けてしまう
+
+上のコードには、消す処理がありません。取得が成功しても失敗しても、`inflight` にはその Promise が残り続けます。
+
+成功したまま残る場合、次の呼び出しは古い結果を受け取ります。これは実質、期限のないキャッシュです。意図しない鮮度の固定が起きます。
+
+もっと厄介なのは失敗した場合です。一度ネットワークが切れて Promise が reject されると、その reject された Promise が `Map` に居座り続けます。以降、同じキーで呼ばれた全員に、この「すでに失敗が確定した Promise」が配られます。電波が回復しても、アプリを再起動するまで永遠に同じエラーを見続ける、という状態に陥りました。私自身、この挙動の再現に半日を溶かしました。
+
+直感的には「結果をキャッシュしたい」と考えてしまいます。けれどシングルフライトの役目は、あくまで進行中の一瞬を束ねることだけです。結果の保存は別の層（TTL 付きキャッシュなど）の仕事として切り離す。私は、この線引きを最初に決めてから実装に入るやり方を好みます。責務が交わると、あとで必ず見通しが悪くなるからです。
+
+修正は、成否にかかわらず settle した時点で必ずエントリを消すことです。
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+
+function coalesce<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const promise = run().finally(() => {
+    // 成功・失敗どちらでも必ず消す。
+    // ここを忘れると、失敗が確定した Promise が次回以降にも配られ続ける
+    inflight.delete(key);
+  });
+  inflight.set(key, promise as Promise<unknown>);
+  return promise;
+}
+```
+
+`finally` に置くのが肝心です。`then` だけに置くと、reject 時に消えません。まさにその「reject 時に消えない」ことが事故の正体でした。
+
+## 罠その二 — 呼び出し側1つの中断が全体を巻き込む
+
+React では、コンポーネントがアンマウントされたら進行中の通信を中断するのが定石です。`AbortController` を使い、クリーンアップで `abort()` を呼びます。
+
+ところがシングルフライトと組み合わせると、素直な実装が牙をむきます。共有している 1 本の通信に、呼び出し側それぞれの `AbortController` を渡してしまうと、いちばん先にアンマウントしたコンポーネントが `abort()` した瞬間、まだ待っている他の全員の取得までまとめて中断されます。
+
+タブを素早く切り替えただけで、残った画面のデータが「中断されました」で埋まる。これは直感に反する壊れ方でした。中断は各コンポーネントの都合なのに、共有された 1 本がその都合に引きずられてしまうのです。
+
+解決は、参照カウントを持たせることです。共有リクエスト用の `AbortController` は 1 つだけ用意し、待っている呼び出し側の数を数える。実際に中断するのは、待っている人が誰もいなくなったときだけにします。
+
+```ts
+type Entry<T> = {
+  promise: Promise<T>;
+  controller: AbortController;
+  refs: number;
+};
+
+const inflight = new Map<string, Entry<unknown>>();
+
+export function coalesce<T>(
+  key: string,
+  run: (signal: AbortSignal) => Promise<T>,
+): { promise: Promise<T>; release: () => void } {
+  let entry = inflight.get(key) as Entry<T> | undefined;
+
+  if (!entry) {
+    const controller = new AbortController();
+    const promise = run(controller.signal).finally(() => {
+      inflight.delete(key); // 罠その一の対策。settle で必ず消す
+    });
+    entry = { promise, controller, refs: 0 };
+    inflight.set(key, entry as Entry<unknown>);
+  }
+
+  entry.refs += 1;
+
+  const release = () => {
+    entry!.refs -= 1;
+    // 待っている人が誰もいなくなって、かつ自分がまだ現行エントリのときだけ中断する
+    if (entry!.refs <= 0 && inflight.get(key) === entry) {
+      entry!.controller.abort();
+      inflight.delete(key);
+    }
+  };
+
+  return { promise: entry.promise, release };
+}
+```
+
+`inflight.get(key) === entry` の照合を入れているのは、古いエントリの `release` が、あとから作られた新しいエントリを誤って消さないためです。この一行を省いて、稀に発生する取り違えの調査に時間を取られました。地味ですが外せません。
+
+## React 側の統合 — useCoalescedQuery
+
+コアレッサーができたら、フックからはそれを呼ぶだけです。マウントで取得し、アンマウントで `release` する。自分の `release` に由来する中断は握りつぶします。
+
+```ts
+import { useEffect, useRef, useState } from "react";
+import { coalesce } from "./request-coalescer";
+
+type State<T> =
+  | { status: "loading" }
+  | { status: "success"; data: T }
+  | { status: "error"; error: unknown };
+
+export function useCoalescedQuery<T>(
+  key: string | null,
+  fetcher: (signal: AbortSignal) => Promise<T>,
+): State<T> {
+  const [state, setState] = useState<State<T>>({ status: "loading" });
+  const fetcherRef = useRef(fetcher);
+  fetcherRef.current = fetcher; // 毎レンダーの最新を参照する
+
+  useEffect(() => {
+    if (key === null) return;
+    let alive = true;
+    setState({ status: "loading" });
+
+    const { promise, release } = coalesce(key, (signal) =>
+      fetcherRef.current(signal),
+    );
+
+    promise.then(
+      (data) => {
+        if (alive) setState({ status: "success", data: data as T });
+      },
+      (error) => {
+        // 自分の release で中断したぶんは無視する
+        if (alive && (error as { name?: string }).name !== "AbortError") {
+          setState({ status: "error", error });
+        }
+      },
+    );
+
+    return () => {
+      alive = false;
+      release();
+    };
+  }, [key]);
+
+  return state;
+}
+```
+
+取得関数は `signal` を受け取り、`fetch` にそのまま渡す形にします。
+
+```ts
+async function fetchEntitlements(signal: AbortSignal) {
+  const res = await fetch(`${API}/me/entitlements`, {
+    headers: { Authorization: `Bearer ${await getToken()}` },
+    signal,
+  });
+  if (!res.ok) throw new Error(`entitlements ${res.status}`);
+  return (await res.json()) as Entitlements;
+}
+```
+
+これで、同じ `key` を渡す限り、いくつのコンポーネントから呼んでも実際の通信は 1 本に束ねられます。
+
+## 束ねてはいけないもの — 書き込みリクエスト
+
+コアレッシングが効くのは、何度呼んでも結果が同じ「読み取り」だけです。ここを取り違えると、静かにデータを失います。
+
+送信ボタンの二度押しを、シングルフライトで防げると考えて、次のように書いたことがあります。
+
+```ts
+// これはやってはいけない
+coalesce("POST /posts", (signal) => createPost(draft, signal));
+```
+
+二度押しの 2 回目は、1 回目の進行中 Promise をそのまま受け取ります。一見、重複作成を防いだように見えます。ところが、2 回目に握っていた別の下書きは、送信されないまま消えました。ユーザーの操作が 1 回ぶん、音もなく捨てられていたのです。
+
+書き込みの重複対策は、束ねることではなく冪等性キーで行うべきものでした。この切り分けは、通信の堅牢化を扱った別稿の [Rork アプリの API 通信を堅くする — トークン更新・再試行・冪等性の設計](/articles/rork-dev/rork-api-client-token-refresh-retry-idempotency-design) と合わせて考えると、役割の違いがはっきりします。シングルフライトは読み取りの重複を消し、冪等性キーは書き込みの重複を無害化する。守る対象がそもそも違います。
+
+## トークン更新のサンダリングハードを鎮める
+
+冒頭の不意のログアウトは、まさにこの読み取り側の束ねが効く場面でした。複数のリクエストが同時にトークン切れに気づき、それぞれが更新をかける。更新自体は書き込みに見えますが、「同じリフレッシュトークンから新しいアクセストークンを 1 つ得る」という意味では、同時実行を 1 本にまとめて全員で結果を共有するのが正解です。
+
+更新処理そのものを固定キーで束ねます。
+
+```ts
+function refreshAccessToken() {
+  const { promise } = coalesce("auth:refresh", async (signal) => {
+    const res = await fetch(`${API}/auth/refresh`, {
+      method: "POST",
+      body: JSON.stringify({ refresh: getRefreshToken() }),
+      signal,
+    });
+    if (!res.ok) throw new Error(`refresh ${res.status}`);
+    return (await res.json()) as { access: string };
+  });
+  // 更新は途中で中断させたくないので release は呼ばない。
+  // settle 時の finally が後始末をするので、エントリは残らない
+  return promise;
+}
+```
+
+`release` を呼ばないことで、待っている呼び出し側の都合で更新が中断されるのを防ぎます。3 本の 401 が重なっても、実際に飛ぶ更新は 1 本。全員がその 1 本の結果を共有し、新しいトークンで再試行します。トークンの取り違えによるログアウトは、これで起きなくなりました。
+
+## 運用で見えた数値
+
+導入の前後を、6 本のアプリのうち利用者の多い 1 本で観察しました。cold start（アプリを完全に終了した状態からの起動）を 20 回試した平均です。
+
+<table>
+  <thead>
+    <tr><th>局面</th><th>導入前</th><th>導入後</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>起動直後の <code>/me/entitlements</code> 本数</td><td>平均 4 本</td><td>1 本</td></tr>
+    <tr><td>同時 401 時の <code>/auth/refresh</code> 本数</td><td>最大 3 本</td><td>1 本</td></tr>
+    <tr><td>起動時の総リクエスト数</td><td>平均 11 本</td><td>平均 6 本</td></tr>
+    <tr><td>不意のログアウト報告（週あたり）</td><td>数件</td><td>0 件</td></tr>
+  </tbody>
+</table>
+
+通信本数の削減そのものより、私にとって大きかったのは最後の行でした。原因の掴みにくいログアウトが消えたこと。ユーザーから見えないところで起きていた綻びが、束ねる 1 手で閉じたのは、素直に安堵しました。
+
+## どこから入れるか
+
+まず、起動直後にネットワークインスペクタをつないで、同じ URL が並んでいないかを見てください。並んでいれば、そこが最初の対象です。エンタイトルメント、ユーザープロフィール、リモート設定 — 複数画面から参照される読み取りが、たいてい候補になります。
+
+コアレッサーは 1 ファイルで完結します。既存の取得コードを一気に書き換える必要はありません。多重に飛んでいる読み取りだけを `coalesce` 経由に差し替え、`finally` の削除と参照カウントの二点さえ外さなければ、静かに効き始めます。
+
+私自身、通信基盤はまだ手を入れ続けている途中です。同じ悩みに向き合う方の一助になれば嬉しく思います。お読みいただき、ありがとうございました。
