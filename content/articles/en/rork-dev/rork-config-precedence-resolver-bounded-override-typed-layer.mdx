@@ -1,0 +1,228 @@
+---
+title: "Resolving App Config in Three Layers: Merging Defaults, User, and Remote With Bounded Overrides"
+slug: "rork-config-precedence-resolver-bounded-override-typed-layer"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-24T11:00"
+author: "Rork Lab"
+description: "A single type-safe layer that merges compiled defaults, user preferences, and remote config. So a broken remote value never takes your app down, each key gets its own override strength, plus schema validation and range clamping, built from a real production incident."
+tags: ["Rork", "React Native", "Config Management", "Remote Config", "Architecture"]
+highlights:
+  - "A type-safe merge layer that resolves defaults, user prefs, and remote config with per-key override strength (locked / user / remote)"
+  - "How to keep one broken remote value from cascading, per-key fallback to defaults plus min/max clamping, written out in full"
+  - "The real config incident across six wallpaper apps and the operational calls it forced (how to set bounds, what to log)"
+---
+
+Late one night I opened my own wallpaper app on my iPhone, and a full-screen ad appeared every time I swiped to the next image. Twice, three times, inside half a minute. My stomach dropped.
+
+It wasn't a bug in the code. The interstitial cooldown value I kept in remote config had somehow been set to something tiny, and that value had shipped straight to the app. Worse, the same config was shared across all six of the wallpaper apps I maintain as an indie developer, so every one of them broke at once.
+
+What this drove home for me was how dangerous the assumption "remote config is safe because I can fix it remotely" really is. Yes, you can push a fix quickly. But for the twenty-odd minutes it takes that fix to reach every device, the app keeps running, exposed. The place to defend was never the delivery side. It was the device receiving the value.
+
+This article is about a design that merges three sources, compiled defaults, user preferences, and remote config, into one type-safe layer, so that a broken value can arrive without taking the app down. It's based on the code I put into all six apps after that night.
+
+## Start From the Fact That Config Has Three Sources
+
+In most apps, config quietly ends up being three-layered whether you plan for it or not. Let me lay them out in order.
+
+The first is the defaults compiled into the binary. They're always present, even offline. This is where the source of truth for types and initial values lives.
+
+The second is user preferences. Stored locally on the device (AsyncStorage or MMKV), they represent choices the user made deliberately, things like prefetch count or theme.
+
+The third is remote config. External input arriving from something like Firebase Remote Config, holding values the operator wants to change quickly for everyone, typically ad frequency or the timing of a review prompt.
+
+The trouble is merging these three with a naive "last one wins" override. That night's incident happened precisely because remote could overwrite anything. Having three layers is unavoidable. What you must avoid is giving every layer the same strength.
+
+## Give Each Key Its Own Override Strength
+
+The heart of the design is declaring, per value, who is allowed to override it and how far. I settled on three policies.
+
+### locked — nobody can override
+
+A flag like which onboarding version to show breaks the experience if it flips by accident, so I mark it locked. Neither remote nor the user can touch it; it stays at its default. It's a safety valve, deliberately made immovable.
+
+### user — user preference wins
+
+A pure preference like prefetch count gets the user policy. Remote stays out of it, and only the value the user chose overrides the default. It simply isn't a value the operator should be changing behind their back.
+
+### remote — allow overrides, but only within a range
+
+A value the operator wants to tune, like the ad cooldown, gets the remote policy. But I don't trust it wholesale. Each key defines a min/max, and the incoming value is always clamped into that range. That 3-second value from the incident now arrives raised to a floor of 60 seconds.
+
+## Write the Merge Itself, Type-Safe
+
+Here's the implementation. First, define the defaults as a schema and make it the single source of truth for both types and initial values. I use zod for validation.
+
+```typescript
+// config/resolver.ts
+import { z } from "zod";
+
+// Defaults schema. The source of truth for types + initial values lives only here.
+const ConfigSchema = z.object({
+  interstitialCooldownSec: z.number().int().min(30).max(600),
+  reviewPromptAfterOpens: z.number().int().min(3).max(50),
+  imagePrefetchCount: z.number().int().min(0).max(40),
+  showOnboardingV2: z.boolean(),
+});
+
+export type AppConfig = z.infer<typeof ConfigSchema>;
+
+const DEFAULTS: AppConfig = {
+  interstitialCooldownSec: 90,
+  reviewPromptAfterOpens: 8,
+  imagePrefetchCount: 12,
+  showOnboardingV2: false,
+};
+
+// Per-key override policy
+//   locked … neither remote nor user may touch it
+//   user   … only the user preference may override the default
+//   remote … remote may override, but is always clamped to min/max
+type Policy =
+  | { kind: "locked" }
+  | { kind: "user" }
+  | { kind: "remote"; min: number; max: number };
+
+const POLICIES: Record<keyof AppConfig, Policy> = {
+  interstitialCooldownSec: { kind: "remote", min: 60, max: 300 },
+  reviewPromptAfterOpens: { kind: "remote", min: 5, max: 20 },
+  imagePrefetchCount: { kind: "user" },
+  showOnboardingV2: { kind: "locked" },
+};
+```
+
+I keep the policy's min/max separate from the schema's min/max on purpose. The schema is "the range of values we'll accept at all," while the policy is "the operational range we'll allow remote to use." The former is wide, the latter narrow. That two-stage framing pays off later.
+
+Next, the resolver itself. Incoming remote values are treated as untrusted external input, validated and clamped one key at a time.
+
+```typescript
+type Sources = {
+  user: Partial<AppConfig>;
+  remote: Record<string, unknown>; // untrusted external input
+};
+
+const clamp = (v: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, v));
+
+export function resolveConfig(sources: Sources): {
+  config: AppConfig;
+  rejected: string[];
+} {
+  const out: AppConfig = { ...DEFAULTS };
+  const rejected: string[] = [];
+
+  for (const key of Object.keys(DEFAULTS) as (keyof AppConfig)[]) {
+    const policy = POLICIES[key];
+
+    if (policy.kind === "locked") continue; // stays at the default
+
+    if (policy.kind === "user") {
+      const val = sources.user[key];
+      if (val !== undefined) (out[key] as unknown) = val;
+      continue;
+    }
+
+    // policy.kind === "remote"
+    const raw = sources.remote[key];
+    if (raw === undefined) continue;
+
+    // If the type is off, drop just this one key back to the default (don't break the whole object)
+    const field = ConfigSchema.shape[key];
+    const parsed = field.safeParse(raw);
+    if (!parsed.success) {
+      rejected.push(`${key}: ${parsed.error.issues[0]?.message ?? "invalid"}`);
+      continue;
+    }
+
+    // Numbers are always pulled inside the policy's bounds
+    const value = parsed.data;
+    (out[key] as unknown) =
+      typeof value === "number" ? clamp(value, policy.min, policy.max) : value;
+  }
+
+  return { config: out, rejected };
+}
+```
+
+The most important thing here is that a key which fails validation is skipped with `continue`, leaving that single key at its default. We never throw away the whole object because one key was rotten. Don't toss the whole crate over one bad apple.
+
+## Prove "Don't Trust Remote Blindly" With Behavior
+
+Words alone don't land, so let's write a test that pours broken values in. It doubles as the spec.
+
+```typescript
+// resolver.test.ts
+import { resolveConfig } from "./resolver";
+
+test("a broken remote value falls back to the app default", () => {
+  const { config, rejected } = resolveConfig({
+    user: { imagePrefetchCount: 24 },
+    remote: {
+      interstitialCooldownSec: 3,      // too small -> clamped to floor 60
+      reviewPromptAfterOpens: "soon",  // type violation -> falls back to default 8
+      showOnboardingV2: true,          // locked -> ignored
+    },
+  });
+
+  expect(config.interstitialCooldownSec).toBe(60); // clamped
+  expect(config.reviewPromptAfterOpens).toBe(8);   // fallback
+  expect(config.imagePrefetchCount).toBe(24);      // user override
+  expect(config.showOnboardingV2).toBe(false);     // still locked
+  expect(rejected.length).toBe(1);
+});
+```
+
+That 3-second value from the incident is literally the first line of this test. Now it arrives clamped to 60 seconds. The stray string in the review prompt quietly falls back to the default of 8. The locked flag doesn't move no matter what shows up. There's a quiet satisfaction in the incident itself becoming the regression test.
+
+## Keep It Behind a Single Hook in React
+
+I don't want this complexity leaking into the call sites. The resolution is sealed inside one hook, and screens receive only a finished `AppConfig`.
+
+```typescript
+// config/useConfig.ts
+import { useMemo } from "react";
+import { resolveConfig, type AppConfig } from "./resolver";
+import { useUserPrefs } from "./userPrefs";   // local to the device
+import { useRemoteConfig } from "./remoteConfig"; // raw values from Firebase, etc.
+
+export function useConfig(): AppConfig {
+  const user = useUserPrefs();
+  const remote = useRemoteConfig();
+
+  return useMemo(() => {
+    const { config, rejected } = resolveConfig({ user, remote });
+    if (rejected.length > 0) {
+      // In production, never swallow this. Always log it. This is what pays off.
+      console.warn("[config] rejected keys", rejected);
+    }
+    return config;
+  }, [user, remote]);
+}
+```
+
+A screen just writes `const { interstitialCooldownSec } = useConfig();`. It never has to know there are three layers, or that clamping ran. Seal the complexity in one place and expose only typed, trustworthy values outward. That's the whole point of a resolution layer.
+
+## What Went Against My Intuition: Making Remote Powerful Caused the Incident
+
+Let me be honest. Before the incident, I believed keeping remote config as powerful as possible was the good design, that being able to change anything instantly from the operator side would make operations easier. The reality was the opposite. Being able to change anything meant being able to break anything.
+
+The other surprise was that the `rejected` log turned out to be a goldmine. At first, logging rejected values felt like a just-in-case precaution. In practice, delivery mistakes, careless type errors, and leftover old key names all show up in that log first. In my own records, roughly 3% of remote deliveries carried some type mismatch or out-of-range value. I could catch it before a single user noticed anything wrong. The very act of rejecting at the boundary turned out to be the best monitoring I had.
+
+Official docs are thorough about how to set up remote config, but "how far to trust the value once it arrives" is left as the app's responsibility. Here are a few of the operational calls I made across the six apps.
+
+<table>
+<thead>
+<tr><th>Decision</th><th>What I chose</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Setting bounds</td><td>Put min/max just inside the range that has been safe in practice</td><td>The more aggressive the value you want to try, the more you want the failure swing narrowed first</td></tr>
+<tr><td>Handling rejects</td><td>Never drop them; always log, review counts weekly</td><td>It becomes the fastest detection path for config mistakes</td></tr>
+<tr><td>Where to use locked</td><td>Limit it to flags tied to the skeleton of the experience</td><td>Add too many safety valves and you lose the ability to fix things quickly</td></tr>
+<tr><td>Schema vs. policy split</td><td>Acceptance range wide, operational range narrow, in two stages</td><td>You want to tune production tolerance separately from basic validity</td></tr>
+</tbody>
+</table>
+
+If I could add only one thing today, I'd recommend starting with the clamp in the remote policy. Even without turning every key into a policy, just wrapping incoming numbers in a single min/max stops cascades like that night almost entirely. You can grow the locked and user classifications gradually as you operate.
+
+Config is a humble layer. But it's also the layer that's most visible in the user's hands when it breaks. If you take away nothing but "defend on the side that receives the value," this article will have been worth writing. Thank you for reading.
