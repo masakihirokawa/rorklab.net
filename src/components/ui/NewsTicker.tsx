@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Maxは全Appleプラットフォーム向けにネイティブSwiftアプリを生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Proに対応します",
-    "PUBLISH — Rork MaxはXcodeなしで2クリックのApp Store公開に対応します。ビルドから申請までの手数を大きく減らせます",
-    "FUND — Rorkはa16zから280万ドルを調達しました。月間743,000訪問・成長率85%と、利用が広がっています",
-    "NATIVE — Rorkは自然言語の指示からReact Native（Expo）のネイティブアプリを生成します。カメラや通知などデバイス機能も扱えます",
-    "OWN — 生成されたコードは完全に自分のものになります。あとから手を入れて拡張していけます",
-    "MVP — Rorkは動くMVPを数週間ではなく数時間で用意できます。アイデアの検証を素早く回せます",
+    "MAX — Rork MaxはネイティブのSwiftアプリを生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまで対応します",
+    "FUND — Rorkはa16zから280万ドルを調達。月間743,000訪問、成長率85%という規模に達しています",
+    "RN — プレーンな英語のプロンプトから、iOS・Androidの実働アプリ（React Native）を生成できます",
+    "FREE — 無料プラン（35クレジット/月・1日5まで）で試作でき、まずプラットフォームを試すのに十分です",
+    "PLAN — Junior（月$25）はアイデア検証、Senior（月$100）はMVPの作り込みに向く水準です",
+    "CROSS — 従来のRorkはReact Nativeでクロスプラットフォーム、Rork MaxはApple向けネイティブと、用途で選び分けられます",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps for every Apple platform: iPhone, iPad, Apple Watch, Apple TV, and Vision Pro",
-    "PUBLISH — Rork Max supports 2-click App Store publishing without Xcode, cutting the steps from build to submission",
-    "FUND — Rork raised $2.8M from a16z, and the platform now draws over 743,000 monthly visits at an 85% growth rate",
-    "NATIVE — Rork turns plain-language prompts into native React Native (Expo) apps that can use device features like the camera and notifications",
-    "OWN — You keep full ownership of the generated code, free to refine and extend it later",
-    "MVP — Rork can stand up a working MVP in hours rather than weeks, so you can validate an idea fast",
+    "MAX — Rork Max generates native Swift apps, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "FUND — Rork raised $2.8M from a16z and now sees over 743,000 monthly visits with 85% growth",
+    "RN — Plain-English prompts turn into working iOS and Android apps built on React Native",
+    "FREE — The free plan (35 credits a month, 5 a day) is enough to test the platform and build a simple prototype",
+    "PLAN — Junior ($25/mo) suits idea validation, while Senior ($100/mo) is the sweet spot for building out an MVP",
+    "CROSS — Original Rork targets cross-platform React Native; Rork Max goes native for Apple, so you pick by use case",
   ],
 };
 
