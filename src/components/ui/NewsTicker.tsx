@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork MaxはネイティブのSwiftアプリを生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessageまで対応します",
-    "FUND — Rorkはa16zから280万ドルを調達。月間743,000訪問、成長率85%という規模に達しています",
-    "RN — プレーンな英語のプロンプトから、iOS・Androidの実働アプリ（React Native）を生成できます",
-    "FREE — 無料プラン（35クレジット/月・1日5まで）で試作でき、まずプラットフォームを試すのに十分です",
-    "PLAN — Junior（月$25）はアイデア検証、Senior（月$100）はMVPの作り込みに向く水準です",
-    "CROSS — 従来のRorkはReact Nativeでクロスプラットフォーム、Rork MaxはApple向けネイティブと、用途で選び分けられます",
+    "CLOUD — Rork MaxはクラウドのMacファームでSwiftをコンパイルし、ブラウザへシミュレータを配信します。XcodeもMac本体も要りません",
+    "SIM — シミュレータは60fpsで届き、ブラウザ上のタッチ操作がそのまま反映されます。手元に実機がなくても操作感を確かめられます",
+    "NATIVE — AR／LiDARスキャン、Metalによる3D描画、Core MLのオンデバイス推論といったネイティブ機能を扱えます",
+    "WIDGET — ホーム画面ウィジェット、Dynamic Island、Live Activities、Siri Intents、HealthKit、NFC、App Clipsにも対応します",
+    "ARR — Rork Maxは2026年2月の公開から3日でARR150万ドルに達しました。ネイティブ生成への需要の大きさがうかがえます",
+    "IOS27 — iOS 27のパブリックベータが7月中旬に公開されました。秋の正式リリースに向け、生成したアプリの動作確認を進める時期です",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "FUND — Rork raised $2.8M from a16z and now sees over 743,000 monthly visits with 85% growth",
-    "RN — Plain-English prompts turn into working iOS and Android apps built on React Native",
-    "FREE — The free plan (35 credits a month, 5 a day) is enough to test the platform and build a simple prototype",
-    "PLAN — Junior ($25/mo) suits idea validation, while Senior ($100/mo) is the sweet spot for building out an MVP",
-    "CROSS — Original Rork targets cross-platform React Native; Rork Max goes native for Apple, so you pick by use case",
+    "CLOUD — Rork Max compiles Swift on a cloud Mac fleet and streams the simulator to your browser, so no Xcode or Mac is required",
+    "SIM — The streamed simulator runs at 60fps and accepts real touch input in the browser, letting you feel the app without a device",
+    "NATIVE — You get native capabilities like AR and LiDAR scanning, Metal-backed 3D rendering, and on-device inference with Core ML",
+    "WIDGET — Home Screen widgets, Dynamic Island, Live Activities, Siri Intents, HealthKit, NFC, and App Clips are all in reach",
+    "ARR — Rork Max reached $1.5M ARR within three days of its February 2026 launch, a fair signal of demand for native generation",
+    "IOS27 — The iOS 27 public beta arrived in mid-July, so now is the time to check generated apps ahead of the autumn release",
   ],
 };
 
