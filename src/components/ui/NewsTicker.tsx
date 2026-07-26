@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "CLOUD — Rork MaxはクラウドのMacファームでSwiftをコンパイルし、ブラウザへシミュレータを配信します。XcodeもMac本体も要りません",
-    "SIM — シミュレータは60fpsで届き、ブラウザ上のタッチ操作がそのまま反映されます。手元に実機がなくても操作感を確かめられます",
-    "NATIVE — AR／LiDARスキャン、Metalによる3D描画、Core MLのオンデバイス推論といったネイティブ機能を扱えます",
-    "WIDGET — ホーム画面ウィジェット、Dynamic Island、Live Activities、Siri Intents、HealthKit、NFC、App Clipsにも対応します",
-    "ARR — Rork Maxは2026年2月の公開から3日でARR150万ドルに達しました。ネイティブ生成への需要の大きさがうかがえます",
-    "IOS27 — iOS 27のパブリックベータが7月中旬に公開されました。秋の正式リリースに向け、生成したアプリの動作確認を進める時期です",
+    "ENGINE — Rork Maxのコード生成はClaude CodeとClaude Opus 4.6を土台にしています。プロンプトの粒度を考えるうえで押さえておきたい前提です",
+    "SPLIT — Rork MaxはAppleプラットフォーム専用です。Androidも必要なら、React Nativeでクロスプラットフォームを生成する従来のRorkを選ぶことになります",
+    "DEVICE — Rork MaxはiPhone・iPad・Apple Watch・Vision Proを対象にできます。React Nativeからは届きにくかった領域まで生成対象に入ります",
+    "CREDIT — 課金はクレジット制で、AIとのやり取り1回につき1クレジットを消費します。毎月1日にリセットされ、繰り越しはできません",
+    "PLAN — 無料は月35クレジット（1日5）、Juniorは月$25、Seniorは月$100、Rork Maxは月$200です。MVPの作り込みはSeniorが目安とされています",
+    "FUND — Rorkはa16zから280万ドルを調達し、月間743,000件を超える訪問を集めています",
   ],
   en: [
-    "CLOUD — Rork Max compiles Swift on a cloud Mac fleet and streams the simulator to your browser, so no Xcode or Mac is required",
-    "SIM — The streamed simulator runs at 60fps and accepts real touch input in the browser, letting you feel the app without a device",
-    "NATIVE — You get native capabilities like AR and LiDAR scanning, Metal-backed 3D rendering, and on-device inference with Core ML",
-    "WIDGET — Home Screen widgets, Dynamic Island, Live Activities, Siri Intents, HealthKit, NFC, and App Clips are all in reach",
-    "ARR — Rork Max reached $1.5M ARR within three days of its February 2026 launch, a fair signal of demand for native generation",
-    "IOS27 — The iOS 27 public beta arrived in mid-July, so now is the time to check generated apps ahead of the autumn release",
+    "ENGINE — Rork Max generates code on top of Claude Code and Claude Opus 4.6, which is worth knowing when you tune how specific your prompts are",
+    "SPLIT — Rork Max is Apple-only. If you also need Android, the original Rork is the one that generates cross-platform apps with React Native",
+    "DEVICE — Rork Max targets iPhone, iPad, Apple Watch, and Vision Pro, reaching territory React Native struggles to cover",
+    "CREDIT — Billing runs on credits: one credit per AI interaction, reset on the 1st of each month with nothing carried over",
+    "PLAN — Free gives 35 credits a month (5 per day); Junior is $25/mo, Senior $100/mo, and Rork Max $200/mo, with Senior the usual pick for MVP work",
+    "FUND — Rork raised $2.8M from a16z and now draws over 743,000 monthly visits",
   ],
 };
 
