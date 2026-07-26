@@ -1,0 +1,323 @@
+---
+title: "iOS プレリリース版の端末を計測から外して失敗した記録 — 除外ではなく分離するトラック設計"
+slug: "rork-os-prerelease-track-separation-telemetry-release-gate"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-26T11:00"
+author: "Rork Lab"
+description: "OS のプレリリース版を使う端末を計測から除外した結果、正式リリース当日に手掛かりを失いました。除外ではなく os_track で分離し、閾値とリリースゲートを分ける設計を実装コードとともにまとめます。"
+tags: ["Rork", "React Native", "Expo", "計測設計", "リリース運用", "iOS 27"]
+highlights:
+  - "Platform.Version から os_track を判定し、リモート baseline で秋の GA 当日に自動追従させる実装"
+  - "クラッシュフリー率の閾値を ga 99.5% / prerelease 98.0% に分け、アラートの誤発火を止める設計"
+  - "プレリリース由来の不具合を「棚上げ」せずリリースゲートの警告枠で扱う判定コード"
+---
+
+秋の正式リリースが降ってきた翌朝、Crashlytics のダッシュボードを開いて手が止まりました。
+
+前日まで静かだったクラッシュ一覧に、見覚えのないスタックトレースが4種類。しかも新しく出したビルドではなく、2週間前から配信していたバージョンで起きています。
+
+原因を追う手掛かりは、本来なら夏のあいだに溜まっていたはずでした。私自身がその手掛かりを、自分の手で捨てていたのです。
+
+## ベータ端末を「除外」した理由は、当時は筋が通っていました
+
+個人開発で6本のアプリを並行して面倒を見ていると、ダッシュボードを開ける時間は1日に数分しかありません。
+
+そこにノイズが混ざると、判断が鈍ります。OS のパブリックベータを入れている端末は母数こそ小さいものの、クラッシュ率だけは目立って高い。全体のクラッシュフリー率がわずかに下がり、しきい値を割ってアラートが飛ぶ。開いてみるとベータ端末だけの問題で、こちらのビルドは無傷。
+
+この空振りが月に何度か続いたあと、私は計測とクラッシュレポートの初期化時にプレリリース端末を弾く分岐を入れました。数字は静かになりました。
+
+静かになった、という感覚が落とし穴でした。
+
+## 除外は「見えない」を作るだけで、「起きない」は作りません
+
+パブリックベータの利用者は、秋の正式リリース当日に消えるわけではありません。むしろ逆で、その日を境に一般ユーザーが同じメジャーバージョンへ一斉に上がってきます。
+
+つまり夏のあいだにベータ端末で観測できていたはずの不具合は、秋になって初めて、全ユーザー規模で顕在化します。事前に数十件の手掛かりとして受け取れたものを、私は数千件の障害として受け取り直したことになります。
+
+もうひとつ、あとから効いてきた事実があります。ベータ端末で起きていたクラッシュのうち、OS 側の不具合と言えるものは半分もありませんでした。多くは、こちらのコードがこれまで偶然通っていた箇所です。
+
+破棄済みのビューへ非同期完了後に触っていた。日付の書式解析が特定ロケールの実装差に依存していた。オプショナルの強制アンラップが、以前は必ず値の入るパスだった。
+
+OS が変わって初めて表に出ただけで、瑕疵はこちら側にありました。「ベータ由来だから様子見」という札を貼った瞬間に、自分のバグを一件ずつ見送っていたわけです。
+
+## iOS にはベータ判定の公開 API がない、という前提から始めます
+
+作り直すにあたって最初にぶつかったのが、そもそも「この端末はプレリリース版か」を確実に知る手段がない点でした。
+
+React Native の `Platform.Version` から取れるのは、iOS では `"27.0"` のようなバージョン文字列、Android では `36` のような API レベルの数値です。同じプロパティなのに型が違うところが最初のつまずきで、`parseInt` をかけずに比較していると Android 側だけ静かに壊れます。
+
+iOS のベータビルドはビルド番号の末尾に小文字が付く慣習が知られていますが、そのビルド番号自体を標準の公開 API から安定して取る方法がありません。ビルド番号に依存した判定は、取得手段ごと将来壊れる可能性を抱えます。
+
+そこで判定を推定に切り替えました。「自分たちが知っている最新の正式リリース版メジャーバージョン」を基準値として持ち、それより大きいメジャーなら prerelease と見なす。推定なので外れることがあります。外れ方を制御できる形にしておくことが、実装上の主題になりました。
+
+```ts
+// src/telemetry/osTrack.ts
+import { Platform } from "react-native";
+
+export type OsTrack = "ga" | "prerelease" | "unknown";
+
+export type GaBaseline = { ios: number; android: number; updatedAt: string };
+
+/**
+ * 端末 OS のメジャーバージョンを数値で返します。
+ * iOS   : Platform.Version は "27.0" のような文字列
+ * Android: Platform.Version は 36 のような数値（API レベル）
+ * 同じプロパティで型が異なるため、必ず正規化してから比較します。
+ */
+export function parseOsMajor(): number | null {
+  const raw = Platform.Version;
+  if (typeof raw === "number") return raw;
+  const major = Number.parseInt(String(raw), 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+export function resolveOsTrack(baseline: GaBaseline | null): OsTrack {
+  const major = parseOsMajor();
+
+  // 判定材料が欠けたときは prerelease に倒しません。
+  // 倒すと基準値の更新が遅れた瞬間に GA トラックが空になります。
+  if (major === null || baseline === null) return "unknown";
+
+  const knownGa = Platform.OS === "ios" ? baseline.ios : baseline.android;
+  return major > knownGa ? "prerelease" : "ga";
+}
+```
+
+判定不能を `unknown` として独立させた点が、この関数でいちばん時間をかけたところです。真偽値の2値にすると、迷ったときの行き先がどちらかに寄ります。寄せた先が prerelease だと正式版の指標が痩せ、ga だとベータの異常が本番の数字に混ざります。3値目を置くほうが、あとから困りません。
+
+## 基準値はリモートに置き、取れなければ静かに前の値へ戻します
+
+基準値をアプリに焼き込むと、秋の正式リリース当日にアップデートを出すまで、全ユーザーが prerelease 扱いのままになります。ストア審査を挟むと数日ずれます。その数日は、いちばん数字を見たい期間そのものです。
+
+小さな JSON をひとつ配信し、起動時に取りに行く形にしました。取れなければキャッシュ、キャッシュもなければビルド同梱値へ落ちます。
+
+```ts
+// src/telemetry/gaBaseline.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import type { GaBaseline } from "./osTrack";
+
+const CACHE_KEY = "telemetry.gaBaseline.v1";
+const ENDPOINT = "https://config.example.com/ga-baseline.json";
+const TIMEOUT_MS = 2500;
+
+// ビルド時点で判明している正式リリース版のメジャー。
+// リモートも キャッシュも駄目なときの最終地点です。
+const BUNDLED: GaBaseline = { ios: 26, android: 36, updatedAt: "2026-07-01" };
+
+function isValid(v: unknown): v is GaBaseline {
+  const b = v as Partial<GaBaseline> | null;
+  return (
+    !!b &&
+    typeof b.ios === "number" &&
+    typeof b.android === "number" &&
+    b.ios > 0 &&
+    b.android > 0
+  );
+}
+
+export async function loadGaBaseline(): Promise<GaBaseline> {
+  let fallback: GaBaseline = BUNDLED;
+  try {
+    const cached = await AsyncStorage.getItem(CACHE_KEY);
+    const parsed = cached ? JSON.parse(cached) : null;
+    if (isValid(parsed)) fallback = parsed;
+  } catch {
+    // キャッシュが壊れていても起動は止めません
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT, { signal: controller.signal });
+    if (!res.ok) throw new Error(`ga-baseline http ${res.status}`);
+    const next: unknown = await res.json();
+    if (!isValid(next)) throw new Error("ga-baseline shape mismatch");
+    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(next));
+    return next;
+  } catch {
+    return fallback;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+タイムアウトを 2,500 ミリ秒に置いたのは、起動計測を汚さない範囲に収めたかったからです。この処理を起動のクリティカルパスに置くと、それ自体が起動時間の悪化として跳ね返ります。私は初期化を待たずに `unknown` で走らせ、解決後に属性を上書きする順序にしました。この辺りの兼ね合いは[リリースを重ねたら起動が静かに重くなっていたとき — Rork運用で効いたTTI計測と起動バジェットのメモ](/articles/rork-dev/rork-cold-start-regression-tti-instrumentation-startup-budget-field-notes)で扱った起動バジェットの考え方と同じ土俵にあります。
+
+`updatedAt` を持たせているのは飾りではありません。基準値の更新忘れは、実際にいちばん起きやすい事故です。この値が90日以上古ければ運用側に警告を出すようにしています。
+
+## 除外をやめ、すべてのイベントに os_track を載せます
+
+作り直しの本体は拍子抜けするほど短いコードでした。落とすのをやめ、次元をひとつ足しただけです。
+
+```ts
+// src/telemetry/index.ts
+import crashlytics from "@react-native-firebase/crashlytics";
+import analytics from "@react-native-firebase/analytics";
+import { loadGaBaseline } from "./gaBaseline";
+import { parseOsMajor, resolveOsTrack, type OsTrack } from "./osTrack";
+
+let currentTrack: OsTrack = "unknown";
+
+export function getOsTrack(): OsTrack {
+  return currentTrack;
+}
+
+export async function initTelemetry(): Promise<void> {
+  // 解決前のイベントも捨てません。unknown のまま先に送り始めます。
+  await analytics().setUserProperty("os_track", currentTrack);
+
+  const baseline = await loadGaBaseline();
+  currentTrack = resolveOsTrack(baseline);
+
+  const staleDays =
+    (Date.now() - new Date(baseline.updatedAt).getTime()) / 86_400_000;
+
+  await crashlytics().setAttributes({
+    os_track: currentTrack,
+    os_major: String(parseOsMajor() ?? "unknown"),
+    ga_baseline: `${baseline.ios}/${baseline.android}`,
+    baseline_stale_days: String(Math.floor(staleDays)),
+  });
+
+  await analytics().setUserProperty("os_track", currentTrack);
+}
+```
+
+`baseline_stale_days` をクラッシュ属性に入れておくと、あとで「この端末はどの基準値で判定されたのか」を事後に追えます。判定ロジックを疑うべき局面で、疑うための材料が残ります。
+
+Analytics 側をユーザープロパティにしたのは、既存レポートを壊さずに済むからです。イベントパラメータとして足すと、過去に定義したファネルやオーディエンスの側を作り直す必要が出ます。ユーザープロパティなら、既存のレポートに絞り込みを一段重ねるだけで分離できます。
+
+## 閾値とアラート先をトラックごとに分けます
+
+ここまでで数字は分離されました。残るのは、分離した数字にどう反応するかです。
+
+<table>
+  <thead>
+    <tr>
+      <th>トラック</th>
+      <th>クラッシュフリー率の閾値</th>
+      <th>通知</th>
+      <th>リリース判断への反映</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>ga</strong></td>
+      <td>99.5% を下回ったら即時</td>
+      <td>常用の通知先へ即時</td>
+      <td>段階公開の停止・ロールバックを検討</td>
+    </tr>
+    <tr>
+      <td><strong>prerelease</strong></td>
+      <td>98.0% を下回ったら日次サマリ</td>
+      <td>別チャンネルへ1日1回</td>
+      <td>公開は止めず、次のビルドの是正対象へ</td>
+    </tr>
+    <tr>
+      <td><strong>unknown</strong></td>
+      <td>閾値なし・比率のみ監視</td>
+      <td>通知なし</td>
+      <td>比率が全体の5%を超えたら判定側を疑う</td>
+    </tr>
+  </tbody>
+</table>
+
+prerelease の閾値を 98.0% と緩めたのは、諦めたからではありません。母数が小さいときに 99.5% を当てると、1件のクラッシュで閾値を割ります。割った通知が続くと人は通知を無視するようになり、無視される監視は無いのと同じになります。
+
+`unknown` に閾値を置かず比率だけを見るのは、ここが増えること自体が「判定が壊れている」という別の信号だからです。私の運用では 5% を目安にしています。ネットワークが不安定な地域の比率や、`updatedAt` の古さと合わせて見ると、原因の切り分けが早くなります。
+
+## リリースゲートでは、止める条件と直す条件を分けます
+
+段階公開を次の段へ進めるかどうかの判定にも、同じ分離を持ち込みました。prerelease の数字で公開を止めることはしません。ただし、黙って通り過ぎることもさせません。
+
+```ts
+// scripts/releaseGate.ts
+export type TrackStats = {
+  track: "ga" | "prerelease" | "unknown";
+  sessions: number;
+  crashFreeRate: number; // 0.0 〜 1.0
+};
+
+export type GateResult = {
+  pass: boolean;
+  blockers: string[];
+  warnings: string[];
+};
+
+const GA_MIN_SESSIONS = 500;
+const GA_MIN_CRASH_FREE = 0.995;
+const PRE_MIN_SESSIONS = 50;
+const PRE_MIN_CRASH_FREE = 0.98;
+const UNKNOWN_MAX_SHARE = 0.05;
+
+const pct = (v: number) => `${(v * 100).toFixed(2)}%`;
+
+export function evaluateGate(stats: TrackStats[]): GateResult {
+  const blockers: string[] = [];
+  const warnings: string[] = [];
+
+  const byTrack = (t: TrackStats["track"]) => stats.find((s) => s.track === t);
+  const total = stats.reduce((sum, s) => sum + s.sessions, 0);
+
+  const ga = byTrack("ga");
+  if (!ga || ga.sessions < GA_MIN_SESSIONS) {
+    blockers.push(
+      `GA トラックのセッションが ${ga?.sessions ?? 0} 件で、判断材料が足りません（${GA_MIN_SESSIONS} 件以上が必要）`
+    );
+  } else if (ga.crashFreeRate < GA_MIN_CRASH_FREE) {
+    blockers.push(
+      `GA クラッシュフリー率 ${pct(ga.crashFreeRate)} が閾値 ${pct(GA_MIN_CRASH_FREE)} を下回っています`
+    );
+  }
+
+  // プレリリースは公開を止める条件にしませんが、是正キューには必ず積みます
+  const pre = byTrack("prerelease");
+  if (pre && pre.sessions >= PRE_MIN_SESSIONS && pre.crashFreeRate < PRE_MIN_CRASH_FREE) {
+    warnings.push(
+      `prerelease クラッシュフリー率 ${pct(pre.crashFreeRate)} — 正式リリース前に是正対象へ`
+    );
+  }
+
+  const unknown = byTrack("unknown");
+  if (unknown && total > 0 && unknown.sessions / total > UNKNOWN_MAX_SHARE) {
+    warnings.push(
+      `unknown が全体の ${pct(unknown.sessions / total)} を占めています — 基準値の配信を確認してください`
+    );
+  }
+
+  return { pass: blockers.length === 0, blockers, warnings };
+}
+```
+
+`warnings` を戻り値に含めながら `pass` の判定からは外している点が、この関数の設計意図そのものです。止める条件と直す条件を同じ配列に入れると、運用者は必ずどちらかに寄せます。多くの場合、緩いほうへ寄ります。
+
+警告を消化する先も決めておく必要があります。私は次のビルドのマイルストーンに直接積む運用にしました。行き先の無い警告は、3回目までに読まれなくなります。
+
+## 運用してみて、予想と逆だったこと
+
+3つあります。
+
+1つ目。プレリリース端末で最初に噴き出したのは、OS の新機能に関わるコードではなく、何年も触っていない古い画面でした。新機能は身構えて書くぶん、想定の外へ出にくい。危ないのは、動いていることを疑わなくなったコードのほうでした。
+
+2つ目。ノイズは、分離したら消えました。除外していた頃に感じていた煩わしさの正体は、ベータ端末の存在そのものではなく、「同じ通知先に混ざって届くこと」でした。宛先を分けただけで、同じ件数の情報が判断材料に変わりました。除外という手段は、実は問題の形と噛み合っていなかったのです。
+
+3つ目。基準値の更新は、思っていたより忘れます。1回目の正式リリース当日、私は基準値の JSON を差し替えるのを半日ほど失念していました。その間、正式版へ上げたユーザーが prerelease として集計され続けます。`unknown` へのフォールバックと `baseline_stale_days` の記録を入れておいたおかげで、集計を後から補正できました。仕組みの側で人の忘却を吸収しておく判断は、入れておいて良かったと感じています。
+
+どのビルドでいつ入った変更なのかを追う話は、[どの生成でこの不具合が入ったのか — Rork アプリに生成来歴を刻む長期運用設計](/articles/rork-dev/rork-generation-provenance-build-stamp-regression-triage-design)で扱った来歴スタンプと組み合わせると、切り分けがさらに短くなります。os_track と生成来歴の両方をクラッシュ属性に持たせておくと、「どの OS 世代で、どの生成のコードが壊れているか」を1回の絞り込みで出せます。
+
+## 正式リリースの前にやっておくこと
+
+iOS 27 のパブリックベータは7月中旬に公開され、秋の正式リリースまでの猶予はもう長くありません。App Store に出しているアプリを抱えている立場としては、この夏のうちに次の順で手を入れておくと落ち着きます。
+
+1. `os_track` の判定と付与を実装し、まず `unknown` を含む3値がクラッシュ属性へ届いていることを実機で確認する
+2. 基準値の JSON を配信し、値を1つ上げたときに端末側の判定が変わることを試す（更新経路の検証はここでしかできません）
+3. アラートの宛先を ga と prerelease で分け、prerelease は日次サマリに落とす
+4. 既存の段階公開チェックへ `evaluateGate` 相当の判定を差し込み、blockers と warnings を別々に表示する
+5. 正式リリース日をカレンダーに入れ、基準値 JSON の差し替えを当日のタスクとして明示的に置く
+
+除外の分岐を消すだけなら、作業は1時間もかかりません。時間がかかるのは、分離したあとの数字にどう反応するかを決める部分です。そこを決めずに次元だけ足すと、見えるノイズが増えただけで終わります。
+
+私はひと夏ぶんの手掛かりを捨てて、そのことを秋に知りました。同じ回り道を省くための記録として、どなたかの運用設計の役に立てば嬉しく思います。お読みいただきありがとうございました。

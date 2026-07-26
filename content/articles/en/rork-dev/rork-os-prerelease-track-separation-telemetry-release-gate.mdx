@@ -1,0 +1,321 @@
+---
+title: "What Filtering Out Prerelease OS Devices Cost Me — Separating Telemetry Tracks Instead of Dropping Them"
+slug: "rork-os-prerelease-track-separation-telemetry-release-gate"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-26T11:00"
+author: "Rork Lab"
+description: "Filtering prerelease OS devices out of telemetry left me with no warning signs on GA day. Here is the rebuild: an os_track dimension, a remote GA baseline, split alert thresholds, and a release gate that separates blockers from fixes."
+tags: ["Rork", "React Native", "Expo", "Telemetry", "Release Engineering", "iOS 27"]
+highlights:
+  - "Deriving os_track from Platform.Version with a remote GA baseline that self-corrects on GA day"
+  - "Split crash-free thresholds — 99.5% for ga, 98.0% for prerelease — so alerts stop crying wolf"
+  - "A release gate that keeps prerelease findings in warnings instead of quietly shelving them"
+---
+
+The morning after the fall OS release shipped, I opened Crashlytics and stopped scrolling.
+
+Four unfamiliar stack traces sat at the top of a list that had been quiet the day before. They weren't from the build I had just pushed. They were from a version that had been live for two weeks.
+
+The evidence I needed had been available all summer. I had thrown it away myself.
+
+## Filtering them out made sense at the time
+
+Running six apps solo as an indie developer, I get maybe a few minutes a day with a dashboard open. Noise in that window is expensive.
+
+Devices on the public OS beta were a small slice of sessions but carried a visibly worse crash rate. That slice dragged the overall crash-free number just below my alert threshold. The alert fired, I opened it, and every time the answer was the same: a beta-only problem, my build untouched.
+
+After the third or fourth false alarm in a month, I added a branch that skipped telemetry and crash reporting initialization on prerelease devices. The numbers went quiet.
+
+That quiet is what I would undo if I could pick one decision to take back.
+
+## Filtering creates "invisible," not "not happening"
+
+People on the public beta don't disappear when the OS ships. The opposite happens: on release day, the general population upgrades onto the same major version all at once.
+
+Every defect those beta devices could have shown me over the summer — a few dozen reports, spread across weeks, with time to fix them — arrived instead as a few thousand reports in a single morning.
+
+There's a second thing I only understood in hindsight. Fewer than half of the crashes on beta devices were actually OS bugs. Most were places where my own code had been getting away with something.
+
+An async completion touching a view that had already been torn down. Date parsing that leaned on locale-specific implementation details. A force-unwrap on a path where the value had always happened to be there.
+
+The OS change just surfaced them. Labeling a crash "beta-related, revisit later" was, in practice, me waving my own bugs through one at a time.
+
+## There is no public API that tells you a device is on a beta
+
+The first wall I hit while rebuilding was that iOS gives you no reliable way to ask this question.
+
+`Platform.Version` in React Native returns a version string like `"27.0"` on iOS and a number like `36` — the API level — on Android. Same property, different types. Comparing it without normalizing first breaks Android silently, which is exactly the kind of bug that survives review.
+
+iOS beta builds are known to carry a lowercase suffix on the build number, but there's no stable public API that hands you that build number. Any check built on it inherits the fragility of however you scraped it.
+
+So I switched to inference. Keep a baseline of the newest major version I know has shipped generally, and treat anything above it as prerelease. Inference is sometimes wrong. Making it wrong in a controlled direction became the actual design problem.
+
+```ts
+// src/telemetry/osTrack.ts
+import { Platform } from "react-native";
+
+export type OsTrack = "ga" | "prerelease" | "unknown";
+
+export type GaBaseline = { ios: number; android: number; updatedAt: string };
+
+/**
+ * Returns the device OS major version as a number.
+ * iOS     : Platform.Version is a string such as "27.0"
+ * Android : Platform.Version is a number such as 36 (API level)
+ * Same property, different types — normalize before comparing.
+ */
+export function parseOsMajor(): number | null {
+  const raw = Platform.Version;
+  if (typeof raw === "number") return raw;
+  const major = Number.parseInt(String(raw), 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+export function resolveOsTrack(baseline: GaBaseline | null): OsTrack {
+  const major = parseOsMajor();
+
+  // Never default to "prerelease" when inputs are missing.
+  // The moment the baseline goes stale, that default empties your GA track.
+  if (major === null || baseline === null) return "unknown";
+
+  const knownGa = Platform.OS === "ios" ? baseline.ios : baseline.android;
+  return major > knownGa ? "prerelease" : "ga";
+}
+```
+
+Giving "can't tell" its own value is the part of this function I spent the most time on. With a boolean, uncertainty has to land somewhere. Land it on prerelease and your production numbers thin out; land it on ga and beta anomalies contaminate the metric you page on. A third value costs almost nothing and saves you later.
+
+## Ship the baseline remotely, and fail backward quietly
+
+Baking the baseline into the binary means every user stays classified as prerelease until you ship an update on GA day. With review time, that's several days — the exact days you most want the data.
+
+I serve a small JSON file and fetch it at startup. If the fetch fails, fall back to cache; if the cache is missing or malformed, fall back to a bundled value.
+
+```ts
+// src/telemetry/gaBaseline.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import type { GaBaseline } from "./osTrack";
+
+const CACHE_KEY = "telemetry.gaBaseline.v1";
+const ENDPOINT = "https://config.example.com/ga-baseline.json";
+const TIMEOUT_MS = 2500;
+
+// What was generally available at build time. The last resort when
+// both the network and the cache let us down.
+const BUNDLED: GaBaseline = { ios: 26, android: 36, updatedAt: "2026-07-01" };
+
+function isValid(v: unknown): v is GaBaseline {
+  const b = v as Partial<GaBaseline> | null;
+  return (
+    !!b &&
+    typeof b.ios === "number" &&
+    typeof b.android === "number" &&
+    b.ios > 0 &&
+    b.android > 0
+  );
+}
+
+export async function loadGaBaseline(): Promise<GaBaseline> {
+  let fallback: GaBaseline = BUNDLED;
+  try {
+    const cached = await AsyncStorage.getItem(CACHE_KEY);
+    const parsed = cached ? JSON.parse(cached) : null;
+    if (isValid(parsed)) fallback = parsed;
+  } catch {
+    // A corrupt cache must never block startup
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(ENDPOINT, { signal: controller.signal });
+    if (!res.ok) throw new Error(`ga-baseline http ${res.status}`);
+    const next: unknown = await res.json();
+    if (!isValid(next)) throw new Error("ga-baseline shape mismatch");
+    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(next));
+    return next;
+  } catch {
+    return fallback;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+I capped the timeout at 2,500 ms to keep this off the startup critical path. A telemetry init that blocks first render turns into a launch-time regression, which is its own kind of self-inflicted wound — the same budget thinking I wrote up in [When Your App's Launch Got Quietly Slower Release After Release](/articles/rork-dev/rork-cold-start-regression-tti-instrumentation-startup-budget-field-notes) applies directly here. I start reporting as `unknown` and overwrite the attributes once the baseline resolves.
+
+The `updatedAt` field isn't decoration. Forgetting to bump the baseline is the single most likely operational failure in this design, and I surface a warning when the value is more than 90 days old.
+
+## Stop dropping. Add a dimension instead.
+
+The rebuild itself was anticlimactically small. I deleted the skip branch and added one attribute.
+
+```ts
+// src/telemetry/index.ts
+import crashlytics from "@react-native-firebase/crashlytics";
+import analytics from "@react-native-firebase/analytics";
+import { loadGaBaseline } from "./gaBaseline";
+import { parseOsMajor, resolveOsTrack, type OsTrack } from "./osTrack";
+
+let currentTrack: OsTrack = "unknown";
+
+export function getOsTrack(): OsTrack {
+  return currentTrack;
+}
+
+export async function initTelemetry(): Promise<void> {
+  // Events fired before resolution are still worth keeping — send them as unknown.
+  await analytics().setUserProperty("os_track", currentTrack);
+
+  const baseline = await loadGaBaseline();
+  currentTrack = resolveOsTrack(baseline);
+
+  const staleDays =
+    (Date.now() - new Date(baseline.updatedAt).getTime()) / 86_400_000;
+
+  await crashlytics().setAttributes({
+    os_track: currentTrack,
+    os_major: String(parseOsMajor() ?? "unknown"),
+    ga_baseline: `${baseline.ios}/${baseline.android}`,
+    baseline_stale_days: String(Math.floor(staleDays)),
+  });
+
+  await analytics().setUserProperty("os_track", currentTrack);
+}
+```
+
+Recording `baseline_stale_days` on the crash report means that when you later suspect the classifier itself, the evidence for that suspicion is sitting right there in the report.
+
+I attached the analytics side as a user property rather than an event parameter on purpose. Event parameters would force me to rebuild funnels and audiences I had already defined. A user property layers a filter on top of reports that keep working.
+
+## Split the thresholds and the notification channels
+
+Separating the numbers is only half of it. The other half is deciding how you react to each one.
+
+<table>
+  <thead>
+    <tr>
+      <th>Track</th>
+      <th>Crash-free threshold</th>
+      <th>Notification</th>
+      <th>Effect on release decisions</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>ga</strong></td>
+      <td>Alert below 99.5%</td>
+      <td>Immediate, to the primary channel</td>
+      <td>Halt phased rollout, consider rollback</td>
+    </tr>
+    <tr>
+      <td><strong>prerelease</strong></td>
+      <td>Alert below 98.0%</td>
+      <td>Once daily, to a separate channel</td>
+      <td>Never blocks release; queued for the next build</td>
+    </tr>
+    <tr>
+      <td><strong>unknown</strong></td>
+      <td>No threshold — track share only</td>
+      <td>None</td>
+      <td>Above 5% of sessions, suspect the classifier</td>
+    </tr>
+  </tbody>
+</table>
+
+Loosening prerelease to 98.0% isn't resignation. With a small denominator, a 99.5% threshold trips on a single crash. Alerts that trip constantly get ignored, and an ignored monitor is indistinguishable from no monitor.
+
+`unknown` gets no threshold because its share is itself the signal: when it grows, the classification is broken, not the app. I watch 5% as the line. Reading it alongside `baseline_stale_days` usually tells me within a minute whether the cause is a stale baseline or flaky connectivity in a particular region.
+
+## In the release gate, blockers and fixes are different lists
+
+I brought the same separation into the check that decides whether a phased rollout advances. Prerelease numbers never hold a release. They also never pass by unnoticed.
+
+```ts
+// scripts/releaseGate.ts
+export type TrackStats = {
+  track: "ga" | "prerelease" | "unknown";
+  sessions: number;
+  crashFreeRate: number; // 0.0 – 1.0
+};
+
+export type GateResult = {
+  pass: boolean;
+  blockers: string[];
+  warnings: string[];
+};
+
+const GA_MIN_SESSIONS = 500;
+const GA_MIN_CRASH_FREE = 0.995;
+const PRE_MIN_SESSIONS = 50;
+const PRE_MIN_CRASH_FREE = 0.98;
+const UNKNOWN_MAX_SHARE = 0.05;
+
+const pct = (v: number) => `${(v * 100).toFixed(2)}%`;
+
+export function evaluateGate(stats: TrackStats[]): GateResult {
+  const blockers: string[] = [];
+  const warnings: string[] = [];
+
+  const byTrack = (t: TrackStats["track"]) => stats.find((s) => s.track === t);
+  const total = stats.reduce((sum, s) => sum + s.sessions, 0);
+
+  const ga = byTrack("ga");
+  if (!ga || ga.sessions < GA_MIN_SESSIONS) {
+    blockers.push(
+      `GA track has ${ga?.sessions ?? 0} sessions — not enough to decide on (need ${GA_MIN_SESSIONS})`
+    );
+  } else if (ga.crashFreeRate < GA_MIN_CRASH_FREE) {
+    blockers.push(
+      `GA crash-free rate ${pct(ga.crashFreeRate)} is below ${pct(GA_MIN_CRASH_FREE)}`
+    );
+  }
+
+  // Prerelease never blocks, but always lands in the fix queue
+  const pre = byTrack("prerelease");
+  if (pre && pre.sessions >= PRE_MIN_SESSIONS && pre.crashFreeRate < PRE_MIN_CRASH_FREE) {
+    warnings.push(
+      `prerelease crash-free rate ${pct(pre.crashFreeRate)} — fix before the OS ships`
+    );
+  }
+
+  const unknown = byTrack("unknown");
+  if (unknown && total > 0 && unknown.sessions / total > UNKNOWN_MAX_SHARE) {
+    warnings.push(
+      `unknown is ${pct(unknown.sessions / total)} of sessions — check baseline delivery`
+    );
+  }
+
+  return { pass: blockers.length === 0, blockers, warnings };
+}
+```
+
+Returning `warnings` while excluding them from `pass` is the whole point of the function. Put "stop the release" and "fix this soon" in one list and whoever is on call will collapse them into one meaning — usually the more permissive one.
+
+Warnings also need a destination. Mine go straight onto the next build's milestone. A warning with nowhere to go stops being read by the third occurrence.
+
+## Three things that ran opposite to my expectations
+
+The first crashes to surface on prerelease devices weren't in code touching new OS features. They were in screens I hadn't opened in years. New-feature code gets written carefully because you know you don't know it. The dangerous code is whatever you stopped questioning.
+
+Second: the noise disappeared once I separated the tracks. What had actually annoyed me back when I was filtering wasn't the existence of beta devices — it was that their reports arrived mixed into the same channel as everything else. Changing the destination turned the same volume of information into something I could act on. Filtering had never matched the shape of the problem.
+
+Third: I forgot to update the baseline. On the first GA day under this design, the JSON sat unchanged for roughly half a day while users upgrading to the shipped version kept getting counted as prerelease. The `unknown` fallback and `baseline_stale_days` made the retroactive correction straightforward. Building the system to absorb my own forgetfulness turned out to be the most valuable decision in the whole rewrite.
+
+Pairing `os_track` with build provenance makes triage faster still — the stamping approach in [Which Generation Introduced This Bug?](/articles/rork-dev/rork-generation-provenance-build-stamp-regression-triage-design) combines cleanly with this one. With both attributes on the crash report, "which OS generation, which generated code" becomes a single filter instead of two investigations.
+
+## What to do before the OS ships
+
+The iOS 27 public beta arrived in mid-July, and the runway to the fall release is short. If you have apps live on the App Store, this order has worked well for me:
+
+1. Implement `os_track` resolution and attachment, then verify on a real device that all three values — including `unknown` — reach your crash attributes
+2. Serve the baseline JSON and bump one value to confirm the device-side classification actually changes (this is the only way to test the update path)
+3. Split the alert destinations for ga and prerelease, and drop prerelease to a daily digest
+4. Wire an `evaluateGate`-equivalent check into your phased rollout review, rendering blockers and warnings in separate sections
+5. Put the OS release date on the calendar with "swap the baseline JSON" as an explicit task for that day
+
+Deleting the filter branch takes under an hour. What takes real time is deciding how you'll respond to the separated numbers. Skip that and you've only added visible noise.
+
+I spent a summer's worth of evidence learning this, and found out in the fall. If it saves you the same detour, the write-up has done its job.
