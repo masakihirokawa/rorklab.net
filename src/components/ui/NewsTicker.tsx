@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ENGINE — Rork Maxのコード生成はClaude CodeとClaude Opus 4.6を土台にしています。プロンプトの粒度を考えるうえで押さえておきたい前提です",
-    "SPLIT — Rork MaxはAppleプラットフォーム専用です。Androidも必要なら、React Nativeでクロスプラットフォームを生成する従来のRorkを選ぶことになります",
-    "DEVICE — Rork MaxはiPhone・iPad・Apple Watch・Vision Proを対象にできます。React Nativeからは届きにくかった領域まで生成対象に入ります",
-    "CREDIT — 課金はクレジット制で、AIとのやり取り1回につき1クレジットを消費します。毎月1日にリセットされ、繰り越しはできません",
-    "PLAN — 無料は月35クレジット（1日5）、Juniorは月$25、Seniorは月$100、Rork Maxは月$200です。MVPの作り込みはSeniorが目安とされています",
-    "FUND — Rorkはa16zから280万ドルを調達し、月間743,000件を超える訪問を集めています",
+    "SDK57 — Expo SDK 57 が公開され、React Native が 0.85 から 0.86 に上がりました。React 19.2 は据え置きで、破壊的変更はない想定です",
+    "CADENCE — 大きな更新の合間に、壊れない小さな更新を挟む新しいリリース間隔への移行がうかがえます。追従の負担が読みやすくなります",
+    "RN086 — React Native 0.86 では Android の edge-to-edge 対応の修正、DevTools のライト/ダーク切り替え、描画・レイアウト・アニメーションの改善が入りました",
+    "PREBUILD — expo prebuild にネイティブディレクトリの消去と再生成の改善が入り、expo-dev-client も iOS 側が強化されています",
+    "IOS27 — iOS 27 は 7月20日に beta 4、7月22日からパブリックベータが配信されています。秋の正式版に向けて生成したアプリの動作確認を進める時期です",
+    "AND17 — Android 17 から従来の Developer Preview が廃止され、継続更新される Canary ビルドに一本化されました",
   ],
   en: [
-    "ENGINE — Rork Max generates code on top of Claude Code and Claude Opus 4.6, which is worth knowing when you tune how specific your prompts are",
-    "SPLIT — Rork Max is Apple-only. If you also need Android, the original Rork is the one that generates cross-platform apps with React Native",
-    "DEVICE — Rork Max targets iPhone, iPad, Apple Watch, and Vision Pro, reaching territory React Native struggles to cover",
-    "CREDIT — Billing runs on credits: one credit per AI interaction, reset on the 1st of each month with nothing carried over",
-    "PLAN — Free gives 35 credits a month (5 per day); Junior is $25/mo, Senior $100/mo, and Rork Max $200/mo, with Senior the usual pick for MVP work",
-    "FUND — Rork raised $2.8M from a16z and now draws over 743,000 monthly visits",
+    "SDK57 — Expo SDK 57 landed, moving React Native from 0.85 to 0.86 while React stays at 19.2, and it is meant to ship no breaking changes",
+    "CADENCE — The release hints at a new cadence: small, non-breaking upgrades slotted between the larger SDK releases, which makes keeping up easier to plan",
+    "RN086 — React Native 0.86 highlights include edge-to-edge fixes on Android, light and dark mode emulation in React Native DevTools, and rendering, layout, and animation fixes",
+    "PREBUILD — expo prebuild improved how it clears and regenerates native directories, and expo-dev-client picked up iOS enhancements",
+    "IOS27 — iOS 27 reached beta 4 on July 20 and opened to public beta testers on July 22, so it is time to check generated apps ahead of the autumn release",
+    "AND17 — Starting with Android 17, traditional Developer Previews are gone, replaced by continuously updated Canary builds",
   ],
 };
 
