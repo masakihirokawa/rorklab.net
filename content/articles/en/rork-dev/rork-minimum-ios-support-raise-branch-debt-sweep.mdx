@@ -1,0 +1,435 @@
+---
+title: "When to Raise Your Minimum iOS Version — Count Leftover Branches, Not User Percentages"
+slug: "rork-minimum-ios-support-raise-branch-debt-sweep"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-27T11:00"
+author: "Rork Lab"
+description: "Judging a minimum OS bump by usage share produces the same answer every year, so the decision never happens. Here is the annotation convention, the sweep script that counts how many branches each candidate floor would retire, and what to watch for 30 days after."
+tags: ["Rork", "Expo", "React Native", "Maintenance", "iOS", "Long-term Operations"]
+highlights:
+  - "The full sweep script that reads @drop-when annotations and reports how many OS branches each candidate minimum would let you delete"
+  - "A three-level exit code design that fails CI on stale branches left behind after a bump, plus the GitHub Actions wiring"
+  - "Why your crash-free rate improves right after a bump, and why recording that as a win will distort next year's decision"
+---
+
+Last autumn I opened the same spreadsheet I had opened the two autumns before it.
+
+I pasted in the session share by OS version from App Store Connect and looked at the oldest row. 0.9 percent. The year before it was 1.4, and before that 2.1. The number was shrinking on schedule.
+
+The conclusion never did. "Still can't drop it," I typed, and closed the sheet.
+
+By the third year I understood that my judgment wasn't the problem. The metric was. Usage share tells you how many people you would stop reaching. It says nothing at all about what you keep carrying if you don't.
+
+## Usage share can only argue for waiting
+
+When you maintain several apps on your own, decisions get made in whatever minutes are left over. That's exactly why a single number is so tempting.
+
+The trouble is that usage share only pushes in one direction.
+
+Say your threshold is 1 percent. At 0.9 percent, can you actually pull the trigger? No — you tell yourself it'll be 0.5 next year, so wait. At 0.5 percent you say something different but equivalent: is it really worth taking on release risk to cut a mere half a percent? The denominator shrinks, the pain of cutting shrinks with it, and your internal threshold quietly shrinks right alongside both.
+
+I run six wallpaper apps in parallel. The cost of deferring was accumulating six times over, in a place I wasn't looking.
+
+That place is the branches that paper over OS generation differences.
+
+```tsx
+// A real example, simplified
+if (Number.parseInt(String(Platform.Version), 10) >= 17) {
+  await Sharing.shareAsync(uri, { UTI: 'public.png' });
+} else {
+  // Older OS closes the multi-select share sheet halfway through, so send one at a time
+  for (const one of uris) {
+    await Sharing.shareAsync(one, { UTI: 'public.png' });
+  }
+}
+```
+
+That branch was correct the day it was written. The problem is that nowhere in the codebase does it say when it becomes safe to delete.
+
+Six months later, I can't tell whether the `else` path is still load-bearing. Because I can't tell, I don't delete it. Because I don't delete it, every future change to this screen means verifying both paths.
+
+So the real cost of deferring never showed up as lost users. It showed up as a count of branches I couldn't retire.
+
+Which suggested an obvious move: count them directly, and let that count be the input to the decision instead of usage share.
+
+## Give the branches one place to live
+
+The first step was deciding where OS checks are allowed to be written, and in what form.
+
+Instead of reading `Platform.Version` from every screen, I wrapped it in a comparison function. Element-wise numeric comparison, so that string ordering never turns `"9.0"` into something greater than `"10.0"`.
+
+```ts
+// src/lib/os.ts
+import { Platform } from 'react-native';
+
+const parse = (v: string | number): number[] =>
+  String(v).split('.').map((n) => Number.parseInt(n, 10) || 0);
+
+/** True when the running iOS is at least `target`. Always false off iOS. */
+export function atLeastIOS(target: string): boolean {
+  if (Platform.OS !== 'ios') return false;
+  const cur = parse(Platform.Version);
+  const req = parse(target);
+  for (let i = 0; i < Math.max(cur.length, req.length); i++) {
+    const a = cur[i] ?? 0;
+    const b = req[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+```
+
+I ran the comparison logic against the boundary cases before trusting it: a bare `"17"` with the minor omitted, `"17.0.1"` against `"17.1"`, `"16.4"` against `"16.4.1"`. Seven cases, all matching expectations. Version comparison looks obviously right the moment you write it and falls apart the moment a third component appears.
+
+The floor itself lives in exactly one file.
+
+```ts
+// src/config/supportMatrix.ts
+// The OS floor this app officially supports. This file is the single source of truth.
+// Never change it without running os-sweep first.
+export const MIN_OS = {
+  ios: '16.0',
+  android: 31,
+} as const;
+```
+
+And every OS branch carries an annotation:
+
+```tsx
+// @drop-when ios>=17.0 -- multi-select share sheet closes early below 17.0
+if (!atLeastIOS('17.0')) {
+  return <LegacyShareSheet uris={uris} />;
+}
+```
+
+The format is deliberately trivial: `@drop-when ios>=X`, then `--`, then the reason.
+
+What matters isn't the rigor of the syntax. It's that "when can this go" and "why does this exist" sit two characters away from the branch itself. With both present, future-you can make the call in seconds.
+
+## Count what each candidate floor would retire
+
+Once the annotations exist, the rest is arithmetic.
+
+The script below walks `src`, collects the annotations, and reports a cumulative count of how many branches disappear at each candidate floor. It also flags two failure modes: annotations that have already fallen below the current floor, and untagged OS checks that the inventory can't see.
+
+```js
+#!/usr/bin/env node
+// scripts/os-sweep.mjs
+// Inventory of OS branches. Answers: if I raise the floor to X,
+// how many branches can I delete?
+import { readFileSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
+import { join, extname, relative } from 'node:path';
+
+const ROOT = process.argv[2] ?? 'src';
+const MATRIX = process.argv[3] ?? 'src/config/supportMatrix.ts';
+const EXT = new Set(['.ts', '.tsx', '.js', '.jsx']);
+const SKIP = new Set(['node_modules', '.git', 'ios', 'android', 'dist', '.expo']);
+const TAG = /@drop-when\s+ios>=\s*([0-9]+(?:\.[0-9]+){0,2})(?:\s*--\s*(.*))?/;
+const CALL = /atLeastIOS\(\s*['"]([0-9]+(?:\.[0-9]+){0,2})['"]\s*\)/;
+
+/** "16.4" becomes 160400 so versions compare as integers. Bad input returns null. */
+function toNum(v) {
+  const parts = String(v).split('.').map((n) => Number.parseInt(n, 10));
+  if (parts.some((n) => !Number.isInteger(n) || n < 0)) return null;
+  const [a = 0, b = 0, c = 0] = parts;
+  return a * 10000 + b * 100 + c;
+}
+
+function readMinIOS(path) {
+  let src;
+  try {
+    src = readFileSync(path, 'utf8');
+  } catch (e) {
+    throw new Error(`cannot read the OS floor definition: ${path} (${e.code ?? e.message})`);
+  }
+  const m = src.match(/ios\s*:\s*['"]([0-9][0-9.]*)['"]/);
+  if (!m) throw new Error(`no ios: "x.y" definition found in ${path}`);
+  const n = toNum(m[1]);
+  if (n === null) throw new Error(`invalid ios value in ${path}: ${m[1]}`);
+  return { raw: m[1], num: n };
+}
+
+async function* walk(dir) {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    throw e;
+  }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) {
+      if (SKIP.has(e.name)) continue;
+      yield* walk(p);
+    } else if (EXT.has(extname(e.name))) {
+      yield p;
+    }
+  }
+}
+
+let min;
+try {
+  min = readMinIOS(MATRIX);
+} catch (e) {
+  console.error(`os-sweep: ${e.message}`);
+  process.exit(2);
+}
+
+const tagged = [];   // annotated, above the floor
+const untagged = []; // OS checks with no annotation
+const stale = [];    // already below the floor, deletable today
+
+for await (const file of walk(ROOT)) {
+  const lines = readFileSync(file, 'utf8').split('\n');
+  const annotated = new Set();
+  lines.forEach((line, i) => {
+    const t = line.match(TAG);
+    if (t) {
+      const num = toNum(t[1]);
+      if (num === null) {
+        console.error(`  ! malformed version: ${relative('.', file)}:${i + 1} -> ${t[1]}`);
+        return;
+      }
+      const rec = {
+        file: relative('.', file), line: i + 1,
+        version: t[1], num, reason: (t[2] ?? '').trim(),
+      };
+      // Treat the next three lines as the branch this annotation guards
+      for (let k = i; k < Math.min(i + 4, lines.length); k++) annotated.add(k);
+      (num <= min.num ? stale : tagged).push(rec);
+    }
+    if (CALL.test(line) && !annotated.has(i)) {
+      untagged.push({ file: relative('.', file), line: i + 1, version: line.match(CALL)[1] });
+    }
+  });
+}
+
+const byVersion = new Map();
+for (const t of tagged) byVersion.set(t.version, (byVersion.get(t.version) ?? 0) + 1);
+const sorted = [...byVersion.entries()].sort((a, b) => toNum(a[0]) - toNum(b[0]));
+
+console.log(`current minimum iOS: ${min.raw}`);
+console.log(`annotated OS branches: ${tagged.length} / untagged: ${untagged.length}`);
+console.log('');
+console.log('branches retired per candidate floor (cumulative):');
+let acc = 0;
+for (const [v, n] of sorted) {
+  acc += n;
+  console.log(`  raise to iOS ${v.padEnd(6)} -> ${String(acc).padStart(3)} branches go away`);
+}
+if (stale.length) {
+  console.log('');
+  console.log(`WARN ${stale.length} branch(es) already below the floor (${min.raw}) and deletable now:`);
+  for (const s of stale) console.log(`  ${s.file}:${s.line}  ios>=${s.version}  ${s.reason}`);
+}
+if (untagged.length) {
+  console.log('');
+  console.log(`WARN ${untagged.length} untagged OS branch(es) — invisible to this inventory:`);
+  for (const u of untagged) console.log(`  ${u.file}:${u.line}  atLeastIOS('${u.version}')`);
+}
+process.exitCode = stale.length > 0 ? 1 : 0;
+```
+
+Run against a sample tree, it prints this:
+
+```text
+$ node scripts/os-sweep.mjs src src/config/supportMatrix.ts
+current minimum iOS: 16.0
+annotated OS branches: 3 / untagged: 1
+
+branches retired per candidate floor (cumulative):
+  raise to iOS 16.4   ->   1 branches go away
+  raise to iOS 17.0   ->   2 branches go away
+  raise to iOS 18.0   ->   3 branches go away
+
+WARN 1 branch(es) already below the floor (16.0) and deletable now:
+  src/screens/Settings.tsx:2  ios>=15.0  left behind after the last bump
+
+WARN 1 untagged OS branch(es) — invisible to this inventory:
+  src/lib/os.ts:3  atLeastIOS('17.2')
+```
+
+Having that list in front of you changes the conversation you have with yourself.
+
+It stops being "do I cut 0.9 percent of users" and becomes "raising to 17.0 retires this many branches I'm currently carrying." The first is a question about feelings. The second is an estimate.
+
+The run itself is cheap. I seeded a tree of 1,000 files carrying 1,004 annotations and measured it: 0.082 seconds. You can put it in a pre-commit hook without anyone noticing.
+
+## Fail CI on the leftovers
+
+The payoff in daily use turned out to be the stale-branch detection, not the projection table.
+
+You raise the floor to 16.0 but an `ios>=15.0` branch is still sitting in the code. That's dead code. It costs a reader's attention and makes every future edit to that file slower, because someone has to satisfy themselves that the other path doesn't matter.
+
+Three exit codes:
+
+<table>
+  <thead>
+    <tr><th>Exit code</th><th>Condition</th><th>CI behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0</td><td>No leftovers</td><td>Pass</td></tr>
+    <tr><td>1</td><td>Branches remain below the current floor</td><td><strong>Fail</strong></td></tr>
+    <tr><td>2</td><td>Config unreadable or malformed</td><td>Fail (configuration error)</td></tr>
+  </tbody>
+</table>
+
+Untagged branches only warn. Making them fail would force a mass annotation pass across the existing codebase before anyone could merge anything, and that's exactly how a convention dies on arrival. New branches get annotated; old ones get annotated when you happen to touch them. That ordering is the only version of this I've managed to sustain.
+
+The Actions wiring is one step:
+
+```yaml
+# .github/workflows/quality.yml (excerpt)
+      - name: OS branch inventory
+        run: node scripts/os-sweep.mjs src src/config/supportMatrix.ts
+```
+
+Any pull request that raises the floor now goes red automatically, and the list of branches to delete is already sitting in the CI log. No runbook lookup required.
+
+For the release mechanics I reuse what I set up in [A Phased Release Strategy for Rork Apps — How I Combine iOS Phased Release, Android Staged Rollout, and OTA Hotfixes for a Production That Doesn't Break](/articles/rork-dev/rork-phased-release-staged-rollout-hotfix-strategy). A floor bump is harder to roll back than a feature, so it belongs in a phased release without exception.
+
+## Three things I had wrong
+
+After roughly six months of running this, several of my assumptions turned out to be false.
+
+### Dropping support freezes the app; it doesn't remove it
+
+I believed for years that raising the minimum made the app disappear from the App Store on older devices.
+
+It doesn't. A user who already owns the app and re-downloads it from their purchase history receives the last version compatible with that device. The app stays. It just stops moving.
+
+That's a mercy and a liability at the same time. The build you thought you had retired keeps running in the wild, which means support requests and one-star reviews from it keep arriving — and you can no longer ship a fix to that build.
+
+So the real preparation happens before the bump. In the release immediately preceding it, I clear whatever known issues I can and confirm that the server API won't start rejecting older clients. You are choosing the state this build will be frozen in, so choose it deliberately.
+
+### I wasn't actually the one deciding
+
+The second misconception was that I controlled the timing.
+
+Rork generates Expo-based React Native apps, and each Expo SDK release raises its own OS floor. Skipping SDK upgrades isn't a real option — eventually builds and store submissions stop going through.
+
+So what I actually control isn't whether to raise the floor. It's how far ahead of the SDK's schedule I finish preparing for it.
+
+Once that landed, I moved the decision earlier in the calendar. When SDK release notes mention a floor change, that value goes into `supportMatrix.ts` as a candidate, and I run the sweep against it to see what would be retired. The scramble on upgrade day disappeared.
+
+Which floor a given SDK requires changes release to release, so check the notes rather than memorizing a number — anything you memorize today will be wrong next year.
+
+### The post-bump improvement isn't an improvement
+
+The week after a bump, my crash-free rate visibly improved.
+
+I nearly wrote that down as a result, then stopped. Nothing about the code had gotten better. What disappeared were branches, not defects. The number moved because the oldest, most crash-prone device generation left the sample.
+
+Logging that as "the payoff from raising the floor" poisons next year's decision. All that survives is the memory that last time, the numbers got better — and you make the next call expecting a benefit that was never real.
+
+Now I compare before and after using only the OS versions that survive the bump. Hold the population fixed and, in most cases, almost nothing moves. That's the honest picture.
+
+For the collection layer underneath all this, I use the pipeline from [Rork × MetricKit — Building a Solo Diagnostics Pipeline for Crashes, Hangs, and Battery Drain](/articles/rork-dev/rork-metrickit-production-diagnostics-complete-guide), sliced by OS version.
+
+## Three ways this bit me
+
+Six months in, a few things tripped me up. Here are the ones I'd warn someone about.
+
+### The floor ends up defined in two places
+
+This was the worst of them. I kept calling `supportMatrix.ts` the single source of truth while the value that actually governed the binary lived somewhere else.
+
+In Expo, the native minimum comes from the build deployment target. Change `supportMatrix.ts` to 17.0 and leave that at 16.0, and the binary in the store still supports 16.0. Meanwhile the sweep happily reports stale branches on the assumption you raised it. That mismatch is the dangerous one, because everything looks consistent from the inside.
+
+The fix is to stop writing the value twice and have the build config read the source of truth.
+
+```ts
+// app.config.ts
+import { MIN_OS } from './src/config/supportMatrix';
+
+export default {
+  expo: {
+    // ...
+    plugins: [
+      [
+        'expo-build-properties',
+        {
+          ios: { deploymentTarget: MIN_OS.ios },
+        },
+      ],
+    ],
+  },
+};
+```
+
+Plugin names and key shapes shift between SDK versions, so confirm the details against your own. The part that matters is simply that the number exists in one place.
+
+### Direct `Platform.Version` reads are a back door
+
+Even with a helper available, older code and rushed fixes reach for `Platform.Version` directly. The sweep can't see those, so they quietly fall outside the inventory.
+
+I closed that with a lint rule.
+
+```js
+// eslint.config.js (rule only)
+{
+  rules: {
+    'no-restricted-syntax': [
+      'error',
+      {
+        selector: "MemberExpression[object.name='Platform'][property.name='Version']",
+        message: 'Do not read Platform.Version directly — use atLeastIOS from src/lib/os.ts',
+      },
+    ],
+  },
+}
+```
+
+You'll need an override so `src/lib/os.ts` itself is exempt.
+
+### The frozen build freezes your SDKs too
+
+This one I only understood in hindsight.
+
+When you raise the floor, older devices keep the last compatible version — and every ad and billing SDK inside it is pinned at that version forever. In areas where the vendor can change policy on their side, such as AdMob, that eventually matters. If ads stop rendering in the frozen build, there is no path to ship a fix.
+
+If any meaningful revenue sits on those devices, upgrade the SDKs in the build you're about to freeze, before you freeze it. I missed this once and watched revenue from the frozen side thin out over several months before I worked out why.
+
+One more piece of sizing advice: if you ship a single app, you don't need any of this tooling. The annotation habit alone is enough. If you run several in parallel and share code through an internal package, put the sweep in that package instead. Shared code gets dragged down to the lowest floor among its consumers, and the report makes it immediately obvious which app is doing the dragging.
+
+## The sequence I follow
+
+1. Run the sweep and note how many branches each candidate floor retires
+2. Check the Expo SDK release notes for the next required floor
+3. In App Store Connect, look at session share and revenue for the versions you're about to drop (usage share is not the deciding input — it's the cost you're agreeing to accept)
+4. In the release before the bump, clear known issues in what will become the frozen build
+5. Confirm the server API still accepts requests from older clients
+6. Update `supportMatrix.ts`, watch CI go red, and delete the branches it lists
+7. Ship it through a phased release
+
+Step 3's position in the list is the whole point. Look at usage share first and thinking stops there. Look at the branch count first and usage share becomes a question of whether you're willing to accept the loss — same number, different job, decided entirely by ordering.
+
+## What I watch for 30 days after
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>How to read it</th><th>When to act</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Crash-free rate, surviving OS versions only</td><td>Fix the population to the post-bump composition and compare</td><td>A drop of 0.2 points or more suggests reverting a deleted branch</td></tr>
+    <tr><td>Support volume from the frozen build</td><td>Tag by the build number you left behind</td><td>Weekly volume that keeps climbing means the frozen build was under-prepared</td></tr>
+    <tr><td>Active device count</td><td>Overlay actuals against a curve that already subtracts the dropped devices</td><td>Falling below the projection means something other than the OS cut is at work</td></tr>
+  </tbody>
+</table>
+
+I didn't track the third one originally. Active devices once dropped further than projected after a bump, and the cause turned out to be an unrelated change shipped the same day. Since then, floor bumps go out on their own.
+
+## Where to start
+
+How many OS branches are in your codebase right now? You probably can't answer. I couldn't either.
+
+Start with a single comparison helper and annotate only the branches you write from here on. There's no need to backfill. Within a couple of quarters the inventory will be complete enough to decide with.
+
+Once you can count them, deferring stops being "not making a decision" and becomes "knowingly carrying visible debt for another year." You might still choose to wait — but you'll be able to say why.
+
+Thank you for reading this far. Small, unglamorous instrumentation like this is what makes the long haul survivable.
