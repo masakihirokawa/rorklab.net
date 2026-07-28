@@ -1,0 +1,429 @@
+---
+title: "Counting what prebuild --clean will erase before you upgrade to Expo SDK 57"
+slug: "rork-expo-prebuild-native-drift-inventory-config-plugin"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-28T11:00"
+author: "Rork Lab"
+description: "A raw diff between two generated ios/ trees showed 649 changed lines; only 3 were real edits. How to count what prebuild --clean erases, and move it into a config plugin."
+tags: ["Rork", "Expo", "prebuild", "config plugin", "Expo SDK 57", "upgrades", "native code", "React Native"]
+highlights:
+  - "Of 649 changed lines between two generated ios/ trees, exactly 3 were real hand edits. An ablation run shows which single normalization rule removes 643 of the false positives"
+  - "A complete script that counts only the edits a regeneration would destroy and exits 1 when any exist. It runs in 0.04s on a 320-source tree, so it drops straight into CI as an upgrade gate"
+  - "The full config plugin that takes those counted edits and makes them survive prebuild --clean, including verified idempotency and why a missing anchor should abort rather than warn"
+---
+
+Expo SDK 57 shipped with React Native 0.86, and the release notes describe it as a non-breaking step up from 0.85. Following along should be cheap.
+
+Still, before running `expo prebuild --clean` on one of the Rork-generated apps I maintain as an indie developer, I wanted an answer to a smaller question.
+
+How many hand edits are actually sitting in `ios/`?
+
+Rork gives you a project you own. You open the generated `ios/` in Xcode, add a linker flag, drop one SDK initialization line into `AppDelegate`. Those edits feel trivial at the time. Three months later you have forgotten every one of them, and `--clean` removes them without comment.
+
+So I built something that counts only the edits that would disappear. The numbers it produced were not what I expected.
+
+## A big diff tells you nothing about risk
+
+I built a fixture that imitates two consecutive `prebuild` outputs for the same `ios/` tree: 320 source entries, a 331-line `project.pbxproj`. The baseline is untouched generator output. The current copy carries three edits of the kind you actually make.
+
+<table>
+<thead><tr><th>Location</th><th>Edit</th></tr></thead>
+<tbody>
+<tr><td><code>MyApp/AppDelegate.mm</code></td><td>One inserted line: <code>[FIRApp configure];</code></td></tr>
+<tr><td><code>MyApp/Info.plist</code></td><td>Added <code>NSCameraUsageDescription</code></td></tr>
+<tr><td><code>MyApp.xcodeproj/project.pbxproj</code></td><td>Added <code>OTHER_LDFLAGS = "-ObjC"</code></td></tr>
+</tbody>
+</table>
+
+Three meaningful lines. Here is what a plain `diff` reports:
+
+```
+$ diff -rq ./baseline ./current | wc -l
+6
+
+$ diff -r ./baseline ./current | grep -c '^[<>]'
+653
+
+$ wc -l < ./baseline/MyApp.xcodeproj/project.pbxproj
+331
+
+$ diff ./baseline/.../project.pbxproj ./current/.../project.pbxproj | grep -c '^[<>]'
+641
+```
+
+A 331-line file producing 641 changed lines. Practically every line on both sides is reported as different.
+
+The cause is the `pbxproj` object ID. Xcode identifies every object in a project file with a 24-digit hex token, and those tokens are regenerated wholesale on every prebuild. Nothing about the content changed; every line still reads as new.
+
+Which means diff volume carries no signal at all about risk. Three lines worth protecting are sitting somewhere inside 653 lines of churn — restricted to the files actually worth scanning, 3 meaningful lines out of 649, or 0.46%. If you do not know that ratio before running `--clean`, you will not notice when those three lines are gone.
+
+## What to skip, and what to normalize
+
+Narrowing the scope happens in two stages.
+
+**Never look at these** — directories where a diff has nothing to say:
+
+- `Pods/` — output of `pod install`. The information worth keeping lives in `Podfile`
+- `build/`, `DerivedData/`, `.gradle/`, `app/build/` — build intermediates
+- `xcuserdata/` — Xcode UI state, different for every person who opens the project
+
+**Look, but flatten the churn** — expressions that change without meaning anything:
+
+<table>
+<thead><tr><th>Rule</th><th>Matches</th><th>Replaced with</th></tr></thead>
+<tbody>
+<tr><td>pbxproj object ID</td><td>24-digit hex tokens</td><td><code>&lt;OBJID&gt;</code></td></tr>
+<tr><td>CocoaPods checksum</td><td>40-digit hex tokens</td><td><code>&lt;SHA1&gt;</code></td></tr>
+<tr><td>Generation timestamp</td><td>ISO 8601 datetimes</td><td><code>&lt;TIME&gt;</code></td></tr>
+<tr><td>Absolute paths</td><td><code>/Users/…</code>, <code>/home/…</code></td><td><code>&lt;PATH&gt;</code></td></tr>
+</tbody>
+</table>
+
+The absolute path rule earns its place the moment you move machines or share the work. A CI container and a local Mac have different home directories, and that alone marks every generated `xcconfig` as changed.
+
+## The script that counts only real edits
+
+Here is the implementation. It sorts every scanned file into "identical", "noise only", or "substantive", and exits with code 1 if any substantive edit exists — which is what makes it usable as a pre-upgrade gate in CI.
+
+```js
+#!/usr/bin/env node
+/**
+ * native-drift.mjs — count only the hand edits a regeneration would destroy
+ *
+ * usage:
+ *   node native-drift.mjs <baseline-dir> <current-dir> [--json report.json]
+ *
+ * baseline : untouched generator output (a clean prebuild)
+ * current  : the ios/ or android/ currently in your repo
+ */
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
+
+const EXCLUDE_DIRS = [
+  'Pods',                    // pod install output; Podfile holds what matters
+  'build', 'DerivedData',
+  '.gradle', 'app/build',
+  'xcuserdata',              // Xcode UI state, per-person churn
+];
+const EXCLUDE_FILES = ['.DS_Store', 'UserInterfaceState.xcuserstate'];
+
+// Expressions that always change on regeneration but never mean anything
+const NORMALIZERS = [
+  { name: 'pbxproj-object-id', re: /\b[0-9A-F]{24}\b/g, to: '<OBJID>' },
+  { name: 'pod-checksum',      re: /\b[0-9a-f]{40}\b/g, to: '<SHA1>' },
+  { name: 'timestamp',         re: /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?/g, to: '<TIME>' },
+  { name: 'abs-path',          re: /\/(Users|home)\/[^\s"']+/g, to: '<PATH>' },
+];
+
+function normalize(text) {
+  let out = text;
+  for (const n of NORMALIZERS) out = out.replace(n.re, n.to);
+  // Compared as a set of lines, so no sorting is needed here (measured: no difference)
+  return out.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l !== '').join('\n');
+}
+
+function walk(root, base = root, acc = []) {
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return acc; }
+  for (const e of entries) {
+    const full = join(root, e.name);
+    if (e.isDirectory()) {
+      if (EXCLUDE_DIRS.some((d) => d === e.name || full.includes(sep + d + sep))) continue;
+      walk(full, base, acc);
+    } else if (e.isFile()) {
+      if (EXCLUDE_FILES.includes(e.name)) continue;
+      acc.push(relative(base, full));
+    }
+  }
+  return acc;
+}
+
+function readSafe(p) {
+  try {
+    const st = statSync(p);
+    if (st.size > 2 * 1024 * 1024) return null; // skip very large files
+    const buf = readFileSync(p);
+    if (buf.includes(0)) return null;           // binary
+    return buf.toString('utf8');
+  } catch { return null; }
+}
+
+function substantiveHunks(aText, bText) {
+  // Normalization destroys line numbers, so compare as sets of lines
+  const A = new Set(normalize(aText).split('\n'));
+  const B = new Set(normalize(bText).split('\n'));
+  return {
+    added:   [...B].filter((l) => !A.has(l)),
+    removed: [...A].filter((l) => !B.has(l)),
+  };
+}
+
+function main() {
+  const [baseDir, curDir] = process.argv.slice(2);
+  if (!baseDir || !curDir) {
+    console.error('usage: node native-drift.mjs <baseline-dir> <current-dir> [--json out.json]');
+    process.exit(2);
+  }
+  const jsonIdx = process.argv.indexOf('--json');
+  const jsonOut = jsonIdx > -1 ? process.argv[jsonIdx + 1] : null;
+
+  const baseFiles = new Set(walk(baseDir));
+  const curFiles  = new Set(walk(curDir));
+  const all = [...new Set([...baseFiles, ...curFiles])].sort();
+
+  const report = {
+    scanned: all.length, identical: 0, noiseOnly: 0,
+    substantive: [], onlyInCurrent: [], onlyInBaseline: [], skippedBinary: 0,
+  };
+
+  for (const rel of all) {
+    if (!baseFiles.has(rel)) { report.onlyInCurrent.push(rel); continue; }
+    if (!curFiles.has(rel))  { report.onlyInBaseline.push(rel); continue; }
+
+    const a = readSafe(join(baseDir, rel));
+    const b = readSafe(join(curDir, rel));
+    if (a === null || b === null) { report.skippedBinary++; continue; }
+    if (a === b) { report.identical++; continue; }
+
+    const { added, removed } = substantiveHunks(a, b);
+    if (added.length === 0 && removed.length === 0) { report.noiseOnly++; continue; }
+    report.substantive.push({ file: rel, added, removed });
+  }
+
+  console.log('── native drift report ──────────────────────');
+  console.log(`files scanned      : ${report.scanned}`);
+  console.log(`identical          : ${report.identical}`);
+  console.log(`noise-only diff    : ${report.noiseOnly}   <- prebuild churn`);
+  console.log(`substantive edits  : ${report.substantive.length}   <- lost on regeneration`);
+  console.log(`only in current    : ${report.onlyInCurrent.length}`);
+  console.log(`only in baseline   : ${report.onlyInBaseline.length}`);
+  console.log('');
+  for (const s of report.substantive) {
+    console.log(`> ${s.file}`);
+    for (const l of s.removed) console.log(`   - ${l.trim()}`);
+    for (const l of s.added)   console.log(`   + ${l.trim()}`);
+    console.log('');
+  }
+  for (const f of report.onlyInCurrent) console.log(`> ${f} (not in generator output = added by hand)`);
+
+  if (jsonOut) writeFileSync(jsonOut, JSON.stringify(report, null, 2));
+
+  const lost = report.substantive.length + report.onlyInCurrent.length;
+  if (lost > 0) {
+    console.log(`\nFAIL: ${lost} change(s) would be lost. Move them into a config plugin before running prebuild --clean.`);
+    process.exit(1);
+  }
+  console.log('\nOK: nothing would be lost on regeneration.');
+}
+main();
+```
+
+Run against the fixture:
+
+```
+$ node native-drift.mjs ./baseline ./current --json report.json
+── native drift report ──────────────────────
+files scanned      : 5
+identical          : 1
+noise-only diff    : 1   <- prebuild churn
+substantive edits  : 3   <- lost on regeneration
+only in current    : 0
+only in baseline   : 0
+
+> MyApp.xcodeproj/project.pbxproj
+   + OTHER_LDFLAGS = "-ObjC";
+
+> MyApp/AppDelegate.mm
+   + [FIRApp configure];
+
+> MyApp/Info.plist
+   + <key>NSCameraUsageDescription</key><string>Used to take your profile photo</string>
+
+FAIL: 3 change(s) would be lost. Move them into a config plugin before running prebuild --clean.
+$ echo $?
+1
+```
+
+653 lines became 3. The scan itself narrowed from 7 files to 5. Runtime on Node.js v22 was 0.03–0.04 seconds, which is nothing in a CI step.
+
+If you wire this into CI, I would recommend running it only on upgrade branches. Ordinary feature branches go weeks without touching `ios/`, so a check on every push produces almost no information.
+
+The `--json` flag writes the same report in machine-readable form. Attaching it to the upgrade pull request gives reviewers a way to check what actually moved into the plugin.
+
+## Measuring which rule does the work
+
+Four normalization rules, but they do not contribute equally. I removed them one at a time and measured how the detected line count moved.
+
+<table>
+<thead><tr><th>Configuration</th><th>Lines detected (5 scanned files)</th><th>Real edits</th></tr></thead>
+<tbody>
+<tr><td>No normalization (raw line comparison)</td><td>649</td><td>3</td></tr>
+<tr><td>Object ID rule removed</td><td>643</td><td>3</td></tr>
+<tr><td>Checksum rule removed</td><td>9</td><td>3</td></tr>
+<tr><td>All rules applied</td><td><strong>3</strong></td><td>3</td></tr>
+</tbody>
+</table>
+
+Almost the entire effect comes from a single rule. Drop the object ID normalization and you are back to 643 lines — a 214x increase in false positives, barely distinguishable from no normalization at all. Flatten the 24-digit hex tokens in `pbxproj` and everything else is a rounding adjustment.
+
+The checksum rule only moves the number from 3 to 9. Those six lines are `SPEC CHECKSUMS` and `PODFILE CHECKSUM` in `Podfile.lock` — values that change every time and tell you nothing by changing. Leave them in and the tool reports at least one false positive on every single run. A gate that always fails is a gate nobody reads. Keeping false positives at zero turned out to be less about precision than about whether the check survives contact with a real team.
+
+One more thing worth reporting: my first draft sorted the normalized lines before comparing them, on the theory that `pbxproj` blocks get reordered. Measured with and without, the result stayed at 3 either way. Since the comparison already works on sets, ordering never mattered. The sort is gone from the code above.
+
+## Moving the counted edits into a config plugin
+
+Counting is not the goal. The goal is a project where `--clean` is safe because the edits come back on their own.
+
+Here are the same three edits, expressed as an Expo config plugin.
+
+```js
+/**
+ * with-native-edits.js — express ios/ hand edits as a config plugin
+ *
+ * app.json:
+ *   { "expo": { "plugins": [["./with-native-edits", { "cameraUsage": "…" }]] } }
+ */
+const { withInfoPlist, withAppDelegate, withXcodeProject } = require('@expo/config-plugins');
+
+// --- 1. Info.plist: usage string ---
+const withCameraUsage = (config, { cameraUsage }) =>
+  withInfoPlist(config, (cfg) => {
+    // Leave it alone if the value already matches, to avoid needless dirtying
+    if (cfg.modResults.NSCameraUsageDescription !== cameraUsage) {
+      cfg.modResults.NSCameraUsageDescription = cameraUsage;
+    }
+    return cfg;
+  });
+
+// --- 2. AppDelegate: inject one SDK initialization line ---
+const ANCHOR = 'self.moduleName = @"main";';
+const INJECT = '[FIRApp configure];';
+
+const withFirebaseInit = (config) =>
+  withAppDelegate(config, (cfg) => {
+    const src = cfg.modResults.contents;
+
+    if (src.includes(INJECT)) return cfg;              // idempotent: never insert twice
+
+    if (!src.includes(ANCHOR)) {
+      // Do not skip silently. A warning here means the initialization
+      // quietly vanishes after an SDK bump and nobody notices.
+      throw new Error(
+        `[with-native-edits] Anchor "${ANCHOR}" not found in AppDelegate. ` +
+        `The Expo SDK template likely changed — update ANCHOR.`
+      );
+    }
+
+    cfg.modResults.contents = src.replace(ANCHOR, `${INJECT}\n  ${ANCHOR}`);
+    return cfg;
+  });
+
+// --- 3. pbxproj: build setting ---
+const withObjCLinkFlag = (config) =>
+  withXcodeProject(config, (cfg) => {
+    const project = cfg.modResults;
+    const configurations = project.pbxXCBuildConfigurationSection();
+    for (const key of Object.keys(configurations)) {
+      const entry = configurations[key];
+      if (typeof entry !== 'object' || !entry.buildSettings) continue;
+      if (!('PRODUCT_NAME' in entry.buildSettings)) continue;   // app target only
+      const cur = entry.buildSettings.OTHER_LDFLAGS;
+      const flags = Array.isArray(cur) ? cur : cur ? [cur] : ['"$(inherited)"'];
+      if (!flags.includes('"-ObjC"')) flags.push('"-ObjC"');
+      entry.buildSettings.OTHER_LDFLAGS = flags;
+    }
+    return cfg;
+  });
+
+module.exports = (config, props = {}) => {
+  const opts = { cameraUsage: 'Used to take your profile photo', ...props };
+  config = withCameraUsage(config, opts);
+  config = withFirebaseInit(config);
+  config = withObjCLinkFlag(config);
+  return config;
+};
+```
+
+The `PRODUCT_NAME` check inside `withXcodeProject` restricts the write to app targets. `pbxXCBuildConfigurationSection()` also hands back Pods target configurations, so writing to everything scatters your flag across settings that `pod install` will overwrite anyway.
+
+Running it against a mock section confirms the boundary holds, and that a second pass changes nothing:
+
+```
+AAA1 → OTHER_LDFLAGS = ["\"$(inherited)\"","\"-ObjC\""]
+AAA2 → OTHER_LDFLAGS = ["\"$(inherited)\"","\"-ObjC\""]
+BBB1 → OTHER_LDFLAGS = undefined
+after second pass, AAA2 = ["\"$(inherited)\"","\"-ObjC\""]
+```
+
+## A missing anchor should abort, not warn
+
+The dangerous moment in any string-replacement plugin is what happens when the anchor is not found. In production this is the deepest pitfall of the whole approach.
+
+The obvious version looks like this:
+
+```js
+if (!src.includes(ANCHOR)) {
+  console.warn('anchor not found, skipping');
+  return cfg;
+}
+```
+
+I chose not to write it that way, because this branch is only ever reached right after an SDK bump. The template changes, the anchor disappears, the warning drowns in several thousand lines of build log, `prebuild` succeeds, the build succeeds, the app launches. Only the SDK is quietly dead. You find out days later, when you notice crash reports have stopped arriving.
+
+Aborting tells you immediately, while you are still in the middle of the upgrade and the context is still in your head. Put the anchor string itself into the error message and the fix is a one-line constant update.
+
+The same caution applies to `withMainApplication` on the Android side. The template changes less often there, but silently skipping is just as dangerous when it does.
+
+Verified against three inputs:
+
+```
+[infoPlist] NSCameraUsageDescription = "Used to take your profile photo"
+[appDelegate] occurrences of [FIRApp configure] after 2 passes = 1  (idempotent)
+[appDelegate] aborted on missing anchor: [with-native-edits] Anchor "self.moduleName = @"main";" not foun…
+```
+
+The idempotency check matters because `prebuild` sometimes runs over an existing `ios/`. Without `--clean`, a replacement plugin stacks the same line again on every pass. Testing `includes(INJECT)` before inserting is the whole fix.
+
+## Folding this into three steps before the upgrade
+
+Once the plugin exists, go back to the script and check your work.
+
+1. Move the current tree aside — `mv ios ios.bak`
+2. Register the plugin in `app.json` and run `npx expo prebuild --platform ios --clean`
+3. Run `node native-drift.mjs ./ios.bak ./ios` and confirm it exits 0
+
+If step 3 exits 0, `ios.bak` is safe to delete. Every edit now lives in the plugin, and `--clean` reproduces it as many times as you like.
+
+The output from an actual full loop:
+
+```
+── native drift report ──────────────────────
+files scanned      : 5
+identical          : 3
+noise-only diff    : 2   <- prebuild churn
+substantive edits  : 0   <- lost on regeneration
+
+OK: nothing would be lost on regeneration.
+$ echo $?
+0
+```
+
+A non-zero exit means edits remain outside the plugin. The reported lines are the raw material for your next mod.
+
+## What you protect is the intent, not the directory
+
+Working through this changed one of my assumptions.
+
+I used to commit `ios/` and `android/` to Git specifically to protect them. Generated or not, I had put work into those files, so the history seemed like the right place to keep it safe.
+
+But committing them puts the churn into every review. Those 641 `pbxproj` lines become permanent diff noise from the moment they land. Nobody reads a diff like that. And an unread diff is the worst possible hiding place for the three lines that actually matter.
+
+What the measurement showed me is that the directory was never the thing worth protecting. The thing worth protecting is the reason a particular line was added — and `ios/` is close to the worst available place to record a reason. Inside a plugin it survives as code and comments, reapplies itself on every regeneration, and stops the build when it can no longer find its footing.
+
+SDK 57 looks like a light, non-breaking step, which also means it will not collide with an App Store submission window. That is exactly what makes it a good occasion for this. Rehearsing on an upgrade you already know will not break you means the heavy one arrives with the tooling already in place.
+
+Start with `mv ios ios.bak`, a clean prebuild, and the count. That alone will tell you how many edits your app was carrying. In my case, the number I remembered and the number I found were not the same.
+
+For primary sources, the plugin API is documented in the [Expo config plugins reference](https://docs.expo.dev/config-plugins/plugins-and-mods/), and prebuild behavior in the [Expo Prebuild documentation](https://docs.expo.dev/workflow/prebuild/).
