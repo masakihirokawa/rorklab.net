@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Max は iPhone・iPad・Apple Watch・Apple TV・Vision Pro 向けにネイティブの Swift アプリを生成します。Xcode を開かずに2クリックで App Store へ出せる構成です",
-    "WIDGET — Rork Max はゲーム・ウィジェット・ライブアクティビティにも対応します。React Native 一本だった守備範囲が Apple プラットフォーム側へ広がりました",
-    "FUND — Rork は a16z から280万ドルを調達しました。月間訪問はおよそ743,000で、伸び率は85%とされています",
-    "MAESTRO — Expo が Maestro の E2E テスト実行向けにインサイトダッシュボードを追加しました（7月20日）。チーム全体の実行時間の推移を追えます",
-    "CICD — Posh の事例として、EAS Workflows・フィンガープリント・Expo Updates で CI/CD を組み直した記録が7月23日に公開されました",
-    "SIRI — iOS 27 のパブリックベータが7月13日に始まりました。生成 AI ベースの新しい Siri は A17 Pro 以降・メモリ8GB以上が条件です",
+    "COMPANION — Rork Companion アプリを使えば、有料の Apple Developer アカウントなしでも実機の iPhone で自作アプリを試せます",
+    "SEED — 調達は2026年4月、Left Lane Capital 主導の1,500万ドルのシードラウンドです。Peak XV・True Ventures・Goodwater・a16z Speedrun が参加しています",
+    "PAPER — Rork はアプリビルダーの Paperline を買収しました。エンジニアリング人材の取り込みを目的に、今後も買収を続ける方針とされています",
+    "ARR — Rork Max は2026年2月のローンチから3日で ARR 150万ドルに達したと報告されています",
+    "NATIVE — Rork Max は AR・LiDAR スキャン、Metal の3Dゲーム、Dynamic Island、ライブアクティビティ、HealthKit、NFC、Core ML のオンデバイス推論に届きます",
+    "PLATFORM — 対応は iPhone・iPad・Apple Watch・Apple TV・Vision Pro に加えて iMessage も含まれます",
   ],
   en: [
-    "MAX — Rork Max generates native Swift apps for iPhone, iPad, Apple Watch, Apple TV, and Vision Pro, with two-click App Store publishing that never opens Xcode",
-    "WIDGET — Rork Max also covers games, widgets, and live activities, widening the scope beyond the React Native output Rork started with",
-    "FUND — Rork raised $2.8 million from a16z, and the platform now sees roughly 743,000 monthly visits with a reported 85% growth rate",
-    "MAESTRO — Expo added an insights dashboard for Maestro end-to-end test runs on July 20, letting teams track run performance over time",
-    "CICD — A Posh case study published July 23 walks through rebuilding a mobile CI/CD pipeline on EAS Workflows, fingerprinting, and Expo Updates",
-    "SIRI — The iOS 27 public beta opened on July 13, and its generative-AI Siri requires an A17 Pro chip or newer with at least 8 GB of RAM",
+    "COMPANION — The Rork Companion app lets you test your build on a real iPhone without paying for an Apple Developer account first",
+    "SEED — Rork raised a $15 million seed round in April 2026 led by Left Lane Capital, with Peak XV, True Ventures, Goodwater, and existing investor a16z Speedrun taking part",
+    "PAPER — Rork acquired the app builder Paperline to bring in engineering talent, and says it plans to stay acquisitive",
+    "ARR — Rork Max reportedly reached $1.5 million in ARR within three days of its February 2026 launch",
+    "NATIVE — Rork Max reaches AR and LiDAR scanning, Metal-backed 3D games, Dynamic Island, Live Activities, HealthKit, NFC, and on-device Core ML",
+    "PLATFORM — Targets include iPhone, iPad, Apple Watch, Apple TV, and Vision Pro, plus iMessage",
   ],
 };
 
