@@ -1,0 +1,346 @@
+---
+title: "The same wallpaper appeared twice in my catalog — measuring perceptual hash thresholds across 324 images"
+slug: "image-catalog-perceptual-hash-dedup-threshold-measurement"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-29T11:00"
+author: "Rork Lab"
+description: "Four approaches to image catalog deduplication measured end to end: SHA-256, dHash, a hue signature, and a block signature. dHash alone scored 0.9% precision. Here is why perceptual hashes collapse on smooth images, and how the ground truth turned out to be the thing that was wrong."
+tags: ["image processing", "perceptual hashing", "dHash", "deduplication", "asset management", "Node.js", "sharp", "indie development"]
+highlights:
+  - "SHA-256 byte matching found 3 of 124 real duplicates — a 2.4% recall rate. The measured breakdown shows exactly which transformations defeat exact hashing and why re-encoding alone is enough"
+  - "dHash at a Hamming threshold of 10 scored 97.5% recall against 0.9% precision, with 16,570 false pairs. The cause: 80 of 160 source images collapsed to an identical, information-free hash. A popcount gate brings false positives to zero"
+  - "Complete implementation of a three-band classifier (auto-merge, human review, distinct) with 96.9% precision in the auto band, zero missed duplicates, and 20.6 ms per image across 324 files"
+---
+
+I was scrolling my own wallpaper app one morning when my thumb stopped.
+
+The same artwork appeared twice, a dozen rows apart.
+
+One came from the original launch batch, the other from a later import. Different filenames, different upload dates, so nothing in the catalog table had ever flagged it. When you maintain a few thousand image assets as an indie developer, this kind of drift accumulates quietly.
+
+Nobody had complained in an App Store review. It still felt wrong that a paying user would scroll past the same picture twice.
+
+Reviewing several thousand images by hand was not an option, so I built something to find them mechanically.
+
+The design I sketched at the start was wrong twice over. Here is what the measurements actually showed.
+
+## Building a verification set I could re-run
+
+Experimenting directly on the production catalog would have left me with no way to check my own results. Instead I synthesized a set with the same characteristics.
+
+160 source images at 1290×2796, the iPhone portrait resolution — 40 each of gradients, blurred blobs, stripes, and noise clouds. That mix mirrors what a wallpaper catalog tends to contain.
+
+From those I generated five kinds of derivative:
+
+<table>
+  <thead>
+    <tr><th>Derivative</th><th>Count</th><th>Ground truth</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Re-encoded at JPEG quality 92 → 74</td><td>54</td><td>Duplicate</td></tr>
+    <tr><td>Resized 1290×2796 → 828×1792</td><td>32</td><td>Duplicate</td></tr>
+    <tr><td>Brightness raised 6%</td><td>23</td><td>Duplicate</td></tr>
+    <tr><td>Cropped 2% on each edge, scaled back</td><td>15</td><td>Duplicate</td></tr>
+    <tr><td>Hue rotated 80 degrees</td><td>40</td><td><strong>Distinct</strong></td></tr>
+  </tbody>
+</table>
+
+324 images in total. Labeling the hue variants as distinct is the pivot of the whole exercise. In a wallpaper catalog the color variant *is* the product, and merging it would delete inventory.
+
+Everything below was measured on Node 22.22.3 with sharp 8.18.3 (libvips).
+
+## SHA-256 gets you almost nothing
+
+I started with a SHA-256 over the raw file bytes. A few lines of code, and it seemed reasonable to sweep the exact matches first.
+
+It found 3 of the 124 real duplicates. A recall rate of 2.4%.
+
+In hindsight the result is obvious. Re-encoding a JPEG changes every byte. So does resizing, brightness adjustment, and cropping. Byte equality only catches the case where the identical file was uploaded twice — and an upload-time guard had already been handling that case for years.
+
+What remained in the catalog was precisely the category exact hashing cannot see: visually identical, byte-wise different.
+
+## dHash worked, then bundled unrelated images together
+
+Perceptual hashing came next. dHash shrinks an image to 9×8 greyscale and folds the left-to-right comparisons between adjacent pixels into 64 bits. The downscale discards compression noise and resolution differences before the comparison happens.
+
+```js
+// fingerprint.mjs
+import sharp from "sharp";
+
+/** dHash: shrink to 9x8 greyscale, fold horizontal pixel comparisons into 64 bits */
+export async function dHash(path) {
+  const { data } = await sharp(path)
+    .greyscale()
+    .resize(9, 8, { fit: "fill", kernel: "lanczos3" })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  let bits = 0n;
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      const l = data[y * 9 + x];
+      const r = data[y * 9 + x + 1];
+      bits = (bits << 1n) | (l > r ? 1n : 0n);
+    }
+  }
+  return bits;
+}
+
+export function hamming(a, b) {
+  let x = a ^ b, n = 0;
+  while (x) { x &= x - 1n; n++; }
+  return n;
+}
+```
+
+Within-group Hamming distances came out exactly as the literature suggests:
+
+<table>
+  <thead>
+    <tr><th>Derivative</th><th>n</th><th>Median</th><th>p95</th><th>Max</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Re-encoded</td><td>54</td><td>0</td><td>3</td><td>3</td></tr>
+    <tr><td>Resized</td><td>32</td><td>0</td><td>11</td><td>12</td></tr>
+    <tr><td>Brightness +6%</td><td>23</td><td>0</td><td>5</td><td>8</td></tr>
+    <tr><td>Cropped 2%</td><td>15</td><td>0</td><td>11</td><td>11</td></tr>
+    <tr><td>Across different groups</td><td>12,720</td><td>27</td><td>36</td><td>47</td></tr>
+  </tbody>
+</table>
+
+Median 0 for duplicates, median 27 for unrelated pairs. A threshold of 10 looked comfortable.
+
+Then I ran the full pairwise sweep over all 324 images and the numbers fell apart: 97.5% recall, **0.9% precision**, 16,570 false pairs.
+
+## Perceptual hashes collapse on smooth images
+
+To find the cause I counted the set bits in every hash. dHash encodes adjacent-pixel comparisons, so on a gently varying image nearly every comparison tips the same direction and the result pins to 0 or 64.
+
+Of the 160 source images, 80 had a popcount of 4 or below, or 60 or above. Exactly half.
+
+The breakdown explained itself: all 40 gradients and all 40 stripe images qualified, while not a single blob or noise cloud did. Worse, those 80 images all shared one identical hash. Eighty unrelated wallpapers had merged into a single enormous cluster.
+
+A wallpaper catalog is essentially a collection of smooth, low-detail images. I had been running perceptual hashing on the exact material it handles worst.
+
+```js
+const popcount = (x) => { let n = 0; while (x) { x &= x - 1n; n++; } return n; };
+
+/** A hash whose bits are this lopsided carries no discriminating power */
+export function isDegenerate(hash) {
+  const p = popcount(hash);
+  return p <= 4 || p >= 60;
+}
+```
+
+Re-measuring across the 80 images that survive the gate: minimum distance 12, 5th percentile 25, median 31. Zero false positives at a threshold of 10, and a single one at 12.
+
+The hash had been doing its job correctly. I had been feeding it the wrong inputs.
+
+## Greyscale conversion erases the thing customers pay for
+
+With the gate in place I nearly declared victory, then checked one more number.
+
+All 40 hue-rotated variants sat at **distance 0** from their source. No threshold can separate them, because dHash converts to greyscale first and rotating hue leaves the luminance distribution untouched.
+
+For a wallpaper app that is a serious failure mode. The blue version and the orange version of the same composition are two products, and merging them shrinks the catalog. My deduplication tool was one step away from deleting inventory.
+
+The robustness to brightness and compression is the same property as blindness to color. They are not separable.
+
+So I added a second, independent fingerprint:
+
+```js
+/** Hue histogram signature: 12 bins of HSV hue, weighted by saturation, normalized */
+export async function hueSignature(path) {
+  const { data, info } = await sharp(path)
+    .resize(64, 64, { fit: "fill" })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const bins = new Float64Array(12);
+  const ch = info.channels;
+
+  for (let i = 0; i < data.length; i += ch) {
+    const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    if (d < 0.08) continue;  // hue is unstable on near-grey pixels — discard them
+
+    let h;
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h = ((h * 60) + 360) % 360;
+
+    bins[Math.floor(h / 30)] += d;  // weight by chroma
+  }
+
+  const sum = bins.reduce((a, v) => a + v, 0) || 1;
+  return Array.from(bins, (v) => v / sum);
+}
+
+/** Half the L1 distance between two signatures, so the range is 0 to 1 */
+export function hueDistance(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return s / 2;
+}
+```
+
+That `if (d < 0.08) continue;` line matters more than it looks. Hue is numerically unstable on near-grey pixels, and without the guard a simple re-encode shifts the histogram enough to break the comparison.
+
+The separation is clean: real duplicates never exceeded a distance of 0.057, and all 40 hue variants landed at exactly 1.000. A threshold of 0.15 sits in a very wide gap.
+
+## A 6% brightness shift moves more than halving the resolution
+
+I added one more coarse fingerprint — the mean color of a 4×4 grid — to capture overall composition.
+
+```js
+/** Block signature: mean color of a 4x4 grid, 48 dimensions */
+export async function blockSignature(path) {
+  const { data, info } = await sharp(path)
+    .resize(4, 4, { fit: "fill" })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const out = [];
+  for (let i = 0; i < 16; i++) {
+    const o = i * info.channels;
+    out.push(data[o] / 255, data[o + 1] / 255, data[o + 2] / 255);
+  }
+  return out;
+}
+
+/** RMSE between two block signatures, 0 to 1 */
+export function blockDistance(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; }
+  return Math.sqrt(s / a.length);
+}
+```
+
+The RMSE distribution inverted my expectations:
+
+<table>
+  <thead>
+    <tr><th>Derivative</th><th>Median</th><th>Max</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Re-encoded</td><td>0.0013</td><td>0.0028</td></tr>
+    <tr><td>Resized (40% of the pixels)</td><td>0.0036</td><td>0.0179</td></tr>
+    <tr><td>Cropped 2%</td><td>0.0052</td><td>0.0340</td></tr>
+    <tr><td>Brightness +6%</td><td>0.0270</td><td>0.0365</td></tr>
+    <tr><td>Hue variant</td><td>0.2819</td><td>0.3164</td></tr>
+  </tbody>
+</table>
+
+A brightness shift almost nobody would notice moves the signature more than seven times as far as cutting the pixel count by 60%.
+
+Averaging is inherently robust to resolution and defenseless against a luminance offset. The reasoning is sound once you see it — but had I calibrated against resizing and picked something near 0.01, every brightness-shifted duplicate would have slipped through.
+
+## Three bands instead of a boolean
+
+Once all three fingerprints existed, I abandoned the original plan of a function returning true or false.
+
+Precision plateaued no matter how I combined the thresholds. Loosen them and unrelated wallpapers creep in; tighten them and brightness variants drop out. In a catalog where images genuinely resemble each other, a band always remains that a machine cannot settle alone.
+
+```js
+/**
+ * Sort a pair into one of three bands.
+ *  auto     … safe to merge automatically
+ *  review   … a person decides
+ *  distinct … treat as separate products
+ */
+export function classifyPair(a, b) {
+  // 1. Different color means a different product. Filter this first.
+  if (hueDistance(a.hue, b.hue) > 0.15) return "distinct";
+
+  const bd = blockDistance(a.block, b.block);
+  const dd = hamming(a.dhash, b.dhash);
+
+  // 2. Composition and detail both match — merge it
+  if (bd <= 0.005 && dd <= 6) return "auto";
+
+  // 3. Only one signal is close — send it to a human
+  if (bd <= 0.04 && dd <= 12) return "review";
+
+  return "distinct";
+}
+```
+
+The ordering carries weight. Evaluating hue first is what stops color variants from being auto-merged. Put dHash first and flat images pass at distance 0 without the hue check ever running.
+
+Across all 52,326 pairs:
+
+<table>
+  <thead>
+    <tr><th>Band</th><th>Pairs</th><th>Precision</th><th>Coverage of real duplicates</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>auto</td><td>96</td><td>96.9%</td><td>47.4%</td></tr>
+    <tr><td>review</td><td>449</td><td>22.9%</td><td>52.6%</td></tr>
+    <tr><td>distinct</td><td>51,781</td><td>—</td><td>0%</td></tr>
+  </tbody>
+</table>
+
+The bottom row is the one that matters. Not one real duplicate landed in the 51,781 discarded pairs. Nothing was missed, and the human queue is 449 pairs — 1.39 per image, roughly half an hour of work.
+
+Computing all three fingerprints took 6.67 seconds for 324 images, or 20.6 ms each. A few thousand assets finish in a couple of minutes.
+
+## Chasing false positives, I found my labels were wrong
+
+The most useful thing I learned came last.
+
+Right after the three-band split, auto-band precision measured 90.6% — nine of 96 pairs were flagged as merges across different groups. I assumed my threshold was sloppy and walked `bd <= 0.005` down through 0.003, 0.002, and 0.0015.
+
+Precision moved to 91.4%, 91.5%, and 92.3%. Barely anything. Coverage, meanwhile, fell from 54.7% to 22.6%.
+
+Suspicious, I printed the nine offending pairs:
+
+```
+base_0056.jpg <-> base_0140.jpg  bd=0.0000  dd=0
+base_0044.jpg <-> base_0064.jpg  bd=0.0020  dd=0
+base_0116.jpg <-> base_0152.jpg  bd=0.0041  dd=0
+```
+
+`bd=0.0000` stood out. Forty-eight dimensions agreeing exactly is far too tidy for coincidence.
+
+A pixel-level comparison settled it:
+
+<table>
+  <thead>
+    <tr><th>Comparison</th><th>Mean pixel difference</th><th>Max</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>base_0056 vs base_0140</td><td>0.00</td><td>0</td></tr>
+    <tr><td>base_0044 vs base_0064</td><td>0.36</td><td>4</td></tr>
+    <tr><td>base_0116 vs base_0152</td><td>0.79</td><td>4</td></tr>
+    <tr><td>(reference) two unrelated images</td><td>87.71</td><td>146</td></tr>
+  </tbody>
+</table>
+
+base_0056 and base_0140 matched on every single pixel. Two images I had generated independently had come out identical. The other two pairs differ by at most 4 levels — invisible to any eye.
+
+They were not false positives. **My ground truth was wrong.**
+
+A full pixel-level sweep of the 160 source images turned up 10 pairs below a mean difference of 2.0. Correcting the labels to merge those groups and re-running the same classifier — without touching a line of it — moved auto-band precision from 90.6% to 96.9%.
+
+Four rounds of threshold tightening, which halved coverage, had accomplished nothing at all.
+
+This generalizes past a synthetic test set. A production catalog table records what a human believed at import time, nothing more. The fingerprints see the contents more accurately than the metadata does. Had I trusted my labels over the tool, I would have shipped three genuine duplicates straight past the cleanup.
+
+## What I settled on for production
+
+Three decisions carried the design into the real pipeline.
+
+1. **Auto-merge only in the auto band, and only reversibly.** Merging sets a `merged_into` column rather than deleting rows. 96.9% precision also means roughly 3 mistakes per 100 merges.
+
+2. **Drain the review band the same day.** 449 pairs is unmanageable if it accumulates and trivial if it does not. I prefer running the sweep immediately after each asset import, because "later, in bulk" reliably becomes never.
+
+3. **Suspect the ground truth before suspecting the classifier.** This was the expensive lesson. A false-positive list is worth reading as a catalog audit before it is worth reading as threshold feedback.
+
+Every threshold here (`0.15`, `0.005`, `6`, `0.04`, `12`) came from this particular image set. Photo-heavy catalogs will barely see the flat-image problem; minimal, near-monochrome designs will trip the popcount gate far more often.
+
+Rather than adopting these numbers directly, carve 100 images out of your own catalog and repeat the measurement. The derivative generation and the measurement scripts are all above.
+
+It took three days from noticing the repeat to understanding why. I hope the detour saves someone else a little time.
