@@ -1,19 +1,19 @@
 ---
-title: "Fixing White Screen on Theme Switch Without recreate() — Lessons from a 50M Download Wallpaper App"
+title: "Fixing the White Screen on Theme Switch Without recreate() — When a Process Restart Is the Right Call"
 slug: "rork-android-theme-switch-white-screen-apprestarter-fix-2026"
 category: "rork-dev"
 level: "intermediate"
 premium: false
 date: "2026-05-16T10:30"
-updated: "2026-05-16T10:30"
+updated: "2026-07-30T12:30"
 author: "Rork Lab"
-description: "How I fixed a white screen bug triggered by theme switching in an Android app — replacing recreate() with an AppRestarter.safeRestart pattern. Lessons from 12 years of indie app development with 50M+ cumulative downloads."
-tags: ["Android", "theme switch", "white screen", "AppRestarter", "recreate", "wallpaper app", "indie dev"]
+description: "Fixing a white screen on Android theme switching by separating the cases AppCompatDelegate can handle from the ones that need an AppRestarter.safeRestart, plus the situations where killProcess should never be used."
+tags: ["Android", "theme switch", "white screen", "AppCompatDelegate", "AppRestarter", "recreate", "indie dev"]
 ---
 
-When you implement a dark mode toggle in Android, the typical flow is: save the setting, restart the Activity, and have the theme applied. Most sample code uses `recreate()` for this purpose. In my wallpaper app, which I've been maintaining for over 12 years with 50M+ cumulative downloads, this exact pattern was causing intermittent white screen flashes for some users.
+A three-star review contained exactly one useful line: "sometimes I get a white screen." No stack trace, no steps, no device model. Toggling dark mode in the settings screen apparently flashed a blank white panel for a fraction of a second — on some devices, not mine.
 
-The lesson I've taken from long-running indie app development: bugs are usually symptoms of a deeper design problem. The white screen was telling me something was off about how I was handling Activity recreation in the presence of SDK initialization and heavy image loading.
+The culprit was how I was calling `recreate()`. Working solo on a wallpaper app, this class of bug is the hardest to close: nothing crashes, so nothing shows up in Crashlytics, and the reproduction window is narrow enough that you cannot hit it by hand.
 
 ## Why recreate() Causes a White Screen
 
@@ -24,8 +24,35 @@ The conditions that make this noticeable are:
 - Activities that load heavy assets at startup (wallpaper apps are a prime example)
 - Lower-spec devices or older Android versions (6 through 8)
 - SharedPreferences written with `apply()` instead of `commit()` — the setting may not be flushed before the Activity restarts
+- Ad SDK callbacks such as AdMob wired into the Activity lifecycle
 
-In my case, users of Beautiful HD Wallpapers began reporting brief white flashes during theme changes. The reproduction condition was narrow enough that I couldn't easily catch it myself, which is exactly the kind of bug that lingers in negative reviews for months.
+If your reviews contain "occasional white flash" at three or four stars, this is usually the pattern. One-star reviews saying "won't launch" are a different problem — reading the star distribution alongside the wording helps you separate the two before you start digging.
+
+## First, Check Whether AppCompatDelegate Is Enough
+
+Before reaching for a process restart, there's something worth ruling out. **If all you're switching is dark mode, `AppCompatDelegate.setDefaultNightMode()` usually covers it.**
+
+```kotlin
+// Restore the saved preference in Application.onCreate()
+AppCompatDelegate.setDefaultNightMode(
+    if (prefs.getBoolean("dark_mode", false)) AppCompatDelegate.MODE_NIGHT_YES
+    else AppCompatDelegate.MODE_NIGHT_NO
+)
+
+// Called from the settings toggle
+fun applyNightMode(isDark: Boolean) {
+    prefs.edit().putBoolean("dark_mode", isDark).apply()
+    AppCompatDelegate.setDefaultNightMode(
+        if (isDark) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO
+    )
+}
+```
+
+This is handled as a `uiMode` configuration change, and AppCompat applies it to live Activities for you. Because you never call `recreate()` yourself, you never open the destroy-then-create gap. If your theme differences live entirely in `res/values` and `res/values-night`, the white screen disappears with it.
+
+In my case it wasn't enough. The app read its color palette once at launch and held the resolved values in an `Application`-level singleton, and Glide's placeholder color was pulled from there. Changing `uiMode` left the old colors in place.
+
+The right fix is to drop the singleton and resolve colors from resources on demand. But the white screen was live in production, and I wanted it stopped in the current version. So the design change went to the next minor release, and the process restart went out first.
 
 ## The AppRestarter.safeRestart Pattern
 
@@ -61,6 +88,8 @@ fun applyTheme(isDark: Boolean) {
 }
 ```
 
+`FLAG_ACTIVITY_CLEAR_TASK` matters here. Without it, the old Activity can survive in the back stack, and pressing back drops the user onto a screen still rendered in the previous theme.
+
 ## recreate() vs. safeRestart: The Real Difference
 
 `recreate()` **restarts only the current Activity**. When your app has complex Fragment hierarchies, ViewModel state, or third-party SDKs initialized at the Application level, there's no guarantee that everything lands in a clean state after recreation.
@@ -69,13 +98,51 @@ In my wallpaper app, AdMob was being initialized early in the Activity lifecycle
 
 `AppRestarter.safeRestart()` **restarts the entire process**, which means `Application.onCreate()` runs again from scratch. Every SDK starts clean. No partial states.
 
+## Choosing Between apply() and commit()
+
+This isn't strictly about the white screen, but if you use the `safeRestart` pattern, write your preferences with `commit()`.
+
+`apply()` writes asynchronously, so calling it immediately before `killProcess()` gives you no guarantee that the value reached disk. Any sequence that saves a setting and then terminates the app needs the synchronous write.
+
+```kotlin
+// Risky: apply() is asynchronous, and the process is about to die
+prefs.edit().putBoolean("dark_mode", isDark).apply()
+AppRestarter.safeRestart(this)
+
+// Safe: commit() writes synchronously before the restart
+prefs.edit().putBoolean("dark_mode", isDark).commit()
+AppRestarter.safeRestart(this)
+```
+
+If you stay on the `AppCompatDelegate` path, `apply()` is fine — the process keeps running, so there's nothing to cut the write short. The rule of thumb: the write method depends on whether you're about to kill the process.
+
+## When Not to Use safeRestart
+
+`killProcess()` terminates the process immediately. `Application.onTerminate()` doesn't run, and neither does the `finally` block of a coroutine in flight. Anything that assumes the process will stay alive is at risk.
+
+<table>
+<thead>
+<tr><th>Situation</th><th>Why to avoid it</th></tr>
+</thead>
+<tbody>
+<tr><td>A foreground service is running (audio playback, downloads)</td><td>The service dies with the process. Even with <code>START_STICKY</code>, in-memory state such as download progress is gone</td></tr>
+<tr><td>A Google Play Billing purchase is in flight</td><td>If the process dies before <code>PurchasesUpdatedListener</code> receives the result, acknowledgement never runs. This is only survivable if you already restore state with <code>queryPurchasesAsync</code> at launch</td></tr>
+<tr><td>Analytics or Crashlytics events were just recorded</td><td>The buffer may not have been flushed yet</td></tr>
+<tr><td>The user has a partially filled form open</td><td>Unless you persist drafts, the input is lost outright</td></tr>
+</tbody>
+</table>
+
+Put the other way around: calling it from a settings screen — where nothing else is in flight — keeps the technique on the safe side. Keeping settings in its own Activity pays off precisely here.
+
 ## The User Experience Trade-off
 
 Switching to `safeRestart` means that when a user changes the theme, the app visibly restarts rather than instantly toggling. There's a brief return to the launcher before the app comes back with the new theme applied.
 
 Whether this feels natural depends on the app. For a wallpaper app, theme switching is a rare, deliberate action. A clean restart actually feels more intentional than a brief white flash. After shipping this fix in v2.1.0, the complaint rate around theme switching in user reviews dropped noticeably.
 
-If 300ms isn't enough delay on your target devices, extending to 500ms is safe.
+300ms works on most devices. Extending to 500ms is safe if you support especially slow hardware, but stay above 200ms so the preference write has time to land.
+
+One small refinement: set `android:windowBackground` to the post-switch background color so the first frame after the restart already carries the new theme. It takes the edge off the relaunch.
 
 ## Applying This to Rork Max Projects
 
@@ -87,12 +154,40 @@ When Rork Max generates an Android project, theme management typically goes thro
 
 Rork-generated settings screens tend to implement theme switching with `recreate()` or equivalent behavior by default. For production use, it's worth refactoring to the `safeRestart` pattern before launch.
 
-## Building Apps That Last
+If you're working with native Android code through Rork Max, the Kotlin `object` above drops in as-is. You can also expose it as a native module and call it from the React Native side, but I find keeping it fully native easier to maintain.
 
-My late grandfathers were both temple carpenters. The belief I grew up watching them practice was that craftsmanship applied to things meant to last is itself a form of devotion. That sensibility carries into how I approach app maintenance.
+## Verifying That the Fix Actually Landed
 
-`recreate()` works on most devices most of the time. But collecting user reviews over time and noticing a pattern of "occasional white screen" reports is how you find the problems that device testing in ideal conditions will never surface.
+To confirm the white screen is gone, force the worst case rather than hoping to catch it.
 
-This is true whether you're writing Android code from scratch or building with Rork. The quality comes from the small, careful fixes — understanding why something works the way it does, and choosing the approach that holds up under real conditions.
+Turn on "Don't keep activities" in developer options. Background Activities are then destroyed immediately, which exaggerates recreation behavior and makes the flash far easier to reproduce. You can toggle it from adb, which also means you won't forget to turn it back off.
 
-If you're seeing white screen reports related to theme switching, start by looking at `recreate()` and how SharedPreferences writes are timed around it. That's where the answer usually is.
+```bash
+# Enable "Don't keep activities"
+adb shell settings put global always_finish_activities 1
+
+# Always restore it after testing
+adb shell settings put global always_finish_activities 0
+```
+
+To confirm the process really is being recreated, watch the process lifecycle in logcat:
+
+```bash
+adb logcat | grep -E "ActivityManager.*(Start proc|Killing)"
+```
+
+Then test theme switching on a low-spec physical device, or an emulator limited to a single CPU core. With `recreate()` the white screen shows up readily in that environment; after switching to `safeRestart` it should be absent.
+
+Play Console's Android Vitals is the other half of the check. If theme switching was producing crashes, the count should fall in the fixed version. In my app, crash reports attributable to theme switching reached zero within a few weeks of the `v2.1.0` release.
+
+Staged rollout gives you the same signal earlier. Watching crash-free users across 5% → 25% → 50% → 100% catches serious regressions while the exposed audience is still small — and with a large daily active user base, even the 5% stage carries enough samples to be meaningful.
+
+## Keep the Order of Investigation
+
+Under one small feature sit three layers: resource qualifiers, SDK initialization order, and the timing of the preference write. A white screen is the signal that one of them is out of step.
+
+Which is why the order matters more than the fix. Try `AppCompatDelegate` first. If it isn't enough, be able to say in one sentence why it isn't. Only then reach for the process restart. Investigating in that sequence leaves a trace of your reasoning, which is what you'll need when you go back to correct the design properly.
+
+If you're stuck on the same symptom, put the `recreate()` call and the preference write immediately before it side by side. Measuring the distance between those two lines has been enough to solve it more than once.
+
+For the day-to-day side of catching crashes after release, see [Two Weeks of Maintenance After v2.1.0 — Running Crashlytics Triage Through Claude in Chrome](/articles/app-dev/android-wallpaper-app-v2-post-release-maintenance-crashlytics-claude-in-chrome). For how the rollout itself is structured, see [A Phased Release Strategy for Rork Apps](/articles/rork-dev/rork-phased-release-staged-rollout-hotfix-strategy).
