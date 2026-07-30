@@ -1,0 +1,386 @@
+---
+title: "Renovate が触ってよい依存と、触ってはいけない依存 — Expo SDK 57 の123パッケージを機械的に切り分ける"
+slug: "rork-renovate-expo-managed-deps-ignore-generation"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-07-30T11:00"
+author: "Rork Lab"
+description: "Rork 生成アプリに依存の自動更新を入れると、Expo が版を管理している123パッケージまで巻き込まれます。2026年7月30日時点の実測では、うち6件が npm の最新版へメジャー更新される差でした。除外リストを手で書かず SDK から機械生成する手順をまとめます。"
+tags: ["Rork", "Expo", "Renovate", "依存関係", "Expo SDK 57", "CI", "React Native", "保守運用"]
+highlights:
+  - "Expo SDK 57 が版を管理するのは123パッケージ。うち41件は名前が expo- で始まりません。この41件を npm の最新版と突き合わせた実測を全件掲載します（メジャー差6件・マイナー差9件）"
+  - "除外リストを SDK 本体から生成し、差分があれば exit 1 を返すスクリプト全文。冪等性と、SDK を上げてもリストが変わらない理由を実行ログつきで示します"
+  - "expo 自身が bundledNativeModules.json に載っていないという落とし穴と、その1行を補わなかった場合に何が起きるか。残った依存にだけ効かせる renovate.json も併載します"
+---
+
+月曜の朝、リポジトリに Renovate の PR が並んでいました。
+
+そのうちの1本が目に留まりました。`react-native-gesture-handler` を `2.32.0` から `3.1.0` へ。メジャーがひとつ上がっています。
+
+CI は緑でした。ユニットテストは通り、型検査も通り、Lint も何も言いません。個人開発で6本のアプリを並行して運用していると、緑の PR は基本的にありがたいものです。手を動かさずに依存が新しくなるなら、それに越したことはありません。
+
+ただ、このアプリは Expo 管理下です。そして `expo install --check` を打つと、Renovate が上げたがっているそのバージョンは「合っていない」と言われます。
+
+依存を新しく保つ仕組みが、依存を壊す仕組みとして働いていました。
+
+原因を突き止めるより先に、まず範囲を知りたくなりました。Renovate が触れてしまう Expo 管理下の依存は、いったい何件あるのか。
+
+## Expo が版を握っているパッケージは123件ある
+
+Expo の SDK パッケージには `bundledNativeModules.json` という一覧が同梱されています。`expo install` が「このパッケージはこの範囲で入れる」と判断する根拠であり、実質的に SDK ごとの互換性契約そのものです。
+
+実物を取り出して数えました。2026年7月30日時点の計測です。
+
+```bash
+npm pack expo@57.0.9 && tar -xzf expo-57.0.9.tgz
+node -e 'console.log(Object.keys(require("./package/bundledNativeModules.json")).length)'
+# => 123
+```
+
+SDK 56.0.18 でも同じことをしたところ 122 件でした。56 から 57 への差は、`expo-eas-client` が1件増えただけです。
+
+一方で、**バージョンレンジが変わったエントリは90件**ありました。追加も削除もほとんど起きていないのに、9割近くの範囲指定が動いている。SDK の更新とは、パッケージの入れ替えではなく範囲の付け替えなのだという当たり前のことが、数字で見えます。
+
+ここまでは想定内でした。想定と違ったのは、次に数えたところです。
+
+## 危ないのは「Expo という名前がついていない」依存だった
+
+123件の内訳を、名前で分けてみました。
+
+```bash
+node -e '
+const m = require("./package/bundledNativeModules.json");
+const all = Object.keys(m);
+const looksExpo = all.filter(n => n.startsWith("expo"));
+console.log("total:", all.length, "expo*:", looksExpo.length, "other:", all.length - looksExpo.length);
+'
+# => total: 123 expo*: 82 other: 41
+```
+
+41件は `expo` で始まりません。`react-native-reanimated`、`@shopify/flash-list`、`@sentry/react-native`、`react-native-svg`。単体で npm に公開されている、ごく普通のパッケージに見えます。
+
+Renovate から見れば、実際にごく普通のパッケージです。Expo が版を握っているという事情は、パッケージ名にもマニフェストにも書かれていません。
+
+この41件が、いま npm の最新版とどれだけ離れているのかを測りました。
+
+```js
+// audit.mjs — Expo が管理する非 expo-* パッケージと npm latest の差を分類する
+import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+const bnm = JSON.parse(readFileSync("./package/bundledNativeModules.json", "utf8"));
+const names = Object.keys(bnm).filter((n) => !n.startsWith("expo-") && n !== "expo");
+
+const num = (v, i) => Number(String(v).replace(/^[~^><= ]+/, "").split(".")[i]);
+
+const rows = [];
+for (const n of names) {
+  let latest = null;
+  try {
+    latest = execSync(`npm view ${n} version`, { encoding: "utf8", timeout: 40000 }).trim();
+  } catch {
+    // 取得できないものは unknown に落とす。ここで例外を投げると全件が無駄になります
+  }
+  if (!latest) {
+    rows.push({ n, pinned: bnm[n], latest: "n/a", gap: "unknown" });
+    continue;
+  }
+  const gap =
+    num(latest, 0) > num(bnm[n], 0)
+      ? "MAJOR"
+      : num(latest, 1) > num(bnm[n], 1)
+        ? "minor"
+        : latest !== String(bnm[n]).replace(/^[~^]/, "")
+          ? "patch"
+          : "same";
+  rows.push({ n, pinned: bnm[n], latest, gap });
+}
+
+const count = (g) => rows.filter((r) => r.gap === g).length;
+console.log(`managed(non expo-*): ${names.length}`);
+console.log(
+  `MAJOR=${count("MAJOR")} minor=${count("minor")} ` +
+    `patch=${count("patch")} same=${count("same")}`,
+);
+for (const g of ["MAJOR", "minor"]) {
+  console.log(`--- ${g} ---`);
+  for (const r of rows.filter((r) => r.gap === g)) {
+    console.log(`${r.n}\t${r.pinned}\t${r.latest}`);
+  }
+}
+```
+
+実行結果です。
+
+```
+managed(non expo-*): 41
+MAJOR=6 minor=9 patch=9 same=17 unknown=0
+```
+
+メジャーが6件。その内訳がこちらです。
+
+<table>
+<thead><tr><th>パッケージ</th><th>Expo SDK 57 の指定</th><th>npm latest</th></tr></thead>
+<tbody>
+<tr><td><code>@react-native-async-storage/async-storage</code></td><td>2.2.0</td><td><strong>3.1.1</strong></td></tr>
+<tr><td><code>react-native-gesture-handler</code></td><td>~2.32.0</td><td><strong>3.1.0</strong></td></tr>
+<tr><td><code>react-native-get-random-values</code></td><td>~1.11.0</td><td><strong>2.0.0</strong></td></tr>
+<tr><td><code>react-native-webview</code></td><td>13.16.1</td><td><strong>14.0.1</strong></td></tr>
+<tr><td><code>@sentry/react-native</code></td><td>~7.11.0</td><td><strong>8.20.0</strong></td></tr>
+<tr><td><code>react-native-bootsplash</code></td><td>^6.3.10</td><td><strong>7.3.2</strong></td></tr>
+</tbody>
+</table>
+
+この6件の並びを見て、少し背筋が寒くなりました。
+
+永続化層、ジェスチャ、乱数、WebView、クラッシュ計測、起動画面。**壊れても CI が赤くならない場所**ばかりです。AsyncStorage のメジャー更新はユーザーの保存データに触れます。ジェスチャの更新は画面遷移に触れます。Sentry の更新は、壊れたことを知らせてくれるはずの仕組み自体に触れます。
+
+マイナー差の9件も載せておきます。こちらは即座に壊れるわけではありませんが、`expo install --check` は等しく警告を出します。
+
+<table>
+<thead><tr><th>パッケージ</th><th>Expo SDK 57 の指定</th><th>npm latest</th></tr></thead>
+<tbody>
+<tr><td><code>@expo/vector-icons</code></td><td>^15.0.2</td><td>15.1.1</td></tr>
+<tr><td><code>@stripe/stripe-react-native</code></td><td>0.64.0</td><td>0.72.0</td></tr>
+<tr><td><code>react-native-keyboard-controller</code></td><td>1.21.9</td><td>1.22.2</td></tr>
+<tr><td><code>react-native-maps</code></td><td>1.27.2</td><td>1.29.0</td></tr>
+<tr><td><code>react-native-worklets</code></td><td>0.10.1</td><td>0.11.3</td></tr>
+<tr><td><code>react-native-safe-area-context</code></td><td>~5.7.0</td><td>5.8.0</td></tr>
+<tr><td><code>sentry-expo</code></td><td>~7.0.0</td><td>7.2.0</td></tr>
+<tr><td><code>@shopify/react-native-skia</code></td><td>2.6.2</td><td>2.10.1</td></tr>
+<tr><td><code>@shopify/flash-list</code></td><td>2.0.2</td><td>2.3.2</td></tr>
+</tbody>
+</table>
+
+事前の見立てでは、「`expo-` で始まるものを除外すれば概ね足りるだろう」と踏んでいました。実際には逆で、**名前で判断すると危険な6件を全部取り逃します**。メジャー差のあるパッケージは、6件とも `expo` で始まりません。
+
+同じ数の依存を扱っていても、供給網の観点からの棚卸しは目的が違います。そちらは[Rork が生成したアプリの依存関係を棚卸しする](/articles/rork-dev/rork-generated-dependency-audit-supply-chain-hygiene)にまとめてありますので、必要でしたら併せてご覧ください。
+
+## 除外リストは手で書かない
+
+対処そのものは単純で、Renovate の `ignoreDeps` に管理下のパッケージを並べれば済みます。
+
+問題は、それを人間が維持できないことです。123件のうち自分のアプリに入っているものだけを抜き出し、依存を1本足すたびに更新し、6本のアプリで揃える。三ヶ月後には確実にずれます。
+
+そこで、アプリの `node_modules` に入っている `expo` から直接生成することにしました。SDK と除外リストが構造的にずれない形です。
+
+```js
+// scripts/gen-renovate-ignore.mjs
+import { createRequire } from "node:module";
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
+
+const require = createRequire(import.meta.url);
+
+// アプリが実際に解決している expo から読む。
+// 固定バージョンを書くと SDK を上げた瞬間に嘘になります
+const managed = JSON.parse(
+  readFileSync(require.resolve("expo/bundledNativeModules.json"), "utf8"),
+);
+
+const pkg = JSON.parse(readFileSync("./package.json", "utf8"));
+const installed = new Set([
+  ...Object.keys(pkg.dependencies ?? {}),
+  ...Object.keys(pkg.devDependencies ?? {}),
+]);
+
+// expo 自身は bundledNativeModules.json に載っていません。
+// ここを補わないと Renovate が SDK のメジャーを上げてきます
+const ignoreDeps = [
+  ...new Set([
+    ...Object.keys(managed).filter((n) => installed.has(n)),
+    ...(installed.has("expo") ? ["expo"] : []),
+  ]),
+].sort();
+
+const configPath = "./renovate.json";
+const config = existsSync(configPath)
+  ? JSON.parse(readFileSync(configPath, "utf8"))
+  : {};
+const before = config.ignoreDeps ?? [];
+config.ignoreDeps = ignoreDeps;
+writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+
+const added = ignoreDeps.filter((n) => !before.includes(n));
+const dropped = before.filter((n) => !ignoreDeps.includes(n));
+
+console.log(`expo managed: ${Object.keys(managed).length} / ignored: ${ignoreDeps.length}`);
+for (const n of added) console.log(`+ ${n}`);
+for (const n of dropped) console.log(`- ${n}`);
+
+// 差分があれば非ゼロで終える。CI でそのままゲートにできます
+process.exit(added.length + dropped.length > 0 ? 1 : 0);
+```
+
+`expo` を補う3行は、後から足したものです。最初に書いたときには入れていませんでした。
+
+## 落とし穴 — expo 自身が自分の管理リストに載っていない
+
+最初の版を検証用のマニフェストで走らせたとき、出力はこうなりました。
+
+```
+expo managed: 123 / installed & ignored: 12
+```
+
+12件。目視で照らすと、`expo` そのものが抜けていました。
+
+理由は分かってしまえば当たり前で、`bundledNativeModules.json` は「SDK が版を管理する**周辺**パッケージ」の一覧です。SDK 本体は、その一覧を提供する側であって、載る側ではありません。
+
+ただ、実運用でいちばん上げられたくないのは `expo` です。ここが `57` から `58` へ静かに上がると、周辺123件との整合が一斉に崩れます。管理リストから生成しているという安心感が、まさにその安心感のせいで最大の穴を作りかけていました。
+
+補ったあとの実行ログです。
+
+```
+expo managed: 123 / ignored: 13
++ expo
+exit=1
+```
+
+もう一度走らせると、こうなります。
+
+```
+expo managed: 123 / ignored: 13
+exit=0
+```
+
+差分がなければ 0 で終わります。冪等です。CI に置いても、変更がない限り赤くなりません。
+
+## SDK を上げてもリストは変わらない
+
+もうひとつ、想定と違ったことがあります。
+
+検証のため `node_modules/expo` の中身を SDK 56.0.18 のものに差し替えて、同じスクリプトを走らせました。管理対象は 123 件から 122 件に減ります。
+
+```
+expo managed: 122 / ignored: 13
+exit=0
+```
+
+`ignoreDeps` は13件のまま、差分ゼロでした。
+
+当然と言えば当然です。`ignoreDeps` はパッケージ**名**の集合であり、バージョンレンジを含みません。SDK を上げると90件のレンジが動きますが、名前はほとんど動かない。56 と 57 の差は `expo-eas-client` の1件だけで、それも検証用マニフェストには入っていません。
+
+これは運用の設計に直接効きます。「SDK を上げるたびに除外リストを作り直す」という段取りを組みかけていたのですが、それは**ほぼ空振りする作業**です。
+
+このスクリプトが実際に捕まえるのは、SDK の更新ではありません。**新しい依存を足したときの入れ忘れ**です。`npx expo install react-native-maps` と打った翌週、Renovate がそれを 1.27.2 から 1.29.0 へ上げようとする。その一手を止めるためのものです。
+
+したがって、CI での置き場所も変わります。SDK アップグレード用のワークフローではなく、`package.json` を変更する全ての PR に効かせるのが正しい配置です。
+
+```yaml
+# .github/workflows/deps.yml
+name: deps
+on:
+  pull_request:
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "renovate.json"
+
+jobs:
+  renovate-ignore-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # bundledNativeModules.json を読むだけなので expo の解決だけできれば十分です
+      - run: npm ci --ignore-scripts
+      - name: renovate.json の ignoreDeps が SDK と一致しているか
+        run: node scripts/gen-renovate-ignore.mjs
+      - name: 差分が出た場合に内容を見せる
+        if: failure()
+        run: git --no-pager diff -- renovate.json
+```
+
+`npm ci --ignore-scripts` にしているのは、このスクリプトが `expo/bundledNativeModules.json` を解決できれば十分で、ネイティブ側のビルドスクリプトを走らせる必要がないためです。
+
+SDK 移行そのものの段取りは別の話になりますので、[Rork アプリの Expo SDK を毎年安全に上げ続ける保守設計](/articles/rork-dev/rork-expo-sdk-annual-upgrade-maintenance-design)に分けて書いています。
+
+## 残った依存にだけルールを効かせる
+
+除外を機械化すると、Renovate の設定はむしろ書きやすくなります。危険な集合が自動で外れているので、残りには素直なルールを当てられます。
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard"],
+  "timezone": "Asia/Tokyo",
+  "schedule": ["after 9am and before 11am on monday"],
+  "prConcurrentLimit": 3,
+  "rangeStrategy": "bump",
+  "ignoreDeps": [],
+  "packageRules": [
+    {
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "groupName": "dev tooling",
+      "automerge": true,
+      "automergeType": "branch"
+    },
+    {
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "runtime patches"
+    },
+    {
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["minor"],
+      "groupName": null
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "labels": ["deps:major", "needs-device-test"]
+    }
+  ]
+}
+```
+
+`ignoreDeps` を空配列で置いてあるのは、スクリプトが上書きする場所を明示しておくためです。人が書く欄ではない、という意思表示でもあります。
+
+`groupName: null` を2箇所に置いているのは意図的です。ランタイム依存のマイナーとメジャーは、まとめずに1つずつ PR を立てさせます。まとめた方が PR 数は減りますが、実機で挙動が変わったときに原因を切り分けられません。**実機確認が必要な更新は束ねない**、というのが6本を並行して回してみて落ち着いた線です。
+
+逆に devDependencies のパッチとマイナーは束ねて自動マージにしています。ここで壊れれば CI が赤くなるので、人間が読む必要がありません。
+
+## 実際にはどれだけ残るのか
+
+検証用に、壁紙アプリでよく使う構成に近いマニフェストを組んで通してみました。`dependencies` 14件、`devDependencies` 2件の計16件です。
+
+結果は、**16件中13件が Expo 管理下**でした。
+
+Renovate に自由に任せられたのは `zustand`、`date-fns`、`typescript` の3件だけです。
+
+正直なところ、この比率を見たときには「では Renovate を入れる意味はあるのか」と一度考えました。
+
+それでも残した理由が2つあります。
+
+ひとつは、その3件が **Expo の互換性契約の外にある依存**だからです。契約の外にあるものは誰も面倒を見てくれません。放っておくと最も静かに古くなるのは、実はこちら側でした。
+
+もうひとつは、Dependency Dashboard です。除外した13件も、ダッシュボードには「無視中」として一覧で残ります。`expo install --check` が教えてくれるのは「ずれているかどうか」ですが、ダッシュボードは「何を意図的に手放していないか」を見せてくれます。半年に一度この一覧を眺める時間が、そのまま棚卸しになっています。
+
+## 入れる順番
+
+既存のアプリへ後から入れる場合、順番を間違えると初回に PR が大量に立って収拾がつかなくなります。私はこの順を推奨します。
+
+1. **先にずれを戻す** — `npx expo install --check --fix` を打ち、Expo 管理下の依存を SDK の指定へ揃えます。ここを飛ばすと、ずれたまま除外リストが作られ、その状態が正として凍結されます
+2. **除外リストを生成してコミットする** — `node scripts/gen-renovate-ignore.mjs` を走らせ、生成された `renovate.json` をそのまま入れます。初回は必ず exit 1 で終わりますが、これは差分が出たという意味なので正常です
+3. **Renovate を有効化し、初回の PR 本数を見る** — `prConcurrentLimit` が 3 なので、多くても3本しか立ちません。3本とも中身を読んでから、上限を上げるかどうかを決めます
+
+2 を 1 より先にやると、ずれた状態がそのまま固定されます。個人開発で6本を順に移していったとき、最初の1本でこれをやってしまい、戻す作業が発生しました。順番だけの話ですが、ここは実際に間違えた場所です。
+
+## まとめ
+
+Expo 管理下のアプリに依存の自動更新を入れるときは、除外リストを **SDK から生成する**のが出発点になります。
+
+手で書くと、名前が `expo` で始まらない41件のどこかを必ず取りこぼします。そして今回の実測では、取りこぼしたときに最も痛い6件が、まさにその41件の中にありました。
+
+次の一手として、いまお手元のアプリで1行だけ試せることがあります。
+
+```bash
+npx expo install --check
+```
+
+ここで何も言われなければ、まだずれていません。何か言われたなら、その差はおそらく自動更新が持ち込んだものです。除外リストを作るのは、その差を戻したあとで構いません。
+
+私自身、この仕組みを入れてからようやく月曜の PR を落ち着いて読めるようになりました。同じ構成で運用されている方の手間がいくらか減れば嬉しく思います。お読みいただきありがとうございました。
