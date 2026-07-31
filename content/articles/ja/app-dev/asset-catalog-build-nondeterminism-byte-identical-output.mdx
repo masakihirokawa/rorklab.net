@@ -1,0 +1,485 @@
+---
+title: "生成した壁紙カタログのハッシュが毎回変わる — 非決定の出どころを5つ切り分ける"
+slug: "asset-catalog-build-nondeterminism-byte-identical-output"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-31T11:00"
+author: "Rork Lab"
+description: "同じ画像フォルダから同じ catalog.json が出てこない。opendir の列挙順、JSON.stringify のキー並べ替え、照合順序、Unicode 正規化、非同期の完了順。1,225ファイルで一つずつ切り分けて、出力を1種類に固定するまでの実測記録です。"
+tags: ["ビルド再現性", "Node.js", "カタログ生成", "CI", "Unicode"]
+highlights:
+  - "readdir は整列済み・opendir は未整列という差の実測。同じ1,225ファイルでもファイルシステムが変われば opendir の順序は同位置一致 2/1225 まで崩れます"
+  - "非決定を1つずつ外していく切り分け表。タイムスタンプを消しても20回中20種類のままだった段階と、その先に何が残っていたか"
+  - "決定的な生成スクリプトの全文と、CI で git diff --exit-code を差分ゲートとして機能させるための正規化ガード"
+---
+
+`git diff` が 1,984 行。
+
+画像は1枚も追加していません。壁紙アプリのカタログを作り直す `npm run catalog` を、直前のコミットと同じ状態でもう一度走らせただけです。11,041 行の `catalog.json` のうち、およそ 18% の行が動いていました。
+
+このスクリプトは、アセットフォルダを舐めて `catalog.json` を吐くだけの短いものです。壁紙系を個人開発で複数本まわしていると、画像の追加は日常作業になります。だからこそ、生成物が正しいことは人の目ではなく機械で担保したいところでした。CI では「生成物が最新か」を `git diff --exit-code` で見張るつもりでした。ところが毎回差分が出るので、ゲートは常に赤。結局チェックを外し、生成物のレビューは目視に戻っていました。
+
+差分が出る理由をタイムスタンプだと決めつけて、その行を消しました。直りませんでした。そこから、非決定の出どころを一つずつ切り離して測っていくことになります。
+
+計測環境は Node v22.22.3 / Ubuntu 22.04（Linux 6.8）。検証用に 1,225 ファイル（連番 ID 360件・カテゴリ接頭辞つき 865件・うち日本語名 25件）のフォルダを ext4 と tmpfs の3か所に用意しました。以下の数値はすべてこの環境で実際に走らせて取ったものです。
+
+## 差分の中身を先に見る
+
+やり直しの前に、何が動いているのかを見ます。
+
+```bash
+$ node scripts/gen-catalog.mjs assets/ public/catalog.json
+$ cp public/catalog.json /tmp/a1.json
+$ node scripts/gen-catalog.mjs assets/ public/catalog.json
+$ diff /tmp/a1.json public/catalog.json | wc -l
+1984
+$ wc -l /tmp/a1.json
+11041 /tmp/a1.json
+```
+
+差分は 2 種類に分かれていました。`generatedAt` の 1 行と、`items` の中身がブロックごと入れ替わっている大量の行です。
+
+後者が厄介でした。値は変わっていません。同じオブジェクトが別の位置に出ているだけです。JSON の意味としては等価で、アプリの動作にも影響しません。だからこそ放置されていたわけですが、差分ゲートを効かせたい以上、バイト列まで一致させる必要があります。
+
+生成スクリプトはこういう形をしていました。
+
+```js
+// scripts/gen-catalog.mjs（当時）
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+const SRC = process.argv[2];
+const OUT = process.argv[3];
+
+const catalog = {};
+const tagSet = new Set();
+const names = [];
+
+// メモリを気にして opendir でストリーミング
+const dir = await fsp.opendir(SRC);
+for await (const ent of dir) {
+  if (ent.isFile() && ent.name.endsWith(".jpg")) names.push(ent.name);
+}
+
+await Promise.all(names.map(async (name) => {
+  const st = await fsp.stat(path.join(SRC, name));
+  const id = name.replace(/\.jpg$/, "");
+  const cat = id.includes("_") ? id.split("_")[0] : "legacy";
+  tagSet.add(cat);
+  catalog[id] = {
+    id, file: name, category: cat,
+    bytes: st.size, width: 1290, height: 2796,
+    aspect: 1290 / 2796,
+  };
+}));
+
+const doc = {
+  generatedAt: new Date().toISOString(),
+  count: Object.keys(catalog).length,
+  tags: [...tagSet].sort((a, b) => a.localeCompare(b)),
+  items: catalog,
+};
+await fsp.writeFile(OUT, JSON.stringify(doc, null, 2));
+```
+
+30行ほどです。この中に、非決定の原因が5つ入っていました。
+
+## タイムスタンプを消しても直らない
+
+最初に `generatedAt` を落としました。これで終わりだと思っていました。
+
+同じディレクトリに対して 20 回連続で走らせ、出力の SHA-256 を集合に入れて数えます。
+
+<table>
+<thead><tr><th>スクリプトの状態</th><th>20回の出力ハッシュ</th></tr></thead>
+<tbody>
+<tr><td>そのまま</td><td>20 種類</td></tr>
+<tr><td>generatedAt を削除</td><td><strong>20 種類</strong></td></tr>
+</tbody>
+</table>
+
+1 種類も減りませんでした。タイムスタンプは、目に見えていただけの原因です。
+
+残っていたのは `Promise.all` の書き方でした。`names.map(async ...)` の中で配列に `push` していると、追加される順番は「その非同期処理が終わった順」になります。`stat` の完了順は毎回わずかにばらつくので、そこから先の並びがすべて変わります。
+
+200件の ID で 20 回ずつ試した結果です。
+
+<table>
+<thead><tr><th>集め方</th><th>20回の出力</th></tr></thead>
+<tbody>
+<tr><td>完了時に配列へ push</td><td>20 種類</td></tr>
+<tr><td>Promise.all の戻り値を使う</td><td>1 種類</td></tr>
+</tbody>
+</table>
+
+`Promise.all` は戻り値の配列を入力順で並べ直してくれます。値を返す形に書き換えるだけで、この原因は消えます。
+
+```js
+// 完了順に依存する書き方
+const items = [];
+await Promise.all(names.map(async (n) => { const st = await fsp.stat(n); items.push(mk(n, st)); }));
+
+// 入力順が保たれる書き方
+const items = await Promise.all(names.map(async (n) => { const st = await fsp.stat(n); return mk(n, st); }));
+```
+
+ここまでで、同じディレクトリを繰り返し処理する限りは出力が 1 種類に落ち着きました。ところが CI では、まだ差分が出ていました。
+
+## 列挙の順序 — readdir は整列済み、opendir は違う
+
+「`readdir` の順序は保証されない」というのは、よく言われる話です。私もそう理解していたので、メモリ節約を兼ねて `opendir` のストリーミングに切り替えていました。実際に測ると、話は逆でした。
+
+同じファイル集合を、作成順だけ変えて 3 つのディレクトリに用意し、`readdirSync` を 50 回ずつ呼びます。
+
+```
+assets-A(作成順)   : 50回 → 1種類  ソート済み配列と完全一致
+assets-B(シャッフル): 50回 → 1種類  ソート済み配列と完全一致
+assets-C(逆順)     : 50回 → 1種類  ソート済み配列と完全一致
+A と B と C の順序は完全に同一（同位置一致 1225/1225）
+```
+
+`fs.readdir` は整列された結果を返していました。libuv が `scandir` の結果を `strcmp` で並べ替えてから渡すためです。バイト列比較なので、ロケールにも左右されません。`LC_ALL` を C / C.UTF-8 / en_US.UTF-8 / POSIX と変えても、ハッシュは同じ `bf263d05356f` のままでした。
+
+一方 `opendir` は、その整列を通りません。
+
+```
+readdir : bf263d05356f
+opendir : 87268f8b81ea   ソート済み配列との同位置一致 1/1225
+opendir を20回繰り返す → 1種類（同じ環境では安定している）
+```
+
+同じ環境では安定していた、というのが罠でした。手元で何度回しても同じ結果が出るので、問題ないように見えてしまいます。
+
+崩れるのは、ファイルシステムが変わったときです。同一のファイル集合を 3 つの異なるファイルシステムに置いて `opendir` の順序を比べました。
+
+<table>
+<thead><tr><th>マウント</th><th>種別</th><th>opendir の順序ハッシュ</th><th>readdir の順序ハッシュ</th></tr></thead>
+<tbody>
+<tr><td>/sessions</td><td>ext4</td><td>87268f8b81ea</td><td>bf263d05356f</td></tr>
+<tr><td>/</td><td>ext4（別デバイス）</td><td>04d38ef7c8d3</td><td>bf263d05356f</td></tr>
+<tr><td>/dev/shm</td><td>tmpfs</td><td>7b8e667294a5</td><td>bf263d05356f</td></tr>
+</tbody>
+</table>
+
+3 つとも別物です。1 つ目と 2 つ目で同じ位置に来たファイルは 1,225 件中 2 件だけでした。ext4 の htree は、ディレクトリごと・ファイルシステムごとに異なるハッシュシードでエントリを並べます。同じ ext4 同士でも、別のボリュームなら順序は一致しません。
+
+つまり、この非決定は「ローカルでは絶対に再現しない」種類のものでした。CI の fresh clone、コンテナのレイヤ、開発機の入れ替え。そのときだけ順序が変わり、生成物がまるごと並べ替わります。
+
+生成物をバイト単位で固定したいなら、列挙の順序をライブラリ実装に預けてはいけません。`readdir` の整列は libuv の実装詳細であって、Node のドキュメントが約束している挙動ではないからです。取得したあとに自分で明示的に並べ替えるのが、唯一壊れない方法でした。
+
+## JSON.stringify が整数風のキーを並べ替える
+
+順序を明示的に固定したのに、まだ完全には一致しませんでした。次に出てきたのが、オブジェクトのキー順です。
+
+JavaScript のオブジェクトは、キーが「配列インデックスとして解釈できる文字列」のとき、挿入順を無視して昇順に並びます。
+
+```js
+const o = {};
+["100", "9", "10", "1", "0007", "7", "a10", "a9"].forEach((k) => (o[k] = 1));
+
+Object.keys(o).join(",");
+// → 1,7,9,10,100,0007,a10,a9
+JSON.stringify(o);
+// → {"1":1,"7":1,"9":1,"10":1,"100":1,"0007":1,"a10":1,"a9":1}
+```
+
+挿入したのは `100, 9, 10, 1, ...` の順でしたが、数値として読めるキーだけが先に昇順で並び、それ以外は挿入順のまま後ろに続きます。先頭ゼロつきの `"0007"` や負数 `"-1"`、小数 `"1.5"` は配列インデックスと見なされないため、文字列側に回ります。上限もあって、`4294967295` 以上は数値扱いされません。
+
+```js
+const t = {};
+["4294967294", "4294967295", "4294967296", "5"].forEach((k) => (t[k] = 1));
+Object.keys(t).join(",");
+// → 5,4294967294,4294967295,4294967296
+//   4294967295 以降は挿入順のまま
+```
+
+ここで実際に困ったのは、この挙動が長いあいだバグを隠していたことです。カタログの ID がすべて連番だった頃は、挿入順が何であろうと出力は同じでした。
+
+実カタログの ID を使って、挿入順を 30 通りに変えたときの出力ハッシュの種類を数えます。
+
+<table>
+<thead><tr><th>ID の構成</th><th>件数</th><th>挿入順30通りでの出力</th></tr></thead>
+<tbody>
+<tr><td>数値 ID のみ</td><td>360</td><td>1 種類</td></tr>
+<tr><td>数値 ID + 非数値 1 件</td><td>361</td><td>1 種類</td></tr>
+<tr><td>数値 ID + 非数値 2 件</td><td>362</td><td><strong>2 種類</strong></td></tr>
+<tr><td>実カタログ全件（数値360 + 接頭辞865）</td><td>1225</td><td><strong>30 種類</strong></td></tr>
+</tbody>
+</table>
+
+非数値の ID が 1 件までは、それが必ず末尾に来るので結果的に決定的です。2 件目が入った瞬間に崩れます。
+
+カテゴリ接頭辞つきの命名（`zen_0006` のような形）に移行したのは、この生成スクリプトを書いてから 1 年以上あとのことでした。命名規則を変えた日から差分ゲートが壊れ始めていたわけですが、当時は「JSON の並びが変わっただけ」に見えていたので、原因として結びついていませんでした。私自身、命名規則の変更を「表示に影響しない安全な変更」に分類していたのが、いま振り返ると誤りでした。
+
+対処は単純です。連想配列で出すのをやめ、配列にします。
+
+```js
+// 変更前: キーの並べ替えを踏む
+items: { "1": {...}, "zen_0006": {...} }
+
+// 変更後: 自分が並べた順がそのまま残る
+items: [ { id: "1", ... }, { id: "zen_0006", ... } ]
+```
+
+アプリ側で ID 引きしたい場合は、読み込み時に `Map` を作れば済みます。`Map` の反復順は挿入順で、オブジェクトのような並べ替えは起きません。
+
+## 並べ替えをロケールに任せない
+
+配列にしたので、次は並べ方を決めます。`localeCompare` を使っていましたが、これも環境に依存します。
+
+1,225 件のファイル名を、比較関数を変えて並べたときの一致率です。基準は `sort()` の既定（UTF-16 コード単位の比較）。
+
+<table>
+<thead><tr><th>比較関数</th><th>既定と同位置</th></tr></thead>
+<tbody>
+<tr><td>sort() 既定（UTF-16 コード単位）</td><td>1225 / 1225</td></tr>
+<tr><td>localeCompare(undefined)</td><td>1225 / 1225</td></tr>
+<tr><td>localeCompare("en")</td><td>1225 / 1225</td></tr>
+<tr><td>localeCompare("ja")</td><td><strong>1045 / 1225</strong></td></tr>
+<tr><td>Intl.Collator("ja", numeric: true)</td><td><strong>686 / 1225</strong></td></tr>
+<tr><td>Buffer.compare（UTF-8 バイト列）</td><td>1225 / 1225</td></tr>
+</tbody>
+</table>
+
+`localeCompare("ja")` は 180 件の位置を動かします。ICU の日本語照合が、漢字を読みの順で扱うためです。タグ 15 件を並べると違いがはっきり出ます。
+
+```
+ja  : 🌸桜 10月 2月 abstract Abstract minimal zen Zen ねこ ネコ ミニマル 猫 夜桜 𠮟咤 α波
+en  : 🌸桜 10月 2月 abstract Abstract minimal zen Zen α波 ねこ ネコ ミニマル 𠮟咤 夜桜 猫
+byte: 10月 2月 Abstract Zen abstract minimal zen α波 ねこ ネコ ミニマル 夜桜 猫 🌸桜 𠮟咤
+```
+
+`ja` では「猫」が「夜桜」より前に、`en` では後ろに来ます。同じデータでも、Node のビルドに入っている ICU のバージョンが違えば結果が変わり得ます。生成物の並びを ICU のバージョンに預けるのは、長期運用では避けたい依存でした。
+
+もう一つ、既定の `sort()` にも落とし穴があります。UTF-16 のコード単位で比べるため、BMP 外の文字（サロゲートペア）がコードポイント順と食い違います。
+
+```
+UTF-16 コード単位: 一.jpg  🌸.jpg  𠮟.jpg  﨑.jpg  ～.jpg
+コードポイント順  : 一.jpg  﨑.jpg  ～.jpg  🌸.jpg  𠮟.jpg
+UTF-8 バイト順    : 一.jpg  﨑.jpg  ～.jpg  🌸.jpg  𠮟.jpg
+```
+
+`﨑` や `～` は U+E000〜U+FFFF の範囲にあり、サロゲートペアの前半（0xD800台）より大きなコード単位を持ちます。だから既定の `sort()` では絵文字より後ろに回ります。異体字を含むファイル名を扱うなら、実害の出る差です。
+
+`Buffer.compare` による UTF-8 バイト順は、コードポイント順と常に一致します。生成物の並べ替えにはこれを使うことにしました。読みやすい五十音順が欲しいのはアプリの表示層であって、ビルド成果物のバイト列ではありません。表示順は別のフィールドとして持たせれば済みます。
+
+```js
+const byBytes = (a, b) =>
+  Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+
+items.sort((a, b) => byBytes(a.id, b.id));
+```
+
+## 濁点の位置 — これは生成スクリプトでは直しきれなかった
+
+最後に残ったのが Unicode 正規化です。ここだけは、生成側の工夫で完結しませんでした。
+
+検証セットには、濁点を結合文字で持つ NFD 形式のファイル名を 5 件混ぜてあります。macOS で作られたファイル名が、そのまま Linux 側に渡ってきた状況を模したものです。
+
+```
+NFD: 長さ 11 / UTF-8 21 バイト
+NFC: 長さ 10 / UTF-8 18 バイト
+a === b            → false
+a.localeCompare(b) → 0     （照合上は同一）
+fs.existsSync(NFC形式のパス) → false
+fs.existsSync(NFD形式のパス) → true
+```
+
+見た目は同じ、`localeCompare` でも同じ、それでも `===` は false で、NFC 化したパスでは開けません。生成物のキーだけを `normalize("NFC")` で揃えると、ID は一致するのにファイルが読めないという最悪の組み合わせになります。
+
+では ID を NFC に正規化しつつ、`file` フィールドには実ファイル名を残せばよいのか。試しました。
+
+<table>
+<thead><tr><th>生成の仕方</th><th>Linux 側（NFD）</th><th>macOS 側（NFC）</th><th>一致</th></tr></thead>
+<tbody>
+<tr><td>file に実ファイル名を残す</td><td>522d6a608417</td><td>ec0c4adeb6d7</td><td>不一致</td></tr>
+<tr><td>file を id から導出する</td><td>ec0c4adeb6d7</td><td>ec0c4adeb6d7</td><td>一致</td></tr>
+</tbody>
+</table>
+
+実ファイル名を残す限り、プラットフォーム間で生成物は一致しません。当然といえば当然ですが、実際に測るまでは「キーだけ正規化すれば揃う」と思い込んでいました。
+
+結論として、正規化はビルドの問題ではなく、リポジトリに入るファイル名の問題でした。生成スクリプトの下流で吸収するのではなく、上流で弾きます。
+
+```js
+// scripts/check-nfc.mjs
+import fs from "node:fs";
+
+const bad = [];
+for (const dir of process.argv.slice(2)) {
+  for (const n of fs.readdirSync(dir)) {
+    if (n !== n.normalize("NFC")) bad.push(`${dir}/${n}`);
+  }
+}
+
+if (bad.length) {
+  console.error(`NFC でないファイル名が ${bad.length} 件あります:`);
+  for (const b of bad.slice(0, 5)) console.error("  " + JSON.stringify(b));
+  process.exit(1);
+}
+console.log("すべて NFC です");
+```
+
+```
+$ node scripts/check-nfc.mjs assets/
+NFC でないファイル名が 5 件あります:
+  "assets/こもれび_0.jpg"
+  ...
+exit=1
+```
+
+あわせて macOS 側では `git config core.precomposeunicode true` を確認します。既定で有効ですが、古い設定を引き継いだリポジトリでは落ちていることがあります。ファイル名の 5 件を NFC に直したあとは、`readdir` の順序も両プラットフォームで一致しました。
+
+## 決定的にした生成スクリプト
+
+ここまでの修正を入れた版です。番号のコメントが、それぞれ潰した非決定に対応しています。
+
+```js
+// scripts/gen-catalog.mjs
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+const SRC = process.argv[2];
+const OUT = process.argv[3];
+
+// 1) 列挙は readdir。opendir のストリーミングは使わない
+const names = (await fsp.readdir(SRC)).filter((n) => n.endsWith(".jpg"));
+
+// 2) 完了順ではなく入力順を保つ（Promise.all の戻り値を使う）
+const items = await Promise.all(
+  names.map(async (name) => {
+    const st = await fsp.stat(path.join(SRC, name));
+    // 3) キーは NFC に正規化。ファイル名は check-nfc.mjs が上流で保証している
+    const id = name.replace(/\.jpg$/, "").normalize("NFC");
+    const cat = id.includes("_") ? id.split("_")[0] : "legacy";
+    return {
+      id,
+      file: `${id}.jpg`,
+      category: cat,
+      bytes: st.size,
+      width: 1290,
+      height: 2796,
+      // 4) 浮動小数は桁を固定してから数値に戻す
+      aspect: Number((1290 / 2796).toFixed(4)),
+    };
+  })
+);
+
+// 5) 並べ替えはロケールに依存しないバイト順で明示的に
+const byBytes = (a, b) =>
+  Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+items.sort((a, b) => byBytes(a.id, b.id));
+
+const tags = [...new Set(items.map((i) => i.category))].sort(byBytes);
+
+// 6) 時刻は外から与えられたときだけ入れる
+const epoch = process.env.SOURCE_DATE_EPOCH;
+const doc = {
+  schema: 2,
+  generatedAt: epoch ? new Date(Number(epoch) * 1000).toISOString() : null,
+  count: items.length,
+  tags,
+  items,
+};
+
+// 7) キー順を固定し、末尾に改行を付ける
+const stable = (obj) =>
+  JSON.stringify(
+    obj,
+    (_k, v) =>
+      v && typeof v === "object" && !Array.isArray(v)
+        ? Object.fromEntries(Object.keys(v).sort(byBytes).map((k) => [k, v[k]]))
+        : v,
+    2
+  ) + "\n";
+
+await fsp.writeFile(OUT, stable(doc));
+```
+
+浮動小数の扱いについて補足します。`1290 / 2796` は `0.4613733905579399` としてシリアライズされます。この値自体は IEEE 754 の演算なので環境が変わっても同じですが、桁数が多いほど後段の処理（別言語でのパース、丸め、再出力）で揺れる余地が増えます。`toFixed(4)` を挟んで `0.4614` に固定しておくと、生成物の見通しがよくなります。`-0` が `0` に、`1e21` が `1e+21` になる点も、値を丸めておけば踏みません。
+
+`SOURCE_DATE_EPOCH` は再現ビルドの世界で使われている環境変数です。CI ではコミット日時を入れ、ローカルでは未設定にしておくと、`git diff` を見張る用途で邪魔になりません。
+
+## 切り分けの結果
+
+修正を 1 つずつ積み上げたときの推移です。同一ディレクトリで 20 回、および 2 つのファイルシステムをまたいで比較しました。
+
+<table>
+<thead><tr><th>状態</th><th>同一環境で20回</th><th>ファイルシステム横断</th></tr></thead>
+<tbody>
+<tr><td>元のスクリプト</td><td>20 種類</td><td>不一致</td></tr>
+<tr><td>+ タイムスタンプを外した</td><td>20 種類</td><td>不一致</td></tr>
+<tr><td>+ 完了順 push をやめた</td><td>1 種類</td><td><strong>不一致</strong></td></tr>
+<tr><td>+ opendir を readdir に戻した</td><td>1 種類</td><td>一致</td></tr>
+<tr><td>+ オブジェクトを配列にした</td><td>1 種類</td><td>一致</td></tr>
+<tr><td>+ 明示ソート / NFC / 桁固定</td><td>1 種類</td><td>一致</td></tr>
+</tbody>
+</table>
+
+3 行目が、この作業でいちばん危なかった地点です。手元で 20 回走らせて 1 種類。テストは緑。それでも CI では壊れていました。「ローカルで再現しない」という報告が上がったとき、まず疑うべきはここだと思います。
+
+最後の 2 行は、同一環境の反復でも横断でも見かけ上は変化がありません。それでも入れているのは、`readdir` の整列が libuv の実装詳細だからです。将来のバージョンで変わっても、`glob` 系のライブラリに差し替えても、明示ソートが入っていれば生成物は動きません。実装詳細に寄りかかった「たまたま決定的」と、自分で並べた「意図して決定的」は、6か月後の自分にとってまったく別物でした。
+
+完成版を 60 回連続で実行した結果です。
+
+```
+v1（元のスクリプト）: 出力ハッシュ 60 種類 / 1回あたり 142.5 ms
+v2（決定化した版）    : 出力ハッシュ  1 種類 / 1回あたり 137.7 ms
+```
+
+環境変数を振っても変わりませんでした。
+
+<table>
+<thead><tr><th>環境</th><th>10回の出力</th><th>ハッシュ</th></tr></thead>
+<tbody>
+<tr><td>既定</td><td>1 種類</td><td>58977ad47094</td></tr>
+<tr><td>LC_ALL=C</td><td>1 種類</td><td>58977ad47094</td></tr>
+<tr><td>LC_ALL=en_US.UTF-8</td><td>1 種類</td><td>58977ad47094</td></tr>
+<tr><td>TZ=America/Los_Angeles</td><td>1 種類</td><td>58977ad47094</td></tr>
+<tr><td>TZ=Asia/Tokyo, LC_ALL=C</td><td>1 種類</td><td>58977ad47094</td></tr>
+</tbody>
+</table>
+
+明示ソートを足したぶん遅くなると思っていましたが、実測では 142.5 ms から 137.7 ms へ、むしろわずかに速くなりました。`opendir` の逐次読み出しをやめた効果のほうが、ソート 1,225 件のコストより大きかったようです。1,000 件規模のカタログでは、決定化のコストは実質ゼロと考えてよさそうです。
+
+## CI で効かせる
+
+ここまで来て、ようやく差分ゲートが意味を持ちます。
+
+```yaml
+- name: ファイル名の正規化を確認
+  run: node scripts/check-nfc.mjs assets
+
+- name: カタログを再生成して差分がないことを確認
+  run: |
+    node scripts/gen-catalog.mjs assets public/catalog.json
+    git diff --exit-code -- public/catalog.json
+```
+
+このゲートが通るということは、「コミットされた生成物が、いまのアセットから再現できる」という保証です。逆に落ちたときは、アセットを足したのに再生成を忘れたか、生成ロジックを変えたのに生成物を更新していないかのどちらかで、どちらも本当に知りたい失敗です。
+
+ノイズが出ないので、生成物をコミットに含める運用そのものが成立するようになりました。CI 側のビルド時間も、生成物が既にあるぶん短くなります。
+
+もう一段の使い道として、生成物のハッシュを配信のキャッシュキーに使えます。内容が変わらなければハッシュが変わらないので、意味のない CDN パージや無駄なダウンロードが発生しません。非決定な生成物では、この設計は成り立ちませんでした。
+
+同じカタログを対象にした重複検出の話は[壁紙カタログに同じ絵が二度並んでいた — 知覚ハッシュの閾値を324枚で実測して決める](/articles/app-dev/image-catalog-perceptual-hash-dedup-threshold-measurement)に、生成物と CI ゲートを組み合わせる別の例は[Renovate が触ってよい依存と、触ってはいけない依存 — Expo SDK 57 の123パッケージを機械的に切り分ける](/articles/rork-dev/rork-renovate-expo-managed-deps-ignore-generation)にまとめてあります。
+
+## 手を入れる順番
+
+同じ症状に当たったときのために、確認する順番を残しておきます。
+
+1. 差分の中身を見る。値が変わっているのか、並びが変わっているだけなのかで原因の層が違います
+2. 明らかな時刻・乱数・ホスト名を消す。ただしここで止まらない
+3. 非同期の集約を確認する。`push` を `return` に変えるだけで消える非決定は多いです
+4. 列挙 API を確認する。`opendir` や独自の走査は順序を保証しません
+5. 出力の器を確認する。オブジェクトのキーは自分の意図と別の順序に並びます
+6. 並べ替えの比較関数をロケールから切り離す。`Buffer.compare` が安全です
+7. ファイル名の正規化は上流で弾く。生成側では直りません
+8. 最後に、同じ入力で N 回まわしてハッシュを数える。1 種類になるまで終わりではありません
+
+この 8 番を最初にやっておけば、私は 1 日を使わずに済みました。「同じ入力から同じバイト列が出る」ことは、テストで確かめられます。確かめていなかったから、差分ゲートを外すという逆方向の対処に流れていました。
+
+生成物をリポジトリに置く設計を取るなら、決定性はその前提条件です。前提が崩れていることに気づかないまま運用すると、崩れたぶんだけチェックを外していくことになります。
+
+お読みいただきありがとうございました。手元のスクリプトを N 回まわしてハッシュを数えるところから、試していただければ嬉しいです。

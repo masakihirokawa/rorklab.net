@@ -1,0 +1,483 @@
+---
+title: "My generated wallpaper catalog hashed differently on every run — isolating five sources of nondeterminism"
+slug: "asset-catalog-build-nondeterminism-byte-identical-output"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-07-31T11:00"
+author: "Rork Lab"
+description: "The same image folder refused to produce the same catalog.json twice. Directory enumeration order, JSON.stringify key reordering, collation, Unicode normalization, and async completion order — measured one at a time across 1,225 files until the output settled on a single hash."
+tags: ["build reproducibility", "Node.js", "catalog generation", "CI", "Unicode"]
+highlights:
+  - "Measured difference between readdir and opendir ordering, including how the same 1,225 files land in a completely different opendir order on a different filesystem (2/1225 positions matched)"
+  - "A step-by-step ablation table, including the stage where removing the timestamp still left 20 distinct hashes out of 20 runs"
+  - "The full deterministic generator plus the normalization guard that makes git diff --exit-code usable as a CI gate"
+---
+
+The diff was 1,984 lines long.
+
+I had not added a single image. I re-ran `npm run catalog` on the wallpaper app with the tree in exactly the state of the previous commit. About 18% of the 11,041 lines in `catalog.json` had moved.
+
+The script is small: walk the asset folder, emit `catalog.json`. The plan for CI was to guard freshness with `git diff --exit-code`. Since every run produced a diff, the gate stayed red. Eventually I removed the check and went back to eyeballing generated output in review.
+
+I assumed the timestamp was the culprit and deleted that line. It did not help. What followed was a session of pulling the sources of nondeterminism apart one at a time.
+
+Everything below was measured on Node v22.22.3 / Ubuntu 22.04 (Linux 6.8), against a fixture of 1,225 files (360 numeric IDs, 865 with a category prefix, 25 of them with Japanese names) placed on three different filesystems.
+
+## Look at the diff before rewriting anything
+
+Before touching the script, I wanted to know what was actually moving.
+
+```bash
+$ node scripts/gen-catalog.mjs assets/ public/catalog.json
+$ cp public/catalog.json /tmp/a1.json
+$ node scripts/gen-catalog.mjs assets/ public/catalog.json
+$ diff /tmp/a1.json public/catalog.json | wc -l
+1984
+$ wc -l /tmp/a1.json
+11041 /tmp/a1.json
+```
+
+Two kinds of change. One line for `generatedAt`, and a large number of lines where entire `items` blocks had swapped positions.
+
+The second kind was the awkward one. No values changed. The same objects simply appeared in different places. Semantically the JSON is equivalent and the app behaves identically, which is exactly why nobody had chased it. But a diff gate needs byte equality, not semantic equality.
+
+Here is the script as it stood.
+
+```js
+// scripts/gen-catalog.mjs (before)
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+const SRC = process.argv[2];
+const OUT = process.argv[3];
+
+const catalog = {};
+const tagSet = new Set();
+const names = [];
+
+// streamed with opendir to keep memory down
+const dir = await fsp.opendir(SRC);
+for await (const ent of dir) {
+  if (ent.isFile() && ent.name.endsWith(".jpg")) names.push(ent.name);
+}
+
+await Promise.all(names.map(async (name) => {
+  const st = await fsp.stat(path.join(SRC, name));
+  const id = name.replace(/\.jpg$/, "");
+  const cat = id.includes("_") ? id.split("_")[0] : "legacy";
+  tagSet.add(cat);
+  catalog[id] = {
+    id, file: name, category: cat,
+    bytes: st.size, width: 1290, height: 2796,
+    aspect: 1290 / 2796,
+  };
+}));
+
+const doc = {
+  generatedAt: new Date().toISOString(),
+  count: Object.keys(catalog).length,
+  tags: [...tagSet].sort((a, b) => a.localeCompare(b)),
+  items: catalog,
+};
+await fsp.writeFile(OUT, JSON.stringify(doc, null, 2));
+```
+
+Roughly thirty lines, hiding five separate sources of nondeterminism.
+
+## Dropping the timestamp changed nothing
+
+I removed `generatedAt` first, expecting that to be the end of it.
+
+The test: run the script 20 times against the same directory and count distinct SHA-256 hashes of the output.
+
+<table>
+<thead><tr><th>Script state</th><th>Distinct hashes in 20 runs</th></tr></thead>
+<tbody>
+<tr><td>As written</td><td>20</td></tr>
+<tr><td>generatedAt removed</td><td><strong>20</strong></td></tr>
+</tbody>
+</table>
+
+Not a single one collapsed. The timestamp was merely the visible cause.
+
+What remained was the shape of the `Promise.all` call. Pushing into an array inside `names.map(async ...)` appends in completion order, and `stat` completion order shifts slightly on every run. Everything downstream reorders with it.
+
+Measured over 200 IDs, 20 runs each:
+
+<table>
+<thead><tr><th>How results are collected</th><th>Distinct outputs in 20 runs</th></tr></thead>
+<tbody>
+<tr><td>push on completion</td><td>20</td></tr>
+<tr><td>use the Promise.all return value</td><td>1</td></tr>
+</tbody>
+</table>
+
+`Promise.all` resolves to an array ordered by input position. Returning values instead of pushing removes this source entirely.
+
+```js
+// depends on completion order
+const items = [];
+await Promise.all(names.map(async (n) => { const st = await fsp.stat(n); items.push(mk(n, st)); }));
+
+// preserves input order
+const items = await Promise.all(names.map(async (n) => { const st = await fsp.stat(n); return mk(n, st); }));
+```
+
+At this point repeated runs against the same directory produced one hash. CI still disagreed.
+
+## Enumeration order — readdir is sorted, opendir is not
+
+"Directory order is not guaranteed" is common advice, and I had internalised it. That belief is part of why I had switched to `opendir` streaming to save memory. Measuring it told the opposite story.
+
+I built the same file set three times, varying only the order in which files were created, then called `readdirSync` 50 times on each.
+
+```
+assets-A (creation order)  : 50 runs → 1 distinct  identical to the sorted array
+assets-B (shuffled)        : 50 runs → 1 distinct  identical to the sorted array
+assets-C (reverse)         : 50 runs → 1 distinct  identical to the sorted array
+A, B and C agree on every position (1225/1225)
+```
+
+`fs.readdir` returns sorted results. libuv sorts the `scandir` output with `strcmp` before handing it over. That is a byte comparison, so locale does not enter into it — setting `LC_ALL` to C, C.UTF-8, en_US.UTF-8 or POSIX produced the same `bf263d05356f` every time.
+
+`opendir` skips that sort.
+
+```
+readdir : bf263d05356f
+opendir : 87268f8b81ea   matches the sorted array in 1/1225 positions
+opendir, repeated 20 times → 1 distinct (stable within one environment)
+```
+
+Stable within one environment was the trap. Run it locally as many times as you like and it looks perfectly well behaved.
+
+It breaks when the filesystem changes. Same file set, three different filesystems:
+
+<table>
+<thead><tr><th>Mount</th><th>Type</th><th>opendir order hash</th><th>readdir order hash</th></tr></thead>
+<tbody>
+<tr><td>/sessions</td><td>ext4</td><td>87268f8b81ea</td><td>bf263d05356f</td></tr>
+<tr><td>/</td><td>ext4 (different device)</td><td>04d38ef7c8d3</td><td>bf263d05356f</td></tr>
+<tr><td>/dev/shm</td><td>tmpfs</td><td>7b8e667294a5</td><td>bf263d05356f</td></tr>
+</tbody>
+</table>
+
+All three differ. Between the first two, only 2 files out of 1,225 landed in the same position. The ext4 htree orders entries using a hash seed that is per-filesystem, so two ext4 volumes will not agree either.
+
+In other words this was a failure that could never reproduce locally. A fresh clone in CI, a new container layer, a replaced dev machine — the order changes there and the whole artifact reshuffles.
+
+If you want byte-stable output, do not delegate ordering to a library's internals. libuv's sort is an implementation detail, not something the Node documentation promises. Sorting explicitly after you read is the only version that cannot drift.
+
+## JSON.stringify reorders integer-like keys
+
+With ordering pinned, the output still refused to match exactly. Next up: object key order.
+
+When a JavaScript object has keys that parse as array indices, those keys ignore insertion order and come out in ascending numeric order.
+
+```js
+const o = {};
+["100", "9", "10", "1", "0007", "7", "a10", "a9"].forEach((k) => (o[k] = 1));
+
+Object.keys(o).join(",");
+// → 1,7,9,10,100,0007,a10,a9
+JSON.stringify(o);
+// → {"1":1,"7":1,"9":1,"10":1,"100":1,"0007":1,"a10":1,"a9":1}
+```
+
+Insertion was `100, 9, 10, 1, ...`, yet the numeric-looking keys sort ascending first and everything else follows in insertion order. `"0007"` with its leading zero, `"-1"`, and `"1.5"` are not array indices, so they stay on the string side. There is also a ceiling: anything at or above `4294967295` is treated as a plain string.
+
+```js
+const t = {};
+["4294967294", "4294967295", "4294967296", "5"].forEach((k) => (t[k] = 1));
+Object.keys(t).join(",");
+// → 5,4294967294,4294967295,4294967296
+//   4294967295 and above keep insertion order
+```
+
+What actually hurt here is that this behaviour had been hiding the bug for a long time. Back when every catalog ID was a plain sequence number, insertion order did not matter at all.
+
+Using the real ID set, shuffling insertion order 30 different ways:
+
+<table>
+<thead><tr><th>ID composition</th><th>Count</th><th>Distinct outputs across 30 orders</th></tr></thead>
+<tbody>
+<tr><td>numeric IDs only</td><td>360</td><td>1</td></tr>
+<tr><td>numeric IDs + 1 non-numeric</td><td>361</td><td>1</td></tr>
+<tr><td>numeric IDs + 2 non-numeric</td><td>362</td><td><strong>2</strong></td></tr>
+<tr><td>full catalog (360 numeric + 865 prefixed)</td><td>1225</td><td><strong>30</strong></td></tr>
+</tbody>
+</table>
+
+With a single non-numeric ID the result is still deterministic, because that one key always lands last. The second one breaks it.
+
+The move to category-prefixed names such as `zen_0006` happened more than a year after this script was written. The diff gate started failing the day the naming convention changed, but at the time it read as "the JSON order shifted again," so nobody connected the two.
+
+The fix is small: stop emitting a keyed object, emit an array.
+
+```js
+// before: subject to key reordering
+items: { "1": {...}, "zen_0006": {...} }
+
+// after: the order you chose is the order you get
+items: [ { id: "1", ... }, { id: "zen_0006", ... } ]
+```
+
+If the app needs lookup by ID, build a `Map` at load time. `Map` iterates in insertion order and never applies the numeric reshuffle.
+
+## Keep collation out of the artifact
+
+Now that ordering is mine to decide, the comparator matters. The script used `localeCompare`, which is environment-dependent.
+
+Sorting the 1,225 filenames with different comparators, measured against the default `sort()` (UTF-16 code unit comparison):
+
+<table>
+<thead><tr><th>Comparator</th><th>Positions matching the default</th></tr></thead>
+<tbody>
+<tr><td>sort() default (UTF-16 code units)</td><td>1225 / 1225</td></tr>
+<tr><td>localeCompare(undefined)</td><td>1225 / 1225</td></tr>
+<tr><td>localeCompare("en")</td><td>1225 / 1225</td></tr>
+<tr><td>localeCompare("ja")</td><td><strong>1045 / 1225</strong></td></tr>
+<tr><td>Intl.Collator("ja", numeric: true)</td><td><strong>686 / 1225</strong></td></tr>
+<tr><td>Buffer.compare (UTF-8 bytes)</td><td>1225 / 1225</td></tr>
+</tbody>
+</table>
+
+`localeCompare("ja")` moves 180 positions, because ICU's Japanese collation orders kanji by reading. Sorting a 15-tag list makes it obvious:
+
+```
+ja  : 🌸桜 10月 2月 abstract Abstract minimal zen Zen ねこ ネコ ミニマル 猫 夜桜 𠮟咤 α波
+en  : 🌸桜 10月 2月 abstract Abstract minimal zen Zen α波 ねこ ネコ ミニマル 𠮟咤 夜桜 猫
+byte: 10月 2月 Abstract Zen abstract minimal zen α波 ねこ ネコ ミニマル 夜桜 猫 🌸桜 𠮟咤
+```
+
+Under `ja`, 猫 sorts before 夜桜; under `en` it sorts after. Two Node builds carrying different ICU versions can disagree on the same data. Pinning artifact order to an ICU version is not a dependency I want to carry for years.
+
+The default `sort()` has its own edge. It compares UTF-16 code units, so characters outside the BMP disagree with code point order.
+
+```
+UTF-16 code units : 一.jpg  🌸.jpg  𠮟.jpg  﨑.jpg  ～.jpg
+code point order  : 一.jpg  﨑.jpg  ～.jpg  🌸.jpg  𠮟.jpg
+UTF-8 byte order  : 一.jpg  﨑.jpg  ～.jpg  🌸.jpg  𠮟.jpg
+```
+
+`﨑` and `～` live in U+E000–U+FFFF, above the high surrogate range, so the default sort pushes them behind the emoji. If your filenames include variant kanji, that difference is real.
+
+UTF-8 byte order always agrees with code point order, so `Buffer.compare` became the comparator for the artifact. Human-friendly ordering belongs to the presentation layer, not to a build product — ship a separate display-order field if you need one.
+
+```js
+const byBytes = (a, b) =>
+  Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+
+items.sort((a, b) => byBytes(a.id, b.id));
+```
+
+## Unicode normalization could not be fixed inside the generator
+
+The last one was normalization, and it was the only source I could not resolve in the script itself.
+
+The fixture includes five filenames in NFD, with combining marks — the shape you get when names created on macOS travel to a Linux box unchanged.
+
+```
+NFD: length 11 / 21 UTF-8 bytes
+NFC: length 10 / 18 UTF-8 bytes
+a === b            → false
+a.localeCompare(b) → 0     (identical under collation)
+fs.existsSync(NFC path) → false
+fs.existsSync(NFD path) → true
+```
+
+They look identical, they compare equal under collation, `===` still says false, and the NFC path cannot be opened. Normalizing only the catalog keys gives you the worst combination: IDs that match and files that cannot be read.
+
+So what about normalizing the ID while keeping the real filename in a `file` field? I measured that too.
+
+<table>
+<thead><tr><th>Generation strategy</th><th>Linux side (NFD)</th><th>macOS side (NFC)</th><th>Match</th></tr></thead>
+<tbody>
+<tr><td>keep the on-disk filename in `file`</td><td>522d6a608417</td><td>ec0c4adeb6d7</td><td>no</td></tr>
+<tr><td>derive `file` from the normalized id</td><td>ec0c4adeb6d7</td><td>ec0c4adeb6d7</td><td>yes</td></tr>
+</tbody>
+</table>
+
+As long as the raw filename is carried through, the artifact cannot match across platforms. Obvious in hindsight; I genuinely expected normalizing the keys to be enough.
+
+Normalization turned out to be a repository problem, not a build problem. Reject it upstream instead of absorbing it downstream.
+
+```js
+// scripts/check-nfc.mjs
+import fs from "node:fs";
+
+const bad = [];
+for (const dir of process.argv.slice(2)) {
+  for (const n of fs.readdirSync(dir)) {
+    if (n !== n.normalize("NFC")) bad.push(`${dir}/${n}`);
+  }
+}
+
+if (bad.length) {
+  console.error(`${bad.length} filenames are not NFC:`);
+  for (const b of bad.slice(0, 5)) console.error("  " + JSON.stringify(b));
+  process.exit(1);
+}
+console.log("all filenames are NFC");
+```
+
+```
+$ node scripts/check-nfc.mjs assets/
+5 filenames are not NFC:
+  "assets/こもれび_0.jpg"
+  ...
+exit=1
+```
+
+On the macOS side, confirm `git config core.precomposeunicode true`. It defaults to true, but repositories carrying old configuration sometimes have it off. Once those five filenames were renamed to NFC, `readdir` order agreed across both platforms.
+
+## The deterministic generator
+
+Here is the version with every fix applied. The numbered comments map to the sources above.
+
+```js
+// scripts/gen-catalog.mjs
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+const SRC = process.argv[2];
+const OUT = process.argv[3];
+
+// 1) enumerate with readdir, never with streamed opendir
+const names = (await fsp.readdir(SRC)).filter((n) => n.endsWith(".jpg"));
+
+// 2) preserve input order (use the Promise.all return value)
+const items = await Promise.all(
+  names.map(async (name) => {
+    const st = await fsp.stat(path.join(SRC, name));
+    // 3) normalize the key; check-nfc.mjs guarantees the on-disk name upstream
+    const id = name.replace(/\.jpg$/, "").normalize("NFC");
+    const cat = id.includes("_") ? id.split("_")[0] : "legacy";
+    return {
+      id,
+      file: `${id}.jpg`,
+      category: cat,
+      bytes: st.size,
+      width: 1290,
+      height: 2796,
+      // 4) fix the precision of floats before serializing
+      aspect: Number((1290 / 2796).toFixed(4)),
+    };
+  })
+);
+
+// 5) sort explicitly, with a locale-free comparator
+const byBytes = (a, b) =>
+  Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+items.sort((a, b) => byBytes(a.id, b.id));
+
+const tags = [...new Set(items.map((i) => i.category))].sort(byBytes);
+
+// 6) only embed a timestamp when one is supplied from outside
+const epoch = process.env.SOURCE_DATE_EPOCH;
+const doc = {
+  schema: 2,
+  generatedAt: epoch ? new Date(Number(epoch) * 1000).toISOString() : null,
+  count: items.length,
+  tags,
+  items,
+};
+
+// 7) pin key order and end the file with a newline
+const stable = (obj) =>
+  JSON.stringify(
+    obj,
+    (_k, v) =>
+      v && typeof v === "object" && !Array.isArray(v)
+        ? Object.fromEntries(Object.keys(v).sort(byBytes).map((k) => [k, v[k]]))
+        : v,
+    2
+  ) + "\n";
+
+await fsp.writeFile(OUT, stable(doc));
+```
+
+A note on the float handling. `1290 / 2796` serializes as `0.4613733905579399`. That value is IEEE 754 arithmetic and does not vary by environment, but the more digits you ship, the more room downstream consumers have to disagree when parsing, rounding, and re-emitting. Rounding to `0.4614` keeps the artifact readable and sidesteps `-0` serializing as `0` and `1e21` serializing as `1e+21`.
+
+`SOURCE_DATE_EPOCH` is the convention borrowed from reproducible builds. Set it to the commit timestamp in CI and leave it unset locally, and it stops interfering with the diff check.
+
+## The ablation
+
+Applying the fixes one at a time, measured over 20 runs in one environment and across two filesystems:
+
+<table>
+<thead><tr><th>State</th><th>20 runs, same environment</th><th>Across filesystems</th></tr></thead>
+<tbody>
+<tr><td>original script</td><td>20 distinct</td><td>differs</td></tr>
+<tr><td>+ timestamp removed</td><td>20 distinct</td><td>differs</td></tr>
+<tr><td>+ stopped pushing on completion</td><td>1 distinct</td><td><strong>differs</strong></td></tr>
+<tr><td>+ opendir back to readdir</td><td>1 distinct</td><td>matches</td></tr>
+<tr><td>+ object replaced by array</td><td>1 distinct</td><td>matches</td></tr>
+<tr><td>+ explicit sort / NFC / fixed precision</td><td>1 distinct</td><td>matches</td></tr>
+</tbody>
+</table>
+
+Row three was the dangerous place to stop. Twenty runs locally, one hash, tests green — and still broken in CI. When someone reports a failure that "doesn't reproduce locally," this is the shape I would look for first.
+
+The last two rows change nothing measurable. They are in because libuv's sort is an implementation detail. If a future version changes it, or someone swaps `readdir` for a glob library, an explicit sort means the artifact does not move. Six months later, "deterministic by accident" and "deterministic on purpose" are not the same thing at all.
+
+Running the finished version 60 times in a row:
+
+```
+v1 (original) : 60 distinct hashes / 142.5 ms per run
+v2 (final)    :  1 distinct hash   / 137.7 ms per run
+```
+
+Environment variables made no difference.
+
+<table>
+<thead><tr><th>Environment</th><th>10 runs</th><th>Hash</th></tr></thead>
+<tbody>
+<tr><td>default</td><td>1 distinct</td><td>58977ad47094</td></tr>
+<tr><td>LC_ALL=C</td><td>1 distinct</td><td>58977ad47094</td></tr>
+<tr><td>LC_ALL=en_US.UTF-8</td><td>1 distinct</td><td>58977ad47094</td></tr>
+<tr><td>TZ=America/Los_Angeles</td><td>1 distinct</td><td>58977ad47094</td></tr>
+<tr><td>TZ=Asia/Tokyo, LC_ALL=C</td><td>1 distinct</td><td>58977ad47094</td></tr>
+</tbody>
+</table>
+
+I expected the explicit sort to cost something. It measured slightly faster instead, 142.5 ms down to 137.7 ms — dropping the sequential `opendir` reads outweighed sorting 1,225 entries. At this scale, determinism is effectively free.
+
+## Making the gate work
+
+Only now does the diff gate mean anything.
+
+```yaml
+- name: verify filename normalization
+  run: node scripts/check-nfc.mjs assets
+
+- name: regenerate the catalog and require no diff
+  run: |
+    node scripts/gen-catalog.mjs assets public/catalog.json
+    git diff --exit-code -- public/catalog.json
+```
+
+A passing gate now asserts something real: the committed artifact is reproducible from the current assets. A failing gate means either assets were added without regenerating, or the generation logic changed without updating the output — both failures worth hearing about.
+
+Because it no longer produces noise, committing the generated artifact became a workable practice again, and CI builds got shorter since the file is already there.
+
+There is a second payoff. A deterministic artifact hash makes a sound cache key: unchanged content means an unchanged hash, so no pointless CDN purges and no wasted downloads for users. That design simply does not hold with a nondeterministic generator.
+
+Deduplication across the same catalog is covered in [The same wallpaper appeared twice in my catalog — measuring perceptual hash thresholds across 324 images](/articles/app-dev/image-catalog-perceptual-hash-dedup-threshold-measurement), and a different pairing of generated output with a CI gate is in [What Renovate may bump in an Expo app, and what it must never touch](/articles/rork-dev/rork-renovate-expo-managed-deps-ignore-generation).
+
+## The order I would work in next time
+
+1. Read the diff. Values changing and positions changing point at different layers
+2. Remove the obvious clocks, randomness, and hostnames — then keep going
+3. Check async aggregation. A lot of nondeterminism disappears by turning `push` into `return`
+4. Check the enumeration API. `opendir` and hand-rolled walkers guarantee nothing
+5. Check the output container. Object keys will not stay in the order you inserted them
+6. Detach the comparator from locale. `Buffer.compare` is the safe choice
+7. Reject non-NFC filenames upstream. The generator cannot fix them
+8. Finally, run the same input N times and count hashes. You are not finished until the count is one
+
+Doing step 8 first would have saved me a day. "The same input produces the same bytes" is a testable property, and because I never tested it, I drifted toward the opposite fix: switching the gate off.
+
+If you commit generated artifacts, determinism is the precondition for that whole design. Operate without it and you end up removing checks one by one, in proportion to how broken it has become.
+
+Thank you for reading. Running your own generator N times and counting the hashes is a good place to start.
