@@ -1,0 +1,475 @@
+---
+title: "Every Experiment Kept Landing on the Same Devices: Hash Choice and Salt Position, Measured Across a Million IDs"
+slug: "rork-deterministic-bucketing-hash-salt-position-measurement"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-01T11:00"
+author: "Rork Lab"
+description: "On-device experiment assignment looked fine in isolation, then collapsed the moment two experiments ran side by side. Here is what one million IDs revealed about four hash functions, why the culprit was the concatenation order rather than hash quality, and the implementation I settled on, with the measured numbers."
+tags: ["Rork", "React Native", "A/B Testing", "Feature Flags", "Architecture"]
+highlights:
+  - "Measured data showing a 31-based polynomial hash passing uniformity yet reaching P(B|A)=65.35% and a 7.239% triple-enrolment rate"
+  - "The condition under which moving the salt to the end flips the overlap to a perfectly exclusive 0.00%, and the algebra behind it"
+  - "A final-mix step that lands FNV-1a at P(B|A)=10.00%, 0.496µs per call, and 100% stickiness through a ramp-up"
+---
+
+Two experiments in the same week: one on paywall copy, one shortening onboarding from three screens to two. Both shipped at a 10% exposure.
+
+A week later I stopped scrolling through the numbers. More than six in ten devices enrolled in the shortened onboarding were also seeing the paywall copy variant. The two experiments had nothing to do with each other. At 10% and 10%, roughly 1% of all devices should have landed in both.
+
+My first suspect was the device IDs. My second was hash quality. Both were wrong. The cause sat in the line that builds the assignment key — the order in which two strings get concatenated, which no code review ever stops.
+
+It took me a full day to see it, so here are the numbers from one million IDs and the implementation I ended up with, for anyone circling the same drain.
+
+## Why assignment happens on the device at all
+
+The wallpaper apps I run as an indie developer earn through AdMob and subscriptions, and I have not stood up a server purely for experiments. An assignment service adds availability, latency, and cost all at once. Long before an App Store submission, that is a place I would rather stay lean.
+
+So assignment resolves entirely on device. Four properties matter:
+
+1. **Deterministic** — the same device sees the same variant on every launch
+2. **Independent across experiments** — being in one experiment must not change the odds of being in another
+3. **Sticky through ramp-ups** — going from 10% to 20% must not push anyone back out
+4. **Synchronously resolvable** — no `await` on the launch path, variant decided before the first paint
+
+The fourth sounds like a nicety. It is not. A paywall headline that renders in the default copy and swaps on the next frame reads as a bug to the person holding the phone.
+
+The unit of assignment is a UUID stored in `expo-secure-store`. Using `identifierForVendor` directly means the value changes on reinstall, quietly moving the same person into a different cohort. What survives a reinstall and what does not is something I worked through in [Why Reinstalling Users Never See "First Launch" Again — Asymmetric State Persistence in Rork (Expo) Apps](/articles/app-dev/rork-expo-reinstall-first-run-keychain-asyncstorage-asymmetry-design).
+
+## Four hashes, one million IDs
+
+The candidates: naive character-code sum, the 31-based polynomial hash (the shape of Java's `String.hashCode`), 32-bit FNV-1a, and the first four bytes of SHA-256.
+
+First, uniformity in isolation. One million UUID v4 values, `hash(salt + ':' + id) % 100` into a hundred buckets, then a chi-squared statistic and the extremes.
+
+```js
+// bench.mjs — run with Node.js 22
+import { createHash, randomUUID } from 'node:crypto';
+
+const N = 1_000_000;
+const ids = new Array(N);
+for (let i = 0; i < N; i++) ids[i] = randomUUID();
+
+function sumChars(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h += s.charCodeAt(i);
+  return h >>> 0;
+}
+function javaHash(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+function fnv1a(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193); // plain * overflows past 2^53 and loses bits
+  }
+  return h >>> 0;
+}
+function sha256t(s) {
+  return createHash('sha256').update(s).digest().readUInt32BE(0);
+}
+
+function uniformity(fn, salt) {
+  const B = 100;
+  const counts = new Int32Array(B);
+  const t0 = process.hrtime.bigint();
+  for (let i = 0; i < N; i++) counts[fn(salt + ':' + ids[i]) % B]++;
+  const t1 = process.hrtime.bigint();
+
+  const expected = N / B;
+  let chi2 = 0;
+  for (let b = 0; b < B; b++) {
+    const d = counts[b] - expected;
+    chi2 += (d * d) / expected;
+  }
+  return {
+    ms: Number(t1 - t0) / 1e6,
+    chi2,
+    min: Math.min(...counts),
+    max: Math.max(...counts),
+  };
+}
+```
+
+With 99 degrees of freedom, the upper 1% critical value is 135.8. Above that, uniformity is hard to defend.
+
+<table>
+<thead>
+<tr><th>Hash</th><th>Time for 1M</th><th>Chi-squared</th><th>Min bucket</th><th>Max bucket</th><th>Verdict</th></tr>
+</thead>
+<tbody>
+<tr><td>Character-code sum</td><td>529.6 ms</td><td>26,013.0</td><td>7,650</td><td>12,483</td><td>Fails</td></tr>
+<tr><td>31-based polynomial (javaHash)</td><td>535.9 ms</td><td>103.0</td><td>9,780</td><td>10,262</td><td>Passes</td></tr>
+<tr><td>FNV-1a 32-bit</td><td>536.0 ms</td><td>89.3</td><td>9,705</td><td>10,320</td><td>Passes</td></tr>
+<tr><td>SHA-256, first 4 bytes</td><td>2,834.4 ms</td><td>113.0</td><td>9,813</td><td>10,287</td><td>Passes</td></tr>
+</tbody>
+</table>
+
+Expected count per bucket is 10,000. The character sum misses by up to 24.83% and drops out here — UUIDs draw from sixteen hex characters plus hyphens, so the reachable sums cluster tightly in the middle.
+
+The other three all passed at this stage. The one I had been shipping was the 31-based polynomial, chosen because it adds no dependency.
+
+## The hash that passed uniformity broke the moment a second experiment appeared
+
+The mistake was looking at one experiment at a time.
+
+Assign experiment A and experiment B at 10% each over the same devices and count how many land in both. Under independence that is 1.00% of all devices, or 10.00% of the devices already in A.
+
+```js
+function overlap(fn, saltA, saltB) {
+  let a = 0, both = 0;
+  for (let i = 0; i < N; i++) {
+    const inA = fn(saltA + ids[i]) % 100 < 10;
+    if (inA) {
+      a++;
+      if (fn(saltB + ids[i]) % 100 < 10) both++;
+    }
+  }
+  return { aPct: (a / N) * 100, conditional: (both / a) * 100 };
+}
+```
+
+<table>
+<thead>
+<tr><th>Scheme</th><th>Exposure of A</th><th>P(B&#124;A)</th><th>Gap vs expected</th></tr>
+</thead>
+<tbody>
+<tr><td>No salt at all (hash the ID only)</td><td>9.99%</td><td>100.00%</td><td>+90.00pt</td></tr>
+<tr><td>Character sum, salt in front</td><td>8.45%</td><td>77.94%</td><td>+67.94pt</td></tr>
+<tr><td><strong>31-based polynomial, salt in front</strong></td><td>10.03%</td><td><strong>65.20%</strong></td><td>+55.20pt</td></tr>
+<tr><td>FNV-1a, salt in front</td><td>9.99%</td><td>10.32%</td><td>+0.32pt</td></tr>
+<tr><td>SHA-256, salt in front</td><td>10.02%</td><td>9.85%</td><td>-0.15pt</td></tr>
+</tbody>
+</table>
+
+Forgetting the salt entirely gives 100%, no surprise. Row three is the surprise. The polynomial hash that sailed through uniformity at 103.0 correlates at 65.20% across two experiments — matching the "six in ten" I had seen in production almost exactly.
+
+Adding a third experiment widened the gap. Three experiments at 10% each should put 0.100% of devices in all three.
+
+<table>
+<thead>
+<tr><th>Hash</th><th>In all three experiments</th><th>Expected under independence</th></tr>
+</thead>
+<tbody>
+<tr><td>31-based polynomial</td><td>7.239%</td><td>0.100%</td></tr>
+<tr><td>FNV-1a</td><td>0.095%</td><td>0.100%</td></tr>
+</tbody>
+</table>
+
+Seventy-two times over. Without meaning to, I had manufactured a permanent test cohort — a group absorbing every change at once. Shortened onboarding, altered paywall copy, and a third unrelated feature, all aimed at the same people. Beyond contaminating the readings, it concentrated every disruption on a small set of users, which bothered me more than the statistics did.
+
+## The culprit was the concatenation order, not the hash
+
+This is where I sat still the longest.
+
+A 31-based polynomial hash returns, for a string `c₀c₁…c_{n-1}`:
+
+```
+h(s) = Σ c_i · 31^(n-1-i)  (mod 2^32)
+```
+
+Build the key as `salt + ':' + id` and the ID length is constant, because it is always a UUID. The salt therefore always gets multiplied by the same `31^37`, and the ID part is simply added on top:
+
+```
+h(saltA + ':' + id) = 31^37 · h(saltA + ':') + h(id)
+h(saltB + ':' + id) = 31^37 · h(saltB + ':') + h(id)
+```
+
+Subtract, and `h(id)` cancels. What remains is a constant that does not depend on the device at all. Collecting the differences over 20,000 devices:
+
+```js
+const diffs = new Set();
+for (let i = 0; i < 20000; i++) {
+  const d = (javaHash('exp_paywall_v2:' + ids[i]) - javaHash('exp_onboard_v3:' + ids[i])) >>> 0;
+  diffs.add(d);
+}
+console.log(diffs.size); // → 1
+```
+
+One distinct value across all 20,000 devices: `3716953708`. Run the same loop with FNV-1a and you get 19,998 distinct differences.
+
+Experiment A and experiment B were the same number line, shifted sideways by a constant. Where that shift happens to land decides whether the overlap comes out at 65% or 90%. Nothing about randomness quality was at fault; a hash that mixes characters purely by addition is simply the wrong shape for this job.
+
+### Moving the salt to the end fixes it — conditionally
+
+Once the structure is visible, the fix suggests itself: write `id + ':' + salt`, so the ID gets multiplied by a power that depends on the salt's length, which differs per experiment. Measured:
+
+<table>
+<thead>
+<tr><th>Scheme (31-based polynomial)</th><th>Exposure of A</th><th>P(B&#124;A)</th></tr>
+</thead>
+<tbody>
+<tr><td>Trailing salt, different lengths (14 vs 15 chars)</td><td>9.99%</td><td>10.08%</td></tr>
+<tr><td>Trailing salt, equal lengths (14 chars)</td><td>9.99%</td><td><strong>0.00%</strong></td></tr>
+<tr><td>Trailing salt, equal lengths, second pair</td><td>9.98%</td><td><strong>0.00%</strong></td></tr>
+</tbody>
+</table>
+
+Different lengths settle at 10.08%. Equal lengths drop to 0.00% — perfectly exclusive. Not one device in experiment A appears in experiment B.
+
+Same algebra, of course. Equal salt lengths mean equal multipliers on the ID, which puts us back at a constant difference. This time the shift happens to carry the 10% window cleanly outside itself.
+
+That is where I abandoned the trailing-salt fix. Keys like `exp_paywall_v2` and `exp_onboard_v3` end up the same length all the time. A design that depends on a rule saying "never let two experiment keys have equal length" is a design my future self will violate within a season. Naming conventions for flags are worth having — I wrote up mine in [Making Feature Flags Survive Production: Kill Switches and Gradual Rollouts in Rork Max](/articles/rork-dev/rork-max-feature-flags-remote-config) — but the accidents a naming rule should prevent and the accidents a hash function should prevent are better kept separate.
+
+## A final mix to clean up the low bits
+
+FNV-1a with a leading salt came in at a healthy 10.32%. Move the salt to the end, though, and it drifts to 12.92%. Taking the bucket with `% 100` uses the low bits, and FNV-1a's avalanche in the low bits is shallow after the last multiply, so strings that differ only at the tail retain a trace of correlation.
+
+One round of MurmurHash3's finalizer (fmix32) closes it:
+
+```js
+function fmix32(h) {
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+const bucketHash = (s) => fmix32(fnv1a(s));
+```
+
+Re-measured over 500,000 IDs:
+
+<table>
+<thead>
+<tr><th>Scheme</th><th>P(B&#124;A)</th><th>Chi-squared</th></tr>
+</thead>
+<tbody>
+<tr><td>FNV-1a, leading salt</td><td>10.63%</td><td>91.5</td></tr>
+<tr><td>FNV-1a, trailing salt (equal lengths)</td><td>12.92%</td><td>88.0</td></tr>
+<tr><td><strong>FNV-1a + fmix32, leading salt</strong></td><td><strong>10.00%</strong></td><td>78.3</td></tr>
+<tr><td>FNV-1a + fmix32, trailing salt (equal lengths)</td><td>10.08%</td><td>104.5</td></tr>
+</tbody>
+</table>
+
+With the extra round, either concatenation order lands near 10%. The triple-enrolment rate comes out at exactly 0.100%, and a 34/33/33 three-way split measures 34.00% / 33.04% / 32.96%.
+
+Cost per call is 0.496µs, against 0.510µs without the finalizer. Five lines that remove the need to reason about concatenation order forever — that was not a hard call.
+
+## Keeping devices in place during a ramp-up
+
+There is one more operation every experiment eventually reaches: watch it at 10%, then widen to 20%.
+
+If a device already seeing the new experience gets pushed back out, the person perceives a feature disappearing. On a subscription path, that costs you people who were one tap from purchasing.
+
+Three ways to write it:
+
+<table>
+<thead>
+<tr><th>Approach</th><th>Devices at 10%</th><th>Still included at 20%</th></tr>
+</thead>
+<tbody>
+<tr><td>Threshold: <code>h % 10000 &lt; ratio × 10000</code></td><td>49,837</td><td><strong>100.00%</strong></td></tr>
+<tr><td>Re-salt per stage (<code>exp:v1:</code> → <code>exp:v2:</code>)</td><td>100,098</td><td>19.85%</td></tr>
+<tr><td>Change the modulus (<code>h % 10 &lt; 1</code> → <code>h % 7 &lt; 2</code>)</td><td>100,566</td><td>28.64%</td></tr>
+</tbody>
+</table>
+
+Only the threshold form is monotone in the exposure. Bucket numbers stay pinned per device and the boundary is the only thing that moves, so nobody who is inside ever falls out.
+
+Versioned salts turn out to be the dangerous one precisely because they look meaningful. You notice that bumping to `v2` reshuffles everyone right after you have bumped to `v2`. The release-side mechanics of staged rollout are covered separately in [A Phased Release Strategy for Rork Apps](/articles/rork-dev/rork-phased-release-staged-rollout-hotfix-strategy).
+
+I settled on 10,000 buckets. One-percent steps cover almost everything, but 0.1% granularity earns its keep when walking a kill switch back, where a coarse step makes the retreat clumsy.
+
+## The implementation I settled on
+
+This is the assignment layer shared across six apps. The only dependencies are `expo-secure-store` and `@react-native-async-storage/async-storage`; the hash is local.
+
+```ts
+// src/experiments/bucketing.ts
+const FNV_OFFSET = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+export const BUCKET_RESOLUTION = 10_000; // 0.01% granularity
+
+function fnv1a32(input: string): number {
+  let h = FNV_OFFSET;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, FNV_PRIME); // a plain * overflows past 2^53
+  }
+  return h >>> 0;
+}
+
+function fmix32(h: number): number {
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/** Bucket 0–9999 from an experiment key and a unit ID. Synchronous, deterministic. */
+export function bucketOf(experimentKey: string, unitId: string): number {
+  if (!experimentKey || !unitId) {
+    // An empty string would drop every device into the same bucket. Fail loudly.
+    throw new Error(`bucketOf: empty key or unitId (key="${experimentKey}")`);
+  }
+  return fmix32(fnv1a32(`${experimentKey}:${unitId}`)) % BUCKET_RESOLUTION;
+}
+
+export type Variant<T extends string> = { name: T; weight: number };
+
+/**
+ * Weighted variant selection. Weights need not sum to 10000;
+ * whatever is left over falls to the first entry, i.e. the control group.
+ */
+export function pickVariant<T extends string>(
+  experimentKey: string,
+  unitId: string,
+  variants: readonly Variant<T>[],
+): T {
+  if (variants.length === 0) throw new Error(`pickVariant: no variants for "${experimentKey}"`);
+  const total = variants.reduce((sum, v) => sum + v.weight, 0);
+  if (total > BUCKET_RESOLUTION) {
+    throw new Error(`pickVariant: weights exceed ${BUCKET_RESOLUTION} in "${experimentKey}"`);
+  }
+
+  const bucket = bucketOf(experimentKey, unitId);
+  let cursor = 0;
+  for (const v of variants) {
+    cursor += v.weight;
+    if (bucket < cursor) return v.name;
+  }
+  return variants[0].name; // outside the allocation = control
+}
+
+/** Ramp-ups. ratioBps runs 0–10000 (10000 = 100%). Raising it never evicts anyone. */
+export function isInRollout(flagKey: string, unitId: string, ratioBps: number): boolean {
+  const clamped = Math.max(0, Math.min(BUCKET_RESOLUTION, Math.floor(ratioBps)));
+  return bucketOf(flagKey, unitId) < clamped;
+}
+```
+
+The unit ID side writes to both the Keychain and AsyncStorage, so either one can restore the value:
+
+```ts
+// src/experiments/unit-id.ts
+import * as SecureStore from 'expo-secure-store';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Crypto from 'expo-crypto';
+
+const KEY = 'exp.unit_id.v1';
+let cached: string | null = null;
+
+export function getUnitIdSync(): string | null {
+  return cached; // the synchronous path used during launch
+}
+
+export async function loadUnitId(): Promise<string> {
+  if (cached) return cached;
+
+  // 1) Keychain / Keystore — survives reinstall on iOS
+  try {
+    const secure = await SecureStore.getItemAsync(KEY);
+    if (secure) return (cached = await mirror(secure));
+  } catch (e) {
+    // Device lock state can make this unreadable. Do not crash here.
+    console.warn('[exp] secure read failed', e);
+  }
+
+  // 2) AsyncStorage — the fallback when the Keychain is unavailable
+  try {
+    const plain = await AsyncStorage.getItem(KEY);
+    if (plain) return (cached = await mirror(plain));
+  } catch (e) {
+    console.warn('[exp] async read failed', e);
+  }
+
+  // 3) Mint a new one
+  const fresh = Crypto.randomUUID();
+  return (cached = await mirror(fresh));
+}
+
+async function mirror(id: string): Promise<string> {
+  await Promise.allSettled([
+    SecureStore.setItemAsync(KEY, id),
+    AsyncStorage.setItem(KEY, id),
+  ]);
+  return id;
+}
+```
+
+Callers await `loadUnitId()` once at startup and evaluate synchronously from then on. Where the first paint has to be correct, such as a paywall, an unloaded ID returns the control variant. Loading finishes in a dozen or so milliseconds, so in practice this only affects the very first frame of a first launch.
+
+```ts
+// src/experiments/use-variant.ts
+import { useMemo } from 'react';
+import { getUnitIdSync } from './unit-id';
+import { pickVariant, type Variant } from './bucketing';
+
+export function useVariant<T extends string>(
+  experimentKey: string,
+  variants: readonly Variant<T>[],
+): T {
+  const unitId = getUnitIdSync();
+  return useMemo(() => {
+    if (!unitId) return variants[0].name; // control while the ID is still loading
+    return pickVariant(experimentKey, unitId, variants);
+  }, [experimentKey, unitId, variants]);
+}
+```
+
+Analytics events carry the bucket number alongside the variant name, so the delivered exposure can be re-derived downstream rather than trusted. That paid off again when aligning with the setup in [Building a Rork A/B Testing Platform with GrowthBook and PostHog from Scratch](/articles/rork-dev/rork-growthbook-posthog-ab-testing-platform).
+
+## Why I skipped SHA-256, and it was not about speed
+
+On the numbers, SHA-256 held up well on independence (P(B&#124;A) 9.85%). It costs 2.781µs per call against FNV-1a's 0.510µs — 5.4 times more — but evaluating thirty flags at launch still totals only 83.4µs. Speed was never the deciding factor.
+
+The decider was elsewhere. React Native has no synchronous SHA-256. `expo-crypto`'s `digestStringAsync` returns a promise, which puts an `await` between launch and the variant you wanted resolved before the first paint. A native module gets you a synchronous version, but whether to add one purely for experiment assignment is a separate decision.
+
+<table>
+<thead>
+<tr><th>Dimension</th><th>FNV-1a + fmix32</th><th>SHA-256 (expo-crypto)</th></tr>
+</thead>
+<tbody>
+<tr><td>Cost per call</td><td>0.496 µs</td><td>2.781 µs (measured in Node)</td></tr>
+<tr><td>Synchronous evaluation</td><td>Yes</td><td>No (promise)</td></tr>
+<tr><td>Extra dependency</td><td>None (20 lines of local code)</td><td>Native module</td></tr>
+<tr><td>Independence across experiments</td><td>P(B&#124;A) 10.00%</td><td>P(B&#124;A) 9.85%</td></tr>
+</tbody>
+</table>
+
+Nothing here needs cryptographic strength. Nobody is trying to guess their assignment. The requirement was mixing, and only mixing. Reach for the heavier tool on a misread requirement and you give up the one that actually mattered.
+
+## Do not over-trust a uniformity test
+
+One more thing surfaced while measuring.
+
+Supposing the unit ID were a sequential counter rather than a UUID, I ran the same uniformity check:
+
+<table>
+<thead>
+<tr><th>ID shape</th><th>Hash</th><th>Chi-squared</th><th>Min</th><th>Max</th></tr>
+</thead>
+<tbody>
+<tr><td>Sequential (user-1 … user-1000000)</td><td>31-based polynomial</td><td><strong>0.8</strong></td><td>9,976</td><td>10,027</td></tr>
+<tr><td>Sequential (user-1 … user-1000000)</td><td>FNV-1a</td><td>32.4</td><td>9,845</td><td>10,126</td></tr>
+<tr><td>Zero-padded sequential</td><td>31-based polynomial</td><td><strong>0.5</strong></td><td>9,983</td><td>10,019</td></tr>
+<tr><td>Zero-padded sequential</td><td>FNV-1a</td><td>39.3</td><td>9,884</td><td>10,220</td></tr>
+</tbody>
+</table>
+
+Chi-squared of 0.8. With 99 degrees of freedom, that sits in the lower rejection region, not the upper one. It is too even. Feed a counter through a linear hash and buckets get filled in orderly rotation, producing a distribution with none of the jitter real randomness has.
+
+Uniformity tests are usually framed as a way to catch skew. For assignment design, "suspiciously smooth" turned out to be just as telling. Seeing that number is what made me stop treating uniformity as the pass condition on its own. Uniformity, independence, and stickiness now get measured together, every time.
+
+## The four rules that came out of it
+
+Four lines went into the README of the shared layer:
+
+1. **Build keys as `experimentKey:unitId` and hash only with `fnv1a32` followed by `fmix32`** — no other hash enters the codebase
+2. **Express exposure as a threshold over 10,000 buckets** — ramp by raising `ratioBps`, and never version the salt
+3. **Whenever a new experiment lands, check its co-enrolment rate against the existing ones once** — a gap over two points from the expectation means a design bug
+4. **Send both the variant name and the bucket number with analytics events** — exposure accidents should be catchable downstream
+
+The third would not have occurred to me otherwise. Tests around assignment layers gravitate toward "is it deterministic," and the relationship between experiments falls straight through the gap.
+
+If you want to know whether the same trap is sitting in your codebase, take your assignment function and measure the co-enrolment rate for two experiment keys. At 10% and 10%, the conditional probability should land near 10%. That one check reproduces everything here in your own environment.
+
+For what it is worth, I spent most of that day suspecting the ID generator. Only after lining the numbers up did the actual suspect come into view. I hope it saves you the day.

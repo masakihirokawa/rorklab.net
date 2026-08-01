@@ -1,0 +1,475 @@
+---
+title: "実験の割り当てが同じ端末に偏る — 100万件のIDで確かめたハッシュ選定と salt の位置"
+slug: "rork-deterministic-bucketing-hash-salt-position-measurement"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-01T11:00"
+author: "Rork Lab"
+description: "端末側で実験の変種を決める割り当てが、実験を2本並べた途端に同じ端末へ集中しました。100万件のIDで4つのハッシュを測り、原因がハッシュの一様性ではなく salt の連結位置にあったこと、そして採用した実装までを実測値とともに残します。"
+tags: ["Rork", "React Native", "A/Bテスト", "フィーチャーフラグ", "アーキテクチャ"]
+highlights:
+  - "一様性テストに合格した31進ハッシュが、実験2本で P(B|A)=65.35%、3実験同時当選 7.239% まで相関した実測データ"
+  - "salt を末尾へ動かすと今度は 0.00% の完全排他になる条件と、そうなる理由を式で追う手順"
+  - "FNV-1a に最終攪拌を足して P(B|A)=10.00%・0.496µs/回・段階拡大の保持率100%へ収めた実装一式"
+---
+
+ペイウォール文言のA/Bと、オンボーディングを3画面から2画面へ縮める検証。この二つを、同じ週にどちらも配信比率10%で走らせました。
+
+一週間後、集計を見て手が止まりました。オンボーディング短縮に入っていた端末の6割以上が、ペイウォール文言の変種側にも入っていたのです。二つの実験は互いに何の関係もないはずでした。10%と10%なら、両方に入る端末は全体の1%前後に落ち着くと踏んでいました。
+
+最初に疑ったのは端末IDの偏りでした。次に疑ったのはハッシュの質です。どちらも外れでした。原因は、割り当てキーを組み立てるときの文字列の連結順という、コードレビューで誰も止めない一行にありました。
+
+腑に落ちるまでに丸一日かかりましたので、同じところで迷う方のために、100万件のIDで測った数字と、最終的に採用した実装をそのまま残します。
+
+## 端末側で割り当てを決める、という前提
+
+個人開発で運用している壁紙アプリは、収益が AdMob と定期購読で、実験のためだけにサーバーを立てる構成にしていません。割り当てサーバーを1本増やすと、可用性・レイテンシ・コストの三つが同時に増えます。App Store の審査に出す前から、そこは避けたい部分でした。
+
+そこで割り当ては端末側で完結させています。求めた性質は四つです。
+
+1. **決定論的であること** — 同じ端末は、アプリを何度起動しても同じ変種を見る
+2. **実験どうしが独立であること** — ある実験に入ったことが、別の実験に入りやすさへ影響しない
+3. **段階拡大で入れ替わらないこと** — 10%から20%へ広げたとき、すでに入っていた端末が外へ出ない
+4. **同期に評価できること** — 起動パスで `await` を挟まず、最初の描画までに変種が確定する
+
+4番目は地味ですが、体感に直結します。ペイウォールの見出しが一瞬だけ既定文言で表示され、次のフレームで差し替わると、ユーザーからは不具合に見えます。
+
+割り当ての単位になる端末IDは、`expo-secure-store` に保存した UUID を使っています。`identifierForVendor` を直接使うと、同じ端末でも再インストールで値が変わり、同じ人が別のコホートへ移ってしまいます。再インストール時に何が残り何が消えるかは[再インストールしたユーザーが「初回」に戻らない — Rork(Expo) アプリの初回判定と状態永続の非対称設計](/articles/app-dev/rork-expo-reinstall-first-run-keychain-asyncstorage-asymmetry-design)で整理しました。
+
+## 4つのハッシュを100万件で比べる
+
+候補は4つ。文字コードの単純加算、31を基数とする多項式ハッシュ（Java の `String.hashCode` と同型）、FNV-1a の32ビット版、そして SHA-256 の先頭4バイトです。
+
+まず、単体での一様性を測りました。100万件の UUID v4 を生成し、`hash(salt + ':' + id) % 100` で100個のバケットへ落として、カイ二乗統計量と最大偏差を見ます。
+
+```js
+// bench.mjs — Node.js 22 で実行
+import { createHash, randomUUID } from 'node:crypto';
+
+const N = 1_000_000;
+const ids = new Array(N);
+for (let i = 0; i < N; i++) ids[i] = randomUUID();
+
+function sumChars(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h += s.charCodeAt(i);
+  return h >>> 0;
+}
+function javaHash(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+function fnv1a(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193); // 32bit の丸めを保つため Math.imul が要る
+  }
+  return h >>> 0;
+}
+function sha256t(s) {
+  return createHash('sha256').update(s).digest().readUInt32BE(0);
+}
+
+function uniformity(fn, salt) {
+  const B = 100;
+  const counts = new Int32Array(B);
+  const t0 = process.hrtime.bigint();
+  for (let i = 0; i < N; i++) counts[fn(salt + ':' + ids[i]) % B]++;
+  const t1 = process.hrtime.bigint();
+
+  const expected = N / B;
+  let chi2 = 0;
+  for (let b = 0; b < B; b++) {
+    const d = counts[b] - expected;
+    chi2 += (d * d) / expected;
+  }
+  return {
+    ms: Number(t1 - t0) / 1e6,
+    chi2,
+    min: Math.min(...counts),
+    max: Math.max(...counts),
+  };
+}
+```
+
+結果です。自由度99のカイ二乗分布で、上側1%点は135.8。これを超えると「一様とは考えにくい」と判断します。
+
+<table>
+<thead>
+<tr><th>ハッシュ</th><th>100万件の所要時間</th><th>カイ二乗</th><th>最小バケット</th><th>最大バケット</th><th>判定</th></tr>
+</thead>
+<tbody>
+<tr><td>文字コード加算</td><td>529.6 ms</td><td>26,013.0</td><td>7,650</td><td>12,483</td><td>不合格</td></tr>
+<tr><td>31進多項式（javaHash）</td><td>535.9 ms</td><td>103.0</td><td>9,780</td><td>10,262</td><td>合格</td></tr>
+<tr><td>FNV-1a 32bit</td><td>536.0 ms</td><td>89.3</td><td>9,705</td><td>10,320</td><td>合格</td></tr>
+<tr><td>SHA-256 先頭4バイト</td><td>2,834.4 ms</td><td>113.0</td><td>9,813</td><td>10,287</td><td>合格</td></tr>
+</tbody>
+</table>
+
+期待値は1バケットあたり10,000件。文字コード加算は最大24.83%も外れており、ここで脱落します。UUID は使われる文字が16進とハイフンに限られるため、加算では取りうる合計値の幅が狭く、中央に山ができます。
+
+残る三つは、この時点ではどれも合格でした。私が実際に使っていたのは、依存を増やさずに済む31進多項式のほうです。
+
+## 一様性に合格したハッシュが、実験を2本並べた瞬間に崩れた
+
+問題は、一つの実験だけを見ていたことにありました。
+
+同じ端末に対して、実験Aと実験Bをそれぞれ10%で割り当て、両方に入る割合を測ります。互いに独立なら、全体の1.00%、実験Aに入った端末の中では10.00%に落ち着くはずの数字です。
+
+```js
+function overlap(fn, saltA, saltB) {
+  let a = 0, both = 0;
+  for (let i = 0; i < N; i++) {
+    const inA = fn(saltA + ids[i]) % 100 < 10;
+    if (inA) {
+      a++;
+      if (fn(saltB + ids[i]) % 100 < 10) both++;
+    }
+  }
+  return { aPct: (a / N) * 100, conditional: (both / a) * 100 };
+}
+```
+
+<table>
+<thead>
+<tr><th>方式</th><th>実験Aの比率</th><th>P(B&#124;A)</th><th>期待値との差</th></tr>
+</thead>
+<tbody>
+<tr><td>salt なし（IDだけをハッシュ）</td><td>9.99%</td><td>100.00%</td><td>+90.00pt</td></tr>
+<tr><td>文字コード加算＋先頭 salt</td><td>8.45%</td><td>77.94%</td><td>+67.94pt</td></tr>
+<tr><td><strong>31進多項式＋先頭 salt</strong></td><td>10.03%</td><td><strong>65.20%</strong></td><td>+55.20pt</td></tr>
+<tr><td>FNV-1a＋先頭 salt</td><td>9.99%</td><td>10.32%</td><td>+0.32pt</td></tr>
+<tr><td>SHA-256＋先頭 salt</td><td>10.02%</td><td>9.85%</td><td>-0.15pt</td></tr>
+</tbody>
+</table>
+
+salt を付け忘れれば100%になるのは当然として、驚いたのは3行目です。一様性のカイ二乗が103.0で堂々と合格していた31進多項式が、実験を2本並べただけで65.20%まで相関しました。集計で見た「6割以上」と、ぴたりと重なる数字です。
+
+実験を3本に増やすと差はさらに開きました。各10%の実験3本すべてに入る端末は、独立なら0.100%です。
+
+<table>
+<thead>
+<tr><th>ハッシュ</th><th>3実験すべてに入る割合</th><th>独立な場合の期待値</th></tr>
+</thead>
+<tbody>
+<tr><td>31進多項式</td><td>7.239%</td><td>0.100%</td></tr>
+<tr><td>FNV-1a</td><td>0.095%</td><td>0.100%</td></tr>
+</tbody>
+</table>
+
+72倍。全実験の変更を一手に引き受ける「常に実験台になる端末」の集団が、意図せず作られていました。オンボーディングを短くされ、ペイウォール文言を変えられ、さらに別の新機能まで同じ人たちに当たっていた計算になります。実験結果が互いに汚染されるだけでなく、特定のユーザーにだけ体験の変化が集中していたわけで、数字の正しさ以前の問題でした。
+
+## 原因はハッシュ関数ではなく、文字列の連結順でした
+
+ここからが、私が一番長く固まった部分です。
+
+31進多項式ハッシュは、文字列 `c₀c₁…c_{n-1}` に対して次の値を返します。
+
+```
+h(s) = Σ c_i · 31^(n-1-i)  (mod 2^32)
+```
+
+割り当てキーを `salt + ':' + id` の順で組み立てると、id の長さは UUID なので常に一定です。つまり salt 部分には常に同じ `31^37` が掛かり、後ろの id 部分はそのまま足されます。式にすると、こうなります。
+
+```
+h(saltA + ':' + id) = 31^37 · h(saltA + ':') + h(id)
+h(saltB + ':' + id) = 31^37 · h(saltB + ':') + h(id)
+```
+
+差を取ると `h(id)` が消え、端末に依らない定数だけが残ります。実際に20,000端末で差分を集めてみました。
+
+```js
+const diffs = new Set();
+for (let i = 0; i < 20000; i++) {
+  const d = (javaHash('exp_paywall_v2:' + ids[i]) - javaHash('exp_onboard_v3:' + ids[i])) >>> 0;
+  diffs.add(d);
+}
+console.log(diffs.size); // → 1
+```
+
+20,000端末すべてで差分は `3716953708` の一つだけでした。FNV-1a で同じことをすると19,998通りに散ります。
+
+実験Aと実験Bの割り当ては、同じ数直線を定数だけ横にずらしたものでしかありませんでした。ずらし幅が偶然どこに落ちるかで、重なりが65%にも90%にもなります。乱数の質の問題ではなく、加算だけで文字を混ぜるハッシュの構造そのものが、この用途に向いていなかったのです。
+
+### salt を末尾に移すと直る。ただし条件付きで
+
+構造が分かれば、対処は思いつきます。`id + ':' + salt` の順にすれば、salt の長さぶんの累乗が id 側に掛かり、実験ごとに係数が変わります。測ってみました。
+
+<table>
+<thead>
+<tr><th>方式（31進多項式）</th><th>実験Aの比率</th><th>P(B&#124;A)</th></tr>
+</thead>
+<tbody>
+<tr><td>末尾 salt・二つの salt の長さが違う（14文字と15文字）</td><td>9.99%</td><td>10.08%</td></tr>
+<tr><td>末尾 salt・二つの salt の長さが同じ（14文字）</td><td>9.99%</td><td><strong>0.00%</strong></td></tr>
+<tr><td>末尾 salt・長さが同じ別のペアで再確認</td><td>9.98%</td><td><strong>0.00%</strong></td></tr>
+</tbody>
+</table>
+
+長さが違えば10.08%に収まり、長さが揃った瞬間に0.00%へ落ちます。完全な排他です。実験Aに入った端末は、実験Bには一台も入りません。
+
+理屈は同じでした。salt の長さが等しければ id に掛かる係数も等しくなり、また定数差に戻ります。今度はそのずらし幅が、10%の窓を綺麗に外へ運んだというだけのことです。
+
+私はここで、末尾へ移す案を捨てました。`exp_paywall_v2` と `exp_onboard_v3` のように、実験キーの長さが偶然揃うのは日常的に起こります。名前の付け方に「文字数を揃えるな」という規約を足すような設計は、半年後の自分が必ず破ります。フィーチャーフラグの命名規約そのものについては[Feature Flags を運用に耐えさせる — Rork Max のキルスイッチと段階的ロールアウト設計](/articles/rork-dev/rork-max-feature-flags-remote-config)で別途まとめていますが、命名規約で防ぐべき事故と、ハッシュ関数で防ぐべき事故は分けたほうが安全です。
+
+## 最終攪拌を足して、下位ビットの弱さを潰す
+
+FNV-1a は先頭 salt で10.32%と良好でした。ただ、末尾 salt にすると12.92%へわずかに膨らみます。バケットを `% 100` で取り出す以上、使っているのは下位ビットです。FNV-1a は最後の乗算のあと下位ビットの攪拌が浅く、末尾だけが違う文字列どうしでわずかに相関が残ります。
+
+そこで MurmurHash3 の最終攪拌（fmix32）を1段だけ足しました。
+
+```js
+function fmix32(h) {
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+const bucketHash = (s) => fmix32(fnv1a(s));
+```
+
+50万件で測り直した結果です。
+
+<table>
+<thead>
+<tr><th>方式</th><th>P(B&#124;A)</th><th>カイ二乗</th></tr>
+</thead>
+<tbody>
+<tr><td>FNV-1a・先頭 salt</td><td>10.63%</td><td>91.5</td></tr>
+<tr><td>FNV-1a・末尾 salt（長さ同じ）</td><td>12.92%</td><td>88.0</td></tr>
+<tr><td><strong>FNV-1a + fmix32・先頭 salt</strong></td><td><strong>10.00%</strong></td><td>78.3</td></tr>
+<tr><td>FNV-1a + fmix32・末尾 salt（長さ同じ）</td><td>10.08%</td><td>104.5</td></tr>
+</tbody>
+</table>
+
+攪拌を1段足すと、salt をどちらに置いても10%前後へ収まります。3実験すべてに入る割合も0.100%と、期待値ちょうどでした。3変種を34/33/33で分けたときの実配分は34.00%／33.04%／32.96%です。
+
+1回あたりのコストは0.496µs。攪拌を足す前の0.510µsと変わりません。5行の追加で、連結順に気を配る必要がなくなるなら、迷う理由はありませんでした。
+
+## 段階拡大で端末が入れ替わらないようにする
+
+もう一つ、実験の途中で必ず来る操作があります。10%で様子を見て、問題がなければ20%へ広げる、という段階拡大です。
+
+このとき、すでに新しい体験を見ていた端末が元へ戻されると、ユーザーからは機能が消えたように見えます。定期購読の導線でこれが起きると、購入直前の人を取りこぼします。
+
+三つの書き方を比べました。
+
+<table>
+<thead>
+<tr><th>書き方</th><th>10%時点の対象</th><th>20%へ広げた後も残る割合</th></tr>
+</thead>
+<tbody>
+<tr><td>しきい値方式：<code>h % 10000 &lt; 比率 × 10000</code></td><td>49,837台</td><td><strong>100.00%</strong></td></tr>
+<tr><td>段階ごとに salt を振り直す（<code>exp:v1:</code> → <code>exp:v2:</code>）</td><td>100,098台</td><td>19.85%</td></tr>
+<tr><td>分母を変える（<code>h % 10 &lt; 1</code> → <code>h % 7 &lt; 2</code>）</td><td>100,566台</td><td>28.64%</td></tr>
+</tbody>
+</table>
+
+しきい値方式だけが、比率を上げる操作に対して単調です。バケット番号は端末ごとに固定で、動くのは境界線だけですから、一度内側に入った端末は外へ出ません。
+
+salt にバージョンを含める書き方は、意味を持たせたくなる分だけ危険でした。「v2 に上げたから振り直しになる」と気づくのは、たいてい振り直した後です。段階公開そのものの進め方は[Rork アプリの段階的リリース戦略 — Phased Release・Staged Rollout・Hotfix を組み合わせて『壊さない本番運用』を作る](/articles/rork-dev/rork-phased-release-staged-rollout-hotfix-strategy)にまとめています。
+
+比率の刻みは10000分割にしました。1%刻みで足りる場面がほとんどですが、0.1%刻みが要るのは緊急のキルスイッチを戻すときで、そこで刻みが粗いと戻し方が乱暴になります。
+
+## 採用した実装
+
+実際に6本のアプリで共有している割り当て層です。依存は `expo-secure-store` と `@react-native-async-storage/async-storage` だけで、ハッシュは自前です。
+
+```ts
+// src/experiments/bucketing.ts
+const FNV_OFFSET = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+export const BUCKET_RESOLUTION = 10_000; // 0.01% 刻み
+
+function fnv1a32(input: string): number {
+  let h = FNV_OFFSET;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, FNV_PRIME); // 通常の * では 2^53 を超えて桁落ちする
+  }
+  return h >>> 0;
+}
+
+function fmix32(h: number): number {
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+/** 実験キーと端末IDから 0〜9999 のバケット番号を返す（同期・決定論的） */
+export function bucketOf(experimentKey: string, unitId: string): number {
+  if (!experimentKey || !unitId) {
+    // 空文字を許すと全端末が同じバケットへ落ちる。設定ミスを黙って通さない
+    throw new Error(`bucketOf: empty key or unitId (key="${experimentKey}")`);
+  }
+  return fmix32(fnv1a32(`${experimentKey}:${unitId}`)) % BUCKET_RESOLUTION;
+}
+
+export type Variant<T extends string> = { name: T; weight: number };
+
+/**
+ * 重み付きで変種を選ぶ。weight の合計は 10000 でなくてもよく、
+ * 合計に満たない分は最初の要素（＝対照群）へ寄せる。
+ */
+export function pickVariant<T extends string>(
+  experimentKey: string,
+  unitId: string,
+  variants: readonly Variant<T>[],
+): T {
+  if (variants.length === 0) throw new Error(`pickVariant: no variants for "${experimentKey}"`);
+  const total = variants.reduce((sum, v) => sum + v.weight, 0);
+  if (total > BUCKET_RESOLUTION) {
+    throw new Error(`pickVariant: weights exceed ${BUCKET_RESOLUTION} in "${experimentKey}"`);
+  }
+
+  const bucket = bucketOf(experimentKey, unitId);
+  let cursor = 0;
+  for (const v of variants) {
+    cursor += v.weight;
+    if (bucket < cursor) return v.name;
+  }
+  return variants[0].name; // 割り当て外＝対照群
+}
+
+/** 段階拡大用。ratioBps は 0〜10000（10000 = 100%）。比率を上げても外へ出ない */
+export function isInRollout(flagKey: string, unitId: string, ratioBps: number): boolean {
+  const clamped = Math.max(0, Math.min(BUCKET_RESOLUTION, Math.floor(ratioBps)));
+  return bucketOf(flagKey, unitId) < clamped;
+}
+```
+
+端末IDの取得側です。Keychain と AsyncStorage の両方に置き、どちらかが読めれば復旧できるようにしています。
+
+```ts
+// src/experiments/unit-id.ts
+import * as SecureStore from 'expo-secure-store';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Crypto from 'expo-crypto';
+
+const KEY = 'exp.unit_id.v1';
+let cached: string | null = null;
+
+export function getUnitIdSync(): string | null {
+  return cached; // 起動直後の同期評価はこちらを使う
+}
+
+export async function loadUnitId(): Promise<string> {
+  if (cached) return cached;
+
+  // 1) Keychain / Keystore（再インストールでも iOS では残る）
+  try {
+    const secure = await SecureStore.getItemAsync(KEY);
+    if (secure) return (cached = await mirror(secure));
+  } catch (e) {
+    // 端末のロック状態などで読めないことがある。ここで落とさない
+    console.warn('[exp] secure read failed', e);
+  }
+
+  // 2) AsyncStorage（Keychain が読めなかったときの控え）
+  try {
+    const plain = await AsyncStorage.getItem(KEY);
+    if (plain) return (cached = await mirror(plain));
+  } catch (e) {
+    console.warn('[exp] async read failed', e);
+  }
+
+  // 3) 新規発行
+  const fresh = Crypto.randomUUID();
+  return (cached = await mirror(fresh));
+}
+
+async function mirror(id: string): Promise<string> {
+  await Promise.allSettled([
+    SecureStore.setItemAsync(KEY, id),
+    AsyncStorage.setItem(KEY, id),
+  ]);
+  return id;
+}
+```
+
+呼び出し側は、起動時に一度だけ `loadUnitId()` を待ち、以降は同期で評価します。ペイウォールのように初回描画で確定させたい箇所では、ID が未読込の間は対照群を返す実装にしました。読み込みは十数ミリ秒で終わるため、実際に対照群へ落ちるのは初回起動の最初の描画だけです。
+
+```ts
+// src/experiments/use-variant.ts
+import { useMemo } from 'react';
+import { getUnitIdSync } from './unit-id';
+import { pickVariant, type Variant } from './bucketing';
+
+export function useVariant<T extends string>(
+  experimentKey: string,
+  variants: readonly Variant<T>[],
+): T {
+  const unitId = getUnitIdSync();
+  return useMemo(() => {
+    if (!unitId) return variants[0].name; // 未読込のあいだは対照群で描く
+    return pickVariant(experimentKey, unitId, variants);
+  }, [experimentKey, unitId, variants]);
+}
+```
+
+計測イベント側には、変種名だけでなくバケット番号もそのまま送っています。後から「本当に意図した比率で配れていたか」を分析側で検算できるようにするためで、これは実験基盤を[Rork の A/B テスト基盤を GrowthBook と PostHog でゼロから組む](/articles/rork-dev/rork-growthbook-posthog-ab-testing-platform)の構成へ寄せる際にも役立ちました。
+
+## SHA-256 を選ばなかった理由は、速度ではありませんでした
+
+数字だけ見れば、SHA-256 も独立性は良好でした（P(B&#124;A) 9.85%）。速度は1回あたり2.781µs で FNV-1a の0.510µs に対して5.4倍ですが、起動時にフラグを30本評価しても合計83.4µs にしかなりません。速度は判断材料になりませんでした。
+
+決め手は別のところにありました。React Native には同期の SHA-256 がありません。`expo-crypto` の `digestStringAsync` は Promise を返します。つまり最初の描画までに変種を確定させたいのに、`await` が一つ入ります。ネイティブモジュールを追加すれば同期版も選べますが、実験の割り当てのためだけに依存を増やすかどうかは、別の判断です。
+
+<table>
+<thead>
+<tr><th>観点</th><th>FNV-1a + fmix32</th><th>SHA-256（expo-crypto）</th></tr>
+</thead>
+<tbody>
+<tr><td>1回あたりのコスト</td><td>0.496 µs</td><td>2.781 µs（Node での測定値）</td></tr>
+<tr><td>同期評価</td><td>可能</td><td>不可（Promise）</td></tr>
+<tr><td>追加の依存</td><td>なし（20行の自前実装）</td><td>ネイティブモジュール</td></tr>
+<tr><td>実験間の独立性</td><td>P(B&#124;A) 10.00%</td><td>P(B&#124;A) 9.85%</td></tr>
+</tbody>
+</table>
+
+暗号学的な強度が要る場面ではありません。割り当ての推測を防ぎたいわけでもなく、必要なのは「よく混ざる」ことだけでした。要件を取り違えて重い道具を選ぶと、同期評価という本当に効く要件のほうを落とします。
+
+## 一様性テストを信じすぎない
+
+最後に、測っている途中で見つけた小さな落とし穴を書き残します。
+
+端末IDが UUID ではなく連番だった場合を想定して、同じ一様性テストを回してみました。
+
+<table>
+<thead>
+<tr><th>ID の形</th><th>ハッシュ</th><th>カイ二乗</th><th>最小</th><th>最大</th></tr>
+</thead>
+<tbody>
+<tr><td>連番（user-1 … user-1000000）</td><td>31進多項式</td><td><strong>0.8</strong></td><td>9,976</td><td>10,027</td></tr>
+<tr><td>連番（user-1 … user-1000000）</td><td>FNV-1a</td><td>32.4</td><td>9,845</td><td>10,126</td></tr>
+<tr><td>ゼロ埋め連番</td><td>31進多項式</td><td><strong>0.5</strong></td><td>9,983</td><td>10,019</td></tr>
+<tr><td>ゼロ埋め連番</td><td>FNV-1a</td><td>39.3</td><td>9,884</td><td>10,220</td></tr>
+</tbody>
+</table>
+
+カイ二乗0.8。自由度99でこの値は、上側ではなく下側の棄却域に入ります。均等すぎるのです。連番を線形なハッシュに通すと、バケットへ規則正しく順番に配られるため、揺らぎのない完璧な分布になります。
+
+一様性の検定は「偏りすぎ」を見つける道具として広く使われますが、割り当ての設計では「均等すぎ」も同じくらい怪しい兆候でした。私はこの数字を見て、一様性だけを合格判定にしていた自分の測り方をやめました。今は、一様性・独立性・粘着性の三つを必ずセットで測っています。
+
+## 運用に落とした4つの決めごと
+
+数字が出そろったあと、共有基盤の README に4行だけ書き足しました。
+
+1. **割り当てキーは `実験キー:端末ID` の順で組み、ハッシュは `fnv1a32` に `fmix32` を通したものだけを使う** — 他のハッシュを持ち込まない
+2. **比率は10000分割のしきい値で表す** — 段階拡大で `ratioBps` だけを上げる。salt にバージョンを含めない
+3. **新しい実験を足したら、既存の実験との同時当選率を1回だけ検算する** — 期待値からの差が2ポイントを超えたら設計ミスを疑う
+4. **計測イベントに変種名とバケット番号の両方を送る** — 配信比率の事故は、分析側で気づけるようにしておく
+
+3番目は、この件がなければ思いつかなかった項目です。実験基盤のテストは「割り当てが決定論的か」に集中しがちで、実験どうしの関係を確かめる観点が抜け落ちていました。
+
+同じ落とし穴に落ちた形跡がないか確かめたい方は、手元の割り当て関数で、二つの実験キーに対する同時当選率を測ってみてください。10%と10%なら、条件付き確率が10%前後に収まるかどうか。それだけで、この記事の内容は自分の環境で検算できます。
+
+私自身、原因を掴むまでは端末IDの生成側ばかりを疑っていました。数字を並べてはじめて、疑うべき場所が見えました。実装の参考になれば幸いです。
