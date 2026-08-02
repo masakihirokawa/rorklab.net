@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAXPRICE — Rork Max は月額 $200 です。無料枠は週5プロンプト程度で、App Store へ出すには別途 Apple Developer Program の年 $99 が要ります",
-    "ARR — 2026年2月に登場した Rork Max は、3日で ARR 150万ドルに達したと報告されています。ネイティブアプリ生成への需要の厚さがうかがえます",
-    "NATIVEAPI — Rork Max は SwiftUI・ARKit・HealthKit・HomeKit・Core ML・Metal といったネイティブ API に直接届くため、React Native では回り道になる領域が射程に入ります",
-    "SHIP — Xcode を開かずに2クリックで App Store へ提出できる導線が用意されています。署名とプロビジョニングでつまずく段階を飛ばせます",
-    "COST — 従来のネイティブ iOS 開発は5,000〜50,000ドル超という見積もりが一般的で、月額 $200 はその比較軸の上で評価されています",
-    "SDK55 — Expo SDK 55 は React Native 0.83 と React 19.2 を採用し、レガシーアーキテクチャのサポートを打ち切りました。New Architecture が唯一の選択肢になります",
+    "RAISE — Rork が1,500万ドルを調達しました。個人開発者がアプリを出すまでの距離を詰める方向に、資金が向かっている形です",
+    "ENGINE — Rork Max は Claude Code と Opus 4.6 の組み合わせで動きます。複雑なアプリロジックや推論での差は、この構成に由来する部分が大きいと説明されています",
+    "CLOUDMAC — 生成された Swift はクラウド上の Mac 群でコンパイルされます。手元に Xcode を置かないまま、実機テストから App Store 提出まで届く導線です",
+    "AR — Rork Max は ARKit と LiDAR スキャンにネイティブ対応しています。3D オブジェクトの配置や空間コンピューティングを含むアプリが射程に入ります",
+    "TRACTION — Rork Max の発表は X で800万表示を超え、2週間で年間収益が倍になったと報告されています",
+    "TRAFFIC — Rork は月間743,000訪問・成長率85%と報告されています。ノーコードのアプリ生成が試作の入口として定着しつつある数字です",
   ],
   en: [
-    "MAXPRICE — Rork Max runs $200 per month. The free tier gives you roughly five prompts a week, and shipping to the App Store still requires the $99/year Apple Developer Program",
-    "ARR — Rork Max, which launched in February 2026, reportedly reached $1.5M ARR within three days. That says something about the appetite for generated native apps",
-    "NATIVEAPI — Rork Max reaches native APIs directly, including SwiftUI, ARKit, HealthKit, HomeKit, Core ML, and Metal, putting territory that is awkward in React Native within reach",
-    "SHIP — Two-click App Store submission is built in, with no need to open Xcode. That skips the signing and provisioning step where many first-time shippers get stuck",
-    "COST — Traditional native iOS development is commonly quoted at $5,000 to $50,000 and up, and the $200/month figure is being judged against that baseline",
-    "SDK55 — Expo SDK 55 ships React Native 0.83 and React 19.2, and drops Legacy Architecture support entirely. The New Architecture is now the only option",
+    "RAISE — Rork raised $15M. The money is pointed at shortening the distance between a solo developer and a shipped app",
+    "ENGINE — Rork Max runs on Claude Code paired with Opus 4.6. Much of its edge on complex app logic and reasoning is attributed to that pairing",
+    "CLOUDMAC — The Swift it generates is compiled on a cloud Mac fleet, so you can go from prompt to on-device testing to App Store submission without installing Xcode",
+    "AR — Rork Max supports ARKit and LiDAR scanning natively, putting 3D object placement and spatial computing apps within reach",
+    "TRACTION — The Rork Max announcement drew more than 8 million views on X, and the company reports its annual revenue doubled within two weeks",
+    "TRAFFIC — Rork reports over 743,000 monthly visits with 85% growth, a sign that prompt-to-app tools are settling in as a prototyping entry point",
   ],
 };
 
