@@ -5,9 +5,9 @@ category: "rork-business"
 level: "advanced"
 premium: false
 date: "2026-05-13T04:45"
-updated: "2026-05-13T04:45"
+updated: "2026-08-02T17:30"
 author: "Rork Lab"
-description: "App Store・Google Play のレビューを Claude API で自動収集・感情分析・機能優先度スコアリングするシステムを Rork アプリに構築する全工程。10年・5,000万DL超の個人開発経験から得た知見と動作確認済みコードを公開。"
+description: "App Store・Google Play のレビューを Claude API で自動収集・感情分析・機能優先度スコアリングするシステムを Rork アプリに構築する全工程。バッチ分析が静かに欠落する問題の切り分けまで、動作確認済みコードとともに解説します。"
 tags: ["App Store", "フィードバック分析", "Claude API", "機能優先度", "ユーザーリサーチ", "感情分析", "個人開発", "収益化"]
 
 ---
@@ -221,6 +221,169 @@ ${batchText}`
 このコードで重要なのは、**Claude Haiku を使っている点**です。レビュー分析は感情分析・カテゴリ分類という定型タスクなので、Sonnet や Opus は不要です。Haiku を使うことでコストを約10分の1に抑えられます。
 
 実際に試したところ、月3,000件のレビューを処理するコストは Haiku で約50〜80円程度でした。これなら個人開発でも十分に継続できます。
+
+## 20件送ったのに17件しか返ってこない — 集計の前に照合する
+
+このシステムを組んでしばらく経った頃、同じ月のレビューを2回流すと「機能リクエスト」と「パフォーマンス」の順位が入れ替わる、という現象に気づきました。乱数はどこにも使っていません。入力も同じです。
+
+原因は、上のコードの末尾にあります。
+
+```javascript
+} catch (e) {
+  console.error('JSON parse error for batch:', e);
+}
+```
+
+パースに失敗したバッチ20件は、ここでログ1行と引き換えに消えます。呼び出し側からは正常終了に見えます。集計関数は「届いた分」を母数として割合を出すので、消えたことに気づく手がかりが残りません。
+
+厄介なのは、この欠落がランダムではないことです。
+
+`max_tokens: 2000` に対して、20件 × 6フィールドの JSON を日本語で返させると、1件あたりおよそ90〜120トークン。20件で1,800〜2,400トークンと、ちょうど境界に乗ります。超えるかどうかを決めるのは `feature_request` の長さで、これが伸びるのは「具体的な要望を丁寧に書いた人」のレビューです。つまり、最も情報量の多いレビューほど、自分を含むバッチを切り詰め側に押し込みます。
+
+そして出力が切れるのは配列の後半です。レビューを取得順（新しい順）に詰めていれば、後半に来るのは古いレビュー。欠落は時間方向にも偏ります。
+
+もう一つ、件数だけでは気づけない壊れ方があります。
+
+```javascript
+review_id: batch[r.index].id
+```
+
+モデルが `index` を1つ取り違えて範囲外の値を返すと、`batch[r.index]` が `undefined` になり、`.id` の参照で TypeError が飛びます。この `map` は `try` の中にあるので、例外は同じ `catch` に落ちます。1件の取り違えで、そのバッチ20件が丸ごと消えるということです。
+
+<table>
+<thead>
+<tr><th>症状</th><th>実際に起きていること</th><th>確認方法</th></tr>
+</thead>
+<tbody>
+<tr><td>同じ入力なのにカテゴリの順位が変わる</td><td>バッチ単位の欠落。落ちるバッチが実行ごとに違う</td><td>入力件数と <code>results.length</code> を毎回ログに残す</td></tr>
+<tr><td>「機能リクエスト」だけ件数が不自然に少ない</td><td><code>feature_request</code> が長い回答ほど出力が膨らみ、切り詰めの対象になる</td><td><code>stop_reason</code> が <code>max_tokens</code> だったバッチを数える</td></tr>
+<tr><td>古いレビューが毎回いなくなる</td><td>切れるのは配列の後半。取得順に詰めると後半＝古い側</td><td>欠落した <code>review_id</code> の日付分布を見る</td></tr>
+<tr><td>20件がまとめて消える</td><td><code>index</code> の取り違えで <code>batch[r.index]</code> が undefined になり map 内で throw</td><td>範囲チェックを一時的に外し、例外を握りつぶさずに送出させる</td></tr>
+<tr><td>件数は合うのに中身が入れ替わる</td><td>同じ <code>index</code> が2回返り、後勝ちで上書きされている</td><td><code>index</code> の重複数を数える</td></tr>
+</tbody>
+</table>
+
+対処は、賢いプロンプトではなく照合です。送った件数と返ってきた件数を突き合わせ、足りない分だけを小さく割って取り直します。
+
+```javascript
+// workers/analyze-reviews.js（照合つき）
+
+// 1件あたりの出力トークンを実測の上振れ側で見積もる
+const TOKENS_PER_REVIEW = 140;
+
+async function callClaude(batch, apiKey) {
+  const batchText = batch.map((r, idx) =>
+    `[${idx}] 評価:${r.rating}★\nタイトル:${r.title}\n本文:${r.body}`
+  ).join('\n---\n');
+
+  const response = await fetch(CLAUDE_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      // 固定値にしない。件数に比例させる
+      max_tokens: Math.min(8000, batch.length * TOKENS_PER_REVIEW + 200),
+      messages: [{ role: 'user', content: buildPrompt(batchText) }]
+    })
+  });
+
+  if (!response.ok) throw new Error('HTTP ' + response.status);
+
+  const data = await response.json();
+
+  // JSON.parse を試す前に見る。切れたことはここで分かる
+  if (data.stop_reason === 'max_tokens') throw new Error('truncated');
+
+  const parsed = JSON.parse(data.content[0].text);
+  if (!Array.isArray(parsed)) throw new Error('not an array');
+  return parsed;
+}
+
+// 1バッチを「全件そろうまで」解決する
+async function resolveBatch(batch, apiKey, depth = 0) {
+  const resolved = new Map(); // batch 内の index -> 分析結果
+
+  try {
+    for (const item of await callClaude(batch, apiKey)) {
+      const i = Number(item.index);
+      // 範囲外・重複はここで捨てる。undefined 参照で throw させない
+      if (!Number.isInteger(i) || i < 0 || i >= batch.length) continue;
+      if (resolved.has(i)) continue;
+      resolved.set(i, {
+        ...item,
+        review_id: batch[i].id,
+        rating: batch[i].rating,
+        date: batch[i].date
+      });
+    }
+  } catch (e) {
+    // 握りつぶさない。下の再取得に進むための失敗として扱う
+  }
+
+  const missing = batch.map((_, i) => i).filter(i => !resolved.has(i));
+  if (missing.length === 0) {
+    return { results: [...resolved.values()], failed: [] };
+  }
+
+  // 1件まで割っても駄目なら、失敗として記録して先へ進む
+  if (batch.length === 1 || depth >= 4) {
+    return {
+      results: [...resolved.values()],
+      failed: missing.map(i => batch[i])
+    };
+  }
+
+  const targets = missing.map(i => batch[i]);
+  const mid = Math.ceil(targets.length / 2);
+  const head = await resolveBatch(targets.slice(0, mid), apiKey, depth + 1);
+  const tail = await resolveBatch(targets.slice(mid), apiKey, depth + 1);
+
+  return {
+    results: [...resolved.values(), ...head.results, ...tail.results],
+    failed: [...head.failed, ...tail.failed]
+  };
+}
+
+async function analyzeReviewsBatch(reviews, apiKey) {
+  const batchSize = 20;
+  const results = [];
+  const failed = [];
+
+  for (let i = 0; i < reviews.length; i += batchSize) {
+    const r = await resolveBatch(reviews.slice(i, i + batchSize), apiKey);
+    results.push(...r.results);
+    failed.push(...r.failed);
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  return {
+    results,
+    failed,
+    lossRate: reviews.length === 0 ? 0 : failed.length / reviews.length
+  };
+}
+```
+
+戻り値を配列から `{ results, failed, lossRate }` に変えたのは意図的です。呼び出し側が取りこぼし率を無視できなくなります。
+
+```javascript
+const { results, failed, lossRate } = await analyzeReviewsBatch(reviews, apiKey);
+
+if (lossRate > 0.03) {
+  // 順位を出さない。3%を超えると下位カテゴリの並びが入れ替わる
+  return { status: 'degraded', lossRate, analyzed: results.length, dropped: failed.length };
+}
+```
+
+3%という線は、上位2カテゴリの差がそれ以上の幅で開いていることが多かったので置いた実務上の閾値です。母数が小さいうちは、もう少し厳しくしても構いません。
+
+分割して取り直す分、API 呼び出しは増えます。ただ増えるのは失敗した箇所だけで、しかも Haiku です。私の環境では月あたりの請求額はほとんど動きませんでした。順位表が信用できるかどうかとは釣り合わない額です。
+
+ダッシュボードには、スコアの隣に取りこぼし率をそのまま出しています。順位表というものは、どれだけ雑に作られていても順位表の顔をして出てくる、と実装しながら思い知ったためです。
 
 ## Step 3: 機能優先度スコアリングのアルゴリズム
 
@@ -484,12 +647,16 @@ App Store のレビューには、日本語・英語・韓国語が混在する�
 
 ## 個人開発者に伝えたい「ユーザーの声の聞き方」
 
-10年間で累計5,000万ダウンロード超のアプリを運営してきて感じるのは、「ユーザーの声を聞く」と「ユーザーの言葉をそのまま実装する」は全くの別物だということです。
+レビューを長く読んできて一番強く感じるのは、「ユーザーの声を聞く」ことと「ユーザーの言葉をそのまま実装する」ことは、まったく別の作業だということです。
 
 レビューに「○○の機能を追加してほしい」と書かれていても、それが本当に必要なのかは、その背後にある課題を見なければ分かりません。AI による分析は、個々のレビューの感情ノイズを除去して、「何が本当に問題になっているか」のパターンを浮かび上がらせてくれます。
 
-宮大工だった両祖父が「木の癖を読む」と言っていたのを思い出します。木は見ただけでは分かりません。触れて、叩いて、時間をかけて観察することで、その木が何に向いているかが分かってくる。ユーザーのフィードバックも同じで、表面の言葉だけを読んでいては見えないものがあります。AI はその「癖を読む」作業を高速化してくれる道具です。
+ただ、スコアは答えではなく、質問の出発点だと考えています。「起動速度が23%」という数字は、なぜ遅いと感じられているのかを調べる理由にはなりますが、何をどう直すべきかまでは教えてくれません。そこから先は結局、該当カテゴリのレビュー原文を10件ほど読み直す作業に戻ります。
+
+AI が減らしてくれたのは、読む量そのものよりも、どれを読むかを決めるときの迷いの方でした。
 
 このシステムを導入してから、機能開発の優先順位について迷う時間が大幅に減りました。もちろん AI の分析が全てではなく、最終的な判断は自分でしますが、データの裏付けがあると、ユーザーとのやり取りがより誠実になったと感じています。
 
-まず App Store Connect API のキーを取得して、手元のレビューデータで試してみてください。最初の分析結果が出たとき、「あ、そうだったのか」と思える瞬間が必ずあります。同じ課題に取り組んでいる方の参考になれば幸いです。
+まず App Store Connect API のキーを取得して、手元の1ヶ月分のレビューで走らせてみてください。最初の集計が出たとき、「あ、そうだったのか」と思える瞬間がだいたい一度は来ます。ただしその前に、入力件数と分析件数が一致していることだけは確かめてください。順位を眺めるのは、その後で十分です。
+
+レビューの読み方で似た引っかかり方をしている方に、少しでも届けばと思っています。

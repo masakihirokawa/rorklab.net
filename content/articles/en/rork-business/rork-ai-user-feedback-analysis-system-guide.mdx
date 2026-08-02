@@ -5,9 +5,9 @@ category: "rork-business"
 level: "advanced"
 premium: false
 date: "2026-05-13T04:45"
-updated: "2026-05-13T04:45"
+updated: "2026-08-02T17:30"
 author: "Rork Lab"
-description: "Build an automated user review analysis system using Claude API and App Store Connect API for your Rork app. Includes working code for sentiment analysis, theme clustering, and priority scoring — from a developer with 50M+ downloads of experience."
+description: "Build an automated user review analysis system using Claude API and App Store Connect API for your Rork app. Working code for sentiment analysis, theme clustering, priority scoring, and the reconciliation step that keeps batches from silently dropping reviews."
 tags: ["App Store", "Feedback Analysis", "Claude API", "Feature Prioritization", "User Research", "Sentiment Analysis", "Indie Development", "Monetization"]
 
 ---
@@ -222,6 +222,169 @@ ${batchText}`,
 ```
 
 **Why Haiku, not Sonnet?** Sentiment classification and category labeling are instruction-following tasks, not reasoning tasks. Haiku handles them with near-identical accuracy at roughly one-tenth the cost. For 3,000 reviews per month, the total Claude API cost with Haiku runs about $0.30–0.50 USD. That's a cost that survives any indie app budget.
+
+## You Sent 20 Reviews and Got 17 Back
+
+A few weeks into running this, I noticed something odd: feeding the same month of reviews through the pipeline twice produced different rankings. "Feature requests" and "Performance" kept trading places. Nothing in the code is random. The input was identical.
+
+The cause is at the bottom of the function above.
+
+```javascript
+} catch (e) {
+  console.error('JSON parse error for batch:', e);
+}
+```
+
+When a batch fails to parse, twenty reviews disappear in exchange for one log line. The caller sees a successful return. The scoring function computes percentages against whatever arrived, so nothing downstream can tell that anything went missing.
+
+What makes this worse than a plain bug is that the loss isn't random.
+
+With `max_tokens: 2000` and twenty reviews times six fields, each review costs roughly 90–120 output tokens. Twenty reviews lands at 1,800–2,400 — right on the boundary. What pushes a batch over is the length of `feature_request`, and that field gets long when someone took the time to describe exactly what they wanted. The most informative reviews are the ones most likely to truncate the batch they're sitting in.
+
+Truncation also always hits the tail of the array. If you queue reviews newest-first, the tail is the oldest reviews, so the loss skews in time as well.
+
+There's a second failure mode that survives a count check:
+
+```javascript
+review_id: batch[r.index].id
+```
+
+If the model returns an index one position off, `batch[r.index]` is `undefined` and reading `.id` throws. That `map` sits inside the `try`, so the exception lands in the same `catch` — one misnumbered item takes all twenty reviews with it.
+
+<table>
+<thead>
+<tr><th>Symptom</th><th>What's actually happening</th><th>How to confirm it</th></tr>
+</thead>
+<tbody>
+<tr><td>Rankings shift between identical runs</td><td>Whole batches drop, and a different batch drops each time</td><td>Log input count against <code>results.length</code> on every run</td></tr>
+<tr><td>"Feature requests" is suspiciously underrepresented</td><td>Long <code>feature_request</code> values inflate output and trigger truncation</td><td>Count batches where <code>stop_reason</code> is <code>max_tokens</code></td></tr>
+<tr><td>Older reviews vanish consistently</td><td>Truncation cuts the tail of the array, which is the oldest half</td><td>Plot the dates of the missing <code>review_id</code> values</td></tr>
+<tr><td>Twenty reviews disappear at once</td><td>A bad <code>index</code> makes <code>batch[r.index]</code> undefined and the map throws</td><td>Temporarily remove the range check and let the exception surface</td></tr>
+<tr><td>Counts match but results look shuffled</td><td>The same <code>index</code> came back twice and the later one overwrote the earlier</td><td>Count duplicate <code>index</code> values per batch</td></tr>
+</tbody>
+</table>
+
+The fix isn't a smarter prompt. It's reconciliation: compare what you sent against what came back, and re-fetch only the gap.
+
+```javascript
+// workers/analyze-reviews.js (with reconciliation)
+
+// Size the budget from measured output, on the high side
+const TOKENS_PER_REVIEW = 140;
+
+async function callClaude(batch, apiKey) {
+  const batchText = batch.map((r, idx) =>
+    `[${idx}] Rating:${r.rating}\nTitle:${r.title}\nBody:${r.body}`
+  ).join('\n---\n');
+
+  const response = await fetch(CLAUDE_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      // Never a fixed number. Scale it with the batch
+      max_tokens: Math.min(8000, batch.length * TOKENS_PER_REVIEW + 200),
+      messages: [{ role: 'user', content: buildPrompt(batchText) }]
+    })
+  });
+
+  if (!response.ok) throw new Error('HTTP ' + response.status);
+
+  const data = await response.json();
+
+  // Check this before attempting to parse. Truncation is visible here
+  if (data.stop_reason === 'max_tokens') throw new Error('truncated');
+
+  const parsed = JSON.parse(data.content[0].text);
+  if (!Array.isArray(parsed)) throw new Error('not an array');
+  return parsed;
+}
+
+// Resolve one batch until every review is accounted for
+async function resolveBatch(batch, apiKey, depth = 0) {
+  const resolved = new Map(); // batch-local index -> analysis
+
+  try {
+    for (const item of await callClaude(batch, apiKey)) {
+      const i = Number(item.index);
+      // Drop out-of-range and duplicate indices here, before they can throw
+      if (!Number.isInteger(i) || i < 0 || i >= batch.length) continue;
+      if (resolved.has(i)) continue;
+      resolved.set(i, {
+        ...item,
+        review_id: batch[i].id,
+        rating: batch[i].rating,
+        date: batch[i].date
+      });
+    }
+  } catch (e) {
+    // Don't swallow it. Fall through to the retry below
+  }
+
+  const missing = batch.map((_, i) => i).filter(i => !resolved.has(i));
+  if (missing.length === 0) {
+    return { results: [...resolved.values()], failed: [] };
+  }
+
+  // If a single review still fails, record it and move on
+  if (batch.length === 1 || depth >= 4) {
+    return {
+      results: [...resolved.values()],
+      failed: missing.map(i => batch[i])
+    };
+  }
+
+  const targets = missing.map(i => batch[i]);
+  const mid = Math.ceil(targets.length / 2);
+  const head = await resolveBatch(targets.slice(0, mid), apiKey, depth + 1);
+  const tail = await resolveBatch(targets.slice(mid), apiKey, depth + 1);
+
+  return {
+    results: [...resolved.values(), ...head.results, ...tail.results],
+    failed: [...head.failed, ...tail.failed]
+  };
+}
+
+async function analyzeReviewsBatch(reviews, apiKey) {
+  const batchSize = 20;
+  const results = [];
+  const failed = [];
+
+  for (let i = 0; i < reviews.length; i += batchSize) {
+    const r = await resolveBatch(reviews.slice(i, i + batchSize), apiKey);
+    results.push(...r.results);
+    failed.push(...r.failed);
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  return {
+    results,
+    failed,
+    lossRate: reviews.length === 0 ? 0 : failed.length / reviews.length
+  };
+}
+```
+
+Changing the return type from an array to `{ results, failed, lossRate }` is deliberate. It makes the loss rate impossible for the caller to ignore.
+
+```javascript
+const { results, failed, lossRate } = await analyzeReviewsBatch(reviews, apiKey);
+
+if (lossRate > 0.03) {
+  // Don't publish a ranking. Past 3%, the lower categories reorder
+  return { status: 'degraded', lossRate, analyzed: results.length, dropped: failed.length };
+}
+```
+
+Three percent is a practical threshold, not a derived one — it's roughly where the gap between my top two categories stopped being wider than the noise. With a smaller review volume, tighten it.
+
+Splitting and re-fetching does mean more API calls, but only for the parts that failed, and it's still Haiku. My monthly bill barely moved. That's a poor trade to refuse when the alternative is a ranking you can't trust.
+
+The dashboard now prints the loss rate next to the scores. Building this taught me that a ranked list arrives looking authoritative no matter how carelessly it was assembled, and I'd rather see the caveat than remember it.
 
 ## Step 3: Priority Scoring Algorithm
 
@@ -449,12 +612,12 @@ The fix: add English keyword hints to category names in the prompt. "Performance
 
 ## What Changes After You Have the Numbers
 
-I've been building apps since 2014, and over that time my wallpaper apps accumulated over 50 million downloads across platforms. The instinct about what users want gets sharper with experience, but intuition and data don't always agree — and when they disagree, I've learned to take the data seriously.
+The thing that took me longest to accept is that listening to users and implementing what users literally asked for are two different activities. Intuition about what people want does sharpen with time, but intuition and data don't always agree — and when they disagree, I've learned to take the data seriously.
 
-My grandfather was a carpenter of old Japanese temples. He used to say that reading wood takes time: you have to touch it, tap it, let it tell you what it's suited for. User feedback is a bit like that. The surface words aren't the whole story. This system doesn't replace the judgment call — the final decision about what to build is still mine — but it removes the noise that comes from reading emotionally charged reviews at midnight and convincing yourself that whatever bothered the loudest user this week is the most urgent problem in your app.
+A score is a starting question, not an answer. "Launch performance, 23%" is a good reason to go find out why the app feels slow; it doesn't tell you what to change. From there I go back and read ten raw reviews in that category by hand. What this system reduced wasn't the amount of reading — it was the hesitation about which reviews to read. The final call about what to build is still mine. What's gone is the part where I read an emotionally charged review at midnight and convinced myself that whatever bothered the loudest user this week was the most urgent problem in the app.
 
 The feedback loop gets tighter too. After shipping a performance fix, you can run the analysis again two weeks later and see whether the scores actually moved. That feedback-to-data loop is what makes the difference between shipping improvements that matter and shipping improvements that feel good to ship.
 
-Get your App Store Connect API key set up, pull your last month of reviews, and run the analysis. The first time you see the scored categories, there's usually a moment of "oh — that's what was actually going on." Start with that.
+Get your App Store Connect API key set up, pull your last month of reviews, and run the analysis. The first time you see the scored categories, there's usually a moment of "oh — that's what was actually going on." Just check that the input count matches the analyzed count before you let that moment land. The ranking can wait until the arithmetic holds.
 
 If you're running into App Store Connect API authentication issues specifically, the [App Store Connect API authentication guide](https://developer.apple.com/documentation/appstoreconnectapi/generating-tokens-for-api-requests) from Apple covers the JWT format in detail.
