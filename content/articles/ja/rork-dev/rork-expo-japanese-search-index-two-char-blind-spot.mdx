@@ -1,0 +1,377 @@
+---
+title: "2文字の検索語が静かに0件になる — Expo アプリの日本語検索インデックスを実測で選び直す"
+slug: "rork-expo-japanese-search-index-two-char-blind-spot"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-02T11:00"
+updated: "2026-08-02T11:00"
+author: "Rork Lab"
+description: "SQLite FTS5 の trigram トークナイザは2文字以下の日本語クエリを例外なしで0件にします。2万件のカタログで線形走査・bigram 転置索引・FTS5 を実測し、索引を足すべき閾値と起動コストの実数を出した記録です。"
+tags: ["Rork", "Expo", "SQLite", "FTS5", "日本語検索", "パフォーマンス"]
+highlights:
+  - "FTS5 の trigram は2文字以下のクエリで例外を投げず0件を返す。実測では「猫」606件・「夜景」816件・「桜」1,263件が静かに消えた"
+  - "20,000件の線形走査は中央値0.80ms。索引を足す判断は「件数がフレーム予算を割ったとき」に限ってよい"
+  - "本当のボトルネックは検索ではなく起動時の正規化パス。20,000件で39.5ms、事前正規化と改行連結の配布で1.1msまで縮んだ"
+---
+
+朝、家族から「猫の壁紙が1枚も出てこない」と言われました。
+
+自分の端末で確かめると、たしかに「猫」と打った瞬間に結果が空になります。カタログには猫のタイトルが600枚以上あります。エラーログには何も残っていません。クラッシュもしていません。ただ、0件。
+
+原因は、その前の週に私自身が入れた検索インデックスでした。件数が増えてきたので「そろそろ線形走査は限界だろう」と考え、SQLite の FTS5 に載せ替えたところだったのです。速くはなりました。ただ、日本語で最も打たれやすい長さのクエリが、まるごと落ちていました。
+
+この記事は、その後で腰を据えて計測をやり直した記録です。線形走査・bigram 転置索引・FTS5 trigram の3つを同じデータで走らせ、どの規模でどれを選ぶべきかを実数で決め直しました。結論から言えば、私は索引を捨てて線形走査に戻しています。
+
+## 計測の土台 — 再現可能なカタログを作る
+
+実データをそのまま貼ると再現できないので、壁紙カタログを模した擬似データを決定論的に生成しました。タイトルは「修飾＋被写体＋接尾」、タグは3つ。1件あたり正規化後およそ13〜20文字という、実物に近い分布になっています。
+
+```js
+// gen.mjs — 線形合同法で決定論的に生成（同じ seed なら同じカタログ）
+let seed = 20260802;
+const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+const pick = (a) => a[Math.floor(rnd() * a.length)];
+
+const subj = ["夜景", "桜", "富士山", "海", "星空", "猫", "森", "雪原", "花火", "滝", "紅葉", "銀河"];
+const mod  = ["静かな", "淡い", "鮮やかな", "霧の", "真夜中の", "冬の", "黄昏の", "雨上がりの"];
+const suf  = ["の風景", "のシルエット", "のグラデーション", "のパノラマ", "", ""];
+const tagp = ["ミニマル", "ダーク", "パステル", "モノクロ", "和風", "自然", "高解像度", "縦向き"];
+
+export function makeCatalog(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push({
+      id: "w" + i,
+      title: pick(mod) + pick(subj) + pick(suf),
+      tags: [pick(tagp), pick(tagp), pick(tagp)],
+    });
+  }
+  return out;
+}
+```
+
+正規化は3層です。NFKC で全角半角を潰し、小文字化し、カタカナをひらがなへ寄せ、空白を落とします。表記ゆれの吸収そのものは以前まとめたとおりですが、今回はこの関数の実行コストが主役になります。
+
+```js
+const norm = (s) =>
+  s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60))
+    .replace(/\s+/g, "");
+```
+
+計測環境は Linux コンテナ上の Node 22.22 と Python 3.10（SQLite 3.37.2）です。手元の iPhone ではありません。以下の数値は絶対値ではなく比率と桁を読むためのものとして扱ってください。実機は一般に数倍遅く、私の手元の検証では3〜5倍を見込むと大きく外れませんでした。
+
+## 素朴な線形走査は、思っていたよりずっと遠くまで走る
+
+まず「何もしない」実装を測ります。読み込み時に正規化済みのキー配列を作り、クエリごとに `indexOf` で舐めるだけの実装です。
+
+```js
+// 正規化済みキーを平坦な文字列配列で保持する
+const keys = new Array(items.length);
+for (let i = 0; i < items.length; i++) {
+  keys[i] = norm(items[i].title + items[i].tags.join(""));
+}
+
+function search(q) {
+  const nq = norm(q);
+  const hits = [];
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i].indexOf(nq) >= 0) hits.push(i);
+  }
+  return hits;
+}
+```
+
+8種類のクエリを各20回、中央値を取った結果です。比較のため `{ id, k }` のオブジェクト配列に対する `filter` も並べました。
+
+<table>
+  <thead>
+    <tr><th>件数</th><th>平坦な文字列配列</th><th>オブジェクト配列 + filter</th><th>キー保持量（概算）</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>20,000</td><td>0.80 ms</td><td>1.11 ms</td><td>1.4 MB</td></tr>
+    <tr><td>50,000</td><td>1.99 ms</td><td>2.79 ms</td><td>3.6 MB</td></tr>
+    <tr><td>100,000</td><td>4.05 ms</td><td>6.48 ms</td><td>7.2 MB</td></tr>
+    <tr><td>200,000</td><td>8.50 ms</td><td>12.43 ms</td><td>14.4 MB</td></tr>
+    <tr><td>500,000</td><td>20.21 ms</td><td>29.65 ms</td><td>35.9 MB</td></tr>
+  </tbody>
+</table>
+
+60fps のフレーム予算は16.7ms です。この環境では20万件まで1フレームに収まりました。実機の3〜5倍という補正を掛けても、数万件規模なら線形走査で十分に戦えます。
+
+同じデータ・同じ判定でありながら、平坦な配列とオブジェクト配列で1.4倍の差が出ている点は覚えておく価値があります。プロパティアクセスが1段挟まるだけの違いですが、走査回数が件数分あるので効いてきます。索引を設計する前に、まずここを平坦にするほうが費用対効果は高いです。
+
+私が最初に索引へ手を伸ばした判断は、この表を作る前のものでした。「2万件は多い」という体感だけで動いていたわけです。
+
+## bigram 転置索引は、成果よりも荷物のほうが重かった
+
+次に、正攻法とされる転置索引を作ります。正規化済みキーを2文字ずつに割り、gram ごとに文書 ID の集合を持たせる形です。
+
+```js
+function buildBigram(items) {
+  const idx = Object.create(null);
+  for (let i = 0; i < items.length; i++) {
+    const k = norm(items[i].title + items[i].tags.join(""));
+    for (let j = 0; j + 2 <= k.length; j++) {
+      (idx[k.slice(j, j + 2)] ||= []).push(i);
+    }
+  }
+  for (const g in idx) idx[g] = [...new Set(idx[g])];
+  return idx;
+}
+
+function queryBigram(idx, keys, q) {
+  const nq = norm(q);
+  if (nq.length < 2) return null; // ← ここが後で問題になります
+  const grams = [];
+  for (let j = 0; j + 2 <= nq.length; j++) grams.push(nq.slice(j, j + 2));
+
+  let cand = null;
+  for (const g of grams) {
+    const posting = idx[g];
+    if (!posting) return [];
+    if (cand === null) cand = posting;
+    else {
+      const s = new Set(posting);
+      cand = cand.filter((x) => s.has(x));
+    }
+    if (cand.length === 0) return [];
+  }
+  // gram の並び順は保証されないので、最後に実文字列で確認する
+  return cand.filter((i) => keys[i].includes(nq));
+}
+```
+
+検索そのものは確かに速くなりました。20,000件で0.093ms、線形走査の8分の1です。問題はその外側にありました。
+
+<table>
+  <thead>
+    <tr><th>件数</th><th>索引の構築</th><th>索引の JSON サイズ</th><th>元カタログの JSON サイズ</th><th>JSON.parse</th><th>検索</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1,000</td><td>11.2 ms</td><td>72 KB</td><td>96 KB</td><td>0.6 ms</td><td>0.009 ms</td></tr>
+    <tr><td>5,000</td><td>31.5 ms</td><td>401 KB</td><td>483 KB</td><td>2.0 ms</td><td>0.024 ms</td></tr>
+    <tr><td>20,000</td><td>120.9 ms</td><td>1,786 KB</td><td>1,947 KB</td><td>5.4 ms</td><td>0.093 ms</td></tr>
+    <tr><td>50,000</td><td>309.1 ms</td><td>4,721 KB</td><td>4,886 KB</td><td>16.5 ms</td><td>0.318 ms</td></tr>
+  </tbody>
+</table>
+
+索引のサイズが、元のカタログとほぼ同じです。50,000件では97%。つまり検索を速くするために、配布物を約2倍にすることになります。ダウンロードサイズが App Store の表示に出る以上、これは軽い判断ではありません。
+
+そして検証中に、線形走査との結果比較でずれが出ました。
+
+```
+MISMATCH 20000 滝  linear=708件  bigram=0件
+```
+
+`nq.length < 2` で早期リターンしている箇所です。1文字のクエリは bigram を1つも作れないため、索引だけでは原理的に引けません。日本語では「猫」「桜」「月」「海」のような1文字が普通に打たれます。索引を入れた時点で、この層が丸ごと落ちていました。
+
+ここまでは、まだ自分の実装の穴です。次が本題でした。
+
+## FTS5 の trigram は、2文字以下を例外なしで捨てる
+
+「自前の索引が雑だったのだ」と考えて、SQLite の FTS5 に移しました。Expo なら `expo-sqlite` で使えますし、CJK に対して `trigram` トークナイザが用意されています。素性の確かな実装に任せるほうが安全だと考えたわけです。
+
+```python
+# 20,000件を trigram トークナイザで格納し、plain テーブルと突き合わせる
+c.execute("CREATE VIRTUAL TABLE s USING fts5(id UNINDEXED, k, tokenize='trigram')")
+c.executemany("INSERT INTO s VALUES (?,?)", rows)
+
+c.execute("CREATE TABLE plain(id TEXT, k TEXT)")
+c.executemany("INSERT INTO plain VALUES (?,?)", rows)
+
+for q in ["夜景", "猫", "桜", "星空の", "高解像度"]:
+    m = c.execute("SELECT count(*) FROM s WHERE k MATCH ?", ('"' + q + '"',)).fetchone()[0]
+    l = c.execute("SELECT count(*) FROM plain WHERE k LIKE ?", ('%' + q + '%',)).fetchone()[0]
+    print(q, len(q), m, l)
+```
+
+出力です。
+
+<table>
+  <thead>
+    <tr><th>クエリ</th><th>文字数</th><th>FTS5 MATCH</th><th>実際の該当件数</th><th>判定</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>夜景</td><td>2</td><td>0</td><td>816</td><td>取りこぼし</td></tr>
+    <tr><td>猫</td><td>1</td><td>0</td><td>606</td><td>取りこぼし</td></tr>
+    <tr><td>桜</td><td>1</td><td>0</td><td>1,263</td><td>取りこぼし</td></tr>
+    <tr><td>星空の</td><td>3</td><td>518</td><td>518</td><td>一致</td></tr>
+    <tr><td>高解像度</td><td>4</td><td>2,727</td><td>2,727</td><td>一致</td></tr>
+  </tbody>
+</table>
+
+例外は投げません。警告も出ません。3文字未満のクエリは、trigram を1つも構成できないため、静かに空集合になります。仕様としては当然の帰結ですが、アプリの画面上では「該当なし」と区別がつきません。ユーザーから見れば「この壁紙アプリには猫がない」のです。
+
+`trigram` という名前は「3文字単位で索引する」ことしか語っていません。「3文字未満は引けない」は、その裏側にある帰結です。英語で `cat` を引けば3文字ですから、英語圏の感覚では問題として立ち上がりません。日本語で「猫」は1文字。この非対称が、そのまま落とし穴になっていました。
+
+もう一つ、デバッグ中に時間を溶かした挙動があります。FTS5 の仮想テーブルに対して `LIKE` を投げると、期待した部分一致になりません。
+
+```sql
+-- 仮想テーブルに対する LIKE：0 が返る
+SELECT count(*) FROM s WHERE k LIKE '%猫%';        -- → 0
+
+-- 同じデータを持つ通常テーブルに対する LIKE：正しい
+SELECT count(*) FROM plain WHERE k LIKE '%猫%';    -- → 606
+```
+
+「MATCH が駄目なら LIKE でフォールバックすればよい」と考えて仮想テーブルにそのまま投げると、原因の切り分けが一段遠のきます。フォールバック先は、同じ内容を持つ通常テーブルとして別に用意する必要があります。
+
+## ハイブリッドにしたら、遅いほうの経路に引きずられた
+
+素直な対処は、クエリ長で経路を分けることです。3文字以上は FTS5、2文字以下は通常テーブルへの `LIKE`。書いて測りました。
+
+<table>
+  <thead>
+    <tr><th>クエリ</th><th>文字数</th><th>経路</th><th>件数</th><th>中央値</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>猫</td><td>1</td><td>LIKE</td><td>606</td><td>4.72 ms</td></tr>
+    <tr><td>桜</td><td>1</td><td>LIKE</td><td>1,263</td><td>5.00 ms</td></tr>
+    <tr><td>夜景</td><td>2</td><td>LIKE</td><td>816</td><td>5.29 ms</td></tr>
+    <tr><td>星空の</td><td>3</td><td>FTS5</td><td>518</td><td>0.77 ms</td></tr>
+    <tr><td>雨上がり</td><td>4</td><td>FTS5</td><td>1,337</td><td>2.24 ms</td></tr>
+    <tr><td>高解像度</td><td>4</td><td>FTS5</td><td>2,727</td><td>4.46 ms</td></tr>
+  </tbody>
+</table>
+
+正しさは戻りました。ただ、この表を眺めていて手が止まりました。
+
+同じ20,000件に対する JavaScript の線形走査は0.80msです。ハイブリッドの遅いほうの経路（4.7〜5.3ms）は、その6倍前後かかっています。速いほうの経路ですら、ヒット件数が増えると4.46msまで落ちます。
+
+つまりこの規模では、SQLite を挟んだ全経路が、素朴な線形走査に負けていました。索引の理論上の優位は、20,000件という規模では実測に現れません。現れるどころか、シリアライズとブリッジ越えの固定費のほうが大きいのです。
+
+FTS5 のデータベースファイルは20,000件で3.3MB、50,000件で9.4MBでした。挿入も20,000件で252ms、50,000件で628msかかります。この費用を払って得たものが「線形走査より遅い検索」だったことになります。
+
+判断として整理すると、こうなります。
+
+1. 検索の応答時間が実測でフレーム予算を割っていないなら、索引は入れない
+2. 割っているなら、まずキー配列を平坦にする（それだけで1.4倍）
+3. それでも割るなら、索引を検討する。ただし配布サイズがおよそ2倍になることを前提に置く
+4. 索引を入れるなら、短いクエリの経路を設計の最初に決める。後付けにすると静かな0件が本番へ出る
+
+## 本当のボトルネックは検索ではなく、起動時の正規化だった
+
+ここまで検索の応答ばかり測ってきましたが、体感を支配していたのは別の場所でした。読み込み時に全件へ `norm()` を掛けるパスです。
+
+<table>
+  <thead>
+    <tr><th>件数</th><th>実行時に normalize</th><th>事前正規化 + JSON.parse</th><th>事前正規化 + 改行連結 split</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>20,000</td><td>39.5 ms</td><td>1.6 ms</td><td>1.1 ms</td></tr>
+    <tr><td>100,000</td><td>185.4 ms</td><td>7.5 ms</td><td>3.9 ms</td></tr>
+    <tr><td>500,000</td><td>926.3 ms</td><td>69.4 ms</td><td>55.8 ms</td></tr>
+  </tbody>
+</table>
+
+20,000件で39.5ms。検索1回の0.80msに対して、実に49倍です。私は0.8msを0.09msに縮める作業に週末を使い、その手前にある39.5msを見ていませんでした。
+
+しかもこれは JavaScript スレッドを占有します。実機の補正を掛ければ100ms以上、10万件規模なら起動が目に見えて重くなる水準です。
+
+対処は単純でした。正規化をビルド時に済ませ、結果だけを配布します。
+
+```js
+// scripts/build-search-keys.mjs — ビルド時に1回だけ走らせる
+import fs from "node:fs";
+
+const norm = (s) =>
+  s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60))
+    .replace(/\s+/g, "");
+
+const items = JSON.parse(fs.readFileSync("assets/catalog.json", "utf8"));
+
+// 改行区切りの単一文字列として出す。id は行番号で対応させる
+const keys = items.map((it) => norm(it.title + it.tags.join("")));
+if (keys.some((k) => k.includes("\n"))) {
+  throw new Error("正規化後のキーに改行が混入しています。区切り文字を見直してください");
+}
+fs.writeFileSync("assets/search-keys.txt", keys.join("\n"));
+console.log(`wrote ${keys.length} keys / ${Buffer.byteLength(keys.join("\n"))} bytes`);
+```
+
+アプリ側は読み込んで `split` するだけです。
+
+```js
+import { Asset } from "expo-asset";
+import * as FileSystem from "expo-file-system";
+
+let KEYS = null;
+
+export async function loadSearchKeys() {
+  if (KEYS) return KEYS;
+  const asset = Asset.fromModule(require("../assets/search-keys.txt"));
+  await asset.downloadAsync();
+  const raw = await FileSystem.readAsStringAsync(asset.localUri);
+  KEYS = raw.split("\n");
+  return KEYS;
+}
+
+export function searchByKeys(nq) {
+  const hits = [];
+  for (let i = 0; i < KEYS.length; i++) {
+    if (KEYS[i].indexOf(nq) >= 0) hits.push(i);
+  }
+  return hits;
+}
+```
+
+JSON 配列ではなく改行連結にしたのは、実測で速く、かつ小さかったからです。20,000件で `JSON.parse` が1.6ms・1,118KB に対し、`split` は1.1ms・1,078KB。100,000件では7.5ms 対 3.9ms と、差が開きます。引用符とカンマの分だけ素直に軽くなる、という納得のいく結果でした。
+
+改行を区切りに使う以上、キーに改行が混入したら全体がずれます。ビルドスクリプト側で必ず弾いてください。私は一度これを省いて、タグに改行が入った1件のせいで以降のインデックスが1つずれる状態を本番に出しました。検索結果の画像が全部となりの壁紙になるという、原因が分かるまで気持ちの悪い不具合でした。
+
+## 私が最終的に採った構成
+
+現在の壁紙アプリは、次の形に落ち着いています。カタログは約24,000件です。
+
+1. **ビルド時**に正規化済みキーを生成し、改行連結のテキストとして同梱する
+2. **起動時**は `split` のみ。正規化関数はクエリ側でしか呼ばない
+3. **検索**は平坦な文字列配列に対する `indexOf` の線形走査。索引は持たない
+4. **クエリ側**も同じ `norm()` を通す。ここを揃えないと表記ゆれの吸収が片側だけになる
+5. **入力**は debounce で間引く。走査そのものより、毎キーストロークで走らせることのほうが高くつく
+
+FTS5 は外しました。件数が今の4倍を超え、実測でフレーム予算を割るようになったら戻す予定です。そのときは短いクエリ用の通常テーブルを最初から用意します。
+
+私はこの、依存を1つ減らして手で読める構成を好みます。速さのためではなく、0件が返ってきたときに原因を10行の中から探せるからです。同じカタログを Google Play 側のビルドでも使っていますが、共有しているのは正規化関数とキー生成スクリプトだけで済んでいます。
+
+判断の分かれ目を表にしておきます。手元の環境で測り直したうえで使ってください。
+
+<table>
+  <thead>
+    <tr><th>状況</th><th>推奨する構成</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>数千〜数万件・部分一致で足りる</td><td>事前正規化 + 平坦配列の線形走査</td><td>索引の固定費を払う理由がない。配布サイズも増えない</td></tr>
+    <tr><td>数十万件・部分一致</td><td>同上 + Web Worker 相当への退避を検討</td><td>走査自体は間に合うが、フレーム予算との競合が出始める</td></tr>
+    <tr><td>スコアリングや語順を伴う検索が要る</td><td>FTS5 + 短いクエリ用の通常テーブル</td><td>順位付けは自前で持つと重い。ただし2文字以下の経路を必ず別に用意する</td></tr>
+    <tr><td>サーバ側に検索を置ける</td><td>サーバへ寄せる</td><td>端末の配布サイズと起動コストを両方回避できる</td></tr>
+  </tbody>
+</table>
+
+Rork や Expo でこの部分を生成させる場合、「検索機能を付けてください」だけでは、まず英語圏の前提が入ります。私は次のように仕様まで書いて渡すようにしました。
+
+```
+アプリ内検索を実装してください。要件は以下です。
+
+- 検索対象は正規化済みのキー配列（assets/search-keys.txt を改行区切りで読む）
+- 正規化: NFKC → 小文字化 → カタカナをひらがなへ → 空白除去。クエリ側にも同じ関数を適用
+- 1文字のクエリでも必ず動作すること。n-gram 索引や FTS5 の trigram は使わないでください
+- 入力は 200ms の debounce。前回の検索は AbortController 相当で打ち切る
+- 0件のときは「該当なし」ではなく、タグ候補を3つ提示する画面にしてください
+```
+
+3行目を明示するようになったのは、今回の一件のあとです。生成されたコードが速いかどうかより、日本語で1文字が引けるかどうかを先に確かめるようになりました。
+
+## 次の一歩
+
+もし手元のアプリに検索があるなら、まず1文字のクエリを1つ打ってみてください。よく使われる被写体を1つ、ひらがな1文字でも構いません。件数が返ってくるか、0件になるか。それだけで、索引の設計が日本語を想定しているかが分かります。
+
+そのうえで、検索の応答ではなく起動時の準備コストを測ってみてください。私の場合、縮める余地は検索側に0.7ms、起動側に38msありました。時間を使うべき場所は、測るまで分からないものです。
+
+数字はすべて私自身の環境で実際に走らせて取ったものです。桁と比率は参考になるはずですが、絶対値はぜひご自身の端末で確かめてみてください。お読みいただきありがとうございました。

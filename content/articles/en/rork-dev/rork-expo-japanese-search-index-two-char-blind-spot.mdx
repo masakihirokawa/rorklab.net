@@ -1,0 +1,375 @@
+---
+title: "When Two-Character Queries Silently Return Nothing: Measuring Japanese Search Indexes in an Expo App"
+slug: "rork-expo-japanese-search-index-two-char-blind-spot"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-02T11:00"
+updated: "2026-08-02T11:00"
+author: "Rork Lab"
+description: "SQLite FTS5's trigram tokenizer returns zero rows for Japanese queries shorter than three characters, without raising anything. I benchmarked linear scan, a bigram inverted index, and FTS5 over a 20,000-item catalog to find the real threshold."
+tags: ["Rork", "Expo", "SQLite", "FTS5", "Japanese search", "Performance"]
+highlights:
+  - "FTS5 trigram silently returns zero for queries under three characters. In my run, 猫 (606 matches), 夜景 (816), and 桜 (1,263) all vanished without an error"
+  - "A linear scan over 20,000 items took 0.80 ms median. Adding an index is only justified once measurements actually breach the frame budget"
+  - "The real bottleneck was startup normalization, not search: 39.5 ms at 20,000 items, cut to 1.1 ms by precomputing keys and shipping them newline-joined"
+---
+
+One morning a family member told me that not a single cat wallpaper was showing up.
+
+I checked on my own phone. Typing 猫 (cat) returned an empty list, instantly. The catalog holds more than six hundred cat titles. No error in the logs. No crash. Just nothing.
+
+The cause was a search index I had shipped the week before. The catalog had grown, I decided a linear scan was surely running out of road, and I moved the whole thing onto SQLite's FTS5. It did get faster. It also dropped the single most common query length in Japanese, entirely.
+
+What follows is what I found after sitting down and measuring properly. I ran a linear scan, a bigram inverted index, and FTS5 trigram over identical data to decide by numbers rather than intuition. The short version: I removed the index and went back to the linear scan.
+
+## Setting up something reproducible
+
+Real catalog data can't be shared, so I generated a synthetic one deterministically. Titles follow a modifier + subject + suffix pattern, with three tags each, producing roughly 13–20 normalized characters per record — close to the real distribution.
+
+```js
+// gen.mjs — linear congruential generator, so the same seed yields the same catalog
+let seed = 20260802;
+const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+const pick = (a) => a[Math.floor(rnd() * a.length)];
+
+const subj = ["夜景", "桜", "富士山", "海", "星空", "猫", "森", "雪原", "花火", "滝", "紅葉", "銀河"];
+const mod  = ["静かな", "淡い", "鮮やかな", "霧の", "真夜中の", "冬の", "黄昏の", "雨上がりの"];
+const suf  = ["の風景", "のシルエット", "のグラデーション", "のパノラマ", "", ""];
+const tagp = ["ミニマル", "ダーク", "パステル", "モノクロ", "和風", "自然", "高解像度", "縦向き"];
+
+export function makeCatalog(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push({
+      id: "w" + i,
+      title: pick(mod) + pick(subj) + pick(suf),
+      tags: [pick(tagp), pick(tagp), pick(tagp)],
+    });
+  }
+  return out;
+}
+```
+
+Normalization has three layers: NFKC to collapse full-width and half-width forms, lowercasing, katakana folded to hiragana, and whitespace stripped. Absorbing orthographic variation is the well-trodden part. What mattered this time was the cost of running this function at all.
+
+```js
+const norm = (s) =>
+  s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60))
+    .replace(/\s+/g, "");
+```
+
+Everything ran in a Linux container on Node 22.22 and Python 3.10 (SQLite 3.37.2) — not on an iPhone. Read the ratios and orders of magnitude, not the absolute values. Devices are generally several times slower; a 3–5x correction has served me reasonably well.
+
+## The naive linear scan goes much further than expected
+
+I started with the do-nothing implementation: build an array of normalized keys at load, then walk it with `indexOf` per query.
+
+```js
+// Keep normalized keys in a flat array of strings
+const keys = new Array(items.length);
+for (let i = 0; i < items.length; i++) {
+  keys[i] = norm(items[i].title + items[i].tags.join(""));
+}
+
+function search(q) {
+  const nq = norm(q);
+  const hits = [];
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i].indexOf(nq) >= 0) hits.push(i);
+  }
+  return hits;
+}
+```
+
+Eight queries, twenty runs each, medians below. For contrast I also measured `filter` over an array of `{ id, k }` objects.
+
+<table>
+  <thead>
+    <tr><th>Items</th><th>Flat string array</th><th>Object array + filter</th><th>Approx. key memory</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>20,000</td><td>0.80 ms</td><td>1.11 ms</td><td>1.4 MB</td></tr>
+    <tr><td>50,000</td><td>1.99 ms</td><td>2.79 ms</td><td>3.6 MB</td></tr>
+    <tr><td>100,000</td><td>4.05 ms</td><td>6.48 ms</td><td>7.2 MB</td></tr>
+    <tr><td>200,000</td><td>8.50 ms</td><td>12.43 ms</td><td>14.4 MB</td></tr>
+    <tr><td>500,000</td><td>20.21 ms</td><td>29.65 ms</td><td>35.9 MB</td></tr>
+  </tbody>
+</table>
+
+A 60fps frame budget is 16.7 ms. In this environment the scan stayed inside one frame up to 200,000 items. Even applying a 3–5x device correction, a catalog in the tens of thousands is comfortably within reach of a plain scan.
+
+The 1.4x gap between the flat array and the object array is worth holding onto. It is one extra property access, but it happens once per item, so it compounds. Flattening your key storage is cheaper and more effective than designing an index.
+
+My original decision to reach for an index was made before this table existed. I was working from the feeling that "twenty thousand is a lot."
+
+## The bigram inverted index cost more in luggage than it saved in speed
+
+Next, the textbook approach: split each normalized key into two-character grams and map each gram to a set of document IDs.
+
+```js
+function buildBigram(items) {
+  const idx = Object.create(null);
+  for (let i = 0; i < items.length; i++) {
+    const k = norm(items[i].title + items[i].tags.join(""));
+    for (let j = 0; j + 2 <= k.length; j++) {
+      (idx[k.slice(j, j + 2)] ||= []).push(i);
+    }
+  }
+  for (const g in idx) idx[g] = [...new Set(idx[g])];
+  return idx;
+}
+
+function queryBigram(idx, keys, q) {
+  const nq = norm(q);
+  if (nq.length < 2) return null; // ← this line becomes the problem
+  const grams = [];
+  for (let j = 0; j + 2 <= nq.length; j++) grams.push(nq.slice(j, j + 2));
+
+  let cand = null;
+  for (const g of grams) {
+    const posting = idx[g];
+    if (!posting) return [];
+    if (cand === null) cand = posting;
+    else {
+      const s = new Set(posting);
+      cand = cand.filter((x) => s.has(x));
+    }
+    if (cand.length === 0) return [];
+  }
+  // Gram order isn't guaranteed by intersection alone, so verify against the real string
+  return cand.filter((i) => keys[i].includes(nq));
+}
+```
+
+Search did get faster: 0.093 ms at 20,000 items, roughly an eighth of the linear scan. The trouble was everywhere else.
+
+<table>
+  <thead>
+    <tr><th>Items</th><th>Index build</th><th>Index JSON size</th><th>Source catalog JSON</th><th>JSON.parse</th><th>Query</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1,000</td><td>11.2 ms</td><td>72 KB</td><td>96 KB</td><td>0.6 ms</td><td>0.009 ms</td></tr>
+    <tr><td>5,000</td><td>31.5 ms</td><td>401 KB</td><td>483 KB</td><td>2.0 ms</td><td>0.024 ms</td></tr>
+    <tr><td>20,000</td><td>120.9 ms</td><td>1,786 KB</td><td>1,947 KB</td><td>5.4 ms</td><td>0.093 ms</td></tr>
+    <tr><td>50,000</td><td>309.1 ms</td><td>4,721 KB</td><td>4,886 KB</td><td>16.5 ms</td><td>0.318 ms</td></tr>
+  </tbody>
+</table>
+
+The index is nearly the same size as the catalog it indexes — 97% of it at 50,000 items. Making search faster means roughly doubling what you ship. With download size visible on the App Store listing, that isn't a free trade.
+
+Then my correctness check against the linear scan disagreed:
+
+```
+MISMATCH 20000 滝  linear=708 hits  bigram=0 hits
+```
+
+That is the `nq.length < 2` early return. A single character produces no bigrams, so the index cannot represent the query at all. In Japanese, single-character queries are ordinary — 猫 (cat), 桜 (cherry blossom), 月 (moon), 海 (sea). The moment I added the index, that entire class of query disappeared.
+
+So far this is my own implementation's flaw. The next part was not.
+
+## FTS5 trigram drops anything shorter than three characters, without complaint
+
+Assuming my hand-rolled index was simply sloppy, I moved to SQLite FTS5. It's available through `expo-sqlite`, and it ships a `trigram` tokenizer specifically for CJK text. Delegating to a well-tested implementation felt like the safer path.
+
+```python
+# Load 20,000 rows into a trigram table and compare against a plain table
+c.execute("CREATE VIRTUAL TABLE s USING fts5(id UNINDEXED, k, tokenize='trigram')")
+c.executemany("INSERT INTO s VALUES (?,?)", rows)
+
+c.execute("CREATE TABLE plain(id TEXT, k TEXT)")
+c.executemany("INSERT INTO plain VALUES (?,?)", rows)
+
+for q in ["夜景", "猫", "桜", "星空の", "高解像度"]:
+    m = c.execute("SELECT count(*) FROM s WHERE k MATCH ?", ('"' + q + '"',)).fetchone()[0]
+    l = c.execute("SELECT count(*) FROM plain WHERE k LIKE ?", ('%' + q + '%',)).fetchone()[0]
+    print(q, len(q), m, l)
+```
+
+The output:
+
+<table>
+  <thead>
+    <tr><th>Query</th><th>Length</th><th>FTS5 MATCH</th><th>Actual matches</th><th>Verdict</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>夜景 (night view)</td><td>2</td><td>0</td><td>816</td><td>lost</td></tr>
+    <tr><td>猫 (cat)</td><td>1</td><td>0</td><td>606</td><td>lost</td></tr>
+    <tr><td>桜 (cherry blossom)</td><td>1</td><td>0</td><td>1,263</td><td>lost</td></tr>
+    <tr><td>星空の</td><td>3</td><td>518</td><td>518</td><td>correct</td></tr>
+    <tr><td>高解像度</td><td>4</td><td>2,727</td><td>2,727</td><td>correct</td></tr>
+  </tbody>
+</table>
+
+No exception. No warning. A query under three characters cannot form a single trigram, so it quietly resolves to the empty set. That is a reasonable consequence of the design, but on screen it is indistinguishable from a genuine miss. To the user, the app simply has no cats.
+
+The name `trigram` tells you it indexes in units of three characters. It does not tell you that fewer than three cannot be queried — that's the implication on the other side. In English, `cat` is three characters, so the issue never surfaces. In Japanese it's one. That asymmetry is the whole trap.
+
+One more behavior burned an hour of my debugging: `LIKE` against the virtual table does not do what you expect.
+
+```sql
+-- LIKE on the FTS5 virtual table: returns 0
+SELECT count(*) FROM s WHERE k LIKE '%猫%';        -- → 0
+
+-- LIKE on a normal table holding the same rows: correct
+SELECT count(*) FROM plain WHERE k LIKE '%猫%';    -- → 606
+```
+
+If you think "MATCH failed, so I'll fall back to LIKE" and aim it at the virtual table, you push the root cause one step further away. The fallback has to live in a separate ordinary table holding the same content.
+
+## Going hybrid meant the slow path set the pace
+
+The obvious fix is to branch on query length: FTS5 for three characters and up, plain-table `LIKE` below that. I wrote it and measured it.
+
+<table>
+  <thead>
+    <tr><th>Query</th><th>Length</th><th>Path</th><th>Hits</th><th>Median</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>猫</td><td>1</td><td>LIKE</td><td>606</td><td>4.72 ms</td></tr>
+    <tr><td>桜</td><td>1</td><td>LIKE</td><td>1,263</td><td>5.00 ms</td></tr>
+    <tr><td>夜景</td><td>2</td><td>LIKE</td><td>816</td><td>5.29 ms</td></tr>
+    <tr><td>星空の</td><td>3</td><td>FTS5</td><td>518</td><td>0.77 ms</td></tr>
+    <tr><td>雨上がり</td><td>4</td><td>FTS5</td><td>1,337</td><td>2.24 ms</td></tr>
+    <tr><td>高解像度</td><td>4</td><td>FTS5</td><td>2,727</td><td>4.46 ms</td></tr>
+  </tbody>
+</table>
+
+Correctness came back. But looking at the table, I stopped.
+
+The JavaScript linear scan over the same 20,000 items runs in 0.80 ms. The slow path here (4.7–5.3 ms) is roughly six times that. Even the fast path degrades to 4.46 ms once the hit count grows.
+
+At this scale, every path through SQLite lost to the naive scan. The theoretical advantage of an index simply doesn't materialize at 20,000 items — the fixed costs of serialization and crossing the bridge dominate instead.
+
+The FTS5 database file was 3.3 MB at 20,000 items and 9.4 MB at 50,000. Insertion took 252 ms and 628 ms respectively. What that expense bought me was search that was slower than the scan it replaced.
+
+The decision rule I now use:
+
+1. If measured search latency isn't breaching the frame budget, don't add an index
+2. If it is, flatten the key array first — that alone is a 1.4x win
+3. If it still breaches, consider an index, accepting that shipping size roughly doubles
+4. If you add one, design the short-query path first. Bolting it on later ships silent zeroes to production
+
+## The real bottleneck was startup normalization, not search
+
+I had been measuring query latency the whole time. What actually governed the feel of the app was elsewhere: the pass that normalizes every record at load.
+
+<table>
+  <thead>
+    <tr><th>Items</th><th>Normalize at runtime</th><th>Precomputed + JSON.parse</th><th>Precomputed + newline split</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>20,000</td><td>39.5 ms</td><td>1.6 ms</td><td>1.1 ms</td></tr>
+    <tr><td>100,000</td><td>185.4 ms</td><td>7.5 ms</td><td>3.9 ms</td></tr>
+    <tr><td>500,000</td><td>926.3 ms</td><td>69.4 ms</td><td>55.8 ms</td></tr>
+  </tbody>
+</table>
+
+39.5 ms at 20,000 items — forty-nine times a single 0.80 ms query. I had spent a weekend shaving 0.8 ms down to 0.09 ms while ignoring the 39.5 ms sitting directly in front of it.
+
+It also occupies the JavaScript thread. Apply the device correction and you are past 100 ms; at a hundred thousand items, startup becomes visibly heavy.
+
+The fix was simple: normalize at build time and ship only the result.
+
+```js
+// scripts/build-search-keys.mjs — runs once, at build time
+import fs from "node:fs";
+
+const norm = (s) =>
+  s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60))
+    .replace(/\s+/g, "");
+
+const items = JSON.parse(fs.readFileSync("assets/catalog.json", "utf8"));
+
+// Emit one newline-delimited string; line number maps to catalog index
+const keys = items.map((it) => norm(it.title + it.tags.join("")));
+if (keys.some((k) => k.includes("\n"))) {
+  throw new Error("A normalized key contains a newline — pick a different delimiter");
+}
+fs.writeFileSync("assets/search-keys.txt", keys.join("\n"));
+console.log(`wrote ${keys.length} keys / ${Buffer.byteLength(keys.join("\n"))} bytes`);
+```
+
+The app just reads and splits.
+
+```js
+import { Asset } from "expo-asset";
+import * as FileSystem from "expo-file-system";
+
+let KEYS = null;
+
+export async function loadSearchKeys() {
+  if (KEYS) return KEYS;
+  const asset = Asset.fromModule(require("../assets/search-keys.txt"));
+  await asset.downloadAsync();
+  const raw = await FileSystem.readAsStringAsync(asset.localUri);
+  KEYS = raw.split("\n");
+  return KEYS;
+}
+
+export function searchByKeys(nq) {
+  const hits = [];
+  for (let i = 0; i < KEYS.length; i++) {
+    if (KEYS[i].indexOf(nq) >= 0) hits.push(i);
+  }
+  return hits;
+}
+```
+
+I chose newline-joined text over a JSON array because it measured faster and smaller: at 20,000 items, `JSON.parse` took 1.6 ms over 1,118 KB while `split` took 1.1 ms over 1,078 KB. At 100,000 items the gap widens to 7.5 ms versus 3.9 ms. Dropping the quotes and commas earns exactly what you'd expect.
+
+Since newlines are the delimiter, a newline inside a key shifts everything after it. Guard for that in the build script. I skipped the check once, a single tag contained a newline, and every index after that record was off by one. Search results showed the neighboring wallpaper for every hit — an unsettling bug until the cause surfaced.
+
+## What I settled on
+
+The wallpaper app I maintain as an indie developer holds roughly 24,000 items today. Its current shape:
+
+1. **At build time**, generate normalized keys and bundle them as newline-joined text
+2. **At startup**, only `split`. The normalization function is called on the query side alone
+3. **For search**, a linear `indexOf` scan over a flat string array. No index
+4. **For queries**, run the same `norm()`. Skipping this normalizes only one side of the comparison
+5. **For input**, debounce. Running on every keystroke costs more than the scan itself
+
+FTS5 is gone. I'll revisit it when the catalog is four times larger and measurements actually breach the frame budget — and I'll build the short-query table on day one.
+
+The branch points, laid out. Please re-measure in your own environment before adopting any row.
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>Recommended shape</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Thousands to tens of thousands, substring match is enough</td><td>Precomputed keys + flat-array linear scan</td><td>No reason to pay the index's fixed cost, and shipping size stays flat</td></tr>
+    <tr><td>Hundreds of thousands, substring match</td><td>Same, plus consider moving the scan off the UI thread</td><td>The scan still fits, but it starts competing for the frame budget</td></tr>
+    <tr><td>You need ranking or phrase-order semantics</td><td>FTS5 plus a plain table for short queries</td><td>Scoring by hand is expensive — but the sub-three-character path must exist from the start</td></tr>
+    <tr><td>You can put search on a server</td><td>Move it server-side</td><td>Avoids both the bundle size and the startup cost</td></tr>
+  </tbody>
+</table>
+
+If you generate this part with Rork or Expo tooling, "add search" alone will import English-language assumptions. I now hand over the specification instead:
+
+```
+Implement in-app search with these requirements.
+
+- Search over a precomputed key array (read assets/search-keys.txt, newline-delimited)
+- Normalization: NFKC → lowercase → katakana to hiragana → strip whitespace. Apply the same function to the query
+- Single-character queries must work. Do not use n-gram indexes or the FTS5 trigram tokenizer
+- Debounce input at 200ms; cancel the previous search via AbortController or equivalent
+- On zero results, show three suggested tags rather than a bare "no matches" message
+```
+
+That third line is there because of this incident. I now check whether a single Japanese character returns anything before I check whether the generated code is fast.
+
+## Where to start
+
+If your app has search, type one single-character query. Pick a subject your users actually look for. Either results come back or they don't — and that alone tells you whether the index was designed with Japanese in mind.
+
+Then measure startup preparation rather than query latency. In my case there were 0.7 ms available on the search side and 38 ms on the startup side. Where the time actually hides isn't knowable until you measure.
+
+Every number here came from running the code myself. The ratios should transfer; the absolute values deserve a check on your own device. Thank you for reading.
