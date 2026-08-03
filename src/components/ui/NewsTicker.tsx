@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "RAISE — Rork が1,500万ドルを調達しました。個人開発者がアプリを出すまでの距離を詰める方向に、資金が向かっている形です",
-    "ENGINE — Rork Max は Claude Code と Opus 4.6 の組み合わせで動きます。複雑なアプリロジックや推論での差は、この構成に由来する部分が大きいと説明されています",
-    "CLOUDMAC — 生成された Swift はクラウド上の Mac 群でコンパイルされます。手元に Xcode を置かないまま、実機テストから App Store 提出まで届く導線です",
-    "AR — Rork Max は ARKit と LiDAR スキャンにネイティブ対応しています。3D オブジェクトの配置や空間コンピューティングを含むアプリが射程に入ります",
-    "TRACTION — Rork Max の発表は X で800万表示を超え、2週間で年間収益が倍になったと報告されています",
-    "TRAFFIC — Rork は月間743,000訪問・成長率85%と報告されています。ノーコードのアプリ生成が試作の入口として定着しつつある数字です",
+    "CLOUD — Rork Max はクラウド上の Mac 群でネイティブ Swift をコンパイルします。Xcode をダウンロードする必要も Mac を所有する必要もありません",
+    "PLATFORM — Rork Max は iPhone・iPad・Apple Watch・Vision Pro に対応し、ゲームやウィジェット、Live Activities まで扱えます",
+    "SHIP — ブラウザでビルドし、ストリーミングのシミュレータでプレビューし、QR コードで実機に入れ、そのまま App Store へ提出できます",
+    "SPLIT — 通常の Rork は React Native (Expo) でクロスプラットフォームに生成します。広く速く出すなら本体、Apple の機能を深く使うなら Max という分かれ方です",
+    "CREDIT — 無料枠はおおむね週5プロンプト程度です。試すコストと作り切るコストは分けて見積もる必要があります",
+    "PRICE — Rork Max は Max プランで月 $200、通常の Rork は無料から始められ、有料プランは月 $25 からです",
   ],
   en: [
-    "RAISE — Rork raised $15M. The money is pointed at shortening the distance between a solo developer and a shipped app",
-    "ENGINE — Rork Max runs on Claude Code paired with Opus 4.6. Much of its edge on complex app logic and reasoning is attributed to that pairing",
-    "CLOUDMAC — The Swift it generates is compiled on a cloud Mac fleet, so you can go from prompt to on-device testing to App Store submission without installing Xcode",
-    "AR — Rork Max supports ARKit and LiDAR scanning natively, putting 3D object placement and spatial computing apps within reach",
-    "TRACTION — The Rork Max announcement drew more than 8 million views on X, and the company reports its annual revenue doubled within two weeks",
-    "TRAFFIC — Rork reports over 743,000 monthly visits with 85% growth, a sign that prompt-to-app tools are settling in as a prototyping entry point",
+    "CLOUD — Rork Max compiles native Swift on a fleet of cloud Macs, so you never download Xcode or need to own a Mac",
+    "PLATFORM — Rork Max targets iPhone, iPad, Apple Watch, and Vision Pro, and reaches games, widgets, and Live Activities",
+    "SHIP — Build in the browser, preview through a streaming simulator, install on device via QR code, and submit to the App Store without leaving Rork",
+    "SPLIT — Regular Rork generates cross-platform apps with React Native and Expo. Reach for it to ship broadly and fast, and for Max when you need Apple-specific depth",
+    "CREDIT — The free tier works out to roughly five prompts a week. It helps to budget the cost of trying something separately from the cost of finishing it",
+    "PRICE — Rork Max sits on the $200/month Max plan, while regular Rork starts free with paid plans from $25/month",
   ],
 };
 
