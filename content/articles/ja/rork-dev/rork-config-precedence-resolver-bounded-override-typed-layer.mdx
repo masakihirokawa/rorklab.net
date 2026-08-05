@@ -203,6 +203,152 @@ export function useConfig(): AppConfig {
 
 画面側は `const { interstitialCooldownSec } = useConfig();` と書くだけです。三層があることも、クランプが走っていることも意識しません。複雑さを一箇所に閉じ込め、外へは型のついた確かな値だけを出す。レイヤー設計の狙いはここにあります。
 
+## リモート値がまだ届いていない数秒を、どう埋めるか
+
+三層のマージが正しく動いても、初回起動には穴が残ります。リモート設定はネットワーク越しに届くため、アプリが最初の画面を描く瞬間には、まだ何も手元にありません。
+
+素直に実装すると、この数秒はすべて既定値で走ります。多くの場面ではそれで構いません。ただ、広告のクールダウンのように運営が意図して緩めている値を使っている最中だと、起動直後だけ既定の厳しい値に戻り、しばらくして緩む、という妙な揺れが起きます。私の壁紙アプリでは、この揺れがレビュー訴求のタイミングに出て、一部のユーザーに起動直後だけ評価ダイアログが早く出る状態になっていました。
+
+対処として入れたのは、最後に受理できたリモートの生値を端末に残しておく仕組みです。
+
+```typescript
+// config/remoteCache.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const KEY = "config.remote.cache.v1";
+const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7日を超えた値は使わない
+
+type Cached = { at: number; values: Record<string, unknown> };
+
+export async function saveRemoteCache(values: Record<string, unknown>) {
+  const payload: Cached = { at: Date.now(), values };
+  await AsyncStorage.setItem(KEY, JSON.stringify(payload));
+}
+
+export async function loadRemoteCache(): Promise<Record<string, unknown>> {
+  const raw = await AsyncStorage.getItem(KEY);
+  if (!raw) return {};
+  try {
+    const c: Cached = JSON.parse(raw);
+    if (Date.now() - c.at > MAX_AGE_MS) return {}; // 古すぎる値は黙って捨てる
+    return c.values;
+  } catch {
+    return {}; // 壊れていたら既定へ落とす
+  }
+}
+```
+
+保存しているのが `resolveConfig` を通した後の完成値ではなく、通す前の生値である点に意味があります。解決済みの値をそのまま保存してしまうと、あとからポリシーの min/max を厳しくしたとき、キャッシュ側だけ古い境界で固まった値が残り続けます。生のまま持てば、次の起動時に必ず最新のポリシーで解決し直されます。
+
+有効期限を7日にしたのは、それより古い配信内容を信じても判断材料にならないと考えたためです。1週間あれば運用の方針は動いています。期限を過ぎたキャッシュは静かに捨て、既定値へ戻します。
+
+起動側では、フェッチ自体にもタイムアウトを置いています。
+
+```typescript
+// config/remoteConfig.ts（抜粋）
+const FETCH_TIMEOUT_MS = 2500;
+
+const withTimeout = <T,>(p: Promise<T>, ms: number): Promise<T | null> =>
+  Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
+
+export async function bootstrapRemote(): Promise<Record<string, unknown>> {
+  const fresh = await withTimeout(fetchRemoteValues(), FETCH_TIMEOUT_MS);
+  if (fresh) {
+    await saveRemoteCache(fresh); // 次回起動のために生値を残す
+    return fresh;
+  }
+  return await loadRemoteCache(); // 届かなければ前回の値、それも無ければ空
+}
+```
+
+届けば新しい値、間に合わなければ前回の値、それも無ければ既定値。三段構えにしておくと、通信状況にかかわらず必ず何かが返り、画面側は待たされません。空のオブジェクトが返っても `resolveConfig` は全キーを既定で埋めるので、呼び出し側の分岐は一切増えません。
+
+なお、この仕組みは値を安全に届けるための土台であって、機能そのものの出し入れとは役割が違います。機能単位でのキルスイッチや段階的な有効化を組みたい場合は、[Feature Flags を運用に耐えさせる — Rork Max のキルスイッチと段階的ロールアウト設計](/articles/rork-dev/rork-max-feature-flags-remote-config)で扱った設計と併用するのが現実的でした。値の境界は設定層で、機能の可否はフラグ層で守る、という住み分けです。
+
+## どの層から来た値かを、端末で見えるようにする
+
+運用を始めて最初につまずいたのは、値そのものを見ても経路が分からないことでした。手元の端末に90秒が入っているとして、それが既定の90秒なのか、リモートが90秒を送ってきたのか、それとも極端な値が60秒にクランプされた結果なのか。数字だけでは区別できません。
+
+そこで解決処理に、キーごとの出所を一緒に返させるようにしました。
+
+```typescript
+// config/resolver.ts（追加分）
+export type Origin = "default" | "user" | "remote" | "clamped" | "rejected";
+
+export function resolveConfigWithOrigin(sources: Sources): {
+  config: AppConfig;
+  origin: Record<keyof AppConfig, Origin>;
+  rejected: string[];
+} {
+  const out: AppConfig = { ...DEFAULTS };
+  const origin = {} as Record<keyof AppConfig, Origin>;
+  const rejected: string[] = [];
+
+  for (const key of Object.keys(DEFAULTS) as (keyof AppConfig)[]) {
+    const policy = POLICIES[key];
+    origin[key] = "default";
+
+    if (policy.kind === "locked") continue;
+
+    if (policy.kind === "user") {
+      const val = sources.user[key];
+      if (val !== undefined) {
+        (out[key] as unknown) = val;
+        origin[key] = "user";
+      }
+      continue;
+    }
+
+    const raw = sources.remote[key];
+    if (raw === undefined) continue;
+
+    const parsed = ConfigSchema.shape[key].safeParse(raw);
+    if (!parsed.success) {
+      rejected.push(`${key}: ${parsed.error.issues[0]?.message ?? "invalid"}`);
+      origin[key] = "rejected"; // 既定のまま。ただし「届いたが弾いた」と記録
+      continue;
+    }
+
+    const value = parsed.data;
+    if (typeof value === "number") {
+      const clamped = clamp(value, policy.min, policy.max);
+      (out[key] as unknown) = clamped;
+      origin[key] = clamped === value ? "remote" : "clamped";
+    } else {
+      (out[key] as unknown) = value;
+      origin[key] = "remote";
+    }
+  }
+
+  return { config: out, origin, rejected };
+}
+```
+
+肝は `rejected` と `default` を別の出所として扱っている点です。どちらも最終的な値は既定ですが、意味はまったく違います。前者は「届いたが信用できなかった」、後者は「そもそも届いていない」。この二つを同じ扱いにしていた頃は、配信ミスとネットワーク不通の切り分けがつかず、調べる順番を毎回間違えていました。
+
+`clamped` を独立させたのも同じ理由です。境界に貼りついた値が続くようなら、それは運営側が設定したい水準とポリシーの上限がずれている合図です。ログを見返して境界そのものを見直す判断材料になります。
+
+デバッグ画面は、開発ビルドでのみ出る一覧にしています。
+
+<table>
+<thead>
+<tr><th>表示する出所</th><th>画面上の意味</th><th>次に見る場所</th></tr>
+</thead>
+<tbody>
+<tr><td>default</td><td>リモートに該当キーが無い、または未取得</td><td>配信側のキー名と、フェッチが成功しているか</td></tr>
+<tr><td>user</td><td>ユーザーが端末で選んだ値</td><td>設定画面の保存処理</td></tr>
+<tr><td>remote</td><td>届いた値がそのまま通った</td><td>問題なし。想定どおり</td></tr>
+<tr><td>clamped</td><td>境界に丸められた</td><td>ポリシーの min/max と、配信した値の乖離</td></tr>
+<tr><td>rejected</td><td>型が合わず弾いた</td><td>配信側の値の型。文字列と数値の取り違えが大半</td></tr>
+</tbody>
+</table>
+
+これを入れてから、設定まわりの調査にかかる時間が体感で半分以下になりました。以前は配信側のコンソールと端末のログを往復していたのが、いまは実機を1台開けば結論が出ます。
+
+リリースビルドではこの画面を含めていません。出所の情報そのものは無害ですが、境界値やキー名の一覧を配布物に残しておく必要はないと考えたためです。`__DEV__` での分岐に加えて、画面のインポート自体を開発ビルドに閉じています。
+
+数値をどの水準に置くべきかという判断は、この記事の範囲を超えます。広告頻度そのものの決め方については[Rork で作ったアプリを AdMob で月10万円にするまで — 個人開発者の収益化実践戦略](/articles/rork-business/rork-admob-monetization-strategy)で実際の数字を追っていますので、境界を決める際の下敷きにしていただけるかもしれません。設定層が守るのは安全であって、最適な値を見つけるのは別の作業です。
+
 ## 直感に反したこと — 「リモートを万能にする」が事故を生んだ
 
 正直に書きます。事故の前、私はリモート設定をできるだけ強くしておくのが良い設計だと思っていました。運営側から何でも即座に変えられるほど、運用は楽になるはずだと。実際は逆でした。何でも変えられるということは、何でも壊せるということでした。
@@ -224,6 +370,8 @@ export function useConfig(): AppConfig {
 <tr><td>スキーマとポリシーの分離</td><td>受理範囲は広め、運用範囲は狭めの二段構え</td><td>本番の許容と、そもそもの妥当性を別々に調整したいため</td></tr>
 </tbody>
 </table>
+
+境界の内側で、実際にどの値がいちばん効くのかを比べたくなる段階も来ます。そこまで進むと解決層のクランプだけでは足りず、配信を分けて結果を測る仕組みが必要になります。その組み方は[Rork の A/B テスト基盤を GrowthBook と PostHog でゼロから組む](/articles/rork-dev/rork-growthbook-posthog-ab-testing-platform)に整理しました。ここで作った三層の解決は、その手前で「どんな値が来ても壊れない」を保証する土台にあたります。
 
 もし今から一つだけ入れるとしたら、私は remote ポリシーのクランプから始めることをお勧めします。全キーをポリシー化しなくても、外部から届く数値にひとつ min/max を挟むだけで、あの夜のような連鎖はほぼ止まります。locked や user への分類は、運用しながら少しずつ足していけば十分です。
 

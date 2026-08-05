@@ -203,6 +203,152 @@ export function useConfig(): AppConfig {
 
 A screen just writes `const { interstitialCooldownSec } = useConfig();`. It never has to know there are three layers, or that clamping ran. Seal the complexity in one place and expose only typed, trustworthy values outward. That's the whole point of a resolution layer.
 
+## Filling the Few Seconds Before Remote Values Arrive
+
+Even when the three-layer merge works correctly, cold start leaves a hole. Remote config travels over the network, so at the moment the app paints its first screen, nothing has arrived yet.
+
+Implemented naively, those few seconds run entirely on defaults. That's fine in most cases. But when you're mid-flight with a value the operator deliberately loosened — an ad cooldown, say — you get an odd wobble: the strict default right after launch, then a loosening a moment later. In my wallpaper apps this surfaced in review prompt timing, where some users saw the rating dialog appear early only in the first seconds after launch.
+
+The fix I added was keeping the last accepted raw remote payload on the device.
+
+```typescript
+// config/remoteCache.ts
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+const KEY = "config.remote.cache.v1";
+const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // anything older than 7 days is unusable
+
+type Cached = { at: number; values: Record<string, unknown> };
+
+export async function saveRemoteCache(values: Record<string, unknown>) {
+  const payload: Cached = { at: Date.now(), values };
+  await AsyncStorage.setItem(KEY, JSON.stringify(payload));
+}
+
+export async function loadRemoteCache(): Promise<Record<string, unknown>> {
+  const raw = await AsyncStorage.getItem(KEY);
+  if (!raw) return {};
+  try {
+    const c: Cached = JSON.parse(raw);
+    if (Date.now() - c.at > MAX_AGE_MS) return {}; // quietly discard stale values
+    return c.values;
+  } catch {
+    return {}; // corrupted? fall back to defaults
+  }
+}
+```
+
+What matters here is that we store the raw values from before `resolveConfig`, not the resolved result. Save the resolved config and you freeze it against whatever bounds were in effect at the time — tighten a policy's min/max later and the cache keeps handing back a value the new policy would never allow. Kept raw, it gets re-resolved against the current policy on every launch.
+
+I settled on a seven-day expiry because a delivery older than that tells you nothing useful. A week is long enough for operational intent to have moved on. Expired caches are dropped silently and the app returns to defaults.
+
+On the boot path, the fetch itself also carries a timeout.
+
+```typescript
+// config/remoteConfig.ts (excerpt)
+const FETCH_TIMEOUT_MS = 2500;
+
+const withTimeout = <T,>(p: Promise<T>, ms: number): Promise<T | null> =>
+  Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), ms))]);
+
+export async function bootstrapRemote(): Promise<Record<string, unknown>> {
+  const fresh = await withTimeout(fetchRemoteValues(), FETCH_TIMEOUT_MS);
+  if (fresh) {
+    await saveRemoteCache(fresh); // keep the raw payload for next launch
+    return fresh;
+  }
+  return await loadRemoteCache(); // otherwise last known values, or nothing
+}
+```
+
+Fresh values if they land, last known values if they don't, defaults if neither exists. With three stages in place something always comes back regardless of connectivity, and the screen never waits. Even an empty object is fine, because `resolveConfig` fills every key from defaults — the calling side gains no extra branches at all.
+
+This machinery is the foundation for delivering values safely, which is a different job from turning features on and off. If you want per-feature kill switches or staged enablement, pairing this with the design in [Making Feature Flags Survive Production: Kill Switches and Gradual Rollouts in Rork Max](/articles/rork-dev/rork-max-feature-flags-remote-config) proved the practical split: the config layer guards value bounds, the flag layer guards whether a feature runs at all.
+
+## Making the Source Layer Visible on the Device
+
+The first thing that tripped me up in operation was that a value alone tells you nothing about its path. Say the device holds 90 seconds. Is that the default 90, a remote delivery of 90, or an extreme value clamped down to 60? The number can't distinguish them.
+
+So I had the resolver return the origin of every key alongside the value.
+
+```typescript
+// config/resolver.ts (addition)
+export type Origin = "default" | "user" | "remote" | "clamped" | "rejected";
+
+export function resolveConfigWithOrigin(sources: Sources): {
+  config: AppConfig;
+  origin: Record<keyof AppConfig, Origin>;
+  rejected: string[];
+} {
+  const out: AppConfig = { ...DEFAULTS };
+  const origin = {} as Record<keyof AppConfig, Origin>;
+  const rejected: string[] = [];
+
+  for (const key of Object.keys(DEFAULTS) as (keyof AppConfig)[]) {
+    const policy = POLICIES[key];
+    origin[key] = "default";
+
+    if (policy.kind === "locked") continue;
+
+    if (policy.kind === "user") {
+      const val = sources.user[key];
+      if (val !== undefined) {
+        (out[key] as unknown) = val;
+        origin[key] = "user";
+      }
+      continue;
+    }
+
+    const raw = sources.remote[key];
+    if (raw === undefined) continue;
+
+    const parsed = ConfigSchema.shape[key].safeParse(raw);
+    if (!parsed.success) {
+      rejected.push(`${key}: ${parsed.error.issues[0]?.message ?? "invalid"}`);
+      origin[key] = "rejected"; // stays on default, but records "arrived and refused"
+      continue;
+    }
+
+    const value = parsed.data;
+    if (typeof value === "number") {
+      const clamped = clamp(value, policy.min, policy.max);
+      (out[key] as unknown) = clamped;
+      origin[key] = clamped === value ? "remote" : "clamped";
+    } else {
+      (out[key] as unknown) = value;
+      origin[key] = "remote";
+    }
+  }
+
+  return { config: out, origin, rejected };
+}
+```
+
+The crux is treating `rejected` and `default` as separate origins. Both end on the default value, but they mean entirely different things: one is "it arrived and I didn't trust it," the other is "nothing arrived at all." Back when I collapsed them into one, I couldn't separate a delivery mistake from a dead network, and I started every investigation in the wrong place.
+
+Splitting out `clamped` follows the same reasoning. A value that keeps pinning to the boundary is a signal that the level the operator wants and the ceiling the policy allows have drifted apart. It gives you grounds to revisit the bound itself rather than the delivery.
+
+The debug screen is a list that only ships in development builds.
+
+<table>
+<thead>
+<tr><th>Origin shown</th><th>What it means on screen</th><th>Where to look next</th></tr>
+</thead>
+<tbody>
+<tr><td>default</td><td>Key absent from remote, or nothing fetched yet</td><td>Key names on the delivery side; whether the fetch succeeded</td></tr>
+<tr><td>user</td><td>Value the user chose on the device</td><td>The save path in your settings screen</td></tr>
+<tr><td>remote</td><td>Delivered value passed through untouched</td><td>Nothing to do. Working as intended</td></tr>
+<tr><td>clamped</td><td>Rounded to a boundary</td><td>Gap between policy min/max and the delivered value</td></tr>
+<tr><td>rejected</td><td>Refused on a type mismatch</td><td>Types on the delivery side. Usually string vs. number</td></tr>
+</tbody>
+</table>
+
+Since adding this, config investigations take me less than half the time they used to. Where I once bounced between the delivery console and device logs, I now open one physical device and have an answer.
+
+I keep the screen out of release builds entirely. The origin data itself is harmless, but there's no reason to ship a list of boundary values and key names inside the binary. Beyond the `__DEV__` branch, the screen's import is confined to development builds.
+
+Deciding what level a number should sit at is beyond this article's scope. For how to arrive at ad frequency itself, [From Rork to $1,000/month with AdMob — A Practical Indie Developer's Monetization Playbook](/articles/rork-business/rork-admob-monetization-strategy) walks through the actual figures, which may serve as the basis for setting your bounds. The config layer defends safety; finding the right value is separate work.
+
 ## What Went Against My Intuition: Making Remote Powerful Caused the Incident
 
 Let me be honest. Before the incident, I believed keeping remote config as powerful as possible was the good design, that being able to change anything instantly from the operator side would make operations easier. The reality was the opposite. Being able to change anything meant being able to break anything.
@@ -222,6 +368,8 @@ Official docs are thorough about how to set up remote config, but "how far to tr
 <tr><td>Schema vs. policy split</td><td>Acceptance range wide, operational range narrow, in two stages</td><td>You want to tune production tolerance separately from basic validity</td></tr>
 </tbody>
 </table>
+
+There comes a stage where you want to compare which value inside the bounds actually performs best. Past that point, clamping in the resolver isn't enough — you need to split delivery and measure outcomes. I wrote up how to assemble that in [Building a Rork A/B Testing Platform with GrowthBook and PostHog from Scratch](/articles/rork-dev/rork-growthbook-posthog-ab-testing-platform). The three-layer resolution here is the groundwork underneath it, guaranteeing nothing breaks no matter which value arrives.
 
 If I could add only one thing today, I'd recommend starting with the clamp in the remote policy. Even without turning every key into a policy, just wrapping incoming numbers in a single min/max stops cascades like that night almost entirely. You can grow the locked and user classifications gradually as you operate.
 
