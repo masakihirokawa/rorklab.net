@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NATIVE — Rork Max では AR / LiDAR スキャン、Metal を使った 3D、Dynamic Island、Siri Intents、HealthKit、NFC、App Clips、Core ML まで届きます",
-    "IOS27 — iOS 27 Developer Beta 4 で Siri AI の対象が iPhone 15 Pro / 15 Pro Max・16 シリーズ・17 系へ広がり、応答が初期ベータより明確に速くなりました",
-    "DESIGN — iOS・iPadOS・macOS 27 向けの Apple 純正デザインキットが Figma と Sketch 向けに公開されました。新 OS の UI を組む段階で参照できます",
-    "CANARY — Android 17（Cinnamon Bun）は従来の Developer Preview を廃し、継続更新される Canary ビルドへ移行しました。検証のタイミング設計が変わります",
-    "SPARK — Android 17 の Gemini Spark は、アプリを直接操作して配車の予約や注文といった複合的な作業を自動化します",
-    "SCALE — Rork は a16z から $2.8M を調達し、月間訪問は74万件規模まで伸びています",
+    "SEED — Rork が Left Lane Capital 主導で $15M のシードラウンドを調達しました。Peak XV・True Ventures・Goodwater・a16z Speedrun が参加しています",
+    "PAPERLINE — シード直後に Paperline を買収しました。AI で native Swift アプリを組み立てる macOS アプリで、ネイティブ Swift への移行が一段進みます",
+    "XCODE — 買収の狙いは「Xcode を置き換えられる web プラットフォーム」です。ブラウザ側で完結するネイティブ開発が現実的な射程に入ってきました",
+    "MAX — Rork Max は React Native ではなく native Swift を出力し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage までを対象にします",
+    "REVIEW — 9月から、App Store への新規申請・アップデート申請と、代替配信向けの notarization で回答の提出が必須になります",
+    "ADAPTIVE — Android 17 は adaptive-first を必須の開発標準にした最初のバージョンです。大画面でのリサイズと向き変更への対応が前提になります",
   ],
   en: [
-    "NATIVE — Rork Max reaches AR and LiDAR scanning, Metal-backed 3D, Dynamic Island, Siri Intents, HealthKit, NFC, App Clips, and on-device Core ML",
-    "IOS27 — iOS 27 Developer Beta 4 extends Siri AI to iPhone 15 Pro and 15 Pro Max plus the 16 and 17 lines, with noticeably faster responses than the first beta",
-    "DESIGN — Apple's own design kits for iOS, iPadOS, and macOS 27 are now available for Figma and Sketch, ready for when you lay out UI for the new OS",
-    "CANARY — Android 17, codenamed Cinnamon Bun, retires Developer Previews in favor of continuously updated Canary builds, which changes when you schedule testing",
-    "SPARK — Gemini Spark in Android 17 drives apps directly to automate multi-step errands like booking a ride or placing an order",
-    "SCALE — Rork raised $2.8M from a16z and now draws roughly 743,000 visits a month",
+    "SEED — Rork closed a $15M seed round led by Left Lane Capital, with Peak XV, True Ventures, Goodwater, and existing backer a16z Speedrun joining in",
+    "PAPERLINE — Right after the seed, Rork acquired Paperline, a macOS app that builds native Swift applications with AI, pushing its native Swift shift further along",
+    "XCODE — The stated aim behind the acquisition is a web platform capable of replacing Xcode, putting browser-side native development within reach",
+    "MAX — Rork Max emits native Swift rather than React Native, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "REVIEW — From September, responses are required when submitting new apps or updates to the App Store, and when notarizing for alternative distribution",
+    "ADAPTIVE — Android 17 is the first release to make adaptive-first a mandatory standard, so large-screen resizing and orientation changes are now table stakes",
   ],
 };
 
