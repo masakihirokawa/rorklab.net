@@ -1,0 +1,358 @@
+---
+title: "Deciding overlay text legibility at ingest time instead of on device — four metrics measured side by side"
+slug: "overlay-text-legibility-ingest-time-scrim-metadata-measurement"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-08-06T11:00"
+author: "Rork Lab"
+description: "Moving the question of whether text stays readable over a wallpaper out of the device and into the content pipeline. Four candidate metrics measured across 240 images, including what downscaled judging actually computes."
+tags: ["Rork", "Expo", "React Native", "Image Processing", "Accessibility", "Content Pipeline"]
+highlights:
+  - "Measured disagreement counts across 240 images for three families of metrics: mean brightness, percentiles, and windowed means"
+  - "What judging on a downscaled thumbnail actually computes, measured against the full-resolution alternatives"
+  - "How many images a uniform scrim was darkening for no reason, and the reduction after switching to per-image text color"
+---
+
+A night-sky wallpaper opened, and there was a faint dark band across the top of the screen. The image is almost entirely black, with a handful of stars. The white clock would have been perfectly readable without any help. The band was there anyway.
+
+I run a wallpaper app as a solo developer, and one screen overlays a clock and a title on top of the image. To protect readability I had been laying down a uniform `rgba(0,0,0,0.35)` gradient across the top. A conservative choice.
+
+Conservative and correct are not the same thing. The night sky was being dimmed for nothing. Meanwhile, on pale pastel images, 0.35 was not enough — the white text smeared into the background. A single fixed value was wrong in both directions.
+
+So decide per image. The hard part turned out to be the question underneath: what exactly determines whether text is readable? I built a 240-image corpus and worked through four candidate metrics in order. The short version is that the method I ended up with removed the scrim entirely for 189 of the 240 images.
+
+## Moving the decision from the device to the pipeline
+
+The first choice was where the computation should run.
+
+Analyzing pixels on device came off the table quickly. There are thousands of wallpapers, and they scroll past continuously. Reading pixels on every display spends the rendering budget exactly where I least want to spend it. Worse, the same image can produce different answers on different devices.
+
+What I settled on: compute once at ingest, write the result into the catalog as plain numbers. The app never touches image data. It reads a `style` and a `scrim` value from JSON and applies them.
+
+<table>
+  <thead>
+    <tr><th>Where the decision runs</th><th>Cost at display time</th><th>Consistency</th><th>Cost to redo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>On device, every display</td><td>Paid every time</td><td>Varies by device and OS</td><td>None</td></tr>
+    <tr><td>On device, cached after first run</td><td>First display only</td><td>Varies when cache is evicted</td><td>None</td></tr>
+    <tr><td>At ingest (what I chose)</td><td>Zero</td><td>Fully pinned</td><td>Recompute and redeploy</td></tr>
+  </tbody>
+</table>
+
+Only the last column gets worse. Change the logic and every asset needs reprocessing, plus a catalog redeploy. As long as a few thousand images can be processed quickly, that cost stays manageable. I measured the actual throughput further down.
+
+## Mean brightness fails on color
+
+The first version was the most obvious thing I could write. Crop the top 12% band where the UI sits, take the plain RGB average, and use white text if it comes out below 0.5.
+
+I ran that across 240 images and compared it against the 95th percentile of relative luminance computed at full resolution. They agreed on 120 images.
+
+120 out of 240. That is a coin flip.
+
+The breakdown made the cause obvious. Forty green foliage images, forty sunsets, forty mid-tone textures. All three are regions where `(R+G+B)/3` does not track how the eye responds.
+
+WCAG relative luminance linearizes the sRGB values first, then weights green at 0.7152, red at 0.2126, and blue at 0.0722. Green contributes almost ten times what blue does. A plain average flattens that away.
+
+```python
+import numpy as np
+
+def relative_luminance(rgb: np.ndarray) -> np.ndarray:
+    """sRGB (uint8 or float) to WCAG 2.x relative luminance.
+    Linearize first, then weight. Never use a plain channel average."""
+    c = rgb.astype(np.float64) / 255.0
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * lin[..., 0] + 0.7152 * lin[..., 1] + 0.0722 * lin[..., 2]
+```
+
+Swapping in this function and rerunning the same decision on mean relative luminance moved agreement to 200 images. All eighty sunset and mid-tone errors disappeared.
+
+Forty foliage images remained. Those were not a color problem.
+
+## Percentiles fail on fine texture
+
+The foliage images are built on dark green with scattered bright dappled-light regions. The band average is dark. Locally, though, some areas reach a brightness where white text starts to disappear.
+
+Collapsing to a single scalar destroys that information. So I switched to a percentile: take the 95th percentile of relative luminance across the band and check whether white text clears 4.5:1 against it.
+
+That fixed the foliage misses. It introduced a different problem.
+
+To speed up the pipeline I wrote a version that judged on a downscaled image, and it disagreed with the full-resolution percentile. At 320px wide, forty images flipped. At 64px wide, also forty. That is 16.7%.
+
+<table>
+  <thead>
+    <tr><th>Method</th><th>Disagreement vs full-res p95</th><th>Which images</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Downscale to 320px, then p95</td><td>40 / 240 (16.7%)</td><td>All foliage textures</td></tr>
+    <tr><td>Downscale to 64px, then p95</td><td>40 / 240 (16.7%)</td><td>All foliage textures</td></tr>
+  </tbody>
+</table>
+
+The interesting part is that 320px and 64px produced identical results. Scaling down harder did not make things worse. What disappears is not resolution but high-frequency content, and a single downscale removes essentially all of it.
+
+At that point I was stuck. Which of the two was right? I had no basis for deciding.
+
+## Measuring the window the glyphs actually occupy
+
+What unstuck me was a simple question. Does a single bright pixel really make text harder to read?
+
+It does not. A clock glyph covers roughly 40px by 120px at full resolution. Readability is governed by the average brightness inside that window. One white pixel inside it does not erase the letterform.
+
+So the right quantity was never a global percentile. It is the maximum, over all window positions, of the mean luminance inside a window the size of the text. The worst placement is what matters.
+
+Written naively that loops once per window position. With an integral image it costs time proportional to the image size instead.
+
+```python
+def window_extremes(lum: np.ndarray, wh: int, ww: int) -> tuple:
+    """Max and min of the mean luminance over every wh x ww window, in O(HW).
+    Using a windowed mean rather than a percentile is the point here — it keeps
+    a single stray bright pixel from flipping the decision."""
+    wh, ww = min(wh, lum.shape[0]), min(ww, lum.shape[1])
+    s = np.pad(lum, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    h, w = lum.shape
+    area = (s[wh:, ww:] - s[:h - wh + 1, ww:]
+            - s[wh:, :w - ww + 1] + s[:h - wh + 1, :w - ww + 1]) / (wh * ww)
+    return float(area.max()), float(area.min())
+```
+
+The maximum is the worst case for white text; the minimum is the worst case for black text. Getting both from one pass makes the later text-color decision straightforward.
+
+Window size is expressed as a ratio against a 1290px reference width, so the decision does not shift when the delivered image size changes.
+
+Applied at full resolution, this method said white text was fine for 68 of the 240 images. The full-resolution percentile had said 40. The 28-image gap was entirely foliage — exactly the set where the percentile had been too strict.
+
+## Judging on a thumbnail was not a shortcut
+
+With that in hand I went back to the downscaled results I had shelved.
+
+Comparing "downscale to 320px, then p95" against "full resolution, windowed mean maximum": they agreed on 228 of 240. That is 95.0%. At 64px, identical — also 228 of 240.
+
+<table>
+  <thead>
+    <tr><th>Comparison</th><th>Agreement</th><th>Reading</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Downscaled p95 vs full-res p95</td><td>200 / 240 (83.3%)</td><td>Flips on 16.7%</td></tr>
+    <tr><td>Downscaled p95 vs full-res windowed max</td><td>228 / 240 (95.0%)</td><td>Measuring nearly the same thing</td></tr>
+  </tbody>
+</table>
+
+Downscaling was not a lossy approximation. Averaging neighboring pixels is a crude implementation of the windowed mean. The more rigorously I computed a full-resolution percentile, the further I drifted from actual readability.
+
+That was the opposite of what I expected. I had written the downscaled version believing I was trading quality for speed. It was computing the metric I actually wanted.
+
+Cost, for completeness:
+
+<table>
+  <thead>
+    <tr><th>Operation</th><th>Per image</th><th>Note</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Full resolution (1290×336) luminance + p95</td><td>26.5 ms</td><td>Most expensive, least aligned with the goal</td></tr>
+    <tr><td>Downscale to 320px + p95</td><td>3.2 ms</td><td>Nearly the same decision as the windowed mean</td></tr>
+    <tr><td>Full-resolution windowed mean (integral image)</td><td>4.8 ms</td><td>Clear semantics, cheap enough</td></tr>
+  </tbody>
+</table>
+
+I kept the windowed mean, for the clarity of what it means, but run it on a downscaled band. Since downscaling and windowed averaging push in the same direction, combining them is consistent as long as the window size shrinks by the same ratio.
+
+## Emitting an amount, not a boolean
+
+Returning "is white text readable?" as a boolean leaves the UI with nothing to do when the answer is no. Knowing it fails does not tell you how much help it needs, so the UI ends up picking a constant anyway.
+
+So the output became continuous: the minimum black scrim alpha required for white text to clear 4.5:1.
+
+Zero means no scrim. 0.2 means a light band suffices. The number is the instruction.
+
+I used a binary search. It is tempting to derive a closed form in linear space, but scrim compositing happens in sRGB space, and a linear approximation misses visibly on the dark end.
+
+```python
+TARGET_RATIO = 4.5
+L_MAX_WHITE = 1.05 / TARGET_RATIO - 0.05   # max background luminance for white text
+L_MIN_BLACK = 0.05 * TARGET_RATIO - 0.05   # min background luminance for black text
+
+
+def required_black_scrim(rgb: np.ndarray, wh: int, ww: int) -> float:
+    """Minimum black-scrim alpha, composited in sRGB space, for white text at 4.5:1.
+    Because compositing happens in sRGB, a linear-space closed form will be off."""
+    lo, hi = 0.0, 1.0
+    for _ in range(18):
+        mid = (lo + hi) / 2
+        dimmed = rgb.astype(np.float64) * (1 - mid)
+        if window_extremes(relative_luminance(dimmed), wh, ww)[0] <= L_MAX_WHITE:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def required_white_scrim(rgb: np.ndarray, wh: int, ww: int) -> float:
+    """The white-scrim side: minimum alpha for black text to clear 4.5:1."""
+    lo, hi = 0.0, 1.0
+    for _ in range(18):
+        mid = (lo + hi) / 2
+        lifted = rgb.astype(np.float64) * (1 - mid) + 255.0 * mid
+        if window_extremes(relative_luminance(lifted), wh, ww)[1] >= L_MIN_BLACK:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+```
+
+Eighteen iterations resolve alpha to about one part in 262,144. Since the value gets quantized to 0.05 steps later, ten iterations would do. I kept the headroom so the raw value stays useful for auditing.
+
+Holding white text fixed, the 240-image corpus needed no scrim on 68 images. Across the remaining 172, the median required alpha was 0.31, the 90th percentile 0.49, and the maximum 0.50.
+
+My uniform 0.35 was not far off as a median. It was still pure waste on 68 images and insufficient for the top decile.
+
+## What the uniform scrim was actually costing
+
+Everything above assumed white text. The last step was dropping that assumption.
+
+If the band is uniformly bright, black text works and needs no help at all. When the minimum windowed mean clears the threshold, black text is viable.
+
+The decision became a four-branch ladder.
+
+1. Windowed maximum below the threshold → white text, no scrim
+2. Windowed minimum above the threshold → black text, no scrim
+3. Neither → compute the black-scrim requirement; if within budget, white text plus scrim
+4. Over budget → black text plus a white scrim
+
+Rerunning the corpus:
+
+<table>
+  <thead>
+    <tr><th>Approach</th><th>No scrim needed</th><th>Scrim needed</th><th>Median alpha</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>White text fixed</td><td>68 images (28.3%)</td><td>172 images (71.7%)</td><td>0.31</td></tr>
+    <tr><td>Text color chosen per image</td><td>189 images (78.8%)</td><td>51 images (21.2%)</td><td>0.30</td></tr>
+  </tbody>
+</table>
+
+Images needing a scrim dropped from 172 to 51. For 189 of 240, picking the right text color is sufficient on its own. The split came out to 122 white and 118 black — close to even.
+
+The uniform scrim was not solving a readability problem. It was papering over a problem created by fixing the text color.
+
+By image family:
+
+<table>
+  <thead>
+    <tr><th>Image family</th><th>White text</th><th>Black text</th><th>Max scrim</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Bright sky gradient</td><td>0</td><td>40</td><td>0.00</td></tr>
+    <tr><td>Night sky with small highlights</td><td>40</td><td>0</td><td>0.00</td></tr>
+    <tr><td>Green foliage texture</td><td>40</td><td>0</td><td>0.15</td></tr>
+    <tr><td>Sunset</td><td>40</td><td>0</td><td>0.40</td></tr>
+    <tr><td>Mid-tone texture</td><td>2</td><td>38</td><td>0.20</td></tr>
+    <tr><td>Pale pastel</td><td>0</td><td>40</td><td>0.00</td></tr>
+  </tbody>
+</table>
+
+Sunsets are the one family that consistently needs a scrim. Warm highlights and dark shadows share the same band, so the worst case is bad for white and black text alike. For that family there is no way around laying something down.
+
+One caveat: these 240 images are a corpus I generated locally to mirror the composition of my own catalog, not the live wallpapers themselves. The proportions depend on the art. The pattern generalizes; the specific numbers should be measured against your own library.
+
+## The metadata shape and the app side
+
+Each asset carries two values.
+
+```json
+{
+  "version": 1,
+  "target_ratio": 4.5,
+  "assets": [
+    { "asset": "aurora-014.webp", "style": "light", "scrim": 0.0 },
+    { "asset": "sunset-021.webp", "style": "light", "scrim": 0.4 },
+    { "asset": "pastel-007.webp", "style": "dark",  "scrim": 0.0 }
+  ]
+}
+```
+
+`style` is the text color and `scrim` is the overlay alpha. Raw computed values go to a separate audit file and never ship. Keeping the shipped values separate from the diagnostic ones has saved me from accidental coupling more than once.
+
+The consuming side stays thin.
+
+```tsx
+import { StatusBar } from "expo-status-bar";
+import { Image } from "expo-image";
+import { View, Text, StyleSheet } from "react-native";
+
+type Overlay = { style: "light" | "dark"; scrim: number };
+
+// Looked up from the catalog JSON. Missing entries fall back to the safe side.
+export function WallpaperHeader({ uri, overlay, title }: {
+  uri: string; overlay: Overlay | undefined; title: string;
+}) {
+  const resolved: Overlay = overlay ?? { style: "light", scrim: 0.4 };
+  const isLight = resolved.style === "light";
+  const scrimColor = isLight ? "0,0,0" : "255,255,255";
+
+  return (
+    <View style={styles.root}>
+      <Image source={{ uri }} style={StyleSheet.absoluteFill} contentFit="cover" />
+      {resolved.scrim > 0 && (
+        <View
+          pointerEvents="none"
+          style={[
+            styles.scrim,
+            { backgroundColor: `rgba(${scrimColor},${resolved.scrim})` },
+          ]}
+        />
+      )}
+      {/* StatusBar `style` names the text color, not the background. light = white glyphs */}
+      <StatusBar style={isLight ? "light" : "dark"} />
+      <Text style={[styles.title, { color: isLight ? "#FFFFFF" : "#000000" }]}>
+        {title}
+      </Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: { height: 240 },
+  // Must match BAND_BOTTOM (12%) used during analysis, or the measurement means nothing
+  scrim: { position: "absolute", top: 0, left: 0, right: 0, height: "12%" },
+  title: { position: "absolute", left: 20, bottom: 20, fontSize: 22, fontWeight: "600" },
+});
+```
+
+I got the `expo-status-bar` `style` prop backwards once during implementation. It names the glyph color, not the background: passing `light` gives you white glyphs, which is the reverse of what the name suggests. Using the same vocabulary in the pipeline output removes the need for a mapping layer.
+
+The other thing that has to line up is the band height. If ingest measured the top 12%, the rendered scrim covers 12%. Any mismatch invalidates the measurement. I keep the constant in one place and reference it from both sides.
+
+## Keeping the decision stable
+
+If reprocessing the same asset produces a different value, every run generates catalog churn. I had been working through build reproducibility separately, and the same issue surfaced here — that thread is covered in "[My generated wallpaper catalog hashed differently on every run — isolating five sources of nondeterminism](/articles/app-dev/asset-catalog-build-nondeterminism-byte-identical-output)".
+
+Two safeguards are in place.
+
+First, quantization. Alpha is rounded up to 0.05 steps. Binary search results wobble slightly run to run; rounding collapses that. Rounding up rather than down keeps the result from ever dipping below the contrast target.
+
+```python
+ALPHA_STEP = 0.05
+quantized = float(np.ceil(alpha / ALPHA_STEP) * ALPHA_STEP)
+```
+
+Second, explicit recompute conditions. As long as the asset bytes are unchanged, the existing value carries forward. Recomputation happens only when an asset is replaced or the analysis version is bumped. The `version` field in the JSON exists for exactly that.
+
+I measured the reprocessing cost too. A complete decision at quarter scale, binary search included, runs at 53 ms per image. A catalog of several thousand images finishes in a few minutes, which keeps a full re-run cheap enough to do whenever the logic changes.
+
+## Where this works and where it does not
+
+This design fits when the overlaid UI has a known position and size. Status bars, pinned headers, fixed labels on cards. Being able to fix the window size in advance is what makes the windowed mean meaningful.
+
+It does not fit in a few cases.
+
+When text scrolls across the image, measuring one band is not enough. Either the whole travel range has to be covered, or the text needs an opaque backing plate instead.
+
+When text length varies, so does the window width. I measure using the longest expected case, but screens with unusually long strings need a separate check.
+
+And when Dynamic Type enlarges the text, the window grows, the average shifts, and the decision drifts toward being permissive. That needs to be reconciled with the accessibility settings, which borders on the territory covered in "[Production-Quality VoiceOver and Dynamic Type for Rork Apps](/articles/rork-dev/rork-voiceover-dynamic-type-production-accessibility)".
+
+One last note on 4.5:1 itself. That is the WCAG AA figure for normal-size text; large headings only need 3:1. Splitting `TARGET_RATIO` by UI role and emitting separate `scrim_title` and `scrim_status` values would be a natural extension. I run a single value today, though headings visibly carry more backing than they need, so that is the next thing I plan to change.
+
+Picking one fixed value looked like a way to skip the measurement work. Measuring showed that what I had actually been compromising was the images. If you have a similar constant sitting somewhere in your UI, a hundred images is enough to find out how far off it is. My guess is the distribution is more lopsided than you expect.
