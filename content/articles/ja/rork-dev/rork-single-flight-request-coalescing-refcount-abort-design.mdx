@@ -6,7 +6,7 @@ level: "advanced"
 premium: true
 date: "2026-07-24T14:00"
 author: "Rork Lab"
-description: "起動直後に同じ API へ何本ものリクエストが同時に飛ぶ多重フェッチを、進行中の Promise を共有して1本に束ねる設計です。失敗した Promise を配り続けてしまう罠、呼び出し側の中断が全体を巻き込む罠を避ける、参照カウント付きシングルフライト層の実装を、実際の通信ログとともに残します。"
+description: "起動直後に同じ API へ何本ものリクエストが同時に飛ぶ多重フェッチを、進行中の Promise を共有して1本に束ねる設計です。束ねる範囲を決めるキーの組み立て方、失敗した Promise を配り続けてしまう罠、呼び出し側の中断が全体を巻き込む罠、そして束ね率を数えて回帰を止めるテストまで、参照カウント付きシングルフライト層の実装を実測の通信ログとともに残します。"
 tags: ["Rork", "React Native", "API", "パフォーマンス", "アーキテクチャ"]
 highlights:
   - "起動時に同一 GET が多重に飛ぶのを、進行中の Promise を共有して1本へ束ねるシングルフライト層の実装"
@@ -67,7 +67,62 @@ function coalesce<T>(key: string, run: () => Promise<T>): Promise<T> {
 
 キーは「何を取りにいくか」を一意に表す文字列にします。`GET /me/entitlements` のように、メソッドとパスを組み合わせるのが分かりやすい形です。同じキーで 4 回呼ばれても、`run()` が実際に走るのは最初の 1 回だけになります。
 
-ここまでは素直です。問題は、この `Map` からいつエントリを消すか。ここに最初の罠があります。
+## キーの設計 — 何を「同じ取得」とみなすか
+
+束ねる範囲を決めているのはキーです。広く取りすぎれば別物が混ざり、狭く取りすぎれば束ねが一度も成立しません。コアレッサー本体より、このキーの決め方のほうが事故に近い場所でした。
+
+### クエリパラメータは並べ替えてから畳む
+
+同じ取得でも、呼び出し側によってクエリの並び順が違うことがあります。`?limit=20&cursor=abc` と `?cursor=abc&limit=20` を別のキーとして扱えば、中身の同じ 2 本がそのまま並んで飛びます。キーを組み立てる関数を一つだけ置き、取得側は必ずそこを通す形を推奨します。
+
+```ts
+export function buildKey(
+  method: "GET" | "HEAD",
+  path: string,
+  query: Record<string, string | number | undefined> = {},
+  subject = "anon",
+): string {
+  const pairs = Object.entries(query)
+    .filter(([, v]) => v !== undefined && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+    .sort(); // 並び順の揺れをここで吸収する
+  const qs = pairs.length ? `?${pairs.join("&")}` : "";
+  return `${subject}|${method} ${path}${qs}`;
+}
+```
+
+`sort()` を一つ挟むだけの話です。けれど各所でキーをその場書きしていたころは、束ねが効く画面と効かない画面が混ざっていて、原因が実装ではなく文字列にあることになかなか辿り着けませんでした。
+
+### 認証の主体をキーに含める
+
+`/me/entitlements` のように「いまのユーザー」を指すパスが、いちばん危ういところです。パスだけをキーにすると、アカウントを切り替えた直後に、前のユーザーぶんの進行中エントリがそのまま配られます。購読状態のように表示が分岐する値だと、無料のはずの画面が一瞬だけ購読済みとして描かれます。
+
+先ほどの `buildKey` が `subject`（ユーザー ID、あるいはトークンのハッシュ）を先頭に置いているのはこのためです。あわせて、サインアウトの時点で進行中のエントリを捨てます。
+
+```ts
+// entry が controller を持つ形は次節で作ります
+export function resetInflight(reason: string) {
+  for (const [key, entry] of inflight) {
+    entry.controller.abort(); // 待っている側には AbortError が届く
+    inflight.delete(key);
+  }
+  if (__DEV__) console.log(`[coalesce] reset: ${reason}`);
+}
+```
+
+購読状態を App Store 側からどう受け取るかは別の話になりますが、サーバーで購読を保持する構成を採用する場合は、[RevenueCat の固定費が気になり始めた人のための、App Store Server Notifications V2 自前運用ガイド](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription) の設計と並べて見ると、キーに何を含めるべきかが決めやすくなります。
+
+### キーに入れてはいけないもの
+
+逆に、呼ぶたびに変わる値をキーへ混ぜると、束ねは一度も成立しません。私が実際に混ぜてしまったのは次の三つです。
+
+1. `Date.now()` を足したキャッシュバスター
+2. リクエストごとに採番していたトレース ID
+3. `AbortSignal` を含むオプションオブジェクトを `JSON.stringify` した文字列
+
+三つ目は特に気づきにくく、通信本数がまったく減らないのに実装は正しく見える、という状態になりました。キーは人が読める短い文字列に保ち、ログへそのまま出せるようにしておくのが安全です。
+
+キーが決まれば、あとは `Map` の出し入れだけです。問題は、いつエントリを消すか。ここに最初の罠があります。
 
 ## 罠その一 — 失敗した Promise を配り続けてしまう
 
@@ -231,6 +286,19 @@ coalesce("POST /posts", (signal) => createPost(draft, signal));
 
 二度押しの 2 回目は、1 回目の進行中 Promise をそのまま受け取ります。一見、重複作成を防いだように見えます。ところが、2 回目に握っていた別の下書きは、送信されないまま消えました。ユーザーの操作が 1 回ぶん、音もなく捨てられていたのです。
 
+重複をどこで潰すかは、層ごとに守る対象が違います。私はこの三つを最初に切り分けてから設計に入るようにしています。
+
+<table>
+  <thead>
+    <tr><th>層</th><th>守る対象</th><th>寿命</th><th>向かないもの</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>シングルフライト</td><td>同時に飛ぶ<strong>読み取り</strong>の重複</td><td>1 本が settle するまで</td><td>書き込み全般</td></tr>
+    <tr><td>TTL キャッシュ</td><td>短時間に繰り返される<strong>再取得</strong></td><td>設定した TTL のあいだ</td><td>即時性が要る値</td></tr>
+    <tr><td>冪等性キー</td><td>再送・二度押しによる<strong>書き込み</strong>の重複</td><td>サーバー側の保持期間</td><td>通信本数の節約</td></tr>
+  </tbody>
+</table>
+
 書き込みの重複対策は、束ねることではなく冪等性キーで行うべきものでした。この切り分けは、通信の堅牢化を扱った別稿の [Rork アプリの API 通信を堅くする — トークン更新・再試行・冪等性の設計](/articles/rork-dev/rork-api-client-token-refresh-retry-idempotency-design) と合わせて考えると、役割の違いがはっきりします。シングルフライトは読み取りの重複を消し、冪等性キーは書き込みの重複を無害化する。守る対象がそもそも違います。
 
 ## トークン更新のサンダリングハードを鎮める
@@ -258,6 +326,52 @@ function refreshAccessToken() {
 
 `release` を呼ばないことで、待っている呼び出し側の都合で更新が中断されるのを防ぎます。3 本の 401 が重なっても、実際に飛ぶ更新は 1 本。全員がその 1 本の結果を共有し、新しいトークンで再試行します。トークンの取り違えによるログアウトは、これで起きなくなりました。
 
+## 効いているかを、目視ではなく数で確かめる
+
+ネットワークインスペクタを睨んで「減った気がする」で終わらせると、あとから足した画面で静かに元へ戻ります。私は、束ね率を数える計器を先に入れてから移行する進め方を採用する場合が多いです。
+
+コアレッサーの中で、呼ばれた回数と実際に走った回数を数えるだけで足ります。
+
+```ts
+const stats = { calls: 0, runs: 0 };
+
+export function coalesceStats() {
+  const { calls, runs } = stats;
+  return { calls, runs, foldRate: calls ? 1 - runs / calls : 0 };
+}
+```
+
+`coalesce` の冒頭で `stats.calls += 1` を、`run()` を実際に呼ぶ直前で `stats.runs += 1` を足します。起動から 5 秒後にこの値を出せば、束ねが効いているかが一目で分かります。私の手元では、導入前に相当する値が 0、導入後は起動直後で 0.4〜0.5 のあたりに落ち着きました。ここが 0 に近いままなら、実装ではなくキーが毎回変わっている可能性が高いところです。
+
+回帰を防ぐには、テストを 1 本だけ置いておくと確実です。同じキーで 3 回呼び、実際の取得が 1 回しか走らないことを確かめます。
+
+```ts
+it("同じキーの同時呼び出しは1本に束ねられる", async () => {
+  let runs = 0;
+  const run = () =>
+    new Promise<number>((resolve) => {
+      runs += 1;
+      setTimeout(() => resolve(runs), 10);
+    });
+
+  const a = coalesce("GET /x", run);
+  const b = coalesce("GET /x", run);
+  const c = coalesce("GET /x", run);
+
+  await Promise.all([a.promise, b.promise, c.promise]);
+  expect(runs).toBe(1);
+
+  // settle 後は新しい 1 本が走る（罠その一の回帰テスト）
+  const d = coalesce("GET /x", run);
+  await d.promise;
+  expect(runs).toBe(2);
+});
+```
+
+価値があるのは後半の 3 行です。エントリを消す処理を誰かが — たいていは半年後の自分が — `finally` から `then` へ動かしたとき、ここで落ちます。あの夜の再現に半日を溶かした身としては、この 3 行の安心感はそれなりのものでした。
+
+本番側では、通信本数そのものより起動の体感に効いてきます。起動の重さを継続して見る仕組みは [Rork × MetricKit でアプリの本番品質を計測する実装ガイド](/articles/rork-dev/rork-metrickit-production-diagnostics-complete-guide) に分けて書いています。
+
 ## 運用で見えた数値
 
 導入の前後を、6 本のアプリのうち利用者の多い 1 本で観察しました。cold start（アプリを完全に終了した状態からの起動）を 20 回試した平均です。
@@ -279,6 +393,8 @@ function refreshAccessToken() {
 ## どこから入れるか
 
 まず、起動直後にネットワークインスペクタをつないで、同じ URL が並んでいないかを見てください。並んでいれば、そこが最初の対象です。エンタイトルメント、ユーザープロフィール、リモート設定 — 複数画面から参照される読み取りが、たいてい候補になります。
+
+なかでもリモート設定は、起動直後にほぼ全画面から引かれるため候補になりやすい読み取りです。フラグを配る側の設計は [Feature Flags を運用に耐えさせる — Rork Max のキルスイッチと段階的ロールアウト設計](/articles/rork-dev/rork-max-feature-flags-remote-config) に、受け取った値を既定値やユーザー設定とどう重ねるかは [アプリの設定値を三層で解決する — 既定・ユーザー・リモートを境界付きにマージするレイヤー設計](/articles/rork-dev/rork-config-precedence-resolver-bounded-override-typed-layer) に、それぞれ分けて書いています。取得を束ねる層と、値を決める層を別に持っておくと、あとから片方だけ差し替えられます。
 
 コアレッサーは 1 ファイルで完結します。既存の取得コードを一気に書き換える必要はありません。多重に飛んでいる読み取りだけを `coalesce` 経由に差し替え、`finally` の削除と参照カウントの二点さえ外さなければ、静かに効き始めます。
 

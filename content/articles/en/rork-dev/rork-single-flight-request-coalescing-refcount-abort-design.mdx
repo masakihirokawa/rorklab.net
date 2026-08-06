@@ -6,7 +6,7 @@ level: "advanced"
 premium: true
 date: "2026-07-24T14:00"
 author: "Rork Lab"
-description: "When several components fire the same API call at launch, you get a burst of identical requests. Here is a single-flight layer that shares one in-flight promise instead, avoiding the trap of handing out a failed promise forever and the trap of one caller's abort cancelling everyone, with the real network numbers alongside."
+description: "When several components fire the same API call at launch, you get a burst of identical requests. Here is a single-flight layer that shares one in-flight promise instead: how to build the key that decides the folding, the trap of handing out a failed promise forever, the trap of one caller's abort cancelling everyone, and the test that keeps it all from regressing, with the real network numbers alongside."
 tags: ["Rork", "React Native", "API", "Performance", "Architecture"]
 highlights:
   - "A single-flight layer that collapses duplicate GETs at startup by sharing one in-flight promise"
@@ -67,7 +67,62 @@ function coalesce<T>(key: string, run: () => Promise<T>): Promise<T> {
 
 The key is a string that uniquely names what you are fetching. Combining method and path, like `GET /me/entitlements`, reads clearly. Called four times with the same key, `run()` actually runs only the first time.
 
-So far, straightforward. The problem is when to delete the entry from the `Map`. That is where the first trap lives.
+## Designing the key: what counts as "the same fetch"
+
+The key is what decides how wide the folding reaches. Make it too broad and unrelated fetches get merged; too narrow and the folding never fires at all. The key turned out to sit closer to real incidents than the coalescer itself.
+
+### Sort query parameters before folding
+
+The same fetch can arrive with its query in a different order depending on the caller. Treat `?limit=20&cursor=abc` and `?cursor=abc&limit=20` as different keys and you get two identical requests side by side. Keep one function that builds keys and route every fetch through it.
+
+```ts
+export function buildKey(
+  method: "GET" | "HEAD",
+  path: string,
+  query: Record<string, string | number | undefined> = {},
+  subject = "anon",
+): string {
+  const pairs = Object.entries(query)
+    .filter(([, v]) => v !== undefined && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+    .sort(); // absorb ordering differences here
+  const qs = pairs.length ? `?${pairs.join("&")}` : "";
+  return `${subject}|${method} ${path}${qs}`;
+}
+```
+
+It is one `sort()` call. But back when keys were written inline at each call site, some screens folded and others did not, and it took a while to accept that the cause was a string rather than the logic.
+
+### Put the authenticated subject in the key
+
+Paths that mean "the current user," like `/me/entitlements`, are the riskiest. Key on the path alone and, right after an account switch, the previous user's in-flight entry is handed out as is. For a value that branches the UI — subscription entitlement, say — a screen that should be free renders as subscribed for a moment.
+
+That is why `buildKey` above puts `subject` (a user ID, or a hash of the token) first. Alongside it, drop every in-flight entry at sign-out.
+
+```ts
+// The entry shape with a controller is built in the next section
+export function resetInflight(reason: string) {
+  for (const [key, entry] of inflight) {
+    entry.controller.abort(); // waiters receive an AbortError
+    inflight.delete(key);
+  }
+  if (__DEV__) console.log(`[coalesce] reset: ${reason}`);
+}
+```
+
+Where the entitlement itself comes from is a separate topic, but if you hold subscriptions on your own server, reading this beside [Outgrowing RevenueCat: A Self-Hosted Guide to App Store Server Notifications V2 for Rork Apps](/articles/rork-dev/rork-app-store-server-notifications-v2-self-hosted-subscription) makes it easier to decide what belongs in the key.
+
+### What must never go into the key
+
+Conversely, mix in anything that changes on every call and the folding never happens once. These are the three I actually mixed in:
+
+1. A cache buster built from `Date.now()`
+2. A trace ID minted per request
+3. A `JSON.stringify` of an options object that contained the `AbortSignal`
+
+The third is the hardest to spot: request counts do not drop at all, yet the implementation looks correct. Keep keys short and human-readable so you can print them straight into a log.
+
+With the key settled, the rest is just putting things into the `Map` and taking them out. The question is when to delete. That is where the first trap lives.
 
 ## Trap one: handing out a failed promise forever
 
@@ -231,6 +286,19 @@ coalesce("POST /posts", (signal) => createPost(draft, signal));
 
 The second tap receives the first tap's in-flight promise. It looks like duplicate creation was prevented. But the different draft the second tap was holding never got sent — it vanished. One of the user's actions was quietly thrown away.
 
+Where you kill duplication depends on the layer, and each layer protects something different. I keep these three separate from the start.
+
+<table>
+  <thead>
+    <tr><th>Layer</th><th>Protects against</th><th>Lifetime</th><th>Wrong fit for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Single-flight</td><td>Concurrent duplicate <strong>reads</strong></td><td>Until the one request settles</td><td>Writes of any kind</td></tr>
+    <tr><td>TTL cache</td><td>Repeated <strong>refetches</strong> over a short window</td><td>The TTL you set</td><td>Values that must be current</td></tr>
+    <tr><td>Idempotency key</td><td>Duplicate <strong>writes</strong> from retries and double taps</td><td>The server's retention window</td><td>Saving request count</td></tr>
+  </tbody>
+</table>
+
 Preventing duplicate writes belongs to idempotency keys, not to coalescing. That separation becomes clear when you set it beside the companion piece on hardening network calls, [Hardening API Calls in a Rork App: Token Refresh, Retries, and Idempotency](/articles/rork-dev/rork-api-client-token-refresh-retry-idempotency-design). Single-flight removes duplicate reads; idempotency keys neutralize duplicate writes. They protect fundamentally different things.
 
 ## Calming the token-refresh thundering herd
@@ -258,6 +326,52 @@ function refreshAccessToken() {
 
 By not calling `release`, a waiting caller's whim can no longer cancel the refresh. Even with three overlapping 401s, exactly one refresh goes out. Everyone shares that single result and retries with the new token. Logouts from token mix-ups stopped happening after this.
 
+## Verify it with a count, not with your eyes
+
+Stare at the network inspector, decide "it looks like fewer requests," and the next screen you add quietly undoes it. I prefer to land the instrument that counts the fold rate before migrating anything.
+
+Counting calls and actual runs inside the coalescer is enough.
+
+```ts
+const stats = { calls: 0, runs: 0 };
+
+export function coalesceStats() {
+  const { calls, runs } = stats;
+  return { calls, runs, foldRate: calls ? 1 - runs / calls : 0 };
+}
+```
+
+Add `stats.calls += 1` at the top of `coalesce` and `stats.runs += 1` right before `run()` actually fires. Print the value five seconds after launch and the folding becomes visible at a glance. On my side the equivalent figure was 0 before, and settled around 0.4 to 0.5 right after launch once it was in. If it stays near 0, the likely cause is a key that changes every call, not the implementation.
+
+To stop regressions, one test is enough. Call three times with the same key and assert the fetch runs once.
+
+```ts
+it("concurrent calls with the same key fold into one", async () => {
+  let runs = 0;
+  const run = () =>
+    new Promise<number>((resolve) => {
+      runs += 1;
+      setTimeout(() => resolve(runs), 10);
+    });
+
+  const a = coalesce("GET /x", run);
+  const b = coalesce("GET /x", run);
+  const c = coalesce("GET /x", run);
+
+  await Promise.all([a.promise, b.promise, c.promise]);
+  expect(runs).toBe(1);
+
+  // after settle, a fresh request runs (regression test for trap one)
+  const d = coalesce("GET /x", run);
+  await d.promise;
+  expect(runs).toBe(2);
+});
+```
+
+The last three lines are the ones that earn their keep. The day someone — usually me, six months later — moves the delete from `finally` into `then`, this is what fails. Having burned half a day reproducing that behavior once, those three lines are worth more to me than they look.
+
+In production, the effect shows up in how launch feels more than in raw request counts. The setup I use to keep watching launch weight over time is written up separately in [Rork × MetricKit — Building a Solo Diagnostics Pipeline for Crashes, Hangs, and Battery Drain](/articles/rork-dev/rork-metrickit-production-diagnostics-complete-guide).
+
 ## The numbers I saw in production
 
 I observed before and after on the one app with the most users out of the six. The averages are over 20 cold starts (launching from a fully terminated state).
@@ -279,6 +393,8 @@ More than the drop in request count, the last row mattered most to me. The hard-
 ## Where to start
 
 First, attach a network inspector right after launch and look for the same URL repeated. If it is, that is your first target. Entitlements, user profile, remote config — reads referenced from several screens are usually the candidates.
+
+Remote config in particular is a strong candidate, since nearly every screen pulls it at launch. The distribution side of flags is covered in [Making Feature Flags Survive Production: Kill Switches and Gradual Rollouts in Rork Max](/articles/rork-dev/rork-max-feature-flags-remote-config), and how the received values stack against defaults and user preferences in [Resolving App Config in Three Layers: Merging Defaults, User, and Remote With Bounded Overrides](/articles/rork-dev/rork-config-precedence-resolver-bounded-override-typed-layer). Keeping the layer that folds fetches separate from the layer that decides values lets you swap either one later without touching the other.
 
 The coalescer fits in one file. You do not need to rewrite all existing fetch code at once. Swap only the reads that are firing in duplicate onto `coalesce`, and as long as you keep the two points — deleting in `finally` and the reference count — it quietly starts to help.
 
