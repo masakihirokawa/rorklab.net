@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "VERIFY — Android の開発者認証が2026年9月に完全義務化されます。Android 17 以降の端末では認証が OS 側に実装され、認証を経ていないアプリは新規インストールが OS レベルでブロックされうる構造です",
-    "REVIEW — 9月から、App Store への新規申請・アップデート申請と、代替配信向けの notarization で回答の提出が必須になります",
-    "SDK — iOS 27 と Xcode 27 は9月に正式リリース見込みです。提出アプリへの iOS 27 SDK ビルド必須化は2027年春の予定で、こちらは1年近い猶予があります",
-    "TIMELINE — Rork の $15M シードと Paperline 買収は2026年4月9日の発表です。直近のニュースではないため、記事で扱う際は時系列を明確に区別する必要があります",
-    "MAX — Rork Max は native Swift を出力し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象です。標準の Rork は React Native（Expo）でクロスプラットフォームのアプリを生成します",
-    "EXPORT — 自動の Publish が失敗しても、GitHub へ同期して React Native のソース一式を無料でエクスポートし、手動で提出まで進められます",
+    "EXPO — Expo Agent がベータで公開されました。ブラウザ上でプロジェクトやリポジトリを直接扱いながら、プロンプトからアプリを生成・変更できます",
+    "NATIVE — Expo Agent の出力は iOS・Android・web 向けの、実際に配布できるネイティブアプリです",
+    "RN — React Native チームは新規プロジェクトについて Expo を公式に推奨しています。AI によるコード生成では、判断の余地を狭められる点が理由に挙げられます",
+    "MAX — Rork Max は native Swift を出力し、Claude Code と Opus 4.6 の組み合わせで動作します。標準の Rork は React Native（Expo）でクロスプラットフォームのアプリを生成します",
+    "CREDIT — Rork は無料で始められ、有料プランは月額 $25 からです。クレジットの消費は速いため、本格的に作る前提なら費用を見積もっておく必要があります",
+    "SEPT — App Store の申請時回答と Android の開発者認証は、いずれも2026年9月からです。配布経路の棚卸しは早めに済ませておく類の変更です",
   ],
   en: [
-    "VERIFY — Android developer verification becomes fully mandatory in September 2026. On Android 17 devices verification lives in the OS, so unverified apps can be blocked from new installs at the OS level",
-    "REVIEW — From September, responses are required when submitting new apps or updates to the App Store, and when notarizing for alternative distribution",
-    "SDK — iOS 27 and Xcode 27 are expected to ship in September, but the requirement to submit iOS 27 SDK builds does not land until spring 2027",
-    "TIMELINE — Rork's $15M seed and the Paperline acquisition were announced on April 9, 2026 — worth dating precisely rather than treating as breaking news",
-    "MAX — Rork Max emits native Swift for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, while standard Rork generates cross-platform apps with React Native (Expo)",
-    "EXPORT — If the automated Publish step fails, you can sync to GitHub and export the full React Native source for free, then finish the submission by hand",
+    "EXPO — Expo Agent is out in beta. It runs in the browser and lets you generate and modify apps from prompts while working directly on a project or repository",
+    "NATIVE — What Expo Agent produces are real, shippable native apps for iOS, Android, and the web",
+    "RN — The React Native team now officially recommends Expo for new projects, citing how much it narrows the decision space AI code generation has to navigate",
+    "MAX — Rork Max emits native Swift and runs on Claude Code paired with Opus 4.6, while standard Rork generates cross-platform apps with React Native (Expo)",
+    "CREDIT — Rork is free to start and paid plans begin at $25/month, but credits burn quickly — worth budgeting for before you build seriously",
+    "SEPT — App Store submission responses and Android developer verification both take effect in September 2026. Auditing your distribution paths early is the safer move",
   ],
 };
 
