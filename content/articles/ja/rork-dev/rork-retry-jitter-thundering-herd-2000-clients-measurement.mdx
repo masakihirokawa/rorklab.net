@@ -1,0 +1,377 @@
+---
+title: "復旧させたのに 429 が止まらない — リトライのジッター設計を2,000端末で測り直しました"
+slug: "rork-retry-jitter-thundering-herd-2000-clients-measurement"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-08T11:00"
+author: "Rork Lab"
+description: "バックエンド復旧後も 429 が続いた原因を、2,000端末の離散シミュレータで測り直しました。指数バックオフ単体・上限値・±10%ジッター・Retry-After の遵守が、それぞれ何秒の遅れを生むかの実測値です。"
+tags: ["リトライ", "バックオフ", "Expo", "React Native", "信頼性設計"]
+highlights:
+  - "指数バックオフをジッター無しで入れると、固定5秒間隔より99%完了が7倍遅くなる実測値"
+  - "「Retry-After をそのまま守る」実装が最も遅かった理由と、下限として扱う書き換え方"
+  - "decorrelated jitter と端末固定オフセットを組み合わせた、そのまま使える fetch ラッパー"
+---
+
+個人開発のアプリが使っているバックエンドを、4分ほど止めた朝がありました。設定を1行変えるだけのつもりが、デプロイに失敗して落ちたままになった、という単純な話です。
+
+慌てて戻して、ログを見ながらほっとしたのも束の間でした。復旧しているのに、429 が止まりません。
+
+サーバは動いている。処理能力も戻っている。それでも数分のあいだ、返るのはエラーばかり。手元の端末で開き直しても同じでした。
+
+原因は自分のリトライ実装にありました。しかも、教科書どおりに書いたつもりの部分が、いちばん効いていました。
+
+腹落ちさせるには測るしかありません。手元で 2,000 端末ぶんの再接続を回せる小さなシミュレータを書いて、実装ごとに何秒の差が出るかを並べてみました。
+
+## 何が起きていたのか
+
+障害が起きると、その時間帯にアプリを開いていた端末が全部まとめて失敗します。失敗した瞬間がほぼ揃っているので、その後のリトライも揃います。
+
+復旧した瞬間、揃った端末が一斉に戻ってくる。処理能力を超えるので 429 を返す。429 を受けた端末が、また揃ったタイミングで戻ってくる。
+
+サーバは復旧しているのに、自分のクライアントが自分のサーバを塞ぎ続けている状態でした。
+
+ここまでは、よく知られた thundering herd の説明そのものです。私が分かっていなかったのは、「では何をどれだけ入れれば解けるのか」という定量の部分でした。
+
+## 測定台を作る
+
+実サービスで実験するわけにはいかないので、離散時間のシミュレータを書きました。100ms を1tick として、端末の送信・サーバの処理・リトライの再スケジュールだけを回します。
+
+条件は手元の構成に寄せています。端末2,000台、復旧は30秒時点、復旧後のサーバ処理能力は 120 req/sec。乱数は seed 固定の mulberry32 で、5つの seed の平均を取りました。
+
+```js
+// herd.mjs — node herd.mjs で実行できます
+const N = 2000;               // 同時に失敗した端末数
+const RECOVER_MS = 30000;     // サーバ復旧時刻
+const CAPACITY_PER_SEC = 120; // 復旧後の処理能力
+const TICK = 100;             // 1tick = 100ms
+const CAP_TICK = CAPACITY_PER_SEC * TICK / 1000;
+const BASE = 1000;            // 基準待機 1s
+
+// seed 固定の疑似乱数（結果を再現できるようにするため）
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function run(nextDelay, seed) {
+  const rand = mulberry32(seed);
+  const next = new Float64Array(N);   // 次に送信する時刻
+  const att  = new Int32Array(N);     // 試行回数
+  const prev = new Float64Array(N);   // 直前の待機時間（decorrelated 用）
+  const done = new Uint8Array(N);
+  for (let i = 0; i < N; i++) { next[i] = rand() * 2000; prev[i] = BASE; }
+
+  let sentAfterRecovery = 0, ok = 0, peak = 0, t99 = -1;
+
+  for (let t = 0; t < 1200000; t += TICK) {
+    const arrivals = [];
+    for (let i = 0; i < N; i++) if (!done[i] && next[i] <= t) arrivals.push(i);
+
+    const up = t >= RECOVER_MS;
+    if (up) {
+      sentAfterRecovery += arrivals.length;
+      const qps = arrivals.length * 1000 / TICK;
+      if (qps > peak) peak = qps;
+    }
+
+    // 復旧前は全滅、復旧後も処理能力を超えた分は 429 相当で弾かれます
+    let budget = up ? CAP_TICK : 0;
+    for (const i of arrivals) {
+      if (budget >= 1) { budget--; done[i] = 1; ok++; }
+      else {
+        att[i]++;
+        const d = nextDelay(att[i], prev[i], rand);
+        prev[i] = d;
+        next[i] = t + d;
+      }
+    }
+    if (t99 < 0 && ok >= N * 0.99) t99 = t;
+    if (ok === N) break;
+  }
+  return { sentAfterRecovery, ok, peak: Math.round(peak), t99 };
+}
+```
+
+計測するのは3つに絞りました。復旧後にサーバへ届いた総リクエスト数、復旧後のピーク QPS、そして 99% の端末が通り終えるまでの時刻です。
+
+平均応答時間を見ても意味がありません。この種の障害で読者が体感するのは、いちばん遅い層がいつ戻るかだからです。
+
+## 指数バックオフだけでは、固定間隔より遅くなりました
+
+まず、素朴な実装から並べました。5秒固定、上限60秒の指数バックオフ、それに3種類のジッターです。
+
+<table>
+  <thead>
+    <tr><th>戦略</th><th>復旧後の総送信</th><th>ピークQPS</th><th>50%完了</th><th>99%完了</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>固定5秒</td><td>9,423</td><td>1,174</td><td>50.4s</td><td>73.5s</td></tr>
+    <tr><td>指数バックオフ（ジッター無し）</td><td>9,423</td><td>1,174</td><td>242.4s</td><td><strong>507.5s</strong></td></tr>
+    <tr><td>指数 + full jitter</td><td>2,011</td><td>152</td><td>43.5s</td><td>84.5s</td></tr>
+    <tr><td>指数 + equal jitter</td><td>2,152</td><td>224</td><td>48.4s</td><td>103.3s</td></tr>
+    <tr><td>decorrelated jitter</td><td>2,324</td><td>264</td><td>39.0s</td><td><strong>73.4s</strong></td></tr>
+  </tbody>
+</table>
+
+復旧は30.0秒時点、処理能力は 120 req/sec です。
+
+一番こたえたのは2行目でした。指数バックオフをジッター無しで入れると、99%完了が 507.5 秒。何もひねっていない固定5秒間隔の 73.5 秒より、7倍近く遅いという結果です。
+
+私が実際に書いていたのが、この2行目でした。私自身、「指数バックオフを入れてあるのだから大丈夫」と長らく思い込んでおりました。「指数バックオフを入れてあるから大丈夫」と思っていた実装が、素朴な固定間隔に負けていたわけです。
+
+送信総数は固定5秒と同じ 9,423 件。つまり、サーバにかける負荷は減っていないのに、待ち時間だけが伸びています。
+
+理由は、待ち時間が長くなるほど「次に全員が集まる瞬間」の間隔も長くなるからです。同期が解けていない以上、指数で伸ばした分はそのまま無駄な待機になります。
+
+## 上限値が、同期を作り直します
+
+指数バックオフには普通、上限を置きます。60秒くらいが一般的です。
+
+その上限が曲者でした。
+
+<table>
+  <thead>
+    <tr><th>実装</th><th>復旧後の総送信</th><th>ピークQPS</th><th>99%完了</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>指数・上限60秒・ジッター無し</td><td>9,423</td><td>1,174</td><td>507.5s</td></tr>
+    <tr><td>指数・上限300秒・ジッター無し</td><td>8,960</td><td>1,174</td><td><strong>20分以内に未完了</strong></td></tr>
+  </tbody>
+</table>
+
+上限を伸ばすと悪化します。当然といえば当然ですが、私が読み違えていたのはその手前でした。
+
+上限に達した瞬間、すべての端末の待機時間が同じ値に収束します。1秒、2秒、4秒…と伸びている途中はまだ試行回数のばらつきで多少散っていたものが、上限で完全に揃うのです。
+
+以降は、60秒ごとに全端末が同時にノックし続ける状態になります。ジッターで崩したはずの同期を、上限値が作り直している。
+
+上限は「これ以上待たせない」ための安全弁のつもりで置いていました。実際には、同期の再生成装置として働いていました。
+
+## ±10% のジッターは、ジッターとして機能していませんでした
+
+ジッターを入れるとき、私は待機時間に ±10% をかけていました。ログを見たときに待機がばらけて見えるので、入っている気になっていた部分です。
+
+幅を変えて測り直しました。
+
+<table>
+  <thead>
+    <tr><th>実装（いずれも上限60秒）</th><th>復旧後の総送信</th><th>ピークQPS</th><th>99%完了</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ジッター無し</td><td>9,423</td><td>1,174</td><td>507.5s</td></tr>
+    <tr><td>±10%</td><td>3,754</td><td>706</td><td>129.4s</td></tr>
+    <tr><td>±25%</td><td>2,554</td><td>370</td><td>72.8s</td></tr>
+    <tr><td>full jitter（0〜上限の一様乱数）</td><td>2,011</td><td><strong>152</strong></td><td>84.5s</td></tr>
+    <tr><td>decorrelated jitter</td><td>2,324</td><td>264</td><td><strong>73.4s</strong></td></tr>
+  </tbody>
+</table>
+
+±10% でもピーク QPS は 1,174 から 706 に落ちます。効いてはいます。
+
+ただ、処理能力 120 req/sec に対して 706 はまだ5.9倍です。弾かれる端末が大量に残るので、99%完了は 129.4 秒。full jitter の 152 QPS とは桁が違います。
+
+±10% は「ジッターを入れた」ではなく「ジッターを入れたつもり」でした。同期を崩したいなら、崩したい間隔と同じオーダーの幅が要ります。
+
+一方で、full jitter が万能かというとそうでもありませんでした。ピーク QPS は最小の 152 ですが、99%完了は 84.5 秒。decorrelated jitter の 73.4 秒に負けています。
+
+full jitter は待機時間の下限が 0 に近づくため、運の悪い端末が短い間隔で何度も弾かれ、試行回数だけが進んで上限側に押し上げられます。ピークを潰す代わりに、尾を伸ばしている構図です。
+
+サーバを守りたいなら full jitter、ユーザーの復帰を早めたいなら decorrelated jitter。この記事の条件では、そう読める結果になりました。
+
+## Retry-After を仕様どおり守るほど、復旧は遅れました
+
+ここが、測る前の予想といちばん食い違った部分です。
+
+429 には `Retry-After` を付けるのが行儀の良いサーバの作法で、クライアントはそれを尊重すべきとされています。私も素直にそう実装していました。
+
+サーバが `Retry-After: 30` を返す条件で測り直します。
+
+<table>
+  <thead>
+    <tr><th>クライアントの実装</th><th>復旧後の総送信</th><th>ピークQPS</th><th>50%完了</th><th>99%完了</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Retry-After をそのまま守る</td><td>9,423</td><td>1,174</td><td>150.4s</td><td><strong>283.5s</strong></td></tr>
+    <tr><td>Retry-After に full jitter を重ねる</td><td>3,818</td><td>1,208</td><td>44.6s</td><td><strong>60.9s</strong></td></tr>
+    <tr><td>Retry-After を下限にして 1〜2倍</td><td>3,762</td><td>1,174</td><td>74.1s</td><td>90.9s</td></tr>
+    <tr><td>Retry-After を無視して decorrelated</td><td>2,324</td><td><strong>264</strong></td><td>39.0s</td><td>73.4s</td></tr>
+  </tbody>
+</table>
+
+`Retry-After` をそのまま守った実装が、いちばん遅くなりました。99%完了 283.5 秒。無視して decorrelated jitter で戻る実装の 73.4 秒に対して、4倍近い差です。
+
+理由は単純でした。サーバが全端末に同じ値を返すので、全端末が同じ時刻に戻ってきます。ジッターを崩すために苦労していた同期を、サーバ自身が毎回きれいに作り直しているのです。
+
+しかも、`Retry-After` を尊重する実装ほど「クライアント側の乱数を上書きする」ことになるので、丁寧に書くほど同期が強くなります。
+
+一方、`Retry-After` に full jitter を重ねると 99%完了は 60.9 秒まで縮み、この表で最速になりました。サーバが持っている「いつ空くか」の情報は正しいので、値そのものは有用です。問題は、同じ値を全員に配ることだけでした。
+
+ピーク QPS が 1,208 と高いのは、復旧30秒時点の最初の一撃が残るためです。この一撃は、障害中に既に予約されていた送信なので、クライアント側のどの戦略でも消えません。ここを削るにはサーバ側で受け口を絞る必要があります。
+
+## 実装に落とす
+
+測った結果を、Expo / React Native 側の fetch ラッパーに落としました。方針は3つです。
+
+1. 既定は decorrelated jitter。復帰の速さを優先します
+2. `Retry-After` は「下限」として扱い、必ず上に乱数を重ねます
+3. 端末ごとに固定のオフセットを足し、同一秒への集中をさらに崩します
+
+```ts
+const BASE_DELAY_MS = 1000;
+const MAX_DELAY_MS = 60000;
+const MAX_ATTEMPTS = 6;
+
+// install id から導く 0〜1 のオフセット。起動をまたいでも同じ値になります
+function installOffset(installId: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < installId.length; i++) {
+    h ^= installId.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 100000) / 100000;
+}
+
+// 直前の待機を基準に、[BASE, prev*3] の一様乱数を引きます
+function decorrelatedJitter(prevDelay: number, rand: () => number): number {
+  const upper = Math.max(BASE_DELAY_MS * 2, prevDelay * 3);
+  return Math.min(MAX_DELAY_MS, BASE_DELAY_MS + rand() * (upper - BASE_DELAY_MS));
+}
+
+// 秒数形式・HTTP-date 形式のどちらも受け取ります
+function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const sec = Number(header);
+  if (Number.isFinite(sec)) return Math.max(0, sec * 1000);
+  const at = Date.parse(header);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null;
+}
+
+const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const id = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => { clearTimeout(id); reject(new DOMException('Aborted', 'AbortError')); },
+      { once: true },
+    );
+  });
+
+type RetryOpts = {
+  installId?: string;
+  rand?: () => number;
+  signal?: AbortSignal;
+  onRetry?: (info: { attempt: number; waitMs: number; reason: string }) => void;
+};
+
+export async function fetchWithRetry(
+  url: string,
+  init: RequestInit = {},
+  opts: RetryOpts = {},
+): Promise<Response> {
+  const { installId = 'anonymous', rand = Math.random, signal, onRetry } = opts;
+  const offset = installOffset(installId);
+  let prevDelay = BASE_DELAY_MS;
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, { ...init, signal });
+      if (!RETRYABLE.has(res.status)) return res; // 4xx の大半はここで即返します
+      lastErr = new Error(`HTTP ${res.status}`);
+
+      const ra = parseRetryAfter(res.headers.get('retry-after'));
+      // Retry-After は下限。同じ値で全端末が揃わないよう必ず乱数を重ねます
+      prevDelay = ra !== null
+        ? ra + rand() * Math.max(ra, BASE_DELAY_MS)
+        : decorrelatedJitter(prevDelay, rand);
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') throw e; // 画面離脱は再試行しません
+      lastErr = e;
+      prevDelay = decorrelatedJitter(prevDelay, rand);
+    }
+
+    if (attempt === MAX_ATTEMPTS) break;
+    const wait = Math.min(MAX_DELAY_MS, prevDelay + offset * BASE_DELAY_MS);
+    onRetry?.({ attempt, waitMs: Math.round(wait), reason: String((lastErr as Error)?.message ?? lastErr) });
+    await sleep(wait, signal);
+  }
+  throw lastErr;
+}
+```
+
+ローカルに 429 を3回返してから 200 を返すサーバを立てて動かした結果です。
+
+```
+status: 200 body: ok
+server hits: 4 elapsed: 6272 ms
+retry log: [
+  {"attempt":1,"waitMs":1889,"reason":"HTTP 429"},
+  {"attempt":2,"waitMs":1704,"reason":"HTTP 429"},
+  {"attempt":3,"waitMs":2640,"reason":"HTTP 429"}
+]
+```
+
+`Retry-After: 1`（1秒）に対して、実際の待機は 1.7〜2.6 秒に散りました。下限は守りつつ、同じ値には落ちていません。
+
+`rand` を差し替え可能にしてあるのは、テストのためです。固定値を渡せば待機列が完全に再現され、リトライまわりのテストが不安定になりません。
+
+## 端末固定オフセットが本当に散っているかを確かめる
+
+`installOffset` は FNV-1a を刈り込んだだけの雑なハッシュです。偏っていたらオフセットの意味がなくなるので、UUID 2,000件で分布を見ました。
+
+```
+10分割ヒストグラム(理想=200): 200 212 193 193 192 189 180 213 217 211
+最大/最小: 217 / 180  偏り: 18.5%
+```
+
+最大 217、最小 180。理想値 200 に対して 18.5% の偏りです。
+
+暗号用途としては褒められた値ではありませんが、目的は「同一秒への集中を崩す」ことなので、この程度なら実用に足ります。逆に、ここで `Math.random()` を使わなかったのには理由があります。
+
+起動のたびに値が変わると、アプリを再起動した端末だけが再び揃う瞬間ができます。障害中はユーザーが何度もアプリを開き直すので、その揃い方は無視できません。install id 由来の固定値にしておけば、何度開き直しても同じ位置に居続けます。
+
+## 運用で決めたこと
+
+測った結果、手元のアプリでは次の形に落ち着きました。
+
+1. 既定は decorrelated jitter、上限60秒、最大6試行
+2. `Retry-After` は下限としてのみ使い、必ず 1〜2倍の乱数を重ねる
+3. 待機に install id 由来の固定オフセットを加算する
+4. サーバ側は 429 に `Retry-After` を返し続ける（値そのものは有用なため）
+5. `AbortController` で画面離脱時のリトライを確実に止める
+
+本番へ入れる前に、ひとつ落とし穴を踏みました。`AbortError` を再試行対象に含めていたため、画面を閉じた直後のリクエストが裏で6回まで走り続けていたのです。
+
+ログには何も出ません。画面はもう無いので、失敗しても誰も気づかない。復旧直後の混雑時には、この「誰も待っていないリクエスト」が帯域を食っていました。
+
+対処は上のコードの `if ((e as Error).name === 'AbortError') throw e;` の1行です。当たり前のようでいて、リトライを後付けすると抜けやすい箇所だと感じております。
+
+どれを選ぶかは、守りたいものによって変わります。私は復帰の速さを優先して decorrelated jitter を推奨しますが、サーバ側に余力がない構成であれば判断は逆になります。
+
+<table>
+  <thead>
+    <tr><th>状況</th><th>推奨</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>サーバの処理能力に余裕がない</td><td>full jitter</td><td>ピークQPSが最小の152。落とさないことを最優先できます</td></tr>
+    <tr><td>ユーザーの復帰を最優先したい</td><td>decorrelated jitter</td><td>99%完了 73.4s。この条件では最短でした</td></tr>
+    <tr><td>サーバが Retry-After を返せる</td><td>Retry-After + full jitter</td><td>99%完了 60.9s。値を活かしつつ同期だけを崩せます</td></tr>
+    <tr><td>変更コストを最小にしたい</td><td>まず ±25% 以上へ広げる</td><td>±10%（129.4s）から ±25%（72.8s）へ、定数1つで改善します</td></tr>
+  </tbody>
+</table>
+
+残った疑問もあります。今回のシミュレータはサーバの処理能力を固定値として扱いましたが、実際には過負荷時に処理能力そのものが落ちます。その効果を入れると、ピークを潰す full jitter の評価が上がる可能性があります。
+
+もうひとつは、復旧30秒時点の最初の一撃です。クライアント側では消せないので、次はサーバ側で受け口を絞る側を測ろうと考えております。
+
+自分の書いたリトライが、自分のサーバを塞いでいた。そう分かったときの居心地の悪さは、しばらく残りました。ただ、測ってしまえば直す場所は明快でした。
+
+同じところでつまずいている方の参考になれば嬉しく思います。お読みいただきありがとうございました。

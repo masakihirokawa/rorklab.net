@@ -1,0 +1,377 @@
+---
+title: "The 429s Kept Coming After Recovery: Measuring Retry Jitter Across 2,000 Clients"
+slug: "rork-retry-jitter-thundering-herd-2000-clients-measurement"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-08T11:00"
+author: "Rork Lab"
+description: "My backend came back but the 429s did not stop. I rebuilt the scenario in a 2,000-client discrete simulator and measured what plain exponential backoff, delay caps, 10% jitter, and honoring Retry-After actually cost in seconds."
+tags: ["retry", "backoff", "Expo", "React Native", "reliability"]
+highlights:
+  - "Measured numbers showing exponential backoff without jitter finishing 7x slower than a naive fixed 5s interval"
+  - "Why the implementation that honors Retry-After exactly was the slowest of all, and how to rewrite it as a floor"
+  - "A drop-in fetch wrapper combining decorrelated jitter with a per-install offset, with smoke test output"
+---
+
+One morning I took down the backend behind my indie developer apps for about four minutes. It was supposed to be a one-line config change; the deploy failed and left the service dead.
+
+I rolled it back and watched the logs, relieved. The relief did not last. The service was up, capacity was back, and the 429s kept coming.
+
+Opening the app on my own phone gave me the same thing. Errors, for several minutes, against a server that was demonstrably healthy.
+
+The cause was in my own retry code. Worse, the part doing the most damage was the part I had written by the book.
+
+I could not reason my way out of it, so I built a small simulator that replays 2,000 clients reconnecting, and measured what each implementation actually costs in seconds.
+
+## What was actually happening
+
+When an outage hits, every client with the app open fails at roughly the same instant. Because their failures are aligned, their retries are aligned too.
+
+The moment the server recovers, that aligned population arrives together. Capacity is exceeded, so the server returns 429. The clients that got 429 come back — still aligned.
+
+The server had recovered. My own clients were keeping it busy.
+
+That much is the standard thundering herd story. What I did not have was the quantitative half: which mitigation buys how much, and where the surprises are.
+
+## Building the test rig
+
+Experimenting on a live service was not an option, so I wrote a discrete-time simulator. One tick is 100ms, and the loop only models three things: clients sending, the server accepting up to capacity, and rejected clients rescheduling.
+
+The parameters mirror my setup. 2,000 clients, recovery at the 30 second mark, 120 req/sec of post-recovery capacity. Randomness comes from a seeded mulberry32, and every figure below is the mean of five seeds.
+
+```js
+// herd.mjs — run with: node herd.mjs
+const N = 2000;               // clients that failed together
+const RECOVER_MS = 30000;     // when the server comes back
+const CAPACITY_PER_SEC = 120; // post-recovery capacity
+const TICK = 100;             // one tick = 100ms
+const CAP_TICK = CAPACITY_PER_SEC * TICK / 1000;
+const BASE = 1000;            // base delay, 1s
+
+// Seeded PRNG so results are reproducible
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function run(nextDelay, seed) {
+  const rand = mulberry32(seed);
+  const next = new Float64Array(N);   // next send time per client
+  const att  = new Int32Array(N);     // attempt count
+  const prev = new Float64Array(N);   // previous delay (for decorrelated jitter)
+  const done = new Uint8Array(N);
+  for (let i = 0; i < N; i++) { next[i] = rand() * 2000; prev[i] = BASE; }
+
+  let sentAfterRecovery = 0, ok = 0, peak = 0, t99 = -1;
+
+  for (let t = 0; t < 1200000; t += TICK) {
+    const arrivals = [];
+    for (let i = 0; i < N; i++) if (!done[i] && next[i] <= t) arrivals.push(i);
+
+    const up = t >= RECOVER_MS;
+    if (up) {
+      sentAfterRecovery += arrivals.length;
+      const qps = arrivals.length * 1000 / TICK;
+      if (qps > peak) peak = qps;
+    }
+
+    // Everything fails before recovery; afterwards, anything over capacity gets a 429
+    let budget = up ? CAP_TICK : 0;
+    for (const i of arrivals) {
+      if (budget >= 1) { budget--; done[i] = 1; ok++; }
+      else {
+        att[i]++;
+        const d = nextDelay(att[i], prev[i], rand);
+        prev[i] = d;
+        next[i] = t + d;
+      }
+    }
+    if (t99 < 0 && ok >= N * 0.99) t99 = t;
+    if (ok === N) break;
+  }
+  return { sentAfterRecovery, ok, peak: Math.round(peak), t99 };
+}
+```
+
+I track three numbers: total requests reaching the server after recovery, peak post-recovery QPS, and the moment 99% of clients have gotten through.
+
+Mean latency would be misleading here. What people experience during an outage is when the slowest slice comes back.
+
+## Exponential backoff alone was slower than a fixed interval
+
+I started with the naive implementations: a flat 5 second interval, exponential backoff capped at 60 seconds, and three flavors of jitter.
+
+<table>
+  <thead>
+    <tr><th>Strategy</th><th>Requests after recovery</th><th>Peak QPS</th><th>50% done</th><th>99% done</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Fixed 5s</td><td>9,423</td><td>1,174</td><td>50.4s</td><td>73.5s</td></tr>
+    <tr><td>Exponential, no jitter</td><td>9,423</td><td>1,174</td><td>242.4s</td><td><strong>507.5s</strong></td></tr>
+    <tr><td>Exponential + full jitter</td><td>2,011</td><td>152</td><td>43.5s</td><td>84.5s</td></tr>
+    <tr><td>Exponential + equal jitter</td><td>2,152</td><td>224</td><td>48.4s</td><td>103.3s</td></tr>
+    <tr><td>Decorrelated jitter</td><td>2,324</td><td>264</td><td>39.0s</td><td><strong>73.4s</strong></td></tr>
+  </tbody>
+</table>
+
+Recovery is at 30.0s; capacity is 120 req/sec.
+
+The second row is the one that stung. Exponential backoff without jitter reaches 99% completion at 507.5 seconds — nearly seven times slower than the completely unsophisticated fixed 5 second interval at 73.5 seconds.
+
+That second row was what I had shipped. For a long time I assumed that having exponential backoff in place meant the problem was handled. The implementation I trusted because "it does exponential backoff" was losing to a flat timer.
+
+Note that the request total is identical: 9,423 either way. The load on the server did not go down at all. Only the waiting got longer.
+
+The mechanism is straightforward once you see it. When the population stays synchronized, growing the delay just grows the gap between collisions. Every doubling is pure dead time.
+
+## The cap rebuilds the synchronization you removed
+
+Exponential backoff normally carries a cap. Sixty seconds is a common choice.
+
+The cap turned out to be the problem.
+
+<table>
+  <thead>
+    <tr><th>Implementation</th><th>Requests after recovery</th><th>Peak QPS</th><th>99% done</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Exponential, 60s cap, no jitter</td><td>9,423</td><td>1,174</td><td>507.5s</td></tr>
+    <tr><td>Exponential, 300s cap, no jitter</td><td>8,960</td><td>1,174</td><td><strong>not finished within 20 min</strong></td></tr>
+  </tbody>
+</table>
+
+A longer cap is worse, which is unsurprising. What I had missed sits one step earlier.
+
+The instant clients hit the cap, every delay collapses to the same value. While delays are climbing through 1s, 2s, 4s, differing attempt counts keep the population somewhat spread. At the cap, that spread disappears entirely.
+
+From then on, all 2,000 clients knock in unison every 60 seconds. The cap regenerates exactly the synchronization jitter is supposed to destroy.
+
+I had added the cap as a safety valve so no user would wait too long. In practice it was a synchronization generator.
+
+## A ±10% jitter is not jitter
+
+My jitter was a ±10% multiplier on the delay. Logs showed varied wait times, which was enough to make me believe it was doing its job.
+
+I measured a range of widths.
+
+<table>
+  <thead>
+    <tr><th>Implementation (all capped at 60s)</th><th>Requests after recovery</th><th>Peak QPS</th><th>99% done</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>No jitter</td><td>9,423</td><td>1,174</td><td>507.5s</td></tr>
+    <tr><td>±10%</td><td>3,754</td><td>706</td><td>129.4s</td></tr>
+    <tr><td>±25%</td><td>2,554</td><td>370</td><td>72.8s</td></tr>
+    <tr><td>Full jitter (uniform 0 to cap)</td><td>2,011</td><td><strong>152</strong></td><td>84.5s</td></tr>
+    <tr><td>Decorrelated jitter</td><td>2,324</td><td>264</td><td><strong>73.4s</strong></td></tr>
+  </tbody>
+</table>
+
+±10% does help: peak QPS drops from 1,174 to 706.
+
+But 706 against 120 req/sec of capacity is still 5.9x over. Plenty of clients keep getting rejected, and 99% completion lands at 129.4 seconds. Full jitter's 152 QPS is a different order of magnitude.
+
+±10% was not jitter. It was the appearance of jitter. To break synchronization you need spread on the same order as the interval you are trying to break.
+
+Full jitter is not a free win either. It has the lowest peak at 152 QPS, but 99% completion is 84.5 seconds — behind decorrelated jitter's 73.4 seconds.
+
+Because full jitter can draw delays near zero, unlucky clients burn attempts quickly, get rejected repeatedly, and climb toward the cap. It flattens the peak by lengthening the tail.
+
+If protecting the server is the priority, full jitter. If getting people back into the app is the priority, decorrelated jitter. That is how this dataset reads.
+
+## Honoring Retry-After made recovery slower
+
+This is where the measurement diverged most sharply from my expectation.
+
+A well-behaved server sends `Retry-After` with a 429, and clients are supposed to respect it. Mine did.
+
+Here is the same scenario with the server returning `Retry-After: 30`.
+
+<table>
+  <thead>
+    <tr><th>Client implementation</th><th>Requests after recovery</th><th>Peak QPS</th><th>50% done</th><th>99% done</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Honor Retry-After exactly</td><td>9,423</td><td>1,174</td><td>150.4s</td><td><strong>283.5s</strong></td></tr>
+    <tr><td>Retry-After + full jitter on top</td><td>3,818</td><td>1,208</td><td>44.6s</td><td><strong>60.9s</strong></td></tr>
+    <tr><td>Retry-After as floor, 1x to 2x</td><td>3,762</td><td>1,174</td><td>74.1s</td><td>90.9s</td></tr>
+    <tr><td>Ignore Retry-After, decorrelated</td><td>2,324</td><td><strong>264</strong></td><td>39.0s</td><td>73.4s</td></tr>
+  </tbody>
+</table>
+
+The compliant implementation was the slowest. 283.5 seconds to 99%, against 73.4 seconds for the client that ignores the header entirely.
+
+The reason is embarrassingly simple. The server hands the same number to every client, so every client returns at the same moment. The synchronization I was fighting so hard to break was being reconstructed by my own server, on every rejection.
+
+And the more faithfully the client honors the header, the more completely it overwrites its own randomness. Correctness, in this narrow sense, strengthened the herd.
+
+Layering full jitter on top of `Retry-After` brought 99% completion down to 60.9 seconds — the fastest row in the table. The server's estimate of when capacity frees up is genuinely useful information. The only defect is that it is broadcast identically.
+
+The 1,208 peak QPS in that row is the initial burst at the 30 second mark. Those requests were already scheduled during the outage, so no client-side strategy removes them. Shaving that spike requires throttling on the server side.
+
+## Putting it into the app
+
+Here is what the measurements turned into on the Expo / React Native side. Three decisions:
+
+1. Decorrelated jitter by default, favoring time-to-recovery
+2. `Retry-After` treated as a floor, always with randomness layered on top
+3. A per-install fixed offset added to every delay, to further break same-second clustering
+
+```ts
+const BASE_DELAY_MS = 1000;
+const MAX_DELAY_MS = 60000;
+const MAX_ATTEMPTS = 6;
+
+// A stable 0-1 offset derived from the install id, unchanged across launches
+function installOffset(installId: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < installId.length; i++) {
+    h ^= installId.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 100000) / 100000;
+}
+
+// Uniform draw over [BASE, prev * 3], anchored to the previous delay
+function decorrelatedJitter(prevDelay: number, rand: () => number): number {
+  const upper = Math.max(BASE_DELAY_MS * 2, prevDelay * 3);
+  return Math.min(MAX_DELAY_MS, BASE_DELAY_MS + rand() * (upper - BASE_DELAY_MS));
+}
+
+// Accepts both the seconds form and the HTTP-date form
+function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const sec = Number(header);
+  if (Number.isFinite(sec)) return Math.max(0, sec * 1000);
+  const at = Date.parse(header);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null;
+}
+
+const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const id = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => { clearTimeout(id); reject(new DOMException('Aborted', 'AbortError')); },
+      { once: true },
+    );
+  });
+
+type RetryOpts = {
+  installId?: string;
+  rand?: () => number;
+  signal?: AbortSignal;
+  onRetry?: (info: { attempt: number; waitMs: number; reason: string }) => void;
+};
+
+export async function fetchWithRetry(
+  url: string,
+  init: RequestInit = {},
+  opts: RetryOpts = {},
+): Promise<Response> {
+  const { installId = 'anonymous', rand = Math.random, signal, onRetry } = opts;
+  const offset = installOffset(installId);
+  let prevDelay = BASE_DELAY_MS;
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, { ...init, signal });
+      if (!RETRYABLE.has(res.status)) return res; // most 4xx return immediately
+      lastErr = new Error(`HTTP ${res.status}`);
+
+      const ra = parseRetryAfter(res.headers.get('retry-after'));
+      // Retry-After is a floor; always layer randomness so clients do not realign
+      prevDelay = ra !== null
+        ? ra + rand() * Math.max(ra, BASE_DELAY_MS)
+        : decorrelatedJitter(prevDelay, rand);
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') throw e; // never retry a cancelled screen
+      lastErr = e;
+      prevDelay = decorrelatedJitter(prevDelay, rand);
+    }
+
+    if (attempt === MAX_ATTEMPTS) break;
+    const wait = Math.min(MAX_DELAY_MS, prevDelay + offset * BASE_DELAY_MS);
+    onRetry?.({ attempt, waitMs: Math.round(wait), reason: String((lastErr as Error)?.message ?? lastErr) });
+    await sleep(wait, signal);
+  }
+  throw lastErr;
+}
+```
+
+Running it against a local server that returns 429 three times and then 200:
+
+```
+status: 200 body: ok
+server hits: 4 elapsed: 6272 ms
+retry log: [
+  {"attempt":1,"waitMs":1889,"reason":"HTTP 429"},
+  {"attempt":2,"waitMs":1704,"reason":"HTTP 429"},
+  {"attempt":3,"waitMs":2640,"reason":"HTTP 429"}
+]
+```
+
+Against `Retry-After: 1`, the actual waits landed between 1.7 and 2.6 seconds. The floor is respected; the values do not collapse onto each other.
+
+`rand` is injectable specifically for tests. Pass a constant and the entire wait sequence becomes reproducible, which keeps retry tests from flaking.
+
+## Checking that the per-install offset actually spreads
+
+`installOffset` is a trimmed FNV-1a and nothing more. A skewed distribution would defeat its purpose, so I ran 2,000 UUIDs through it.
+
+```
+Histogram over 10 buckets (ideal = 200): 200 212 193 193 192 189 180 213 217 211
+max/min: 217 / 180   skew: 18.5%
+```
+
+Highest bucket 217, lowest 180, against an ideal of 200 — an 18.5% skew.
+
+That would be poor for anything cryptographic. For the goal here, which is breaking same-second clustering, it is fine.
+
+The more interesting choice is why this is not `Math.random()`. A value that changes on every launch means that clients which restart the app realign with each other. During an outage people reopen the app constantly, so that realignment is not hypothetical. Deriving the offset from the install id keeps each client in its own slot no matter how many times it is reopened.
+
+## What I settled on
+
+For my apps, the configuration ended up as:
+
+1. Decorrelated jitter by default, 60 second cap, 6 attempts maximum
+2. `Retry-After` used only as a floor, always multiplied by a 1x-2x random factor
+3. A per-install fixed offset added to every wait
+4. The server keeps sending `Retry-After` on 429, because the value itself is useful
+5. `AbortController` to reliably stop retries when a screen is dismissed
+
+One trap caught me before this reached production. I had `AbortError` in the retryable path, so a request fired from a screen the user had already dismissed kept going for up to six attempts in the background.
+
+Nothing shows up in the logs. The screen is gone, so a failure has no observer. During post-recovery congestion, those unwanted requests were competing for the same capacity as the ones people were actually waiting on.
+
+The fix is the single line `if ((e as Error).name === 'AbortError') throw e;` above. Obvious in isolation, easy to miss when retry logic is bolted on afterwards.
+
+Which one you pick depends on what you are protecting.
+
+<table>
+  <thead>
+    <tr><th>Situation</th><th>Recommendation</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Server capacity is tight</td><td>Full jitter</td><td>Lowest peak at 152 QPS; prioritizes not falling over</td></tr>
+    <tr><td>Getting users back matters most</td><td>Decorrelated jitter</td><td>99% done at 73.4s, the fastest under these conditions</td></tr>
+    <tr><td>Your server can send Retry-After</td><td>Retry-After + full jitter</td><td>99% done at 60.9s; keeps the signal, drops the synchronization</td></tr>
+    <tr><td>You want the smallest possible change</td><td>Widen jitter to at least ±25%</td><td>129.4s to 72.8s by editing a single constant</td></tr>
+  </tbody>
+</table>
+
+Open questions remain. The simulator treats server capacity as a constant, but real servers degrade under load. Modeling that would likely improve full jitter's standing, since suppressing the peak matters more when the peak damages throughput.
+
+The other one is the initial burst at the 30 second mark. No client-side strategy removes it, so the next thing worth measuring is throttling on the server side.
+
+My own retry code was blocking my own server. That was an uncomfortable thing to sit with. But once the numbers were on the table, the fix was obvious.
+
+If you are staring at the same problem, I hope some of this saves you an afternoon.
