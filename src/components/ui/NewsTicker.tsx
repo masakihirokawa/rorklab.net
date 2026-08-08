@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EXPO — Expo Agent がベータで公開されました。ブラウザ上でプロジェクトやリポジトリを直接扱いながら、プロンプトからアプリを生成・変更できます",
-    "NATIVE — Expo Agent の出力は iOS・Android・web 向けの、実際に配布できるネイティブアプリです",
-    "RN — React Native チームは新規プロジェクトについて Expo を公式に推奨しています。AI によるコード生成では、判断の余地を狭められる点が理由に挙げられます",
-    "MAX — Rork Max は native Swift を出力し、Claude Code と Opus 4.6 の組み合わせで動作します。標準の Rork は React Native（Expo）でクロスプラットフォームのアプリを生成します",
-    "CREDIT — Rork は無料で始められ、有料プランは月額 $25 からです。クレジットの消費は速いため、本格的に作る前提なら費用を見積もっておく必要があります",
-    "SEPT — App Store の申請時回答と Android の開発者認証は、いずれも2026年9月からです。配布経路の棚卸しは早めに済ませておく類の変更です",
+    "COMPARE — Expo が8月5日に、実際に Expo アプリを作らせる形で AI モデル3種を比較した記事を公開しました。コードと UI の品質では Fable 5 が最良という結果です",
+    "SDK — Expo SDK 57 は React Native 0.86 への追随を主眼とした小規模なリリースです。アップグレードを一大プロジェクトにしない方針が示されています",
+    "PREBUILD — expo prebuild が既定でネイティブの android / ios ディレクトリをクリアして再生成するようになりました。手を入れているプロジェクトは影響を受けます",
+    "OTA — Hermes のバイトコード差分により、OTA 更新で JS バンドル全体ではなく差分だけを配信できます。規模が出るほど帯域と費用に効きます",
+    "SIMULATOR — Rork はクラウド上の iOS シミュレータをブラウザへストリーミングします。Xcode も Mac 実機もなしに Apple 環境での確認ができます",
+    "HARDWARE — Rork は HealthKit・ARKit / LiDAR・NFC・Dynamic Island・Metal 3D まで届き、ノーコードの通常の範囲を超えた機能に対応します",
   ],
   en: [
-    "EXPO — Expo Agent is out in beta. It runs in the browser and lets you generate and modify apps from prompts while working directly on a project or repository",
-    "NATIVE — What Expo Agent produces are real, shippable native apps for iOS, Android, and the web",
-    "RN — The React Native team now officially recommends Expo for new projects, citing how much it narrows the decision space AI code generation has to navigate",
-    "MAX — Rork Max emits native Swift and runs on Claude Code paired with Opus 4.6, while standard Rork generates cross-platform apps with React Native (Expo)",
-    "CREDIT — Rork is free to start and paid plans begin at $25/month, but credits burn quickly — worth budgeting for before you build seriously",
-    "SEPT — App Store submission responses and Android developer verification both take effect in September 2026. Auditing your distribution paths early is the safer move",
+    "COMPARE — On August 5, Expo published a head-to-head of three AI models actually building Expo apps. Fable 5 came out ahead on code and UI quality",
+    "SDK — Expo SDK 57 is a small, focused release centered on moving apps to React Native 0.86 without turning the upgrade into a project of its own",
+    "PREBUILD — expo prebuild now clears and regenerates the native android and ios directories by default, which matters if you have hand-edited native code",
+    "OTA — Hermes bytecode diffing means an OTA update ships only the delta rather than the whole JS bundle, saving bandwidth and cost at scale",
+    "SIMULATOR — Rork streams a cloud iOS simulator to your browser, so you can test in a real Apple environment without Xcode or Mac hardware",
+    "HARDWARE — Rork reaches HealthKit, ARKit and LiDAR, NFC, Dynamic Island, and Metal 3D, well past where no-code tooling usually stops",
   ],
 };
 
