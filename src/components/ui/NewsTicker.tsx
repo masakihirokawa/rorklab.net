@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "COMPARE — Expo が8月5日に、実際に Expo アプリを作らせる形で AI モデル3種を比較した記事を公開しました。コードと UI の品質では Fable 5 が最良という結果です",
-    "SDK — Expo SDK 57 は React Native 0.86 への追随を主眼とした小規模なリリースです。アップグレードを一大プロジェクトにしない方針が示されています",
-    "PREBUILD — expo prebuild が既定でネイティブの android / ios ディレクトリをクリアして再生成するようになりました。手を入れているプロジェクトは影響を受けます",
-    "OTA — Hermes のバイトコード差分により、OTA 更新で JS バンドル全体ではなく差分だけを配信できます。規模が出るほど帯域と費用に効きます",
-    "SIMULATOR — Rork はクラウド上の iOS シミュレータをブラウザへストリーミングします。Xcode も Mac 実機もなしに Apple 環境での確認ができます",
-    "HARDWARE — Rork は HealthKit・ARKit / LiDAR・NFC・Dynamic Island・Metal 3D まで届き、ノーコードの通常の範囲を超えた機能に対応します",
+    "PREBUILD — expo prebuild が既定でネイティブの android / ios を消してから再生成します。ネイティブに手を入れているプロジェクトは前提の組み直しが要ります",
+    "SDK — Expo SDK 57 は React Native を 0.85 から 0.86 へ上げることが主目的です。React は SDK 56 と同じ 19.2 のままです",
+    "RHYTHM — 年3回の大型リリースから、軽量で速いリズムへ移す試験という位置づけです。次の SDK は9月から10月ごろが見込まれています",
+    "LAUNCHER — expo-dev-client の iOS ランチャーに、直近のプロジェクトを自動で開くかランチャーを表示するかを選べる設定が加わりました",
+    "COMPANION — Rork Companion を使えば、有料の Apple Developer アカウントなしで、生成したアプリを実機の iPhone で試せます",
+    "NATIVE — Rork Max はネイティブ Swift を生成し Xcode でコンパイルします。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象です",
   ],
   en: [
-    "COMPARE — On August 5, Expo published a head-to-head of three AI models actually building Expo apps. Fable 5 came out ahead on code and UI quality",
-    "SDK — Expo SDK 57 is a small, focused release centered on moving apps to React Native 0.86 without turning the upgrade into a project of its own",
-    "PREBUILD — expo prebuild now clears and regenerates the native android and ios directories by default, which matters if you have hand-edited native code",
-    "OTA — Hermes bytecode diffing means an OTA update ships only the delta rather than the whole JS bundle, saving bandwidth and cost at scale",
-    "SIMULATOR — Rork streams a cloud iOS simulator to your browser, so you can test in a real Apple environment without Xcode or Mac hardware",
-    "HARDWARE — Rork reaches HealthKit, ARKit and LiDAR, NFC, Dynamic Island, and Metal 3D, well past where no-code tooling usually stops",
+    "PREBUILD — expo prebuild now wipes and regenerates the native android and ios directories by default, so hand-edited native code needs a different home",
+    "SDK — Expo SDK 57 exists mainly to move apps from React Native 0.85 to 0.86. React stays at 19.2, unchanged from SDK 56",
+    "RHYTHM — It is a trial run for a lighter, faster release cadence after years of three big SDKs a year. The next one is expected around September or October",
+    "LAUNCHER — The iOS launcher in expo-dev-client gained a setting to either auto-open your most recent project or show the launcher",
+    "COMPANION — With Rork Companion you can run a generated app on a real iPhone without paying for an Apple Developer account",
+    "NATIVE — Rork Max generates native Swift and compiles it with Xcode, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
   ],
 };
 
