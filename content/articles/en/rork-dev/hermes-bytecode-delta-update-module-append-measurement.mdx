@@ -1,0 +1,270 @@
+---
+title: "Measuring Hermes Bytecode Delta Updates: One Added Module Cost 29x More Than One Changed Line"
+slug: "hermes-bytecode-delta-update-module-append-measurement"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-09T11:00"
+author: "Rork Lab"
+description: "I measured OTA delta sizes against a 2.4MB Hermes bytecode bundle. Changing one line cost 2,104 bytes; adding one module cost 61,197. The widely repeated advice about stable module IDs turned out to matter least."
+tags: ["Hermes", "EAS Update", "OTA", "Expo", "React Native"]
+highlights:
+  - "A measured table comparing bsdiff and zstd delta sizes across four kinds of change to the same bundle"
+  - "Why stabilizing module IDs — the standard advice — barely moved delta size, and what the numbers say instead"
+  - "The bundle split that took a delta from 61,197 bytes down to 1,247, with runnable measurement scripts"
+---
+
+There was a month where a copy tweak — one string, one line — shipped as a surprisingly heavy OTA update.
+
+As an indie developer running several apps, I find EAS bandwidth adds up in a quiet way. A one-word change pulling tens of kilobytes felt wrong, and "felt wrong" is not something I enjoy leaving in that state.
+
+So I built a small measurement rig instead of theorizing. Synthesize a bundle, compile it to Hermes bytecode, and line up the delta size for each kind of change.
+
+Two of my predictions turned out to be wrong.
+
+## What I was actually trying to measure
+
+The bandwidth cost of an OTA update comes down to one number: how many bytes separate the previous version from the new one.
+
+Ship the whole JS bundle and you pay the gzipped size every time. Ship a delta and you should pay something proportional to how much actually changed. That expected proportionality is the whole appeal of Hermes bytecode diffing.
+
+What I wanted to know was where the proportionality breaks.
+
+My prediction going in: Metro numbers its modules sequentially, so adding one module shifts every ID after it. Those shifted IDs sit inside dependency arrays across the whole file, so the delta smears out and balloons. Fix it with a stable `createModuleIdFactory` and the problem goes away.
+
+That prediction did not survive the measurement.
+
+## Building the rig
+
+Comparing two real builds mixes changes together and makes attribution impossible. So I generated a synthetic bundle shaped like Metro output.
+
+480 modules, each with 34 small functions and 28 dependency lookups, emitted as `__d(function(g,r,i,a,m,e,d){...}, ID, [DEPS]);`. That produced roughly 1.97MB of JavaScript, which Hermes compiled into about 2.40MB of bytecode — the same order of magnitude as the real bundles I ship.
+
+```python
+# gen.py — run with python3 gen.py
+# requires: pip install bsdiff4 --break-system-packages
+import random, hashlib, gzip, json, bsdiff4
+
+random.seed(20260809)
+N = 480
+NAMES = [f"src/features/{chr(97 + i % 26)}{i}/module{i}" for i in range(N)]
+
+def body(i, tweak=False):
+    """A module body with enough bulk to resemble real Metro output."""
+    lines = ["'use strict';Object.defineProperty(e,'__esModule',{value:!0});"]
+    for k in range(28):
+        lines.append(f"var _v{k}=r(d[{k % 6}]).default;")
+    # only this one string literal changes when tweak=True
+    label = "saved to library" if tweak else "saved"
+    lines.append(f"var LABEL_{i}='{label}';")
+    for k in range(34):
+        lines.append(
+            f"function h{i}_{k}(a,b){{var s=a+{k}*{i};if(s>{k * 7 + 3})"
+            f"{{return _v{k % 28}(s,'k{k}');}}return b?b(s):s;}}"
+        )
+    exports = ",".join(f"h{k}:h{i}_{k}" for k in range(34))
+    lines.append(f"e.default={{LABEL:LABEL_{i},{exports}}};")
+    return "".join(lines)
+
+def build(ids, order, tweak_at=None, extra=None, extra_pos=None):
+    """ids maps module index -> module ID (numeric or string)."""
+    out = []
+    for idx in order:
+        deps = [ids[(idx + 1 + j) % N] for j in range(6)]
+        out.append(
+            f"__d(function(g,r,i,a,m,e,d){{{body(idx, tweak=(idx == tweak_at))}}},"
+            f"{json.dumps(ids[idx])},{json.dumps(deps)});\n"
+        )
+    if extra is not None:
+        out.insert(len(out) if extra_pos is None else extra_pos, extra)
+    return ("var __d=function(){};\n" + "".join(out)).encode()
+
+order = list(range(N))
+num_ids = {i: i for i in order}
+hash_ids = {i: hashlib.sha1(NAMES[i].encode()).hexdigest()[:8] for i in order}
+
+NEW_BODY = 'function(g,r,i,a,m,e,d){"use strict";e.default=function(x){return x*2;};}'
+new_num = f'__d({NEW_BODY},480,[]);\n'
+new_hash = f'__d({NEW_BODY},{json.dumps(hashlib.sha1(b"src/features/new/doubler").hexdigest()[:8])},[]);\n'
+
+variants = {
+    "v1":  build(num_ids, order),                    # baseline, numeric IDs
+    "v1c": build(hash_ids, order),                   # baseline, hashed IDs
+    "vA":  build(num_ids, order, tweak_at=300),      # one string literal changed
+    "vB":  build({i: i + 1 for i in order}, order),  # every ID shifted, no code change
+    "vC":  build(num_ids, order, extra=new_num),     # one module appended
+    "vD":  build(hash_ids, order, extra=new_hash),   # same append, hashed IDs
+}
+for name, data in variants.items():
+    open(f"{name}.js", "wb").write(data)
+    print(f"{name}.js  {len(data):,} B  gzip={len(gzip.compress(data, 9)):,} B")
+```
+
+For the bytecode step I used the real Hermes compiler. `hermes-engine-cli` ships a Linux `hermesc` binary, so none of this requires a Mac.
+
+```bash
+npm install hermes-engine-cli
+H=./node_modules/hermes-engine-cli/linux64-bin/hermesc
+chmod +x "$H"
+for f in v1 v1c vA vB vC vD; do
+  "$H" -emit-binary -O -out "$f.hbc" "$f.js"
+done
+ls -l *.hbc
+```
+
+I ran two different differs: `bsdiff4`, which subtracts bytes before compressing, and `zstd --patch-from`, which is LZ-based. Drawing conclusions from a single differ means mistaking one implementation's quirks for a law.
+
+```python
+# measure.py
+import bsdiff4, subprocess, os
+
+def bs(a, b):
+    return len(bsdiff4.diff(open(a, "rb").read(), open(b, "rb").read()))
+
+def zs(a, b):
+    subprocess.run(["zstd", "-19", "--long=27", f"--patch-from={a}", b,
+                    "-o", "/tmp/p.zst", "-f", "-q"], check=True)
+    return os.path.getsize("/tmp/p.zst")
+
+cases = [
+    ("one string literal changed", "v1", "vA"),
+    ("all module IDs shifted",     "v1", "vB"),
+    ("one module appended",        "v1", "vC"),
+    ("one module appended (hash)", "v1c", "vD"),
+]
+for label, a, b in cases:
+    print(f"{label:30s} JS_bsdiff={bs(a+'.js', b+'.js'):>7,}  "
+          f"HBC_bsdiff={bs(a+'.hbc', b+'.hbc'):>7,}  "
+          f"HBC_zstd={zs(a+'.hbc', b+'.hbc'):>7,}")
+```
+
+## The numbers
+
+The baseline bundle came out at 1,965,412 bytes of JavaScript (151,037 gzipped) and 2,403,772 bytes of bytecode (374,232 gzipped). Ship it whole and even a one-character fix costs you 151KB or 374KB.
+
+Here is what the deltas looked like.
+
+<table>
+<thead>
+<tr><th>Change</th><th>JS text / bsdiff</th><th>Bytecode / bsdiff</th><th>Bytecode / zstd</th></tr>
+</thead>
+<tbody>
+<tr><td>One string literal changed</td><td>191 B</td><td><strong>2,104 B</strong></td><td>67,592 B</td></tr>
+<tr><td>All module IDs shifted</td><td>456 B</td><td><strong>589 B</strong></td><td>32,696 B</td></tr>
+<tr><td>One module appended (numeric IDs)</td><td>264 B</td><td><strong>61,197 B</strong></td><td>80,064 B</td></tr>
+<tr><td>One module appended (hashed IDs)</td><td>—</td><td>5,617 B</td><td>109,846 B</td></tr>
+</tbody>
+</table>
+
+I stared at that table for a while. The row I had been worried about produced the smallest number on the board.
+
+## Wrong prediction #1: stable module IDs barely mattered
+
+"Metro IDs are sequential, so adding a module shifts everything after it — switch to path-derived stable IDs with `createModuleIdFactory`" is advice you see everywhere. I believed it.
+
+But shifting every module ID while changing no code at all (row two) produced a **589-byte** bytecode delta. That is smaller than changing a single string literal.
+
+The reason is in how bsdiff works. It can express more than "copy this matching run" — it can also say "take the old bytes and add this offset." When `301` becomes `302` and `302` becomes `303` across the file, the difference values form a long, uniform run. Uniform runs compress away to almost nothing.
+
+In other words, a uniform ID shift is exactly the shape of change a byte-subtracting differ handles best. Fixing it moves your payload almost not at all.
+
+I had a `metro.config.js` change scheduled to implement stable IDs. Without measuring, I would have spent half a day on something worth 589 bytes.
+
+## Wrong prediction #2: the choice of differ was decisive for bytecode
+
+The second surprise was that the same change landed an order of magnitude apart depending on the differ.
+
+One changed string: 2,104 bytes with bsdiff, 67,592 bytes with `zstd --patch-from`. Roughly 32x apart.
+
+On the JS text, the same change measured 191 bytes with bsdiff and 202 bytes with zstd. Effectively identical.
+
+The gap exists because bytecode embeds offsets inside itself. Add one function and every table entry pointing past it shifts, scattering thousands of slightly-changed integers across the file. An LZ-based differ can only express "copy this matching run," so it cannot absorb thousands of values that each moved by one. A byte-subtracting differ folds them into near-zero difference runs.
+
+**If you ship JS text, the choice of differ hardly matters. If you ship bytecode, it is the single biggest fork in the road.** Build a delta pipeline on the wrong side of that fork and most of the benefit of diffing disappears.
+
+## The real culprit was adding a module at all
+
+That leaves row three. Appending one module — at the end, changing nothing else — produced a 61,197-byte delta. About 29x the cost of changing a string literal.
+
+The same change on the JS text costs 264 bytes. Compiling to bytecode turns "add a module," one of the most routine things you do, into an unusually expensive operation in bandwidth terms.
+
+Position made no difference. Inserting near the top or appending at the end both landed in the 61KB range, and row two already rules out ID shifting as the cause.
+
+What remains is the function table. A Hermes bytecode file carries a header entry for every function; this bundle contained 16,802 of them. Adding one module adds two functions, which lengthens that header region and pushes the entire bytecode body downstream. All 16,802 header offsets get rewritten. That pile of tiny rewrites is the 61KB.
+
+The hashed-ID row does drop to 5,617 bytes, but zstd reverses the ordering (109,846 bytes). When two differs disagree on direction, there is no reproducible effect to act on, so I am leaving that row in as a curiosity rather than a recommendation. What the measurement failed to establish is worth reporting as plainly as what it did.
+
+## What worked: splitting the bundle cut 98%
+
+If the cause is "the whole function table shifts," the fix is to shrink what can shift. Put the parts that rarely change and the parts that change every release into separate bytecode files.
+
+I moved 400 modules into a vendor bundle, kept 80 in the app bundle, and appended the new module only on the app side.
+
+```bash
+python3 - <<'PY'
+exec(open('gen.py').read().split('variants =')[0])
+vendor, app = list(range(400)), list(range(400, 480))
+open('vendor1.js','wb').write(build(num_ids, vendor))
+open('app1.js','wb').write(build(num_ids, app))
+open('vendor2.js','wb').write(build(num_ids, vendor))           # unchanged
+open('app2.js','wb').write(build(num_ids, app, extra=new_num))  # one module added
+PY
+H=./node_modules/hermes-engine-cli/linux64-bin/hermesc
+for f in vendor1 app1 vendor2 app2; do "$H" -emit-binary -O -out "$f.hbc" "$f.js"; done
+python3 -c "
+import bsdiff4
+d=lambda a,b: len(bsdiff4.diff(open(a,'rb').read(),open(b,'rb').read()))
+v,a=d('vendor1.hbc','vendor2.hbc'), d('app1.hbc','app2.hbc')
+print(f'vendor={v:,} B  app={a:,} B  total={v+a:,} B')
+"
+```
+
+The result:
+
+<table>
+<thead>
+<tr><th>Layout</th><th>Total delta</th><th>vs. single bundle</th></tr>
+</thead>
+<tbody>
+<tr><td>Single bundle (2.40MB)</td><td>61,197 B</td><td>—</td></tr>
+<tr><td>Split: vendor 2.00MB + app 0.40MB</td><td><strong>1,247 B</strong></td><td><strong>-98.0%</strong></td></tr>
+</tbody>
+</table>
+
+Splitting has its own trap. Even when the vendor source is effectively unchanged, a different dependency resolution order produces different bytecode. In production I now record the vendor bundle hash on every release so I can see when it was rebuilt without my intending it.
+
+The breakdown was 217 bytes for vendor and 1,030 for the app bundle. That 217 is bsdiff's fixed header cost even for byte-identical input — I confirmed with `cmp` that the two vendor files match exactly.
+
+The mechanism is simple. The function-table shift is now confined to the 0.40MB app bundle. The 2.00MB vendor bundle is untouched.
+
+The part worth getting right is where you draw the line: split by **change frequency**, not by feature or layer. React, React Native, navigation, state management — anything that only moves when you bump the SDK — goes on one side. Screens and business logic go on the other. That single decision changes your per-release payload by two orders of magnitude.
+
+## Turning this into an operating rule
+
+Here is how the results translated into my own checklist.
+
+1. **Confirm what you are actually shipping.** If you ship JS text, most of this is irrelevant; your deltas live in the 191–264 byte range and there is nothing to optimize. This article starts mattering the moment you move to bytecode diffing.
+2. **Verify your differ subtracts bytes.** If you build a delta pipeline yourself and pick an LZ-based differ, a one-line change will ship tens of kilobytes and you have thrown away most of the point.
+3. **Split the bundle by change frequency.** Dependencies on one side, app code on the other. This is the single highest-leverage change.
+4. **Deprioritize module ID stability.** Worth 589 bytes in this measurement. Do it for build reproducibility if you like; do not do it for bandwidth.
+5. **Log the actual delta size on every release.** One line per release. When a number jumps, you will know what you did that day.
+
+Unlike an App Store release, an OTA goes out with almost no friction, which is exactly why this class of cost stays invisible. One operational habit shifted for me as a result. Adding a single dependency can cost more bandwidth than rewriting a hundred lines of your own code. "Small addition" and "small change" carry very different prices in OTA terms, and I have become noticeably more deliberate about pulling in libraries.
+
+Delivery problems are a separate axis from size. I have written up [what to check when an EAS Update ships but nothing changes](/articles/rork-dev/rork-eas-update-ota-not-reflecting-troubleshooting) and [how to structure a staged rollout](/articles/rork-dev/ota-update-staged-rollout) separately — keeping size and reachability apart makes root-causing much faster.
+
+## Where this measurement stops
+
+To be straight about it: the bundle is synthetic. Real code has different function granularity and different string-reuse patterns, so you cannot lift these absolute numbers into your own project.
+
+The ratios are structural, though, and I think they hold as an order-of-magnitude guide. "Adding a module costs one to two orders more than changing a string" and "splitting removes most of that" follow from having a function table at all.
+
+Measuring your own bundle is the reliable move. Swap the generation step in `gen.py` for a read of your real bundle and the rest of the scripts run unchanged.
+
+## What the measurement taught me
+
+Had I optimized by intuition, I would have shipped a `createModuleIdFactory` implementation and felt good about a change worth almost nothing.
+
+The levers that actually mattered were on the side I was not looking at: which differ you use, and where you cut the bundle. Both are less interesting than module IDs, and both matter enormously more.
+
+The runs where the numbers contradict you teach the most. This was one of those. Thank you for reading.

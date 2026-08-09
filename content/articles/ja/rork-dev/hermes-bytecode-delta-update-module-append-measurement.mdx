@@ -1,0 +1,280 @@
+---
+title: "Hermes バイトコードの差分更新を実測する — モジュール1本の追加が更新サイズを29倍にした"
+slug: "hermes-bytecode-delta-update-module-append-measurement"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-09T11:00"
+author: "Rork Lab"
+description: "2.4MB の Hermes バイトコードで OTA 差分を実測しました。1行の変更は 2,104 バイト、モジュールを1本足すと 61,197 バイト。よく言われるモジュールID安定化はほぼ効かず、効いたのは別の2つでした。"
+tags: ["Hermes", "EAS Update", "OTA", "Expo", "React Native"]
+highlights:
+  - "同一バンドルに対する4種類の変更で、bsdiff と zstd の差分サイズを並べた実測表"
+  - "「モジュールIDを安定させる」定番の助言が差分サイズにほとんど効かなかった測定結果とその理由"
+  - "バンドル分割で差分を 61,197 バイトから 1,247 バイトへ落とした手順と、そのまま実行できる測定スクリプト"
+---
+
+文言を1つ直しただけの OTA 更新で、配信サイズが妙に大きい月がありました。
+
+個人開発でアプリを何本か抱えていると、EAS の帯域は地味に効いてきます。文字列を1つ変えただけの更新が、数十KB を持っていく。感覚としては「そんなに変わっていないはずなのに」という違和感でした。
+
+私自身、この手の違和感を放置して後で困ったことが何度かあります。今回は先に潰しておくことにしました。
+
+原因を推測で語るのは気持ちが悪かったので、手元で測ることにしました。バンドルを合成し、Hermes でバイトコードに落とし、変更の種類ごとに差分サイズを並べる。それだけの単純な測定台です。
+
+結果は、私の予想を2つとも外しました。
+
+## 何を測ろうとしたのか
+
+OTA 更新の配信量を決めるのは、最終的には「前のバージョンと今のバージョンの差分が何バイトか」です。
+
+JS バンドルをまるごと配るなら、gzip 後のサイズがそのまま配信量になります。一方、差分だけを配れるなら、変更の大きさに比例した量で済むはずです。Hermes のバイトコード差分が話題になるのも、この「比例するはず」という期待があるからです。
+
+私が知りたかったのは、その比例がどこで壊れるかでした。
+
+事前の予想はこうでした。モジュールIDが連番で振られている以上、モジュールを1本足せば以降のIDが全部ずれる。ずれたIDが依存配列に埋まっているので、差分は全体に広がって膨らむ。だから `createModuleIdFactory` でIDを安定させれば解決する — と。
+
+この予想は、後で見るとおり外れます。
+
+## 測定台を作る
+
+実プロジェクトで比較すると、変更が混ざって切り分けができません。そこで、Metro の出力に似せた合成バンドルを生成しました。
+
+480 モジュール、各モジュールに 34 個の小さな関数と 28 個の依存呼び出しを持たせ、`__d(function(g,r,i,a,m,e,d){...}, ID, [DEPS]);` の形で並べます。生成後のサイズは約 1.97MB、Hermes に通すと約 2.40MB のバイトコードになりました。手元のアプリの実バンドルと同じ桁です。
+
+```python
+# gen.py — python3 gen.py で実行できます
+# pip install bsdiff4 --break-system-packages が必要です
+import random, hashlib, gzip, json, bsdiff4
+
+random.seed(20260809)
+N = 480
+NAMES = [f"src/features/{chr(97 + i % 26)}{i}/module{i}" for i in range(N)]
+
+def body(i, tweak=False):
+    """Metro 出力に似た、それなりの大きさを持つモジュール本体を作ります。"""
+    lines = ["'use strict';Object.defineProperty(e,'__esModule',{value:!0});"]
+    for k in range(28):
+        lines.append(f"var _v{k}=r(d[{k % 6}]).default;")
+    # tweak=True のときだけ、この1行の文字列リテラルが変わります
+    label = "saved to library" if tweak else "saved"
+    lines.append(f"var LABEL_{i}='{label}';")
+    for k in range(34):
+        lines.append(
+            f"function h{i}_{k}(a,b){{var s=a+{k}*{i};if(s>{k * 7 + 3})"
+            f"{{return _v{k % 28}(s,'k{k}');}}return b?b(s):s;}}"
+        )
+    exports = ",".join(f"h{k}:h{i}_{k}" for k in range(34))
+    lines.append(f"e.default={{LABEL:LABEL_{i},{exports}}};")
+    return "".join(lines)
+
+def build(ids, order, tweak_at=None, extra=None, extra_pos=None):
+    """ids: モジュール index -> ID（数値でも文字列でも可）"""
+    out = []
+    for idx in order:
+        deps = [ids[(idx + 1 + j) % N] for j in range(6)]
+        out.append(
+            f"__d(function(g,r,i,a,m,e,d){{{body(idx, tweak=(idx == tweak_at))}}},"
+            f"{json.dumps(ids[idx])},{json.dumps(deps)});\n"
+        )
+    if extra is not None:
+        out.insert(len(out) if extra_pos is None else extra_pos, extra)
+    return ("var __d=function(){};\n" + "".join(out)).encode()
+
+order = list(range(N))
+num_ids = {i: i for i in order}
+hash_ids = {i: hashlib.sha1(NAMES[i].encode()).hexdigest()[:8] for i in order}
+
+NEW_BODY = 'function(g,r,i,a,m,e,d){"use strict";e.default=function(x){return x*2;};}'
+new_num = f'__d({NEW_BODY},480,[]);\n'
+new_hash = f'__d({NEW_BODY},{json.dumps(hashlib.sha1(b"src/features/new/doubler").hexdigest()[:8])},[]);\n'
+
+variants = {
+    # 基準（数値ID・ハッシュID）
+    "v1":  build(num_ids, order),
+    "v1c": build(hash_ids, order),
+    # A: 1行の文字列変更だけ
+    "vA":  build(num_ids, order, tweak_at=300),
+    # B: モジュールIDを全件+1ずらすだけ（コードは無変更）
+    "vB":  build({i: i + 1 for i in order}, order),
+    # C: 末尾にモジュールを1本追加するだけ（数値ID）
+    "vC":  build(num_ids, order, extra=new_num),
+    # D: 同じ追加をハッシュIDで
+    "vD":  build(hash_ids, order, extra=new_hash),
+}
+for name, data in variants.items():
+    open(f"{name}.js", "wb").write(data)
+    print(f"{name}.js  {len(data):,} B  gzip={len(gzip.compress(data, 9)):,} B")
+```
+
+バイトコード化には Hermes のコンパイラをそのまま使いました。`hermes-engine-cli` に Linux 向けの `hermesc` が同梱されているので、Mac がなくても測れます。
+
+```bash
+npm install hermes-engine-cli bsdiff4 2>/dev/null
+H=./node_modules/hermes-engine-cli/linux64-bin/hermesc
+chmod +x "$H"
+for f in v1 v1c vA vB vC vD; do
+  "$H" -emit-binary -O -out "$f.hbc" "$f.js"
+done
+ls -l *.hbc
+```
+
+差分器は2種類用意しました。バイト単位の減算を行う bsdiff 系（`bsdiff4`）と、LZ 系の `zstd --patch-from` です。1つの差分器だけで結論を出すと、その実装の癖を法則と取り違えます。
+
+```python
+# measure.py
+import bsdiff4, subprocess, os
+
+def bs(a, b):
+    return len(bsdiff4.diff(open(a, "rb").read(), open(b, "rb").read()))
+
+def zs(a, b):
+    subprocess.run(["zstd", "-19", "--long=27", f"--patch-from={a}", b,
+                    "-o", "/tmp/p.zst", "-f", "-q"], check=True)
+    return os.path.getsize("/tmp/p.zst")
+
+cases = [
+    ("1行の文字列変更のみ",        "v1", "vA"),
+    ("モジュールIDを全件ずらすのみ", "v1", "vB"),
+    ("モジュール1本追加（数値ID）",  "v1", "vC"),
+    ("モジュール1本追加（ハッシュID）", "v1c", "vD"),
+]
+for label, a, b in cases:
+    print(f"{label:28s} JS_bsdiff={bs(a+'.js', b+'.js'):>7,}  "
+          f"HBC_bsdiff={bs(a+'.hbc', b+'.hbc'):>7,}  "
+          f"HBC_zstd={zs(a+'.hbc', b+'.hbc'):>7,}")
+```
+
+## 測定結果
+
+基準となるバンドルのサイズは、JS が 1,965,412 バイト（gzip 後 151,037 バイト）、バイトコードが 2,403,772 バイト（gzip 後 374,232 バイト）でした。まるごと配れば、どんな小さな変更でも 151KB か 374KB がかかります。
+
+差分にするとこうなりました。
+
+<table>
+<thead>
+<tr><th>変更の内容</th><th>JS テキスト / bsdiff</th><th>バイトコード / bsdiff</th><th>バイトコード / zstd</th></tr>
+</thead>
+<tbody>
+<tr><td>1行の文字列変更のみ</td><td>191 B</td><td><strong>2,104 B</strong></td><td>67,592 B</td></tr>
+<tr><td>モジュールIDを全件ずらすのみ</td><td>456 B</td><td><strong>589 B</strong></td><td>32,696 B</td></tr>
+<tr><td>モジュール1本追加（数値ID）</td><td>264 B</td><td><strong>61,197 B</strong></td><td>80,064 B</td></tr>
+<tr><td>モジュール1本追加（ハッシュID）</td><td>—</td><td>5,617 B</td><td>109,846 B</td></tr>
+</tbody>
+</table>
+
+この表を最初に見たとき、しばらく手が止まりました。予想していた行の数字が、いちばん小さかったからです。
+
+## 外れた予想①: モジュールIDの安定化は、差分サイズにほぼ効かなかった
+
+「Metro のモジュールIDは連番なので、モジュールを足すと以降が全部ずれる。だから `createModuleIdFactory` でパス由来の安定IDに変えるべき」という助言は、あちこちで目にします。私もそう思っていました。
+
+ところが、コードを一切変えずにモジュールIDだけを全件ずらした条件（表の2行目）の差分は、バイトコードで **589 バイト** でした。1行の文字列を変えた条件の 2,104 バイトより小さいくらいです。
+
+理由は差分アルゴリズムの性質にあります。bsdiff は「一致する部分をコピー」だけでなく「旧バイト列との差を足し引きする」表現を持ちます。`301` が `302` に、`302` が `303` に、と全体が同じ方向へ1ずつずれた領域は、差分値がほぼ揃った長い列になります。揃った列は、そのあと圧縮されて消えます。
+
+つまり、IDのずれは差分器がいちばん得意とする形の変化でした。ここを直しても、配信サイズはほとんど動きません。
+
+私はこの助言を額面どおり受け取って、`metro.config.js` に安定IDの実装を入れる作業を予定に組んでいました。測っていなければ、効果のない変更に半日を使っていたはずです。
+
+## 外れた予想②: 差分器の選択が、バイトコードでは決定的だった
+
+もう1つの驚きは、同じ変更でも差分器によって桁が変わったことです。
+
+1行の文字列変更に対して、bsdiff は 2,104 バイト、`zstd --patch-from` は 67,592 バイトを出しました。約32倍の開きです。
+
+一方 JS テキストでは、同じ変更に対して bsdiff が 191 バイト、zstd が 202 バイト。ほぼ同じでした。
+
+差が出るのは、バイトコードが内部にオフセット値を埋め込んでいるからです。関数が1つ増えるとテーブルの各エントリが指す位置がずれ、ファイル全体に散らばった数値が少しずつ変わります。LZ 系の差分は「一致するバイト列のコピー」しか表現できないため、この「1ずつずれた無数の数値」を一致として扱えません。バイト単位で減算できる bsdiff 系は、これを差分ゼロに近い形に畳めます。
+
+**JS テキストを配っている限り、差分器の選択はほぼどうでもよい。バイトコードを配るなら、そこが最大の分岐点になる。** 差分配信の仕組みを自前で組む場合、ここを間違えると差分にした意味の大半が消えます。
+
+## 犯人はモジュールの追加そのものだった
+
+残ったのが3行目です。末尾にモジュールを1本足しただけで、差分は 61,197 バイトになりました。1行の文字列変更（2,104 バイト）の約29倍です。
+
+JS テキストなら同じ変更が 264 バイトで済むことを考えると、この差は無視できません。バイトコードにした瞬間、「モジュールを足す」という日常的な操作が、配信量の上では特別に高い操作に変わります。
+
+追加位置は関係ありませんでした。先頭付近に挿入しても末尾に追加しても、差分は6万バイト台のままです。IDのずれが原因ではないことは、2行目の測定が示しているとおりです。
+
+残るのは、関数テーブルの構造そのものです。バイトコードのファイルには、全関数のヘッダが並ぶ領域があります。今回のバンドルには 16,802 個の関数が入っていました。モジュールを1本足すと関数が2つ増え、そのぶんヘッダ領域が伸び、後続のバイトコード本体の位置が一律にずれます。16,802 個のヘッダが持つオフセット値がすべて書き換わる。この「膨大な数の小さな書き換え」が、6万バイトの正体です。
+
+ハッシュIDにすると 5,617 バイトまで下がる行もありますが、これは zstd で測ると逆転しました（109,846 バイト）。2つの差分器で結果が逆になる以上、再現する法則ではありません。運用の判断材料にはできないと考えて、この行は参考値として置いています。測定して分かったことより、測定しても分からなかったことのほうを正直に書いておきます。
+
+## 効いた対策: バンドルを分けると 98% 減った
+
+原因が「関数テーブル全体のずれ」なら、対策は「ずれる範囲を小さくする」ことになります。つまり、めったに変わらない部分と、毎回変わる部分を別のバイトコードファイルに分けることです。
+
+480 モジュールのうち 400 を vendor 側、80 をアプリ側に置き、アプリ側にだけモジュールを1本追加して測り直しました。
+
+```bash
+# 分割して測る（gen.py の build() を再利用します）
+python3 - <<'PY'
+exec(open('gen.py').read().split('variants =')[0])
+vendor, app = list(range(400)), list(range(400, 480))
+open('vendor1.js','wb').write(build(num_ids, vendor))
+open('app1.js','wb').write(build(num_ids, app))
+open('vendor2.js','wb').write(build(num_ids, vendor))          # 無変更
+open('app2.js','wb').write(build(num_ids, app, extra=new_num)) # 1本追加
+PY
+H=./node_modules/hermes-engine-cli/linux64-bin/hermesc
+for f in vendor1 app1 vendor2 app2; do "$H" -emit-binary -O -out "$f.hbc" "$f.js"; done
+python3 -c "
+import bsdiff4
+d=lambda a,b: len(bsdiff4.diff(open(a,'rb').read(),open(b,'rb').read()))
+v,a=d('vendor1.hbc','vendor2.hbc'), d('app1.hbc','app2.hbc')
+print(f'vendor={v:,} B  app={a:,} B  合計={v+a:,} B')
+"
+```
+
+結果です。
+
+<table>
+<thead>
+<tr><th>構成</th><th>差分の合計</th><th>単一バンドル比</th></tr>
+</thead>
+<tbody>
+<tr><td>単一バンドル（2.40MB）</td><td>61,197 B</td><td>—</td></tr>
+<tr><td>分割: vendor 2.00MB + app 0.40MB</td><td><strong>1,247 B</strong></td><td><strong>-98.0%</strong></td></tr>
+</tbody>
+</table>
+
+分割そのものにも落とし穴があります。vendor 側の内容が実質同じでも、依存の解決順が変わるとバイトコードは別物になります。本番運用では、vendor バンドルのハッシュをリリースごとに記録して、意図せず作り直されていないかを見るようにしました。
+
+内訳は vendor 側が 217 バイト、アプリ側が 1,030 バイトでした。vendor 側の 217 バイトは、入力が完全に同一でも bsdiff が出力するヘッダ相当の固定分です（`cmp` で両者がバイト一致していることは確認済みです）。
+
+効いた理由は単純です。関数テーブルのずれが、アプリ側の 0.40MB の中に閉じ込められました。vendor 側の 2.00MB は1バイトも触られていません。
+
+ここで大事なのは、分割の境界を「変更頻度」で引くことです。機能でもレイヤーでもありません。React・React Native・ナビゲーション・状態管理といった、SDK を上げるまで動かないものを片側にまとめる。画面とロジックを反対側に置く。この線の引き方だけで、日々の更新の配信量が2桁変わります。
+
+## 実運用に落とすときの判断
+
+測った結果を、自分のプロジェクトの手順に落とすとこうなりました。
+
+1. **まず、自分が何を配っているかを確認する。** JS テキストを配っているなら、ここまでの話の大半は関係ありません。差分は 191〜264 バイトの世界で、悩む余地がありません。バイトコード差分の仕組みに乗せた瞬間から、この記事の話が始まります。
+2. **差分器が bsdiff 系かを確かめる。** 自前で差分配信を組む場合、LZ 系を選ぶと1行の変更でも数十KB を配ることになります。差分にした意味が消えるので、ここは最初に確認します。
+3. **バンドルを変更頻度で2つに割る。** 依存パッケージ側とアプリ側。これが単独でいちばん効きます。
+4. **モジュールIDの安定化は、優先度を下げてよい。** 効果は測定範囲では 589 バイト分でした。ビルドの再現性のためにやる価値はありますが、配信量のためにやる作業ではありません。
+5. **リリースのたびに、実際の差分サイズを1行ログに残す。** 数字が跳ねた回に何をしたかが分かれば、次から判断が速くなります。
+
+順番としては 2 と 3 を先に済ませることを推奨します。1 と 4 は確認だけで終わることが多く、実際に配信量を動かすのは差分器とバンドル境界の2つだからです。
+
+App Store 側の審査を通す通常のリリースと違い、OTA は気軽に出せてしまうぶん、この種のコストが見えにくいところがあります。もう1つ、運用側で気づいたことがあります。依存パッケージを1つ足す変更は、コードを100行書き換える変更より配信量が大きくなり得ます。「小さな追加」と「小さな変更」は、OTA の世界では別のコストを持ちます。ライブラリを気軽に足していた自分の癖は、少し見直すことにしました。
+
+配信が思ったとおりに届かない側の問題については、[EAS Update を配信したのに反映されないときの確認手順](/articles/rork-dev/rork-eas-update-ota-not-reflecting-troubleshooting)と[段階配信の組み方](/articles/rork-dev/ota-update-staged-rollout)に別途まとめています。サイズと到達は別の問題として切り分けたほうが、原因にたどり着くのが速いはずです。
+
+## 測定の限界
+
+正直に書いておきます。今回のバンドルは合成したものです。実プロジェクトのコードは、関数の粒度も文字列の重複の仕方も違います。絶対値をそのまま自分のアプリに当てはめることはできません。
+
+一方で、比率のほうは構造から来ているので、桁の感覚としては使えると考えています。「モジュールの追加は文字列の変更より1桁から2桁重い」「分割すればその大半が消える」という関係は、関数テーブルを持つ形式である限り変わりません。
+
+自分のバンドルで測り直すのが確実です。上のスクリプトは、`gen.py` の生成部分を実バンドルの読み込みに差し替えるだけで、そのまま使えるようにしてあります。
+
+## 手を動かして分かったこと
+
+推測で最適化していたら、`createModuleIdFactory` を実装して、何も変わらないまま満足していたと思います。
+
+測ってみると、いちばん効く場所は自分が想定していない側にありました。差分器の選択と、バンドルの割り方。どちらも、モジュールIDよりずっと地味で、ずっと大きく効きます。
+
+数字が予想を裏切ったときのほうが、学べることが多い。今回もそうでした。お読みいただきありがとうございました。
