@@ -1,0 +1,278 @@
+---
+title: "署名付きURLに変えたらキャッシュが効かなくなった — expo-image のキーを URL から切り離す"
+slug: "rork-expo-image-signed-url-stable-cache-key-design"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-08-10T10:00"
+updated: "2026-08-10T10:00"
+author: "Rork Lab"
+description: "署名付きURLは毎回クエリが変わるため、URL をそのままキーにしている限りキャッシュは当たりません。expo-image の writeToCacheAsync / readFromCacheAsync でキーを自分で握り、再ダウンロードを半減させるまでの設計と実測です。"
+tags: ["Rork", "expo-image", "署名付きURL", "キャッシュ設計", "React Native"]
+highlights:
+  - "署名付きURLに移行してから通信量が増えた原因を特定でき、どこを直せば止まるかが判断できるようになります"
+  - "expo-image の writeToCacheAsync と readFromCacheAsync でキャッシュキーを自前管理する、そのまま動くコードが手に入ります"
+  - "キー設計を変えた場合にヒット率がどこまで戻るかを、自分のアクセス分布で見積もれるようになります"
+---
+
+配信元を署名付きURLに切り替えた翌週、通信量のグラフだけが一段上に持ち上がりました。画像の点数も解像度も変えていません。変えたのは URL の形だけです。
+
+犯人はキャッシュキーでした。署名付きURLは有効期限を過ぎるたびに `X-Amz-Signature` と `X-Amz-Date` が書き換わります。ライブラリから見れば、それは昨日と同じ画像ではなく、初めて見る別の画像です。
+
+私自身、壁紙アプリでこの構造に気づくまで、ディスクキャッシュの容量設定ばかりを疑っていました。上限を上げてもヒット率は戻りません。当たり前で、そもそも当たっていなかったからです。
+
+## 署名が変わるたびに、同じ画像が別物になる
+
+署名付きURLは、オブジェクトのパスに対して「この時刻まで、この鍵で、この操作を許す」という証明をクエリとして付けたものです。証明部分は有効期限に紐づくので、期限が切れれば作り直しになります。
+
+同じ壁紙 `w042.webp` が、セッションごとに次のように姿を変えます。
+
+```
+セッション1: https://cdn.example.net/wallpapers/w042.webp?X-Amz-Expires=3600&X-Amz-Date=20260810T000000Z&X-Amz-Signature=6f1c...
+セッション2: https://cdn.example.net/wallpapers/w042.webp?X-Amz-Expires=3600&X-Amz-Date=20260811T000000Z&X-Amz-Signature=a93e...
+```
+
+パスは同一です。しかし文字列としては別物です。ここが分岐点になります。
+
+<table>
+  <thead>
+    <tr><th>要素</th><th>セッションをまたいだときの挙動</th><th>キーに使えるか</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ホスト名</td><td>基本は不変。CDN を切り替えると変わる</td><td>単独では不十分</td></tr>
+    <tr><td>パス（<code>/wallpapers/w042.webp</code>）</td><td>不変。オブジェクトの同一性を表す</td><td><strong>使える</strong></td></tr>
+    <tr><td><code>X-Amz-Date</code> / <code>X-Amz-Signature</code></td><td>期限ごとに必ず変わる</td><td>使ってはいけない</td></tr>
+    <tr><td>変換パラメータ（<code>?w=1080&amp;fm=webp</code>）</td><td>要求内容が変われば変わる</td><td>使う。別バリアントは別キー</td></tr>
+  </tbody>
+</table>
+
+つまりキーに含めるべきは「どのオブジェクトを、どの形で欲しいか」であって、「いつ誰が許可したか」ではありません。
+
+## 既定のキャッシュキーはどこで決まっているか
+
+`expo-image` は `source.uri` の文字列からディスク上の格納先を決めます。`cachePolicy` は保存する層（メモリ／ディスク）を選ぶ設定であって、キーの作り方を変える設定ではありません。ここを混同していると、`cachePolicy="memory-disk"` を指定しているのに何も効いていない状態が起こります。
+
+```tsx
+// これは「保存先」を指定しているだけで、キーの安定性には一切関与しません
+<Image
+  source={{ uri: signedUrl }}   // 毎セッション文字列が変わる
+  cachePolicy="memory-disk"     // 保存はされるが、次回は別キーとして扱われる
+  style={styles.thumb}
+/>
+```
+
+保存はされます。ただし翌日には参照されないエントリとして残り、ディスク上限を押し上げるだけの死蔵データになります。容量が膨らむ側の症状は[Rork 製アプリの「書類とデータ」が数 GB に膨らむときの原因と対処](/articles/rork-dev/rork-expo-image-disk-cache-bloat-fix)で扱っていますが、署名付きURLが絡む場合は上限調整では止まりません。原因が容量ではなくキーだからです。
+
+## URL からキャッシュキーを切り離す
+
+方針は単純です。URL を「取得のための一時的な手段」と割り切り、キャッシュの同一性は別の関数で決めます。
+
+```ts
+// lib/imageKey.ts
+import * as Crypto from "expo-crypto";
+
+/** キーに含める変換パラメータ。ここに無いクエリは同一性に影響させません */
+const VARIANT_PARAMS = ["w", "h", "fm", "q", "dpr"] as const;
+
+/**
+ * 署名付きURLから、署名に依存しない安定キーを導きます。
+ * 同じオブジェクト・同じ変換なら、署名が変わっても同じ文字列を返します。
+ */
+export async function stableImageKey(url: string): Promise<string> {
+  const u = new URL(url);
+
+  // 変換パラメータのみを、順序を固定して取り出す
+  const variant = VARIANT_PARAMS
+    .map((p) => {
+      const v = u.searchParams.get(p);
+      return v === null ? null : `${p}=${v}`;
+    })
+    .filter((s): s is string => s !== null)
+    .join("&");
+
+  // ホスト名は含めません。CDN 移行でキャッシュ全滅を起こさないためです
+  const canonical = variant ? `${u.pathname}?${variant}` : u.pathname;
+
+  return Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    canonical
+  );
+}
+
+// 期待する出力（署名だけが違う2つのURL）
+// stableImageKey(".../w042.webp?w=1080&X-Amz-Signature=6f1c...")
+//   → "3b7c9f...".  同じ
+// stableImageKey(".../w042.webp?w=1080&X-Amz-Signature=a93e...")
+//   → "3b7c9f...".  同じ
+// stableImageKey(".../w042.webp?w=540&X-Amz-Signature=a93e...")
+//   → "e14a02...". 変換が違うので別キー
+```
+
+ホスト名を意図的に外している点が、後から効いてきます。配信元を切り替えたときに全キャッシュが無効化されると、移行当日に通信量が跳ねます。オブジェクトの同一性は保管場所ではなくパスが決めるはずなので、キーからも外しておきます。
+
+`VARIANT_PARAMS` を許可リストにしているのも同じ理由です。除外リストにすると、CDN 側が計測用のクエリを一つ足しただけでキーが割れます。含めるものを明示する側が安全です。
+
+## writeToCacheAsync と readFromCacheAsync で保存と再利用を自分で握る
+
+キーが決まれば、あとは読み書きをそのキーで行います。`expo-image` のキャッシュ API は、指定したキーで書き込み・読み出しができます。
+
+```ts
+// lib/imageCache.ts
+import { Image } from "expo-image";
+import { stableImageKey } from "./imageKey";
+
+type Resolver = (objectPath: string) => Promise<string>; // 署名付きURLを発行する関数
+
+/**
+ * 安定キーで先にキャッシュを引き、無ければ署名を取り直して取得・保存します。
+ * 返り値は <Image source={{ uri }} /> にそのまま渡せるローカルパスです。
+ */
+export async function resolveCachedImage(
+  objectPath: string,        // 例: "/wallpapers/w042.webp"
+  variantQuery: string,      // 例: "w=1080&fm=webp"
+  sign: Resolver
+): Promise<string> {
+  // キー導出は署名を必要としません。ここが重要です
+  const key = await stableImageKey(
+    `https://placeholder.invalid${objectPath}?${variantQuery}`
+  );
+
+  const cached = await Image.readFromCacheAsync(key);
+  if (cached) {
+    return cached; // 署名を一度も発行せずに返せます
+  }
+
+  // ここで初めて署名を発行する。発行回数そのものが減ります
+  const signed = await sign(`${objectPath}?${variantQuery}`);
+  const written = await Image.writeToCacheAsync(signed, { cacheKey: key });
+
+  return written ?? signed; // 書き込みに失敗しても表示は止めません
+}
+```
+
+順序が肝心です。署名を発行してからキャッシュを引くのではなく、キャッシュを引いてから必要な場合だけ署名を発行します。署名発行が API 呼び出しやエッジ関数の実行を伴う構成では、この順序だけで呼び出し回数が目に見えて減ります。
+
+呼び出し側はこうなります。
+
+```tsx
+// components/WallpaperThumb.tsx
+import { useEffect, useState } from "react";
+import { Image } from "expo-image";
+import { resolveCachedImage } from "../lib/imageCache";
+import { signObject } from "../lib/sign";
+
+export function WallpaperThumb({ objectPath }: { objectPath: string }) {
+  const [uri, setUri] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    resolveCachedImage(objectPath, "w=1080&fm=webp", signObject)
+      .then((u) => alive && setUri(u))
+      .catch(() => alive && setUri(null)); // 失敗時はプレースホルダのまま
+    return () => {
+      alive = false; // 高速スクロール中のアンマウント対策
+    };
+  }, [objectPath]);
+
+  return (
+    <Image
+      source={uri ? { uri } : undefined}
+      cachePolicy="memory"   // ディスク層は自前で握っているのでメモリのみに
+      style={{ width: 120, height: 213 }}
+      transition={120}
+    />
+  );
+}
+```
+
+`cachePolicy` を `memory` に落としているのは二重管理を避けるためです。ディスクへの書き込みを自前でも `expo-image` 既定でも行うと、同じバイト列が2つ残ります。プリフェッチとスクロール性能の兼ね合いについては[Rork で作ったリストのスクロールが重い — 画像キャッシュとプリフェッチの設計](/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design)で整理しています。
+
+## 手元で回した比較 — ヒット率 17.7% から 59.3% へ
+
+どれくらい戻るのかは、アクセス分布に依存します。感覚で語れないので、自分のアプリに近い条件でシミュレータを書いて回しました。Node v22.22.3 で実行した結果です。私が個人開発で運用している壁紙アプリは、閲覧が上位の数十点に強く偏るタイプなので、その偏りを再現する形にしています。
+
+条件は、カタログ300点、1セッションあたり60点を閲覧、20セッション、1枚あたり平均1.8MB、ディスク上限256MB、人気に偏る（指数2.2のべき乗）アクセス分布としました。署名は毎セッション再発行されます。
+
+<table>
+  <thead>
+    <tr><th>キーの決め方</th><th>ヒット率</th><th>20セッションの累計ダウンロード</th><th>LRU 退避回数</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>URL 全体をキーにする（既定）</td><td>17.7%</td><td>1.74 GB</td><td>846</td></tr>
+    <tr><td>パスと変換のみを正規化したキー</td><td><strong>59.3%</strong></td><td><strong>0.86 GB</strong></td><td>346</td></tr>
+  </tbody>
+</table>
+
+累計ダウンロード量で 50.6% の削減でした。退避回数が 846 から 346 へ落ちている点も見どころです。無効なエントリが枠を食い潰していたため、本来残るべき人気の壁紙まで押し出されていたことになります。ヒット率の低下は二重に効いていたわけです。
+
+キー導出そのものの費用も測りました。SHA-1 相当のハッシュ導出を10万回繰り返して 207.7 ms、1回あたり約 2.08 マイクロ秒です。スクロール1フレームの予算 16.7 ms に対して無視できる水準で、ここを惜しむ理由はありません。
+
+この数字はあくまで模擬環境のものです。分布のべき乗指数を 1.5 に緩めると差は縮み、2.5 に強めると広がります。自分のアプリの閲覧ログから指数を当てはめて回し直すと、投資に見合うかどうかの判断がつきます。
+
+## 署名が失効した瞬間の再取得経路
+
+キャッシュを外した先で、失効した署名を掴む場面が必ず来ます。プリフェッチ済みの URL を数時間後に使う、という経路が典型です。
+
+```ts
+// lib/fetchWithResign.ts
+const RESIGNABLE = new Set([401, 403]);
+
+/**
+ * 署名切れ（401/403）のときだけ一度だけ署名を取り直して再試行します。
+ * 404 や 5xx で再署名しても意味がないので、対象を絞ります。
+ */
+export async function fetchWithResign(
+  objectPath: string,
+  variantQuery: string,
+  sign: (p: string) => Promise<string>
+): Promise<Response> {
+  const target = `${objectPath}?${variantQuery}`;
+  let res = await fetch(await sign(target));
+
+  if (RESIGNABLE.has(res.status)) {
+    res = await fetch(await sign(target)); // 再署名は1回まで
+  }
+  return res;
+}
+
+// 期待する挙動
+// 200 → そのまま返る（署名発行1回）
+// 403 → 再署名して200（署名発行2回）
+// 404 → 再署名せずそのまま404（無駄な発行をしない）
+```
+
+再試行を1回に限っているのは、鍵側の設定ミスで恒久的に 403 が返る状態に入ると、無限にリトライして課金だけが伸びるからです。403 が連続する原因はバケットのポリシー側にあることが多く、こちらの切り分けは[Supabase Storage に画像を保存したのに URL が 403 になる](/articles/rork-dev/rork-supabase-storage-403-image-url-fix)が参考になります。
+
+## 実装中に踏んだ3つの落とし穴
+
+**クエリの順序でキーが割れる。** CDN やSDKによって `?w=1080&fm=webp` と `?fm=webp&w=1080` が混在します。`URLSearchParams` の列挙順をそのまま連結すると、同じ画像に2つのキーができます。上のコードで `VARIANT_PARAMS` の配列順に固定しているのはこのためです。
+
+**大文字小文字と末尾スラッシュ。** パスを人手で組み立てている箇所があると、`/Wallpapers/` と `/wallpapers/` が混ざります。キー導出の前に正規化するか、そもそもパスを一箇所からしか生成しない構造にします。私はこの手の揺れは規約で潰す方を好みます。パス生成はカタログ層の関数一つに寄せて、コンポーネント側では文字列連結をしないと決めました。
+
+**キー方式を変えた初回だけ通信量が跳ねる。** 旧キーで貯めたキャッシュは全部ミスになります。アプリ更新の当日にリリースノート無しでこれをやると、通信量の増加として観測されます。段階公開の 5% 枠で1日置いて、ディスク使用量と転送量の両方を見てから広げるのが安全です。
+
+## この設計を採るかどうかの判断基準
+
+全員がやるべき変更ではありません。判断の分かれ目は3つあります。
+
+<table>
+  <thead>
+    <tr><th>条件</th><th>自前キーにする価値</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>署名の有効期限がセッション長より短い</td><td>高い</td><td>同一セッション内ですらキーが割れる</td></tr>
+    <tr><td>同じ画像を複数セッションで再表示する</td><td>高い</td><td>ヒット率の回復幅がそのまま効く</td></tr>
+    <tr><td>画像が1回しか見られない（都度生成など）</td><td>低い</td><td>キャッシュ自体が仕事をしない</td></tr>
+    <tr><td>公開バケットで署名が不要</td><td>不要</td><td>既定のキーで十分に安定している</td></tr>
+  </tbody>
+</table>
+
+個人開発の範囲では、追加コードは 100 行に届きません。それでも自前で持つ以上、キャッシュの削除・移行・破損時の復旧まで自分の責任になります。無効化の手段（キー体系にバージョン接頭辞を1文字入れておく、など）を最初から仕込んでおくと、後から助かります。私は接頭辞 `v1:` を canonical の先頭に付けて運用しています。方式を変えたい日に、その1文字を `v2:` にするだけで全件を作り直せます。
+
+フォーマットの選択とデコード費用も同じ層の話なので、あわせて[転送量が半分になったのに、体感は速くならなかった](/articles/rork-dev/rork-image-format-avif-webp-decode-cost-cdn-negotiation)も読み合わせると、どこに手を入れるべきかの優先順位が付けやすくなります。
+
+## まとめ
+
+まず自分のアプリで、署名付きURLを2セッション分だけログに落として並べてみてください。パス以外のどこが変わっているかが1分で分かります。そこが分かれば、キーに何を含めるべきかは自ずと決まります。
+
+キャッシュの設計は地味で、効いているときは誰にも気づかれません。それでも通信量のグラフが静かに下がるのを見ると、少し報われた気持ちになります。お読みいただきありがとうございました。
