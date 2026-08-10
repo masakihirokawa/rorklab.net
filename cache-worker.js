@@ -10,7 +10,7 @@
 import nextHandler from "./.open-next/worker";
 
 // ── Config ──────────────────────────────────────────────────────
-const DEPLOY_VERSION = "2026-06-12-error-nocache";
+const DEPLOY_VERSION = "2026-08-10-bing-reopen";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 function injectPolyfill(response) {
