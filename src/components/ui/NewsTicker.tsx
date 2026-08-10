@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PREBUILD — expo prebuild が既定でネイティブの android / ios を消してから再生成します。ネイティブに手を入れているプロジェクトは前提の組み直しが要ります",
-    "SDK — Expo SDK 57 は React Native を 0.85 から 0.86 へ上げることが主目的です。React は SDK 56 と同じ 19.2 のままです",
-    "RHYTHM — 年3回の大型リリースから、軽量で速いリズムへ移す試験という位置づけです。次の SDK は9月から10月ごろが見込まれています",
-    "LAUNCHER — expo-dev-client の iOS ランチャーに、直近のプロジェクトを自動で開くかランチャーを表示するかを選べる設定が加わりました",
-    "COMPANION — Rork Companion を使えば、有料の Apple Developer アカウントなしで、生成したアプリを実機の iPhone で試せます",
-    "NATIVE — Rork Max はネイティブ Swift を生成し Xcode でコンパイルします。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象です",
+    "PUBLISH — Rork Max は生成したアプリの App Store 公開までを製品内で扱うとされています。他の AI アプリビルダーにはない範囲です",
+    "STEPS — 対象になるのは署名・プロビジョニング・審査提出という、初めての人がいちばん詰まる工程です",
+    "CAVEAT — ただし審査そのものは Apple 側の判断であり、通ることが保証される仕組みではありません",
+    "COMPANION — Rork Companion を使えば、有料の Apple Developer アカウントなしで実機の iPhone で試せます",
+    "FUNDING — 2026年4月9日、Left Lane Capital がリードする1,500万ドルのシードが発表されました。それ以前に a16z から280万ドルを調達しています",
+    "SCALE — アプリビルダーの Paperline を買収し、月間74万3,000訪問・成長率85%という数字が挙げられています",
   ],
   en: [
-    "PREBUILD — expo prebuild now wipes and regenerates the native android and ios directories by default, so hand-edited native code needs a different home",
-    "SDK — Expo SDK 57 exists mainly to move apps from React Native 0.85 to 0.86. React stays at 19.2, unchanged from SDK 56",
-    "RHYTHM — It is a trial run for a lighter, faster release cadence after years of three big SDKs a year. The next one is expected around September or October",
-    "LAUNCHER — The iOS launcher in expo-dev-client gained a setting to either auto-open your most recent project or show the launcher",
-    "COMPANION — With Rork Companion you can run a generated app on a real iPhone without paying for an Apple Developer account",
-    "NATIVE — Rork Max generates native Swift and compiles it with Xcode, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "PUBLISH — Rork Max handles App Store submission inside the product itself, a step no other AI app builder currently covers",
+    "STEPS — That means signing, provisioning, and review submission, the exact places first-time publishers tend to get stuck",
+    "CAVEAT — Approval still rests with Apple, so nothing here guarantees your app makes it through review",
+    "COMPANION — With Rork Companion you can try a generated app on a real iPhone without a paid Apple Developer account",
+    "FUNDING — On April 9, 2026, Rork announced a $15M seed led by Left Lane Capital, following an earlier $2.8M from a16z",
+    "SCALE — The company acquired app builder Paperline and reports roughly 743,000 monthly visits at an 85% growth rate",
   ],
 };
 
