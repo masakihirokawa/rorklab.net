@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PUBLISH — Rork Max は生成したアプリの App Store 公開までを製品内で扱うとされています。他の AI アプリビルダーにはない範囲です",
-    "STEPS — 対象になるのは署名・プロビジョニング・審査提出という、初めての人がいちばん詰まる工程です",
-    "CAVEAT — ただし審査そのものは Apple 側の判断であり、通ることが保証される仕組みではありません",
-    "COMPANION — Rork Companion を使えば、有料の Apple Developer アカウントなしで実機の iPhone で試せます",
-    "FUNDING — 2026年4月9日、Left Lane Capital がリードする1,500万ドルのシードが発表されました。それ以前に a16z から280万ドルを調達しています",
-    "SCALE — アプリビルダーの Paperline を買収し、月間74万3,000訪問・成長率85%という数字が挙げられています",
+    "ENGINE — Rork Max の内側では Claude Code と Opus 4.6 が動いています。長い作業を続け、自分の誤りに気づく点が強みとされています",
+    "NATIVE — 生成されるのは React Native ではなくネイティブ Swift です。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象になります",
+    "BUILD — ビルドはクラウド上の Mac で行われます。手元に Mac がなくても Apple 向けのアプリを組み立てられる構成です",
+    "CHOICE — iOS と Android と web を1つのコードで賄うなら従来の Rork、Apple に絞って作り込むなら Rork Max という分かれ方になります",
+    "TRACTION — 2026年2月に公開された Rork Max は、3日で年間経常収益150万ドルに達したと報じられています",
+    "LIMIT — ネイティブに寄せた分、Rork Max では Android や web に出せません。対象プラットフォームを先に決めてから選ぶ必要があります",
   ],
   en: [
-    "PUBLISH — Rork Max handles App Store submission inside the product itself, a step no other AI app builder currently covers",
-    "STEPS — That means signing, provisioning, and review submission, the exact places first-time publishers tend to get stuck",
-    "CAVEAT — Approval still rests with Apple, so nothing here guarantees your app makes it through review",
-    "COMPANION — With Rork Companion you can try a generated app on a real iPhone without a paid Apple Developer account",
-    "FUNDING — On April 9, 2026, Rork announced a $15M seed led by Left Lane Capital, following an earlier $2.8M from a16z",
-    "SCALE — The company acquired app builder Paperline and reports roughly 743,000 monthly visits at an 85% growth rate",
+    "ENGINE — Rork Max runs on Claude Code paired with Opus 4.6, which is credited with sustaining longer tasks and catching its own mistakes",
+    "NATIVE — It generates native Swift rather than React Native, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "BUILD — Compilation happens on cloud Mac servers, so you can assemble an Apple app without owning a Mac yourself",
+    "CHOICE — Original Rork covers iOS, Android, and web from one codebase; Rork Max trades that reach for depth on Apple platforms",
+    "TRACTION — Rork Max, released in February 2026, is reported to have reached $1.5M in annual recurring revenue within three days",
+    "LIMIT — That native focus is also a boundary: Rork Max cannot ship to Android or web, so pick your target platforms first",
   ],
 };
 
