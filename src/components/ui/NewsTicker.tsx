@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ENGINE — Rork Max の内側では Claude Code と Opus 4.6 が動いています。長い作業を続け、自分の誤りに気づく点が強みとされています",
-    "NATIVE — 生成されるのは React Native ではなくネイティブ Swift です。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象になります",
-    "BUILD — ビルドはクラウド上の Mac で行われます。手元に Mac がなくても Apple 向けのアプリを組み立てられる構成です",
-    "CHOICE — iOS と Android と web を1つのコードで賄うなら従来の Rork、Apple に絞って作り込むなら Rork Max という分かれ方になります",
-    "TRACTION — 2026年2月に公開された Rork Max は、3日で年間経常収益150万ドルに達したと報じられています",
-    "LIMIT — ネイティブに寄せた分、Rork Max では Android や web に出せません。対象プラットフォームを先に決めてから選ぶ必要があります",
+    "SEED — 2026年4月9日に Left Lane Capital 主導で1,500万ドルのシードラウンドを実施したと報じられています",
+    "M&A — 同じ発表でアプリビルダー Paperline の買収も明かされ、技術者を迎え入れる形の買収を続ける方針が示されています",
+    "MAX — 2026年2月公開の Rork Max はネイティブ Swift を書き出します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象です",
+    "CLOUD — ビルドはクラウド上の Mac で走ります。手元に Mac がなくても Apple 向けのアプリを組み立てられる構成になっています",
+    "REACH — 月間アクセスは74万を超え、伸び率は85%と集計されています。ノーコードのモバイル開発では上位に位置しています",
+    "CHOICE — iOS と Android と web を1つのコードで賄うなら従来の Rork、Apple に絞って作り込むなら Rork Max という分かれ方です",
   ],
   en: [
-    "ENGINE — Rork Max runs on Claude Code paired with Opus 4.6, which is credited with sustaining longer tasks and catching its own mistakes",
-    "NATIVE — It generates native Swift rather than React Native, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "BUILD — Compilation happens on cloud Mac servers, so you can assemble an Apple app without owning a Mac yourself",
+    "SEED — Rork is reported to have raised a $15M seed round led by Left Lane Capital, announced on April 9, 2026",
+    "M&A — The same announcement revealed the acquisition of app builder Paperline, with more talent-driven acquisitions signalled ahead",
+    "MAX — Rork Max, released in February 2026, emits native Swift for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "CLOUD — Builds run on a cloud Mac fleet, so you can assemble an Apple app without owning a Mac yourself",
+    "REACH — Traffic is tracked at over 743,000 monthly visits with 85% growth, placing it near the top of no-code mobile tooling",
     "CHOICE — Original Rork covers iOS, Android, and web from one codebase; Rork Max trades that reach for depth on Apple platforms",
-    "TRACTION — Rork Max, released in February 2026, is reported to have reached $1.5M in annual recurring revenue within three days",
-    "LIMIT — That native focus is also a boundary: Rork Max cannot ship to Android or web, so pick your target platforms first",
   ],
 };
 
