@@ -13,7 +13,7 @@ const META = {
   ja: {
     title: "メンバーシップ — Rork Lab",
     description:
-      `Rork Lab メンバーシップで、実装コード付きの上級ガイドが読み放題。Pro プラン（${PRICES.ja.pro}）と Premium プラン（${PRICES.ja.premium} 永久アクセス）をご用意しています。`,
+      `Rork Lab メンバーシップにご登録いただくと、実装コード付きの上級ガイドやプレミアム記事が読み放題になります。月額の Pro プラン（${PRICES.ja.pro}）と、一度のお支払いで永久にアクセスできる Premium プラン（${PRICES.ja.premium}）をご用意しています。`,
   },
   en: {
     title: "Membership — Rork Lab",

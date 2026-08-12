@@ -17,12 +17,12 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   return {
     title: isJa ? "すべての記事" : "All Articles",
     description: isJa
-      ? "Rork Max の使い方・開発テクニック・AI連携・収益化まで、すべての記事を一覧できます。"
+      ? "Rork Lab に掲載しているすべての記事の一覧です。Rork と Rork Max の使い方、React Native の開発テクニック、Gemini や Claude との AI 連携、広告やサブスクリプションによる収益化まで、カテゴリを横断して探せます。"
       : "Browse all articles covering Rork Max usage, development techniques, AI integrations, and monetization strategies.",
     openGraph: {
       title: isJa ? "すべての記事" : "All Articles",
       description: isJa
-        ? "Rork Max の使い方・開発テクニック・AI連携・収益化まで、すべての記事を一覧できます。"
+        ? "Rork Lab に掲載しているすべての記事の一覧です。Rork と Rork Max の使い方、React Native の開発テクニック、Gemini や Claude との AI 連携、広告やサブスクリプションによる収益化まで、カテゴリを横断して探せます。"
         : "Browse all articles covering Rork Max usage, development techniques, AI integrations, and monetization strategies.",
       images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
     },

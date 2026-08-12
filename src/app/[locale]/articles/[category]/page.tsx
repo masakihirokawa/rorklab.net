@@ -22,24 +22,24 @@ const CATEGORY_NAMES: Record<string, Record<string, string>> = {
 
 const CATEGORY_DESC: Record<string, Record<string, string>> = {
   "rork-basics": {
-    ja: "Rork Max の基本と使い方",
-    en: "Setup and basics of Rork Max",
+    ja: "RorkとRork Maxの始め方、プロンプトの基本的な書き方、Todoアプリや家計簿などの初心者向けチュートリアル、他のノーコードツールとの比較まで、AIでのアプリ開発をこれから始める方に向けた入門記事を集めています。",
+    en: "Getting-started guides, prompt-writing basics, beginner tutorials, and comparisons with other no-code tools for anyone new to building apps with Rork.",
   },
   "rork-dev": {
-    ja: "React Native・Expo・API連携",
-    en: "React Native, Expo, API integration",
+    ja: "React NativeとExpoの実装テクニック、ビルドエラーやクラッシュのトラブルシューティング、認証・通知・課金などのAPI連携まで、Rorkで生成したコードを本番品質へ育てるための開発者向けの実践記事を集めています。",
+    en: "React Native and Expo techniques, build-error and crash troubleshooting, and API integrations that help you take Rork-generated code to production quality.",
   },
   "rork-ai": {
-    ja: "Gemini・Claude・GPT統合",
-    en: "Gemini, Claude, GPT integration",
+    ja: "GeminiやClaude、GPTといったAIモデルの統合手順、プロンプト設計の実践、AIアプリビルダーの比較レビューまで、RorkのAI機能を深く使いこなすための記事をまとめています。ストリーミング応答や音声機能の実装例も扱います。",
+    en: "Hands-on guides for integrating Gemini, Claude, and GPT into Rork apps, along with prompt design techniques and in-depth AI app builder comparisons.",
   },
   "rork-business": {
-    ja: "App Store公開・収益化",
-    en: "App Store, monetization, analytics",
+    ja: "App StoreとGoogle Playへの公開手順、審査リジェクト対策、AdMob広告やサブスクリプションによる収益化、料金プランの選び方まで、Rorkで作ったアプリをビジネスとして育てるための実務記事を集めています。",
+    en: "Publishing to the App Store and Google Play, fixing review rejections, and growing revenue with ads, subscriptions, and smart pricing strategy.",
   },
   "app-dev": {
-    ja: "React Native・Expo・アプリ設計",
-    en: "React Native, Expo, mobile architecture",
+    ja: "React NativeとExpoを軸にしたアプリ設計の考え方、ストア用スクリーンショットなどの素材制作、パフォーマンス改善、リリース後の運用まで、個人開発でモバイルアプリを作り届けるための実践的な記事をまとめています。",
+    en: "Mobile architecture with React Native and Expo, store asset production, performance tuning, and post-launch operations for indie developers shipping apps.",
   },
 };
 

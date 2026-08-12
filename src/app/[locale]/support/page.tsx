@@ -10,11 +10,11 @@ interface Props {
 const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "メンバーシップ & サポート — Rork Lab",
-    description: `Rork Lab Pro / Premium メンバーシップで全プレミアム記事にアクセス。月額 ${PRICES.ja.pro.replace("/月", "")} または永久アクセス ${PRICES.ja.premium}。`,
+    description: `Rork Lab Pro / Premium メンバーシップにご登録いただくと、すべてのプレミアム記事と実装コードにアクセスできます。月額 ${PRICES.ja.pro.replace("/月", "")} の Pro と、一度のお支払いで永久にお読みいただける ${PRICES.ja.premium} の Premium からお選びください。`,
   },
   en: {
     title: "Membership & Support — Rork Lab",
-    description: `Get full access to all premium articles with Rork Lab Pro / Premium. ${PRICES.en.pro.replace("/mo", "")}/month or ${PRICES.en.premium} lifetime.`,
+    description: `Unlock every premium article and code walkthrough on Rork Lab with a Pro or Premium membership — ${PRICES.en.pro.replace("/mo", "")}/month, or a one-time ${PRICES.en.premium} payment for lifetime access.`,
   },
 };
 

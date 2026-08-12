@@ -56,8 +56,8 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const title = locale === "ja" ? `${label}の記事一覧` : `${label} Articles`;
   const description =
     locale === "ja"
-      ? `Rork Lab の${label}向け記事を一覧で閲覧できます。`
-      : `Browse all ${label.toLowerCase()}-level articles on Rork Lab.`;
+      ? `Rork Lab の${label}向け記事を難易度で絞り込んだ一覧ページです。Rork と Rork Max の学習を${label}のレベルに合わせて進められるよう、チュートリアルから実践的な解説までを揃えています。気になる記事から順にお読みください。`
+      : `Browse every ${label.toLowerCase()}-level article on Rork Lab — tutorials and practical guides matched to your experience with Rork and Rork Max.`;
 
   const base = "https://rorklab.net";
   const canonical = locale === "ja" ? `${base}/level/${level}` : `${base}/en/level/${level}`;

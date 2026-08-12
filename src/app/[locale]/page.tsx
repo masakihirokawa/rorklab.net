@@ -10,7 +10,7 @@ const META: Record<string, { title: string; description: string }> = {
   ja: {
     title: "Rork Lab — Rork Max 日本語ナレッジベース",
     description:
-      "Rork Max の初心者から上級者までを対象にした日本語ナレッジベース。基本機能、開発ツール連携、AI 統合、ビジネス活用まで網羅。",
+      "Rork と Rork Max の初心者から上級者までを対象にした日本語ナレッジベースです。基本機能の使い方、React Native や Expo との開発ツール連携、Gemini・Claude などの AI 統合、App Store 公開と収益化まで、実践的な記事を日々更新しています。",
   },
   en: {
     title: "Rork Lab — Rork Max Knowledge Base",

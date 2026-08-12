@@ -10,8 +10,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const title = locale === "ja" ? "タグ一覧" : "All Tags";
   const description =
     locale === "ja"
-      ? "Rork Lab の全記事をタグで分類。気になるトピックから記事を探せます。"
-      : "Browse all Rork Lab articles by tag. Find articles on the topics that interest you.";
+      ? "Rork Lab の全記事をタグごとに分類した一覧ページです。React Native、収益化、トラブルシューティングなど、気になるトピックのタグを選ぶと関連記事へすぐたどり着けます。学びたいテーマを横断して読むのに便利です。"
+      : "Browse every Rork Lab article by tag, from React Native and monetization to troubleshooting, and jump straight to the topics that interest you most.";
 
   const base = "https://rorklab.net";
   return {
