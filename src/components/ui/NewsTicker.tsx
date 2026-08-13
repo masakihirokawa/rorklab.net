@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SEED — 2026年4月9日に Left Lane Capital 主導で1,500万ドルのシードラウンドを実施したと報じられています",
-    "M&A — 同じ発表でアプリビルダー Paperline の買収も明かされ、技術者を迎え入れる形の買収を続ける方針が示されています",
-    "MAX — 2026年2月公開の Rork Max はネイティブ Swift を書き出します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象です",
-    "CLOUD — ビルドはクラウド上の Mac で走ります。手元に Mac がなくても Apple 向けのアプリを組み立てられる構成になっています",
-    "REACH — 月間アクセスは74万を超え、伸び率は85%と集計されています。ノーコードのモバイル開発では上位に位置しています",
-    "CHOICE — iOS と Android と web を1つのコードで賄うなら従来の Rork、Apple に絞って作り込むなら Rork Max という分かれ方です",
+    "MAX — Rork Max はネイティブ Swift を書き出し、クラウド上の Mac でビルドします。シミュレータの画面はブラウザにそのまま流れてきます",
+    "ENGINE — Rork Max の生成は Claude Code と Opus 4.6 で動いていると説明されています",
+    "SHIP — App Store への公開は2クリックで、Xcode も手元の Mac も要らない構成になっています",
+    "NATIVE — ARKit や LiDAR、Metal と SceneKit、ウィジェット、Dynamic Island、Live Activities、Siri Intents、HealthKit、HomeKit、NFC、App Clips まで届きます",
+    "PRICE — Max プランは月200ドルです。無料枠は週5プロンプト程度と案内されています",
+    "TRACTION — 2026年2月の公開から3日で ARR 150万ドルに達したと報じられ、月間アクセスは74万を超えています",
   ],
   en: [
-    "SEED — Rork is reported to have raised a $15M seed round led by Left Lane Capital, announced on April 9, 2026",
-    "M&A — The same announcement revealed the acquisition of app builder Paperline, with more talent-driven acquisitions signalled ahead",
-    "MAX — Rork Max, released in February 2026, emits native Swift for iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "CLOUD — Builds run on a cloud Mac fleet, so you can assemble an Apple app without owning a Mac yourself",
-    "REACH — Traffic is tracked at over 743,000 monthly visits with 85% growth, placing it near the top of no-code mobile tooling",
-    "CHOICE — Original Rork covers iOS, Android, and web from one codebase; Rork Max trades that reach for depth on Apple platforms",
+    "MAX — Rork Max emits native Swift and compiles it on a cloud Mac fleet, streaming the simulator straight into your browser",
+    "ENGINE — Rork Max is described as running on Claude Code with Opus 4.6 behind the generation step",
+    "SHIP — Publishing to the App Store takes two clicks, with no Xcode and no Mac of your own required",
+    "NATIVE — It reaches ARKit and LiDAR, Metal and SceneKit, widgets, Dynamic Island, Live Activities, Siri Intents, HealthKit, HomeKit, NFC, and App Clips",
+    "PRICE — The Max plan runs $200 per month, with a free tier documented at roughly five prompts per week",
+    "TRACTION — Rork Max is reported to have hit $1.5M ARR within three days of its February 2026 launch, and traffic sits above 743,000 monthly visits",
   ],
 };
 
