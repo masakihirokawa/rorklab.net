@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Max はネイティブ Swift を書き出し、クラウド上の Mac でビルドします。シミュレータの画面はブラウザにそのまま流れてきます",
-    "ENGINE — Rork Max の生成は Claude Code と Opus 4.6 で動いていると説明されています",
-    "SHIP — App Store への公開は2クリックで、Xcode も手元の Mac も要らない構成になっています",
-    "NATIVE — ARKit や LiDAR、Metal と SceneKit、ウィジェット、Dynamic Island、Live Activities、Siri Intents、HealthKit、HomeKit、NFC、App Clips まで届きます",
-    "PRICE — Max プランは月200ドルです。無料枠は週5プロンプト程度と案内されています",
-    "TRACTION — 2026年2月の公開から3日で ARR 150万ドルに達したと報じられ、月間アクセスは74万を超えています",
+    "PRICE — Rork Max の価格帯は月200ドルから1,800ドルまで幅があります。作業量の多い開発者やチーム向けの帯が上に伸びている形です",
+    "FREE — 無料枠は週5プロンプト程度です。試すには足りますが、継続的に作るなら有料前提の設計になっています",
+    "SHIP — App Store への公開はビルド・証明書・申請まで自動化されており、Mac も Xcode も持たずに iOS アプリを出せます",
+    "SIM — ブラウザ配信のシミュレータで、実際の Apple 環境で動く画面を手元のブラウザから確認できます",
+    "NATIVE — HealthKit、ARKit と LiDAR、NFC、Dynamic Island、Metal による3D まで届きます。React Native では触れない領域です",
+    "FUNDING — 2026年4月9日発表のシードで Left Lane Capital 主導の1,500万ドルを調達し、アプリビルダーの Paperline を買収しています",
   ],
   en: [
-    "MAX — Rork Max emits native Swift and compiles it on a cloud Mac fleet, streaming the simulator straight into your browser",
-    "ENGINE — Rork Max is described as running on Claude Code with Opus 4.6 behind the generation step",
-    "SHIP — Publishing to the App Store takes two clicks, with no Xcode and no Mac of your own required",
-    "NATIVE — It reaches ARKit and LiDAR, Metal and SceneKit, widgets, Dynamic Island, Live Activities, Siri Intents, HealthKit, HomeKit, NFC, and App Clips",
-    "PRICE — The Max plan runs $200 per month, with a free tier documented at roughly five prompts per week",
-    "TRACTION — Rork Max is reported to have hit $1.5M ARR within three days of its February 2026 launch, and traffic sits above 743,000 monthly visits",
+    "PRICE — Rork Max spans $200 to $1,800 per month, with the upper tiers aimed at heavier builders and teams",
+    "FREE — The free tier lands at roughly five prompts per week, enough to try it but not to build on continuously",
+    "SHIP — App Store publishing is automated through builds, certificates, and submission, so you can ship an iOS app without a Mac or Xcode",
+    "SIM — A browser-streamed simulator lets you watch your app run in a real Apple environment from your own browser",
+    "NATIVE — It reaches HealthKit, ARKit and LiDAR, NFC, Dynamic Island, and Metal 3D — territory React Native cannot touch",
+    "FUNDING — Rork raised a $15M seed led by Left Lane Capital, announced April 9, 2026, and acquired app builder Paperline",
   ],
 };
 
