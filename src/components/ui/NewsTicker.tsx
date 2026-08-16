@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FLOOD — App Store には2026年上半期だけで約56万本の新規アプリが並びました。2025年の年間総数に迫る勢いで、年内100万件超のペースです",
-    "REVIEW — 提出の急増で審査が長引いています。数週間待たされたという開発者の声も出ており、公開スケジュールには余裕を見ておきたいところです",
-    "RULE — Apple はガイドライン 2.5.2 を根拠に Replit と Vibecode の更新を止めた経緯があります。生成物を外部ブラウザで開く設計が求められました",
-    "MAX — Rork Max は React Native ではなく Swift を生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro、そして iMessage まで対象です",
-    "SIM — クラウド上の Mac 群でビルドし、60fps のシミュレータをブラウザへ配信します。タッチ入力もそのまま届きます",
-    "FUNDING — 4月9日発表のシードで Left Lane Capital 主導の1,500万ドルを調達し、アプリビルダーの Paperline を買収しています",
+    "ARCH — Expo SDK 56 は React Native 0.85 と React 19.2 を同梱します。New Architecture が既定になり、実験的採用の段階を抜けました",
+    "ENGINE — Hermes V1 が既定の JavaScript エンジンになりました。起動の高速化・実行時性能の改善・メモリ使用量の削減が入っています",
+    "SPEED — expo start が約5倍、Metro のファイルクロールが6倍、cold bundling が20〜50%、warm bundling が3〜8倍と公称されています。手元での実測と突き合わせたいところです",
+    "UI — Expo UI の Jetpack Compose と SwiftUI の API が SDK 56 で安定版になり、create-expo-app の既定テンプレートにも入りました",
+    "ANDROID — 6月16日配信の Android 17 は adaptive-first を必須の開発標準とした最初のバージョンです。大画面でのリサイズと画面向き変更への対応が求められます",
+    "GLASS — iOS 27 は Liquid Glass を採用した2013年以来最大の刷新です。対応アプリは Featured の編集コレクションで優先されるとされています",
   ],
   en: [
-    "FLOOD — The App Store took in roughly 560,000 new apps in the first half of 2026 alone, close to all of 2025, on pace to pass a million submissions this year",
-    "REVIEW — That surge is stretching review times, with some developers reporting waits of several weeks, so it is worth leaving slack in a launch schedule",
-    "RULE — Apple has previously halted updates from Replit and Vibecode under Guideline 2.5.2, requiring generated content to open in an external browser rather than an in-app web view",
-    "MAX — Rork Max generates Swift rather than React Native, reaching iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "SIM — Builds run on a cloud Mac fleet and stream a 60fps simulator back to your browser, touch input included",
-    "FUNDING — Rork raised a $15M seed led by Left Lane Capital, announced April 9, 2026, and acquired app builder Paperline",
+    "ARCH — Expo SDK 56 ships React Native 0.85 and React 19.2, and the New Architecture is now the default rather than the early-adopter path",
+    "ENGINE — Hermes V1 is the default JavaScript engine, bringing faster startup, better runtime performance, and lower memory use",
+    "SPEED — Expo quotes roughly 5x faster expo start, a 6x faster Metro file crawl, cold bundling 20 to 50 percent quicker, and warm bundling 3 to 8x faster, all worth measuring on your own project",
+    "UI — The Jetpack Compose and SwiftUI APIs in Expo UI are stable as of SDK 56 and now ship in the default create-expo-app template",
+    "ANDROID — Android 17, released June 16, is the first version to make adaptive-first a mandatory standard, requiring apps to handle resizing and orientation changes on large screens",
+    "GLASS — iOS 27 brings Liquid Glass, Apple's biggest platform redesign since 2013, and apps adopting it are reported to get priority in editorial featuring",
   ],
 };
 
