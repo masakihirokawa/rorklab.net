@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ARCH — Expo SDK 56 は React Native 0.85 と React 19.2 を同梱します。New Architecture が既定になり、実験的採用の段階を抜けました",
-    "ENGINE — Hermes V1 が既定の JavaScript エンジンになりました。起動の高速化・実行時性能の改善・メモリ使用量の削減が入っています",
-    "SPEED — expo start が約5倍、Metro のファイルクロールが6倍、cold bundling が20〜50%、warm bundling が3〜8倍と公称されています。手元での実測と突き合わせたいところです",
-    "UI — Expo UI の Jetpack Compose と SwiftUI の API が SDK 56 で安定版になり、create-expo-app の既定テンプレートにも入りました",
-    "ANDROID — 6月16日配信の Android 17 は adaptive-first を必須の開発標準とした最初のバージョンです。大画面でのリサイズと画面向き変更への対応が求められます",
-    "GLASS — iOS 27 は Liquid Glass を採用した2013年以来最大の刷新です。対応アプリは Featured の編集コレクションで優先されるとされています",
+    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと既存アプリの更新の双方に対象 API レベル36（Android 16）以上を要求します。残り13日です",
+    "EXTENSION — 期限に間に合わない場合は Play Console の期限延長フォームから申請することで11月1日まで配信を継続できます。延長は自動ではなく、申請自体を期限内に行う必要があります",
+    "TARGET SDK — Rork などのビルダーが出力する Expo / React Native アプリでも targetSdkVersion は自分で確認が必要です。テンプレートが古い SDK に固定されていると生成しただけでは要件を満たしません",
+    "POLICY — スパムと最低限の機能に関するポリシーが改定され、高品質な機能とコンテンツ体験が求められます。薄いアプリを量産する運用は正面から影響を受ける領域です",
+    "PRIVACY — 収集するデータの項目・用途・第三者への共有の有無について詳細な説明が求められます。ビルダーが自動で組み込む解析 SDK や広告 ID も申告の対象です",
+    "RORK — 従来の Rork が React Native / Expo を出力するのに対し、Rork Max は SwiftUI を生成します。無料枠から始められ、有料プランは月25ドルからです",
   ],
   en: [
-    "ARCH — Expo SDK 56 ships React Native 0.85 and React 19.2, and the New Architecture is now the default rather than the early-adopter path",
-    "ENGINE — Hermes V1 is the default JavaScript engine, bringing faster startup, better runtime performance, and lower memory use",
-    "SPEED — Expo quotes roughly 5x faster expo start, a 6x faster Metro file crawl, cold bundling 20 to 50 percent quicker, and warm bundling 3 to 8x faster, all worth measuring on your own project",
-    "UI — The Jetpack Compose and SwiftUI APIs in Expo UI are stable as of SDK 56 and now ship in the default create-expo-app template",
-    "ANDROID — Android 17, released June 16, is the first version to make adaptive-first a mandatory standard, requiring apps to handle resizing and orientation changes on large screens",
-    "GLASS — iOS 27 brings Liquid Glass, Apple's biggest platform redesign since 2013, and apps adopting it are reported to get priority in editorial featuring",
+    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 (Android 16) or higher for both new apps and updates to existing ones. Thirteen days left",
+    "EXTENSION — If you cannot make the date, the deadline extension form in Play Console buys you until November 1. The extension is not automatic, so the request itself has to land before August 31",
+    "TARGET SDK — Even for Expo and React Native apps produced by builders like Rork, the targetSdkVersion is yours to verify. A template pinned to an older SDK will not meet the requirement on its own",
+    "POLICY — The spam and minimum functionality policy has been tightened around high-quality features and content experience, which puts thin, mass-produced apps squarely in scope",
+    "PRIVACY — You are expected to explain in detail what data is collected, how it is used, and whether it is shared, including analytics SDKs and advertising identifiers a builder wires in for you",
+    "RORK — Where the original Rork emits React Native and Expo, Rork Max generates SwiftUI. There is a free tier to start with, and paid plans begin at $25 per month",
   ],
 };
 
