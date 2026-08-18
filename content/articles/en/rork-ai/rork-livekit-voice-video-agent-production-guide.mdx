@@ -5,18 +5,18 @@ category: "rork-ai"
 level: "advanced"
 premium: true
 date: "2026-04-22T20:00"
-updated: "2026-04-22T20:00"
+updated: "2026-08-18T19:30"
 author: "Rork Lab"
-description: "A complete guide to wiring LiveKit Agents into a Rork-generated React Native app and running low-latency AI voice agents in production."
+description: "Field notes on wiring LiveKit Agents into a Rork-generated React Native app: the agent server and token API, recovering from incoming calls and expired tokens, metered subscription billing, unit economics, and the monitoring queries that catch trouble before your users do."
 tags: ["Rork", "LiveKit", "Voice AI Agent", "React Native", "WebRTC", "Production"]
 highlights:
-  - "If you've been stuck on latency, dropped sessions, or flaky reconnects when prototyping voice AI, you'll come out with a production-ready infrastructure you can copy into your own app"
-  - "You'll get the full three-layer stack — LiveKit Agents server, Rork-generated client, and billing/permission wiring — as code you can paste and run"
-  - "You'll pick up the pattern for capping call minutes per subscription tier and the reconnect UX that cuts churn, giving you a real foundation for growing MRR"
+  - "Turn a voice agent that only works in demos into one that survives incoming calls, backgrounding, and expired tokens"
+  - "Get the full three-layer stack — LiveKit Agents server, Rork-generated client, and billing and permission wiring — as code you can paste and run"
+  - "Learn how to meter call minutes against subscription tiers, read your per-minute cost, and monitor the three signals that tell you something broke"
 ---
 "I want a voice-first AI assistant baked into my app." I've been getting this question almost weekly since OpenAI opened up the Realtime API and voice-first platforms like Vapi and Retell dropped their entry price. Getting a demo to talk back is easy. Shipping something that survives a subway tunnel and a monthly billing cycle is an entirely different game.
 
-My first voice chat app crashed every time a user rode under a bridge. Users don't type an angry review in that moment — they just leave. Reviewers who stuck around gave me one-star reviews with the subject "doesn't work on the train." The painful truth is that voice AI is one of those categories where anything above one second of latency makes users stop speaking, and a three-second reconnect means a 90-second churn.
+My first voice chat app crashed every time a user rode under a bridge. Users don't type an angry review in that moment — they just leave. Reviewers who stuck around gave me one-star reviews with the subject "doesn't work on the train." The painful truth is that voice AI is one of those categories where anything above one second of latency makes users stop speaking, and a session that takes a while to come back almost never comes back at all.
 
 This guide is for anyone stuck at that "demo works, production falls over" stage. We'll walk through the entire blueprint of a voice agent app using LiveKit Agents as the backend and a Rork-generated React Native client. Why LiveKit? Because writing your own WebRTC stack means you'll eventually face SRTP retransmission bugs and jitter-buffer issues that will eat weeks of your life. LiveKit Agents bundles the SFU and a Python/Node agent runtime together, and that one decision removes an entire category of production incidents from your roadmap.
 
@@ -443,6 +443,138 @@ const styles = StyleSheet.create({
 
 Expected behavior: tapping the button flips state to `connecting`, then `connected`, and the agent plays its greeting.
 
+### Treat Interruption and Disconnect as Two Different Problems
+
+With what we've built so far, LiveKit reconnects on its own when the network drops. But the network isn't the only thing that stops a call in production.
+
+In the order I hit them: an incoming phone call, another app grabbing audio playback, the user tapping home, and the access token expiring. The first three leave you connected to the room with a dead microphone. The last one makes every reconnect fail for the same reason, forever. Auto-reconnect saves you from neither.
+
+<table>
+<thead>
+<tr><th>Cause</th><th>What's actually happening</th><th>What your app has to do</th></tr>
+</thead>
+<tbody>
+<tr><td>Incoming call or alarm</td><td>The OS takes audio priority; the room stays connected</td><td>Re-check mic state on return and re-enable it</td></tr>
+<tr><td>Another app plays audio</td><td>Same as above; the user doesn't read this as a disconnect</td><td>Same — and don't show "disconnected" in the UI</td></tr>
+<tr><td>Home button or screen lock</td><td>Audio stops when the app backgrounds</td><td>Declare <code>audio</code> in <code>UIBackgroundModes</code></td></tr>
+<tr><td>Token expiry</td><td>The server closes the connection</td><td>Fetch a fresh token before every reconnect</td></tr>
+</tbody>
+</table>
+
+The last row is the one that fails quietly. We capped token TTL at 30 minutes back in Chapter 3, which means any call longer than 30 minutes is designed to drop once. Reuse the token you're holding and every retry gets rejected for the same reason — from the user's seat, the app simply doesn't connect.
+
+First, add a few thin accessors to the `VoiceClient` from Chapter 4.
+
+```typescript
+// lib/livekit.ts (added to VoiceClient)
+isConnected() {
+  return this.room.state === ConnectionState.Connected;
+}
+
+isMicrophoneEnabled() {
+  return this.room.localParticipant.isMicrophoneEnabled;
+}
+
+async setMicrophoneEnabled(on: boolean) {
+  await this.room.localParticipant.setMicrophoneEnabled(on);
+}
+
+giveUp() {
+  this.setState("error");
+}
+```
+
+Then put reconnect and mic recovery in one module.
+
+```typescript
+// lib/resilience.ts
+import { AppState, type AppStateStatus } from "react-native";
+import type { VoiceClient } from "./livekit";
+
+type TokenFetcher = () => Promise<{ url: string; token: string }>;
+
+const BACKOFF_MS = [0, 1_000, 2_000, 4_000, 8_000];
+
+export function attachResilience(client: VoiceClient, fetchToken: TokenFetcher) {
+  let attempt = 0;
+  let stopped = false;
+  let reconnecting = false;
+
+  const reconnect = async () => {
+    if (reconnecting) return;
+    reconnecting = true;
+    while (!stopped && attempt < BACKOFF_MS.length) {
+      await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
+      attempt += 1;
+      try {
+        // Always re-fetch: the old token may be exactly why we dropped
+        const { url, token } = await fetchToken();
+        await client.connect(url, token);
+        attempt = 0;
+        reconnecting = false;
+        return;
+      } catch {
+        // fall through to the next backoff step
+      }
+    }
+    reconnecting = false;
+    client.giveUp();
+  };
+
+  const offState = client.onState((s) => {
+    if (s === "disconnected" && !stopped) void reconnect();
+  });
+
+  const onAppState = async (next: AppStateStatus) => {
+    if (next !== "active" || stopped) return;
+    // Some devices come back from an interruption with the mic still off
+    if (client.isConnected() && !client.isMicrophoneEnabled()) {
+      await client.setMicrophoneEnabled(true);
+    }
+  };
+
+  const sub = AppState.addEventListener("change", onAppState);
+
+  return () => {
+    stopped = true;
+    offState();
+    sub.remove();
+  };
+}
+```
+
+Three unglamorous details carry this code.
+
+Re-fetching the token on every attempt is what turns "expired credentials" into a recoverable disconnect. Pass the token in as an argument instead and the caller will hold a stale one until the end of time.
+
+The `reconnecting` flag exists because some devices emit `disconnected` several times in quick succession. Without it, backoff stops meaning anything: you fire parallel connection attempts and the server starts rejecting them.
+
+And calling `giveUp()` when you're out of attempts is what keeps the app from failing silently. After five tries, telling someone to try again is more useful than a screen that just sits there.
+
+Last, declare background audio. Skip this and the call dies the moment the user taps home — by the time they come back, the conversation is over.
+
+```typescript
+// app.config.ts (extends the Chapter 4 snippet)
+ios: {
+  infoPlist: {
+    UIBackgroundModes: ["audio"],
+    NSMicrophoneUsageDescription: "We use the microphone so you can talk with the AI assistant.",
+  },
+},
+android: {
+  permissions: [
+    "RECORD_AUDIO",
+    "MODIFY_AUDIO_SETTINGS",
+    "FOREGROUND_SERVICE",
+    "FOREGROUND_SERVICE_MICROPHONE",
+  ],
+},
+```
+
+Android 14 and later require `FOREGROUND_SERVICE_MICROPHONE` for anything that keeps recording in the background. Ship without it and the call breaks on some real devices while working perfectly on your dev build — one of the harder bugs to narrow down.
+
+If you're an indie developer without a shelf of test devices, put one item in your pre-release checklist: start a call on a physical phone and have someone ring it. I skipped that step once and shipped a build that went silent on every incoming call for two weeks.
+
 ## Chapter 5: Production Pitfalls
 
 Here's what actually bit me in production, in the order it happened.
@@ -564,7 +696,7 @@ Apps that show "Call disconnected" when the network flickers get uninstalled. In
 2. If recovery fails after 5 seconds, say "Please check your connection and try again" — warm, not scolding
 3. Cache the last 3–4 conversation turns locally so reconnect preserves context and doesn't feel like a cold start
 
-These three changes moved my 30-day retention from 18% to 34%.
+After these three changes, my 30-day retention roughly doubled. I also rewrote the first-run copy in the same release, so I can't isolate the reconnect work as the cause. Take the direction, not the number.
 
 ## Chapter 7: Unit Economics and Break-Even
 
@@ -607,7 +739,7 @@ WHERE vu.period = to_char(now(), 'YYYY-MM');
 
 Check `status = 'LOSS'` users daily. Most are unintentional heavy users; a friendly email with usage tips usually resolves it.
 
-## Chapter 7.5: Observability — What You'll Actually Watch at 2 AM
+## Chapter 8: Observability — What You'll Actually Watch at 2 AM
 
 The moment you have paying users, you'll find yourself waking up to support emails like "the app just stopped talking halfway through a call." Without the right traces, you'll have no idea whether the STT dropped, the LLM rate-limited you, or LiveKit rotated a media server. Invest one afternoon in observability up front — it pays back the first time production flinches.
 
@@ -711,7 +843,7 @@ You may be tempted to ship the end-of-turn latency from the phone instead of the
 
 Log the error, then swallow it, then continue. The user is still on the line. They'd rather hear "sorry, could you repeat that?" than hear nothing at all. In the Python `VoiceAssistant` subclass, override `on_error` to speak a graceful apology and continue listening. I learned this after shipping a version that silently died on the first rate-limit error, leaving users on a frozen call.
 
-## Chapter 8: What to Do Next
+## Chapter 9: What to Do Next
 
 What you've gained here is the minimum map for a production voice agent. Where you grow from here depends on your goals.
 
@@ -735,4 +867,4 @@ I used this stack to ship a voice-memo-with-AI-summary app and crossed ¥400,000
 
 The biggest lesson: ship a working voice call to ten real users before optimizing anything. Real users surface problems — background noise, weird accents, accidental barge-ins — that never appear in your test sessions. Everything in this guide came from watching real calls fail in specific ways and patching each failure one at a time.
 
-For related implementation notes, see [Rork × OpenAI Realtime API: Building a Voice Assistant App](/en/articles/rork-ai/rork-openai-realtime-api-voice-assistant-app) and [Rork AI App Monetization Strategy: The Complete Guide](/en/articles/rork-ai/rork-ai-monetization-strategy-complete-guide).
+If you want a deeper billing layer under this, [Monetizing Rork AI Agents as SaaS](/articles/rork-ai/rork-ai-agent-monetization-subscription-model) covers the three-tier model. For the other side of voice — storing it and turning it into something users come back for — see [Building an AI Voice Diary App with Rork](/articles/rork-ai/rork-ai-voice-diary-emotion-tracking-complete-guide). Both sit on the same Supabase and Stripe foundation used here.
