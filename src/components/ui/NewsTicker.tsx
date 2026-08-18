@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと既存アプリの更新の双方に対象 API レベル36（Android 16）以上を要求します。残り13日です",
+    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと既存アプリの更新の双方に対象 API レベル36（Android 16）以上を要求します。残り12日です",
     "EXTENSION — 期限に間に合わない場合は Play Console の期限延長フォームから申請することで11月1日まで配信を継続できます。延長は自動ではなく、申請自体を期限内に行う必要があります",
-    "TARGET SDK — Rork などのビルダーが出力する Expo / React Native アプリでも targetSdkVersion は自分で確認が必要です。テンプレートが古い SDK に固定されていると生成しただけでは要件を満たしません",
-    "POLICY — スパムと最低限の機能に関するポリシーが改定され、高品質な機能とコンテンツ体験が求められます。薄いアプリを量産する運用は正面から影響を受ける領域です",
-    "PRIVACY — 収集するデータの項目・用途・第三者への共有の有無について詳細な説明が求められます。ビルダーが自動で組み込む解析 SDK や広告 ID も申告の対象です",
-    "RORK — 従来の Rork が React Native / Expo を出力するのに対し、Rork Max は SwiftUI を生成します。無料枠から始められ、有料プランは月25ドルからです",
+    "TARGET SDK — Rork が出力する Expo / React Native アプリでも targetSdkVersion は自分で確認が必要です。テンプレートが古い SDK に固定されていると、生成しただけでは要件を満たしません",
+    "RORK MAX — 従来の Rork が React Native / Expo を出力するのに対し、Rork Max はネイティブ Swift を生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage に対応します",
+    "FUNDING — Left Lane Capital 主導の1,500万ドルのシードラウンドが4月9日に発表されました。あわせてアプリビルダーの Paperline を買収し、エンジニアリング人材の獲得を進めています",
+    "iOS — iOS 27 は開発者向けベータ6が8月17日に配布され、秋の正式リリースが近づいています。ネイティブ Swift 出力を使うなら、新 OS への対応時期が配布計画に直接効いてきます",
   ],
   en: [
-    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 (Android 16) or higher for both new apps and updates to existing ones. Thirteen days left",
+    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 (Android 16) or higher for both new apps and updates to existing ones. Twelve days left",
     "EXTENSION — If you cannot make the date, the deadline extension form in Play Console buys you until November 1. The extension is not automatic, so the request itself has to land before August 31",
-    "TARGET SDK — Even for Expo and React Native apps produced by builders like Rork, the targetSdkVersion is yours to verify. A template pinned to an older SDK will not meet the requirement on its own",
-    "POLICY — The spam and minimum functionality policy has been tightened around high-quality features and content experience, which puts thin, mass-produced apps squarely in scope",
-    "PRIVACY — You are expected to explain in detail what data is collected, how it is used, and whether it is shared, including analytics SDKs and advertising identifiers a builder wires in for you",
-    "RORK — Where the original Rork emits React Native and Expo, Rork Max generates SwiftUI. There is a free tier to start with, and paid plans begin at $25 per month",
+    "TARGET SDK — Even for the Expo and React Native apps Rork produces, the targetSdkVersion is yours to verify. A template pinned to an older SDK will not meet the requirement on its own",
+    "RORK MAX — Where the original Rork emits React Native and Expo, Rork Max generates native Swift, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "FUNDING — A $15M seed round led by Left Lane Capital was announced on April 9, alongside the acquisition of app builder Paperline to bring in engineering talent",
+    "iOS — Developer beta 6 of iOS 27 arrived on August 17 with the autumn release drawing closer. If you ship native Swift output, the new OS timeline feeds straight into your release plan",
   ],
 };
 
