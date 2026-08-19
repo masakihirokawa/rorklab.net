@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと既存アプリの更新の双方に対象 API レベル36（Android 16）以上を要求します。残り12日です",
-    "EXTENSION — 期限に間に合わない場合は Play Console の期限延長フォームから申請することで11月1日まで配信を継続できます。延長は自動ではなく、申請自体を期限内に行う必要があります",
-    "TARGET SDK — Rork が出力する Expo / React Native アプリでも targetSdkVersion は自分で確認が必要です。テンプレートが古い SDK に固定されていると、生成しただけでは要件を満たしません",
-    "RORK MAX — 従来の Rork が React Native / Expo を出力するのに対し、Rork Max はネイティブ Swift を生成します。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage に対応します",
-    "FUNDING — Left Lane Capital 主導の1,500万ドルのシードラウンドが4月9日に発表されました。あわせてアプリビルダーの Paperline を買収し、エンジニアリング人材の獲得を進めています",
-    "iOS — iOS 27 は開発者向けベータ6が8月17日に配布され、秋の正式リリースが近づいています。ネイティブ Swift 出力を使うなら、新 OS への対応時期が配布計画に直接効いてきます",
+    "MEMORY — Expo SDK 57.0.9 が8月13日に React Native 0.86.2 へ更新され、SDK 56 で入った Hermes V1 のメモリ回帰が解消されました。reanimated や worklets を読み込むアプリが対象です",
+    "PREBUILD — expo prebuild が既定でネイティブディレクトリを破棄して再生成するようになりました。ios や android に手を入れている場合、更新前に差分の棚卸しが必要です",
+    "UPGRADE — SDK 57 は React Native 0.86 を含み React は 19.2 のままです。破壊的変更のない1コマンド更新として設計されており、大きな更新の合間に挟む位置づけです",
+    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと既存アプリの更新の双方に対象 API レベル36 以上を要求します。残り11日です",
+    "TARGET SDK — Rork が出力する Expo / React Native アプリでも targetSdkVersion は自分で確認が必要です。テンプレートが古い SDK に固定されていると生成しただけでは要件を満たしません",
+    "TESTFLIGHT — App Store Connect の TestFlight が Xcode 27 beta 5 でビルドしたアプリの内部・外部テストに対応しました。必須 SDK は現時点で iOS 26 のままです",
   ],
   en: [
-    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 (Android 16) or higher for both new apps and updates to existing ones. Twelve days left",
-    "EXTENSION — If you cannot make the date, the deadline extension form in Play Console buys you until November 1. The extension is not automatic, so the request itself has to land before August 31",
-    "TARGET SDK — Even for the Expo and React Native apps Rork produces, the targetSdkVersion is yours to verify. A template pinned to an older SDK will not meet the requirement on its own",
-    "RORK MAX — Where the original Rork emits React Native and Expo, Rork Max generates native Swift, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "FUNDING — A $15M seed round led by Left Lane Capital was announced on April 9, alongside the acquisition of app builder Paperline to bring in engineering talent",
-    "iOS — Developer beta 6 of iOS 27 arrived on August 17 with the autumn release drawing closer. If you ship native Swift output, the new OS timeline feeds straight into your release plan",
+    "MEMORY — Expo SDK 57.0.9 shipped React Native 0.86.2 on August 13, clearing the Hermes V1 memory regression from SDK 56 that hit apps importing reanimated or worklets",
+    "PREBUILD — expo prebuild now clears and regenerates native directories by default. If you have hand-edited ios or android, take stock of those changes before upgrading",
+    "UPGRADE — SDK 57 carries React Native 0.86 with React unchanged at 19.2, designed as a one-command upgrade with no breaking changes between the larger SDK releases",
+    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 or higher for both new apps and updates to existing ones. Eleven days left",
+    "TARGET SDK — Even for the Expo and React Native apps Rork produces, the targetSdkVersion is yours to verify. A template pinned to an older SDK will not meet the requirement",
+    "TESTFLIGHT — App Store Connect now accepts TestFlight builds made with Xcode 27 beta 5 for internal and external testing. The mandatory SDK floor stays at iOS 26 for now",
   ],
 };
 
