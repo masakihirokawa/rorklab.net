@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MEMORY — Expo SDK 57.0.9 が8月13日に React Native 0.86.2 へ更新され、SDK 56 で入った Hermes V1 のメモリ回帰が解消されました。reanimated や worklets を読み込むアプリが対象です",
-    "PREBUILD — expo prebuild が既定でネイティブディレクトリを破棄して再生成するようになりました。ios や android に手を入れている場合、更新前に差分の棚卸しが必要です",
-    "UPGRADE — SDK 57 は React Native 0.86 を含み React は 19.2 のままです。破壊的変更のない1コマンド更新として設計されており、大きな更新の合間に挟む位置づけです",
-    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと既存アプリの更新の双方に対象 API レベル36 以上を要求します。残り11日です",
-    "TARGET SDK — Rork が出力する Expo / React Native アプリでも targetSdkVersion は自分で確認が必要です。テンプレートが古い SDK に固定されていると生成しただけでは要件を満たしません",
-    "TESTFLIGHT — App Store Connect の TestFlight が Xcode 27 beta 5 でビルドしたアプリの内部・外部テストに対応しました。必須 SDK は現時点で iOS 26 のままです",
+    "BUILD — Rork Max はクラウド上の実機 Mac に Xcode と iOS SDK を載せ、SwiftUI を書き、ビルドし、エラーを読んで直す反復を回します。コードを吐いて終わりではない点が生成物の質に効いています",
+    "NATIVE — 生成されるのは React Native ではなく純粋な Swift / SwiftUI です。AR や Metal、ウィジェットなど React Native からは届かない機能に手が届くことが、他ビルダーとの実質的な差になります",
+    "PLATFORMS — 対応は iPhone・iPad・Apple Watch・Apple TV・Vision Pro に加えて iMessage まで含みます。ウォッチや拡張から入る設計を試すのに向いています",
+    "COMPANION — Rork Companion により、有料の Apple Developer アカウントなしで生成したアプリを実機の iPhone で確認できます。最初の一本を試す段階の障壁が一段下がりました",
+    "PRICING — 無料で開始でき有料プランは月額25ドルから、Rork Max は月額200ドルの Max プランです。回収できる本数と規模を先に見積もっておく価値があります",
+    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと更新の双方に対象 API レベル36 以上を要求します。残り10日で、生成物の targetSdkVersion は自分で確認が必要です",
   ],
   en: [
-    "MEMORY — Expo SDK 57.0.9 shipped React Native 0.86.2 on August 13, clearing the Hermes V1 memory regression from SDK 56 that hit apps importing reanimated or worklets",
-    "PREBUILD — expo prebuild now clears and regenerates native directories by default. If you have hand-edited ios or android, take stock of those changes before upgrading",
-    "UPGRADE — SDK 57 carries React Native 0.86 with React unchanged at 19.2, designed as a one-command upgrade with no breaking changes between the larger SDK releases",
-    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 or higher for both new apps and updates to existing ones. Eleven days left",
-    "TARGET SDK — Even for the Expo and React Native apps Rork produces, the targetSdkVersion is yours to verify. A template pinned to an older SDK will not meet the requirement",
-    "TESTFLIGHT — App Store Connect now accepts TestFlight builds made with Xcode 27 beta 5 for internal and external testing. The mandatory SDK floor stays at iOS 26 for now",
+    "BUILD — Rork Max runs real Macs in the cloud loaded with Xcode and the iOS SDK, writing SwiftUI, compiling, reading the errors and building again. That loop, not the code generation, is what lifts the output",
+    "NATIVE — What comes out is pure Swift and SwiftUI, not React Native. Reaching AR, Metal graphics and widgets that React Native cannot touch is the real gap between this and other builders",
+    "PLATFORMS — Coverage spans iPhone, iPad, Apple Watch, Apple TV and Vision Pro, plus iMessage. Worth a look if you want to start from a watch app or an extension rather than a phone screen",
+    "COMPANION — The Rork Companion app lets you check a generated build on a real iPhone without a paid Apple Developer account, lowering the bar for trying a first project end to end",
+    "PRICING — Free to start, paid plans from $25 a month, and Rork Max on the $200 Max plan. Worth working out up front how many projects it takes to earn that back",
+    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 or higher for new apps and updates alike. Ten days out, and the targetSdkVersion of what you generate is yours to verify",
   ],
 };
 
