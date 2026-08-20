@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-13T20:15"
-updated: "2026-04-13T20:15"
+updated: "2026-08-20T11:30"
 author: "Rork Lab"
 description: "Field notes on shipping LLM streaming (SSE) in React Native and Expo. Anthropic, OpenAI and Gemini behind one interface, AbortController cancellation and retries, a Cloudflare Workers proxy, context compaction, and a mock SSE server for testing at zero API cost."
 tags: ["streaming", "SSE", "LLM", "AI", "Anthropic", "OpenAI", "React Native", "Expo", "Cloudflare Workers", "Rork"]
@@ -45,10 +45,20 @@ es.onmessage = (e) => console.log(e.data);
 
 In React Native, this throws or does nothing depending on your setup. The `EventSource` Web API simply isn't part of the RN runtime.
 
-The correct approach uses `fetch()` with `ReadableStream`, which has been available in React Native since Expo SDK 49:
+Streaming means reading a `ReadableStream` off a `fetch()` response. And this is where the second trap sits — the one that cost me half a day.
+
+**React Native's global `fetch` does not give you `response.body`.** RN's `fetch` is a polyfill layered on XMLHttpRequest, and stream support was never implemented ([facebook/react-native#27741](https://github.com/facebook/react-native/issues/27741) has been open for years). Upgrading your Expo SDK does not change this.
+
+What you want is **`expo/fetch`**, added in Expo SDK 52. It is a separate WinterCG-compliant implementation that you pull in as a named import. It does not replace the global, so if you forget the import line your code quietly falls back to the old implementation — and that is genuinely hard to spot.
 
 ```tsx
-// ✅ Correct approach for React Native / Expo
+// ❌ The global fetch — the request succeeds, but body is undefined
+const bad = await fetch(url, { method: 'POST', body });
+bad.body; // → undefined (RN polyfill)
+
+// ✅ Expo SDK 52+. The named import is not optional
+import { fetch } from 'expo/fetch';
+
 const response = await fetch('https://api.anthropic.com/v1/messages', {
   method: 'POST',
   headers: {
@@ -75,7 +85,18 @@ while (true) {
 }
 ```
 
-If `response.body` comes back as `null`, your project is on Expo SDK 48 or earlier. Upgrade to SDK 49+ or install the `react-native-fetch-api` polyfill. New Rork projects use the latest SDK by default, so this usually isn't an issue.
+When `response.body` comes back as `undefined`, it is almost always one of three causes.
+
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><code>body</code> is undefined, no error thrown</td><td>You are on the global fetch</td><td>Add <code>import &#123; fetch &#125; from 'expo/fetch';</code></td></tr>
+<tr><td>Still undefined after importing</td><td>Expo SDK 51 or earlier</td><td>Upgrade to SDK 52+, or fall back to a library such as <code>react-native-sse</code></td></tr>
+<tr><td>Works on web, fails on device only</td><td><code>EXPO_PUBLIC_USE_RN_FETCH=1</code> is set</td><td>That flag restores the RN implementation as the global. Named imports are unaffected, so check your import path first</td></tr>
+</tbody>
+</table>
+
+Rork scaffolds projects on a recent SDK, but whether the generated code actually calls `expo/fetch` depends on what it wrote for you. When adding streaming, read the import line with your own eyes before anything else.
 
 ### Parsing SSE Format Correctly
 
@@ -109,6 +130,8 @@ Here's the full `useStreamingChat` hook used in production Rork projects. It han
 ```tsx
 // hooks/useStreamingChat.ts
 import { useState, useRef, useCallback } from 'react';
+// ⚠️ The global fetch cannot stream. This named import is required.
+import { fetch } from 'expo/fetch';
 
 type Message = {
   role: 'user' | 'assistant';
@@ -127,11 +150,22 @@ type StreamingState = {
 // Always proxy through your backend — never put API keys in the app binary
 const PROXY_URL = 'https://your-worker.your-subdomain.workers.dev/api/chat';
 
+// For error events that arrive after an HTTP 200. A dedicated class keeps them
+// distinguishable from ordinary per-chunk JSON parse failures.
+class StreamAbortedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StreamAbortedError';
+  }
+}
+
 export function useStreamingChat(): StreamingState {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Whether we've painted at least one character. Gates retry eligibility.
+  const hasEmittedRef = useRef(false);
 
   const stopStreaming = useCallback(() => {
     if (abortControllerRef.current) {
@@ -157,6 +191,7 @@ export function useStreamingChat(): StreamingState {
     setMessages([...updatedMessages, { role: 'assistant', content: '' }]);
 
     let retryCount = 0;
+    hasEmittedRef.current = false; // reset on every send
     const maxRetries = 2;
 
     const attemptFetch = async (): Promise<void> => {
@@ -198,6 +233,15 @@ export function useStreamingChat(): StreamingState {
 
               try {
                 const parsed = JSON.parse(data);
+
+                // ⚠️ Easy to miss: an error event can arrive *after* a 200 OK.
+                // Drop it and a truncated answer looks like a clean finish.
+                if (parsed.type === 'error' || parsed.error) {
+                  const detail =
+                    parsed.error?.message ?? parsed.error?.type ?? 'stream error';
+                  throw new StreamAbortedError(detail);
+                }
+
                 // Handle Anthropic format
                 const deltaText = parsed.delta?.text
                   // Handle OpenAI format
@@ -205,6 +249,7 @@ export function useStreamingChat(): StreamingState {
                   ?? '';
 
                 if (deltaText) {
+                  hasEmittedRef.current = true;
                   accumulatedText += deltaText;
                   // Use functional setState to avoid stale closure issues
                   setMessages(prev => {
@@ -213,7 +258,9 @@ export function useStreamingChat(): StreamingState {
                     return next;
                   });
                 }
-              } catch {
+              } catch (e) {
+                // Do not swallow StreamAbortedError — let it reach the handler
+                if (e instanceof StreamAbortedError) throw e;
                 // Individual chunk parse failures are common and safe to ignore
               }
             }
@@ -222,6 +269,15 @@ export function useStreamingChat(): StreamingState {
       } catch (err: unknown) {
         if (err instanceof Error && err.name === 'AbortError') {
           return; // User-initiated cancellation — not an error
+        }
+
+        // ⚠️ Retrying after even one character has painted rewinds the UI.
+        // accumulatedText is re-initialised inside attemptFetch, so the first
+        // paint of the retry replaces visible text with a shorter string.
+        if (hasEmittedRef.current) {
+          const message = err instanceof Error ? err.message : 'Unknown error';
+          setError(`Response ended early: ${message}`);
+          return;
         }
 
         if (retryCount < maxRetries) {
@@ -604,6 +660,18 @@ Having shipped several AI chat features in React Native apps, these are the mist
 **Ignoring iOS background transitions**: iOS terminates network connections within seconds of backgrounding. Use `AppState.addEventListener` to detect this and stop streaming proactively rather than letting it fail and confuse the user.
 
 **Embedding API keys in app code**: The binary is downloadable and inspectable. Even obfuscated keys get extracted. Always use a server-side proxy. See also the [hiding API keys behind a Worker with rate limiting and key rotation](/articles/rork-dev/rork-expo-api-key-proxy-worker-rate-limit-rotation) for more on this architecture.
+
+**Discarding error events that arrive after a 200 OK**: This is the one that scared me most. Anthropic's stream can connect successfully, deliver a few tokens, and then send `event: error` — `overloaded_error` being the classic case.
+
+A parser that only looks for delta text treats that event as "an event with no text" and walks straight past it. The stream reaches `done`, the UI records a clean finish, and the reader is left staring at a truncated answer. No error surfaces. No retry fires.
+
+I pulled the parser into a standalone Node script and fed it nothing but a `ping` and an `overloaded_error`. Result: zero characters extracted, no exception, no error detected. It fails in complete silence. That's why the hook above checks `parsed.type === 'error'` explicitly and converts it into a typed exception.
+
+**Retrying after partial output, which rewinds the screen**: Exponential backoff is the right call when the connection itself never opened. But calling the same function again after five characters have already painted re-initialises `accumulatedText`, and the first paint of the retry **replaces the visible text with something shorter**.
+
+Reproducing it with the same parser: five characters on screen at the moment of disconnect, two characters on the retry's first paint. To the reader, a half-written sentence vanishes and a different one grows in its place. On top of that, LLM calls are not idempotent, so you pay for the generated tokens twice.
+
+The fix is small. Once a single character has shipped, stop retrying. Keep the partial text and append the error beneath it. That's all `hasEmittedRef` is for.
 
 ## Cost Monitoring in Production
 
