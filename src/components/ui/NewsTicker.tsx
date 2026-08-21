@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "BUILD — Rork Max はクラウド上の実機 Mac に Xcode と iOS SDK を載せ、SwiftUI を書き、ビルドし、エラーを読んで直す反復を回します。コードを吐いて終わりではない点が生成物の質に効いています",
-    "NATIVE — 生成されるのは React Native ではなく純粋な Swift / SwiftUI です。AR や Metal、ウィジェットなど React Native からは届かない機能に手が届くことが、他ビルダーとの実質的な差になります",
-    "PLATFORMS — 対応は iPhone・iPad・Apple Watch・Apple TV・Vision Pro に加えて iMessage まで含みます。ウォッチや拡張から入る設計を試すのに向いています",
-    "COMPANION — Rork Companion により、有料の Apple Developer アカウントなしで生成したアプリを実機の iPhone で確認できます。最初の一本を試す段階の障壁が一段下がりました",
-    "PRICING — 無料で開始でき有料プランは月額25ドルから、Rork Max は月額200ドルの Max プランです。回収できる本数と規模を先に見積もっておく価値があります",
-    "DEADLINE — Google Play は2026年8月31日以降、新規アプリと更新の双方に対象 API レベル36 以上を要求します。残り10日で、生成物の targetSdkVersion は自分で確認が必要です",
+    "NATIVE — Rork Max は純粋な Swift と SwiftUI を生成するため、AR や LiDAR、Metal を使った 3D、ウィジェット、Dynamic Island、Live Activities、HealthKit、NFC、Core ML まで手が届きます",
+    "CHOICE — 逆にいえば、こうした Apple 固有の機能を使わないアプリならクロスプラットフォームの通常の Rork で足ります。Max を選ぶ理由はこの一点に集約されます",
+    "PLAY — 8月31日から、Google Play の新規アプリと既存アプリの更新は対象 API レベル36（Android 16）が必要になります。残り9日です",
+    "PLAY — 更新を出さない既存アプリでも、より新しい Android を載せた端末の新規ユーザーへ配信を続けるには対象 API レベル35 以上が要ります。見落とすと新規インストールだけが止まります",
+    "GRACE — Play Console の延長フォームから申請すれば11月1日まで猶予されます。自動ではないため、8月31日までに申請そのものを済ませておく必要があります",
+    "EXPO — expo prebuild がネイティブディレクトリを破棄して再生成するのが既定になりました。手を入れている場合は no-clean を渡します。API 36 対応の最中は事故になりやすい箇所です",
   ],
   en: [
-    "BUILD — Rork Max runs real Macs in the cloud loaded with Xcode and the iOS SDK, writing SwiftUI, compiling, reading the errors and building again. That loop, not the code generation, is what lifts the output",
-    "NATIVE — What comes out is pure Swift and SwiftUI, not React Native. Reaching AR, Metal graphics and widgets that React Native cannot touch is the real gap between this and other builders",
-    "PLATFORMS — Coverage spans iPhone, iPad, Apple Watch, Apple TV and Vision Pro, plus iMessage. Worth a look if you want to start from a watch app or an extension rather than a phone screen",
-    "COMPANION — The Rork Companion app lets you check a generated build on a real iPhone without a paid Apple Developer account, lowering the bar for trying a first project end to end",
-    "PRICING — Free to start, paid plans from $25 a month, and Rork Max on the $200 Max plan. Worth working out up front how many projects it takes to earn that back",
-    "DEADLINE — From August 31, 2026, Google Play requires target API level 36 or higher for new apps and updates alike. Ten days out, and the targetSdkVersion of what you generate is yours to verify",
+    "NATIVE — Because Rork Max generates pure Swift and SwiftUI, it reaches AR and LiDAR, Metal-backed 3D, Home Screen widgets, Dynamic Island, Live Activities, HealthKit, NFC and Core ML",
+    "CHOICE — Put the other way around, if your app touches none of those Apple-specific capabilities, the regular cross-platform Rork is enough. That single question decides whether Max is worth it",
+    "PLAY — From August 31, new apps and app updates on Google Play must target API level 36, or Android 16. Nine days remain",
+    "PLAY — Even an app you are not updating needs to target API level 35 or higher to keep reaching new users on newer Android devices. Miss it and only new installs quietly stop",
+    "GRACE — An extension form in Play Console buys you until November 1, but it is not automatic. The request itself has to be filed before August 31",
+    "EXPO — expo prebuild now clears and regenerates the native directories by default. Pass no-clean if you have edited them by hand, which is easy to trip over mid API 36 migration",
   ],
 };
 
