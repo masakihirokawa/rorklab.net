@@ -1,5 +1,5 @@
 ---
-title: "Rork Max × Expo Modules API: カスタムネイティブモジュールの実装と配布の"
+title: "Rork Max × Expo Modules API でカスタムネイティブモジュールを作り、npm で配布する"
 slug: "rork-max-expo-modules-custom-native-guide"
 category: "rork-dev"
 level: "advanced"
@@ -20,7 +20,9 @@ Rork Max は AI 駆動のコード生成と Expo エコシステムにより、�
 
 たとえば、独自のハードウェアセンサーへのアクセス、特定の OS API との高速なブリッジ通信、あるいはサードパーティ SDK のラッパー実装など、ネイティブコードを直接書く必要があるケースは少なくありません。
 
-Expo Modules API は、こうした課題に対するモダンな解決策です。従来の React Native Bridge と比較して、型安全性・パフォーマンス・開発体験のすべてにおいて大きく進化しています。ここで扱うのはExpo Modules API を使ったカスタムネイティブモジュールの設計から npm 配布までを、実践的なコードとともに解説します。
+Expo Modules API は、こうした課題に対するモダンな解決策です。従来の React Native Bridge と比較して、型安全性・パフォーマンス・開発体験のすべてにおいて大きく進化しています。
+
+加速度センサーを読むだけの小さなモジュールを題材に、Swift と Kotlin の実装、TypeScript レイヤーの設計、テスト、そして npm 配布までを順に追っていきます。後半には、私が実機で動かして初めて気づいた設計上の落とし穴も併せて記しました。
 
 **この記事の対象読者:**
 
@@ -860,9 +862,101 @@ private func throttledSendEvent(_ data: [String: Any]) {
 
 ### メモリリークの防止
 
-ネイティブモジュールでは `OnDestroy` ハンドラを必ず実装し、リスナーやタイマーの解放を保証してください。これを怠ると、アプリのバックグラウンド遷移時にメモリリークが発生します。
+ネイティブモジュールでは `OnDestroy` ハンドラを必ず実装し、リスナーやタイマーの解放を保証してください。ただし `OnDestroy` が発火するのはモジュールが解放される直前だけです。アプリがバックグラウンドに回った瞬間には呼ばれません。この点は誤解しやすいので、次の節で詳しく扱います。
 
 ## 個人開発者の視点から（実体験メモ）
+
+ここまでのコードは、そのままビルドすれば動きます。ただ私が実機に載せて最初に突きつけられたのは、動くことと消耗しないことは別だという当たり前の事実でした。
+
+個人開発ではレビュアーがいません。バッテリーの減りも、スクロールのわずかな引っかかりも、自分で気づくまで誰も教えてくれない。
+
+以下は expo-modules-core 57.0.12 のソースを読み直しながら整理した、自分のモジュールで実際に踏んだ三つの落とし穴です。
+
+### `OnDestroy` はバックグラウンド遷移では呼ばれない
+
+`OnDestroy` の実体は `EventListener(.moduleDestroy, closure)` です。ソースのコメントにも「called when the module is about to be deallocated」と明記されています。発火するのはモジュールが解放される直前であって、ホームボタンでアプリを背面に送った瞬間ではありません。
+
+私自身、停止処理を `OnDestroy` にだけ書いていました。結果として、アプリを背面に回したあとも加速度計が回り続けていました。気づいたきっかけは、実装の不具合ではなくバッテリーの減り方です。
+
+バックグラウンド遷移には専用のフックが用意されています。
+
+<table>
+<thead>
+<tr><th>タイミング</th><th>iOS（Swift）</th><th>Android（Kotlin）</th></tr>
+</thead>
+<tbody>
+<tr><td>背面に回った</td><td><code>OnAppEntersBackground</code></td><td><code>OnActivityEntersBackground</code></td></tr>
+<tr><td>前面に戻った</td><td><code>OnAppEntersForeground</code></td><td><code>OnActivityEntersForeground</code></td></tr>
+<tr><td>解放される直前</td><td><code>OnDestroy</code></td><td><code>OnDestroy</code></td></tr>
+</tbody>
+</table>
+
+```swift
+// definition() の中に追加する
+OnAppEntersBackground {
+    if self.isTracking {
+        self.motionManager.stopAccelerometerUpdates()
+    }
+}
+
+OnAppEntersForeground {
+    if self.isTracking {
+        // 中断前の interval を保持しておき、同じ設定で再開する
+        self.resumeAccelerometerUpdates()
+    }
+}
+```
+
+`OnDestroy` は最後の保険として残します。役割が違うので、どちらか一方では足りません。
+
+### センサーのコールバックをメインキューに載せない
+
+前半のサンプルでは `startAccelerometerUpdates(to: .main)` と書きました。素直で読みやすい反面、`accelerometerUpdateInterval` を 0.01 秒に設定すると、毎秒 100 回のクロージャがメインスレッドのキューに積まれます。
+
+同じスレッドで React Native の UI 更新も走ります。スクロール中に指の追従が鈍る感触が出たら、まずここを疑ってください。
+
+センサー用のキューを分けて、UI に触れる処理だけを明示的にメインへ戻す形が安全です。
+
+```swift
+private let sensorQueue: OperationQueue = {
+    let queue = OperationQueue()
+    queue.name = "net.rorklab.sensor"
+    queue.qualityOfService = .userInitiated
+    queue.maxConcurrentOperationCount = 1
+    return queue
+}()
+
+// startAccelerometerUpdates(to: sensorQueue) { ... } のように渡す
+```
+
+前掲のスロットリングと組み合わせると、間引かれたあとのイベントだけがブリッジを越えます。送出頻度そのものが下がるため、効き方が分かりやすい対策です。
+
+### 購読者がいない間はハードウェアを止める
+
+`Events("onSensorUpdate", "onError")` を宣言しただけでは、JavaScript 側にリスナーが一つも無くても `sendEvent` は呼ばれ続けます。センサーは回りっぱなしです。
+
+expo-modules-core には、最初のリスナーが追加された時と全てのリスナーが外れた時に呼ばれるフックがあります。
+
+```swift
+public func OnStartObserving(_ event: String? = nil, _ closure: @escaping () -> Void) -> EventObservingDefinition
+public func OnStopObserving(_ event: String? = nil, _ closure: @escaping () -> Void) -> EventObservingDefinition
+```
+
+第 1 引数にイベント名を渡せば、購読対象ごとに分けられます。Kotlin 側も `ObjectDefinitionBuilder` に同名の関数が用意されているため、同じ考え方をそのまま持ち込めます。
+
+```swift
+OnStartObserving("onSensorUpdate") {
+    self.startAccelerometerUpdatesIfNeeded()
+}
+
+OnStopObserving("onSensorUpdate") {
+    self.motionManager.stopAccelerometerUpdates()
+}
+```
+
+こうしておくと、画面を離れて `subscription.remove()` が走った時点でハードウェアが止まります。`startTracking` と `stopTracking` を JavaScript から明示的に呼ばせる設計に比べ、停止し忘れが構造的に起きません。
+
+一つ注意があります。`OnStartObserving` を入れたなら、`AsyncFunction("startTracking")` 側で二重に起動しないよう、起動処理は一箇所にまとめてください。私は両方から呼んでしまい、`stopAccelerometerUpdates()` を一度呼んでも止まらない状態を作りました。
 
 ## まとめ
 
@@ -870,6 +964,10 @@ Expo Modules API によるカスタムネイティブモジュール開発は、
 
 本記事で解説したセンサーモジュールの実装パターンは、カメラ制御、Bluetooth 通信、OS 固有の UI コンポーネントなど、あらゆるネイティブ拡張に応用できます。ぜひ自分のプロジェクトで実践してみてください。
 
-React Native と Expo のアーキテクチャをより深く理解したい方には「[React Native 0.84 + Hermes V1 完全ガイド](/articles/rork-dev/react-native-084-hermes-v1-guide)」や「[Rork の React Native + Expo アーキテクチャを深掘り解説](/articles/rork-dev/react-native-expo-architecture)」も参考になります。
+モジュールが載る土台のほうを先に押さえたい場合は「[RorkのReact Native + Expoアーキテクチャを深掘り解説](/articles/rork-dev/react-native-expo-architecture)」が参考になります。
 
-モバイルアプリ開発のネイティブ拡張手法
+モジュールを公開したあとも、実機のバッテリー消費とプロファイラの数字は定期的に見返しています。手元で動いた形がそのまま最適とは限らない、というのが Expo Modules API に向き合って一番学んだことでした。
+
+まずは `Function` を一つだけ持つ最小のモジュールを作り、`npx expo run:ios` で実機に載せてみてください。そこから先は、必要になった API を一つずつ足していくだけです。
+
+お読みいただきありがとうございました。
