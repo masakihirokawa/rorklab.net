@@ -1,0 +1,247 @@
+---
+title: "The four acceptance checks I still run after the build turns green"
+slug: "rork-build-green-post-generation-acceptance-checks"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-08-21T11:00"
+updated: "2026-08-21T11:00"
+author: "Rork Lab"
+description: "A successful build does not mean a shippable build. Here are the four failure classes an AI build loop cannot see, and a dependency-free script that inspects the artifact itself before you submit."
+tags: ["Rork", "Expo", "Android", "Release", "Quality"]
+highlights:
+  - "You will be able to decide, project by project, which steps to hand to an AI build loop and which ones need a gate you own"
+  - "You will be able to catch post-release-only failures before submission by inspecting the artifact instead of the build config"
+  - "You will be able to move from shipping on build status alone to shipping on a four-point acceptance check"
+---
+
+After I shipped v2.0.0 of one of my Android wallpaper apps, the crash count in Crashlytics refused to come down. The build had never gone red. Upload passed, review passed. And yet on Android 6.0.1 devices, the app died on launch.
+
+The cause was a Java 8 API reference without desugaring behind it, and the fix was a single line in Gradle. But the line was not the part that stayed with me. What stayed with me was finally feeling, rather than knowing, that there is a gap between "the build passes" and "this is shippable."
+
+With Rork, where generation and building loop on the cloud side, that gap gets wider. The agent only ever sees what the compiler and linker report back. Distribution, real devices, and review sit outside its field of view.
+
+## What a green build actually guarantees
+
+A green build guarantees roughly three things:
+
+1. Every type and symbol you reference exists somewhere on the compile-time classpath
+2. Resource references resolve well enough to produce a resource table
+3. The output can be packaged into a valid artifact
+
+Everything else is unguaranteed. Classes loaded at runtime through a different path, behavior after the artifact is split for delivery, the information you need to read a crash after the fact, and files that should never have been packaged at all. Every shipping failure I have hit as an indie developer fell neatly into one of those four buckets.
+
+<table>
+<thead><tr><th>Check</th><th>Where it surfaces</th><th>Visible to the build?</th></tr></thead>
+<tbody>
+<tr><td>Missing backward compatibility</td><td>Older OS devices</td><td>No — runtime only</td></tr>
+<tr><td>Density bucket gaps</td><td>Subset of devices post-release</td><td>No — after splitting</td></tr>
+<tr><td>Missing symbolication inputs</td><td>Your crash dashboard</td><td>No — separate pipeline</td></tr>
+<tr><td>Files that should not ship</td><td>The published artifact</td><td>No — packaged as instructed</td></tr>
+</tbody>
+</table>
+
+## Check 1: verify backward compatibility in the artifact, not the config
+
+Desugaring settings look like something you can confirm by reading the build file. That is how I treated it at first. The case that cost me time was one where the config looked correct, but a dependency pulled in newer API references through its own path. The lesson was that the build definition is not evidence. The artifact is.
+
+The DEX inside your artifact carries referenced class names as plain strings. When desugaring is in effect you will see rewritten names like `Lj$/util/function/Supplier;`. When it is not, only `Ljava/util/function/Supplier;` remains. Opening the artifact as a ZIP and scanning the bytes is enough to tell them apart, with no special tooling.
+
+The symptom and the fix itself are covered in [the Java 8 desugaring fix for crashes limited to older OS versions](/articles/rork-dev/rork-max-android-version-crash-java8-desugaring-fix). What I want to add here is the part that catches a regression after you have fixed it once.
+
+## Check 2: resources that vanish when the delivery shape changes
+
+App Bundle delivery means the artifact is split per device. If an image only lives in `drawable-xxhdpi/`, devices outside that bucket receive a split that simply does not contain it. It renders fine on your test device, fine during review, and then breaks for a slice of users after release. That ordering is what makes it expensive.
+
+The intuitive fix is to supply every density. I went the other way and removed density from the equation: anything in `drawable-nodpi/` is excluded from density splitting and reaches every device unchanged. For a wallpaper app, where the images are the product rather than the chrome, there was little reason to carry per-density variants in the first place. The full account is in [the drawable-nodpi fix for images lost to density splitting](/articles/rork-dev/rork-android-play-store-density-split-drawable-nodpi-fix).
+
+As a check, scanning `res/drawable-*dpi/` inside the artifact and listing any filename that appears in exactly one bucket turned out to be sufficient.
+
+## Check 3: the gap that makes symptoms unreadable
+
+The third class is not about something being broken. It is about not being able to read the breakage when it happens.
+
+A bundle packaged as Hermes bytecode produces stack traces you cannot interpret directly. Unless the matching source map and identifier reach your crash aggregator, production crashes arrive as meaningless line numbers. I once let several weeks of crashes accumulate without that pipeline in place, and paid for it in the time it took to reconstruct causes afterward. The procedure is written up in [wiring Hermes source maps and debug IDs into your crash aggregator](/articles/rork-dev/rork-expo-hermes-sourcemap-debug-id-sentry-symbolication).
+
+What the artifact can tell you is whether the bundle really is Hermes bytecode. A configuration mismatch that leaves plain JavaScript in place will never line up with the source maps you generated. Reading the first eight magic bytes settles it.
+
+## Check 4: things that should never have been packaged
+
+The fourth class is, from the build's point of view, entirely correct behavior. It packaged the files it was told to package.
+
+Three kinds put me on guard: bundled source maps, environment files pulled in as assets, and anything resembling a signing key or API credential. Template-generated projects tend to treat the assets directory loosely, which makes stowaways easier. Moments when dependencies grow — adding AdMob mediation adapters, for instance — are worth an extra look.
+
+This one is pure filename pattern matching. There is no judgment call involved, which is exactly why automating it pays off most.
+
+## Folding all four into one script
+
+All four checks amount to opening the artifact as a ZIP and scanning what is inside. No extra dependencies, standard library only.
+
+```python
+#!/usr/bin/env python3
+"""Open an artifact (.apk / .aab) as a ZIP and run four checks
+that build status alone cannot cover.
+
+Usage: python3 preflight_artifact.py app-release.aab --min-sdk 23
+Exit code: 0 = pass / 1 = findings
+"""
+import argparse
+import collections
+import re
+import sys
+import zipfile
+
+# 1) Desugaring: references to java.util.function.* without the
+#    rewritten classes will crash on devices below minSdk 24
+DESUGARED_TARGETS = [
+    b"Ljava/util/function/Supplier;",
+    b"Ljava/util/function/Consumer;",
+    b"Ljava/util/Optional;",
+    b"Ljava/time/Duration;",
+]
+DESUGARED_PREFIX = b"Lj$/"
+
+# 4) Files that must never ship inside the artifact
+FORBIDDEN_PATTERNS = [
+    re.compile(r"\.map$"),                        # bundled source maps
+    re.compile(r"(^|/)\.env(\.|$)"),              # environment files
+    re.compile(r"\.(keystore|jks|p8|p12|pem)$"),  # signing / API keys
+]
+
+DENSITY_RE = re.compile(r"^res/drawable-([a-z]*dpi)(-v\d+)?/(.+)$")
+KNOWN_DENSITIES = ["ldpi", "mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]
+HERMES_MAGIC = bytes([0xC6, 0x1F, 0xBC, 0x03, 0xC1, 0x03, 0x19, 0x1F])
+
+
+def check_desugaring(zf, min_sdk):
+    """Scan the DEX string pool directly: trust the artifact, not the config."""
+    dex_names = [n for n in zf.namelist() if re.search(r"classes\d*\.dex$", n)]
+    if not dex_names:
+        return ["No classes.dex found (for an AAB, look under base/dex/)"]
+    raw = b"".join(zf.read(n) for n in dex_names)
+    has_desugared = DESUGARED_PREFIX in raw
+    missing = [t.decode() for t in DESUGARED_TARGETS if t in raw]
+    if min_sdk >= 24 or not missing:
+        return []
+    if has_desugared:
+        return []
+    return [
+        "minSdk %d references %s but no rewritten classes (Lj$/...) "
+        "are present in the artifact" % (min_sdk, ", ".join(missing))
+    ]
+
+
+def check_density_coverage(zf):
+    """An image in only one density bucket never reaches other devices."""
+    buckets = collections.defaultdict(set)
+    for name in zf.namelist():
+        m = DENSITY_RE.match(name)
+        if m:
+            buckets[m.group(3)].add(m.group(1))
+    findings = []
+    for filename, found in sorted(buckets.items()):
+        if len(found) == 1 and found & set(KNOWN_DENSITIES):
+            findings.append(
+                "%s exists only in %s (move to drawable-nodpi/ "
+                "or supply every density)" % (filename, next(iter(found)))
+            )
+    return findings
+
+
+def check_js_bundle(zf):
+    """Confirm the bundle is Hermes bytecode. Plain JavaScript will never
+    line up with the source maps you generated."""
+    targets = [n for n in zf.namelist() if n.endswith("index.android.bundle")]
+    if not targets:
+        return []  # native-only artifact
+    findings = []
+    for name in targets:
+        head = zf.read(name)[:8]
+        if head != HERMES_MAGIC:
+            findings.append(
+                "%s is not Hermes bytecode (leading bytes %s)"
+                % (name, head.hex())
+            )
+    return findings
+
+
+def check_forbidden(zf):
+    findings = []
+    for name in zf.namelist():
+        for pattern in FORBIDDEN_PATTERNS:
+            if pattern.search(name):
+                findings.append("Must not ship: %s" % name)
+                break
+    return findings
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("artifact")
+    parser.add_argument("--min-sdk", type=int, default=24)
+    args = parser.parse_args()
+
+    with zipfile.ZipFile(args.artifact) as zf:
+        results = [
+            ("Backward compatibility (desugaring)", check_desugaring(zf, args.min_sdk)),
+            ("Density bucket coverage", check_density_coverage(zf)),
+            ("JS bundle format", check_js_bundle(zf)),
+            ("Forbidden files", check_forbidden(zf)),
+        ]
+
+    failed = 0
+    for label, findings in results:
+        if findings:
+            failed += 1
+            print("FAIL %s" % label)
+            for line in findings:
+                print("   - %s" % line)
+        else:
+            print("OK   %s" % label)
+    print("---")
+    print("%d findings across %d checks" % (failed, len(results)))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Run a deliberately broken artifact through it and all four fire:
+
+```
+$ python3 preflight_artifact.py bad.aab --min-sdk 23
+FAIL Backward compatibility (desugaring)
+   - minSdk 23 references Ljava/util/function/Supplier;, Ljava/util/Optional; but no rewritten classes (Lj$/...) are present in the artifact
+FAIL Density bucket coverage
+   - hero_banner.png exists only in xxhdpi (move to drawable-nodpi/ or supply every density)
+FAIL JS bundle format
+   - assets/index.android.bundle is not Hermes bytecode (leading bytes 766172205f5f4255)
+FAIL Forbidden files
+   - Must not ship: assets/index.android.bundle.map
+   - Must not ship: assets/.env.production
+---
+4 findings across 4 checks
+```
+
+Run the same artifact with `--min-sdk 24` and only the first check drops out. Whether desugaring matters is decided by your distribution target rather than by the artifact, so pass that flag explicitly and keep it aligned with your Gradle value.
+
+## Putting the gate outside the loop
+
+Rork Max runs Xcode on a cloud Mac, lets the agent read the errors it produces, and rebuilds — the same cycle a developer runs by hand, automated. The quality of what comes out rests on that cycle. The flip side is that the cycle's only success criterion is what the compiler and linker return.
+
+Which means that once it goes green, the loop has done its job. The four checks above can only live outside it. More iterations and better prompts will not surface something the loop cannot observe.
+
+The arrangement I settled on is deliberately plain:
+
+1. Let the generate-and-build cycle run untouched — intervening to add iterations has rarely been worth it in my experience
+2. Run the acceptance check exactly once, the moment an artifact exists
+3. Send only passing artifacts into staged rollout, raising the percentage while Crash-free users stays at or above 99.7%
+
+Running the check when you receive the artifact rather than the night before submission matters because a finding is still actionable then — it folds back into the regeneration prompt. Discovered late, your options narrow to shipping it or delaying.
+
+## What to try on your next release
+
+Take the most recent artifact you have and run it through the script. An already-published one works too. Which of the four fires tells you which failure class your project is structurally prone to.
+
+Running six apps in parallel, I found the answer differed per app. Image-heavy ones tripped the density check; dependency-heavy ones tripped the forbidden-files check. Rather than fixing everything at once, work down the list of checks that actually fired on your own artifacts. That is the version of this habit that survives contact with a real release schedule.
