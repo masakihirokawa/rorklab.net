@@ -140,10 +140,6 @@ export default async function AboutPage({ params }: Props) {
           <br />
           <a href="https://rorklab.net" style={LINK_STYLE}>Rork Lab</a> — Rork (App Development)
         </p>
-
-        <p style={{ color: "var(--text-faint)", fontSize: 13, marginTop: 48 }}>
-          {isJa ? "最終更新日: 2026年5月" : "Last updated: May 2026"}
-        </p>
       </div>
     </div>
   );

@@ -237,10 +237,6 @@ export default async function TokushoPage({ params }: Props) {
           </>
         )}
       </div>
-
-      <p style={{ color: "var(--text-faint)", fontSize: 13, marginTop: 48 }}>
-        {isJa ? "最終更新日: 2026年3月" : "Last updated: March 2026"}
-      </p>
     </div>
   );
 }
