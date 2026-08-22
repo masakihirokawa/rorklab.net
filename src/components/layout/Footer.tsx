@@ -123,7 +123,7 @@ export function Footer() {
         >
           © 2026{" "}
           <a
-            href="https://dolice.design"
+            href="https://dolice.net"
             target="_blank"
             rel="noopener noreferrer"
             style={{
