@@ -123,7 +123,7 @@ const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; pric
       priceId: CAMPAIGN.enabled ? CAMPAIGN.priceIds.ja : STRIPE_PRICE_IDS.ja.premium,
       label: CAMPAIGN.enabled ? `永久アクセス — ${CAMPAIGN.prices.ja}（${CAMPAIGN.name.ja}）` : "Premium — 永久アクセス",
       price: CAMPAIGN.enabled ? CAMPAIGN.prices.ja : PRICES.ja.premium,
-      ...(CAMPAIGN.enabled && { originalPrice: PRICES.ja.premium }),
+      ...(CAMPAIGN.enabled ? { originalPrice: PRICES.ja.premium } : {}),
     },
   },
   en: {
@@ -132,7 +132,7 @@ const STRIPE_PLANS: Record<string, { pro: { priceId: string; label: string; pric
       priceId: CAMPAIGN.enabled ? CAMPAIGN.priceIds.en : STRIPE_PRICE_IDS.en.premium,
       label: CAMPAIGN.enabled ? `Lifetime Access — ${CAMPAIGN.prices.en} (${CAMPAIGN.name.en})` : "Premium — Lifetime",
       price: CAMPAIGN.enabled ? CAMPAIGN.prices.en : PRICES.en.premium,
-      ...(CAMPAIGN.enabled && { originalPrice: PRICES.en.premium }),
+      ...(CAMPAIGN.enabled ? { originalPrice: PRICES.en.premium } : {}),
     },
   },
 };

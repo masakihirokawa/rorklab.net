@@ -71,7 +71,7 @@ export const PLAN_LABELS = {
 
 export const CAMPAIGN = {
   /** true にするとキャンペーン価格が有効になります */
-  enabled: true,
+  enabled: false,
 
   /** キャンペーン名（UIバッジに表示） */
   name: { ja: "感謝価格", en: "Thank You Price" },
