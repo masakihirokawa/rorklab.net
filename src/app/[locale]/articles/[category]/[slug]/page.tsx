@@ -8,6 +8,7 @@ import { RelatedArticles } from "@/components/ui/RelatedArticles";
 import { TableOfContents } from "@/components/ui/TableOfContents";
 import { PremiumPaywall } from "@/components/ui/PremiumPaywall";
 import { MembershipCTA } from "@/components/ui/MembershipCTA";
+import { MembershipStickyBar } from "@/components/ui/MembershipStickyBar";
 import { TipCTA } from "@/components/ui/TipCTA";
 import { SingleArticleCTA } from "@/components/ui/SingleArticleCTA";
 import { ArticlePurchaseThankYou } from "@/components/ui/ArticlePurchaseThankYou";
@@ -377,6 +378,11 @@ export default async function ArticlePage({ params }: Props) {
       {/* Membership CTA — shown only for non-members on free articles */}
       {!canViewPremium && (
         <MembershipCTA locale={locale} />
+      )}
+
+      {/* Membership sticky bar — 無料記事・非会員・デスクトップのみ（全画面を覆わない） */}
+      {!canViewPremium && !article.meta.premium && (
+        <MembershipStickyBar locale={locale} siteName="Rork Lab" />
       )}
 
       {/* Tip CTA — shown on free articles for all readers */}

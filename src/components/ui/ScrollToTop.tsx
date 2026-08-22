@@ -21,7 +21,7 @@ export function ScrollToTop() {
       aria-label="Scroll to top"
       style={{
         position: "fixed",
-        bottom: 28,
+        bottom: "var(--floating-bottom, 28px)",
         right: 28,
         zIndex: 50,
         width: 44,
@@ -38,7 +38,7 @@ export function ScrollToTop() {
         opacity: visible ? 1 : 0,
         pointerEvents: visible ? "auto" : "none",
         transform: visible ? "translateY(0)" : "translateY(12px)",
-        transition: "opacity 0.3s, transform 0.3s, background 0.3s, color 0.3s",
+        transition: "opacity 0.3s, transform 0.3s, background 0.3s, color 0.3s, bottom 0.3s",
         boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
       }}
       onMouseEnter={(e) => {

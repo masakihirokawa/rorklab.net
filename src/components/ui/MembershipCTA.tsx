@@ -41,6 +41,7 @@ export function MembershipCTA({ locale, relatedPremiumArticles }: MembershipCTAP
 
   return (
     <section
+      id="membership-cta"
       style={{
         marginTop: 48,
         marginBottom: 32,
