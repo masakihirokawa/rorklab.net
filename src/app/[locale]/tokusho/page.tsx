@@ -135,7 +135,7 @@ export default async function TokushoPage({ params }: Props) {
               masakihirokawa@gmail.com
             </Row>
             <Row label="ウェブサイト">
-              <a href="https://dolice.design" target="_blank" rel="noopener noreferrer" style={LINK}>dolice.design</a>
+              <a href="https://dolice.net" target="_blank" rel="noopener noreferrer" style={LINK}>dolice.net</a>
             </Row>
             <Row label="運営者プロフィール">
               <a href={`${prefix}/about`} style={LINK}>運営者について</a>
@@ -196,7 +196,7 @@ export default async function TokushoPage({ params }: Props) {
               masakihirokawa@gmail.com
             </Row>
             <Row label="Website">
-              <a href="https://dolice.design" target="_blank" rel="noopener noreferrer" style={LINK}>dolice.design</a>
+              <a href="https://dolice.net" target="_blank" rel="noopener noreferrer" style={LINK}>dolice.net</a>
             </Row>
             <Row label="About the Founder">
               <a href={`${prefix}/about`} style={LINK}>About page</a>

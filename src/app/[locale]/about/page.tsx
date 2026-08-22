@@ -111,17 +111,17 @@ export default async function AboutPage({ params }: Props) {
         {/* ── Websites ── */}
         <h2 style={{ marginTop: 40 }}>{isJa ? "ウェブサイト" : "Websites"}</h2>
         <p>
-          <a href="https://dolice.design" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.design</a>
+          <a href="https://dolice.net" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.net</a>
           {isJa ? "（公式サイト）" : " (Official)"}
           <br />
-          <a href="https://dolice.net" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.net</a>
-          {isJa ? "（ポートフォリオ）" : " (Portfolio)"}
+          <a href="https://dolice.design" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.design</a>
+          {isJa ? "（アート・ポートフォリオ）" : " (Art Portfolio)"}
           <br />
           <a href="https://dolice.base.shop" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.base.shop</a>
           {isJa ? "（ストア）" : " (Store)"}
           <br />
           <a href="https://linktr.ee/masakihirokawa" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>linktr.ee/masakihirokawa</a>
-          {isJa ? "（リンクまとめ）" : " (Linktree)"}
+          {isJa ? "（全てのリンク）" : " (All Links)"}
         </p>
 
         {/* ── Dolice Labs ── */}
