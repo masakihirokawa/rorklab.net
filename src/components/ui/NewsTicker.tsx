@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "NATIVE — Rork Max は純粋な Swift と SwiftUI を生成するため、AR や LiDAR、Metal を使った 3D、ウィジェット、Dynamic Island、Live Activities、HealthKit、NFC、Core ML まで手が届きます",
-    "CHOICE — 逆にいえば、こうした Apple 固有の機能を使わないアプリならクロスプラットフォームの通常の Rork で足ります。Max を選ぶ理由はこの一点に集約されます",
-    "PLAY — 8月31日から、Google Play の新規アプリと既存アプリの更新は対象 API レベル36（Android 16）が必要になります。残り9日です",
-    "PLAY — 更新を出さない既存アプリでも、より新しい Android を載せた端末の新規ユーザーへ配信を続けるには対象 API レベル35 以上が要ります。見落とすと新規インストールだけが止まります",
-    "GRACE — Play Console の延長フォームから申請すれば11月1日まで猶予されます。自動ではないため、8月31日までに申請そのものを済ませておく必要があります",
-    "EXPO — expo prebuild がネイティブディレクトリを破棄して再生成するのが既定になりました。手を入れている場合は no-clean を渡します。API 36 対応の最中は事故になりやすい箇所です",
+    "DEADLINE — 8月31日から、Google Play の新規アプリとアプリ更新はすべて Android 16（API レベル36）を対象にする必要があります。残り8日です",
+    "EXTENSION — 条件を満たす開発者は Play Console のフォームから11月1日までの延長を申請できます。申請そのものは締切前に済ませておく必要があります",
+    "EXISTING — 更新を出さない既存アプリも、新しい Android を載せた端末で新規ユーザーに見つけてもらうには最低 API レベル35 が必要です。静かに新規流入だけが止まる構造です",
+    "EXPO — Expo SDK 57 は React Native 0.85 から 0.86 への更新で、破壊的変更なしの1コマンド移行を狙った小さなリリースです。React は SDK 56 と同じ 19.2 のままです",
+    "MEMORY — expo@57.0.9 が React Native 0.86.2 へ更新し、reanimated や worklets を読み込むアプリでメモリが大きく増える Hermes V1 の回帰を解消しました",
+    "PREBUILD — expo prebuild が既定でネイティブディレクトリを破棄して再生成するようになりました。API 36 対応で手を入れた設定と衝突しやすい部分です",
   ],
   en: [
-    "NATIVE — Because Rork Max generates pure Swift and SwiftUI, it reaches AR and LiDAR, Metal-backed 3D, Home Screen widgets, Dynamic Island, Live Activities, HealthKit, NFC and Core ML",
-    "CHOICE — Put the other way around, if your app touches none of those Apple-specific capabilities, the regular cross-platform Rork is enough. That single question decides whether Max is worth it",
-    "PLAY — From August 31, new apps and app updates on Google Play must target API level 36, or Android 16. Nine days remain",
-    "PLAY — Even an app you are not updating needs to target API level 35 or higher to keep reaching new users on newer Android devices. Miss it and only new installs quietly stop",
-    "GRACE — An extension form in Play Console buys you until November 1, but it is not automatic. The request itself has to be filed before August 31",
-    "EXPO — expo prebuild now clears and regenerates the native directories by default. Pass no-clean if you have edited them by hand, which is easy to trip over mid API 36 migration",
+    "DEADLINE — From August 31, every new app and app update on Google Play must target Android 16 (API level 36). Eight days to go",
+    "EXTENSION — Eligible developers can request an extension through November 1 via a form in Play Console, but the request itself has to be filed before the deadline",
+    "EXISTING — Even apps you leave alone need at least API level 35 to stay discoverable to new users on recent Android devices. Standing still quietly cuts off new installs",
+    "EXPO — Expo SDK 57 moves React Native from 0.85 to 0.86 as a small, one-command upgrade with no breaking changes. React stays at 19.2, same as SDK 56",
+    "MEMORY — expo@57.0.9 bumps React Native to 0.86.2 and clears the Hermes V1 memory regression that inflated usage in apps importing reanimated or worklets",
+    "PREBUILD — expo prebuild now clears and regenerates the native directories by default, which collides easily with hand-edited config from your API 36 migration",
   ],
 };
 
