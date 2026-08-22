@@ -13,6 +13,11 @@
  *  - 直近 7 日以内に閉じられていない
  *  - ページを 50% 以上スクロールした
  *  - 記事末尾の MembershipCTA が視界に入っていない（二重訴求の回避）
+ *
+ * 閉じ方は 3 通り:
+ *  - 「×」ボタン        … 7 日間は再表示しない
+ *  - バーの外側をクリック … そのタブを閉じるまで再表示しない
+ *  - Escape キー        … 外側クリックと同じ扱い
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -24,6 +29,7 @@ interface Props {
 }
 
 const LS_DISMISSED_UNTIL = "membershipBarDismissedUntil";
+const SS_CLOSED = "membershipBarClosedSession";
 const DISMISS_DAYS = 7;
 const SCROLL_THRESHOLD = 0.5;
 const DESKTOP_QUERY = "(min-width: 769px)";
@@ -65,6 +71,20 @@ function dismissedRecently(): boolean {
   }
 }
 
+function closedThisSession(): boolean {
+  try {
+    return sessionStorage.getItem(SS_CLOSED) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markClosedThisSession() {
+  try {
+    sessionStorage.setItem(SS_CLOSED, "1");
+  } catch {}
+}
+
 function markDismissed() {
   try {
     localStorage.setItem(
@@ -91,6 +111,7 @@ export function MembershipStickyBar({ locale, siteName }: Props) {
   const eligibleRef = useRef(false);
   const ctaInViewRef = useRef(false);
   const trackedRef = useRef(false);
+  const barRef = useRef<HTMLDivElement>(null);
 
   // ScrollToTop ボタンがバーに重ならないよう、表示中だけ持ち上げる
   useEffect(() => {
@@ -115,7 +136,10 @@ export function MembershipStickyBar({ locale, siteName }: Props) {
     const mq = window.matchMedia(DESKTOP_QUERY);
     const evaluate = () => {
       eligibleRef.current =
-        mq.matches && !hasPurchaseCookie() && !dismissedRecently();
+        mq.matches &&
+        !hasPurchaseCookie() &&
+        !dismissedRecently() &&
+        !closedThisSession();
       if (!eligibleRef.current) setVisible(false);
     };
     evaluate();
@@ -153,6 +177,32 @@ export function MembershipStickyBar({ locale, siteName }: Props) {
     return () => window.removeEventListener("scroll", onScroll);
   }, [mounted]);
 
+  // バーの外側クリック / Escape で閉じる（このタブの間だけ抑制）
+  const closeForSession = useCallback((reason: string) => {
+    markClosedThisSession();
+    eligibleRef.current = false;
+    setVisible(false);
+    track(reason);
+  }, []);
+
+  useEffect(() => {
+    if (!visible) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const bar = barRef.current;
+      if (!bar) return;
+      if (!bar.contains(e.target as Node)) closeForSession("membership_bar_outside_close");
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeForSession("membership_bar_escape_close");
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [visible, closeForSession]);
+
   const dismiss = useCallback(() => {
     markDismissed();
     eligibleRef.current = false;
@@ -169,6 +219,7 @@ export function MembershipStickyBar({ locale, siteName }: Props) {
 
   return (
     <div
+      ref={barRef}
       role="region"
       aria-label={copy.region}
       aria-hidden={!visible}
