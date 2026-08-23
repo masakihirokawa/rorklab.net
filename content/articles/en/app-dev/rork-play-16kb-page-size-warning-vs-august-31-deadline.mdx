@@ -1,0 +1,196 @@
+---
+title: "Bumping targetSdk to 36 surfaced a 16 KB warning. These are two different deadlines"
+slug: "rork-play-16kb-page-size-warning-vs-august-31-deadline"
+category: "app-dev"
+level: "intermediate"
+premium: false
+date: "2026-08-23T14:30"
+author: "Rork Lab"
+description: "The August 31 target API 36 requirement and the February 1, 2027 16 KB page size requirement are separate conditions. Here is how to inspect your AAB without installing the NDK, and why a LOAD misalignment and a zip boundary miss need completely different fixes."
+tags: ["Google Play", "16 KB page size", "target API 36", "Expo", "Rork"]
+---
+
+I raised one of my wallpaper apps to target API level 36, pushed it to internal testing, and a warning I had not seen before appeared in Play Console: this app must support 16 KB memory page sizes.
+
+With the August 31 deadline a week away, my first reaction was to assume this had just been added to the same pile. It has not. These are two separate requirements with two different dates.
+
+Treating them as one problem pulls work that is not due until next year into a week that is already full. Treating them as interchangeable is worse — you fix one, see the warning clear, and assume the other is handled too.
+
+## The two conditions in Play Console differ in scope and in date
+
+The target API level requirement and the 16 KB page size requirement are triggered by different things.
+
+<table>
+<thead>
+<tr><th>Item</th><th>Target API level 36</th><th>16 KB page size</th></tr>
+</thead>
+<tbody>
+<tr><td>Date</td><td>August 31, 2026</td><td>February 1, 2027</td></tr>
+<tr><td>Who it applies to</td><td>Every app update and every new app</td><td>Apps targeting API 35+ <strong>that ship native code</strong></td></tr>
+<tr><td>Consequence of missing it</td><td>You cannot submit updates</td><td>You cannot submit updates (from that date)</td></tr>
+<tr><td>Where the fix lives</td><td>Build config (targetSdkVersion) and behavior changes</td><td>Link-time alignment of `.so` files and their position in the zip</td></tr>
+<tr><td>Kotlin / Java-only apps</td><td>Applies</td><td>Does not apply — already compliant</td></tr>
+</tbody>
+</table>
+
+So the moment you move targetSdk from below 35 up to 36, the 16 KB requirement newly applies to you. The warning did not appear because the deadlines collided. It appeared because you just stepped inside the condition.
+
+I have written up the target API 36 side separately, in [an audit of what the effective targetSdkVersion actually resolves to](/articles/app-dev/rork-android-target-api-36-effective-targetsdkversion-audit) and in [why August 31 means different things depending on whether you ship updates](/articles/rork-business/rork-play-target-api-36-update-vs-availability-deadline). This post stays on the 16 KB side.
+
+The primary source is [Support 16 KB page sizes on Android Developers](https://developer.android.com/guide/practices/page-sizes). You will find plenty of posts citing November 1, 2025, or an extension to May 31, 2026. The current official wording is that starting February 1, 2027, updates that do not support 16 KB page sizes cannot be released. There is no reason to panic over the older dates — and no reason to assume the runway is unlimited either.
+
+## Checking your AAB without installing the NDK
+
+The documented procedure uses `llvm-objdump` and `zipalign`. Both require the Android SDK and NDK. If you build through EAS and have no local toolchain, that means several gigabytes of install for a single yes-or-no answer.
+
+In practice only two pieces of information matter: the ELF program headers inside each `.so`, and where that `.so` starts inside the zip. Python's standard library reads both.
+
+```python
+#!/usr/bin/env python3
+"""Inspect .so files in an APK / AAB for 16 KB alignment. No dependencies."""
+import sys, zipfile, struct
+
+PT_LOAD, PT_GNU_RELRO = 1, 0x6474e552
+
+def read_program_headers(data):
+    if data[:4] != b"\x7fELF":
+        return None
+    is64, little = data[4] == 2, data[5] == 1
+    end = "<" if little else ">"
+    if not is64:
+        return {"arch": "32bit", "loads": [], "relro": False}
+    e_machine, = struct.unpack_from(end + "H", data, 18)
+    e_phoff, = struct.unpack_from(end + "Q", data, 32)
+    e_phentsize, e_phnum = struct.unpack_from(end + "HH", data, 54)
+    loads, relro = [], False
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type, = struct.unpack_from(end + "I", data, off)
+        p_align, = struct.unpack_from(end + "Q", data, off + 48)
+        if p_type == PT_LOAD:
+            loads.append(p_align)
+        elif p_type == PT_GNU_RELRO:
+            relro = True
+    return {"arch": {0xB7: "arm64-v8a", 0x3E: "x86_64"}.get(e_machine, hex(e_machine)),
+            "loads": loads, "relro": relro}
+
+def data_offset(z, info):
+    """Read the local header to find where the data actually starts."""
+    f = z.fp
+    f.seek(info.header_offset + 26)
+    n, m = struct.unpack("<HH", f.read(4))
+    return info.header_offset + 30 + n + m
+
+def main(path):
+    ng = 0
+    with zipfile.ZipFile(path) as z:
+        infos = [i for i in z.infolist() if i.filename.endswith(".so")]
+        if not infos:
+            print("No .so under lib/. This app ships no native code.")
+            return 0
+        for info in sorted(infos, key=lambda i: i.filename):
+            hdr = read_program_headers(z.read(info))
+            if hdr is None:
+                continue
+            worst = min(hdr["loads"]) if hdr["loads"] else 0
+            aligned = worst >= 16384
+            stored = info.compress_type == zipfile.ZIP_STORED
+            zip_ok = (data_offset(z, info) % 16384 == 0) if stored else None
+            flags = []
+            if not aligned: flags.append("LOAD=%d" % worst); ng += 1
+            if not hdr["relro"]: flags.append("no RELRO")
+            if stored and zip_ok is False: flags.append("zip boundary"); ng += 1
+            state = "UNALIGNED" if flags else "ALIGNED"
+            print("%-10s %-12s %-9s %s" % (state, hdr["arch"],
+                  "stored" if stored else "deflated", info.filename),
+                  ("[" + " / ".join(flags) + "]") if flags else "")
+    print("\nNeeds attention: %d" % ng)
+    return 1 if ng else 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1]))
+```
+
+`p_align` sits 48 bytes into each program header entry as a 64-bit value. 16 KB is 16384, so if every `PT_LOAD` segment reports 16384 or more, the ELF side is fine. This is the same number `llvm-objdump` prints as `align 2**14`, just written in a different base.
+
+`data_offset()` reads the zip local header to find where the payload actually begins. The `header_offset` that `zipfile` hands you points at the header, not at the data — and `zipalign` aligns the data. I missed that distinction on my first pass and flagged a perfectly good build as broken.
+
+## Reading the output: LOAD=4096 and a zip boundary miss need different fixes
+
+To verify the checker, I built one `.so` linked at 4 KB and one at 16 KB, packed them into a zip laid out like an APK, and ran it. This is the actual output.
+
+```
+$ python3 check_16kb.py sample-app.apk
+UNALIGNED  x86_64       stored    lib/arm64-v8a/libapp.so [zip boundary]
+ALIGNED    x86_64       deflated  lib/arm64-v8a/libhermes.so
+UNALIGNED  x86_64       stored    lib/arm64-v8a/libthirdparty.so [LOAD=4096 / zip boundary]
+
+Needs attention: 3
+```
+
+The `arch` column reads `x86_64` because of the verification environment; a real APK shows `arm64-v8a` there. The column reflects the machine field in the ELF header itself, so a file sitting under `lib/arm64-v8a/` that is secretly a different architecture will also stand out.
+
+I then rebuilt the zip with padding so each stored `.so` lands on a multiple of 16384, and ran the same check.
+
+```
+$ python3 check_16kb.py aligned-app.apk
+ALIGNED    x86_64       stored    lib/arm64-v8a/libapp.so
+ALIGNED    x86_64       deflated  lib/arm64-v8a/libhermes.so
+UNALIGNED  x86_64       stored    lib/arm64-v8a/libthirdparty.so [LOAD=4096]
+
+Needs attention: 1
+```
+
+The zip boundary flag on `libapp.so` cleared. The `LOAD=4096` on `libthirdparty.so` did not. That gap is the distinction that matters most in practice.
+
+<table>
+<thead>
+<tr><th>Output</th><th>Cause</th><th>Who can fix it</th></tr>
+</thead>
+<tbody>
+<tr><td>`zip boundary` only</td><td>Packaging — where the file lands inside the AAB / APK</td><td>You, by updating build tooling</td></tr>
+<tr><td>`LOAD=4096`</td><td>The `.so` itself was linked assuming 4 KB pages</td><td>The library author, or you if you rebuild it</td></tr>
+<tr><td>`no RELRO`</td><td>Relocation sections are not made read-only after load</td><td>The library author. This can crash on 16 KB devices</td></tr>
+</tbody>
+</table>
+
+A `zip boundary` flag on its own clears by moving to Android Gradle Plugin 8.5.1 or higher. `LOAD=4096` will not budge no matter what you change in your own build config — the binary you were handed was linked that way. Your options are to wait for an updated release or to replace the dependency.
+
+Collapsing both into "16 KB support" means burning hours on build settings for a problem your build cannot reach. Working solo, those hours come straight out of the deadline.
+
+## What actually helps in an Expo or Rork project
+
+React Native added 16 KB page size support in 0.77 (see the [React Native 0.77 release notes](https://reactnative.dev/blog/2025/01/21/version-0.77)), which corresponds to Expo SDK 53 and later. If you are on the current Rork-generated setup, core libraries are very unlikely to report `LOAD=4096`.
+
+The risk sits in third-party native modules added afterwards. Maps, video, payments, and on-device ML libraries all tend to lag, and a repository can carry the fix while the version published to npm still ships the old `.so`.
+
+The fastest order to work through:
+
+1. Download the `.aab` from EAS Build and run the check. If there are zero `.so` files, the requirement does not apply to you at all
+2. Note the library names that report `LOAD=4096` and read their changelogs. Most have a release with a one-line "16 KB support" entry
+3. If updating does not clear it, look at whether `expo-build-properties` lets you pin `ndkVersion` and rebuild the module yourself
+4. If it still persists, decide between replacing the library and accepting that it needs resolving before the date
+
+Before you touch anything native, confirm your changes will survive the current `expo prebuild` defaults. I covered that in [auditing which native changes prebuild will erase](/articles/rork-dev/rork-expo-sdk-57-prebuild-clean-native-changes-audit).
+
+## 16 KB backcompat mode, and what it costs
+
+The documentation describes a compatibility mode that lets 16 KB-kernel devices run apps built for 4 KB pages. When a `.so` has 4 KB `LOAD` segments and uncompressed `.so` files sit on 4 KB boundaries, the package manager turns it on.
+
+The catch is a dialog on first launch telling the user the app is running in compatibility mode. From the user's side, that warning is the first thing the app does. Setting `android:pageSizeCompat` in the manifest suppresses the dialog, but not the underlying state.
+
+I treat this strictly as a bridge to a date, not a resolution. An app running is not the same as an app running as intended. Lean on backcompat and forget about it, and the next time this topic surfaces will be a support message about a strange screen at startup.
+
+## Where to draw the line for August 31
+
+Framed as this week's task list:
+
+What August 31 requires is the target API 36 bump and keeping up with the behavior changes that come with it. The 16 KB warning, red as it looks in Play Console, is not on that list. It is due February 1, 2027.
+
+Run the check today anyway. The reason is narrow: if `LOAD=4096` shows up, you cannot fix it yourself, and waiting on a dependency takes calendar time. Knowing how many unfixable items you have is what determines how many options you still have. If all you see is `zip boundary`, it is a tooling update and there is no rush.
+
+If you do one thing today, download a single recent `.aab` and run the check on it. It takes under a minute, and a result of zero means you can put this out of your head until next year.
+
+For the behavior changes that tend to surface alongside a target API 36 bump, [deciding when to fix predictive back on Android 16](/articles/rork-dev/rork-android-16-predictive-back-optout-config-plugin-decision) walks through the same kind of split between what the deadline forces and what can wait.
+
+When deadlines stack up, the instinct is to work down the list of red warnings in the order they appear. Writing out the condition and the date next to each one often halves what actually belongs in this week.

@@ -1,0 +1,196 @@
+---
+title: "targetSdk を 36 に上げたら 16 KB の警告が出ました。この2つは別の期限です"
+slug: "rork-play-16kb-page-size-warning-vs-august-31-deadline"
+category: "app-dev"
+level: "intermediate"
+premium: false
+date: "2026-08-23T14:30"
+author: "Rork Lab"
+description: "対象 API レベル36 の8月31日と、16 KB メモリページサイズの2027年2月1日は別の条件です。NDK を入れずに手元の AAB を検査する方法と、LOAD のずれと zip 境界のずれで直し方が変わることを、実際の出力とあわせて整理しました。"
+tags: ["Google Play", "16 KB ページサイズ", "target API 36", "Expo", "Rork"]
+---
+
+運用している壁紙アプリの一本を対象 API レベル36 に引き上げ、内部テストへ上げたところで、Play Console に見慣れない警告が並びました。「アプリは 16 KB のメモリページサイズをサポートする必要があります」という一文です。
+
+8月31日の期限に追われている最中でしたので、一瞬「これも今週中に直さないといけないのか」と身構えました。結論から書きますと、この2つは別の条件で、期日も違います。
+
+混ぜて考えると、本来なら来年まで時間のある作業を、残り8日の作業リストに引き込んでしまいます。逆に「同じ話だろう」と片方だけ直して安心してしまう危険もあります。ここを最初に切り分けておきます。
+
+## Play Console に並ぶ2つの条件は、対象も期日も違います
+
+対象 API レベルの要件と、16 KB ページサイズの要件は、発動する条件がそもそも異なります。
+
+<table>
+<thead>
+<tr><th>項目</th><th>対象 API レベル36</th><th>16 KB ページサイズ</th></tr>
+</thead>
+<tbody>
+<tr><td>期日</td><td>2026年8月31日</td><td>2027年2月1日</td></tr>
+<tr><td>対象になる条件</td><td>すべてのアプリ更新と新規アプリ</td><td>API レベル35 以上を対象にし、かつネイティブコードを含むアプリ</td></tr>
+<tr><td>満たさないと起きること</td><td>更新が提出できない</td><td>更新が提出できない（期日以降）</td></tr>
+<tr><td>直す場所</td><td>ビルド設定（targetSdkVersion）と挙動の追随</td><td>`.so` のリンク時アライメントと zip の格納位置</td></tr>
+<tr><td>Kotlin / Java だけのアプリ</td><td>対象</td><td>対象外（すでに満たしている）</td></tr>
+</tbody>
+</table>
+
+つまり、targetSdk を 35 未満から 36 へ引き上げた瞬間に、16 KB の要件が「新たに自分に適用された」状態になります。警告が今このタイミングで出てきたのは、期限が重なったからではなく、自分が条件の内側に入ったからでした。
+
+対象 API レベル36 側の作業内容については、[実効 targetSdkVersion を洗い出した記録](/articles/app-dev/rork-android-target-api-36-effective-targetsdkversion-audit)と、[更新を出す人と出さない人で8月31日の意味が変わる話](/articles/rork-business/rork-play-target-api-36-update-vs-availability-deadline)にまとめてあります。本記事は 16 KB 側だけを扱います。
+
+期日の一次情報は [Android Developers の「16 KB ページサイズをサポートする」](https://developer.android.com/guide/practices/page-sizes)にあります。過去に「2025年11月1日」「延長すると2026年5月31日」という日付が広く共有されましたが、現在の公式表記は「2027年2月1日以降、16 KB をサポートしない更新はリリースできない」です。古い記事を読んで焦る必要はありませんが、猶予が無限にあるわけでもありません。
+
+## NDK を入れずに、手元の AAB がどちら側か調べる
+
+公式の検査手順は `llvm-objdump` と `zipalign` を使います。どちらも Android SDK と NDK が要りますので、CI コンテナや、普段 EAS Build に任せていて手元にツールチェーンがない環境では、この確認のためだけに数 GB を入れることになります。
+
+実際には、判定に必要な情報は `.so` の ELF プログラムヘッダと、zip の格納位置の2つだけです。Python の標準ライブラリだけで両方読めます。
+
+```python
+#!/usr/bin/env python3
+"""APK / AAB の .so を 16 KB アライメント観点で検査する（外部依存なし）"""
+import sys, zipfile, struct
+
+PT_LOAD, PT_GNU_RELRO = 1, 0x6474e552
+
+def read_program_headers(data):
+    if data[:4] != b"\x7fELF":
+        return None
+    is64, little = data[4] == 2, data[5] == 1
+    end = "<" if little else ">"
+    if not is64:
+        return {"arch": "32bit", "loads": [], "relro": False}
+    e_machine, = struct.unpack_from(end + "H", data, 18)
+    e_phoff, = struct.unpack_from(end + "Q", data, 32)
+    e_phentsize, e_phnum = struct.unpack_from(end + "HH", data, 54)
+    loads, relro = [], False
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type, = struct.unpack_from(end + "I", data, off)
+        p_align, = struct.unpack_from(end + "Q", data, off + 48)
+        if p_type == PT_LOAD:
+            loads.append(p_align)
+        elif p_type == PT_GNU_RELRO:
+            relro = True
+    return {"arch": {0xB7: "arm64-v8a", 0x3E: "x86_64"}.get(e_machine, hex(e_machine)),
+            "loads": loads, "relro": relro}
+
+def data_offset(z, info):
+    """ローカルヘッダを読み、実データの開始位置を返す（zipalign が揃えるのはここ）"""
+    f = z.fp
+    f.seek(info.header_offset + 26)
+    n, m = struct.unpack("<HH", f.read(4))
+    return info.header_offset + 30 + n + m
+
+def main(path):
+    ng = 0
+    with zipfile.ZipFile(path) as z:
+        infos = [i for i in z.infolist() if i.filename.endswith(".so")]
+        if not infos:
+            print("lib/ に .so がありません。ネイティブコードなしと判断できます")
+            return 0
+        for info in sorted(infos, key=lambda i: i.filename):
+            hdr = read_program_headers(z.read(info))
+            if hdr is None:
+                continue
+            worst = min(hdr["loads"]) if hdr["loads"] else 0
+            aligned = worst >= 16384
+            stored = info.compress_type == zipfile.ZIP_STORED
+            zip_ok = (data_offset(z, info) % 16384 == 0) if stored else None
+            flags = []
+            if not aligned: flags.append("LOAD=%d" % worst); ng += 1
+            if not hdr["relro"]: flags.append("RELRO なし")
+            if stored and zip_ok is False: flags.append("zip 境界ずれ"); ng += 1
+            state = "UNALIGNED" if flags else "ALIGNED"
+            print("%-10s %-12s %-9s %s" % (state, hdr["arch"],
+                  "stored" if stored else "deflated", info.filename),
+                  ("[" + " / ".join(flags) + "]") if flags else "")
+    print("\n要対応: %d 件" % ng)
+    return 1 if ng else 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1]))
+```
+
+`p_align` はプログラムヘッダの先頭から 48 バイト目にある 64 ビット値です。16 KB は 16384 ですので、`PT_LOAD` セグメントの `p_align` がすべて 16384 以上であれば ELF 側は満たしています。`llvm-objdump` が `align 2**14` と表示するのと同じ値を、桁の表現だけ変えて読んでいます。
+
+`data_offset()` のほうは、zip のローカルヘッダを読んで実データの開始位置を求めています。`zipfile` が返す `header_offset` はヘッダの位置であって、`zipalign` が揃えるのはその先のデータ開始位置です。ここを取り違えると、揃っている AAB を「ずれている」と誤判定します。私は最初この違いに気づかず、正しいはずのビルドを不合格にしてしまいました。
+
+## 出力の読み分け: LOAD=4096 と zip 境界ずれは、直し方が違う
+
+検証のため、4 KB リンクの `.so` と 16 KB リンクの `.so` を用意し、APK と同じ構造の zip に詰めて実行しました。以下は実際の出力です。
+
+```
+$ python3 check_16kb.py sample-app.apk
+UNALIGNED  x86_64       stored    lib/arm64-v8a/libapp.so [zip 境界ずれ]
+ALIGNED    x86_64       deflated  lib/arm64-v8a/libhermes.so
+UNALIGNED  x86_64       stored    lib/arm64-v8a/libthirdparty.so [LOAD=4096 / zip 境界ずれ]
+
+要対応: 3 件
+```
+
+検証環境の都合で `arch` 列が `x86_64` になっていますが、実際の APK では `arm64-v8a` が表示されます。この列は ELF ヘッダの機種フィールドを読んでいますので、`lib/arm64-v8a/` の下にあっても中身が別アーキテクチャなら、それはそれで気づける作りにしてあります。
+
+次に、`.so` の実データが 16384 の倍数に載るよう詰め物を入れた zip を作り直して、同じ検査を通しました。
+
+```
+$ python3 check_16kb.py aligned-app.apk
+ALIGNED    x86_64       stored    lib/arm64-v8a/libapp.so
+ALIGNED    x86_64       deflated  lib/arm64-v8a/libhermes.so
+UNALIGNED  x86_64       stored    lib/arm64-v8a/libthirdparty.so [LOAD=4096]
+
+要対応: 1 件
+```
+
+`libapp.so` の `zip 境界ずれ` は消えましたが、`libthirdparty.so` の `LOAD=4096` は残りました。この差が、実務でいちばん効いてくる区別です。
+
+<table>
+<thead>
+<tr><th>出力</th><th>原因</th><th>直す人</th></tr>
+</thead>
+<tbody>
+<tr><td>`zip 境界ずれ` のみ</td><td>パッケージング側。AAB / APK に詰めるときの位置</td><td>自分（ビルド設定の更新で解消）</td></tr>
+<tr><td>`LOAD=4096`</td><td>`.so` そのものがリンク時に 4 KB 前提で作られている</td><td>そのライブラリの提供者（または自分で再ビルド）</td></tr>
+<tr><td>`RELRO なし`</td><td>再配置セクションが読み取り専用化されていない</td><td>提供者。16 KB 環境ではクラッシュ要因になり得ます</td></tr>
+</tbody>
+</table>
+
+`zip 境界ずれ` だけであれば、Android Gradle Plugin 8.5.1 以上へ上げるだけで解消します。一方 `LOAD=4096` は、自分のビルド設定をいくらいじっても直りません。配布されているバイナリの中身の問題ですので、依存の更新を待つか、置き換えるかの判断になります。
+
+この2つを分けずに「16 KB 対応」とひとくくりにしてしまうと、直せない相手にビルド設定を延々と試すことになります。個人開発では、その数時間がそのまま期限との差になります。
+
+## Expo / Rork のプロジェクトで実際に効く手当て
+
+React Native 本体は 0.77 で 16 KB ページサイズに対応しました（[React Native 0.77 のリリースノート](https://reactnative.dev/blog/2025/01/21/version-0.77)）。Expo SDK でいえば 53 以降が該当しますので、Rork が生成する現行構成をそのまま使っている限り、コア側で `LOAD=4096` が出ることはまずありません。
+
+問題になるのは、あとから足したサードパーティのネイティブモジュールです。地図、動画、決済、機械学習まわりのライブラリは更新が滞りやすく、リポジトリでは新しいバージョンが出ていても、npm 上の最新版に古い `.so` が残っていることがあります。
+
+手順としては、次の順で確認するのが早いです。
+
+1. EAS Build から `.aab` をダウンロードし、上の検査を通します。ここで `.so` が 0 件なら、そもそもこの要件の対象外です
+2. `LOAD=4096` が出たライブラリ名を控え、そのパッケージの更新履歴を見ます。多くは「16 KB support」の一行が入ったバージョンが出ています
+3. 更新で消えない場合は、`expo-build-properties` で `ndkVersion` と `android.minSdkVersion` などのビルド条件を揃え、自前でプリビルドし直せるか検討します
+4. それでも残るなら、そのライブラリを置き換えるか、期日までに解決するかを判断します
+
+なお、ネイティブ側に手を入れる前に、`expo prebuild` の既定変更で自分の変更が消えないかを確認しておいてください。この点は[プリビルドで消えるネイティブ変更を洗い出す記事](/articles/rork-dev/rork-expo-sdk-57-prebuild-clean-native-changes-audit)に手順を書いています。
+
+## 16 KB backcompat モードという逃げ道と、その代償
+
+公式ドキュメントには、16 KB カーネルの端末が 4 KB 前提のアプリを動かすための互換モードが記載されています。`.so` の `LOAD` が 4 KB で、かつ非圧縮の `.so` が 4 KB 境界に載っている場合、パッケージマネージャがこのモードを有効にします。
+
+ただし、初回起動時に「互換モードで動作しています」という警告ダイアログが表示されます。ユーザーから見れば、アプリを開いた最初の体験がその警告です。マニフェストの `android:pageSizeCompat` を設定すればダイアログは出なくなりますが、互換モードで動いている事実は変わりません。
+
+私はこれを「期日までの一時しのぎ」として位置づけています。動くことと、意図した状態であることは別です。互換モードに寄りかかったまま忘れると、次にこの話題が浮上するのは、ユーザーからの「起動時に変な表示が出る」という問い合わせになります。
+
+## 8月31日に持ち込む作業の線引き
+
+ここまでを、今週の作業リストという観点でまとめます。
+
+8月31日までに必要なのは、対象 API レベル36 への引き上げと、それに伴う挙動の追随だけです。16 KB の警告は、Play Console に赤く出ていても今週の必須項目ではありません。2027年2月1日までに片付ければよい作業です。
+
+ただし、検査自体は今日のうちに一度通しておくことをおすすめします。理由は単純で、`LOAD=4096` が出た場合は自分では直せず、依存の更新を待つ時間が要るからです。「直せない項目がいくつあるか」を早く知っておくほど、選べる手が増えます。逆に `zip 境界ずれ` だけなら、ビルド設定の更新で片付く話ですので、急ぐ必要はありません。
+
+今日できることを1つ挙げるなら、直近の `.aab` を1本だけダウンロードして、上の検査を通してみることです。所要は数十秒で、結果が「要対応: 0 件」なら、この話は来年まで頭から外して構いません。
+
+対象 API レベル36 に上げた際に一緒に浮上しやすい挙動の変化については、[Android 16 の予測型「戻る」をいつ直すかの判断](/articles/rork-dev/rork-android-16-predictive-back-optout-config-plugin-decision)でも扱っています。期限に必要な作業と、切り離せる作業の線引きという意味では、本記事と同じ考え方に立っています。
+
+期限が重なる時期は、どうしても目の前の赤い表示から順に手をつけたくなります。条件と期日を並べて書き出すだけで、その日にやるべきことが半分になることもあります。お読みいただきありがとうございました。
