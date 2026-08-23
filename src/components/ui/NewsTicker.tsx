@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — 8月31日から、Google Play の新規アプリとアプリ更新はすべて Android 16（API レベル36）を対象にする必要があります。残り8日です",
-    "EXTENSION — 条件を満たす開発者は Play Console のフォームから11月1日までの延長を申請できます。申請そのものは締切前に済ませておく必要があります",
-    "EXISTING — 更新を出さない既存アプリも、新しい Android を載せた端末で新規ユーザーに見つけてもらうには最低 API レベル35 が必要です。静かに新規流入だけが止まる構造です",
-    "EXPO — Expo SDK 57 は React Native 0.85 から 0.86 への更新で、破壊的変更なしの1コマンド移行を狙った小さなリリースです。React は SDK 56 と同じ 19.2 のままです",
-    "MEMORY — expo@57.0.9 が React Native 0.86.2 へ更新し、reanimated や worklets を読み込むアプリでメモリが大きく増える Hermes V1 の回帰を解消しました",
-    "PREBUILD — expo prebuild が既定でネイティブディレクトリを破棄して再生成するようになりました。API 36 対応で手を入れた設定と衝突しやすい部分です",
+    "DEADLINE — 8月31日から、Google Play の新規アプリと更新はすべて Android 16（API レベル36）を対象にする必要があります。残り7日です",
+    "EXTENSION — 条件を満たす場合は Play Console のフォームで11月1日までの延長を申請できますが、申請そのものを締切前に済ませる必要があります",
+    "MAX — Rork Max は React Native ではなくネイティブ Swift を生成し、クラウド上の Mac 群でビルドします。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象です",
+    "COMPANION — Rork Companion アプリを使えば、有料の Apple Developer アカウントなしに実機の iPhone で動作を確認できます。設計・実装・テストをブラウザだけで回せる構成です",
+    "DEVTOOLS — Expo SDK 57 の React Native DevTools でライトモードとダークモードのエミュレーションが可能になりました。端末設定を切り替えずに両方の見え方を確認できます",
+    "IOS27 — iOS 27 は9月に出ます。ベータ6が8月17日に配布され、RCS Universal Profile 3.0 対応で Android から届いたメッセージへの個別返信ができるようになりました",
   ],
   en: [
-    "DEADLINE — From August 31, every new app and app update on Google Play must target Android 16 (API level 36). Eight days to go",
-    "EXTENSION — Eligible developers can request an extension through November 1 via a form in Play Console, but the request itself has to be filed before the deadline",
-    "EXISTING — Even apps you leave alone need at least API level 35 to stay discoverable to new users on recent Android devices. Standing still quietly cuts off new installs",
-    "EXPO — Expo SDK 57 moves React Native from 0.85 to 0.86 as a small, one-command upgrade with no breaking changes. React stays at 19.2, same as SDK 56",
-    "MEMORY — expo@57.0.9 bumps React Native to 0.86.2 and clears the Hermes V1 memory regression that inflated usage in apps importing reanimated or worklets",
-    "PREBUILD — expo prebuild now clears and regenerates the native directories by default, which collides easily with hand-edited config from your API 36 migration",
+    "DEADLINE — From August 31, every new app and update on Google Play must target Android 16 (API level 36). Seven days to go",
+    "EXTENSION — If you qualify, you can request an extension through November 1 using a form in Play Console, but the request itself has to be filed before the deadline",
+    "MAX — Rork Max generates native Swift rather than React Native and compiles on a cloud Mac fleet, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "COMPANION — The Rork Companion app lets you test on a real iPhone without a paid Apple Developer account, so design, build, and test can all happen in a browser",
+    "DEVTOOLS — React Native DevTools in Expo SDK 57 can emulate light and dark mode, letting you check both appearances without touching device settings",
+    "IOS27 — iOS 27 ships next month. Beta 6 landed on August 17, and RCS Universal Profile 3.0 support means you can finally reply to a specific message received from Android",
   ],
 };
 
