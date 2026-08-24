@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — 8月31日から、Google Play の新規アプリと更新はすべて Android 16（API レベル36）を対象にする必要があります。残り7日です",
-    "EXTENSION — 条件を満たす場合は Play Console のフォームで11月1日までの延長を申請できますが、申請そのものを締切前に済ませる必要があります",
-    "MAX — Rork Max は React Native ではなくネイティブ Swift を生成し、クラウド上の Mac 群でビルドします。iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage が対象です",
-    "COMPANION — Rork Companion アプリを使えば、有料の Apple Developer アカウントなしに実機の iPhone で動作を確認できます。設計・実装・テストをブラウザだけで回せる構成です",
-    "DEVTOOLS — Expo SDK 57 の React Native DevTools でライトモードとダークモードのエミュレーションが可能になりました。端末設定を切り替えずに両方の見え方を確認できます",
-    "IOS27 — iOS 27 は9月に出ます。ベータ6が8月17日に配布され、RCS Universal Profile 3.0 対応で Android から届いたメッセージへの個別返信ができるようになりました",
+    "DEADLINE — 8月31日から、Google Play の新規アプリと更新はすべて Android 16（API レベル36）を対象にする必要があります。残り6日です",
+    "IOS27 — iOS 27 と macOS 27 の7回目の開発者ベータが8月24日に配布されました。正式リリースは来月です。Apple Intelligence 側の変更を含むため、手元のビルドの確認を始める時期です",
+    "ANDROID17 — Android 17 QPR1 のベータでは、Circle to Search を使った後に画面下のジェスチャーバーでアプリを切り替えられなくなる不具合が修正されました",
+    "FUNDING — Rork は2026年4月9日、Left Lane Capital 主導で1,500万ドルのシードラウンドを発表しました。あわせてアプリビルダーの Paperline を買収し、今後も人材獲得を目的とした買収を続ける方針を示しています",
+    "TRAFFIC — Rork のプラットフォームは月間74万3,000訪問を集め、成長率は85%と報告されています。AI アプリビルダーの中でも、ネイティブモバイルに絞った位置取りが効いている形です",
+    "FORECAST — Gartner は2026年に新規アプリケーションの75%がローコードまたはノーコードで作られると見ています。2020年時点では25%未満でした",
   ],
   en: [
-    "DEADLINE — From August 31, every new app and update on Google Play must target Android 16 (API level 36). Seven days to go",
-    "EXTENSION — If you qualify, you can request an extension through November 1 using a form in Play Console, but the request itself has to be filed before the deadline",
-    "MAX — Rork Max generates native Swift rather than React Native and compiles on a cloud Mac fleet, covering iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
-    "COMPANION — The Rork Companion app lets you test on a real iPhone without a paid Apple Developer account, so design, build, and test can all happen in a browser",
-    "DEVTOOLS — React Native DevTools in Expo SDK 57 can emulate light and dark mode, letting you check both appearances without touching device settings",
-    "IOS27 — iOS 27 ships next month. Beta 6 landed on August 17, and RCS Universal Profile 3.0 support means you can finally reply to a specific message received from Android",
+    "DEADLINE — From August 31, every new app and update on Google Play must target Android 16 (API level 36). Six days to go",
+    "IOS27 — The seventh developer betas of iOS 27 and macOS 27 landed on August 24, with the public releases due next month. They include Apple Intelligence changes, so it is time to check your own builds",
+    "ANDROID17 — The Android 17 QPR1 beta fixed a bug that prevented swiping the bottom gesture bar to switch apps after using Circle to Search",
+    "FUNDING — On April 9, 2026, Rork announced a $15M seed round led by Left Lane Capital. It also acquired app builder Paperline and signalled it will keep acquiring to bring in engineering talent",
+    "TRAFFIC — Rork reports over 743,000 monthly visits with 85 percent growth, which suggests its narrow focus on native mobile is paying off among AI app builders",
+    "FORECAST — Gartner expects 75 percent of new applications to be built with low-code or no-code in 2026, up from under 25 percent in 2020",
   ],
 };
 
