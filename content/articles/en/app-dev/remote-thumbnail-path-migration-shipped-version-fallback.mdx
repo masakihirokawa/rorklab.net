@@ -1,0 +1,237 @@
+---
+title: "I Moved the Thumbnails Assuming the Shipped Build Would Keep Asking for the Old Path"
+slug: "remote-thumbnail-path-migration-shipped-version-fallback"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-08-24T11:00"
+author: "Rork Lab"
+description: "Reorganizing image directories on the server does not reach the builds already installed on people's phones. Here is the two-way fallback that returns 200 for both the old and new paths, the ordering rule for images versus catalog, and the four checks I run through a CDN before calling a release live."
+tags: ["asset delivery", "wallpaper apps", "Expo", "operations", "CDN"]
+highlights:
+  - "You will be able to inventory what your already-shipped builds assume, and decide for yourself when it is safe to start reorganizing anything on the server"
+  - "You will be able to move assets while old-path traffic is still arriving, without users ever seeing a screen full of missing thumbnails"
+  - "You will be able to tell within minutes whether a release is half-applied — images uploaded, catalog still stale — even with a CDN sitting in front of everything"
+---
+
+The new 6.5-inch thumbnails were generated, verified, and moved into the master tree. All that was left was the upload. That is where I stopped.
+
+Renaming the directory meant that the URL the currently shipped iOS build assembles and the place where the files would actually live from tomorrow were about to disagree. On my machine the simulator runs the newest code, so this disagreement never surfaces during development. It only exists on other people's phones.
+
+Running wallpaper apps as an indie developer for as long as I have, this kind of "server-side only" cleanup comes up regularly. You cannot push a build through App Store review every time you add a single image, so the actual content lives on the server. The price of that freedom is that every directory you rename collides with an assumption some shipped build baked in months ago.
+
+The move itself takes ten minutes. The hard part was deciding what evidence would let me say the release had actually landed.
+
+## What a shipped build holds is not the image — it is the rule that builds the URL
+
+An app that delivers its content remotely does not carry the images. It carries a function from ID to URL.
+
+```ts
+// The rule the currently shipped build (iOS 4.1.1) carries
+const STORAGE_BASE = "https://storage.example.net";
+const THUMB_DIR = "5_8inch/thumb_full";   // frozen at build time
+
+export function thumbUrl(app: string, id: number) {
+  return `${STORAGE_BASE}/ios/wallpaper_apps/${app}/${THUMB_DIR}/${id}.jpg`;
+}
+```
+
+`THUMB_DIR` will not change by a single character until that device installs a newer build. The moment the files move to `6_5inch/thumb_full/`, every shipped build keeps knocking on a door that is no longer there.
+
+The part that is easy to miss: **this rule differs per version, not per app**. Across my wallpaper apps the iOS and Android lines are not in sync — iOS is mostly on 4.1.1 while Android sits on 1.9.0, and each shipped with its own directory convention. The blast radius of a move is not "how many apps do I have"; it is "how many distinct versions are still in active use."
+
+Open the version breakdown in the store console and you will usually find a build from six months ago still holding a double-digit share. People who turned off automatic updates. Devices on metered connections. Phones restored from an old backup after an upgrade. The old path does not disappear the day after you finish moving files.
+
+## Remote config only helps from the build that contains it
+
+My first instinct was to make `THUMB_DIR` come from remote config.
+
+```ts
+type RemoteConfig = { thumbDir?: string };
+
+export async function loadThumbDir(): Promise<string> {
+  try {
+    const res = await fetch(`${API_BASE}/ios/wallpaper_apps/${app}/config.json`, {
+      cache: "no-store",
+    });
+    const cfg = (await res.json()) as RemoteConfig;
+    return cfg.thumbDir ?? "6_5inch/thumb_full";   // current default
+  } catch {
+    return "6_5inch/thumb_full";                    // keep building URLs offline
+  }
+}
+```
+
+Clean enough. But it rescues exactly one population: builds shipped after the change. The builds giving me trouble are the ones without this branch.
+
+That was my own mistake, stated plainly. Remote config buys future flexibility; it does not travel backwards into binaries you already shipped. The only thing that can reach those binaries is the response your server sends.
+
+For the same reason I stopped hard-coding fallback constants such as the catalog total. When a fallback literal drifts away from the real value, the devices that failed to reach the network are the only ones living in the stale world — which is precisely the population you cannot debug. Those responses are now assembled from the same variable the live endpoint uses.
+
+## Return 200 for both the old and the new path
+
+So before touching a single file, I put a two-way fallback on the storage host. Whichever path a request arrives on, it gets whichever copy actually exists.
+
+```apache
+# storage .htaccess — serve the real file whether the request says 5_8inch or 6_5inch
+RewriteEngine On
+
+# (1) old path requested, nothing there, new path has it
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{DOCUMENT_ROOT}/ios/wallpaper_apps/$1/6_5inch/$2/$3 -f
+RewriteRule ^ios/wallpaper_apps/([^/]+)/5_8inch/(wallpaper|thumb_full)/([^/]+)$ \
+            /ios/wallpaper_apps/$1/6_5inch/$2/$3 [L]
+
+# (2) new path requested, nothing there yet, old path still has it (mid-move safety)
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{DOCUMENT_ROOT}/ios/wallpaper_apps/$1/5_8inch/$2/$3 -f
+RewriteRule ^ios/wallpaper_apps/([^/]+)/6_5inch/(wallpaper|thumb_full)/([^/]+)$ \
+            /ios/wallpaper_apps/$1/5_8inch/$2/$3 [L]
+```
+
+The `$1` `$2` `$3` inside `RewriteCond` are back-references to the pattern of the `RewriteRule` that follows. Write `%1` there instead and you get the captures of the preceding `RewriteCond`, which silently tests something you never meant to test. I lost time to that once.
+
+With those two rules in place, the migration stops having a broken moment. While files are in flight, requests on either path land on whichever copy exists, so neither the order of the move nor the timing of your next app release matters anymore.
+
+## Dropping the `-f` guard turns a 404 into something worse
+
+My first draft omitted the `-f` conditions. Without them, a request for a file that exists in neither location — one that should simply 404 — still gets rewritten to the other path. Nothing is there either, and depending on how the rules are written the two can rewrite into each other until the internal redirect limit trips and the server answers 500.
+
+What makes this nasty in production is that **the client-side symptom changes**. A 404 tells the app "this ID isn't available," and it moves on. A 500 looks transient, so retry logic kicks in and the same request repeats. One stray ID in a catalog is enough to fill your access log with that single path.
+
+Think of `-f` not as the condition that enables the rewrite, but as the condition that *prevents* it. Reading it that way makes the intent obvious months later, and if you are building this for the first time I would write the guard in from the start rather than bolting it on after the first incident.
+
+## Images first, catalog second
+
+There is a second ordering rule. When new content goes out, images are uploaded first and the total count plus category lists are updated afterwards.
+
+<table>
+<tr><th>Order</th><th>What users see</th></tr>
+<tr><td><strong>Images → catalog</strong></td><td>Until the catalog moves, nothing references the new files. Visually nothing happens at all</td></tr>
+<tr><td>Catalog → images</td><td>The count jumps first, so the end of the grid fills with placeholders for IDs that do not exist yet — for every user, for the whole duration of the upload</td></tr>
+</table>
+
+The first is "not visible yet." The second is "visibly broken." Total work is identical, so picking an order is free insurance.
+
+The same logic applies to category lists: adding IDs there has the same effect as raising the total.
+
+And here is the side effect that makes verification hard. If images land but the catalog never does, the app looks completely normal. A partial upload **fails silently by design**.
+
+## The four things I check before saying it is live
+
+Which is why local state is never my evidence. After every upload I go and read what the server actually returns, in four places.
+
+<table>
+<tr><th>#</th><th>Endpoint</th><th>What to look at</th></tr>
+<tr><td>1</td><td>iOS config response</td><td>Total count equals the new number</td></tr>
+<tr><td>2</td><td>Android config response</td><td>Same, but at a different array position</td></tr>
+<tr><td>3</td><td>Category list response</td><td>The new IDs are present</td></tr>
+<tr><td>4</td><td>The image itself, on both old and new paths</td><td>200, and the dimensions you expect</td></tr>
+</table>
+
+The footnote on row 2 exists because the config payloads are not shaped identically across platforms. In my setup the total sits at index 33 on the iOS endpoint and index 0 on the Android one — a historical accident, nothing more. Forget it and you will read one platform's position on the other platform's payload and declare a stale release healthy. Pinning both indices as named constants in the check script was the fix.
+
+```bash
+#!/usr/bin/env bash
+# verify_release.sh — read what the server actually returns, in four places
+set -euo pipefail
+
+API="https://api.example.net"
+IMG="https://storage.example.net"
+APP="ukiyo-e"
+EXPECT_TOTAL="${1:?pass the new total}"
+NEW_ID="${2:?pass the newest id}"
+CB="v=$(date +%s)"          # cache buster: look past the CDN edge
+
+IOS_TOTAL_INDEX=33          # array position differs per platform
+AND_TOTAL_INDEX=0
+
+fail() { echo "NG: $*" >&2; exit 1; }
+
+ios_total=$(curl -fsS "${API}/ios/wallpaper_apps/${APP}/4_1_1/index.php?config=1&${CB}" \
+  | jq -r ".[${IOS_TOTAL_INDEX}]")
+[ "$ios_total" = "$EXPECT_TOTAL" ] || fail "iOS config total=${ios_total} expected=${EXPECT_TOTAL}"
+
+and_total=$(curl -fsS "${API}/android/wallpaper_apps/${APP}/1_9_0/index.php?config=1&${CB}" \
+  | jq -r ".[${AND_TOTAL_INDEX}]")
+[ "$and_total" = "$EXPECT_TOTAL" ] || fail "Android config total=${and_total} expected=${EXPECT_TOTAL}"
+
+curl -fsS "${API}/ios/wallpaper_apps/${APP}/category_list.php?category=15&${CB}" \
+  | grep -q "\b${NEW_ID}\b" || fail "category_list is missing id=${NEW_ID}"
+
+for p in "5_8inch/thumb_full" "6_5inch/thumb_full"; do
+  code=$(curl -o /dev/null -s -w '%{http_code}' \
+    "${IMG}/ios/wallpaper_apps/${APP}/${p}/${NEW_ID}.jpg?${CB}")
+  [ "$code" = "200" ] || fail "${p} returned ${code}"
+done
+
+echo "OK: total=${EXPECT_TOTAL} id=${NEW_ID} — both legacy and new paths return 200"
+```
+
+The same script earns its keep a second time as a scheduled job. Because a partial upload is invisible in the UI, the only way it surfaces on its own is if something asks the question on a schedule. I run the check nightly against the current total and the newest ID, and treat a non-zero exit as a signal to look at the storage host rather than the app. Twice it has caught a state I would otherwise have discovered weeks later, from a support message rather than from my own tooling.
+
+One caveat on step 3: matching the ID as a bare string against the raw response is deliberately loose, and it will happily match `1291` inside `11291`. Anchoring on word boundaries as above is enough for numeric IDs, but if your catalog is JSON, parse it and compare properly rather than grepping. A check that can pass for the wrong reason is worse than no check, because it converts an open question into false confidence.
+
+Hitting the legacy path in step 4 is the whole point of this article. Check only the new path and you will happily sign off on a state where the fallback is not working and the shipped build is the only thing that is broken.
+
+## A CDN will lie to you during verification
+
+There is one more trap. Any path that received traffic just before the move has its response sitting on a CDN edge. Request the same URL afterwards and you get the cached copy, so you are inspecting history while believing you are inspecting the origin.
+
+The inverse happens too. If a 404 escapes during the move, that 404 can be negatively cached. Origin is correct, yet users behind one particular edge keep seeing a hole in the grid.
+
+The fix is unglamorous: give every verification request a unique query string. That is what `CB="v=$(date +%s)"` is doing above. When eyeballing images in a browser I append `?v=1` and read the filename and dimensions off the tab title. If you would rather judge from headers:
+
+```bash
+curl -sI "${IMG}/ios/wallpaper_apps/${APP}/6_5inch/thumb_full/${NEW_ID}.jpg?v=$(date +%s)" \
+  | grep -Ei '^(HTTP/|cf-cache-status|age|content-length):'
+```
+
+A non-zero `age` means you are looking at an edge copy. It is not evidence about the state of your origin.
+
+## Why I did not make the client do the recovery
+
+I did consider skipping the server work entirely and letting the app retry the old path when a load fails.
+
+```tsx
+// The client-side recovery I chose not to rely on
+const [uri, setUri] = useState(newUrl);
+
+<Image
+  source={{ uri }}
+  onError={() => {
+    if (uri !== legacyUrl) setUri(legacyUrl);   // fall back exactly once
+  }}
+/>
+```
+
+Short, and it works. Three reasons kept it out of the lead role.
+
+1. It also only helps from the build that contains it — the old builds that are actually suffering never get the fix, so the server work is required anyway
+2. It doubles round trips. A grid view fires dozens of thumbnail requests at once, and on a weak connection a failure-then-retry on every one of them is a visible cost
+3. It hides failures. A silent `onError` recovery means a genuine mistake — a bad move, a missing ID — never surfaces. I would rather have broken things look broken while I still have the context to fix them
+
+Client-side fallback earns its place after the server is correct, as insurance against transient network failures.
+
+## When can the old path be retired?
+
+A two-way fallback keeps the legacy path alive indefinitely. When you can retire it is decided by your users, not by your calendar. Start by counting.
+
+```bash
+# how many requests still arrive on each path
+awk '{print $7}' access.log \
+  | grep -oE '/(5_8inch|6_5inch)/(wallpaper|thumb_full)/' \
+  | sort | uniq -c | sort -rn
+```
+
+The ratio varies enormously between apps, so someone else's number is useless to you. My own rule is to keep the fallback until legacy traffic drops below 1% of the total. I deliberately did not pick a date: update adoption depends on how often people open the app, and apps opened daily drain their old versions on a completely different curve from apps opened when someone remembers they exist.
+
+When retirement finally comes, I start by answering `410 Gone` rather than deleting files. A 404 can trigger retry logic on the client; a 410 says "this is over" clearly enough that well-written clients stop asking.
+
+The design of separating content delivery from App Store review is covered in [Shipping Wallpaper Packs Without an App Review — Versioning and Delta Delivery for Remote Assets Across Six Apps](/articles/app-dev/rork-remote-asset-pack-versioning-delta-delivery-six-apps), including the manifest format and the delta download implementation. This article is about the problem you meet after running that system for a while.
+
+## Where to start
+
+Open your store console and count the versions actually in use right now. Something you assumed was a single build is often three or four. That number is exactly how many sets of frozen assumptions your server has to honour.
+
+Server cleanup looks like work you can do at any time. I assumed it was just a rename, too. It turned out to be a renegotiation with every version of myself that I have already shipped — and writing those terms down first is what turns it back into a ten-minute job.
