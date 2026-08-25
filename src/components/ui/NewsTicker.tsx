@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — 8月31日から、Google Play の新規アプリと更新はすべて Android 16（API レベル36）を対象にする必要があります。残り6日です",
-    "IOS27 — iOS 27 と macOS 27 の7回目の開発者ベータが8月24日に配布されました。正式リリースは来月です。Apple Intelligence 側の変更を含むため、手元のビルドの確認を始める時期です",
-    "ANDROID17 — Android 17 QPR1 のベータでは、Circle to Search を使った後に画面下のジェスチャーバーでアプリを切り替えられなくなる不具合が修正されました",
-    "FUNDING — Rork は2026年4月9日、Left Lane Capital 主導で1,500万ドルのシードラウンドを発表しました。あわせてアプリビルダーの Paperline を買収し、今後も人材獲得を目的とした買収を続ける方針を示しています",
-    "TRAFFIC — Rork のプラットフォームは月間74万3,000訪問を集め、成長率は85%と報告されています。AI アプリビルダーの中でも、ネイティブモバイルに絞った位置取りが効いている形です",
-    "FORECAST — Gartner は2026年に新規アプリケーションの75%がローコードまたはノーコードで作られると見ています。2020年時点では25%未満でした",
+    "DEADLINE — Google Play の Android 16（API レベル36）必須化まで残り5日です。8月31日以降、新規アプリと更新はすべて対象となります",
+    "EXTENSION — 条件を満たす場合は Play Console のフォームから11月1日までの延長を申請できます。申請そのものを締切前に済ませておく必要があります",
+    "EXPO — Expo SDK 57 が 57.0.9 で React Native 0.86.2 に対応しました。SDK 57 は React Native を 0.85 から 0.86 へ引き上げるリリースです",
+    "HERMES — SDK 56 にあった Hermes V1 のメモリ退行が修正されました。react-native-worklets や react-native-reanimated を使うアプリで効きます",
+    "IOS — iOS 27 の7回目の開発者ベータが8月24日に配布されました。正式リリースは9月で、Android から届いた個別のメッセージへ返信できるようになります",
+    "RORK — Rork Max はネイティブ Swift を生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage を対象にクラウド上の Mac でビルドされます",
   ],
   en: [
-    "DEADLINE — From August 31, every new app and update on Google Play must target Android 16 (API level 36). Six days to go",
-    "IOS27 — The seventh developer betas of iOS 27 and macOS 27 landed on August 24, with the public releases due next month. They include Apple Intelligence changes, so it is time to check your own builds",
-    "ANDROID17 — The Android 17 QPR1 beta fixed a bug that prevented swiping the bottom gesture bar to switch apps after using Circle to Search",
-    "FUNDING — On April 9, 2026, Rork announced a $15M seed round led by Left Lane Capital. It also acquired app builder Paperline and signalled it will keep acquiring to bring in engineering talent",
-    "TRAFFIC — Rork reports over 743,000 monthly visits with 85 percent growth, which suggests its narrow focus on native mobile is paying off among AI app builders",
-    "FORECAST — Gartner expects 75 percent of new applications to be built with low-code or no-code in 2026, up from under 25 percent in 2020",
+    "DEADLINE — Five days remain before Google Play requires Android 16 (API level 36). From August 31 it applies to new apps and updates alike",
+    "EXTENSION — If you qualify, you can request an extension through November 1 via a Play Console form, but the request itself has to be filed before the deadline",
+    "EXPO — Expo SDK 57 reached 57.0.9 with React Native 0.86.2. SDK 57 is primarily the jump from React Native 0.85 to 0.86",
+    "HERMES — The Hermes V1 memory regression introduced in SDK 56 has been fixed, which matters most for apps pulling in react-native-worklets or react-native-reanimated",
+    "IOS — The seventh iOS 27 developer beta shipped on August 24. The public release lands in September and finally lets you reply to an individual message from an Android sender",
+    "RORK — Rork Max generates native Swift and compiles on a cloud Mac fleet, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
   ],
 };
 
