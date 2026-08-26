@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — Google Play の Android 16（API レベル36）必須化まで残り5日です。8月31日以降、新規アプリと更新はすべて対象となります",
-    "EXTENSION — 条件を満たす場合は Play Console のフォームから11月1日までの延長を申請できます。申請そのものを締切前に済ませておく必要があります",
-    "EXPO — Expo SDK 57 が 57.0.9 で React Native 0.86.2 に対応しました。SDK 57 は React Native を 0.85 から 0.86 へ引き上げるリリースです",
-    "HERMES — SDK 56 にあった Hermes V1 のメモリ退行が修正されました。react-native-worklets や react-native-reanimated を使うアプリで効きます",
-    "IOS — iOS 27 の7回目の開発者ベータが8月24日に配布されました。正式リリースは9月で、Android から届いた個別のメッセージへ返信できるようになります",
-    "RORK — Rork Max はネイティブ Swift を生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage を対象にクラウド上の Mac でビルドされます",
+    "DEADLINE — Google Play の Android 16（API レベル36）必須化まで残り4日です。8月31日以降、新規アプリも既存アプリの更新も対象となります",
+    "RULES — 提出ルールと可視性ルールは別物です。更新を止めているアプリも、API 35 未満のままだと新しい端末で新規ユーザーに表示されなくなります",
+    "EXTENSION — 延長を申請すれば11月1日まで全ユーザーへの配信を続けられます。フォームは Play Console から出るため、締切前に済ませておく必要があります",
+    "EXPO — Expo SDK 57 は React Native を 0.85 から 0.86 へ引き上げ、React は 19.2 で据え置きです。0.86 は破壊的変更がない想定とされています",
+    "HERMES — 57.0.9 が React Native 0.86.2 に更新し、SDK 56 の Hermes V1 メモリ退行を解消しました。reanimated や worklets を使うアプリで効きます",
+    "PREBUILD — expo prebuild が native の android・ios ディレクトリを既定でクリアして再生成します。手を入れた native 変更は、事前に洗い出さないと静かに失われます",
   ],
   en: [
-    "DEADLINE — Five days remain before Google Play requires Android 16 (API level 36). From August 31 it applies to new apps and updates alike",
-    "EXTENSION — If you qualify, you can request an extension through November 1 via a Play Console form, but the request itself has to be filed before the deadline",
-    "EXPO — Expo SDK 57 reached 57.0.9 with React Native 0.86.2. SDK 57 is primarily the jump from React Native 0.85 to 0.86",
-    "HERMES — The Hermes V1 memory regression introduced in SDK 56 has been fixed, which matters most for apps pulling in react-native-worklets or react-native-reanimated",
-    "IOS — The seventh iOS 27 developer beta shipped on August 24. The public release lands in September and finally lets you reply to an individual message from an Android sender",
-    "RORK — Rork Max generates native Swift and compiles on a cloud Mac fleet, targeting iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage",
+    "DEADLINE — Four days remain until Google Play requires Android 16 (API level 36). From August 31 it applies to new apps and to updates of existing ones alike",
+    "RULES — The submission rule and the visibility rule are separate. An app you have stopped updating still disappears for new users on newer devices if it targets below API 35",
+    "EXTENSION — An extension keeps you shipping to all users until November 1, but the form lives in Play Console and has to be filed before the deadline passes",
+    "EXPO — Expo SDK 57 moves React Native from 0.85 to 0.86 while React stays at 19.2, and 0.86 is intended to land without breaking changes",
+    "HERMES — 57.0.9 updates React Native to 0.86.2 and clears the Hermes V1 memory regression from SDK 56, which shows up in apps importing reanimated or worklets",
+    "PREBUILD — expo prebuild now clears and regenerates the native android and ios directories by default, so hand-edited native changes vanish unless you audit for them first",
   ],
 };
 
