@@ -10,7 +10,7 @@
 import nextHandler from "./.open-next/worker";
 
 // ── Config ──────────────────────────────────────────────────────
-const DEPLOY_VERSION = "2026-08-22-campaign-end";
+const DEPLOY_VERSION = "2026-08-28-restore-prune-noindex";
 const CACHE_TTL = 14400; // 4 hours (edge only)
 
 function injectPolyfill(response) {
