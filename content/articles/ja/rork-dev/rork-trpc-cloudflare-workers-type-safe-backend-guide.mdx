@@ -1,30 +1,53 @@
 ---
-title: "Rork Max × tRPC × Cloudflare Workers：型安全なエッジAPIバックエンドの設計・実装・本番運用"
+title: "Rork Max × tRPC × Cloudflare Workers：型検査が緑でも本番が 500 を返す3つの境界"
 slug: "rork-trpc-cloudflare-workers-type-safe-backend-guide"
 category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-01T11:15"
-updated: "2026-04-01T11:15"
+updated: "2026-08-27T11:30"
 author: "Rork Lab"
-description: "Rork MaxとtRPC、Cloudflare Workersを組み合わせ、モバイルとサーバー間で完全な型安全を実現するエッジAPIバックエンドを構築します。プロジェクト構成の設計、ルーター実装、クライアント側の組み込み、本番運用の高度なパターンまでを解説します。"
-tags: ["tRPC", "Cloudflare Workers", "型安全", "エッジAPI", "Rork Max", "TypeScript", "バックエンド", "フルスタック"]
+description: "tRPC と Cloudflare Workers でエッジAPIを組む実装手順に加えて、型検査を通り抜けてしまう3つの境界—D1の列名と出力スキーマ、KVキャッシュの戻り値、レート制限の計数—を実測値つきで検証し、修正版のコードまで示します。"
+tags: ["tRPC", "Cloudflare Workers", "型安全", "エッジAPI", "Rork Max", "TypeScript", "バックエンド", "D1"]
 highlights:
-  - "tRPC + Cloudflare Workers でモバイルとサーバー間の型定義を完全共有し、ランタイムエラーをゼロに近づける実装手法を習得できる"
-  - "Zodバリデーション・ミドルウェア設計・エラーハンドリングまで、本番運用に耐える堅牢なAPI設計パターンを理解できる"
-  - "GitHub Actions × Wrangler によるCI/CDパイプラインの自動化とエッジデプロイの全手順を実践的に習得できる"
+  - "SELECT * と .output() を同じ手続きに並べると本番で全件 500 になる理由と、境界に変換関数を1枚置く修正版コードを手に入れられる"
+  - "「60回/分」と書いたレート制限が実測 30.5 回/分しか通さない原因を計測結果つきで確認し、時刻バケット方式の修正実装をそのまま流用できる"
+  - "KVキャッシュが D1Result を配列の顔で返す罠と、waitUntil による書き込み待ちの解消まで含めた実装を把握できる"
 ---
-## 取り組みの背景：なぜ型安全なバックエンドが個人開発者に必要なのか
+tsc は緑でした。`trpc.user.getProfile.useQuery` の戻り値には補完が効き、`profile.name` も `profile.bio` も、エディタ上では何ひとつ間違っていませんでした。
 
-Rork Max でアプリを開発していると、バックエンドAPIとの連携で思わぬバグに悩まされることがあります。APIのレスポンス型が変わったことに気づかず、モバイルアプリがクラッシュします。フィールド名のタイポが実行時エラーになります。こうした問題は、開発規模が大きくなるほど深刻さを増します。
+それでも、デプロイした Worker は `INTERNAL_SERVER_ERROR` を返し続けました。
 
-tRPC（TypeScript Remote Procedure Call）は、クライアントとサーバーの間で型定義を完全に共有する画期的なフレームワークです。Cloudflare Workers のエッジ環境と組み合わせることで、世界中どこからでも低レイテンシで動作する型安全なAPIバックエンドを、個人開発者でも構築できます。
+原因は型ではありませんでした。D1 が返す列名が `avatar_url` で、`.output()` に渡した Zod スキーマが期待していたのは `avatarUrl` だった、というだけのことです。型検査はビルド時にコードの内側だけを見ます。データベースの列名は、その外側にあります。
+
+個人開発では、この手の失敗に気づく人が自分しかいません。私がこの一件で学んだのは、tRPC が保証してくれる範囲と、保証してくれない範囲の線引きでした。ここを曖昧にしたまま「型安全だから安心」と考えると、コンパイラが通した設計がそのまま本番で 500 を返します。
+
+以下では、tRPC（TypeScript Remote Procedure Call）と Cloudflare Workers を組み合わせたバックエンドを組み直す手順を追いながら、**型が守ってくれる境界がどこで切れるのか**を毎回明示していきます。ルーターの実装だけでなく、D1 との列名の対応、KV キャッシュの戻り値の形、レート制限の計数の正確さ——私が個人開発で実際に踏んで、手元で数字を取り直したところまで含めて共有します。
+
+### tRPC が守る範囲と、守らない範囲
+
+先に全体像を置いておきます。以降の実装は、この表の「守らない」側を人手で埋めていく作業だと考えていただくと読みやすいはずです。
+
+<table>
+<thead>
+<tr><th>境界</th><th>型の保証</th><th>破れたときに起きること</th></tr>
+</thead>
+<tbody>
+<tr><td>クライアント ↔ ルーター定義</td><td><strong>あり</strong>（`AppRouter` 型の共有）</td><td>ビルドが落ちる。本番には出ない</td></tr>
+<tr><td>入力値 ↔ Zod スキーマ</td><td><strong>あり</strong>（実行時に検証）</td><td>`BAD_REQUEST` が返る。想定内の失敗</td></tr>
+<tr><td>D1 の列名 ↔ 出力スキーマ</td><td><strong>なし</strong></td><td>`.output()` が実行時に落ち、全件 500</td></tr>
+<tr><td>KV の戻り値 ↔ 宣言した型</td><td><strong>なし</strong>（`as T` で素通り）</td><td>形の違う値が型どおりの顔で返る</td></tr>
+<tr><td>環境変数（Secrets）の存在</td><td><strong>なし</strong></td><td>デプロイ後の初回リクエストで気づく</td></tr>
+</tbody>
+</table>
+
+型が効くのは上の 2 行だけです。下の 3 行は、書き手が意識して閉じない限り開きっぱなしになります。
 
 ## tRPC と Cloudflare Workers の組み合わせが強力な理由
 
 ### tRPC の核心：型の自動伝播
 
-従来の REST API 開発では、バックエンドとフロントエンドで同じ型定義を別々に管理することが一般的でしました。しかし tRPC では、サーバー側で定義した型が自動的にクライアント側に伝わります。
+従来の REST API 開発では、バックエンドとフロントエンドで同じ型定義を別々に管理するのが一般的でした。しかし tRPC では、サーバー側で定義した型が自動的にクライアント側に伝わります。
 
 ```typescript
 // サーバー側（Cloudflare Workers）
@@ -211,6 +234,7 @@ export const userRouter = router({
         });
       }
 
+      // ⚠️ この行は動きません。理由は直後に説明します
       return result as z.infer<typeof UserSchema>;
     }),
 
@@ -250,6 +274,67 @@ export const userRouter = router({
     }),
 });
 ```
+
+### `SELECT *` と `.output()` を並べた時点で、このコードは 500 を返す
+
+上の `getProfile` は型検査を通ります。それでも本番では全件 `INTERNAL_SERVER_ERROR` になります。理由は 2 つあり、どちらも型の外側で起きています。
+
+**1つ目は列名です。** 後述するマイグレーションでは列を `avatar_url` / `created_at` と定義します。D1 の `.first()` はその列名のままオブジェクトを返します。一方 `UserSchema` が要求しているのは `avatarUrl` / `createdAt` です。`.output()` はレスポンスを実行時に検証するため、必須プロパティの `createdAt` が見つからず、そこで例外になります。`as z.infer<typeof UserSchema>` は TypeScript に嘘をついているだけで、実行時には何の効果もありません。
+
+**2つ目は id の形式です。** `UserSchema` は `z.string().uuid()` を要求しています。ところが SQLite の `lower(hex(randomblob(16)))` が返すのはハイフンなしの 32 桁 16 進文字列です。手元で確かめたところ、生成されるのは次のような値でした。
+
+```text
+1d6bd9d5eea00bf5749725b94279a2fe   ← 長さ 32・区切り文字なし
+```
+
+RFC 4122 の UUID はハイフンで区切られた 8-4-4-4-12 の 36 文字で、14 文字目にバージョン、17 文字目にバリアントを表す桁が入ります。上の値はどの条件も満たしません。つまり列名を直したとしても、id の検証で今度は別の例外になります。
+
+対処は、**DB の行を返す前に1回だけ変換関数を通す**ことです。境界を1箇所に集めておくと、後から列を増やしたときに直す場所が1つで済みます。
+
+```typescript
+// packages/api/src/db/mappers.ts
+import { z } from 'zod';
+
+// DB の生の行（snake_case・id はハイフンなし16進）
+const UserRowSchema = z.object({
+  id: z.string().regex(/^[0-9a-f]{32}$/),
+  name: z.string(),
+  email: z.string().email(),
+  bio: z.string().nullable(),
+  avatar_url: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+// API が外に出す形（camelCase）
+export const UserSchema = z.object({
+  id: z.string().regex(/^[0-9a-f]{32}$/),
+  name: z.string().min(1).max(50),
+  email: z.string().email(),
+  bio: z.string().max(200).optional(),
+  avatarUrl: z.string().url().optional(),
+  createdAt: z.string(),
+});
+
+export function toUser(row: unknown): z.infer<typeof UserSchema> {
+  // ここで落ちれば「DB のスキーマが変わった」と即座に分かる
+  const r = UserRowSchema.parse(row);
+  return {
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    bio: r.bio ?? undefined,
+    avatarUrl: r.avatar_url ?? undefined,
+    createdAt: r.created_at,
+  };
+}
+```
+
+ルーター側は `return toUser(result);` に差し替えるだけです。`as` を消したことで、マイグレーションで列名を変えた瞬間に `UserRowSchema.parse` が失敗し、原因の分かるエラーが出ます。`as` を残したままだと、失敗するのは検証の1段あとになり、メッセージからは列名の話だと読み取れません。
+
+`z.string().uuid()` を使い続けたい場合は、DB 側を合わせます。SQLite にはハイフン入りを直接生成する関数がないため、`randomblob` を切り貼りするか、アプリ側で `crypto.randomUUID()` を生成して INSERT する方が素直です。私は後者を選びました。id の生成規則をアプリのコードに置いた方が、あとで別のストレージへ移す時に迷わないためです。
+
+Zod を境界に1枚だけ挟むという考え方そのものは、クライアント側の fetch でも同じように効きます。この設計を最小構成で試したい方は、[Rork が生成した fetch コードに、Zod の検証境界を1枚だけ挟む](/articles/rork-dev/rork-generated-fetch-zod-validation-boundary-layer) も参考になるかもしれません。
 
 ## Cloudflare Workers エントリーポイントの実装
 
@@ -495,6 +580,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX idx_users_email ON users(email);
 ```
 
+`DEFAULT (lower(hex(randomblob(16))))` が返すのはハイフンなしの 32 桁 16 進文字列です。前述のとおり `z.string().uuid()` とは形式が合いません。UUID 形式で揃えたい場合は DEFAULT を外し、アプリ側で `crypto.randomUUID()` を生成して INSERT する構成にします。Workers ランタイムでも `crypto.randomUUID()` はそのまま使えます。
+
 ```bash
 # D1 データベースの作成とマイグレーション
 npx wrangler d1 create my-rork-db
@@ -502,10 +589,12 @@ npx wrangler d1 migrations apply my-rork-db --local  # ローカル開発
 npx wrangler d1 migrations apply my-rork-db          # 本番環境
 ```
 
-### KV キャッシュによるパフォーマンス最適化
+### KV キャッシュ — `.all()` の戻り値をそのまま入れない
+
+キャッシュ層は書きやすい反面、型が効かない場所の代表でもあります。次は素朴に書いた版です。
 
 ```typescript
-// packages/api/src/utils/cache.ts
+// ⚠️ 3つの問題があります（後述）
 export async function withCache<T>(
   kv: KVNamespace,
   key: string,
@@ -513,45 +602,88 @@ export async function withCache<T>(
   fetcher: () => Promise<T>
 ): Promise<T> {
   const cached = await kv.get(key, 'json');
-  if (cached !== null) {
-    return cached as T;
-  }
+  if (cached !== null) return cached as T;
 
   const fresh = await fetcher();
-  await kv.put(key, JSON.stringify(fresh), {
+  await kv.put(key, JSON.stringify(fresh), { expirationTtl: ttlSeconds });
+  return fresh;
+}
+```
+
+<table>
+<thead>
+<tr><th>問題</th><th>何が起きるか</th><th>直し方</th></tr>
+</thead>
+<tbody>
+<tr><td><code>as T</code> で素通し</td><td>D1 の <code>.all()</code> は配列ではなく <code>{ results, success, meta }</code> を返す。呼び出し側は配列のつもりで <code>.map()</code> して落ちる</td><td>fetcher の中で <code>.results</code> を取り出す</td></tr>
+<tr><td><code>cached !== null</code> で判定</td><td>値として <code>null</code> を保存した場合と、キーが無い場合を区別できない</td><td>存在確認は <code>{ type: 'json' }</code> の戻り値ではなくラッパーオブジェクトで持つ</td></tr>
+<tr><td><code>await kv.put(...)</code></td><td>書き込み完了までレスポンスを返さない。キャッシュミス時のレイテンシに毎回上乗せされる</td><td><code>executionCtx.waitUntil()</code> に逃がす</td></tr>
+</tbody>
+</table>
+
+3点を反映した版が次です。
+
+```typescript
+// packages/api/src/utils/cache.ts
+type Envelope<T> = { v: T };
+
+export async function withCache<T>(
+  kv: KVNamespace,
+  key: string,
+  ttlSeconds: number,
+  fetcher: () => Promise<T>,
+  waitUntil?: (p: Promise<unknown>) => void
+): Promise<T> {
+  // ラッパーに包むことで「値が null」と「キーが無い」を区別する
+  const cached = await kv.get<Envelope<T>>(key, 'json');
+  if (cached) return cached.v;
+
+  const fresh = await fetcher();
+  const write = kv.put(key, JSON.stringify({ v: fresh }), {
     expirationTtl: ttlSeconds,
   });
 
+  // 書き込みを待たずにレスポンスを返す
+  if (waitUntil) waitUntil(write);
+  else await write;
+
   return fresh;
 }
+```
 
-// 使用例：ルーター内で重いクエリをキャッシュ
+ルーター側では、`.all()` の戻り値から `results` を取り出してからキャッシュに入れます。ここを省くと、キャッシュヒット時とミス時で戻り値の形が揃っているにもかかわらず、どちらも配列ではないという分かりにくい状態になります。
+
+```typescript
 export const contentRouter = router({
-  getFeaturedContent: publicProcedure
-    .query(async ({ ctx }) => {
-      return withCache(
-        ctx.env.CACHE,
-        'featured-content',
-        300, // 5分間キャッシュ
-        async () => {
-          return ctx.env.DB.prepare(
-            'SELECT * FROM content WHERE featured = 1 ORDER BY created_at DESC LIMIT 10'
-          ).all();
-        }
-      );
-    }),
+  getFeaturedContent: publicProcedure.query(async ({ ctx }) => {
+    return withCache(
+      ctx.env.CACHE,
+      'featured-content',
+      300,
+      async () => {
+        const { results } = await ctx.env.DB.prepare(
+          'SELECT * FROM content WHERE featured = 1 ORDER BY created_at DESC LIMIT 10'
+        ).all<ContentRow>();
+        return results.map(toContent);  // 列名の変換もここで済ませる
+      },
+      ctx.waitUntil
+    );
+  }),
 });
 ```
 
-### レート制限の実装
+`ctx.waitUntil` は、コンテキスト生成時に Hono の `c.executionCtx.waitUntil` を束ねて渡しておきます。バインドを忘れると `Illegal invocation` になるため、`(p) => c.executionCtx.waitUntil(p)` の形で包むのが安全です。
+
+なお KV は書き込みが世界中の PoP に伝播するまで時間差があります。「書いた直後に読む」用途には向きません。キャッシュとしては十分ですが、次のレート制限のような**数え間違いが許されない用途では別の仕組みが要ります**。
+
+### レート制限 — 「60回/分」と書いたコードが、実際には 30.5 回/分しか通さなかった
+
+レート制限は、私が最も長く間違ったまま運用していた箇所です。まず、よく見かける書き方を置きます。
 
 ```typescript
-// packages/api/src/middleware/rateLimit.ts
-import { TRPCError } from '@trpc/server';
-import { t } from '../trpc';
-
+// ⚠️ 公称値どおりには効きません
 export const rateLimitMiddleware = t.middleware(async ({ ctx, next, path }) => {
-  const ip = 'client-ip'; // ヘッダーから取得する実装が必要
+  const ip = 'client-ip'; // ← ヘッダーから取得する実装が必要
   const key = `rate-limit:${ip}:${path}`;
   const limit = 60; // 1分あたり60リクエスト
 
@@ -559,23 +691,86 @@ export const rateLimitMiddleware = t.middleware(async ({ ctx, next, path }) => {
   const count = current ? parseInt(current) : 0;
 
   if (count >= limit) {
-    throw new TRPCError({
-      code: 'TOO_MANY_REQUESTS',
-      message: 'リクエスト制限に達しました。しばらく待ってから再試行してください。',
-    });
+    throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: '...' });
   }
 
   await ctx.env.CACHE.put(key, String(count + 1), { expirationTtl: 60 });
+  return next();
+});
+```
+
+問題は 3 つあります。順に見ていきます。
+
+**IP が固定文字列のままです。** `'client-ip'` はプレースホルダで、書き換えないと全利用者が1つのバケットを共有します。同時に使う人が 10 人いれば、1人あたりの割り当ては 10 分の 1 になります。Cloudflare Workers では `request.headers.get('CF-Connecting-IP')` で実クライアント IP が取れます。`X-Forwarded-For` は利用者側から詐称できるため、そちらを信頼してはいけません。
+
+**TTL が書き込みのたびにリセットされます。** これが一番厄介でした。カウンタを 1 増やすたびに `expirationTtl: 60` を指定し直すため、有効期限は常に「最後の書き込みから 60 秒後」へ後ろにずれます。ウィンドウが区切られないまま伸び続ける、という挙動です。
+
+どのくらいずれるのか、実装をそのまま JavaScript で模して測りました。KV の挙動（TTL 経過で消える／`put` で期限が更新される）を再現し、10 分間の連続アクセスを流した結果です。
+
+<table>
+<thead>
+<tr><th>流量</th><th>上の実装で通った数</th><th>時刻バケット方式で通った数</th></tr>
+</thead>
+<tbody>
+<tr><td>毎秒 1 リクエスト（公称上限ちょうど）</td><td>305 件 = <strong>30.5 回/分</strong></td><td>600 件 = 60.0 回/分</td></tr>
+<tr><td>毎秒 2 リクエスト（公称上限の 2 倍）</td><td>420 件 = <strong>42.0 回/分</strong></td><td>600 件 = 60.0 回/分</td></tr>
+</tbody>
+</table>
+
+上限ちょうどの流量、つまり本来 1 件も弾かれてはいけないペースで、実際に通ったのは公称値の約半分でした。さらに厄介なのは、流量を 2 倍に増やすと通過数が **増える**（30.5 → 42.0）という点です。上限に張り付くと `throw` して `put` を飛ばすため、その間だけ期限が伸びなくなり、かえって早く窓が開きます。「制限をきつくしたはずが緩くなる」方向に振れるので、ログを眺めていても不整合に気づけません。
+
+**KV は結果整合です。** 書き込みが各 PoP に伝播するまで時間差があるため、複数拠点から同時にアクセスされると、それぞれが古いカウンタを読んで加算します。厳密な上限にはなりません。
+
+修正版では、鍵に時刻バケットを含めて窓を固定します。こうすると `put` で期限を触っても窓の境界は動きません。
+
+```typescript
+// packages/api/src/middleware/rateLimit.ts
+import { TRPCError } from '@trpc/server';
+import { t } from '../trpc';
+
+const WINDOW_SEC = 60;
+const LIMIT = 60;
+
+export const rateLimitMiddleware = t.middleware(async ({ ctx, next, path }) => {
+  // 実クライアント IP。CF-Connecting-IP は Cloudflare が付け替えるため詐称できない
+  const ip = ctx.req.headers.get('CF-Connecting-IP') ?? 'unknown';
+
+  // 鍵に時刻バケットを含める → 窓の境界が put で動かない
+  const bucket = Math.floor(Date.now() / 1000 / WINDOW_SEC);
+  const key = `rl:${ip}:${path}:${bucket}`;
+
+  const count = Number(await ctx.env.CACHE.get(key)) || 0;
+
+  if (count >= LIMIT) {
+    const retryAfter = WINDOW_SEC - Math.floor((Date.now() / 1000) % WINDOW_SEC);
+    throw new TRPCError({
+      code: 'TOO_MANY_REQUESTS',
+      message: `リクエストが多すぎます。${retryAfter} 秒後に再試行してください。`,
+    });
+  }
+
+  // 窓 2 つ分を TTL に取り、境界をまたぐ書き込みで消え残りが出ないようにする
+  await ctx.env.CACHE.put(key, String(count + 1), {
+    expirationTtl: WINDOW_SEC * 2,
+  });
 
   return next();
 });
 ```
 
+`ctx.req` はコンテキスト生成時に `opts.req` を持ち回しておきます。ヘッダーだけあれば足りるので、`headers` を抜き出して渡す形でも構いません。
+
+この修正でも、KV の結果整合という制約は残ります。上限を厳密に守らせたい場合、たとえば有料 API を中継していて超過が課金に直結する場面では、カウンタを1箇所に集約できる仕組みが要ります。Durable Objects なら1オブジェクトが単一スレッドで直列に処理するため、読み書きの競合が起きません。実装の当たりをつけたい方は [Rork × Cloudflare Durable Objects で「リアルタイム協調アプリ」のバックエンドを作る実装ガイド](/articles/rork-dev/rork-cloudflare-durable-objects-realtime-backend-guide) で扱っている状態管理の考え方が、ほぼそのまま流用できます。
+
+外部 API の鍵を Worker で中継する構成でのレート制限は、[Rork（Expo）生成アプリに OpenAI の鍵を直書きすると抜かれます](/articles/rork-dev/rork-expo-api-key-proxy-worker-rate-limit-rotation) でも扱っています。守りたいものが「自分のサーバー資源」なのか「従量課金される外部 API」なのかで、許容できる誤差が変わる点は意識しておく価値があります。
+
 ## よくあるエラーと対処法
 
 ### CORS エラーが発生する場合
 
-Rork Max（Expo）の開発環境では `exp://localhost:8081` からリクエストが送信されます。wrangler の設定で許可するオリジンに開発用 URL を追加してください。本番環境では Expo ビルドのディープリンクスキームも必要に応じて追加します。
+先に整理しておくと、**React Native のネイティブ実行では CORS は関係ありません**。CORS はブラウザが Origin ヘッダーを付けてプリフライトを行う仕組みで、ネイティブの fetch はその制約下にないためです。`exp://localhost:8081` を `origin` の配列に並べても、実際には照合されません。
+
+CORS の設定が要るのは、Expo Router の Web 書き出しやブラウザからの動作確認を行う場合です。その用途では `http://localhost:8081` のような HTTP オリジンを指定します。逆に言えば、ネイティブだけを対象にしているのに CORS エラーが出ているなら、原因はブラウザ経由の呼び出しか、プリフライトを弾いているルーティング側にあります。
 
 ### Workers の `nodejs_compat` フラグが必要な場合
 
@@ -632,13 +827,33 @@ jobs:
 
 GitHub の Secrets に `CLOUDFLARE_API_TOKEN`（Cloudflare ダッシュボードで発行）と `CLOUDFLARE_ACCOUNT_ID` を設定するだけで、`main` ブランチへのプッシュ時に自動デプロイが走ります。
 
-## 個人開発者の視点から（実体験メモ）
+## 個人開発者の視点から
+
+この構成を選んで良かったと感じているのは、エラーの出る場所が前倒しになったことです。以前は「アプリがクラッシュしたのでサーバーのログを見に行く」という順序でしたが、今は「型が合わないのでビルドが落ちる」で終わる場面が増えました。原因を探す時間が短くなった実感があります。
+
+一方で、この記事で挙げた 3 つの不具合はいずれもビルドを通り抜けています。列名の不一致も、キャッシュの戻り値の形も、レート制限の数え方も、TypeScript から見れば正しいコードでした。**型検査が緑であることは、設計が正しいことの証明にはならない**——このあたりまえの一文を、私は本番の 500 を見てからようやく肌で理解しました。
+
+ですので、導入するなら順番をおすすめします。まずルーターを 1 本と手続きを 2 〜 3 個だけ作り、実機から呼んで戻り値を目で確認する。そこまで済んでから認証、キャッシュ、レート制限と足していく。一気に組むと、どの層で形が崩れたのか切り分けられなくなります。
+
+モノレポの構成そのものに迷いがある場合は、[Rork × Turborepo モノレポ設計](/articles/rork-dev/rork-turborepo-monorepo-shared-components-guide) に共有パッケージの切り方をまとめてあります。REST で組んだ場合との比較を見たい方は [Rork × Hono.js × Cloudflare Workers で本番レベル REST API を構築する](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) と読み比べると、tRPC を選ぶ理由がはっきりするはずです。
 
 ## ここまでの要点
-Rork Max × tRPC × Cloudflare Workers の組み合わせは、個人開発者がプロフェッショナル品質のフルスタックモバイルアプリを構築するうえで、現時点で最も生産性の高い選択肢のひとつです。
 
-型安全によりランタイムエラーが大幅に減り、Cloudflare のエッジ実行により世界中どこからでも低レイテンシを実現でき、無料枠も十分に広い。このスタックを習得することで、バックエンドとモバイルアプリの開発速度が格段に向上するはずです。
+tRPC と Cloudflare Workers の組み合わせが解決してくれるのは、クライアントとルーター定義のあいだの食い違いです。フィールド名の変更も、戻り値の形の変更も、ビルドの時点で止まります。ここは確かに強力です。
 
-まずは小規模な API から試してみて、徐々に認証・キャッシュ・CI/CD を追加していく進め方をおすすめします。フルスタック型安全の恩恵を一度体験すると、以前の開発スタイルには戻れなくなるでしょう。
+同時に、ここで直した 3 箇所はいずれもその保証の外側にありました。
 
-型安全なAPIアーキテクチャについてさらに深く
+<table>
+<thead>
+<tr><th>直した箇所</th><th>症状</th><th>入れた対策</th></tr>
+</thead>
+<tbody>
+<tr><td>D1 の列名と出力スキーマ</td><td>型検査は緑のまま、本番で全件 500</td><td>行を変換する <code>toUser()</code> を境界に1枚置く</td></tr>
+<tr><td><code>withCache</code> の戻り値</td><td><code>.all()</code> の <code>D1Result</code> が配列の顔で返る</td><td><code>results</code> を取り出し、書き込みは <code>waitUntil</code> へ</td></tr>
+<tr><td>レート制限のカウンタ</td><td>公称 60 回/分が実測 30.5 回/分</td><td>鍵に時刻バケットを含めて窓を固定する</td></tr>
+</tbody>
+</table>
+
+次の一歩としては、いま動いているバックエンドの `.output()` を 1 つ選び、DB の列名と突き合わせてみるところから始めてみてください。`SELECT *` と `.output()` が同じ手続きの中に並んでいたら、そこは高い確率で同じ問題を抱えています。確認は数分で終わりますし、見つかれば本番の 500 を 1 つ減らせます。
+
+私自身、まだ手探りで組み替えている部分の多い構成です。お読みいただきありがとうございました。

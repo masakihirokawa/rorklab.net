@@ -1,18 +1,18 @@
 ---
-title: "Rork Max × tRPC × Cloudflare Workers: Designing, Implementing, and Running a Type-Safe Edge API Backend"
+title: "Rork Max × tRPC × Cloudflare Workers: Three Boundaries Where a Green Type Check Still Returns a 500"
 slug: "rork-trpc-cloudflare-workers-type-safe-backend-guide"
 category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-01T11:15"
-updated: "2026-04-01T11:15"
+updated: "2026-08-27T11:30"
 author: "Rork Lab"
-description: "Build a type-safe edge API for Rork Max with tRPC and Cloudflare Workers. Covers project setup, Zod validation, JWT auth, KV caching, and CI/CD deployment."
-tags: ["tRPC", "Cloudflare Workers", "type safety", "edge API", "Rork Max", "TypeScript", "backend", "full-stack"]
+description: "A full tRPC and Cloudflare Workers edge API walkthrough, plus three boundaries that slip past the type checker: D1 column names versus your output schema, KV cache return shapes, and a rate limiter that measured 30.5 requests per minute against a stated limit of 60."
+tags: ["tRPC", "Cloudflare Workers", "type safety", "edge API", "Rork Max", "TypeScript", "backend", "D1"]
 highlights:
-  - "Learn how to achieve complete type safety between your mobile app and server using tRPC + Cloudflare Workers, reducing runtime errors to near zero"
-  - "Understand production-grade API design patterns including Zod validation, middleware architecture, and robust error handling"
-  - "Master the full workflow from GitHub Actions × Wrangler CI/CD pipeline automation to edge deployment"
+  - "See exactly why putting SELECT * and .output() in the same procedure returns a 500 on every request, and get the mapper function that closes the gap"
+  - "Read the measured numbers behind a rate limiter that admits 30.5 requests per minute when it claims 60, plus a fixed-window rewrite you can drop in"
+  - "Learn why a KV cache wrapper hands back a D1Result wearing an array's face, and how waitUntil removes the write latency from every cache miss"
 ---
 ## Setup and context: The Hidden Cost of Untyped APIs in Mobile Development
 
@@ -23,6 +23,25 @@ This problem isn't unique to beginners. Even experienced TypeScript developers w
 tRPC (TypeScript Remote Procedure Call) takes a fundamentally different approach. Instead of generating types from a schema, it shares the type definitions themselves between your server and client. When you define a procedure on the server, your React Native components automatically know its input and output types — no generation step, no schema file, no manual sync. If the server type changes, your client shows a compile-time error immediately.
 
 Pair this with Cloudflare Workers, and you have a globally distributed, low-latency backend that costs virtually nothing for indie app scales and scales seamlessly as your user base grows. This guide covers everything: project architecture, router design, authentication, caching, advanced middleware patterns, and a full CI/CD pipeline with GitHub Actions. It's written for developers comfortable with TypeScript who have shipped apps with Rork Max.
+
+### What tRPC Guarantees, and What It Does Not
+
+Before the implementation, here is the map I wish I had drawn first. Everything below the third row is a boundary you have to close by hand, and the first time I skipped one it cost me a production incident: a `getProfile` procedure that compiled cleanly, autocompleted perfectly in the editor, and returned `INTERNAL_SERVER_ERROR` on every single call.
+
+<table>
+<thead>
+<tr><th>Boundary</th><th>Type guarantee</th><th>What happens when it breaks</th></tr>
+</thead>
+<tbody>
+<tr><td>Client ↔ router definition</td><td><strong>Yes</strong> (shared <code>AppRouter</code> type)</td><td>The build fails. It never reaches production</td></tr>
+<tr><td>Input ↔ Zod schema</td><td><strong>Yes</strong> (validated at runtime)</td><td><code>BAD_REQUEST</code> comes back. An expected failure</td></tr>
+<tr><td>D1 column names ↔ output schema</td><td><strong>No</strong></td><td><code>.output()</code> throws at runtime — every request 500s</td></tr>
+<tr><td>KV return value ↔ declared type</td><td><strong>No</strong> (<code>as T</code> waves it through)</td><td>A differently shaped value arrives wearing the right type</td></tr>
+<tr><td>Environment secrets existing</td><td><strong>No</strong></td><td>You find out on the first request after deploy</td></tr>
+</tbody>
+</table>
+
+Only the top two rows are covered by the compiler. The bottom three stay open unless you deliberately close them, and this guide flags each one as we reach it.
 
 ## Understanding tRPC's Core Concepts
 
@@ -238,6 +257,7 @@ export const userRouter = router({
         });
       }
 
+      // This line does not work in production. Explanation follows
       return result as z.infer<typeof UserSchema>;
     }),
 
@@ -269,6 +289,68 @@ export const userRouter = router({
 ```
 
 Defining both `.input()` and `.output()` on a procedure is a useful discipline for premium APIs. The output schema acts as a contract: if your database query returns a shape that doesn't match `UserSchema`, you'll get a runtime error in development before it reaches production.
+
+
+### Why `SELECT *` Plus `.output()` Returns a 500 on Every Call
+
+The `getProfile` procedure above type-checks. It also fails in production on every request, for two reasons that both live outside the type system.
+
+**First, the column names.** The migration later in this guide defines the columns as `avatar_url` and `created_at`. D1's `.first()` hands them back exactly as written. `UserSchema`, meanwhile, requires `avatarUrl` and `createdAt`. Because `.output()` validates the response at runtime, the required `createdAt` property is missing and Zod throws. The `as z.infer<typeof UserSchema>` cast only lies to TypeScript — at runtime it does nothing at all.
+
+**Second, the id format.** `UserSchema` asks for `z.string().uuid()`. SQLite's `lower(hex(randomblob(16)))` produces a 32-character hex string with no separators. I generated one to check the shape:
+
+```text
+1d6bd9d5eea00bf5749725b94279a2fe   ← 32 characters, no hyphens
+```
+
+An RFC 4122 UUID is 36 characters in an 8-4-4-4-12 layout, with a version digit at position 15 and a variant digit at position 20. This value satisfies none of that. So even after fixing the column names, the id check would throw next.
+
+The fix is to run every database row through one conversion function before it leaves the handler. Keeping the boundary in a single place means that when you add a column later, there is exactly one file to update.
+
+```typescript
+// packages/api/src/db/mappers.ts
+import { z } from 'zod';
+
+// The raw DB row: snake_case, id is unhyphenated hex
+const UserRowSchema = z.object({
+  id: z.string().regex(/^[0-9a-f]{32}$/),
+  name: z.string(),
+  email: z.string().email(),
+  bio: z.string().nullable(),
+  avatar_url: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+// The shape the API actually returns: camelCase
+export const UserSchema = z.object({
+  id: z.string().regex(/^[0-9a-f]{32}$/),
+  name: z.string().min(1).max(50),
+  email: z.string().email(),
+  bio: z.string().max(200).optional(),
+  avatarUrl: z.string().url().optional(),
+  createdAt: z.string(),
+});
+
+export function toUser(row: unknown): z.infer<typeof UserSchema> {
+  // A failure here tells you immediately that the DB schema moved
+  const r = UserRowSchema.parse(row);
+  return {
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    bio: r.bio ?? undefined,
+    avatarUrl: r.avatar_url ?? undefined,
+    createdAt: r.created_at,
+  };
+}
+```
+
+In the router, `return result as ...` becomes `return toUser(result)`. Removing the cast means a renamed column now fails inside `UserRowSchema.parse`, with an error that names the missing field. Leave the cast in place and the failure surfaces one layer later, in a message that gives no hint that column naming is the culprit.
+
+You could also alias in SQL (`SELECT avatar_url AS avatarUrl`), and for a single query that is faster to write. I stopped doing it once I had four procedures reading the same table, because the aliases drifted apart and the mismatch moved from one obvious place to four subtle ones.
+
+If you want to see the same "one validation boundary" idea applied on the client side instead, [Adding a Single Zod Validation Boundary to Rork's Generated Fetch Code](/articles/rork-dev/rork-generated-fetch-zod-validation-boundary-layer) works through the minimal version.
 
 ## The Cloudflare Workers Entry Point
 
@@ -493,6 +575,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX idx_users_email ON users(email);
 ```
 
+Note the id default. `lower(hex(randomblob(16)))` produces an unhyphenated 32-character hex string, which — as covered earlier — will not satisfy `z.string().uuid()`. If you want real UUIDs, drop the DEFAULT and generate `crypto.randomUUID()` in application code before inserting. The Workers runtime supports it natively.
+
 ```bash
 # Create and apply migrations
 npx wrangler d1 create my-rork-db
@@ -502,12 +586,12 @@ npx wrangler d1 migrations apply my-rork-db           # Production
 
 D1 queries are simple: prepare a parameterized statement with `.prepare()`, bind values with `.bind()`, and execute with `.first()` (one row), `.all()` (all rows), or `.run()` (mutations).
 
-### KV Caching for High-Read Data
+### KV Caching — Don't Store `.all()` Straight From D1
 
-Not every piece of data needs to hit the database on every request. Featured content, configuration, and computed aggregates are good candidates for KV caching. A simple wrapper function makes the pattern reusable:
+Caching is easy to write and, for the same reason, easy to get subtly wrong. Here is the naive version:
 
 ```typescript
-// packages/api/src/utils/cache.ts
+// Three problems, listed below
 export async function withCache<T>(
   kv: KVNamespace,
   key: string,
@@ -521,32 +605,82 @@ export async function withCache<T>(
   await kv.put(key, JSON.stringify(fresh), { expirationTtl: ttlSeconds });
   return fresh;
 }
+```
 
-// In a router — transparent caching of expensive queries
+<table>
+<thead>
+<tr><th>Problem</th><th>What it does</th><th>Fix</th></tr>
+</thead>
+<tbody>
+<tr><td><code>as T</code> waves the value through</td><td>D1's <code>.all()</code> returns <code>{ results, success, meta }</code>, not an array. Callers expecting an array call <code>.map()</code> and crash</td><td>Unwrap <code>.results</code> inside the fetcher</td></tr>
+<tr><td><code>cached !== null</code> as the hit test</td><td>A stored value of <code>null</code> is indistinguishable from a missing key</td><td>Wrap the value in an envelope object</td></tr>
+<tr><td><code>await kv.put(...)</code></td><td>The response waits for the write. That latency is added to every cache miss</td><td>Hand the write to <code>executionCtx.waitUntil()</code></td></tr>
+</tbody>
+</table>
+
+With all three addressed:
+
+```typescript
+// packages/api/src/utils/cache.ts
+type Envelope<T> = { v: T };
+
+export async function withCache<T>(
+  kv: KVNamespace,
+  key: string,
+  ttlSeconds: number,
+  fetcher: () => Promise<T>,
+  waitUntil?: (p: Promise<unknown>) => void
+): Promise<T> {
+  // The envelope separates "the value is null" from "the key is absent"
+  const cached = await kv.get<Envelope<T>>(key, 'json');
+  if (cached) return cached.v;
+
+  const fresh = await fetcher();
+  const write = kv.put(key, JSON.stringify({ v: fresh }), {
+    expirationTtl: ttlSeconds,
+  });
+
+  // Return without waiting for the write to land
+  if (waitUntil) waitUntil(write);
+  else await write;
+
+  return fresh;
+}
+```
+
+In the router, pull `results` out of the D1 response before it reaches the cache. Skip this and both the hit path and the miss path return the same shape — which sounds fine until you notice that neither of them is the array your component is iterating.
+
+```typescript
 export const contentRouter = router({
   getFeaturedContent: publicProcedure.query(async ({ ctx }) => {
-    return withCache(ctx.env.CACHE, 'featured-content', 300, async () =>
-      ctx.env.DB.prepare(
-        'SELECT * FROM content WHERE featured = 1 ORDER BY created_at DESC LIMIT 10'
-      ).all()
+    return withCache(
+      ctx.env.CACHE,
+      'featured-content',
+      300,
+      async () => {
+        const { results } = await ctx.env.DB.prepare(
+          'SELECT * FROM content WHERE featured = 1 ORDER BY created_at DESC LIMIT 10'
+        ).all<ContentRow>();
+        return results.map(toContent);  // handle column naming here too
+      },
+      ctx.waitUntil
     );
   }),
 });
 ```
 
-Five-minute caching of featured content means the database is queried at most twelve times per hour for that data, regardless of how many users hit the endpoint simultaneously.
+Bind `ctx.waitUntil` when you build the context, wrapping Hono's `c.executionCtx.waitUntil`. Pass the method unbound and you get `Illegal invocation` at runtime, so use the `(p) => c.executionCtx.waitUntil(p)` form.
 
-### Middleware for Rate Limiting
+One more property worth internalizing: KV writes take time to propagate across Cloudflare's points of presence. That is acceptable for a cache. It is not acceptable for anything where miscounting matters — which brings us to rate limiting.
 
-For procedures that could be abused — like authentication endpoints or content generation — add rate limiting via tRPC middleware:
+### Rate Limiting — The Code That Says 60/min Measured 30.5/min
+
+This is the piece I ran in production the longest while it was quietly wrong. Start with the version you'll find in most write-ups, including an earlier draft of this one:
 
 ```typescript
-// packages/api/src/middleware/rateLimit.ts
-import { TRPCError } from '@trpc/server';
-import { t } from '../trpc';
-
+// Does not enforce the number it advertises
 export const rateLimitMiddleware = t.middleware(async ({ ctx, next, path }) => {
-  const ip = 'client-ip'; // In practice, read from CF-Connecting-IP header
+  const ip = 'client-ip'; // placeholder — read from CF-Connecting-IP
   const key = `rate-limit:${ip}:${path}`;
   const limit = 60;
 
@@ -554,27 +688,90 @@ export const rateLimitMiddleware = t.middleware(async ({ ctx, next, path }) => {
   const count = current ? parseInt(current) : 0;
 
   if (count >= limit) {
-    throw new TRPCError({
-      code: 'TOO_MANY_REQUESTS',
-      message: 'Rate limit exceeded. Please try again in a minute.',
-    });
+    throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: '...' });
   }
 
   await ctx.env.CACHE.put(key, String(count + 1), { expirationTtl: 60 });
   return next();
 });
+```
 
-// Apply to a procedure
+Three separate problems.
+
+**The IP is a literal string.** `'client-ip'` is a placeholder, and left unchanged it puts every caller in one shared bucket — ten concurrent users each get a tenth of the allowance. On Cloudflare Workers, `request.headers.get('CF-Connecting-IP')` gives you the real client address. Don't reach for `X-Forwarded-For` instead; a client can set that header to anything it likes.
+
+**The TTL resets on every write.** This is the one that took me longest to see. Each increment passes `expirationTtl: 60` again, so the expiry keeps sliding forward to "sixty seconds after the most recent write." The window never closes; it just keeps stretching.
+
+To find out how far off it lands, I reimplemented the KV semantics in plain JavaScript — entries vanish when the TTL elapses, and `put` refreshes the expiry — and ran ten minutes of steady traffic through both versions.
+
+<table>
+<thead>
+<tr><th>Traffic</th><th>Admitted by the code above</th><th>Admitted by a time-bucketed window</th></tr>
+</thead>
+<tbody>
+<tr><td>1 req/sec (exactly the stated limit)</td><td>305 requests = <strong>30.5/min</strong></td><td>600 requests = 60.0/min</td></tr>
+<tr><td>2 req/sec (twice the stated limit)</td><td>420 requests = <strong>42.0/min</strong></td><td>600 requests = 60.0/min</td></tr>
+</tbody>
+</table>
+
+At exactly the advertised rate — traffic that should never be rejected — roughly half of it was. The stranger result is the second row: doubling the incoming rate *increases* the number of requests that get through, from 30.5 to 42.0 per minute. Once a client is over the limit the middleware throws before it writes, so the expiry stops sliding and the window reopens sooner. Tightening the pressure loosens the limit, which is exactly the direction that makes the bug invisible in your logs.
+
+**KV is eventually consistent.** Writes take time to reach every point of presence, so simultaneous requests hitting different locations each read a stale counter and increment it. This will never be an exact ceiling.
+
+The fix puts a time bucket in the key, so writing to it can't move the window boundary:
+
+```typescript
+// packages/api/src/middleware/rateLimit.ts
+import { TRPCError } from '@trpc/server';
+import { t } from '../trpc';
+
+const WINDOW_SEC = 60;
+const LIMIT = 60;
+
+export const rateLimitMiddleware = t.middleware(async ({ ctx, next, path }) => {
+  // Cloudflare sets CF-Connecting-IP itself, so a client can't forge it
+  const ip = ctx.req.headers.get('CF-Connecting-IP') ?? 'unknown';
+
+  // The time bucket in the key keeps put() from moving the boundary
+  const bucket = Math.floor(Date.now() / 1000 / WINDOW_SEC);
+  const key = `rl:${ip}:${path}:${bucket}`;
+
+  const count = Number(await ctx.env.CACHE.get(key)) || 0;
+
+  if (count >= LIMIT) {
+    const retryAfter = WINDOW_SEC - Math.floor((Date.now() / 1000) % WINDOW_SEC);
+    throw new TRPCError({
+      code: 'TOO_MANY_REQUESTS',
+      message: `Too many requests. Try again in ${retryAfter} seconds.`,
+    });
+  }
+
+  // Two windows of TTL so a write near the boundary isn't lost
+  await ctx.env.CACHE.put(key, String(count + 1), {
+    expirationTtl: WINDOW_SEC * 2,
+  });
+
+  return next();
+});
+
 export const rateLimitedProcedure = publicProcedure.use(rateLimitMiddleware);
 ```
 
-tRPC middleware composes cleanly. You can combine rate limiting, authentication, and logging into a single procedure type by chaining `.use()` calls.
+Carry `opts.req` through when you build the context so `ctx.req` is available here. Only the headers are needed, so passing just `headers` works equally well.
+
+The eventual-consistency caveat survives this fix. When the ceiling has to be exact — proxying a metered third-party API, where an overage shows up on an invoice — you need the counter in one place. A Durable Object processes requests for a given object serially, which removes the read-modify-write race entirely; the state-management patterns in [Building a Real-Time Collaborative App Backend with Rork and Cloudflare Durable Objects](/articles/rork-dev/rork-cloudflare-durable-objects-realtime-backend-guide) transfer over almost unchanged.
+
+For the specific case of shielding an external API key behind a Worker, [Hardcoding Your OpenAI Key in a Rork (Expo) App Means It Gets Stolen](/articles/rork-dev/rork-expo-api-key-proxy-worker-rate-limit-rotation) covers the proxy side. Whether you're protecting your own compute or someone else's metered endpoint changes how much counting error you can live with.
+
+tRPC middleware composes cleanly, so rate limiting, authentication, and logging can be chained onto a single procedure type with successive `.use()` calls.
 
 ## Troubleshooting Common Issues
 
 ### CORS Errors in Expo Development
 
-When running your Rork Max app in Expo Go or the Expo development server, requests originate from `exp://localhost:8081` or a local network IP. Make sure your Hono CORS configuration explicitly allows these origins. In production Expo builds (standalone apps), requests come from the device's network stack without an `Origin` header, so you may not see CORS issues at all — but it's worth testing with a standalone build before assuming the configuration is correct.
+Worth stating plainly first: **CORS does not apply to React Native running natively.** It is a browser mechanism — the browser attaches an `Origin` header and issues preflight requests — and the native fetch implementation isn't subject to it. Listing `exp://localhost:8081` in your `origin` array has no effect, because nothing is ever matched against it.
+
+CORS configuration matters when you export through Expo Router for web, or when you test endpoints from a browser. For those, list HTTP origins such as `http://localhost:8081`. Which also means: if you're targeting native only and you're still seeing CORS errors, the request is coming from a browser somewhere, or your routing is rejecting the preflight before Hono's middleware runs.
 
 ### Workers Fails to Start with `nodejs_compat`
 
@@ -644,9 +841,31 @@ For even more confidence, add a staging environment by creating a second `wrangl
 
 ## A Note from an Indie Developer
 
+What I appreciate most about this stack is that failures moved earlier. The old sequence was "the app crashed, go read the server logs." Now it is more often "the types don't line up, the build stopped." The time I used to spend locating a problem largely disappeared.
+
+And yet all three defects in this article compiled without complaint. The column mismatch, the cache return shape, the rate-limit arithmetic — as far as TypeScript was concerned, every one of them was correct code. **A green type check is not evidence that the design is right.** Obvious in the abstract; I only felt it after watching production return 500s from a procedure the editor had been autocompleting happily.
+
+So if you're adopting this, go in order. Build one router with two or three procedures, call them from a real device, and look at the values that come back. Then add auth, then caching, then rate limiting. Assemble it all at once and you lose the ability to tell which layer bent the shape.
+
+If the monorepo layout is what's giving you pause, [Rork × Turborepo Monorepo Architecture](/articles/rork-dev/rork-turborepo-monorepo-shared-components-guide) covers how to split the shared packages. And reading this against [Building a Production-Ready REST API with Rork, Hono.js & Cloudflare Workers](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) makes the case for choosing tRPC a lot more concrete than either article does alone.
+
 ## Key Takeaways
-The Rork Max × tRPC × Cloudflare Workers stack represents one of the most compelling full-stack architectures available to indie mobile developers in 2026. End-to-end type safety means the most common class of API bugs — mismatched types, renamed fields, changed response shapes — are caught by the compiler before they ever reach users. Cloudflare Workers' global edge execution means your users get low-latency responses regardless of where they are. And the economics make it realistic to launch and run a production backend for free until your app achieves meaningful scale.
 
-The learning curve is real, particularly around monorepo tooling and Cloudflare Workers' environment model. But once the foundation is in place, the development velocity that comes from complete end-to-end type safety is genuinely transformative. You spend less time writing interface files, less time debugging mismatched data shapes, and more time building features your users actually want.
+What tRPC plus Cloudflare Workers genuinely solves is drift between your client and your router definitions. Rename a field, change a return shape, and the build stops before anyone downloads it. That part is as good as it sounds.
 
-Start with a single router and a few procedures. Add authentication. Then caching. Then CI/CD. Each layer builds naturally on the previous one. Within a week of following this guide, you'll have a globally distributed, type-safe API backend running in production — and a development workflow that makes you genuinely reluctant to build any other way.
+The three things this guide fixed all sat outside that guarantee.
+
+<table>
+<thead>
+<tr><th>What was fixed</th><th>Symptom</th><th>The change</th></tr>
+</thead>
+<tbody>
+<tr><td>D1 columns vs. output schema</td><td>Type check green, every request 500s in production</td><td>One <code>toUser()</code> mapper at the boundary</td></tr>
+<tr><td><code>withCache</code> return value</td><td><code>.all()</code> hands back a <code>D1Result</code> wearing an array's face</td><td>Unwrap <code>results</code>; move the write to <code>waitUntil</code></td></tr>
+<tr><td>Rate limit counter</td><td>A stated 60/min measured at 30.5/min</td><td>Time bucket in the key to pin the window</td></tr>
+</tbody>
+</table>
+
+A good next step: open the backend you're running now, pick one procedure with an `.output()` schema, and compare it against the actual column names in your database. If `SELECT *` and `.output()` appear in the same handler, the odds are high that it has the same problem. The check takes a few minutes, and finding one removes a class of production 500s.
+
+I'm still rearranging parts of this setup myself. Thank you for reading.
