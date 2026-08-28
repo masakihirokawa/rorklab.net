@@ -1,0 +1,282 @@
+---
+title: "Two weeks of half-finished batch runs, and every log line said success"
+slug: "scheduled-job-missed-slot-run-ledger-backlog-watermark"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-08-28T11:00"
+author: "Rork Lab"
+description: "A job scheduled twice a day was firing once, and nothing in the logs showed it. Here is the run ledger that catches executions that never happened, plus a backlog-slope check, with real command output."
+tags: ["scheduled jobs", "operations", "monitoring", "automation", "indie dev"]
+highlights:
+  - "Confirm within a single day whether your scheduler actually honors multi-slot cron expressions the way you assume it does"
+  - "Put a check in place that catches runs that never happened at all, which success logs structurally cannot show you"
+  - "Spot periods where processing has fallen behind intake by reading the slope of your pending queue in a few dozen lines of code"
+---
+
+One morning I opened the folder of uncategorized wallpaper images out of habit, and stopped. There were far too many of them.
+
+That folder was supposed to be emptied twice a day by a classification job. I scrolled back through the run logs and found nothing but success lines. Not a single error.
+
+The problem was not inside the job. A job scheduled to run twice a day had been running once, and no log anywhere recorded that fact.
+
+## The evidence showed up in the pile, not in the logs
+
+The expression I had written was `30 4,16 * * *`. Half past four in the morning, half past four in the afternoon. A comma-separated list of slots in a single expression, which is about as ordinary as cron gets.
+
+Only the morning slot was actually firing. The afternoon one quietly did not exist.
+
+What makes this awkward is that nothing looks broken. Every run that did happen went all the way through and finished successfully. The job itself was healthy. What was broken was the number of times it ran.
+
+I noticed because I happened to glance at a folder, not because any monitoring told me. I had been treating the pipeline as something my tooling watched over, when in practice it was my own eyes doing the watching. That is worth admitting plainly.
+
+## Runs that never happened leave no trace
+
+Obvious in hindsight, but it took me a while to really absorb it.
+
+A log is a record of things that occurred. A run that never started has no author. So no amount of careful reading through success lines will ever surface the gap.
+
+<table>
+<tr><th>What you watch</th><th>What it catches</th><th>What it misses</th></tr>
+<tr><td>Success / failure in run logs</td><td>Runs that started and then died</td><td><strong>Runs that never started</strong></td></tr>
+<tr><td>Last execution timestamp</td><td>A job that stopped entirely</td><td>One of two daily slots still firing</td></tr>
+<tr><td>Job duration</td><td>Changes in workload weight</td><td>Nothing, since each run is normal</td></tr>
+<tr><td>Expected slots vs. recorded runs</td><td><strong>The exact dates and times that went missing</strong></td><td>Errors in the slot definition itself</td></tr>
+<tr><td>Slope of the pending queue</td><td>Periods where processing trails intake</td><td>Cases where intake dropped too</td></tr>
+</table>
+
+If you only have the first two rows, a job running at half capacity can continue indefinitely. In my case it did, until the next time I looked.
+
+## The expression was valid; the thing reading it was not the thing I assumed
+
+This is the part I actually took away from the incident.
+
+`30 4,16 * * *` is valid cron syntax, and under a standard cron implementation it fires twice a day. There was nothing wrong with what I wrote. Yet in the scheduler I was using, only one of the two slots fired.
+
+"The expression is correct" and "the thing interpreting the expression behaves to spec" are two separate claims. I had been treating them as one. If the docs said cron format, I assumed cron semantics.
+
+The same trap sits all around mobile development. Scheduled CI runs, periodic store-asset generation, server-side aggregation batches. Plenty of them say "accepts cron syntax" without ever specifying how multi-slot lists or seconds fields are handled.
+
+And this class of difference never shows up on the day you write it. It shows up quietly, from the next day onward, as a job doing half the work.
+
+## Measuring firings: expected slots against recorded runs
+
+The first countermeasure is to make the job record its own firing, then reconcile that record against the schedule you expect.
+
+It amounts to appending one line at the top of the job. JSON Lines keeps it trivially machine-readable later.
+
+```js
+// Append one line at the very start of the job — regardless of eventual success or failure
+import { appendFileSync } from "node:fs";
+
+function stamp(processed = 0, status = "started") {
+  const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const row = {
+    date: jst.toISOString().slice(0, 10),
+    at: jst.toISOString().slice(11, 16), // "04:31"
+    processed,
+    status,
+  };
+  appendFileSync("ledger.jsonl", JSON.stringify(row) + "\n");
+}
+```
+
+There is a `status` field, but it is not what makes this work. What matters is whether the row **exists at all**. If the job crashes, the row survives. If the job never starts, no row is born. That absence was the signal I needed.
+
+The reconciliation side looks like this.
+
+```js
+// ledger.mjs — reconcile expected firing slots against recorded runs
+// usage: node ledger.mjs ledger.jsonl 2026-08-10 2026-08-23
+import { readFileSync } from "node:fs";
+
+const SLOTS = ["04:30", "16:30"]; // slots that should fire each day (JST)
+const TOLERANCE_MIN = 20;         // acceptable drift
+
+const toMin = (hhmm) => {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h * 60 + m;
+};
+
+function loadLedger(path) {
+  const rows = [];
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    try {
+      const r = JSON.parse(s);
+      if (r.date && r.at) rows.push(r);
+    } catch {
+      // Skip malformed rows rather than aborting — gap detection matters more
+    }
+  }
+  return rows;
+}
+
+function eachDate(from, to) {
+  const out = [];
+  for (
+    let d = new Date(`${from}T00:00:00Z`);
+    d <= new Date(`${to}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + 1)
+  ) {
+    out.push(d.toISOString().slice(0, 10));
+  }
+  return out;
+}
+
+export function audit(path, from, to) {
+  const rows = loadLedger(path);
+  const byDate = new Map();
+  for (const r of rows) {
+    if (!byDate.has(r.date)) byDate.set(r.date, []);
+    byDate.get(r.date).push(r);
+  }
+
+  const missing = [];
+  let expected = 0;
+  let matched = 0;
+
+  for (const date of eachDate(from, to)) {
+    const runs = byDate.get(date) ?? [];
+    for (const slot of SLOTS) {
+      expected += 1;
+      const hit = runs.find(
+        (r) => Math.abs(toMin(r.at) - toMin(slot)) <= TOLERANCE_MIN
+      );
+      if (hit) matched += 1;
+      else missing.push({ date, slot });
+    }
+  }
+  return { expected, matched, missing, coverage: matched / expected };
+}
+
+const [, , path, from, to] = process.argv;
+const r = audit(path, from, to);
+console.log(
+  `expected ${r.expected} / ran ${r.matched} / coverage ${(r.coverage * 100).toFixed(1)}%`
+);
+console.log(
+  `missing ${r.missing.length}:`,
+  r.missing.slice(0, 5).map((m) => `${m.date} ${m.slot}`).join(", "),
+  r.missing.length > 5 ? "…" : ""
+);
+process.exitCode = r.missing.length === 0 ? 0 : 1;
+```
+
+Feeding it a ledger shaped exactly like the incident produces this (run on Node.js v22):
+
+```
+expected 28 / ran 14 / coverage 50.0%
+missing 14: 2026-08-10 16:30, 2026-08-11 16:30, 2026-08-12 16:30, 2026-08-13 16:30, 2026-08-14 16:30 …
+exit=1
+```
+
+Fifty percent coverage. Blunt, but it is a number that fourteen success lines will never give you.
+
+Three implementation choices in there were deliberate.
+
+The tolerance window is twenty minutes. Schedulers drift by a few minutes; an exact-match comparison would flag healthy runs as gaps.
+
+Malformed rows are skipped rather than fatal. Having gap detection itself go down because one ledger line got truncated would defeat the purpose.
+
+The exit code is non-zero when gaps exist. That single line is what lets the check ride on whatever notification plumbing you already have. Anything that requires a human to read and interpret output will eventually go unread again.
+
+## A second sentinel: watch the slope of the backlog
+
+Reconciling the ledger is not sufficient on its own. If the slot definition itself is wrong, expected and actual will agree perfectly.
+
+So it helps to look from the results side too: is the pending count going down?
+
+```js
+// backlog.mjs — is the pending queue actually shrinking?
+// Success logs can all be green while intake outpaces processing
+import { readFileSync } from "node:fs";
+
+const WINDOW = 7;      // fit over the most recent 7 points
+const SLOPE_LIMIT = 0; // growth beyond this per day is a problem
+
+function slope(ys) {
+  const n = ys.length;
+  const xs = ys.map((_, i) => i);
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i] - mx) * (ys[i] - my);
+    den += (xs[i] - mx) ** 2;
+  }
+  return den === 0 ? 0 : num / den;
+}
+
+export function checkBacklog(points) {
+  const recent = points.slice(-WINDOW);
+  const s = slope(recent.map((p) => p.pending));
+  return {
+    from: recent[0],
+    to: recent.at(-1),
+    slopePerDay: Number(s.toFixed(2)),
+    healthy: s <= SLOPE_LIMIT,
+    daysToDouble: s > 0 ? Math.ceil(recent.at(-1).pending / s) : null,
+  };
+}
+
+const points = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const r = checkBacklog(points);
+console.log(`${r.from.date} pending=${r.from.pending} → ${r.to.date} pending=${r.to.pending}`);
+console.log(
+  `slope ${r.slopePerDay}/day / verdict ${r.healthy ? "OK" : "growing"}` +
+    (r.daysToDouble ? ` / doubles in ${r.daysToDouble} days at this rate` : "")
+);
+process.exitCode = r.healthy ? 0 : 1;
+```
+
+Running it over the period when only one slot fired (96 items arriving per day, 48 processed):
+
+```
+2026-08-17 pending=210 → 2026-08-23 pending=498
+slope 48/day / verdict growing / doubles in 11 days at this rate
+exit=1
+```
+
+And after splitting the slots so both actually run:
+
+```
+2026-08-24 pending=498 → 2026-08-30 pending=258
+slope -40/day / verdict OK
+exit=0
+```
+
+The important part is not the magnitudes but the fact that it **reads the sign of the slope**. Threshold on the absolute count and you get false alarms whenever intake spikes, while a slow, patient backlog grows happily beneath the line. Direction avoids both.
+
+The `daysToDouble` line is a small self-serving addition. Being told "something is wrong" does not help me prioritize. Being told eleven days does.
+
+## What I fixed was the ownership of the slots, not the expression
+
+The repair was almost anticlimactic. Instead of one `30 4,16 * * *`, I now have `30 4 * * *` and `30 16 * * *` as two separate entries.
+
+Writing `4,16` reads naturally to a human: one job that runs twice. But as a unit of operations, the morning run and the afternoon run are distinct executions. Wanting to re-run only one of them after a failure, or shift only one of them later, are per-slot concerns.
+
+Collapsing them into one expression leaves nowhere to express those concerns. Even without the missed firing, splitting them would have been the better shape.
+
+I have made the same kind of call inside the generation pipeline more than once. While [isolating why my generated wallpaper catalog hashed differently on every run](/articles/app-dev/asset-catalog-build-nondeterminism-byte-identical-output), the fix involved breaking a single bundled pass into stages so the drift became visible. Splitting costs you a few extra moving parts and buys you the ability to touch one of them later.
+
+## How much of this is worth building on your own
+
+Having said all that, building monitoring is not enjoyable work. It ships no features and earns no revenue. As an indie developer maintaining several published apps alone, every hour spent here is an hour not spent on the apps themselves.
+
+I kept these two checks because the arithmetic worked out. A few lines to append to the ledger, roughly fifty lines to reconcile it, another thirty for the backlog slope. Under an hour all told, against two weeks of running at half throughput without noticing.
+
+I also decided against some things. Per-job duration distributions, and richer notifications. The former had nothing to do with this failure, and the latter was already covered by an exit code.
+
+The filter I keep coming back to is simply: **would this mechanism have caught the failure I actually had?** Anything that would not is not needed yet. When I [measured a perceptual-hash threshold to stop duplicate wallpapers](/articles/app-dev/image-catalog-perceptual-hash-dedup-threshold-measurement) from slipping into the catalog, the same question set the scope.
+
+## Where to start, if you want to try this
+
+If there is one thing worth doing today, it is finding any job where you have packed multiple slots into a single expression, and counting its firings tomorrow.
+
+Add the one-line ledger append now and you will have the answer in a day. Whether a comma-separated list really fires twice in your particular environment is something more of us are assuming than verifying.
+
+I have not finished checking all of mine either. If this saves someone else the same two weeks, that would make me glad. Thank you for reading.
