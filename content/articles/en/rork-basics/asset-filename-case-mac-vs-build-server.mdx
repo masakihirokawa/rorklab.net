@@ -1,0 +1,252 @@
+---
+title: "Sunset.png and sunset.png: one file on your Mac, two on the build server"
+slug: "asset-filename-case-mac-vs-build-server"
+category: "rork-basics"
+level: "beginner"
+premium: false
+date: "2026-08-28T14:30"
+author: "Rork Lab"
+description: "An image that renders locally but breaks the cloud build. The cause was filename casing. Here is the reproduction, the git behavior behind it, and a small checker with measured results."
+tags: ["Rork", "Expo", "Assets", "Git", "Build Errors"]
+---
+
+The background image rendered fine in my local simulator. The cloud build stopped with a missing-module error.
+
+The diff showed one change: I had swapped a single image. The file was right there. I opened it to be sure.
+
+What I had actually done was rename `Sunset.png` to `sunset.png`. To me that was tidying up. To the build server it was a different file entirely.
+
+On a wallpaper app carrying several hundred images, this kind of mix-up will happen at some rate no matter how careful anyone is. That is exactly the sort of thing I would rather hand to a script than to my own attention.
+
+## Your local filesystem does not distinguish upper from lower case
+
+That is where this starts. macOS ships with a filesystem configured to treat casing as insignificant. It resolves `Sunset.png` and `sunset.png` to the same thing.
+
+Linux does not. It treats them as two separate files. Rork and Expo cloud builds, GitHub Actions, EAS Build — all Linux underneath. Android device filesystems behave the same way.
+
+Two lines will tell you which side you are standing on:
+
+```bash
+: > probe_a.txt
+[ -e PROBE_A.TXT ] && echo "case-insensitive" || echo "case-sensitive"
+```
+
+I reproduced the same setup on Linux with Node.js v22.23.2. The real file is `assets/Sunset.png`, and the code asks for it in lower case.
+
+```js
+// app.js — file on disk is assets/Sunset.png, the reference is lowercase
+const p = require.resolve("./assets/sunset.png");
+console.log("resolved:", p);
+```
+
+The result:
+
+```
+Error: Cannot find module './assets/sunset.png'
+```
+
+Works here, fails there. That asymmetry is why re-reading the diff never got me any closer.
+
+Metro hands the path string to the filesystem as written. When the filesystem has different rules, you get a different answer. Nothing more complicated than that.
+
+## The worse half is that git never recorded the rename
+
+This is where I actually lost the day.
+
+git on macOS defaults to `core.ignorecase = true`. A rename that changes only casing is invisible to it.
+
+I set up the same condition to see what happens:
+
+```bash
+git config core.ignorecase true
+mv assets/Sunset.png assets/tmp && mv assets/tmp assets/sunset.png
+git status --porcelain
+```
+
+One line came back:
+
+```
+ D assets/Sunset.png
+```
+
+A deletion, and nothing else. The new `sunset.png` does not even show up as untracked. Run `git add -A` from here and what gets staged is the removal:
+
+```
+D	assets/Sunset.png
+```
+
+After committing, I checked what the repository actually held:
+
+```bash
+git ls-files assets   # → prints nothing
+ls assets             # → sunset.png (present in the working tree)
+```
+
+The image sits in the working tree while the repository has none. A fresh clone had no `assets` directory at all.
+
+So the casing mismatch was only the entry point. The real event was that **the asset had dropped out of the repository**. Of course it worked locally — locally was the only place the file existed.
+
+The correct move is to route the rename through `git mv -f`:
+
+```bash
+git mv -f assets/Sunset.png assets/sunset.png
+git diff --cached --name-status
+```
+
+```
+R100	assets/Sunset.png	assets/sunset.png
+```
+
+`R100` means git logged it as a rename. Cloning after that commit gave me `sunset.png`, intact.
+
+If you are putting exported Rork code under version control for the first time, [Write .gitignore Before You Run git init on an Exported Rork Project](/articles/rork-basics/rork-export-gitignore-before-git-init) covers the setup order. Deciding how you will handle `core.ignorecase` at the same moment is worth the extra minute.
+
+## Catching the mismatch before you commit
+
+Knowing the cause does not help much if the defense is human vigilance. I moved the detection into a small script instead.
+
+The logic is plain. Collect relative asset references from the source, check whether each one exists exactly as written, and when it does not, look for a file that matches once you lowercase both sides. A match means a casing mismatch. No match means the file genuinely is not there.
+
+```js
+// asset-case-check.mjs — no dependencies
+import { readdir, readFile, stat } from "node:fs/promises";
+import path from "node:path";
+
+const ROOTS = process.argv.slice(2).length ? process.argv.slice(2) : ["src", "app"];
+const CODE = /\.(t|j)sx?$/;
+const ASSET = /\.(png|jpg|jpeg|gif|webp|svg|mp3|mp4|ttf|otf|json)$/i;
+// covers require("./a.png"), from "./a.png", and import("./a.png")
+const REF = /(?:require\(|from\s+|import\()\s*["'](\.\.?\/[^"']+)["']/g;
+
+async function walk(dir, out = []) {
+  let items;
+  try { items = await readdir(dir, { withFileTypes: true }); } catch { return out; }
+  for (const it of items) {
+    if (it.name === "node_modules" || it.name.startsWith(".")) continue;
+    const full = path.join(dir, it.name);
+    if (it.isDirectory()) await walk(full, out);
+    else out.push(full);
+  }
+  return out;
+}
+
+// read each directory once, keyed by lowercase name
+const dirCache = new Map();
+async function entriesOf(dir) {
+  if (dirCache.has(dir)) return dirCache.get(dir);
+  let names = [];
+  try { names = await readdir(dir); } catch {}
+  const map = new Map();
+  for (const n of names) {
+    const k = n.toLowerCase();
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(n);
+  }
+  dirCache.set(dir, map);
+  return map;
+}
+
+async function exists(p) { try { await stat(p); return true; } catch { return false; } }
+
+const findings = [];
+let scanned = 0, refs = 0;
+
+for (const root of ROOTS) {
+  for (const file of await walk(root)) {
+    if (!CODE.test(file)) continue;
+    scanned++;
+    const src = await readFile(file, "utf8");
+    for (const m of src.matchAll(REF)) {
+      const spec = m[1];
+      if (!ASSET.test(spec)) continue;
+      refs++;
+      const abs = path.resolve(path.dirname(file), spec);
+      if (await exists(abs)) continue;                       // spelled exactly right
+      const map = await entriesOf(path.dirname(abs));
+      const hit = map.get(path.basename(abs).toLowerCase()); // any case-insensitive match?
+      findings.push({ file, spec, actual: hit ? hit[0] : null });
+    }
+  }
+}
+
+for (const f of findings) {
+  console.log(`${f.actual ? "CASE" : "MISS"}  ${f.file}\n      ref:  ${f.spec}` +
+    (f.actual ? `\n      file: ${f.actual}` : ""));
+}
+const caseCount = findings.filter((f) => f.actual).length;
+console.log(`\n${scanned} sources / ${refs} asset refs / ` +
+  `${caseCount} case mismatches / ${findings.length - caseCount} missing`);
+process.exit(caseCount ? 1 : 0);
+```
+
+Putting the `exists()` check first is what keeps this cheap. Anything spelled correctly stops there, so a healthy project barely reads any directories at all.
+
+Running it against a small fixture — `Sunset.png`, `hero-Banner.webp`, and `icons/Play.svg` on disk, all referenced in lower case:
+
+```
+CASE  src/screens/Home.tsx
+      ref:  ../assets/sunset.png
+      file: Sunset.png
+CASE  src/screens/Home.tsx
+      ref:  ../assets/hero-banner.webp
+      file: hero-Banner.webp
+CASE  src/screens/Home.tsx
+      ref:  ../assets/icons/play.svg
+      file: Play.svg
+MISS  src/screens/Home.tsx
+      ref:  ../assets/nothing-here.png
+
+1 sources / 5 asset refs / 3 case mismatches / 1 missing
+```
+
+`CASE` and `MISS` are separated because the fixes differ. For `CASE` you either correct the reference or align the file with `git mv -f`. For `MISS` the file was never added, so you are looking somewhere else entirely.
+
+## How long it takes at real project size
+
+A check has to be fast to become a habit. I built a tree close to what my wallpaper app looks like: 420 assets, 120 source files, 480 asset references, with 9 references deliberately lowercased.
+
+```
+120 sources / 480 asset refs / 9 case mismatches / 0 missing
+
+real	0m0.144s
+```
+
+It found all 9, in 0.144 seconds.
+
+<table>
+  <thead>
+    <tr><th>Metric</th><th>Value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Assets</td><td>420</td></tr>
+    <tr><td>Source files</td><td>120</td></tr>
+    <tr><td>Asset references</td><td>480</td></tr>
+    <tr><td>Mismatches planted</td><td>9</td></tr>
+    <tr><td>Mismatches found</td><td>9 (0 missed)</td></tr>
+    <tr><td>Runtime</td><td>0.144 s (Node.js v22.23.2)</td></tr>
+  </tbody>
+</table>
+
+At a tenth of a second, running it on every commit costs nothing. It exits with code 1 only when something is wrong, so the same command works from CI once you park it in `package.json`.
+
+```json
+{
+  "scripts": {
+    "check:assets": "node asset-case-check.mjs src app"
+  }
+}
+```
+
+I run it as a prebuild line. Waiting ten minutes for a cloud build to tell me the same thing is simply worse for my mood than a tenth of a second here.
+
+## Three decisions that make this a non-event
+
+**Keep asset filenames lowercase with hyphens.** Allow `Hero Banner@2x.PNG` and you have inherited spaces and an at-sign along with the casing question. Settle it once and the situation stops arising.
+
+**Route every rename through `git mv -f`.** Renaming in Finder or in your editor never reaches git while `core.ignorecase` is on. Making this one operation a command-line habit is the reliable fix.
+
+**Give the checking to a machine, not a person.** Operations that report success while quietly breaking something else are not rare. [Every bulk replace exited zero. The damage was in the lines I did not delete](/articles/rork-dev/rork-bulk-replace-collateral-damage-guard) walks through the same shape of problem. Verification you run identically every time finishes faster in the long run.
+
+Assets are not the only names worth settling before you ship. [The names you can change, and the ones you can't — the 30 minutes before your first Rork release](/articles/rork-basics/rork-app-id-immutable-before-first-release) is worth a read before you start.
+
+Next time a build stops with "not found," check `git ls-files` first to confirm the file is actually in the repository. Present in the working tree and present in the repository are two different facts — it took me a full day to internalize that one.
