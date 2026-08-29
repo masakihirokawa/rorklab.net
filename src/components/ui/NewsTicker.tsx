@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — Google Play の Android 16（API レベル36）必須化まで残り2日です。8月31日以降、新規アプリも既存アプリの更新も対象となります",
-    "EXTENSION — 11月1日までの配信継続を求める延長申請は、期限を過ぎてからでは出せません。間に合わない見込みなら、今日明日が最後の判断点です",
-    "CHECK — 確認すべきは targetSdkVersion の値そのものより、その値でビルドが通って提出まで到達するかどうかです。一度通しで試しておくほうが確実です",
-    "EXPO — expo@57.0.17 が8月27日に公開され、React Native を 0.86.3 へ更新しました。Hermes V1 のメモリ退行と起動時間の退行が解消されています",
-    "PREBUILD — expo prebuild は native の android・ios ディレクトリを既定でクリアして再生成します。手を入れた native 変更は config plugin へ寄せてから当ててください",
-    "RORK MAX — ネイティブ Swift を生成する Rork Max は、AR/LiDAR・Dynamic Island・Live Activities・HealthKit・Core ML など React Native から触れにくい層に届きます",
+    "DEADLINE — Google Play の Android 16（API レベル36）必須化は明日8月31日です。残り1日で、新規アプリも既存アプリの更新も対象になります",
+    "DECISION — 延長申請は期限を過ぎてからでは提出できません。間に合わせるのか申請へ切り替えるのか、その判断そのものの締切が今日という形になります",
+    "VISIBILITY — 更新を止めているアプリも無関係ではありません。API レベル35 未満のままだと、新しい Android 端末の新規ユーザーには表示されなくなります",
+    "PITFALL — 依存ライブラリ側が新しい API レベルに追随していない場合、ローカルのビルドは通ってもストアのプリチェックで止まることがあります。自分のコードだけを見ていても分かりません",
+    "EXPO — expo@57.0.17 が React Native を 0.86.3 へ更新しました。大きな SDK リリースの合間に破壊的変更のないパッチを挟む流れが見えてきており、追随のコストが下がる方向です",
+    "CHOICE — Android も出すなら React Native を生成する本家 Rork、Apple プラットフォーム固有の機能が要件の中心なら Swift を生成する Rork Max。優劣ではなく何を出すかで決まります",
   ],
   en: [
-    "DEADLINE — Two days remain until Google Play requires Android 16 (API level 36). From August 31 it applies to new apps and to updates of existing ones alike",
-    "EXTENSION — The extension that keeps you shipping to all users until November 1 cannot be filed after the deadline passes, so the decision point is effectively today",
-    "CHECK — What matters is not the targetSdkVersion number itself but whether a build at that level still compiles and reaches submission. Run it end to end once",
-    "EXPO — expo@57.0.17 shipped on August 27, moving React Native to 0.86.3 and clearing both the Hermes V1 memory regression and the startup time regression",
-    "PREBUILD — expo prebuild clears and regenerates the native android and ios directories by default, so move hand-edited native changes into a config plugin first",
-    "RORK MAX — Rork Max generates native Swift, reaching AR and LiDAR, Dynamic Island, Live Activities, HealthKit, and Core ML — layers React Native struggles to touch",
+    "DEADLINE — Google Play's Android 16 (API level 36) requirement lands tomorrow, August 31. One day left, and it covers new apps and updates to existing ones alike",
+    "DECISION — An extension cannot be filed once the deadline passes. So the real cutoff today is not the build itself but deciding whether to make it or to file instead",
+    "VISIBILITY — Apps you no longer update are not exempt. Anything still below API level 35 stops appearing for new users on newer Android devices",
+    "PITFALL — When a dependency has not caught up to the new API level, the local build can pass while the store pre-check stops you. Reading your own code will not surface that",
+    "EXPO — expo@57.0.17 moved React Native to 0.86.3. A pattern is emerging of small non-breaking patches between major SDK releases, which lowers the cost of keeping current",
+    "CHOICE — Shipping to Android too points at Rork proper and its React Native output; Apple-specific capabilities at the center of the spec point at Rork Max and Swift. It is a question of what you ship",
   ],
 };
 
