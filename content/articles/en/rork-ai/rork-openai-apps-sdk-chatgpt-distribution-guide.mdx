@@ -65,9 +65,10 @@ app.post("/mcp", async (c) => {
 
   server.tool(
     "create_task",
+    "Call this when the user mentions something they intend to do later. Do not use it to change an existing task — call update_task for that.",
     {
-      title: z.string().describe("Task title"),
-      due_date: z.string().optional().describe("YYYY-MM-DD"),
+      title: z.string().describe("The user's own wording, copied verbatim. Do not summarize or rephrase."),
+      due_date: z.string().optional().describe("Due date as YYYY-MM-DD. Omit it if the user never mentioned a date."),
     },
     async ({ title, due_date }, ctx) => {
       const userId = await resolveUserId(ctx, c.env.DB);
@@ -81,16 +82,21 @@ app.post("/mcp", async (c) => {
     }
   );
 
-  server.tool("list_tasks", {}, async (_, ctx) => {
-    const userId = await resolveUserId(ctx, c.env.DB);
-    const tasks = await listTasks(c.env.DB, userId);
-    return {
-      content: [
-        { type: "resource", resource: { uri: `ui://task-list?count=${tasks.length}` } },
-      ],
-      structuredContent: { tasks },
-    };
-  });
+  server.tool(
+    "list_tasks",
+    "Fetch the user's current tasks. Always call this before updating or completing a task.",
+    {},
+    async (_, ctx) => {
+      const userId = await resolveUserId(ctx, c.env.DB);
+      const tasks = await listTasks(c.env.DB, userId);
+      return {
+        content: [
+          { type: "resource", resource: { uri: `ui://task-list?count=${tasks.length}` } },
+        ],
+        structuredContent: { tasks },
+      };
+    }
+  );
 
   const transport = new StreamableHTTPServerTransport({});
   await server.connect(transport);
@@ -104,7 +110,67 @@ Two things matter most here. First, ship signature verification on day one. Open
 
 Second, return both `structuredContent` and `content` from every tool. The model uses the structured payload for reasoning later in the conversation; the content array is what users see. I dropped `structuredContent` early on and watched ChatGPT lose track of which task the user had just created — every follow-up question forced a redundant re-fetch. Returning both from the start avoids that whole class of bug.
 
-A third subtler point: the descriptions you put in the `z.string().describe(...)` calls are read by the model when deciding whether to call your tool. If your description is "Task title" the model often invokes the tool with vague placeholder text. If it's "The exact phrase the user said they want to remember, copied verbatim from the conversation," the tool gets meaningful arguments. Tool descriptions are prompt engineering disguised as type definitions — treat them seriously.
+Third, pass a description alongside the tool name — that's the second argument to `server.tool()` above. Leave it out and the only clue the model has is the identifier `create_task`. This is the single biggest lever on call accuracy, so it gets its own section next.
+
+## Making the Model Pick the Right Tool: Descriptions, Annotations, and Instructions
+
+Registering a tool doesn't mean the model will reach for it. All ChatGPT can see is the name, the description, and the argument schema. When those are thin, a user says "help me get organized this week," no tool fires, and the model answers from general knowledge instead.
+
+Here is a before and after from my own server.
+
+<table>
+<tr><th>Field</th><th>Before</th><th>After</th></tr>
+<tr><td>Tool description</td><td>Creates a task.</td><td>Call this when the user mentions something they intend to do later. Do not use it to change an existing task &mdash; call update_task for that.</td></tr>
+<tr><td>Argument <code>title</code></td><td>Task title</td><td>The user's own wording, copied verbatim. Do not summarize or rephrase.</td></tr>
+</table>
+
+Length is not what made the difference. What made the difference was stating <strong>both when to call it and when not to</strong>. Adding one sentence about the negative case visibly cut mix-ups between neighbouring tools. The same goes for `describe()` on each argument: "Task title" invites a bland paraphrase, while "copy the user's own wording" preserves what they actually said. These are prompts wearing the costume of type definitions.
+
+The MCP TypeScript SDK also offers `registerTool`, which takes a config object and lets you declare `annotations` and `outputSchema` alongside the description. Where your SDK version supports it, this shape is easier to live with.
+
+```typescript
+server.registerTool(
+  "delete_task",
+  {
+    title: "Delete Task",
+    description: "Call only when the user explicitly asks to delete. To mark something finished, call complete_task instead.",
+    inputSchema: z.object({ task_id: z.string() }),
+    annotations: { destructiveHint: true, idempotentHint: true },
+  },
+  async ({ task_id }, ctx) => { /* ... */ }
+);
+```
+
+Annotations are hints for the client, not the model. A tool marked `readOnlyHint` can run without a confirmation prompt; one marked `destructiveHint` gets one. Forgetting the hint on a delete tool is how conversational momentum turns into deleted data.
+
+Rules that span tools belong in the server's `instructions`, not in any single description:
+
+```typescript
+const server = new McpServer(
+  { name: "task-app", version: "1.0.0" },
+  {
+    instructions:
+      "Always call list_tasks before updating or completing a task. Lists are capped at 50 items. If the user hasn't mentioned a date, omit due_date rather than guessing.",
+  }
+);
+```
+
+Clients are expected to surface `instructions` near the system prompt, so it shouldn't repeat what the tool descriptions already say. Keep it to ordering, limits, and things the model must not infer on its own.
+
+One more lever: how you return errors changes how the model behaves. If your handler throws, the SDK still turns it into an error result, but what reaches the model is a raw exception string. Returning `isError: true` yourself lets you write the correction in your own words.
+
+```typescript
+if (due_date && !isValidDate(due_date)) {
+  return {
+    content: [
+      { type: "text", text: `due_date must be YYYY-MM-DD. Received: ${due_date}` },
+    ],
+    isError: true,
+  };
+}
+```
+
+After that one branch went in, date-format mismatches started resolving themselves mid-conversation. The user sees nothing; the model quietly retries with the right shape. Write error text as instructions addressed to the model rather than to a human reading a log, and accuracy climbs.
 
 ## Reshaping Rork's React Components Into ChatGPT UI Resources
 
@@ -250,6 +316,7 @@ Apps SDK runs primarily on OpenAI's credit envelope for tool calls, but anything
 ```typescript
 server.tool(
   "upgrade_to_pro",
+  "Call only when the user asks to move to a paid plan. If they merely ask about pricing, answer without calling this.",
   { plan: z.enum(["monthly", "yearly"]) },
   async ({ plan }, ctx) => {
     const userId = await resolveUserId(ctx, c.env.DB);
