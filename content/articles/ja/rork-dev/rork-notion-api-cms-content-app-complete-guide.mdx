@@ -113,6 +113,106 @@ export default app;
 
 **なぜ `page_size: 50` なのか**ですが、Notion API の1回のクエリ上限は100件です。ただし100件取るとレスポンスサイズが肥大化し、スマホ側のパース時間が伸びます。一覧画面で即座に見える分（30〜50件）にとどめて、以降はページネーションするのが実用的です。
 
+## `databases.query` が動かなくなる日 — API バージョン 2025-09-03 と data source
+
+ここまでのコードは `notion.databases.query()` を使っています。実はこの書き方には期限があります。Notion API のバージョン `2025-09-03` で、**データベースとデータソースという2つの概念が分離された**からです。
+
+何が怖いかというと、壊れるきっかけが自分の手元にないことです。
+
+執筆担当の方が Notion の画面でデータベースに2つ目のデータソースを追加する。ただそれだけで、こちらは何もデプロイしていないのに、古いバージョンで動いているアプリの記事一覧が落ちます。公式のアップグレードガイドは、この状況で失敗する操作を明示しています。
+
+<table>
+<tr><th>操作</th><th>2つ目のデータソース追加後の挙動（旧バージョン）</th></tr>
+<tr><td>そのデータベースを親としたページ作成</td><td><strong>失敗</strong></td></tr>
+<tr><td>データベースの読み取り・書き込み・クエリ</td><td><strong>失敗</strong></td></tr>
+<tr><td>そのデータベースを指すリレーションプロパティの書き込み</td><td><strong>失敗</strong></td></tr>
+</table>
+
+記事配信アプリで言えば、2番目の行がそのまま「一覧が空になる」を意味します。しかもサーバーのログには `validation_error` が出るだけで、原因が Notion 側の UI 操作だとは気づきにくいのです。
+
+### 移行の骨子は「ID をもう1段掘る」こと
+
+やることは単純です。これまで `database_id` ひとつで叩いていたところを、まず **データベース配下の `data_source_id` を取得**し、以降はそちらを使います。
+
+```ts
+// server/src/notion/dataSource.ts
+import { Client } from "@notionhq/client";
+
+// 2025-09-03 を明示的に指定する。指定しないと旧バージョンで動く
+const notion = new Client({
+  auth: NOTION_TOKEN,
+  notionVersion: "2025-09-03",
+});
+
+// GET /v1/databases/:database_id が data_sources の一覧を返すようになった
+export async function resolveDataSourceId(databaseId: string): Promise<string> {
+  const db: any = await notion.request({
+    method: "get",
+    path: `databases/${databaseId}`,
+  });
+
+  // 従来の単一ソース構成なら要素はひとつだけ
+  const first = db.data_sources?.[0];
+  if (!first) throw new Error("no_data_source_found");
+  return first.id;
+}
+```
+
+`2025-09-03` では、`GET /v1/databases/:database_id` の役割が「スキーマを返す」から「配下のデータソース一覧（`id` と `name`）を返す」へ置き換わりました。プロパティ定義を取りたいときは、データソース側の取得 API を使います。
+
+クエリ本体は名前空間が `/v1/data_sources` へ移ります。SDK を v5 に上げれば、専用メソッドで書けます。
+
+```ts
+// SDK v5（@notionhq/client 5.x）以降
+const res = await notion.dataSources.query({
+  data_source_id: dataSourceId,
+  filter: {
+    and: [
+      { property: "Status", select: { equals: "Published" } },
+      { property: "Locale", select: { equals: "ja" } },
+    ],
+  },
+  sorts: [{ property: "PublishedAt", direction: "descending" }],
+  page_size: 50,
+});
+```
+
+SDK をまだ上げられない事情がある場合は、`notion.request()` に `method: "post"` と `path: "data_sources/<データソースID>/query"` を渡す形で、先にバージョンだけ移行しておくこともできます。ページ作成も同様で、`parent` は `{ type: "database_id", database_id }` から `{ type: "data_source_id", data_source_id }` へ変わります。
+
+### レート制限を考えると、data_source_id はキャッシュ必須です
+
+ここが実装上いちばん見落とされるところだと思っています。
+
+素直に書くと、記事一覧のリクエストが来るたびに「データベース取得 → データソース取得」の2往復が発生します。前述のとおり Notion の実効上限は 3 req/秒。往復が倍になるということは、耐えられる同時アクセスが半分になるということです。
+
+`data_source_id` は、Notion の画面でデータソースを足したり消したりしない限り変わりません。つまり**長めに持って構わない値**です。
+
+```ts
+// Workers なら KV、単一プロセスならモジュールスコープの Map で十分
+const DS_CACHE_TTL_SEC = 60 * 60 * 24; // 24時間
+
+export async function getDataSourceId(env: Env, databaseId: string) {
+  const key = `ds:${databaseId}`;
+  const hit = await env.KV.get(key);
+  if (hit) return hit;
+
+  const id = await resolveDataSourceId(databaseId);
+  await env.KV.put(key, id, { expirationTtl: DS_CACHE_TTL_SEC });
+  return id;
+}
+```
+
+そのうえで、クエリが `validation_error` で落ちたときだけキャッシュを捨てて引き直す — これで「データソース構成を変えた直後の一度だけ余分に叩く」形に収まります。毎回2往復するより、はるかに素直です。
+
+### 忘れやすい2箇所
+
+検索 API とウェブフックも、同じ改訂の影響を受けます。
+
+- **Search API**: `filter.value` に渡す値が `"database"` から `"data_source"` へ変わります。記事検索を Notion の Search に任せている場合、ここを直さないと結果が空になります。
+- **ウェブフック**: `database.content_updated` は `data_source.content_updated` へ、`database.schema_updated` は `data_source.schema_updated` へ改名されました。「記事を更新したらキャッシュをパージする」仕組みをウェブフックで組んでいるなら、購読設定の API バージョンを上げる前に、**新旧どちらのペイロードも受けられる状態**にしてから切り替えてください。
+
+バージョンを上げる作業自体は半日で終わります。厄介なのは、上げないまま放置したときの壊れ方が「ある日いきなり、自分の操作と無関係に」だという点です。運用に入れる前の今日のうちに、`notionVersion` を明示して data source 経由に寄せておくことをおすすめします。
+
 ## ブロックを UI に落とし込む — 型で守りながら描画する
 
 記事一覧が取れたら、次は本文のレンダリングです。Notion の本文は「ブロックの配列」として返ってきます。段落・見出し・画像・コード・リスト・引用など、それぞれ種類（type）が違うオブジェクトが並ぶ形です。
@@ -573,6 +673,8 @@ export function buildPublishedFilter(locale: "ja" | "en", now = new Date()) {
 
 Notion と Rork を組み合わせる楽しさは、「書いた記事が数秒後にアプリで読める」という即時性にあります。本格的な運用を目指すなら、今日は **1記事を1画面に描画するところまで**作り切ってみてください。
 
-一覧エンドポイント・詳細エンドポイント・画像プロキシの3つが揃えば、あとは画面側の UI に肉付けするだけで読み物アプリの骨格が完成します。ペイウォール実装や課金連携に進みたくなったら、[Rork × Cloudflare D1 バックエンド構築ガイド](/articles/rork-dev/rork-cloudflare-d1-sqlite-backend-guide) で紹介しているキャッシュ層との合わせ技が効いてきます。また、サーバー側のデータ取得と整合させたクライアントキャッシュを組みたい場合は [Rork × TanStack Query キャッシュ設計ガイド](/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide) の構成とそのまま統合できます。
+一覧エンドポイント・詳細エンドポイント・画像プロキシの3つが揃えば、あとは画面側の UI に肉付けするだけで読み物アプリの骨格が完成します。ペイウォール実装や課金連携に進みたくなったら、[Rork × Cloudflare Durable Objects リアルタイムバックエンド実装ガイド](/articles/rork-dev/rork-cloudflare-durable-objects-realtime-backend-guide) で紹介しているキャッシュ層との合わせ技が効いてきます。また、サーバー側のデータ取得と整合させたクライアントキャッシュを組みたい場合は [署名付きURLに変えたらキャッシュが効かなくなった — expo-image のキーを URL から切り離す](/articles/rork-dev/rork-expo-image-signed-url-stable-cache-key-design) の構成とそのまま統合できます。
 
-Notion の設計を
+Notion の設計を作り込むのは、実際に1画面が動いてからで間に合います。プロパティ名も、キャッシュの TTL も、走らせてみて初めて「ここが足りない」と分かるものでした。
+
+書いたものが数秒後に自分のアプリで読める — その手触りが、次の記事を書く気力を連れてきます。お読みいただきありがとうございました。

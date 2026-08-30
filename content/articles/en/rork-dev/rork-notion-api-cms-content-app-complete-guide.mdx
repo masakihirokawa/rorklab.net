@@ -45,7 +45,7 @@ If you're a solo developer shipping your own writing to your own app, **start wi
 
 There is one rule, though, that you cannot bend: **never put the token in the client bundle**. Dropping `NOTION_TOKEN=secret_xxx` into a Rork-generated `.env` that ships with the app is a leak waiting to happen. The token belongs on a server (Cloudflare Workers, a tiny Hono BFF, whatever you have) and the app always talks to Notion through that server.
 
-A minimal backend needs exactly three endpoints: list articles, get one article, and proxy images. The Hono setup from [Rork × Hono Cloudflare Workers REST API Implementation Guide](/en/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) pairs cleanly with Notion and is what I'm using in the examples below.
+A minimal backend needs exactly three endpoints: list articles, get one article, and proxy images. The Hono setup from [Rork × Hono Cloudflare Workers REST API Implementation Guide](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide) pairs cleanly with Notion and is what I'm using in the examples below.
 
 ## Minimum viable article list from a Notion database
 
@@ -112,6 +112,106 @@ export default app;
 Expected behavior: returns up to 50 published, English-language articles in descending publish order. The `cache()` middleware keeps the response at the edge for five minutes, which alone is enough to keep the Notion API breathing during a traffic spike.
 
 **Why `page_size: 50`?** Notion allows up to 100 per query, but 100 inflates the payload and slows first paint on the phone. Thirty to fifty items is what a list screen actually needs for the first scroll, and pagination picks up from there.
+
+## The day `databases.query` stops working — API version 2025-09-03 and data sources
+
+The code above calls `notion.databases.query()`. That call has an expiry date on it. Notion API version `2025-09-03` **split databases and data sources into two separate concepts**, and the change is not backwards-compatible.
+
+What makes this one nasty is that the trigger isn't in your hands.
+
+Someone on the editorial side opens Notion and adds a second data source to the database. That's it. You haven't deployed anything, and the article list in your app goes dark. The official upgrade guide spells out exactly which operations break for connections still pinned to an older version:
+
+<table>
+<tr><th>Operation</th><th>After a second data source is added (older version)</th></tr>
+<tr><td>Create page with that database as parent</td><td><strong>Fails</strong></td></tr>
+<tr><td>Database read, write, or query</td><td><strong>Fails</strong></td></tr>
+<tr><td>Writing relation properties pointing at that database</td><td><strong>Fails</strong></td></tr>
+</table>
+
+For a content app, row two is the whole product. And all your logs show is a `validation_error` — nothing that points at a UI action taken in Notion by someone who doesn't know your backend exists.
+
+### The migration is really just "resolve one more ID"
+
+Where you used to pass a `database_id`, you now first **resolve the `data_source_id` underneath it**, then use that everywhere.
+
+```ts
+// server/src/notion/dataSource.ts
+import { Client } from "@notionhq/client";
+
+// Pin the version explicitly. Leave it out and you stay on the old behavior.
+const notion = new Client({
+  auth: NOTION_TOKEN,
+  notionVersion: "2025-09-03",
+});
+
+// GET /v1/databases/:database_id now returns the list of data sources
+export async function resolveDataSourceId(databaseId: string): Promise<string> {
+  const db: any = await notion.request({
+    method: "get",
+    path: `databases/${databaseId}`,
+  });
+
+  // A conventional single-source database has exactly one entry
+  const first = db.data_sources?.[0];
+  if (!first) throw new Error("no_data_source_found");
+  return first.id;
+}
+```
+
+Under `2025-09-03`, Retrieve Database is repurposed: instead of returning the schema, it returns a list of `data_sources`, each with an `id` and a `name`. Property definitions now live on the Retrieve Data Source endpoint.
+
+The query itself moves into the `/v1/data_sources` namespace. Once you're on SDK v5, there's a dedicated method:
+
+```ts
+// @notionhq/client 5.x and later
+const res = await notion.dataSources.query({
+  data_source_id: dataSourceId,
+  filter: {
+    and: [
+      { property: "Status", select: { equals: "Published" } },
+      { property: "Locale", select: { equals: "en" } },
+    ],
+  },
+  sorts: [{ property: "PublishedAt", direction: "descending" }],
+  page_size: 50,
+});
+```
+
+If you can't bump the SDK yet, you can still move the version forward first by calling `notion.request()` with `method: "post"` and `path: "data_sources/<your-data-source-id>/query"`. Page creation shifts the same way: `parent` goes from `{ type: "database_id", database_id }` to `{ type: "data_source_id", data_source_id }`.
+
+### Cache the data_source_id, or you halve your rate limit headroom
+
+This is the part I see skipped most often.
+
+Written naively, every request to your article list now makes two round trips instead of one — resolve the database, then query the data source. Notion's practical ceiling is 3 requests per second. Doubling the round trips halves the concurrency you can absorb before you start seeing 429s.
+
+The `data_source_id` doesn't change unless someone adds or removes a data source in Notion. It is a value you can safely hold onto for a long time.
+
+```ts
+// KV on Workers; a module-scope Map is fine for a single process
+const DS_CACHE_TTL_SEC = 60 * 60 * 24; // 24 hours
+
+export async function getDataSourceId(env: Env, databaseId: string) {
+  const key = `ds:${databaseId}`;
+  const hit = await env.KV.get(key);
+  if (hit) return hit;
+
+  const id = await resolveDataSourceId(databaseId);
+  await env.KV.put(key, id, { expirationTtl: DS_CACHE_TTL_SEC });
+  return id;
+}
+```
+
+Then invalidate that cache only when a query comes back with `validation_error` and re-resolve. You pay for one extra call right after someone changes the data source layout, instead of paying on every single request.
+
+### Two places people forget
+
+The same revision touches search and webhooks.
+
+- **Search API**: `filter.value` takes `"data_source"` instead of `"database"`. If you delegate article search to Notion, missing this returns an empty result set rather than an error, which is the worst kind of bug to notice late.
+- **Webhooks**: `database.content_updated` became `data_source.content_updated`, and `database.schema_updated` became `data_source.schema_updated`. If your cache purge runs off a webhook, make your handler accept **both the old and new payload shapes** before you bump the subscription's API version, not after.
+
+The upgrade itself is half a day of work. The reason to do it now is the failure mode if you don't: one morning, without any deploy of yours, from an action you never saw.
 
 ## Render blocks into UI — type-safe, with graceful unknown-type handling
 
@@ -566,4 +666,4 @@ None of these look impressive on a slide. All of them matter at 2am.
 
 The moment Notion-backed content clicks for you is when something you just typed appears in your own app a few seconds later. Don't try to build the perfect pipeline up front. Get **one article rendering end-to-end** today — list endpoint, detail endpoint, image proxy — and iterate from there.
 
-For the caching layer that pairs with this setup, see [Rork × Cloudflare D1 SQLite Backend Guide](/en/articles/rork-dev/rork-cloudflare-d1-sqlite-backend-guide). For client-side cache design that plays well with the short-TTL edge cache above, see [Rork × TanStack Query Data Fetching & Cache Guide](/en/articles/rork-dev/rork-tanstack-query-data-fetching-cache-guide). The three fit together without translation layers.
+For the caching layer that pairs with this setup, see [Rork × Cloudflare Durable Objects Real-Time Backend Guide](/articles/rork-dev/rork-cloudflare-durable-objects-realtime-backend-guide). For client-side cache design that plays well with the short-TTL edge cache above, see [Switching to Signed URLs Killed My Image Cache](/articles/rork-dev/rork-expo-image-signed-url-stable-cache-key-design). The three fit together without translation layers.
