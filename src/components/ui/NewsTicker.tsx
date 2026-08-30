@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — Google Play の Android 16（API レベル36）必須化は明日8月31日です。残り1日で、新規アプリも既存アプリの更新も対象になります",
-    "DECISION — 延長申請は期限を過ぎてからでは提出できません。間に合わせるのか申請へ切り替えるのか、その判断そのものの締切が今日という形になります",
-    "VISIBILITY — 更新を止めているアプリも無関係ではありません。API レベル35 未満のままだと、新しい Android 端末の新規ユーザーには表示されなくなります",
-    "PITFALL — 依存ライブラリ側が新しい API レベルに追随していない場合、ローカルのビルドは通ってもストアのプリチェックで止まることがあります。自分のコードだけを見ていても分かりません",
-    "EXPO — expo@57.0.17 が React Native を 0.86.3 へ更新しました。大きな SDK リリースの合間に破壊的変更のないパッチを挟む流れが見えてきており、追随のコストが下がる方向です",
-    "CHOICE — Android も出すなら React Native を生成する本家 Rork、Apple プラットフォーム固有の機能が要件の中心なら Swift を生成する Rork Max。優劣ではなく何を出すかで決まります",
+    "DEADLINE — 本日8月31日から、Google Play への新規アプリ提出と既存アプリの更新は Android 16（API レベル36）以上をターゲットにする必要があります",
+    "SCOPE — 既存アプリは削除されません。ただし要件を下回ったままだと、新しい Android バージョンのユーザーには表示されなくなります。消えないが届かなくなる、という形の影響です",
+    "EXTENSION — 間に合わない場合、11月1日までの延長を申請できます。申請という選択肢があること自体を知らずに当日を迎える例が毎年出ています",
+    "MIGRATION — Rork の生成物は React Native と Expo が土台です。targetSdkVersion を上げる作業は、Expo SDK とネイティブ依存の更新を必ず伴います",
+    "TESTING — 本当に時間を取られるのはビルドが通った後です。バックグラウンド実行制限、権限モデル、フォアグラウンドサービスの型指定が一斉に効きます",
+    "ORDER — 現実的な順序は、延長申請の可否を確認し、Expo SDK のアップグレード計画を立て、最後に最小構成で実機の回帰テストを行うことです。当日に全部やると原因が追えません",
   ],
   en: [
-    "DEADLINE — Google Play's Android 16 (API level 36) requirement lands tomorrow, August 31. One day left, and it covers new apps and updates to existing ones alike",
-    "DECISION — An extension cannot be filed once the deadline passes. So the real cutoff today is not the build itself but deciding whether to make it or to file instead",
-    "VISIBILITY — Apps you no longer update are not exempt. Anything still below API level 35 stops appearing for new users on newer Android devices",
-    "PITFALL — When a dependency has not caught up to the new API level, the local build can pass while the store pre-check stops you. Reading your own code will not surface that",
-    "EXPO — expo@57.0.17 moved React Native to 0.86.3. A pattern is emerging of small non-breaking patches between major SDK releases, which lowers the cost of keeping current",
-    "CHOICE — Shipping to Android too points at Rork proper and its React Native output; Apple-specific capabilities at the center of the spec point at Rork Max and Swift. It is a question of what you ship",
+    "DEADLINE — From today, August 31, new submissions to Google Play and updates to existing apps must target Android 16, API level 36 or higher",
+    "SCOPE — Existing apps are not removed. But anything below the requirement stops appearing for users on newer Android versions, so it does not vanish, it just stops reaching people",
+    "EXTENSION — If you cannot make it, an extension can be requested through November 1. Every year some developers reach the deadline without knowing that option existed",
+    "MIGRATION — What Rork generates sits on React Native and Expo, so raising targetSdkVersion always drags the Expo SDK and its native dependencies along with it",
+    "TESTING — The time really goes after the build passes. Background execution limits, the permission model, and foreground service type declarations all take effect at once",
+    "ORDER — A workable sequence: check whether an extension applies, plan the Expo SDK upgrade, then run device regression tests on a minimal build. Doing all three at once hides the cause",
   ],
 };
 
