@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "DEADLINE — 本日8月31日から、Google Play への新規アプリ提出と既存アプリの更新は Android 16（API レベル36）以上をターゲットにする必要があります",
-    "SCOPE — 既存アプリは削除されません。ただし要件を下回ったままだと、新しい Android バージョンのユーザーには表示されなくなります。消えないが届かなくなる、という形の影響です",
-    "EXTENSION — 間に合わない場合、11月1日までの延長を申請できます。申請という選択肢があること自体を知らずに当日を迎える例が毎年出ています",
-    "MIGRATION — Rork の生成物は React Native と Expo が土台です。targetSdkVersion を上げる作業は、Expo SDK とネイティブ依存の更新を必ず伴います",
-    "TESTING — 本当に時間を取られるのはビルドが通った後です。バックグラウンド実行制限、権限モデル、フォアグラウンドサービスの型指定が一斉に効きます",
-    "ORDER — 現実的な順序は、延長申請の可否を確認し、Expo SDK のアップグレード計画を立て、最後に最小構成で実機の回帰テストを行うことです。当日に全部やると原因が追えません",
+    "PLAY — Google Play の target API level 36 要件が昨日8月31日に発効しました。今日以降、新規アプリと既存アプリの更新は Android 16 対応が必須です",
+    "VISIBILITY — API 35 のままのアプリは掲載こそ続きますが、新しい Android 版のユーザーには表示されなくなります。エラーが出ないまま新規インストールだけが減る点に注意が要ります",
+    "EXTENSION — 間に合わなかった場合は、Play Console から2026年11月1日までの延長申請が出せます。恒久対応の計画とセットで進めるのが実務的です",
+    "APPLE — Apple 側は9月9日にイベント、iOS 27 の正式リリースは9月14日と報じられています。生成したアプリの iOS 27 実機確認はリリース週の前に済ませておきたいところです",
+    "EXPO — Expo が expo-paste-input を公開しました（8月28日）。React Native の TextInput に画像・GIF・ステッカーの貼り付けを追加するネイティブモジュールです",
+    "EAS — EAS Observe が8月20日に GA になりました。クラッシュや性能の観測を、ビルドや配信と同じ EAS 上で持てるようになっています",
   ],
   en: [
-    "DEADLINE — From today, August 31, new submissions to Google Play and updates to existing apps must target Android 16, API level 36 or higher",
-    "SCOPE — Existing apps are not removed. But anything below the requirement stops appearing for users on newer Android versions, so it does not vanish, it just stops reaching people",
-    "EXTENSION — If you cannot make it, an extension can be requested through November 1. Every year some developers reach the deadline without knowing that option existed",
-    "MIGRATION — What Rork generates sits on React Native and Expo, so raising targetSdkVersion always drags the Expo SDK and its native dependencies along with it",
-    "TESTING — The time really goes after the build passes. Background execution limits, the permission model, and foreground service type declarations all take effect at once",
-    "ORDER — A workable sequence: check whether an extension applies, plan the Expo SDK upgrade, then run device regression tests on a minimal build. Doing all three at once hides the cause",
+    "PLAY — Google Play's target API level 36 requirement took effect yesterday, August 31. From today, new apps and updates must target Android 16",
+    "VISIBILITY — Apps still on API 35 stay listed but disappear for users on newer Android versions. No error is raised; new installs simply fade, which makes the change easy to miss",
+    "EXTENSION — If you missed the deadline, an extension through November 1, 2026 can be requested in Play Console — best filed alongside a concrete migration plan",
+    "APPLE — On the Apple side, the event lands September 9 and iOS 27 is reported to ship September 14. Testing generated apps on iOS 27 hardware before release week is time well spent",
+    "EXPO — Expo released expo-paste-input on August 28, a native module that brings image, GIF, and sticker paste to React Native TextInput",
+    "EAS — EAS Observe reached general availability on August 20, putting crash and performance monitoring on the same EAS platform as builds and updates",
   ],
 };
 
