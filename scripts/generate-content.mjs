@@ -60,6 +60,22 @@ function processCallouts(content) {
 }
 
 /**
+ * Localize root-relative internal links for non-default locales.
+ * next-intl uses localePrefix "as-needed": JA (default) has no prefix, EN lives under /en.
+ * Article/blog HTML is injected verbatim (dangerouslySetInnerHTML), so an EN article that
+ * links to "/articles/..." would send English readers to the Japanese page. Rewrite
+ * href="/..." → href="/en/..." unless the link is already prefixed (or is an asset/API path).
+ */
+const DEFAULT_LOCALE = "ja";
+function localizeInternalLinks(html, locale) {
+  if (locale === DEFAULT_LOCALE) return html;
+  const skip = new RegExp(`^(?:${locale}(?:/|$)|_next/|content/|api/|og/|images/|icons/|favicon)`);
+  return html.replace(/href="\/([^"]*)"/g, (match, rest) =>
+    skip.test(rest) ? match : rest === "" ? `href="/${locale}"` : `href="/${locale}/${rest}"`
+  );
+}
+
+/**
  * Add id="section-N" to <h2> and <h3> tags for TOC anchor links.
  * This ensures heading IDs are present in SSR HTML for Google Passage Ranking.
  */
@@ -113,22 +129,28 @@ async function generateArticleIndex() {
         }
 
         // Validate & auto-remove broken internal article links (links to non-existent articles cause 404)
-        const internalLinkPattern = /\[([^\]]*)\]\(\/articles\/([^)#\s]+)\)/g;
-        let linkMatch;
-        while ((linkMatch = internalLinkPattern.exec(cleanedContent)) !== null) {
+        // Covers both "/articles/..." (JA) and "/en/articles/..." (EN) forms.
+        // NOTE: collect matches first, then replace — mutating the string inside a regex.exec()
+        // loop shifts lastIndex and silently skips the next broken link on the same line.
+        const internalLinkPattern = /\[([^\]]*)\]\(\/(?:(?:ja|en)\/)?articles\/([^)#\s]+)\)/g;
+        const brokenLinks = [];
+        for (const linkMatch of cleanedContent.matchAll(internalLinkPattern)) {
           const linkTarget = linkMatch[2].replace(/^(ja|en)\//, '');
           // linkTarget should be "category/slug" — check if that MDX file exists in any locale
           const jaPath = path.join(CONTENT_DIR, "articles", "ja", ...linkTarget.split('/')) + '.mdx';
           const enPath = path.join(CONTENT_DIR, "articles", "en", ...linkTarget.split('/')) + '.mdx';
           if (!fs.existsSync(jaPath) && !fs.existsSync(enPath)) {
-            console.warn(`  ⚠ AUTO-FIX: ${locale}/${category}/${file}: removed broken link [${linkMatch[1]}](/articles/${linkMatch[2]}) — target article does not exist`);
-            // Remove the entire markdown link, keeping only the link text
-            cleanedContent = cleanedContent.replace(linkMatch[0], linkMatch[1]);
+            brokenLinks.push(linkMatch);
           }
+        }
+        for (const linkMatch of brokenLinks) {
+          console.warn(`  ⚠ AUTO-FIX: ${locale}/${category}/${file}: removed broken link [${linkMatch[1]}](/articles/${linkMatch[2]}) — target article does not exist`);
+          // Remove the entire markdown link (all occurrences), keeping only the link text
+          cleanedContent = cleanedContent.split(linkMatch[0]).join(linkMatch[1]);
         }
 
         // Compile MDX/markdown to HTML at build time
-        const html = addHeadingIds(await compileMarkdown(cleanedContent));
+        const html = localizeInternalLinks(addHeadingIds(await compileMarkdown(cleanedContent)), locale);
 
         // Validate: warn if compiled HTML still has hardcoded locale-prefixed article links
         if (/href="\/articles\/(ja|en)\//.test(html)) {
@@ -251,7 +273,7 @@ async function generateBlogIndex() {
       const { data, content } = matter(raw);
       const slug = file.replace(/\.mdx$/, "");
 
-      const html = addHeadingIds(await compileMarkdown(content));
+      const html = localizeInternalLinks(addHeadingIds(await compileMarkdown(content)), locale);
 
       // Write individual HTML content to public/content/blog/{locale}/{slug}.html
       const htmlDir = path.join(CONTENT_HTML_DIR, "blog", locale);

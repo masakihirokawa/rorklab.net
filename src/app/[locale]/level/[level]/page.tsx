@@ -65,7 +65,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const metadata: Metadata = {
     title,
     description,
-    openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
+    openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }] },
     alternates: {
       canonical,
       languages: {

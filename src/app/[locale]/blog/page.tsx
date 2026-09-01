@@ -18,7 +18,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: isJa
         ? "Rork Lab ブログでは、Rork と Rork Max の最新ニュースや機能アップデート、資金調達などの企業動向、個人開発者のストーリーをお届けします。技術記事より少し柔らかい読み物として、開発の合間にお楽しみいただける内容です。"
         : "The Rork Lab blog covers the latest Rork and Rork Max news, feature updates, company milestones, and stories from indie developers building apps with AI.",
-      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
+      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }],
     },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/blog" : "https://rorklab.net/en/blog",

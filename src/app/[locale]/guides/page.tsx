@@ -19,7 +19,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: isJa
         ? "目的別に整理した体系的な学習パスで Rork Max を使いこなせるようになるガイドページです。入門から React Native などの開発ツール連携、AI 活用、収益化まで、読む順番に迷わないようステップバイステップで案内します。"
         : "Master Rork Max with systematic, goal-oriented learning paths. Step-by-step guides from getting started to monetization.",
-      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
+      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }],
     },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/guides" : "https://rorklab.net/en/guides",

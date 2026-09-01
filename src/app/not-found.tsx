@@ -5,11 +5,10 @@ export default function GlobalNotFound() {
         <title>404 — ページが見つかりません | Rork Lab</title>
         <meta name="robots" content="noindex, nofollow" />
         <meta name="description" content="お探しのページは存在しないか、移動された可能性があります。" />
-        <link
-          href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400&family=DM+Sans:wght@300;400;500;700&display=swap"
-          rel="stylesheet"
-        />
+        {/* @import instead of <link rel="stylesheet">: React Float hoists a preload for the
+            link on EVERY page's RSC payload (unused-preload warning + wasted request). */}
         <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400&family=DM+Sans:wght@300;400;500;700&display=swap');
           :root {
             --bg-primary: #0c0c14;
             --text-primary: #fafafa;

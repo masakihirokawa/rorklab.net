@@ -24,7 +24,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     openGraph: {
       title: m.title,
       description: m.description,
-      images: [{ url: "https://rorklab.net/og/default.png", width: 1200, height: 630 }],
+      images: [{ url: "https://rorklab.net/og/default.png", width: 1200, height: 1200 }],
     },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/about" : "https://rorklab.net/en/about",
