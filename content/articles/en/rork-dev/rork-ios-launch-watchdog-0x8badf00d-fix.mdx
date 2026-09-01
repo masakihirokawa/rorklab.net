@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "intermediate"
 date: "2026-05-20T11:30"
 author: "Rork Lab"
-description: "Your Rork iOS app dies right after launch on real devices. Crashlytics shows exception code 0x8badf00d. Here is the watchdog termination story and the exact steps an indie developer running React Native apps for 50M downloads uses to make it stop."
+description: "Your Rork iOS app dies right after launch on real devices, but never on your bench. Crashlytics shows exception code 0x8badf00d. Here is how to read the exact watchdog budget out of the crash log and rearrange your launch path so it stops."
 tags: ["rork", "ios", "crash", "watchdog", "launch", "react-native", "expo"]
 premium: false
 ---
@@ -14,7 +14,9 @@ premium: false
 
 The shape of the bug is always the same: the App Store build dies the instant a user taps the icon, you cannot reproduce it on your own iPhone, and Crashlytics shows `EXC_CRASH (SIGKILL)` with exception code `0x8badf00d`. Apple intends that hex string to read as "ate bad food," and it is iOS telling you the watchdog killed the process for taking too long to launch.
 
-I am Hirokawa, an indie developer who has been shipping iOS and Android apps since 2014 and crossed 50 million downloads across a wallpaper-and-relaxation portfolio. Every time I add a new SDK, this 0x8badf00d shows up first on iPhone 8 and SE second generation, then disappears once I rearrange the launch sequence. Here is the playbook that has held up across many Rork-style React Native projects.
+What makes this one awkward is that it does not look like a bug in your code. The frame at the top of the stack is almost always a third-party SDK's init function, and that function is behaving correctly. iOS simply ran out of patience and killed the whole process.
+
+React Native, Expo, and Rork put JavaScript bundle evaluation directly on the launch path, so there is less headroom than a purely native app has. Every SDK you add raises the odds. Here is how to tell the cases apart, and what actually moved the needle in apps I keep in production.
 
 ## What Watchdog Actually Measures
 
@@ -34,6 +36,30 @@ In Crashlytics or Xcode Organizer the signature is unambiguous:
 - The triggered thread is usually thread 0 with frames inside `RCTCxxBridge`, `facebook::hermes::HermesRuntime`, `expo-modules-core`, or `+[FIRApp configure]`
 
 If you see those four marks together, stop investigating other crash categories. This is a launch-time block, not a memory issue, not a missing entitlement.
+
+### You do not have to guess the budget — it is printed in the log
+
+The detail most write-ups skip: the termination reason string contains **the exact allowance that device granted on that launch**.
+
+```
+Termination Reason: FRONTBOARD 2343432205
+<RBSTerminateContext| domain:10 code:0x8BADF00D explanation:
+scene-create watchdog transgression: application<com.example.app>:9312
+exhausted real (wall clock) time allowance of 19.43 seconds>
+```
+
+That `19.43 seconds` is not a documented constant, it is what iOS actually gave this process under these conditions. Write the number down across a handful of crashes and you get the real floor your app is fighting, instead of a range from a WWDC slide. On the same build I have seen it swing from the high teens down to nine seconds.
+
+Just as important: `0x8badf00d` is not exclusively a launch code. The start of the explanation tells you which lifecycle transition was cut off.
+
+<table>
+<tr><th>Start of the explanation</th><th>Where it was killed</th><th>First suspect</th></tr>
+<tr><td><code>scene-create watchdog transgression</code></td><td>Launch through first scene creation</td><td>Synchronous AppDelegate init, JS bundle evaluation</td></tr>
+<tr><td><code>scene-update watchdog transgression</code></td><td>Foreground resume and other scene updates</td><td>Synchronous IO on resume, blocking AppOpen preload</td></tr>
+<tr><td><code>process-exit watchdog transgression</code></td><td>Termination handling</td><td>Save work inside <code>applicationWillTerminate</code></td></tr>
+</table>
+
+If you fixed the launch path and the crash rate refused to move, it was very likely `scene-update` all along. Read the explanation before you touch code.
 
 ## The Four Things That Block Launch in a Rork App
 
@@ -123,9 +149,62 @@ Watchdog enforcement gets stricter when the device is cold, low on battery, and 
 
 That sequence reproduces the iPhone 8 crash about three times out of five for me. Firebase Test Lab on a physical iPhone 8 works too, but it costs more, so I do the local trick first.
 
+## Proving It Is Fixed With Field Data, Not One Bench Device
+
+Local reproduction is good for forming a hypothesis. It is not enough to claim the problem is gone, because one device tells you nothing about the distribution. MetricKit reports that distribution daily, straight from your users' hardware.
+
+`MXAppLaunchMetric.histogrammedTimeToFirstDraw` hands you launches bucketed by duration rather than averaged. The tail is the whole point: if a bucket up near eight seconds keeps returning a non-zero count, there are devices reaching the watchdog even though your mean looks healthy.
+
+```swift
+import MetricKit
+
+final class LaunchMetricsSubscriber: NSObject, MXMetricManagerSubscriber {
+  static let shared = LaunchMetricsSubscriber()
+
+  func start() {
+    MXMetricManager.shared.add(self)
+  }
+
+  func didReceive(_ payloads: [MXMetricPayload]) {
+    for payload in payloads {
+      guard let histogram = payload.applicationLaunchMetrics?
+              .histogrammedTimeToFirstDraw else { continue }
+
+      for case let bucket as MXHistogramBucket<UnitDuration> in histogram.bucketEnumerator {
+        let start = bucket.bucketStart.converted(to: .seconds).value
+        let end = bucket.bucketEnd.converted(to: .seconds).value
+        guard start >= 5 else { continue }   // only report the danger zone
+        Analytics.logEvent("slow_launch", parameters: [
+          "bucket": "\(start)-\(end)",
+          "count": bucket.bucketCount,
+        ])
+      }
+    }
+  }
+
+  // The watchdog's own reason string is available here too (iOS 14+)
+  func didReceive(_ payloads: [MXDiagnosticPayload]) {
+    for payload in payloads {
+      for crash in payload.crashDiagnostics ?? [] {
+        guard crash.exceptionCode?.intValue == 0x8badf00d else { continue }
+        Analytics.logEvent("watchdog_kill", parameters: [
+          "reason": crash.terminationReason ?? "unknown",
+        ])
+      }
+    }
+  }
+}
+```
+
+Calling `start()` from `didFinishLaunching` is fine. `MXMetricManager.shared.add` only registers a subscriber; it does none of the work this article is trying to evict from the launch path.
+
+In an Expo or Rork project, add this Swift file to the native target through a config plugin. There is no need to bridge anything to JavaScript — reporting directly to Analytics is the shortest path.
+
+One operational catch worth knowing before you wire it up: MetricKit delivers at most one payload every 24 hours, and only on a subsequent launch. Nothing arrives the day you ship. It is only useful paired with a phased rollout you are willing to hold for a day. I lost an afternoon assuming an empty dashboard the next morning meant I had wired the subscriber up wrong.
+
 ## A Pre-release Checklist to Keep 0x8badf00d Out
 
-Instruments → App Launch is the only honest measurement, and I run it on every release branch in Apps/iOS Apps. The three gates I enforce are:
+Instruments → App Launch is the only honest pre-release measurement, and I run it on every release branch. The three gates I enforce are:
 
 - App Launch (Pre-main + Time to first frame) under 1.8 s on a recent iPhone and under 3.5 s on SE second generation
 - No new `await` or synchronous file reads added inside `didFinishLaunching`
