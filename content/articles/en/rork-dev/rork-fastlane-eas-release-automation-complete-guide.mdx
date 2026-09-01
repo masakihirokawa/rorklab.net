@@ -99,12 +99,16 @@ end
 desc "iOS TestFlight delivery: EAS build → pilot upload → metadata sync"
 lane :ios_beta do
   # 1) EAS Build (--non-interactive keeps behavior identical to CI)
-  sh("cd .. && eas build --platform ios --profile preview --non-interactive --wait")
+  #    Use the store-distribution profile (`beta` in eas.json). Leaving this on
+  #    `preview` produces an Ad-hoc signed build that TestFlight will reject (pitfall 2)
+  sh("cd .. && eas build --platform ios --profile beta --non-interactive --wait")
 
   # 2) Grab the latest build artifact URL
   build_json = sh("cd .. && eas build:list --platform ios --limit 1 --json --non-interactive")
-  artifact_url = JSON.parse(build_json).first["artifacts"]["buildUrl"]
-  UI.user_error\!("Build URL not found") if artifact_url.nil? || artifact_url.empty?
+  build = JSON.parse(build_json).first
+  UI.user_error!("Build history is empty — did `eas build` finish?") if build.nil?
+  artifact_url = build.dig("artifacts", "buildUrl")
+  UI.user_error!("Build URL not found (status: #{build["status"]})") if artifact_url.to_s.empty?
 
   # 3) Download locally, then upload to TestFlight via pilot
   ipa_path = "/tmp/rork-#{Time.now.to_i}.ipa"
@@ -134,6 +138,8 @@ end
 ```
 
 The `ensure` block that deletes the temporary `.ipa` is intentional. CI runners are throwaway, but I've had my local disk fill up more than once when a run failed mid-way without cleanup.
+
+The `dig` call is deliberate too. When the most recent build failed, or is still queued, `eas build:list` returns that build with `artifacts` set to `null`. Chaining square brackets crashes with `NoMethodError: undefined method for nil` at exactly that point, so the friendly `UI.user_error!` you wrote one line below never runs. Switching to `dig` and printing `status` alongside the failure means one glance at the CI log tells you whether the build is still running or whether it died — a distinction worth having at 1 a.m.
 
 ### Why pilot and deliver are separate
 
@@ -221,7 +227,7 @@ stop_after_first_error(true)
 concurrent_simulators(true)
 ```
 
-`concurrent_simulators(true)` is 2–3× faster, but below 16 GB of RAM Simulator tends to crash. On Apple Silicon GitHub runners (`macos-14-xlarge` and similar) I keep it on. On local Intel Macs I keep it off.
+`concurrent_simulators(true)` is 2–3× faster, but below 16 GB of RAM Simulator tends to crash. On Apple Silicon GitHub runners (`macos-15` and newer) I keep it on. On local Intel Macs I keep it off.
 
 ## Metadata sync — `deliver` lets you version-control your listings
 
@@ -271,7 +277,7 @@ def validate_metadata_lengths
       next unless File.exist?(path)
       length = File.read(path).strip.length
       if length > limit
-        UI.user_error\!("#{path}: #{length} chars (limit #{limit})")
+        UI.user_error!("#{path}: #{length} chars (limit #{limit})")
       end
     end
   end
@@ -291,10 +297,12 @@ Android has an equivalent workflow. `fastlane supply init --json_key /path/to/se
 ```ruby
 desc "Ship to Android Internal Testing + sync metadata"
 lane :android_beta do
-  sh("cd .. && eas build --platform android --profile preview --non-interactive --wait")
+  sh("cd .. && eas build --platform android --profile beta --non-interactive --wait")
 
   build_json = sh("cd .. && eas build:list --platform android --limit 1 --json --non-interactive")
-  artifact_url = JSON.parse(build_json).first["artifacts"]["buildUrl"]
+  build = JSON.parse(build_json).first
+  artifact_url = build&.dig("artifacts", "buildUrl")
+  UI.user_error!("Could not resolve the AAB URL") if artifact_url.to_s.empty?
 
   aab_path = "/tmp/rork-#{Time.now.to_i}.aab"
   sh("curl -L -o #{aab_path} #{artifact_url}")
@@ -342,7 +350,7 @@ on:
 jobs:
   ios:
     if: inputs.platform == 'ios' || inputs.platform == 'both'
-    runs-on: macos-14-xlarge
+    runs-on: macos-15          # Apple Silicon by default. Never macos-latest (pitfall 5)
     steps:
       - uses: actions/checkout@v4
 
@@ -444,9 +452,30 @@ The Play Console service account JSON is the whole credential — base64-encode 
 
 Here are the issues that cost me hours or days, so you can skip straight past them.
 
-### 1. App Store Connect API keys silently expire (180 days)
+### 1. Assuming `Invalid token` means the API key expired
 
-API keys have a 180-day lifetime. The first time CI started failing with `Invalid token` I spent half a day debugging Fastlane configs before realizing the key itself had expired. Mitigations: put a calendar reminder on day 150, and have your Fastlane failure handler post to Slack mentioning "check key expiry" as a first triage step.
+The first time CI started failing with `Invalid token`, my opening hypothesis was that the App Store Connect API key had expired. That hypothesis cost me half a day, because it is wrong.
+
+The `.p8` private key itself has no expiry. What expires is the JWT signed with that key, and Apple caps its lifetime at 20 minutes. Fastlane mints a fresh token during the lane, so this is almost never something you touch directly.
+
+<table>
+<thead>
+<tr><th>Credential</th><th>Expires?</th><th>How it actually dies</th></tr>
+</thead>
+<tbody>
+<tr><td>API key (<code>.p8</code> private key)</td><td><strong>No</strong></td><td>Only when revoked in App Store Connect. A revoked key cannot be reinstated</td></tr>
+<tr><td>JWT signed with that key</td><td><strong>20 minutes max</strong></td><td>Times out; Fastlane reissues it per run</td></tr>
+<tr><td>Google Play service account key</td><td>No</td><td>Deleted in Google Cloud, or its Play Console role is removed</td></tr>
+</tbody>
+</table>
+
+So when `Invalid token` shows up, work through these three in order instead:
+
+- **Mismatched `key_id` / `issuer_id`.** If you belong to more than one team, it is easy to paste another team's `issuer_id` into Secrets.
+- **Someone revoked the key.** Common after a credential audit, or when a collaborator cleans house.
+- **Runner clock drift.** If the JWT's `iat` lands in the future, Apple rejects it immediately. I hit this on a self-hosted runner whose NTP sync had quietly stopped.
+
+Passing a raw PEM while `is_key_content_base64: true` is set produces the same error, incidentally. Running `bundle exec fastlane run app_store_connect_api_key ...` once on your own machine before wiring it into CI keeps key problems and CI problems in separate boxes, which is most of the debugging battle.
 
 ### 2. `--profile preview` is rejected by TestFlight / Play
 
@@ -460,9 +489,13 @@ iPhone 16 Pro Max's native resolution is `1320 × 2868` (3x), but App Store Conn
 
 `deliver` will happily upload demo credentials, but only if you fill in `metadata/ios/review_information/demo_user.txt` and `demo_password.txt`. If you push `automatic_release: true` without these, Review bounces you the same day. Check in placeholder files as part of onboarding so this never happens again.
 
-### 5. Runner macOS + Xcode version drift
+### 5. Pinning a runner label that then gets retired
 
-`macos-latest` eventually bumps Xcode under you, and the day it does, your `snapshot` tests break. **Pin `macos-14-xlarge` (or the successor for your target iOS version) explicitly.** Opt-in to updates; don't be surprised by them.
+`macos-latest` eventually bumps Xcode under you, and the day it does, your `snapshot` tests break. That much is well known.
+
+The sharper edge is that the label you pinned can disappear before you're ready. GitHub's macOS 14 images — including `macos-14` and `macos-14-xlarge` — entered phased deprecation on July 6, 2026 and become fully unsupported on November 2, 2026. During the wind-down, jobs on those labels are deliberately failed at intervals to make the change impossible to miss. This guide originally recommended `macos-14-xlarge`; if you're building the pipeline today, pin **`macos-15`** instead (Apple Silicon by default), or `macos-26` if you want to track the newer image.
+
+Pinning is not a decision you make once. Put a twice-yearly reminder on your calendar to check the [actions/runner-images announcements](https://github.com/actions/runner-images/issues) and re-pin. That single habit is what separates "our CI is stable" from "our CI was stable until one Tuesday morning."
 
 ### 6. `ensure_git_status_clean` fights with Git LFS-tracked screenshots
 
@@ -515,7 +548,7 @@ I also rotate the `EXPO_TOKEN` and Google service account every six months. It's
 
 ## CI ownership — the hidden cost of automation
 
-One honest caveat: **CI is not free, not in money and not in attention**. My `macos-14-xlarge` runner minutes on GitHub Actions cost a few cents per iOS release, so across a year it's a meaningful but not scary line item. What costs more is ownership: when the pipeline breaks, the time debugging is yours, and the cognitive load of "is the pipeline healthy right now?" is a new background task you didn't have before.
+One honest caveat: **CI is not free, not in money and not in attention**. My macOS runner minutes on GitHub Actions cost a few cents per iOS release, so across a year it's a meaningful but not scary line item. What costs more is ownership: when the pipeline breaks, the time debugging is yours, and the cognitive load of "is the pipeline healthy right now?" is a new background task you didn't have before.
 
 Mitigations I've found useful:
 

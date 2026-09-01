@@ -98,12 +98,16 @@ end
 desc "iOS TestFlight 配信: EAS でビルド → pilot でアップロード → メタデータ更新"
 lane :ios_beta do
   # 1) EAS Build でバイナリ生成（--non-interactive で CI 挙動に揃える）
-  sh("cd .. && eas build --platform ios --profile preview --non-interactive --wait")
+  #    プロファイルは store 配布用（eas.json の beta）を指定します。
+  #    preview のままだと Ad-hoc 証明書になり TestFlight で弾かれます（後述の落とし穴 2）
+  sh("cd .. && eas build --platform ios --profile beta --non-interactive --wait")
 
   # 2) 最新ビルドアーティファクトの URL を取得
   build_json = sh("cd .. && eas build:list --platform ios --limit 1 --json --non-interactive")
-  artifact_url = JSON.parse(build_json).first["artifacts"]["buildUrl"]
-  UI.user_error\!("Build URL not found") if artifact_url.nil? || artifact_url.empty?
+  build = JSON.parse(build_json).first
+  UI.user_error!("ビルド履歴が空です。eas build が完了しているか確認してください") if build.nil?
+  artifact_url = build.dig("artifacts", "buildUrl")
+  UI.user_error!("Build URL not found (status: #{build["status"]})") if artifact_url.to_s.empty?
 
   # 3) ローカルにダウンロードしてから pilot で TestFlight にアップロード
   ipa_path = "/tmp/rork-#{Time.now.to_i}.ipa"
@@ -133,6 +137,10 @@ end
 ```
 
 `ensure` ブロックで一時ファイル（`.ipa`）を必ず削除するのがポイントです。CI のランナーはインスタンス使い捨てなので問題ありませんが、ローカルで回したときにディスクを圧迫する失敗談が何度かありました。
+
+URL の取り出しに `["artifacts"]["buildUrl"]` ではなく `dig` を使っているのにも理由があります。`eas build:list` が返す最新ビルドは、ビルドが失敗している場合やまだキューに積まれている場合、`artifacts` が `null` のまま返ってきます。角括弧で二段掘ると、そこで `NoMethodError: undefined method for nil` が出て停止し、せっかく用意した `UI.user_error!` の親切なメッセージには到達しません。`dig` に変えて、`status` を添えて落とすようにしておくと、CI ログを開いた瞬間に「ビルドがまだ終わっていない」のか「ビルド自体が失敗した」のかが判別できます。
+
+小さな書き換えですが、深夜にログとにらみ合う時間を確実に削ってくれる一行です。
 
 ### なぜ pilot と deliver を分けるのか
 
@@ -220,7 +228,7 @@ stop_after_first_error(true)
 concurrent_simulators(true)
 ```
 
-`concurrent_simulators(true)` は同時実行で速度が 2〜3 倍になりますが、ランナーの RAM が 16GB 未満だと Simulator がクラッシュしがちです。CI で Apple Silicon ベースのランナー（GitHub Actions の `macos-14-xlarge` など）を使うときは ON、ローカルの Intel Mac では OFF が安全です。
+`concurrent_simulators(true)` は同時実行で速度が 2〜3 倍になりますが、ランナーの RAM が 16GB 未満だと Simulator がクラッシュしがちです。CI で Apple Silicon ベースのランナー（GitHub Actions なら `macos-15` 以降）を使うときは ON、ローカルの Intel Mac では OFF が安全です。
 
 ## メタデータ同期 — deliver で日英を一括管理する
 
@@ -270,7 +278,7 @@ def validate_metadata_lengths
       next unless File.exist?(path)
       length = File.read(path).strip.length
       if length > limit
-        UI.user_error\!("#{path}: #{length} 文字（上限 #{limit}）")
+        UI.user_error!("#{path}: #{length} 文字（上限 #{limit}）")
       end
     end
   end
@@ -290,10 +298,12 @@ Android の Play Console メタデータも、同じ発想で管理できます�
 ```ruby
 desc "Android Internal Testing への配信 + メタデータ同期"
 lane :android_beta do
-  sh("cd .. && eas build --platform android --profile preview --non-interactive --wait")
+  sh("cd .. && eas build --platform android --profile beta --non-interactive --wait")
 
   build_json = sh("cd .. && eas build:list --platform android --limit 1 --json --non-interactive")
-  artifact_url = JSON.parse(build_json).first["artifacts"]["buildUrl"]
+  build = JSON.parse(build_json).first
+  artifact_url = build&.dig("artifacts", "buildUrl")
+  UI.user_error!("AAB の URL を取得できませんでした") if artifact_url.to_s.empty?
 
   aab_path = "/tmp/rork-#{Time.now.to_i}.aab"
   sh("curl -L -o #{aab_path} #{artifact_url}")
@@ -341,7 +351,7 @@ on:
 jobs:
   ios:
     if: inputs.platform == 'ios' || inputs.platform == 'both'
-    runs-on: macos-14-xlarge
+    runs-on: macos-15          # Apple Silicon が既定。macos-latest は使わない（後述の落とし穴 5）
     steps:
       - uses: actions/checkout@v4
 
@@ -443,9 +453,30 @@ Play Console の Service Account 鍵は JSON ファイルそのものを Base64 
 
 ここからは私が実際に踏んで数時間〜数日を溶かしたポイントを共有します。同じ事故を回避していただければ幸いです。
 
-### 1. App Store Connect API Key の有効期限（180 日）で突然死する
+### 1. `Invalid token` を「API Key の期限切れ」だと思い込む
 
-API Key には有効期限があります（作成から 180 日）。気づかず CI が突然 `Invalid token` で落ち始め、原因特定に半日かかりました。対策: カレンダーに更新リマインダーを入れる、あるいは fastlane の失敗時に Slack に通知して「キー期限」をチェックリストに含める、などが現実解です。
+CI が突然 `Invalid token` で落ち始めたとき、私が最初に立てた仮説は「API Key の有効期限が切れた」でした。この仮説が誤りだったせいで、切り分けが半日遅れています。
+
+App Store Connect API Key（`.p8`）そのものに有効期限はありません。期限があるのは、その鍵で署名して毎回発行する JWT のほうで、Apple が受け付ける上限は 20 分です。Fastlane はレーンの実行中に自動でトークンを作り直すため、ここを開発者が意識する場面はほとんどありません。
+
+<table>
+<thead>
+<tr><th>対象</th><th>有効期限</th><th>失効の仕方</th></tr>
+</thead>
+<tbody>
+<tr><td>API Key（<code>.p8</code> 秘密鍵）</td><td><strong>なし</strong></td><td>App Store Connect で取り消したときのみ。取り消した鍵は復活できません</td></tr>
+<tr><td>JWT（鍵で署名するトークン）</td><td><strong>最長 20 分</strong></td><td>時間経過で自動失効。Fastlane が都度再発行します</td></tr>
+<tr><td>Google Play の Service Account 鍵</td><td>なし</td><td>Google Cloud 側で鍵を削除、または権限を剥奪したとき</td></tr>
+</tbody>
+</table>
+
+ですから `Invalid token` が出たときに疑う順序は、期限ではなく次の 3 つになります。
+
+- **`key_id` と `issuer_id` の取り違え**。複数のチームに所属していると、別チームの `issuer_id` を Secrets に入れてしまう事故が起きやすいです
+- **誰かが鍵を取り消した**。共同開発者がいる場合や、鍵を棚卸ししたあとに起こります
+- **ランナーの時刻ずれ**。JWT の `iat` が未来の時刻になっていると、Apple 側で即座に弾かれます。セルフホストランナーで NTP が止まっているときに実際に踏みました
+
+なお `is_key_content_base64: true` を指定しているのに素の PEM を渡している、という取り違えも同じエラーになります。CI に載せる前に、`bundle exec fastlane run app_store_connect_api_key ...` をローカルで一度だけ通しておくと、鍵まわりの設定ミスと CI の設定ミスを分けて考えられるようになります。
 
 ### 2. `eas build` で `--profile preview` を使っていると Submit 時に拒否される
 
@@ -459,9 +490,13 @@ iPhone 16 Pro Max のネイティブ解像度は `1320 × 2868`（3x）ですが
 
 `deliver` は審査用ログイン情報をメタデータとして送信できますが、`automatic_release: true` で出すと、テストアカウントを事前登録していない場合に即リジェクトされます。必ず `metadata/ios/review_information/demo_user.txt` と `demo_password.txt` を埋めてから送ること。
 
-### 5. CI ランナーの macOS バージョンと Xcode のミスマッチ
+### 5. ランナーを固定したつもりが、そのイメージごと退役する
 
-`snapshot` が参照する Simulator は Xcode に紐づいています。GitHub Actions の macOS ランナーを無指定（`macos-latest`）にしていると、ある日突然 Xcode が上がってビルドが壊れる事故が起きます。**必ず `macos-14-xlarge` のように明示する**のがプロの作法です。
+`snapshot` が参照する Simulator は Xcode に紐づいています。GitHub Actions の macOS ランナーを無指定（`macos-latest`）にしていると、ある日突然 Xcode が上がってビルドが壊れる事故が起きます。ここまでは以前から知られた話です。
+
+厄介なのは、固定したラベルのほうが先に消えることがある点です。GitHub Actions の macOS 14 系イメージ（`macos-14` および `macos-14-xlarge` を含む）は 2026 年 7 月 6 日から段階的な廃止に入り、11 月 2 日に完全にサポート外となります。周知のため、廃止期間中は該当ラベルのジョブが意図的に失敗させられる時間帯も設けられています。本稿は初出時に `macos-14-xlarge` を推奨していましたが、いま新しく組むなら **`macos-15`**（Apple Silicon が既定）を指定してください。さらに新しいイメージを追う場合は `macos-26` が選択肢になります。
+
+固定は一度決めて終わりではありません。半年に一度、[actions/runner-images のアナウンス](https://github.com/actions/runner-images/issues) を確認してラベルを見直す予定をカレンダーに置いておく。それだけで、ある朝いきなり全ジョブが赤くなる朝を回避できます。
 
 ### 6. `ensure_git_status_clean` が Git LFS 管理のスクリーンショットで常に dirty になる
 
