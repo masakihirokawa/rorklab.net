@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PLAY — Google Play の target API level 36 要件が昨日8月31日に発効しました。今日以降、新規アプリと既存アプリの更新は Android 16 対応が必須です",
-    "VISIBILITY — API 35 のままのアプリは掲載こそ続きますが、新しい Android 版のユーザーには表示されなくなります。エラーが出ないまま新規インストールだけが減る点に注意が要ります",
-    "EXTENSION — 間に合わなかった場合は、Play Console から2026年11月1日までの延長申請が出せます。恒久対応の計画とセットで進めるのが実務的です",
-    "APPLE — Apple 側は9月9日にイベント、iOS 27 の正式リリースは9月14日と報じられています。生成したアプリの iOS 27 実機確認はリリース週の前に済ませておきたいところです",
-    "EXPO — Expo が expo-paste-input を公開しました（8月28日）。React Native の TextInput に画像・GIF・ステッカーの貼り付けを追加するネイティブモジュールです",
-    "EAS — EAS Observe が8月20日に GA になりました。クラッシュや性能の観測を、ビルドや配信と同じ EAS 上で持てるようになっています",
+    "APPLE — Apple のイベントは9月9日、同日に iOS 27 の RC が公開されます。正式リリースは9月14日、予約は9月12日、店頭は9月18日の見込みです",
+    "TESTING — 実質的な検証期間は RC 公開から正式リリースまでの5日間です。React Native / Expo 製アプリは、この間に Xcode 27 と iOS 27 SDK で一通り動かしておきたいところです",
+    "SIRI — iOS 27 は Siri が全面刷新されます。Siri Intents や音声まわりを使っているアプリは、優先して確認する対象になります",
+    "PLAY — Google Play の target API level 36 要件は8月31日に発効済みです。間に合わなかった場合も、Play Console から11月1日までの延長申請がまだ出せます",
+    "EXPO — expo@57.0.17 が React Native 0.86.3 へ更新し、react-native-worklets や reanimated を使うアプリで出ていた Hermes V1 のメモリ退行が解消されました",
+    "RORK — 同じ Rork でも成果物が違います。本家 Rork は React Native（Expo）を生成し、Rork Max は Swift を生成してクラウドの Mac ファームでコンパイルします",
   ],
   en: [
-    "PLAY — Google Play's target API level 36 requirement took effect yesterday, August 31. From today, new apps and updates must target Android 16",
-    "VISIBILITY — Apps still on API 35 stay listed but disappear for users on newer Android versions. No error is raised; new installs simply fade, which makes the change easy to miss",
-    "EXTENSION — If you missed the deadline, an extension through November 1, 2026 can be requested in Play Console — best filed alongside a concrete migration plan",
-    "APPLE — On the Apple side, the event lands September 9 and iOS 27 is reported to ship September 14. Testing generated apps on iOS 27 hardware before release week is time well spent",
-    "EXPO — Expo released expo-paste-input on August 28, a native module that brings image, GIF, and sticker paste to React Native TextInput",
-    "EAS — EAS Observe reached general availability on August 20, putting crash and performance monitoring on the same EAS platform as builds and updates",
+    "APPLE — Apple's event is September 9, with the iOS 27 release candidate landing the same day. General release is September 14, preorders September 12, and retail September 18",
+    "TESTING — That leaves five working days between the RC and the public release. For React Native and Expo apps, it is the last clean window to run everything against Xcode 27 and the iOS 27 SDK",
+    "SIRI — iOS 27 rebuilds Siri from the ground up, which puts anything using Siri Intents or voice input at the top of the list to verify",
+    "PLAY — Google Play's target API level 36 requirement took effect on August 31. If you did not make it, an extension request through November 1 is still available in Play Console",
+    "EXPO — expo@57.0.17 moves React Native to 0.86.3 and clears the Hermes V1 memory regression that hit apps importing react-native-worklets or reanimated",
+    "RORK — The two Rork products build different things: the original generates React Native via Expo, while Rork Max generates Swift and compiles it on a cloud Mac fleet",
   ],
 };
 
