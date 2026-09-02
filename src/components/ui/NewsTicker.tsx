@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "APPLE — Apple のイベントは9月9日、同日に iOS 27 の RC が公開されます。正式リリースは9月14日、予約は9月12日、店頭は9月18日の見込みです",
-    "TESTING — 実質的な検証期間は RC 公開から正式リリースまでの5日間です。React Native / Expo 製アプリは、この間に Xcode 27 と iOS 27 SDK で一通り動かしておきたいところです",
-    "SIRI — iOS 27 は Siri が全面刷新されます。Siri Intents や音声まわりを使っているアプリは、優先して確認する対象になります",
-    "PLAY — Google Play の target API level 36 要件は8月31日に発効済みです。間に合わなかった場合も、Play Console から11月1日までの延長申請がまだ出せます",
-    "EXPO — expo@57.0.17 が React Native 0.86.3 へ更新し、react-native-worklets や reanimated を使うアプリで出ていた Hermes V1 のメモリ退行が解消されました",
-    "RORK — 同じ Rork でも成果物が違います。本家 Rork は React Native（Expo）を生成し、Rork Max は Swift を生成してクラウドの Mac ファームでコンパイルします",
+    "PLAY — Google Play の対象 API レベル要件の期限が8月31日でした。ビルダーが生成するプロジェクトが追随しているかは、任せきりにせず確かめておきたいところです",
+    "POLICY — Play が低価値アプリの線引きを明確にしました。既存アプリの焼き直しや、モデルを包むだけで固有の有用性がないものが該当するとされています",
+    "DATA — サードパーティの AI 連携にもユーザーデータ要件が適用されます。外部モデルへ何を送っているかの開示責任は、アプリを公開する開発者の側にあります",
+    "APPLE — ガイドライン 2.5.2 の運用が厳格になり、実行時のコード実行環境を持つアプリへの審査が厳しくなりました。ツールとアプリの境界が問われています",
+    "BUILD — 一方で、サーバー側で署名済みのネイティブバイナリを再現可能なパイプラインで生成する方式は 2.5.2 の対象外です。技術的な違いは書き分けが要ります",
+    "IOS — iOS 27 が9月に一般公開されます。対応は iPhone 11 以降です。新しい OS が来たときの実機確認は、毎年の恒例作業として組み込んでおくと安心です",
   ],
   en: [
-    "APPLE — Apple's event is September 9, with the iOS 27 release candidate landing the same day. General release is September 14, preorders September 12, and retail September 18",
-    "TESTING — That leaves five working days between the RC and the public release. For React Native and Expo apps, it is the last clean window to run everything against Xcode 27 and the iOS 27 SDK",
-    "SIRI — iOS 27 rebuilds Siri from the ground up, which puts anything using Siri Intents or voice input at the top of the list to verify",
-    "PLAY — Google Play's target API level 36 requirement took effect on August 31. If you did not make it, an extension request through November 1 is still available in Play Console",
-    "EXPO — expo@57.0.17 moves React Native to 0.86.3 and clears the Hermes V1 memory regression that hit apps importing react-native-worklets or reanimated",
-    "RORK — The two Rork products build different things: the original generates React Native via Expo, while Rork Max generates Swift and compiles it on a cloud Mac fleet",
+    "PLAY — Google Play's target API level deadline passed on August 31. Whether the project your builder generates has kept pace is worth verifying yourself rather than assuming",
+    "POLICY — Play has sharpened its definition of a low-value app: rehashes of existing apps, or thin wrappers around a third-party model with no useful function of their own",
+    "DATA — User Data requirements apply to third-party AI integrations too. Disclosing what gets sent to an external model is the responsibility of whoever publishes the app",
+    "APPLE — Enforcement of Guideline 2.5.2 has tightened around apps that execute arbitrary code at runtime, putting the line between a tool and an app under closer scrutiny",
+    "BUILD — Compiling a signed native binary server-side through a reproducible pipeline sits outside 2.5.2, and the technical distinction is worth stating precisely",
+    "IOS — iOS 27 reaches general release in September, supporting iPhone 11 and later. Building the device check into an annual routine takes the surprise out of it",
   ],
 };
 
