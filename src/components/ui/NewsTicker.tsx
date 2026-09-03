@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PLAY — Google Play の対象 API レベル要件の期限が8月31日でした。ビルダーが生成するプロジェクトが追随しているかは、任せきりにせず確かめておきたいところです",
-    "POLICY — Play が低価値アプリの線引きを明確にしました。既存アプリの焼き直しや、モデルを包むだけで固有の有用性がないものが該当するとされています",
-    "DATA — サードパーティの AI 連携にもユーザーデータ要件が適用されます。外部モデルへ何を送っているかの開示責任は、アプリを公開する開発者の側にあります",
-    "APPLE — ガイドライン 2.5.2 の運用が厳格になり、実行時のコード実行環境を持つアプリへの審査が厳しくなりました。ツールとアプリの境界が問われています",
-    "BUILD — 一方で、サーバー側で署名済みのネイティブバイナリを再現可能なパイプラインで生成する方式は 2.5.2 の対象外です。技術的な違いは書き分けが要ります",
-    "IOS — iOS 27 が9月に一般公開されます。対応は iPhone 11 以降です。新しい OS が来たときの実機確認は、毎年の恒例作業として組み込んでおくと安心です",
+    "FOUNDATION — アプリビルダーが載っているモデル層が今週まとめて動きました。9月2日に Gemini 3.8 Flash が一般提供へ、9月1日には Claude Fable 5.1 が出ています",
+    "IMPACT — こうした更新は、使う側からは選べない形で降ってきます。生成されるコードの質がある日から静かに変わるので、いつ何が変わったかを自分で記録しておく価値があると考えています",
+    "MAX — Rork Max はネイティブ Swift を生成し、iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage までを対象にします。クラウド上の Mac ファームでコンパイルするため、手元に Mac がなくても組めます",
+    "DEPTH — 届く範囲が広いのが Rork Max の特徴です。AR や LiDAR スキャン、Dynamic Island、Live Activities、HealthKit、NFC、Core ML によるオンデバイス機械学習まで扱えます",
+    "PRICING — Max プランは月額 $200、無料枠は週5プロンプト程度です。個人開発で試すなら、まず無料枠の範囲でどこまで届くかを見極める使い方が現実的だと思います",
+    "STACK — 標準の Rork は React Native と Expo が土台です。Web ラッパーではないネイティブ体験を狙う構成で、Max とは作り分けの判断が必要になります",
   ],
   en: [
-    "PLAY — Google Play's target API level deadline passed on August 31. Whether the project your builder generates has kept pace is worth verifying yourself rather than assuming",
-    "POLICY — Play has sharpened its definition of a low-value app: rehashes of existing apps, or thin wrappers around a third-party model with no useful function of their own",
-    "DATA — User Data requirements apply to third-party AI integrations too. Disclosing what gets sent to an external model is the responsibility of whoever publishes the app",
-    "APPLE — Enforcement of Guideline 2.5.2 has tightened around apps that execute arbitrary code at runtime, putting the line between a tool and an app under closer scrutiny",
-    "BUILD — Compiling a signed native binary server-side through a reproducible pipeline sits outside 2.5.2, and the technical distinction is worth stating precisely",
-    "IOS — iOS 27 reaches general release in September, supporting iPhone 11 and later. Building the device check into an annual routine takes the surprise out of it",
+    "FOUNDATION — The model layer underneath every AI app builder moved this week. Gemini 3.8 Flash reached general availability on September 2, and Claude Fable 5.1 arrived on September 1",
+    "IMPACT — Updates like these land without you choosing them. The quality of generated code can shift quietly from one day to the next, which is why it helps to keep your own record of when things changed",
+    "MAX — Rork Max generates native Swift across iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage. It compiles on a cloud Mac fleet, so you can build for Apple platforms without owning a Mac",
+    "DEPTH — Its reach into native capabilities is the real draw: AR and LiDAR scanning, Dynamic Island, Live Activities, HealthKit, NFC, and on-device machine learning through Core ML",
+    "PRICING — The Max plan runs $200 a month, with a free tier of roughly five prompts a week. For solo developers, working out how far the free tier gets you is a sensible first step",
+    "STACK — Standard Rork is built on React Native and Expo, aiming for a genuinely native experience rather than a web wrapper. Choosing between it and Max is a decision worth making deliberately",
   ],
 };
 
