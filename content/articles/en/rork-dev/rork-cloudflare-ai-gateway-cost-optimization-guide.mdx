@@ -7,12 +7,12 @@ premium: true
 date: "2026-05-03T05:15"
 updated: "2026-05-03T05:15"
 author: "Rork Lab"
-description: "Complete guide to reducing AI API costs in Rork apps using Cloudflare AI Gateway. Covers caching strategy, multi-provider failover, rate limiting, and real implementation code to achieve 90%+ cost reduction."
+description: "The default AI Gateway cache key is built from the request you actually send. Here is why prompt normalization silently does nothing, how to wire it in with cf-aig-cache-key, and the Workers and React Native code I run in production."
 tags: ["Cloudflare", "AI Gateway", "Cost Optimization", "OpenAI", "Gemini", "Rork", "Workers"]
 highlights:
-  - "The exact prompt-normalization function that lifted cache hit rate from 12% to 61%"
-  - "A production Workers proxy with typed OpenAI-to-Gemini failover and per-error-code logic"
-  - "Advanced patterns — tiered cache TTL, cache warming, and premium-only cache bypass"
+  - "The five components of the default cache key, and why normalizing a prompt does nothing unless it reaches the request or cf-aig-cache-key"
+  - "A production Workers proxy with typed OpenAI-to-Gemini failover, gateway-side timeouts and retries, and cf-aig-cache-status passed through to the client"
+  - "The cache-bypass header people get wrong (cf-aig-cache-ttl: 0 is not it), the 60-second TTL floor, and a device-side cache key that does not collide"
 ---
 Three months after releasing my third AI-powered app on the App Store, I opened my OpenAI billing dashboard and saw a charge that made me pause: **$352 for the month**.
 
@@ -95,7 +95,34 @@ https://gateway.ai.cloudflare.com/v1/{ACCOUNT_ID}/{GATEWAY_ID}/anthropic
 https://gateway.ai.cloudflare.com/v1/{ACCOUNT_ID}/{GATEWAY_ID}/groq
 ```
 
-In the gateway settings, enable "Cache Responses" and set a default TTL. I use 24 hours for classification tasks. You can override this per-request with headers, which we'll do in the Workers code.
+In the gateway settings, enable "Cache Responses" and set a default TTL. I use 24 hours for classification tasks. Caching is off until you do this, which is worth saying plainly: I swapped the URL one evening, came back the next morning expecting a hit rate, and spent a while staring at 0% before I found the toggle.
+
+You can override the default per request with headers, which is what the Workers code below does.
+
+## What the Cache Key Is Actually Made Of
+
+Before the code, the thing I wish I had read first.
+
+By default the gateway builds the cache key by concatenating five things and hashing the result with SHA-256, as described in the [AI Gateway caching documentation](https://developers.cloudflare.com/ai-gateway/features/caching/):
+
+<table>
+<thead><tr><th>Component</th><th>What it means in practice</th></tr></thead>
+<tbody>
+<tr><td>Provider (openai, anthropic, …)</td><td>Nothing is shared across providers</td></tr>
+<tr><td>Endpoint (the API path)</td><td>A different path is a different cache</td></tr>
+<tr><td>Model</td><td>Swap the model and you start from an empty cache</td></tr>
+<tr><td>Provider auth header</td><td><strong>Rotate your API key and the cache turns over with it</strong></td></tr>
+<tr><td>Full request body</td><td>One character of difference in messages, tools, or parameters is a separate entry</td></tr>
+</tbody>
+</table>
+
+Two consequences follow, and both cost me time.
+
+The first: a normalization function only helps if the normalized string is what you actually send, or if you override the key yourself with `cf-aig-cache-key`. Writing the function and leaving the original prompt in the body changes nothing. The proxy below sends `normalizedPrompt`, and also sets an explicit key so the behaviour does not depend on a detail someone might refactor away later.
+
+**The key is decided by the request that leaves your Worker, not by the helper you wrote next to it.**
+
+The second: because the auth header is part of the key, a cost spike the day after a key rotation may be nothing more than a cold cache. That is a much calmer thing to discover on purpose than at two in the morning.
 
 ## Step 2: The Workers Proxy Implementation
 
@@ -176,6 +203,7 @@ app.post('/ai/generate', async (c) => {
 
   const normalizedPrompt = normalizePrompt(prompt)
   const cacheEnabled = cache && isCacheable(normalizedPrompt)
+  const cacheKey = buildCacheKey(normalizedPrompt, model, 'generate')
   
   const gatewayBase = `https://gateway.ai.cloudflare.com/v1/${c.env.AI_GATEWAY_ACCOUNT_ID}/${c.env.AI_GATEWAY_ID}`
 
@@ -185,12 +213,17 @@ app.post('/ai/generate', async (c) => {
     model,
     maxTokens,
     cacheEnabled,
+    cacheKey,
     gatewayBase,
     apiKey: c.env.OPENAI_API_KEY,
   })
 
   if (openAIResult.success) {
-    return c.json(openAIResult.data)
+    // Pass HIT/MISS through so the client can log why a call felt slow
+    return c.json(openAIResult.data, 200, {
+      'x-ai-cache-status': openAIResult.cacheStatus,
+      'x-ai-provider': 'openai',
+    })
   }
 
   // Log the failure reason before attempting fallback
@@ -204,12 +237,16 @@ app.post('/ai/generate', async (c) => {
   const geminiResult = await tryGemini({
     prompt: normalizedPrompt,
     cacheEnabled,
+    cacheKey,
     gatewayBase,
     apiKey: c.env.GEMINI_API_KEY,
   })
 
   if (geminiResult.success) {
-    return c.json(geminiResult.data)
+    return c.json(geminiResult.data, 200, {
+      'x-ai-cache-status': geminiResult.cacheStatus,
+      'x-ai-provider': 'gemini',
+    })
   }
 
   console.error(`All providers failed. OpenAI: ${openAIResult.errorCode}, Gemini: ${geminiResult.errorCode}`)
@@ -222,28 +259,52 @@ async function tryOpenAI(params: {
   model: string
   maxTokens: number
   cacheEnabled: boolean
+  cacheKey: string
   gatewayBase: string
   apiKey: string
-}): Promise<{ success: true; data: unknown } | { success: false; errorCode: number; errorMessage: string }> {
+}): Promise<
+  | { success: true; data: unknown; cacheStatus: string }
+  | { success: false; errorCode: number; errorMessage: string }
+> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${params.apiKey}`,
+    // Time to the first byte of the response, enforced by the gateway
+    'cf-aig-request-timeout': '8000',
+    // Transient failures are retried before they reach this code
+    'cf-aig-max-attempts': '3',
+    'cf-aig-retry-delay': '500',
+    'cf-aig-backoff': 'exponential',
+  }
+
+  if (params.cacheEnabled) {
+    // Setting the key opts this request into caching and pins it to the
+    // normalized prompt, independent of the rest of the body
+    headers['cf-aig-cache-key'] = params.cacheKey
+    headers['cf-aig-cache-ttl'] = '86400'
+  } else {
+    // Note: cf-aig-cache-ttl: '0' does NOT disable caching. This does.
+    headers['cf-aig-skip-cache'] = 'true'
+  }
+
   try {
     const response = await fetch(`${params.gatewayBase}/openai/chat/completions`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${params.apiKey}`,
-        'cf-aig-cache-ttl': params.cacheEnabled ? '86400' : '0',
-      },
+      headers,
       body: JSON.stringify({
         model: params.model,
         messages: [{ role: 'user', content: params.prompt }],
         max_tokens: params.maxTokens,
         temperature: params.cacheEnabled ? 0 : 0.7,
       }),
-      signal: AbortSignal.timeout(10000),
     })
 
     if (response.ok) {
-      return { success: true, data: await response.json() }
+      return {
+        success: true,
+        data: await response.json(),
+        cacheStatus: response.headers.get('cf-aig-cache-status') ?? 'UNKNOWN',
+      }
     }
 
     let errorMessage = `OpenAI error ${response.status}`
@@ -266,24 +327,38 @@ async function tryOpenAI(params: {
 async function tryGemini(params: {
   prompt: string
   cacheEnabled: boolean
+  cacheKey: string
   gatewayBase: string
   apiKey: string
-}): Promise<{ success: true; data: unknown } | { success: false; errorCode: number; errorMessage: string }> {
+}): Promise<
+  | { success: true; data: unknown; cacheStatus: string }
+  | { success: false; errorCode: number; errorMessage: string }
+> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'x-goog-api-key': params.apiKey,
+    'cf-aig-request-timeout': '12000',
+  }
+
+  if (params.cacheEnabled) {
+    // Prefix the key: the provider is part of the default key, so once you
+    // override it you have to keep providers apart yourself
+    headers['cf-aig-cache-key'] = `gemini:${params.cacheKey}`
+    headers['cf-aig-cache-ttl'] = '86400'
+  } else {
+    headers['cf-aig-skip-cache'] = 'true'
+  }
+
   try {
     const response = await fetch(
       `${params.gatewayBase}/google-ai-studio/v1beta/models/gemini-2.0-flash:generateContent`,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': params.apiKey,
-          'cf-aig-cache-ttl': params.cacheEnabled ? '86400' : '0',
-        },
+        headers,
         body: JSON.stringify({
           contents: [{ parts: [{ text: params.prompt }] }],
           generationConfig: { temperature: params.cacheEnabled ? 0 : 0.7 },
         }),
-        signal: AbortSignal.timeout(12000),
       }
     )
 
@@ -309,6 +384,7 @@ async function tryGemini(params: {
         choices: [{ message: { role: 'assistant', content }, finish_reason: 'stop' }],
         _provider: 'gemini',
       },
+      cacheStatus: response.headers.get('cf-aig-cache-status') ?? 'UNKNOWN',
     }
   } catch (err: any) {
     if (err.name === 'TimeoutError') {
@@ -339,11 +415,28 @@ function shouldFallback(errorCode: number): boolean {
 function normalizePrompt(prompt: string): string {
   return prompt
     .trim()
+    .normalize('NFKC')
     .replace(/\s+/g, ' ')
     .replace(/[""]/g, '"')
     .replace(/['']/g, "'")
     .replace(/　/g, ' ')  // Japanese full-width space
     .toLowerCase()
+}
+
+// FNV-1a: no dependencies, and it produces the same value in Workers
+// and in React Native. Share this file between both sides.
+export function fnv1a(input: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, '0')
+}
+
+// The model is part of the key so a model swap never serves stale answers
+export function buildCacheKey(normalized: string, model: string, task: string): string {
+  return `${task}:${model}:${fnv1a(normalized)}`
 }
 
 // Conservative check: only cache when we're confident the output is deterministic enough
@@ -385,8 +478,14 @@ interface GenerateOptions {
 interface GenerateResult {
   content: string
   fromLocalCache: boolean
+  cacheStatus: string   // HIT or MISS at the gateway
   provider: string
 }
+
+// Same file as the Worker uses. If the two drift, the two tiers
+// start caching under different keys and neither one looks broken.
+import { buildCacheKey, normalizePrompt } from '../shared/cacheKey'
+
 
 export function useAI() {
   const [loading, setLoading] = useState(false)
@@ -404,7 +503,7 @@ export function useAI() {
     // Tier 1: AsyncStorage local cache (instant, no network)
     if (cache) {
       try {
-        const key = `aicache:${prompt.slice(0, 120)}`
+        const key = `aicache:${buildCacheKey(normalizePrompt(prompt), model, 'generate')}`
         const raw = await AsyncStorage.getItem(key)
         if (raw) {
           const { data, ts } = JSON.parse(raw)
@@ -449,16 +548,22 @@ export function useAI() {
         throw new Error(`Worker returned ${res.status}`)
       }
 
-      const json = await res.json<{ choices: Array<{ message: { content: string } }>; _provider?: string }>()
+      const json = await res.json<{ choices?: Array<{ message?: { content?: string } }>; _provider?: string }>()
+      const content = json.choices?.[0]?.message?.content
+      if (typeof content !== 'string') {
+        throw new Error('AI response contained no content')
+      }
+
       const result: GenerateResult = {
-        content: json.choices[0].message.content,
+        content,
         fromLocalCache: false,
-        provider: json._provider ?? 'openai',
+        cacheStatus: res.headers.get('x-ai-cache-status') ?? 'UNKNOWN',
+        provider: res.headers.get('x-ai-provider') ?? json._provider ?? 'openai',
       }
 
       // Tier 2 write: save to local cache for subsequent requests
       if (cache) {
-        const key = `aicache:${prompt.slice(0, 120)}`
+        const key = `aicache:${buildCacheKey(normalizePrompt(prompt), model, 'generate')}`
         AsyncStorage.setItem(key, JSON.stringify({ data: result, ts: Date.now() })).catch(() => {})
       }
 
@@ -531,7 +636,9 @@ export function CategoryTagger({ content }: { content: string }) {
 
 Cloudflare AI Gateway cannot cache streamed responses. This is a hard architectural constraint.
 
-If you have chat-like features that need real-time streaming output, keep them on a separate endpoint (`/ai/stream`) that deliberately sets `cf-aig-cache-ttl: 0`. Reserve the cacheable `/ai/generate` endpoint for batch-style tasks like classification, summarization, and extraction.
+If you have chat-like features that need real-time streaming output, keep them on a separate endpoint (`/ai/stream`) that sets `cf-aig-skip-cache: true`. Reserve the cacheable `/ai/generate` endpoint for batch-style tasks like classification, summarization, and extraction.
+
+One correction I owe anyone who read an earlier version of this: `cf-aig-cache-ttl: 0` is not a way to disable caching. That header sets the duration of a request that is already being cached, and the accepted range runs from **60 seconds to one month**. The header that bypasses the cache is `cf-aig-skip-cache`. I had the wrong one in production for a while, and the reason it never announced itself is that caching was off at the gateway level anyway — so the code looked correct right up until the day I turned caching on.
 
 ### Mistake 2: Variable temperature breaks cache key consistency
 
@@ -549,7 +656,9 @@ Consider these three prompts that should produce identical results:
 "classify the following text into a category: AI tools for developers"
 ```
 
-Without normalization, these are three separate cache entries. With the normalization function in the Workers code above — collapsing whitespace, lowercasing, normalizing punctuation — they become a single cache entry. In my implementation, this single change moved cache hit rate from 12% to 61%.
+Without normalization, these are three separate cache entries. With the normalization function in the Workers code above — collapsing whitespace, lowercasing, normalizing punctuation — they become one. In my implementation that change moved cache hit rate from 12% to 61%.
+
+The part that is easy to miss: normalizing is only half of it. The normalized string has to be the one that leaves your Worker, or it has to reach the gateway as `cf-aig-cache-key`. I spent a fortnight watching a flat 12% because my normalizer ran, returned a tidy string, and then the original prompt went out in the body regardless. **A helper function that nothing downstream reads is indistinguishable from no helper at all.**
 
 ## Real Numbers After 30 Days
 
@@ -566,11 +675,15 @@ Here's what the Cloudflare AI Gateway dashboard showed after one month of runnin
 
 The latency improvement was an unexpected bonus. Cache hits returning in under 100ms versus 1-2 seconds for live API calls made the app feel noticeably snappier — user session lengths increased by about 18% in the week after deployment.
 
+Two notes on reading these numbers. The dashboard is for trends; for any single request, `cf-aig-cache-status` comes back as `HIT` or `MISS`, which is why the proxy above forwards it to the client. When someone reports that the app felt slow, knowing whether that one call was a MISS narrows the search considerably.
+
+And 73.4% is the hit rate for this app's prompt mix — mostly classification and summarization. An app built around open-ended conversation will not land anywhere near it. **I would rather you watched your own Cache Hit Rate for a week than trusted my number.** The gateway cache is also volatile: the documentation notes that two identical requests arriving at once may both miss, because the first has not finished storing when the second arrives. Cache warming shortens the queue at the front; it does not eliminate it.
+
 ## Where to Start
 
 The implementation in this article is production-ready, but deploy incrementally:
 
-**Week 1**: Set up AI Gateway in Cloudflare, add the gateway URL to your existing Workers code with `cf-aig-cache-ttl: 0` (caching disabled). This lets you see your baseline traffic patterns in the dashboard without changing behavior.
+**Week 1**: Set up AI Gateway in Cloudflare and point your existing Workers code at the gateway URL. Caching is off by default, so nothing about your behaviour changes — you simply start seeing your baseline traffic in the dashboard. Log `cf-aig-cache-status` from day one, even while every response is a MISS.
 
 **Week 2**: Enable caching on low-risk endpoints first — classification tasks with temperature 0. Check cache hit rates after 48 hours.
 
