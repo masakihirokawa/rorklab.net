@@ -6,12 +6,13 @@ level: "advanced"
 premium: true
 date: "2026-07-17T14:00"
 author: "Rork Lab"
-description: "How I rerouted video uploads to the Gemini Files API from a Cloudflare Workers relay to a direct device-to-Google path — why the 128MB isolate limit breaks the relay, how to hand out a resumable upload URL without leaking your API key, and how resolution and frame rate actually decide the bill."
+description: "How I rerouted video uploads to the Gemini Files API from a Cloudflare Workers relay to a direct device-to-Google path — why the 128MB isolate limit breaks the relay, how to hand out a resumable upload URL without leaking your API key, what Expo SDK 54 broke on the device side, and how the 20GB project ceiling and media resolution decide the bill."
 tags: ["Rork", "Gemini", "Files API", "Video Analysis", "Cloudflare Workers", "Expo", "Indie Dev"]
 highlights:
   - "Why loading a video into a Worker's arrayBuffer collides with the 128MB isolate ceiling, and the upload path that removes the problem instead of tuning around it"
   - "Working Worker and Expo code that keeps the API key server-side while the video travels straight from the device to Google"
-  - "Using low media resolution and a lower fps to cut roughly 300 tokens per second of video down to roughly 100, and when that trade costs you the answer"
+  - "What Expo SDK 54 did to createUploadTask, the expo/fetch rewrite that replaces it, and the upload progress you give up by moving"
+  - "Keeping the 20GB project-wide Files API ceiling visible once the bytes stop passing through your server, plus fps and media resolution as billing controls"
 ---
 
 A 28-second clip shot on my iPhone went through every time. The analysis came back looking exactly like I wanted.
@@ -166,7 +167,7 @@ Taking `sizeBytes` from the client may look sloppy. It is self-reported, and not
 
 But a lie here only hurts the liar. Send more bytes than declared and Google rejects them; send fewer and the finalize never completes. What the server is protecting is the key and the issuance count, not the honesty of a number. I made peace with that distinction.
 
-The per-user daily quota exists because issuing a destination is, in practice, a reservation for one analysis. For enforcing the actual spend ceiling at runtime, I wrote up a three-layer approach in [Enforcing AI Cost Ceilings at Runtime](/articles/rork-dev/rork-ai-runtime-budget-enforcement-architecture).
+The per-user daily quota exists because issuing a destination is, in practice, a reservation for one analysis. Stopping someone here means the ceiling gets hit before the analysis is ever dispatched.
 
 ## Sending straight from the device
 
@@ -178,7 +179,7 @@ Except this time it is not multipart at all. Stage two of a resumable upload jus
 
 ```typescript
 // app/lib/uploadVideo.ts
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy'; // SDK 54 and later: see below
 import * as ImagePicker from 'expo-image-picker';
 
 const API_BASE = 'https://your-worker.example.workers.dev';
@@ -248,6 +249,60 @@ export async function pickAndUploadVideo(
 `BINARY_CONTENT` is the load-bearing choice. Switch it to `MULTIPART` and boundary strings wrap the payload, and Google can no longer read it as a video. It fails quietly, which cost me an evening.
 
 Honest progress reporting came free with the change. Relaying through the Worker, the progress bar hit 100% the moment the upload to Cloudflare finished — and then the user stared at a full bar for another 40 seconds on a three-minute video while Cloudflare pushed the bytes to Google. Now the bar tracks the last byte.
+
+## The morning the function was gone
+
+That code needs a footnote.
+
+Expo SDK 54 rebuilt `expo-file-system`. The new API that shipped as `expo-file-system/next` back in SDK 52 was promoted to stable, the `next` entry point disappeared, and the old API moved to `expo-file-system/legacy`. Which means: leave your import as `expo-file-system`, bump the SDK, and `FileSystem.createUploadTask` is simply not there anymore. If you're lucky the types catch it. In plain JavaScript you get `undefined is not a function` at the moment the user picks a video, and it took me a few round trips through the logs to realize the failure wasn't in the upload — it was in the thing that was supposed to start the upload.
+
+That's why the import above points at `expo-file-system/legacy`. It works. But the legacy upload helpers are deprecated as of SDK 54, and the recommended path now is `expo/fetch`.
+
+The new `File` class implements the `Blob` interface, so it drops straight into an `expo/fetch` body. Since the second leg of a resumable upload is nothing but raw bytes, that's arguably a better fit than the helper ever was.
+
+```typescript
+// app/lib/uploadVideoModern.ts — the SDK 54+ shape
+import { fetch } from 'expo/fetch';
+import { File } from 'expo-file-system';
+
+export async function putVideo(uploadUrl: string, localUri: string) {
+  const file = new File(localUri);
+
+  // File is a Blob, so it goes in the body directly and never lands in the JS heap
+  const res = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Length': String(file.size),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: file,
+  });
+
+  if (!res.ok) throw new Error(`upload_failed_${res.status}`);
+  return (await res.json()) as { file: { uri: string; state: string } };
+}
+```
+
+Shorter. No `FileSystemUploadType` to specify, so no way to confuse `BINARY_CONTENT` with `MULTIPART`.
+
+There is a cost. **`expo/fetch` gives you no upload progress callback** — the very progress I was congratulating myself about one paragraph ago. On a thin connection, a three-minute video means roughly 40 seconds of silence.
+
+<table>
+  <thead>
+    <tr><th></th><th>legacy createUploadTask</th><th>expo/fetch + File</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>SDK 54 status</td><td>Works, deprecated</td><td>Recommended</td></tr>
+    <tr><td>Upload progress</td><td>Callback available</td><td>None</td></tr>
+    <tr><td>Loads into JS heap</td><td>No</td><td>No</td></tr>
+    <tr><td>Lines of code</td><td>More options to get wrong</td><td>Fewer</td></tr>
+  </tbody>
+</table>
+
+I'm still on legacy for now. Uploading a video is the longest wait this app asks of anyone, and a progress bar that appears frozen there costs me more than one deprecation warning in the build log does. **Deprecated is not a deadline; it's notice that a destination exists.** I'd rather move once I can render progress myself.
+
+If I were starting fresh, I'd probably go the other way. For anything where progress doesn't need showing — syncing a settings file, shipping a log bundle — `expo/fetch` is the simpler choice from day one.
 
 ## How long ACTIVE takes scales with the video
 
@@ -319,6 +374,31 @@ So I split what gets stored.
 The KV TTL is 47 hours rather than 48 on purpose. A matching TTL creates a window where KV still has the reference but Google has already dropped the file. Giving up an hour moves the expiry decision entirely to my side of the line — better to treat it as gone than to fetch it and catch a 403.
 
 Inside the window, follow-up questions skip the upload entirely. Outside it, the app quietly re-uploads from the copy still sitting on the device. Either way the user just asked again.
+
+There's a second ceiling that bites well before the 48 hours does: the Files API stores 20GB per project. Two gigabytes for any single file, twenty for everything you have.
+
+Going direct made that number much harder to see. When the Worker carried the bytes, a day's volume was one log query away. Now the Worker knows only how many destinations it handed out.
+
+At 96MB a video, roughly two hundred uploads fill the project. For an indie app that's not an abstract number — it's one decent week of attention after launch. And the failure surfaces during the `start` call, so from the user's side the symptom is "I pressed upload and nothing happened," which is the hardest kind of broken to explain.
+
+So the issuer now tallies declared bytes alongside the count. It's a few lines on top of `issueUploadUrl`.
+
+```typescript
+// Track declared bytes, not just issuances, against the 20GB project ceiling
+const bytesKey = `upload_bytes:${new Date().toISOString().slice(0, 10)}`;
+const bytesUsed = Number((await env.SESSIONS.get(bytesKey)) ?? '0');
+
+const SOFT_CEILING = 14 * 1024 * 1024 * 1024; // start sweeping at 14 of the 20
+if (bytesUsed + sizeBytes > SOFT_CEILING) {
+  // Don't block the issuance — clean up first
+  await sweepExpiredFiles(env);
+}
+await env.SESSIONS.put(bytesKey, String(bytesUsed + sizeBytes), { expirationTtl: 172800 });
+```
+
+`sweepExpiredFiles` walks `files.list` and calls `files.delete` on anything already analyzed, reclaiming space without waiting out the 48 hours. The KV total is a sum of self-reported sizes, so it isn't an accurate balance. I treat it as a signal that it's time to sweep, nothing more.
+
+**A limit you route around is a limit you stop seeing.** That was the most useful thing the rewiring taught me. Shortening a path makes it faster, and it also quietly retires whatever was doing the counting along the way. Writing down what the middle was measuring, before removing the middle, would have saved me this particular detour.
 
 ## Resolution and frame rate decide the bill
 
@@ -404,7 +484,7 @@ I used to decide by length: under 30 seconds, analyze precisely; over three minu
 
 Clipping earned its keep immediately. A swing analysis really only needs about two seconds. Let the user record thirty and cut the range server-side: pulling the relevant window at 4fps came out cheaper than scanning the whole thing at 1fps, and more accurate.
 
-For the broader cost picture, [How I Cut My Rork App's AI Costs from $350 to $35/Month](/articles/rork-dev/rork-cloudflare-ai-gateway-cost-optimization-guide) covers the caching layer, and [When Your Rork Hybrid AI Quietly Drifts to the Cloud](/articles/rork-ai/rork-hybrid-ai-router-silent-cloud-drift-cost-regression-instrumentation-field-notes) covers routing drift.
+For the broader cost picture, [How I Cut My Rork App's AI Costs from $350 to $35/Month](/articles/rork-dev/rork-cloudflare-ai-gateway-cost-optimization-guide) covers the caching layer, and [Rork × Multimodal AI: Design Patterns for Camera, Voice, and Text](/articles/rork-ai/rork-multimodal-ai-app-design-patterns) covers handling these inputs together in one app.
 
 ## What was left after the rewiring
 
@@ -439,6 +519,6 @@ For me the answer was the API key. That was the entire list. Routing video throu
 
 If you have this running already, pull up your Worker logs and look at CPU time for a single upload. If it reads in the thousands of milliseconds, most of those milliseconds are probably spent making no decisions at all.
 
-For handling footage straight from the camera, [Rork × Vision Camera v4](/articles/rork-dev/rork-vision-camera-v4-frame-processor-production-guide) covers that side, and [LLM Streaming in Rork Apps](/articles/rork-dev/rork-llm-streaming-sse-realtime-ai-response-complete-guide) covers showing results before they finish.
+For handling footage straight from the camera, [Rork × Vision Camera v4](/articles/rork-dev/rork-vision-camera-v4-frame-processor-production-guide) covers that side, and [Rork × LiveKit: Call Infrastructure for Production AI Voice Agents](/articles/rork-ai/rork-livekit-voice-video-agent-production-guide) covers the realtime side of audio and video.
 
 I resent that three-minute video more times than I want to admit before the path made sense. If it saves someone else the same detour, it was worth writing down.
