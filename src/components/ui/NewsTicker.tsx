@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "FOUNDATION — アプリビルダーの土台にあるモデル層が動きました。9月2日に Gemini 3.8 Flash が一般提供へ移り、長期にわたるコーディングと自律エージェントへ向けた世代交代が進んでいます",
-    "RECORD — 生成されるコードの質は、こうした更新に合わせて静かに変わります。いつ何が変わったかを手元に書き留めておくと、後から挙動の差を追いやすくなると考えています",
-    "MAX — Rork Max はネイティブ Swift を書き、クラウド上の Mac 群でコンパイルします。ブラウザに実機さながらのシミュレータが流れ、App Store への公開まで Xcode なしで進められます",
-    "DEPTH — 触れる範囲の広さが持ち味です。LiDAR、Dynamic Island、Live Activities、HealthKit、ウィジェット、App Clips、そして Core ML によるオンデバイス推論まで扱えます",
-    "PRICING — Max は月額 $200 から。上位の階層では $1,800 まで幅があり、無料枠は週5プロンプト程度です。個人開発でしたら、まず無料枠でどこまで届くかを見極めるところからだと思います",
-    "STACK — 標準の Rork は React Native と Expo が土台です。Web ラッパーではない体験を狙う構成で、ネイティブの深いところまで要るときに Max を選ぶ、という切り分けになります",
+    "PRICING — 通常 Rork の階層が具体化しました。Junior が月額 $25 で100クレジット、Middle が $50 で250、Senior が $100 で500 という並びです",
+    "CREDITS — 課金はメッセージ単位です。AI へ送るプロンプト1回が1クレジットで、画面をまるごと作る指示もボタンの色を変える指示も同じ1つを消費します",
+    "PRACTICE — ですので、細かい手直しを重ねるほどクレジットは早く減ります。要件をまとめて渡し、細部は手元のエディタで直す。この配分が実際のコストを大きく左右します",
+    "STACK — 通常の Rork は Expo 経由の React Native を生成し、iOS と Android の両方に届きます。Rork Max は別製品で、ネイティブ Swift を書きます",
+    "MAX — Max は月額 $200 から。クラウド上の Mac 群でコンパイルし、ブラウザにライブシミュレータを流し、2クリックで App Store へ公開します。Xcode は要りません",
+    "FOUNDATION — 土台のモデル層では Gemini 3.8 Flash が9月2日に一般提供、9月3日には GitHub Copilot でも使えるようになりました。導入価格の失効は12月31日です",
   ],
   en: [
-    "FOUNDATION — The model layer underneath every AI app builder moved again. Gemini 3.8 Flash reached general availability on September 2, aimed squarely at long-horizon coding and autonomous agents",
-    "RECORD — The quality of generated code shifts quietly alongside updates like these. Keeping your own note of when something changed makes it far easier to trace a difference in behavior later",
-    "MAX — Rork Max writes native Swift and compiles it on a cloud Mac fleet. A live simulator streams to your browser, and you can publish to the App Store without ever opening Xcode",
-    "DEPTH — Its reach into native capabilities is the real draw: LiDAR, Dynamic Island, Live Activities, HealthKit, widgets, App Clips, and on-device inference through Core ML",
-    "PRICING — Max starts at $200 a month and runs up to $1,800 at higher tiers, with a free tier of roughly five prompts a week. For solo developers, working out how far the free tier gets you is a sensible first step",
-    "STACK — Standard Rork is built on React Native and Expo, aiming for a genuinely native feel rather than a web wrapper. Max is the choice when you need to reach deeper into the platform",
+    "PRICING — Standard Rork's tiers are now clear: Junior at $25 a month for 100 credits, Middle at $50 for 250, and Senior at $100 for 500",
+    "CREDITS — Billing is per message. One prompt to the AI costs one credit, whether you are asking it to build an entire screen or just to change a button color",
+    "PRACTICE — Which means credits drain fastest when you iterate in small nudges. Bundle the requirements, then handle the fine details in your own editor. That split moves the real cost more than anything",
+    "STACK — Standard Rork generates React Native through Expo and reaches both iOS and Android. Rork Max is a separate product that writes native Swift instead",
+    "MAX — Max starts at $200 a month. It compiles on a cloud Mac fleet, streams a live simulator to your browser, and publishes to the App Store in two clicks, with no Xcode required",
+    "FOUNDATION — In the model layer beneath it, Gemini 3.8 Flash went generally available on September 2 and reached GitHub Copilot on September 3. Its introductory pricing expires December 31",
   ],
 };
 
