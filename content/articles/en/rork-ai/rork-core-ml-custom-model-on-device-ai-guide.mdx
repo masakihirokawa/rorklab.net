@@ -330,7 +330,11 @@ In the Create ML interface, select a pre-trained architecture under "Architectur
 
 ### Understanding Model File Size
 
-Create ML outputs .mlmodel files that can be surprisingly large. Given App Store distribution constraints (1GB app size limit), optimization is essential.
+Create ML outputs `.mlmodel` files that can be surprisingly large.
+
+The App Store limit is **4 GB uncompressed for the whole iOS or iPadOS app**, and 75 MB for watchOS ([Maximum build file sizes](https://developer.apple.com/help/app-store-connect/reference/app-uploads/maximum-build-file-sizes/)).
+
+4 GB sounds like plenty of room. What actually bit me first wasn't the ceiling — it was the first-download completion rate. The same thing happened in my wallpaper app when I let the bundle grow. People stop waiting long before Apple stops you.
 
 **Typical Sizes**
 
@@ -352,55 +356,92 @@ After training, you'll see a Quantization section:
 - Int8 (Quantized): ~75% smaller, typically 1-3% accuracy drop
 ```
 
-Example validation:
+Inspecting the bundled model:
 
 ```swift
 import CoreML
 
-let modelURL = Bundle.main.url(forResource: "defect-detection", withExtension: "mlmodel")!
-let model = try MLModel(contentsOf: modelURL)
-print("Model size and details: \(model.modelDescription)")
+// The generated class is the most reliable route
+// (defect-detection.mlmodel becomes defect_detection)
+let wrapper = try defect_detection(configuration: MLModelConfiguration())
+print(wrapper.model.modelDescription)
+
+// If you load by URL, the bundle contains the .mlmodelc, not the .mlmodel
+guard let url = Bundle.main.url(forResource: "defect-detection", withExtension: "mlmodelc") else {
+    throw MLError.modelNotFound
+}
+let model = try MLModel(contentsOf: url)
+print(model.modelDescription)
 ```
+
+I wrote `withExtension: "mlmodel"` here first, got `nil` back, and force-unwrapped it into a crash. Xcode compiles `.mlmodel` at build time, so what ships inside the bundle is a `.mlmodelc` **directory** — and `MLModel(contentsOf:)` only accepts a compiled model ([init(contentsOf:)](https://developer.apple.com/documentation/coreml/mlmodel/2880279-init)).
 
 ### Advanced Optimization with Python
 
 For fine-grained control, use Apple's coremltools library:
 
 ```python
-pip install coremltools
+# pip install coremltools tensorflow
 
 import coremltools as ct
+import coremltools.optimize as cto
 import tensorflow as tf
 
-# Load your trained model
 tf_model = tf.keras.models.load_model('defect_model.h5')
 
-# Convert to Core ML
+# Class labels go through classifier_config, not outputs
+class_labels = ["ok", "scratch", "dent"]
+
 mlmodel = ct.convert(
     tf_model,
     inputs=[ct.ImageType(name="image", shape=(1, 224, 224, 3))],
-    outputs=[ct.ClassifierOutputType(name="defects")],
-    compute_units=ct.ComputeUnit.CPU_AND_NE
+    classifier_config=ct.ClassifierConfig(class_labels),
+    convert_to="mlprogram",
+    minimum_deployment_target=ct.target.iOS17,
+    compute_units=ct.ComputeUnit.CPU_AND_NE,
 )
 
-# Apply Int8 quantization
-quantized = ct.quantization_utils.quantize_weights(mlmodel, nbits=8)
-quantized.save('defect-detection.mlmodel')
+# Weight quantization for an ML Program goes through this API
+op_config = cto.coreml.OpLinearQuantizerConfig(
+    mode="linear_symmetric", weight_threshold=512
+)
+config = cto.coreml.OptimizationConfig(global_config=op_config)
+quantized_mlmodel = cto.coreml.linear_quantize_weights(mlmodel, config=config)
+
+# Save the quantized model — an ML Program is a .mlpackage
+quantized_mlmodel.save('DefectDetection.mlpackage')
 ```
+
+Twenty lines, and I tripped over two of them.
+
+The first was the quantization call. `quantization_utils.quantize_weights`, the one you'll find in older write-ups, applies to the legacy neural network format — not to the ML Program that `ct.convert` produces by default. ML Programs go through `coremltools.optimize.coreml.linear_quantize_weights` with an `OptimizationConfig` ([API Overview](https://apple.github.io/coremltools/docs-guides/source/opt-quantization-api.html)). Passing class labels to `outputs=` failed on the same afternoon; they belong in `classifier_config` ([Classifiers](https://apple.github.io/coremltools/docs-guides/source/classifiers.html)).
+
+The second one was sillier. I assigned the quantized model to a new variable and then saved the pre-quantization one. No error, a perfectly valid file, and a size that never went down — I didn't notice until I opened it in Xcode. These compression APIs return a new model rather than mutating the one you handed them. Forget to save what you were given, and all you're left with is the result of having done nothing.
 
 ### Memory Optimization at Runtime
 
 Minimize memory footprint during inference:
 
 ```swift
-// Cache the model once
-class ModelCache {
+// Load once, and keep a way to let go of it
+actor ModelCache {
     static let shared = ModelCache()
-    private let model: MLModel
+    private var cached: MLModel?
 
-    private init() {
-        let url = Bundle.main.url(forResource: "defect-detection", withExtension: "mlmodel")!
-        self.model = try! MLModel(contentsOf: url)
+    func model() throws -> MLModel {
+        if let cached { return cached }
+        guard let url = Bundle.main.url(forResource: "defect-detection",
+                                        withExtension: "mlmodelc") else {
+            throw MLError.modelNotFound
+        }
+        let loaded = try MLModel(contentsOf: url)
+        cached = loaded
+        return loaded
+    }
+
+    /// Call on a memory warning; the next inference reloads it
+    func evict() {
+        cached = nil
     }
 }
 
@@ -410,6 +451,8 @@ autoreleasepool {
     // Process prediction
 }
 ```
+
+Leave the `try!` in and the app dies the moment the load fails. A bundled model feels like something you can count on being there, right up until the build where someone renames the file.
 
 ---
 
@@ -844,76 +887,180 @@ One aside: if you also gate the app binary behind a minimum supported version, w
 
 **Solution: Over-The-Air (OTA) Updates**
 
-Keep the app binary unchanged but download new models from your server:
+Leave the app binary alone and ship the model from your own server. My first version of this didn't work, though: it handed the downloaded `.mlmodel` straight to `MLModel(contentsOf:)`.
+
+That initializer takes a *compiled* model. A `.mlmodel` isn't valid input. You run `MLModel.compileModel(at:)` on the device and load the `.mlmodelc` it returns — and that return value lives in a temporary location the system is free to delete. Apple's guide is emphatic about moving it somewhere permanent ([Downloading and Compiling a Model on the User's Device](https://developer.apple.com/documentation/coreml/downloading-and-compiling-a-model-on-the-user-s-device)).
+
+Until I added those two lines, my app re-downloaded the model on every launch. Fittingly, what surfaced it wasn't a bandwidth bill — it was a test in airplane mode.
+
+**Compiling the model and deciding where it lives are part of downloading it, not steps that come after.** Stop at "the download finished" and you get an app that works and phones home every single time.
 
 ```swift
-struct ModelManager {
-    let remoteURL = URL(string: "https://api.rorklab.com/models/defect-v2.mlmodel")!
-    let cachePath = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("ml-models")
+import CoreML
 
-    func fetchLatestModel() async throws -> MLModel {
-        // Check local cache
-        let versionFile = cachePath.appendingPathComponent("version.json")
-        if FileManager.default.fileExists(atPath: versionFile.path) {
-            let data = try Data(contentsOf: versionFile)
-            let version = try JSONDecoder().decode(ModelVersion.self, from: data)
-
-            if version.id == "v2" {
-                let modelPath = cachePath.appendingPathComponent("defect.mlmodel")
-                return try MLModel(contentsOf: modelPath)
-            }
-        }
-
-        // Download latest model
-        let (data, _) = try await URLSession.shared.data(from: remoteURL)
-
-        // Cache it
-        try FileManager.default.createDirectory(at: cachePath, withIntermediateDirectories: true)
-        let modelPath = cachePath.appendingPathComponent("defect.mlmodel")
-        try data.write(to: modelPath)
-
-        // Record version
-        let version = ModelVersion(id: "v2", timestamp: Date())
-        let versionData = try JSONEncoder().encode(version)
-        try versionData.write(to: versionFile)
-
-        return try MLModel(contentsOf: modelPath)
-    }
+enum ModelStoreError: Error {
+    case bundledModelMissing
+    case checksumMismatch
 }
 
-struct ModelVersion: Codable {
-    let id: String
-    let timestamp: Date
+actor ModelStore {
+    private let bundledName = "defect-detection"
+    private var cached: MLModel?
+
+    /// Always returns something. A dead server doesn't stop inference.
+    func current(remote: URL, version: String, sha256: String) async -> MLModel? {
+        if let cached { return cached }
+
+        // 1) Already installed
+        if let installed = try? load(version: version) {
+            cached = installed
+            return installed
+        }
+
+        // 2) Otherwise go fetch it
+        if let fetched = try? await install(from: remote, version: version, sha256: sha256) {
+            cached = fetched
+            return fetched
+        }
+
+        // 3) Anything goes wrong, fall back to what shipped
+        cached = try? bundledModel()
+        return cached
+    }
+
+    /// Call on a memory warning
+    func evict() { cached = nil }
+
+    private func install(from remote: URL, version: String, sha256: String) async throws -> MLModel {
+        // data(from:) pulls the whole model into memory; download(from:) doesn't
+        let (downloaded, response) = try await URLSession.shared.download(from: remote)
+        defer { try? FileManager.default.removeItem(at: downloaded) }
+
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+        guard try digest(of: downloaded) == sha256.lowercased() else {
+            throw ModelStoreError.checksumMismatch
+        }
+
+        // Compile on device — the result is a .mlmodelc in a temporary directory
+        let compiled = try await MLModel.compileModel(at: downloaded)
+
+        // Move it somewhere permanent. Skip this and it's gone by the next launch
+        let fm = FileManager.default
+        let destination = try modelDirectory().appendingPathComponent("\(version).mlmodelc")
+        if fm.fileExists(atPath: destination.path) {
+            try fm.removeItem(at: destination)
+        }
+        try fm.moveItem(at: compiled, to: destination)
+
+        try? pruneOldVersions(keeping: version)
+        return try MLModel(contentsOf: destination)
+    }
+
+    private func load(version: String) throws -> MLModel {
+        let url = try modelDirectory().appendingPathComponent("\(version).mlmodelc")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return try MLModel(contentsOf: url)
+    }
+
+    private func bundledModel() throws -> MLModel {
+        guard let url = Bundle.main.url(forResource: bundledName, withExtension: "mlmodelc") else {
+            throw ModelStoreError.bundledModelMissing
+        }
+        return try MLModel(contentsOf: url)
+    }
+
+    /// Application Support, not Caches. The system reclaims Caches,
+    /// which is exactly how this broke for me offline.
+    private func modelDirectory() throws -> URL {
+        let fm = FileManager.default
+        let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                              appropriateFor: nil, create: true)
+        let dir = base.appendingPathComponent("ml-models", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func pruneOldVersions(keeping version: String) throws {
+        let fm = FileManager.default
+        let dir = try modelDirectory()
+        for item in try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        where item.lastPathComponent != "\(version).mlmodelc" {
+            try? fm.removeItem(at: item)
+        }
+    }
+}
+```
+
+A `.mlmodelc` is a directory, not a file. Copy or delete it with `Data` reads and writes and it will diverge on you without saying a word — use `FileManager`'s directory operations.
+
+### Verifying What You Shipped
+
+You're distributing code that will execute, so confirm it wasn't swapped in transit before compiling it. Hash it in a stream so a 100 MB file never lands in memory all at once.
+
+```swift
+import CryptoKit
+
+extension ModelStore {
+    fileprivate func digest(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
 }
 ```
 
 ### Version Management Best Practices
 
+The server returns a manifest first, not the model itself.
+
 ```swift
-enum ModelVersionControl {
-    case bundled    // Fallback included with app
-    case remote(URL) // Latest from server
-
-    static func load() async throws -> MLModel {
-        do {
-            // Try remote first
-            return try await ModelManager().fetch(
-                from: URL(string: "https://api.rorklab.com/models/latest.mlmodel")!
-            )
-        } catch {
-            // Fallback to bundled
-            print("Remote fetch failed, using bundled: \(error)")
-            return try bundledModel()
-        }
-    }
-
-    private static func bundledModel() throws -> MLModel {
-        let url = Bundle.main.url(forResource: "defect-detection", withExtension: "mlmodel")!
-        return try MLModel(contentsOf: url)
-    }
+struct ModelManifest: Codable {
+    let version: String           // e.g. "2026-08-11-a"
+    let url: URL
+    let sha256: String
+    let minimumAppVersion: String // keeps new models off old binaries
 }
 ```
+
+Four rules I settled on:
+
+<table>
+  <thead>
+    <tr>
+      <th>Rule</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Version name becomes the directory name</td>
+      <td>Overwriting in place means a half-failed install gets loaded next time</td>
+    </tr>
+    <tr>
+      <td>Always keep one bundled model</td>
+      <td>First launch, no signal, or a pulled release — inference still has to run</td>
+    </tr>
+    <tr>
+      <td>Put a minimum app version in the manifest</td>
+      <td>A model with a changed input or output shape must not reach an older build</td>
+    </tr>
+    <tr>
+      <td>Switch on the next launch, never mid-session</td>
+      <td>Swapping models under a running inference makes the same input give different answers</td>
+    </tr>
+  </tbody>
+</table>
+
+Comparing app versions as strings breaks on releases like 1.10.0, which is the article linked above. Reach for the same comparator when you read `minimumAppVersion`.
 
 ---
 
@@ -925,51 +1072,63 @@ On-device AI's greatest advantage is privacy. Implement these practices rigorous
 
 **Essential Safeguards**
 
-1. **Never Persist Input Data**: Don't save images or text used for inference to disk
-2. **Clear Memory Immediately**: Overwrite buffers after use
-3. **Local-Only Processing**: Never send user data to servers without explicit consent
+1. **Never persist input data**: nothing used for inference reaches disk
+2. **Release buffers immediately**: let go of them the moment you're done
+3. **Local only**: nothing goes to a server without explicit consent
+4. **Transparent permissions**: always ask before touching camera or microphone
 
 Your own code sending nothing isn't the whole story — review asks what the SDKs you bundled collect. The audit path for tracing a Privacy Manifest through the SDK chain is in [auditing Privacy Manifests in Rork-generated Expo apps](/articles/rork-dev/rork-privacy-manifest-sdk-chain-pre-review-audit-workflow). If on-device inference is your selling point, a mismatch here undoes it.
-4. **Transparent Permissions**: Always ask before accessing camera/microphone
 
 ### Secure Data Handling
 
 ```swift
-class SecureMLProcessor {
-    func processImageWithoutPersisting(_ image: UIImage) throws -> String {
-        var processedBuffer: CVPixelBuffer?
+final class SecureMLProcessor {
+    private let model: defect_detection
 
-        defer {
-            // Clean up immediately after inference
-            if var buffer = processedBuffer {
-                CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
-                processedBuffer = nil
-            }
-        }
+    init(model: defect_detection) {
+        self.model = model
+    }
 
+    func classifyWithoutPersisting(_ image: UIImage) throws -> String {
         guard let buffer = image.pixelBuffer(size: CGSize(width: 224, height: 224)) else {
             throw MLError.conversionFailed
         }
-        processedBuffer = buffer
 
-        // Run inference
-        let input = defect_detectionInput(imageAt: buffer)
-        let output = try model.prediction(input: input)
+        // Lock and unlock as a pair. Unlocking a buffer you never locked
+        // is a bug in itself, not cleanup.
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
 
-        // Return result only (never persist)
+        let output = try model.prediction(input: defect_detectionInput(imageAt: buffer))
+
+        // Return the result; the input is never written anywhere
         return output.classLabel
     }
 
-    func deleteAllLocalData() throws {
-        let cachePath = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        try FileManager.default.removeItem(at: cachePath)
+    /// Clears only the subdirectory this class created.
+    /// Calling removeItem on Caches itself takes URLCache, image caches,
+    /// and whatever else lives there down with it.
+    func deleteInferenceCache() throws {
+        let fm = FileManager.default
+        let caches = try fm.url(for: .cachesDirectory, in: .userDomainMask,
+                                appropriateFor: nil, create: false)
+        let mine = caches.appendingPathComponent("inference", isDirectory: true)
+
+        guard fm.fileExists(atPath: mine.path) else { return }
+        for item in try fm.contentsOfDirectory(at: mine, includingPropertiesForKeys: nil) {
+            try fm.removeItem(at: item)
+        }
     }
 }
 
 enum MLError: Error {
     case conversionFailed
+    case modelNotFound
+    case privacyPolicyViolation
 }
 ```
+
+For a while this was a `deleteAllLocalData()` that removed the Caches directory outright. It did clear the inference cache. It also took the photo library's thumbnails with it, and I got to debug a blank grid I had built myself. Delete only inside what you created.
 
 ### User Permission Management
 
@@ -1008,17 +1167,23 @@ PermissionManager.requestCameraAccess { granted in
 
 ```swift
 struct PrivacyCompliance {
-    let allowDataSharing: Bool = false
-    let allowAnalytics: Bool = false
-    let dataRetentionDays: Int = 0
+    var allowDataSharing = false
+    var allowAnalytics = false
+    var dataRetentionDays = 0
 
-    func validateBeforePrediction() -> Bool {
-        assert(!allowDataSharing, "Sharing must be disabled for privacy")
-        assert(!allowAnalytics, "Analytics collection is disabled")
-        return true
+    /// assert disappears in Release builds. A check you want in production
+    /// has to be a guard that throws.
+    func validateBeforePrediction() throws {
+        guard !allowDataSharing, !allowAnalytics, dataRetentionDays == 0 else {
+            throw MLError.privacyPolicyViolation
+        }
     }
 }
 ```
+
+I had this as `assert` for a long time. It fired in debug exactly as intended, the tests were green, and I felt covered. But `assert` is removed when optimizations are on, so not one of those lines ever ran in the app people installed.
+
+**A check that vanishes in a Release build isn't a check.** I'd been satisfied by it stopping on my machine, while it waved everything through in the one place it mattered.
 
 ---
 
