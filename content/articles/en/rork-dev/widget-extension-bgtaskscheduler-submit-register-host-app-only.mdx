@@ -1,0 +1,235 @@
+---
+title: "Your Widget Extension Can Submit a BGTaskScheduler Request. It Just Cannot Register the Handler"
+slug: "widget-extension-bgtaskscheduler-submit-register-host-app-only"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-09-05T11:00"
+author: "Rork Lab"
+description: "Calling BGTaskScheduler from a widget extension compiles, submits, and returns true — and then nothing runs. Here is why registration belongs to the host app only, and how I moved refresh ownership back where it belongs across my wallpaper apps."
+tags: ["Rork", "WidgetKit", "BGTaskScheduler", "iOS", "Expo", "App Extension"]
+highlights:
+  - "You will be able to tell within 5 minutes whether register or submit is the call your setup is not allowed to make, instead of losing half a day to a silent no-op"
+  - "You will be able to separate the two budgets at play — the chance a BGAppRefreshTask gets to run, and WidgetKit's reload allowance — and design the handoff from host app to widget deliberately"
+  - "You will know whether to inspect getPendingTaskRequests or your App Group write record first when submit returned true but the widget never changed"
+---
+
+The week after I finished chasing down a widget that froze on yesterday's image every evening, a new request arrived: the wallpaper should already be the next one by morning, even on days the app is never opened.
+
+The obvious reading is that the widget owns the refresh. The widget is what draws the image, so the widget should fetch the next one — that was my reasoning when I added a `BGAppRefreshTaskRequest` to the widget extension target.
+
+It compiled. `submit` returned true. The next morning the screen was unchanged, and it took me half a day to find out why.
+
+## Submit is allowed. Only register is refused
+
+Here is the short version. `BGTaskScheduler` lets an extension ask for work, but it does not let an extension be the one that receives it. In the SDK header, `registerForTaskWithIdentifier:usingQueue:launchHandler:` carries an extension-unavailable annotation with a single line of explanation: "Only the host application may register launch handlers" ([BGTaskScheduler.h in BackgroundTasks.framework](https://github.com/xybp888/iOS-SDKs/blob/master/iPhoneOS13.0.sdk/System/Library/Frameworks/BackgroundTasks.framework/Headers/BGTaskScheduler.h)).
+
+The discussion text right below it adds that while some extensions may submit task requests, only the host app is ever launched to perform the background work. So a successful `submit` means "request accepted" and nothing more.
+
+<table>
+<thead>
+<tr><th>Call</th><th>From a widget extension</th><th>What actually happens</th></tr>
+</thead>
+<tbody>
+<tr><td><code>submitTaskRequest:error:</code></td><td>Allowed</td><td>The request is accepted and you get true back</td></tr>
+<tr><td><code>registerForTaskWithIdentifier:...</code></td><td>Not allowed</td><td>Marked unavailable to extensions</td></tr>
+<tr><td>Target that gets launched</td><td>—</td><td>The host app only; the extension is never woken</td></tr>
+</tbody>
+</table>
+
+This is the code I wrote. It runs. There is simply nobody on the receiving end.
+
+```swift
+// WallpaperWidget/RefreshScheduler.swift — this design is a dead end
+import BackgroundTasks
+
+enum RefreshScheduler {
+    static func scheduleFromWidget() {
+        let request = BGAppRefreshTaskRequest(identifier: "net.dolice.wallpaper.dailyRefresh")
+        request.earliestBeginDate = Calendar.current.date(byAdding: .hour, value: 6, to: Date())
+        do {
+            try BGTaskScheduler.shared.submit(request)
+            // This line is reached. true comes back, the log says "scheduled".
+            // But no launchHandler can be registered here, so nothing ever wakes up.
+            NSLog("[widget] submitted dailyRefresh")
+        } catch {
+            NSLog("[widget] submit failed: \(error)")
+        }
+    }
+}
+```
+
+Because `submit` never throws here, the log only ever records success. Nothing crashes, so the problem stays invisible. Silent failures like this are the ones I have learned to distrust most.
+
+## The identifier allow-list lives in the app's Info.plist
+
+There is a second wall waiting if you try to keep refresh inside the extension, and it is the permitted-identifier list.
+
+`BGTaskScheduler` returns `NotPermitted` (Code=3) when the right mode is missing from `UIBackgroundModes`, or when the identifier is absent from `BGTaskSchedulerPermittedIdentifiers`. The detail that matters: that array belongs in the app's Info.plist. Reading it alongside [the unavailable error code reference](https://developer.apple.com/documentation/backgroundtasks/bgtaskscheduler/error/code/unavailable) makes the split between Code=1 and Code=3 much clearer.
+
+### Adding it to the extension's Info.plist does nothing
+
+It is tempting to select the widget extension target in Xcode and put `BGTaskSchedulerPermittedIdentifiers` in its Info.plist. I did exactly that once. No error appears. Nothing happens either.
+
+### On Rork and Expo projects, put it in app.config
+
+Rork emits a React Native and Expo project, so rather than hand-editing Info.plist I keep this in the config file.
+
+```js
+// app.config.js — this lands in the host app's Info.plist
+export default {
+  expo: {
+    ios: {
+      bundleIdentifier: "net.dolice.wallpaper",
+      infoPlist: {
+        UIBackgroundModes: ["fetch", "processing"],
+        BGTaskSchedulerPermittedIdentifiers: [
+          "net.dolice.wallpaper.dailyRefresh"
+        ]
+      }
+    }
+  }
+};
+```
+
+### Define the identifier once and read it from both targets
+
+If the identifier string drifts between the host app and the extension, `register` and `submit` end up pointing at different tasks, and that mismatch is silent too. I keep the constants in a shared target that both sides include.
+
+```swift
+// Shared/RefreshTaskID.swift — included in both the app and the widget extension
+public enum RefreshTaskID {
+    public static let daily = "net.dolice.wallpaper.dailyRefresh"
+    public static let appGroup = "group.net.dolice.wallpaper"
+    public static let widgetKind = "DailyWallpaperWidget"
+}
+```
+
+## Moving refresh ownership back to the host app
+
+Once I accepted the dead end, I rewrote the design around a different subject. The host app owns the refresh. The widget goes back to being the thing that reads a result and draws it.
+
+The app takes on three jobs in order: register at launch, pick the next image and write it into the App Group when it wakes, then ask `WidgetCenter` to reload once the write has landed.
+
+```swift
+// AppDelegate.swift — the host app; register can only happen here
+import BackgroundTasks
+import WidgetKit
+
+func application(_ application: UIApplication,
+                 didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+
+    // Must happen before launch finishes. Register late and registration itself fails.
+    BGTaskScheduler.shared.register(forTaskWithIdentifier: RefreshTaskID.daily,
+                                    using: nil) { task in
+        handleDailyRefresh(task as! BGAppRefreshTask)
+    }
+    scheduleNextRefresh()
+    return true
+}
+
+func scheduleNextRefresh() {
+    let request = BGAppRefreshTaskRequest(identifier: RefreshTaskID.daily)
+    // Ask for something too soon and the system rounds it into a window you did not intend.
+    request.earliestBeginDate = Calendar.current.date(byAdding: .hour, value: 6, to: Date())
+    do {
+        try BGTaskScheduler.shared.submit(request)
+    } catch {
+        NSLog("[app] submit failed: \(error)")
+    }
+}
+
+func handleDailyRefresh(_ task: BGAppRefreshTask) {
+    // Queue the next run first. Forget this and you get exactly one refresh, ever.
+    scheduleNextRefresh()
+
+    let work = Task {
+        let picked = await DailyWallpaperPicker.pickNext()
+        SharedStore.write(picked)                     // writes into the App Group container
+        WidgetCenter.shared.reloadTimelines(ofKind: RefreshTaskID.widgetKind)
+        task.setTaskCompleted(success: true)
+    }
+
+    task.expirationHandler = {
+        work.cancel()
+        task.setTaskCompleted(success: false)
+    }
+}
+```
+
+The order of the write and the reload is not interchangeable. Call `reloadTimelines` first and the widget simply re-reads the old value. I got this backwards once and watched a symptom I had already fixed come back.
+
+If you still need the extension to request work, keep `submit` there and leave `register` plus the handler in the host app. Thinking of it as requester and recipient rather than one owner makes the whole layout easier to hold in your head.
+
+## Two budgets, and confusing them will misdirect your debugging
+
+There is a deeper point here that I misread for a long time. More than one budget is involved.
+
+The first is whether a `BGAppRefreshTask` gets a chance to run at all, which is the system's call based on usage patterns, battery and connectivity. The second is how often WidgetKit will redraw a timeline; as [the WidgetCenter reference](https://developer.apple.com/documentation/widgetkit/widgetcenter) notes, you can request a reload but immediate execution is not promised.
+
+Treat those as one budget and your diagnosis will drift. Here is how I tell them apart.
+
+<table>
+<thead>
+<tr><th>Symptom</th><th>Budget to suspect</th><th>Where to look first</th></tr>
+</thead>
+<tbody>
+<tr><td>The App Group write timestamp is not moving</td><td>BGAppRefreshTask side</td><td>getPendingTaskRequests and your last-run record</td></tr>
+<tr><td>Timestamp is fresh but the display is stale</td><td>WidgetKit reload side</td><td>Where reloadTimelines is called, and your timeline entries</td></tr>
+<tr><td>Fine in the morning, frozen by evening</td><td>WidgetKit reload side</td><td>Whether you batch a full day of entries in one timeline</td></tr>
+</tbody>
+</table>
+
+The evening-freeze case is one I wrote up separately in [why an iOS widget keeps showing stale data](/en/articles/rork-dev/rork-ios-widget-app-group-stale-data-design). What this article covers sits one layer earlier: who wakes up in the first place.
+
+## Do not trust a true from submit
+
+To keep silent failures visible, I made both the scheduling and the execution report on themselves. Pending requests are readable through `getPendingTaskRequests`. Execution is recorded by writing a timestamp into the App Group from inside the handler and surfacing it on a debug screen.
+
+```swift
+// A self-reporting view I keep in the settings screen of development builds
+import BackgroundTasks
+import SwiftUI
+
+struct RefreshDiagnosticsView: View {
+    @State private var pending: [String] = []
+    @State private var lastRun: Date? = SharedStore.lastRefreshAt()
+
+    var body: some View {
+        List {
+            Section("Pending requests") {
+                if pending.isEmpty {
+                    Text("None — submit may have returned true and the request still vanished")
+                } else {
+                    ForEach(pending, id: \.self) { Text($0) }
+                }
+            }
+            Section("Last run") {
+                Text(lastRun.map { $0.formatted() } ?? "no record")
+            }
+        }
+        .task {
+            let requests = await BGTaskScheduler.shared.pendingTaskRequests()
+            pending = requests.map(\.identifier)
+        }
+    }
+}
+```
+
+The reading order is fixed. Empty last-run timestamp means the host app is not waking, so I check the identifier and the Info.plist. Fresh timestamp with a stale display means it did wake, so I check the reload side instead. Splitting it into those two questions cut my debugging time noticeably.
+
+For the ways Code=1 shows up, I have the causes laid out in [tracking down BGTaskScheduler.submit Error Code=1](/en/articles/rork-dev/rork-ios-bgtaskscheduler-submit-error-code-1-unavailable-fix). Read together with this piece, the extension-related gaps are covered as well.
+
+## Where interactive widgets stop short
+
+Widgets can hold buttons from iOS 17 onward, so it is natural to want the image to change the moment one is tapped. Calling a reload from inside an `AppIntent`'s `perform()`, though, has drawn repeated reports of minutes-long delays that reproduce only on device — [one such thread on the developer forums](https://developer.apple.com/forums/thread/737206) collects several. My own results matched: instant in the simulator, a wait on hardware.
+
+So I render the tap from the value I just wrote into the App Group, and let the system reload catch up afterwards. **Responsiveness comes from my own write; correctness comes from the system's reload.** Since splitting those two responsibilities, the simulator-versus-device gap has stopped costing me evenings.
+
+## The rules I kept after rolling this out to six apps
+
+Rolling the same structure across six wallpaper apps, I wrote down three short rules so the decision would not wobble. Background refresh registration is the host app's job alone. Identifiers are read only from the shared constant. The reload request comes after the write, never before.
+
+If you have a `BGTaskScheduler` call half-written in an extension target right now, try moving just the `register` line into the host app first. For me, relocating that single line was what finally made the morning screen change.
+
+Thanks for staying with a problem this narrow. I hope the half day it cost me is one you get to keep.
