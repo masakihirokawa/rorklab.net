@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PRICING — 通常 Rork の階層が具体化しました。Junior が月額 $25 で100クレジット、Middle が $50 で250、Senior が $100 で500 という並びです",
-    "CREDITS — 課金はメッセージ単位です。AI へ送るプロンプト1回が1クレジットで、画面をまるごと作る指示もボタンの色を変える指示も同じ1つを消費します",
-    "PRACTICE — ですので、細かい手直しを重ねるほどクレジットは早く減ります。要件をまとめて渡し、細部は手元のエディタで直す。この配分が実際のコストを大きく左右します",
-    "STACK — 通常の Rork は Expo 経由の React Native を生成し、iOS と Android の両方に届きます。Rork Max は別製品で、ネイティブ Swift を書きます",
-    "MAX — Max は月額 $200 から。クラウド上の Mac 群でコンパイルし、ブラウザにライブシミュレータを流し、2クリックで App Store へ公開します。Xcode は要りません",
-    "FOUNDATION — 土台のモデル層では Gemini 3.8 Flash が9月2日に一般提供、9月3日には GitHub Copilot でも使えるようになりました。導入価格の失効は12月31日です",
+    "MAX — Rork Max は従来の Rork とは別系統です。React Native ではなくネイティブ Swift を生成し、クラウド上の Mac 群でコンパイルします",
+    "REACH — 対応は iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage。AR/LiDAR、Metal の3D、Dynamic Island、Live Activities、HealthKit、NFC、Core ML まで届きます",
+    "CHOICE — ですので選び方は素直です。必要な OS 機能から逆算して、React Native で足りるなら通常の Rork、届かないなら Max という順に考えます",
+    "FUNDING — 4月9日、Left Lane Capital 主導のシードラウンドで1,500万ドルを調達しました。あわせてアプリビルダーの Paperline を買収しています",
+    "TRACTION — 2月の Max ローンチから3日で ARR 150万ドル。人材獲得を目的に、今後も買収を続ける方針が示されています",
+    "REALITY — ただ「ワンクリックで App Store 公開」は言葉のあやです。審査、証明書、スクリーンショット、年齢区分と、人手の要る工程はいまも残ります",
   ],
   en: [
-    "PRICING — Standard Rork's tiers are now clear: Junior at $25 a month for 100 credits, Middle at $50 for 250, and Senior at $100 for 500",
-    "CREDITS — Billing is per message. One prompt to the AI costs one credit, whether you are asking it to build an entire screen or just to change a button color",
-    "PRACTICE — Which means credits drain fastest when you iterate in small nudges. Bundle the requirements, then handle the fine details in your own editor. That split moves the real cost more than anything",
-    "STACK — Standard Rork generates React Native through Expo and reaches both iOS and Android. Rork Max is a separate product that writes native Swift instead",
-    "MAX — Max starts at $200 a month. It compiles on a cloud Mac fleet, streams a live simulator to your browser, and publishes to the App Store in two clicks, with no Xcode required",
-    "FOUNDATION — In the model layer beneath it, Gemini 3.8 Flash went generally available on September 2 and reached GitHub Copilot on September 3. Its introductory pricing expires December 31",
+    "MAX — Rork Max is a separate line from the original Rork. It generates native Swift rather than React Native and compiles on a cloud Mac fleet",
+    "REACH — It covers iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, reaching AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, HealthKit, NFC, and Core ML",
+    "CHOICE — So the decision works backwards from the OS features you need: the original Rork if React Native gets you there, Max if it does not",
+    "FUNDING — Rork raised a $15M seed led by Left Lane Capital on April 9, and acquired the app builder Paperline around the same time",
+    "TRACTION — Max reached $1.5M ARR within three days of its February launch, and the company has signalled it will keep acquiring to bring in engineering talent",
+    "REALITY — Still, one-click App Store publishing is a figure of speech. Review, certificates, screenshots, and age ratings remain steps you do by hand",
   ],
 };
 
