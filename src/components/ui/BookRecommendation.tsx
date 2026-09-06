@@ -438,19 +438,6 @@ export function BookRecommendation({ locale, category }: BookRecommendationProps
             ? "※ アフィリエイトリンクを含みます"
             : "* Contains affiliate links"}
         </div>
-        <a
-          href={`/${locale === "en" ? "en/" : ""}articles/rork-ai/recommended-books`}
-          style={{
-            fontSize: 11,
-            fontFamily: "'DM Mono', monospace",
-            color: "var(--accent-coral)",
-            textDecoration: "none",
-            letterSpacing: "0.02em",
-            transition: "opacity 0.2s",
-          }}
-        >
-          {locale === "ja" ? "もっと見る →" : "See all →"}
-        </a>
       </div>
     </div>
   );

@@ -2,6 +2,11 @@
 // 2026-06-10: GSC「クロール済み-インデックス未登録」∩ 検索実績ゼロ(28日) の死蔵記事 + 週間ランキング全件
 // 機構: src/middleware.ts が /articles/{category}/{slug} 一致時に 410 を返す
 export const GONE_ARTICLE_SLUGS: string[] = [
+  // 2026-09-07: GSC「見つかりませんでした(404)」実測で残っていた削除済み記事を 410 に統一（#124）
+  "rork-app-data-not-saving-persistence-troubleshooting",
+  "rork-dependency-update-audit-cadence-indie",
+  "toyama-darkness-uozu-tax-office-kura-ai-reform",
+  "toyama-tax-office-darkness-systemic-injustice",
   "ai-app-icon-design-store-guidelines",
   "ai-app-monetization-dynamic-pricing-strategy",
   "ai-app-preview-video-creation-guide",
@@ -358,6 +363,11 @@ export const GONE_ARTICLE_SLUGS: string[] = [
 
 // 2026-06-14: 恒久削除した blog 記事（税務YMYL等）を 410 化
 export const GONE_BLOG_SLUGS: string[] = [
+  // 2026-09-07: GSC「見つかりませんでした(404)」実測で残っていた削除済み記事を 410 に統一（#124）
+  "admob-export-exemption-family-loss-app-developer-testimony",
+  "admob-export-tax-exemption-ai-defense",
+  "japan-tax-injustice-complete-record",
+  "why-ai-should-replace-tax-officials",
   "ai-tax-filing-and-fighting-injustice",
   "tax-battle-complete-chronicle",
   "toyama-darkness-uozu-tax-office-kura-ai-reform",

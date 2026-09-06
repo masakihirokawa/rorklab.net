@@ -76,6 +76,29 @@ function localizeInternalLinks(html, locale) {
 }
 
 /**
+ * Remove markdown links that point to articles which no longer exist (410 pruned / renamed).
+ * Article MDX has had this since #120; blog MDX did not, so every monthly/weekly roundup post
+ * kept linking to pruned articles and Google kept re-crawling 410s from live pages (2026-09-07, #124).
+ * Keeps the link text, drops only the link.
+ */
+function stripBrokenArticleLinks(content, label) {
+  const pattern = /\[([^\]]*)\]\(\/(?:(?:ja|en)\/)?articles\/([^)#\s]+)\)/g;
+  const broken = [];
+  for (const m of content.matchAll(pattern)) {
+    const target = m[2].replace(/^(ja|en)\//, "");
+    const jaPath = path.join(CONTENT_DIR, "articles", "ja", ...target.split("/")) + ".mdx";
+    const enPath = path.join(CONTENT_DIR, "articles", "en", ...target.split("/")) + ".mdx";
+    if (!fs.existsSync(jaPath) && !fs.existsSync(enPath)) broken.push(m);
+  }
+  let out = content;
+  for (const m of broken) {
+    console.warn(`  ⚠ AUTO-FIX: ${label}: removed broken link [${m[1]}](/articles/${m[2]}) — target article does not exist`);
+    out = out.split(m[0]).join(m[1]);
+  }
+  return out;
+}
+
+/**
  * Add id="section-N" to <h2> and <h3> tags for TOC anchor links.
  * This ensures heading IDs are present in SSR HTML for Google Passage Ranking.
  */
@@ -273,7 +296,7 @@ async function generateBlogIndex() {
       const { data, content } = matter(raw);
       const slug = file.replace(/\.mdx$/, "");
 
-      const html = localizeInternalLinks(addHeadingIds(await compileMarkdown(content)), locale);
+      const html = localizeInternalLinks(addHeadingIds(await compileMarkdown(stripBrokenArticleLinks(content, `blog/${locale}/${file}`))), locale);
 
       // Write individual HTML content to public/content/blog/{locale}/{slug}.html
       const htmlDir = path.join(CONTENT_HTML_DIR, "blog", locale);

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
-import { getArticle, getArticleContent, getAllArticleSlugs, CATEGORIES, getTagCounts } from "@/lib/content";
+import { notFound, permanentRedirect } from "next/navigation";
+import { getArticle, getArticles, getArticleContent, getAllArticleSlugs, CATEGORIES, getTagCounts } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
@@ -132,6 +132,11 @@ export default async function ArticlePage({ params }: Props) {
   const article = getArticle(locale, category, slug);
 
   if (!article) {
+    // カテゴリ違いの URL（旧カテゴリ・Google の推測 URL）は正しいカテゴリへ恒久移転（2026-09-07・#124）
+    const moved = getArticles(locale).find((a) => a.slug === slug);
+    if (moved && moved.category !== category) {
+      permanentRedirect(`${locale === "ja" ? "" : `/${locale}`}/articles/${moved.category}/${slug}`);
+    }
     notFound();
   }
 
