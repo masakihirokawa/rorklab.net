@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MAX — Rork Max は従来の Rork とは別系統です。React Native ではなくネイティブ Swift を生成し、クラウド上の Mac 群でコンパイルします",
-    "REACH — 対応は iPhone・iPad・Apple Watch・Apple TV・Vision Pro・iMessage。AR/LiDAR、Metal の3D、Dynamic Island、Live Activities、HealthKit、NFC、Core ML まで届きます",
-    "CHOICE — ですので選び方は素直です。必要な OS 機能から逆算して、React Native で足りるなら通常の Rork、届かないなら Max という順に考えます",
-    "FUNDING — 4月9日、Left Lane Capital 主導のシードラウンドで1,500万ドルを調達しました。あわせてアプリビルダーの Paperline を買収しています",
-    "TRACTION — 2月の Max ローンチから3日で ARR 150万ドル。人材獲得を目的に、今後も買収を続ける方針が示されています",
-    "REALITY — ただ「ワンクリックで App Store 公開」は言葉のあやです。審査、証明書、スクリーンショット、年齢区分と、人手の要る工程はいまも残ります",
+    "SPLIT — Rork は2本立てです。標準の Rork は React Native を生成し、2026年2月に出た Rork Max は別製品としてネイティブ Swift を生成します",
+    "MAX — Rork Max は月額 $200 と報じられています。クラウド上の Mac でのコンパイルから App Store 公開まで含み、Vision Pro や iMessage にも届きます",
+    "PLANS — 標準版は無料枠に加えて Junior $25、Middle $50、Senior $100、その上に Scale。数えるのはトークンではなくメッセージ数です",
+    "COUNT — 1メッセージでどれだけ進むかは指示の書き方で大きく変わります。プランを比べるなら、実際に何メッセージ要ったかを測るのがいちばん確かです",
+    "STORE — 2026年9月から、App Store への提出時と代替配布の公証申請時に新しい質問票への回答が必須になります。年齢レーティングと Time Allowances の挙動を決めるものです",
+    "SCOPE — 審査要件の変更は、次に出すアプリだけでなく、すでに公開しているアプリすべてに降りてきます。公開手順の見直しは早めが安全です",
   ],
   en: [
-    "MAX — Rork Max is a separate line from the original Rork. It generates native Swift rather than React Native and compiles on a cloud Mac fleet",
-    "REACH — It covers iPhone, iPad, Apple Watch, Apple TV, Vision Pro, and iMessage, reaching AR/LiDAR, Metal 3D, Dynamic Island, Live Activities, HealthKit, NFC, and Core ML",
-    "CHOICE — So the decision works backwards from the OS features you need: the original Rork if React Native gets you there, Max if it does not",
-    "FUNDING — Rork raised a $15M seed led by Left Lane Capital on April 9, and acquired the app builder Paperline around the same time",
-    "TRACTION — Max reached $1.5M ARR within three days of its February launch, and the company has signalled it will keep acquiring to bring in engineering talent",
-    "REALITY — Still, one-click App Store publishing is a figure of speech. Review, certificates, screenshots, and age ratings remain steps you do by hand",
+    "SPLIT — Rork comes in two lines. The standard product generates React Native, while Rork Max, launched in February 2026, is a separate product that writes native Swift",
+    "MAX — Rork Max is reported at $200 a month, covering compilation on cloud Macs through App Store publishing, and reaching Vision Pro and iMessage",
+    "PLANS — The standard tiers run free, Junior at $25, Middle at $50, Senior at $100, with Scale above that. What gets counted is messages, not tokens",
+    "COUNT — How far a single message takes you depends heavily on how you write the prompt. The honest way to compare plans is to measure the messages an actual build took",
+    "STORE — From September 2026, App Store submissions and notarization requests require a new questionnaire that sets age ratings and Time Allowances behavior",
+    "SCOPE — Review requirement changes land on everything you have already shipped, not just the next release. Revisiting your submission checklist early is the safer move",
   ],
 };
 
