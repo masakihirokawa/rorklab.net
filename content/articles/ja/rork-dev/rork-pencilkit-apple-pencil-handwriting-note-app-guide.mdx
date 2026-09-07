@@ -42,7 +42,7 @@ Rork で作るときに最初に決めておきたいのが、SwiftUI レイヤ�
 
 - **View 層（SwiftUI）**: ノート一覧、ツールバー、ページサムネイル
 - **Canvas 層（UIViewRepresentable）**: PKCanvasView と PKToolPicker の橋渡し
-- **Document 層（@Observable）**: PKDrawing と Page の状態管理。Undo/Redo はここに寄せる
+- **Document 層（@Observable）**: PKDrawing と Page の状態管理、そして Undo/Redo の集約先
 - **Persistence 層**: ローカル（FileManager）と CloudKit を抽象化したリポジトリ
 
 Rork Max にプロンプトを投げるときも、この4層を明示してあげると生成コードがブレません。「`PKCanvasView` を SwiftUI で扱える `CanvasRepresentable` を作って、`PKDrawing` を `@Bindable` の Document に流し込んでください」という指定の仕方をすると、後段の同期実装まで一貫性が保てます。
@@ -120,7 +120,7 @@ struct CanvasRepresentable: UIViewRepresentable {
 Apple Pencil Pro（第3世代相当）になってから、開発者が拾える入力チャネルが3つ増えました。
 
 - **Squeeze**: 軸を握り込むジェスチャ。`UIPencilInteraction` に `.squeeze` フェーズで届きます
-- **Barrel Roll**: ペンを軸方向に回転させる。ストローク中の `.azimuth` と `.altitude` が更新されます
+- **Barrel Roll**: ペンを軸方向に回す動き。ストローク中の `.azimuth` と `.altitude` が更新されます
 - **Hover**: ペン先が画面に近付いたが触れていない状態。`UIHoverGestureRecognizer` で取得します
 
 Squeeze をどう使うかは設計判断ですが、私は「ツールクイック切替（ペン↔消しゴム）」と「ツールピッカー表示トグル」をユーザーが設定で選べるようにしています。Procreate Dreams や純正メモアプリも似た思想で、Squeeze を「現在のコンテキストで一番呼びたい操作」のショートカットに割り当てるのが自然です。
@@ -221,7 +221,7 @@ struct PageRepository {
 
 ## ステップ4: CloudKit で端末間同期を実装する
 
-iPad で書いたノートが iPhone でも見られる。これは手書きノートアプリでは事実上必須の体験です。
+iPad で書いたノートが iPhone でもそのまま開けることは、手書きノートアプリでは事実上必須の体験です。
 
 私は Core Data + CloudKit、Realm + Atlas、Supabase など何度か乗り換えましたが、Apple 純正のシンプルさと iCloud 直結のオンボーディング楽さでは CloudKit 直叩きが今も強いと感じます。`PKDrawing` は数 MB に達することもあるので、レコードに直接埋めるのではなく `CKAsset` として送るのが正解です。
 
@@ -273,7 +273,152 @@ final class CloudPageSync {
 
 実装で詰まりがちなのが、**「保存即同期」をしてしまうとバッテリーと帯域を食う**問題です。私は `actor` で 5 秒の debounce バッファを持たせ、ストロークが落ち着いたら 1 リクエストにまとめて送るようにしています。
 
-もう1つ重要なのが、競合解決です。同じノートを iPad と iPhone で同時に開いて編集された場合、CloudKit は片方を弾きます。`CKError.serverRecordChanged` を捕まえて、サーバー側のレコードを取得し、ストローク単位で merge するのが理想です。最初は「最後に書いた方が勝つ（last writer wins）」で良いので、`updatedAt` の比較で十分です。本格的な merge は `PKDrawing.appending(_:)` を使えば実装できます。
+もう1つ重要なのが、競合解決です。同じノートを iPad と iPhone で同時に開いて編集された場合、CloudKit は片方を弾きます。最初のリリースは「最後に書いた方が勝つ（last writer wins）」、つまり `updatedAt` の比較でも出せます。ただしこの割り切りは、手書きアプリではあとから必ず跳ね返ってきます。次の節で、その跳ね返り方と、`CKError.serverRecordChanged` から三方向マージへ進むときの落とし穴をお伝えします。
+
+## 競合を三方向マージで解く — 祖先レコードは値を持っていません
+
+iPad で書きかけのページを閉じないまま出かけ、移動中に iPhone から同じページへ一行だけ足した日がありました。帰って iPad を開くと、その一行がありません。`last writer wins` のまま出していたので、あとから push した iPad のレコードが iPhone の変更を丸ごと上書きしていたのです。
+
+`CKError.serverRecordChanged` の `userInfo` には三つのレコードが入ります。`CKRecordChangedErrorClientRecordKey`（こちらが送ろうとした版）、`CKRecordChangedErrorServerRecordKey`（サーバーにある版）、そして `CKRecordChangedErrorAncestorRecordKey`（両者が分かれた地点の版）です。名前を見るかぎり、三方向マージの材料は揃っているように読めます。
+
+私もそう読んで実装に入りました。ところが祖先レコードから `record["drawing"]` を取り出すと `nil` が返ってきます。**祖先レコードが運ぶのはシステムフィールドだけで、アプリが書いたフィールドの値は入っていません。** それに気づいたのは、マージ結果が毎回「サーバー側の全ストローク＋こちらの全ストローク」になり、消したはずの線が翌朝よみがえるという報告をいただいたあとでした。
+
+分かれた地点の中身は、自分で控えておくしかありません。push が成功した版をそのままローカルに残す、という素朴な方法で足ります。
+
+```swift
+struct NotePage: Identifiable, Codable {
+    let id: UUID
+    var drawingData: Data
+    var baseDrawingData: Data?   // 直近の push 成功時に控えた分岐点
+    var thumbnailPath: String?
+    var updatedAt: Date
+}
+```
+
+### ストロークに ID がないので、指紋を作ります
+
+`PKStroke` には安定した識別子がありません。そこで、パスの生成時刻・インクの種類と色・制御点の数・最初の点の位置を束ねて指紋にします。同じストロークは端末をまたいでも同じ指紋になり、別のストロークが偶然すべて一致することはまずありません。
+
+```swift
+import PencilKit
+import UIKit
+
+private extension UIColor {
+    /// カラースペースの差を丸めて比較できる文字列にする
+    var strokeKeyString: String {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(format: "%.3f,%.3f,%.3f,%.3f", r, g, b, a)
+    }
+}
+
+struct StrokeKey: Hashable {
+    let createdAt: TimeInterval
+    let inkType: String
+    let color: String
+    let pointCount: Int
+    let origin: String
+
+    init(_ stroke: PKStroke) {
+        createdAt = stroke.path.creationDate.timeIntervalSince1970
+        inkType = stroke.ink.inkType.rawValue
+        color = stroke.ink.color.strokeKeyString
+        pointCount = stroke.path.count
+        let p = stroke.path.first?.location ?? .zero
+        // 端末間の浮動小数差を吸収するため小数第2位で丸める
+        origin = String(format: "%.2f,%.2f", p.x, p.y)
+    }
+}
+```
+
+### 追加と削除を、両側から引き算で取り出す
+
+分岐点さえあれば、それぞれの側が「何を足したか」と「何を消したか」を引き算で出せます。マージ結果は、分岐点から両側の削除を引き、両側の追加を足したものです。
+
+```swift
+func mergeThreeWay(base: PKDrawing, local: PKDrawing, server: PKDrawing) -> PKDrawing {
+    func keyed(_ drawing: PKDrawing) -> [StrokeKey: PKStroke] {
+        Dictionary(drawing.strokes.map { (StrokeKey($0), $0) },
+                   uniquingKeysWith: { first, _ in first })
+    }
+
+    let b = keyed(base), l = keyed(local), s = keyed(server)
+
+    let removedByLocal  = Set(b.keys).subtracting(l.keys)
+    let removedByServer = Set(b.keys).subtracting(s.keys)
+    let survivors = Set(b.keys)
+        .subtracting(removedByLocal)
+        .subtracting(removedByServer)
+
+    let addedByLocal  = Set(l.keys).subtracting(b.keys)
+    let addedByServer = Set(s.keys).subtracting(b.keys)
+
+    var merged: [PKStroke] = survivors.compactMap { b[$0] }
+    merged += addedByLocal.compactMap { l[$0] }
+    merged += addedByServer.compactMap { s[$0] }
+    merged.sort { $0.path.creationDate < $1.path.creationDate }
+
+    return PKDrawing(strokes: merged)
+}
+```
+
+`PKDrawing.appending(_:)` を使わずに配列を組み直しているのには理由があります。`appending` は片方の全ストロークを足すだけで、削除を表現できません。分岐点との差分を取って初めて、「片方で消した線を復活させない」という当たり前の挙動が手に入ります。
+
+**片側に無い線には、消したものと、まだ知らないものの二種類があります。** 分岐点は、その二つを見分けるためだけに置いています。
+
+### 呼び出し側
+
+```swift
+func push(_ page: NotePage) async throws -> NotePage {
+    var page = page
+    do {
+        try await save(page)
+    } catch let error as CKError where error.code == .serverRecordChanged {
+        guard
+            let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord,
+            let asset = serverRecord["drawing"] as? CKAsset,
+            let url = asset.fileURL
+        else { throw error }
+
+        let serverDrawing = try PKDrawing(data: Data(contentsOf: url))
+        let localDrawing  = try page.drawing()
+        // 分岐点が無い初回は、すべてを「追加」として扱う
+        let baseDrawing   = try page.baseDrawingData.map { try PKDrawing(data: $0) } ?? PKDrawing()
+
+        let merged = mergeThreeWay(base: baseDrawing, local: localDrawing, server: serverDrawing)
+        page.drawingData = merged.dataRepresentation()
+        page.updatedAt = Date()
+        try await save(page, into: serverRecord)   // サーバー側レコードに載せ替えて再送
+    }
+    page.baseDrawingData = page.drawingData   // 成功した版が次の分岐点
+    return page
+}
+```
+
+再送のときに `CKRecord` を作り直さず、`userInfo` から受け取ったサーバー側レコードへ値を載せ替えているところが要点です。手元のレコードには古い change tag が残っているため、作り直すと同じ競合をもう一度踏みます。
+
+### マージ結果をキャンバスへ戻すとき
+
+反映するときは、`canvasView.drawing.strokes` へ足すのではなく `canvasView.drawing` ごと差し替えてください。ストローク配列に直接 append すると、`PKToolPicker` の取り消しボタンは押せるのに何も起きない、という状態になります。差し替えたあとは `undoManager?.removeAllActions()` で履歴も畳んでおくと、ユーザーの「取り消し」が他端末で書かれた線まで巻き戻す事故を防げます。
+
+### テストは分岐点の作り方だけを見ます
+
+```swift
+func testMergeKeepsRemoteAdditionAndHonorsLocalDeletion() throws {
+    let a = stroke(at: 0), b = stroke(at: 1), c = stroke(at: 2)
+    let base   = PKDrawing(strokes: [a, b])
+    let local  = PKDrawing(strokes: [a])        // こちらは b を消した
+    let server = PKDrawing(strokes: [a, b, c])  // 相手は c を足した
+
+    let merged = mergeThreeWay(base: base, local: local, server: server)
+    let keys = Set(merged.strokes.map(StrokeKey.init))
+
+    XCTAssertTrue(keys.contains(StrokeKey(c)))   // 相手の追加は残る
+    XCTAssertFalse(keys.contains(StrokeKey(b)))  // こちらの削除は尊重される
+}
+```
+
+この 1 本が緑であれば、同期まわりで本当に困る種類の事故はおおむね防げます。逆にこれが落ちたまま出すと、消したはずの線が翌朝ふいに戻ってきて、原因の切り分けだけで半日を使うことになるかもしれません。
 
 ## ステップ5: 手書きを検索可能にする — Vision で OCR を組み込む
 
@@ -496,12 +641,12 @@ final class NotePageTests: XCTestCase {
 ここまで実装すると、無料／Pro の機能境界をどう引くかという話になります。私の経験上、手書きノート系で転換率が高い境界線は次の3つです。
 
 - **ノート数の上限**: 無料は 5 ノート、Pro で無制限
-- **PDF エクスポート**: 注釈付き PDF の書き出しを Pro 限定にする
-- **OCR 検索**: 手書き検索を Pro 限定にする
+- **PDF エクスポート**: 注釈付き PDF の書き出しを Pro 限定に
+- **OCR 検索**: 手書き検索を Pro 限定に
 
 ここで重要なのは、無料ユーザーにも「これ便利」と感じる十分な体験を提供することです。例えば「3 ノート目を作ろうとしたらいきなりペイウォール」だと、レビューが荒れます。私は「使い始めて 7 日後 + 3 ノート以上書いた人にだけ、初めて控えめに案内する」という設計に落ち着きました。
 
-サブスクの実装そのものは StoreKit 2 が現代では一番楽です。実装の詳細は [Rork × StoreKit 2 で課金を実装する完全ガイド](/articles/rork-dev/rork-max-storekit-2-in-app-purchase) を参照してください。CloudKit 連動の購入状態同期については [RevenueCat × Stripe Web で会員サブスクをまたがって扱う](/articles/rork-dev/rork-revenuecat-stripe-web-unified-subscription-backend-guide) も役に立ちます。
+サブスクの実装そのものは StoreKit 2 が現代では一番楽です。実装の詳細は [Rork × StoreKit 2 で課金を実装する](/articles/rork-dev/rork-max-storekit-2-in-app-purchase) を参照してください。CloudKit 連動の購入状態同期については [RevenueCat × Stripe Web で会員サブスクをまたがって扱う](/articles/rork-dev/rork-revenuecat-stripe-web-unified-subscription-backend-guide) も役に立ちます。
 
 ## 全体を振り返って — 今日からできる最初の一歩
 

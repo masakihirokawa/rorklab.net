@@ -270,7 +270,152 @@ final class CloudPageSync {
 
 The trap most people walk into is "save → sync immediately". That kills battery and bandwidth. I wrap pushes in an `actor` with a 5-second debounce buffer so a flurry of strokes coalesces into a single network request.
 
-The other thing you will eventually need is conflict handling. If the same page is open on iPad and iPhone, CloudKit will reject one of the writes. Catch `CKError.serverRecordChanged`, fetch the remote record, and merge stroke-by-stroke. To start, "last writer wins" using `updatedAt` is acceptable. For real merging, `PKDrawing.appending(_:)` is your friend.
+The other thing you will eventually need is conflict handling. If the same page is open on iPad and iPhone, CloudKit rejects one of the writes. You can ship the first release with "last writer wins" on `updatedAt`, and plenty of apps do. In a handwriting app that shortcut comes back to bite you, though — the next section covers how it bites, and the trap waiting inside `CKError.serverRecordChanged` when you go to fix it.
+
+## Resolving conflicts with a three-way merge — the ancestor record has no values
+
+One afternoon I left a page open on the iPad, added a single line to the same page from my iPhone while I was out, and came back to find that line gone. I was still shipping `last writer wins`, so the iPad record — pushed later — overwrote everything the phone had written.
+
+The `userInfo` of `CKError.serverRecordChanged` carries three records: `CKRecordChangedErrorClientRecordKey` (what you tried to send), `CKRecordChangedErrorServerRecordKey` (what the server holds), and `CKRecordChangedErrorAncestorRecordKey` (the point where the two diverged). Read the names alone and it looks like everything a three-way merge needs is right there.
+
+I read them that way too. Then I pulled `record["drawing"]` off the ancestor and got `nil` back. **The ancestor record carries only system fields — none of the values your app wrote.** What made me look was a report that erased strokes kept coming back the next morning, because every merge was resolving to "all server strokes plus all local strokes."
+
+So the diverging point is something you have to keep yourself. Holding on to the version that last pushed successfully is enough.
+
+```swift
+struct NotePage: Identifiable, Codable {
+    let id: UUID
+    var drawingData: Data
+    var baseDrawingData: Data?   // the version that last pushed cleanly
+    var thumbnailPath: String?
+    var updatedAt: Date
+}
+```
+
+### Strokes have no ID, so give them a fingerprint
+
+`PKStroke` carries no stable identifier. Fingerprint one instead: path creation date, ink type and color, control point count, and the location of the first point. The same stroke fingerprints identically across devices, and two different strokes matching on all five is vanishingly unlikely.
+
+```swift
+import PencilKit
+import UIKit
+
+private extension UIColor {
+    /// Round away color space differences so values compare cleanly
+    var strokeKeyString: String {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(format: "%.3f,%.3f,%.3f,%.3f", r, g, b, a)
+    }
+}
+
+struct StrokeKey: Hashable {
+    let createdAt: TimeInterval
+    let inkType: String
+    let color: String
+    let pointCount: Int
+    let origin: String
+
+    init(_ stroke: PKStroke) {
+        createdAt = stroke.path.creationDate.timeIntervalSince1970
+        inkType = stroke.ink.inkType.rawValue
+        color = stroke.ink.color.strokeKeyString
+        pointCount = stroke.path.count
+        let p = stroke.path.first?.location ?? .zero
+        // Round to two decimals to absorb float differences between devices
+        origin = String(format: "%.2f,%.2f", p.x, p.y)
+    }
+}
+```
+
+### Subtract additions and deletions out of both sides
+
+With a base in hand, each side's additions and deletions fall out of simple set arithmetic. The merged drawing is the base, minus what either side removed, plus what either side added.
+
+```swift
+func mergeThreeWay(base: PKDrawing, local: PKDrawing, server: PKDrawing) -> PKDrawing {
+    func keyed(_ drawing: PKDrawing) -> [StrokeKey: PKStroke] {
+        Dictionary(drawing.strokes.map { (StrokeKey($0), $0) },
+                   uniquingKeysWith: { first, _ in first })
+    }
+
+    let b = keyed(base), l = keyed(local), s = keyed(server)
+
+    let removedByLocal  = Set(b.keys).subtracting(l.keys)
+    let removedByServer = Set(b.keys).subtracting(s.keys)
+    let survivors = Set(b.keys)
+        .subtracting(removedByLocal)
+        .subtracting(removedByServer)
+
+    let addedByLocal  = Set(l.keys).subtracting(b.keys)
+    let addedByServer = Set(s.keys).subtracting(b.keys)
+
+    var merged: [PKStroke] = survivors.compactMap { b[$0] }
+    merged += addedByLocal.compactMap { l[$0] }
+    merged += addedByServer.compactMap { s[$0] }
+    merged.sort { $0.path.creationDate < $1.path.creationDate }
+
+    return PKDrawing(strokes: merged)
+}
+```
+
+There is a reason this rebuilds the array instead of reaching for `PKDrawing.appending(_:)`. Appending only adds one side's strokes wholesale, so it cannot express a deletion at all. Only by diffing against the base do you get the behaviour everyone expects — a line erased on one device stays erased.
+
+**A stroke missing from one side is either something erased or something not yet seen.** The base exists purely to tell those two apart.
+
+### The call site
+
+```swift
+func push(_ page: NotePage) async throws -> NotePage {
+    var page = page
+    do {
+        try await save(page)
+    } catch let error as CKError where error.code == .serverRecordChanged {
+        guard
+            let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord,
+            let asset = serverRecord["drawing"] as? CKAsset,
+            let url = asset.fileURL
+        else { throw error }
+
+        let serverDrawing = try PKDrawing(data: Data(contentsOf: url))
+        let localDrawing  = try page.drawing()
+        // With no base yet, treat everything as an addition
+        let baseDrawing   = try page.baseDrawingData.map { try PKDrawing(data: $0) } ?? PKDrawing()
+
+        let merged = mergeThreeWay(base: baseDrawing, local: localDrawing, server: serverDrawing)
+        page.drawingData = merged.dataRepresentation()
+        page.updatedAt = Date()
+        try await save(page, into: serverRecord)   // re-send on the server's record
+    }
+    page.baseDrawingData = page.drawingData   // the version that landed becomes the next base
+    return page
+}
+```
+
+The important detail is re-sending on the record handed to you in `userInfo` rather than building a fresh `CKRecord`. Your local copy still holds a stale change tag, so rebuilding it walks straight back into the same conflict.
+
+### Putting the merged result back on the canvas
+
+Replace `canvasView.drawing` wholesale instead of appending into `canvasView.drawing.strokes`. Appending directly into the stroke array leaves the `PKToolPicker` undo buttons tappable but inert. After swapping the drawing in, call `undoManager?.removeAllActions()` so a user's undo cannot roll back strokes that were written on another device.
+
+### The test only checks how the base is used
+
+```swift
+func testMergeKeepsRemoteAdditionAndHonorsLocalDeletion() throws {
+    let a = stroke(at: 0), b = stroke(at: 1), c = stroke(at: 2)
+    let base   = PKDrawing(strokes: [a, b])
+    let local  = PKDrawing(strokes: [a])        // we erased b
+    let server = PKDrawing(strokes: [a, b, c])  // they added c
+
+    let merged = mergeThreeWay(base: base, local: local, server: server)
+    let keys = Set(merged.strokes.map(StrokeKey.init))
+
+    XCTAssertTrue(keys.contains(StrokeKey(c)))   // their addition survives
+    XCTAssertFalse(keys.contains(StrokeKey(b)))  // our deletion is respected
+}
+```
+
+Keep that one test green and the sync bugs that actually hurt mostly stay away. Ship without it and you may find yourself losing half a day to strokes that quietly reappear overnight.
 
 ## Step 5: make handwriting searchable with Vision
 
