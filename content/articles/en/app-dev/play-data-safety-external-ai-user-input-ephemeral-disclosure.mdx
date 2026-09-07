@@ -1,0 +1,236 @@
+---
+title: "Sending user text to an external AI: what actually goes in Play's Data safety form"
+slug: "play-data-safety-external-ai-user-input-ephemeral-disclosure"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-09-07T11:00"
+updated: "2026-09-07T11:00"
+author: "Rork Lab"
+description: "Classifying user input sent to an external AI as collected, shared, or ephemeral in Play's Data safety form, plus a redaction ordering bug found by running the code."
+tags: ["Google Play", "Data safety", "Privacy", "AI", "Indie development", "Android"]
+highlights:
+  - "You will be able to inventory everything your app sends off device, including the traffic your own code never wrote"
+  - "You will avoid the rejection loop that comes from assuming ephemeral processing means you can leave the answer blank"
+  - "You will be able to decide whether user input sent to an external model counts as collected, shared, or ephemeral, based on the recipient's retention window"
+---
+
+I added a small text box to an app: write down what is bothering you, and an AI tidies it up and hands it back. The implementation took half a day. What stopped me was the step after that. I opened the Data safety section in Play Console and sat there, unsure which row this text box belonged to.
+
+Nothing gets stored on my own server. The text goes to an external model, the reply is rendered, and that is the end of it. So "not collected" should be fine — that was my first instinct.
+
+It was not enough. The classification does not hinge on whether I keep the data. It hinges on what the recipient does with it. I ship a handful of apps as an indie developer, and before I understood that, I pushed several updates where the form and the actual traffic had quietly drifted apart. Here is the order I now work through.
+
+## Whether it counts as "shared" depends on the recipient, not the sender
+
+In Play's vocabulary, data leaving the device is *collected*, and data reaching a third party is *shared*. The part that trips people up is the second one.
+
+Transmission alone does not settle it. What matters is whether the recipient uses the data **for their own purposes**, and **how long they hold it**. Ad targeting, cross-app profiling, benchmarking — if any of those apply on their side, it is sharing.
+
+External AI providers sit right on that line. Most state that API traffic is not used for training, yet retaining logs for a fixed window to monitor abuse is common practice. "Not used for training" and "not retained" are two different claims.
+
+**My code decides what gets sent. The recipient's retention window decides how it gets declared.** I reread that line every time I add a destination.
+
+There is a harder part, too: your own `fetch` calls are not the only way out. Ad SDKs and crash reporters each make their own decisions. If an SDK in your app collects or shares data, that belongs in the form as well. I walked through auditing the SDK chain in [auditing the Privacy Manifest of a Rork-generated Expo app all the way down the SDK chain](/en/articles/rork-dev/rork-privacy-manifest-sdk-chain-pre-review-audit-workflow).
+
+## Ephemeral does not mean you skip the question
+
+Here is the second thing I had backwards.
+
+Play recognises *ephemeral processing*: data sent off device, held only in memory, and kept no longer than needed to serve that request in real time. The canonical example is a weather app passing location to fetch a local forecast.
+
+The crucial detail is that ephemerally processed data **still gets answered in the form**. What meeting the standard buys you is that the item is not surfaced on your store listing. It does not buy you a blank field.
+
+Read it as "ephemeral, so I don't have to write it" and you ship a form that disagrees with your app's behaviour — a disagreement you will not notice until review points at it. For a while I skipped that same field on every update.
+
+Ephemeral status is also fragile in a way that has nothing to do with policy. The moment you log a request and response to check an answer, the "not retained" premise is gone. A debugging line can change the classification.
+
+## Route everything outbound through one place
+
+To avoid redoing the inventory each release, I narrowed the exit. No scattered `fetch` calls across screens — one function, with each destination's properties held in the type.
+
+```ts
+// src/net/outbound.ts
+// Everything leaving the app goes through here.
+// The destination declaration doubles as a draft of the Data safety form.
+
+export type Retention = "none" | "shortTerm" | "persisted";
+
+export type Destination = {
+  id: string;                 // human-readable name used in the form
+  host: string;               // where it actually goes
+  retention: Retention;       // how long they keep it (from their docs, not a guess)
+  usedByThirdParty: boolean;  // do they use it for their own purposes
+};
+
+export const DESTINATIONS = {
+  assistant: {
+    id: "Text tidy-up assistant",
+    host: "api.example-model.com",
+    retention: "shortTerm",   // docs state logs are held for abuse monitoring
+    usedByThirdParty: false,
+  },
+} satisfies Record<string, Destination>;
+
+type SendOptions = {
+  destination: Destination;
+  body: unknown;
+  signal?: AbortSignal;
+};
+
+export async function sendOutbound({ destination, body, signal }: SendOptions) {
+  const startedAt = Date.now();
+  const requestId = Math.random().toString(36).slice(2, 10);
+
+  try {
+    const res = await fetch(`https://${destination.host}/v1/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) throw new Error(`upstream ${res.status}`);
+    return await res.json();
+  } finally {
+    // The payload never reaches the log. Only what tracing needs.
+    console.log(
+      `[outbound] id=${requestId} to=${destination.id} ms=${Date.now() - startedAt}`
+    );
+  }
+}
+```
+
+Drafting the form got easier once this was in place. Reading `DESTINATIONS` top to bottom gives you destination, retention and third-party use in one column. And because a new entry will not typecheck without `retention`, you cannot ship a destination you never looked up.
+
+The quiet win is what the `finally` block leaves out. Put `body` in there and the user's text lives on in the device log. The ephemeral premise has to hold on your side too, not just theirs.
+
+## Get the redaction order wrong and half of it survives
+
+Before sending, strip what you do not need. This is where I actually tripped.
+
+I wrote a function to mask email addresses, phone numbers and long digit strings, then ran it over a sample. The input:
+
+```
+The save button freezes the screen since last week's update.
+Reach me at taro.example@example.com or 090-1234-5678.
+Receipt 4901234567890 shows the same symptom.
+Device is iPhone 15 Pro, app v2.1.0.
+```
+
+Replacing in the order email → phone → long digits produced this:
+
+```
+Reach me at [email] or [phone].
+Receipt 49[phone] shows the same symptom.
+```
+
+The receipt became `49[phone]`. The Japanese phone pattern consumed the `0123456789` slice first, leaving the leading `49` sitting in the payload in the clear. I thought I had masked it. I had masked most of it.
+
+The cause was ordering, nothing more. Settle long digit runs first and the phone pattern has nothing left to cut into:
+
+```ts
+// src/net/redact.ts
+const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+const LONG_DIGITS = /\d{10,}/g;   // order and membership numbers, unhyphenated
+const PHONE_JP = /(?:\+81[-\s]?|0)\d{1,4}[-\s]?\d{1,4}[-\s]?\d{3,4}/g;
+
+export function redact(input: string) {
+  const hits = { email: 0, longDigits: 0, phone: 0 };
+  let out = input.replace(EMAIL, () => { hits.email++; return "[email]"; });
+  out = out.replace(LONG_DIGITS, () => { hits.longDigits++; return "[number]"; }); // settle first
+  out = out.replace(PHONE_JP, () => { hits.phone++; return "[phone]"; });
+  return { text: out, hits, before: [...input].length, after: [...out].length };
+}
+```
+
+Same input, rerun:
+
+```
+Reach me at [email] or [phone].
+Receipt [number] shows the same symptom.
+Device is iPhone 15 Pro, app v2.1.0.
+
+{"beforeChars":146,"afterChars":118,"email":1,"longDigits":1,"phone":1}
+```
+
+146 characters down to 118 — roughly 19% shorter — with one email, one long digit run and one phone number removed. Returning the counts is worth the two extra lines — later you can look at how much a given screen typically strips.
+
+I also checked the opposite failure. Version strings like `v2.1.0`, the date `2026-09-07`, `iOS 27`, `0.5s`, the crash code `0x8badf00d` and the resolution `1080x1920` all passed through untouched. The parts that make a bug report useful survive.
+
+Redaction always looks correct on the page you wrote it on. You cannot judge it until you run real text through and read the before and after side by side.
+
+## Count your outbound hosts in a dev build
+
+A destination declaration is only half the picture. Traffic your own code never wrote will not appear in it.
+
+In dev builds I wrap `fetch` and collect hostnames.
+
+```ts
+// src/dev/outboundAudit.ts
+// Dev builds only. This never ships.
+
+const seen = new Map<string, number>();
+
+export function installOutboundAudit() {
+  if (!__DEV__) return;
+  const original = global.fetch;
+
+  global.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    try {
+      const host = new URL(url).host;
+      seen.set(host, (seen.get(host) ?? 0) + 1);
+    } catch {
+      // relative URLs are not counted
+    }
+    return original(input, init);
+  };
+}
+
+export function dumpOutboundHosts() {
+  const rows = [...seen.entries()].sort((a, b) => b[1] - a[1]);
+  console.log("[outbound-audit] " + JSON.stringify(Object.fromEntries(rows)));
+}
+```
+
+Walk the whole app once, call `dumpOutboundHosts()`, and reconcile the list against your declarations. Native-side traffic that bypasses `fetch` will not show up, so treat this as a starting point rather than a complete picture. Even so, one unrecognised host is enough to send you into that SDK's documentation, which is exactly where the answer lives.
+
+For the ordering of consent prompts at startup, I covered that in [the production guide to Rork with AdMob UMP and ATT consent management](/en/articles/rork-dev/rork-gdpr-ump-att-consent-management-production-guide).
+
+## The table I use to pick a classification
+
+Three columns per destination, filled in before I choose a row.
+
+<table>
+<thead>
+<tr><th>What is sent</th><th>Recipient's handling</th><th>Form classification</th><th>Store listing</th></tr>
+</thead>
+<tbody>
+<tr><td>User-written text</td><td>In memory only, no retention</td><td>Collected / qualifies as ephemeral</td><td>Not displayed</td></tr>
+<tr><td>User-written text</td><td>Logged for a period to monitor abuse</td><td>Collected / not ephemeral</td><td>Displayed</td></tr>
+<tr><td>User-written text</td><td>Also used for the recipient's own purposes</td><td>Collected and shared</td><td>Displayed</td></tr>
+<tr><td>Advertising ID (via ad SDK)</td><td>Used for targeting</td><td>Shared (device ID)</td><td>Displayed</td></tr>
+<tr><td>Crash logs</td><td>Retained by the reporting service</td><td>Collected (app performance)</td><td>Displayed</td></tr>
+</tbody>
+</table>
+
+The gap between row one and row two is the point of this whole piece. The text is identical; only the recipient's retention window differs, and that alone changes what appears on your listing. Which is why the thing to check is not your code but their terms and their retention documentation.
+
+When retention is unstated, or an enquiry does not produce a firm answer, I declare it as retained. Over-declaring and trimming later keeps releases moving. Under-declaring and getting sent back does not.
+
+## Four questions before I save the form
+
+1. Does the audit log show a host that is missing from my destination declarations?
+2. Did I compare before and after on real text, not a contrived string?
+3. Is the payload still sitting in a debug log somewhere?
+4. Did I confirm retention from the provider's own documentation rather than a secondhand summary?
+
+Question three catches me most often. A log line added while chasing a bug has a way of staying. I now pair the `console.log` sweep with the form review rather than treating them as separate chores.
+
+If you ship several apps from one codebase, the destinations differ per app while the form gets copied wholesale from last time. I touched on that trap in [the one-page value manifest I keep for a second app built from the same codebase](/en/articles/rork-business/sibling-app-distinct-value-manifest-play-low-value-review).
+
+## What to do next
+
+Walk your shipping app end to end in a dev build and write down the outbound hosts. Declarations and redaction can come after. Reverse the order and you end up declaring what you imagine your app does rather than what you have observed.
+
+Wiring in an external AI is half a day of work now. The slow part is getting to where you can describe, in your own words, what your app is sending. I am still partway through that inventory myself, but narrowing the exit to a single function is the decision I have been glad of. Thank you for reading.
