@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SPLIT — Rork は2本立てです。標準の Rork は React Native を生成し、2026年2月に出た Rork Max は別製品としてネイティブ Swift を生成します",
-    "MAX — Rork Max は月額 $200 と報じられています。クラウド上の Mac でのコンパイルから App Store 公開まで含み、Vision Pro や iMessage にも届きます",
-    "PLANS — 標準版は無料枠に加えて Junior $25、Middle $50、Senior $100、その上に Scale。数えるのはトークンではなくメッセージ数です",
-    "COUNT — 1メッセージでどれだけ進むかは指示の書き方で大きく変わります。プランを比べるなら、実際に何メッセージ要ったかを測るのがいちばん確かです",
-    "STORE — 2026年9月から、App Store への提出時と代替配布の公証申請時に新しい質問票への回答が必須になります。年齢レーティングと Time Allowances の挙動を決めるものです",
-    "SCOPE — 審査要件の変更は、次に出すアプリだけでなく、すでに公開しているアプリすべてに降りてきます。公開手順の見直しは早めが安全です",
+    "EVENT — 本日9月9日、Apple が「Surprise and Shine」と題したイベントを開きます。日本時間では9月10日の未明2時からです",
+    "EXPECT — iPhone 18 Pro と Pro Max、折りたたみ機、2nm プロセスの A20 Pro チップ、そして iOS 27 以下の配信日発表が見込まれています",
+    "WAIT — この記事を書いている時点ではまだ開催前です。噂の段階で書いたものと発表後に書いたものが混ざると、読む側には区別がつきません",
+    "MAX — Rork Max がネイティブ Swift を生成する以上、Apple の動きは他人事ではありません。標準の Rork は React Native、という線引きは繰り返し確認したいところです",
+    "SIMULATOR — Rork Max はクラウド上の Mac でコンパイルし、ブラウザ内で動くストリーミングの iOS シミュレータで確認できます。Xcode も Mac の実機も要りません",
+    "SEASON — OS が新しくなる時期は、自動生成の足場がいちばん揺れます。便利さを謳う記事ほど、この揺れに触れないと不誠実になると感じています",
   ],
   en: [
-    "SPLIT — Rork comes in two lines. The standard product generates React Native, while Rork Max, launched in February 2026, is a separate product that writes native Swift",
-    "MAX — Rork Max is reported at $200 a month, covering compilation on cloud Macs through App Store publishing, and reaching Vision Pro and iMessage",
-    "PLANS — The standard tiers run free, Junior at $25, Middle at $50, Senior at $100, with Scale above that. What gets counted is messages, not tokens",
-    "COUNT — How far a single message takes you depends heavily on how you write the prompt. The honest way to compare plans is to measure the messages an actual build took",
-    "STORE — From September 2026, App Store submissions and notarization requests require a new questionnaire that sets age ratings and Time Allowances behavior",
-    "SCOPE — Review requirement changes land on everything you have already shipped, not just the next release. Revisiting your submission checklist early is the safer move",
+    "EVENT — Apple holds its Surprise and Shine event today, September 9, starting at 10:00 Pacific. That lands in the small hours of September 10 in Japan",
+    "EXPECT — Expected are the iPhone 18 Pro and Pro Max, a foldable, the 2nm A20 Pro chip, and release dates for iOS 27 and its sibling updates",
+    "WAIT — As this is written the event has not happened yet. Rumor-stage writing and post-announcement writing look identical once they are mixed together",
+    "MAX — Since Rork Max generates native Swift, Apple news is not somebody else's problem. Worth repeating that the standard product still writes React Native",
+    "SIMULATOR — Rork Max compiles on cloud Macs and lets you check the result in a streaming iOS simulator inside the browser, with no Xcode and no Mac hardware",
+    "SEASON — A new OS is when automated build pipelines wobble most. An article selling convenience owes its readers a word about that wobble",
   ],
 };
 
