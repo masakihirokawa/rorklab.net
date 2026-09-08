@@ -651,7 +651,122 @@ const embeddingResponse = await fetch(
 // Expected output: array of 512 floating-point numbers
 ```
 
-Remember to update both the table definition and index if you change the dimension count.
+### Changing Dimensions Without Taking Search Down
+
+"Update the table definition and the index too." I left it at that one line for a long time, and it caught me out.
+
+Deploy code that passes `dimensions: 512` while the column is still `vector(1536)`, and pgvector answers on the first write:
+
+```text
+ERROR: expected 1536 dimensions, not 512
+```
+
+A pgvector column's type includes its dimension count. Changing only the sending side doesn't work. And here's the part that took me a while to see: **the `vector(1536)` you wrote in the function signature isn't enforced.** PostgreSQL treats type modifiers on function parameters as declaration only, so fixing the RPC signature lets a dimension mismatch sail straight through. The column type is the only thing that stops it.
+
+Rewriting the live column with `alter column ... type vector(512)` isn't an option either — every existing 1536-dimensional vector disappears the moment you run it, and search returns nothing for as long as the rebuild takes. To a user, that's an outage.
+
+What I settled on is a shadow column, with each row carrying its own record of which generation of embedding it holds.
+
+```sql
+-- Add the new dimension as a nullable column; existing rows are untouched
+alter table products add column if not exists embedding_512 vector(512);
+
+-- Record which generation of embedding a row holds
+alter table products add column if not exists embedding_version smallint default 1;
+
+-- Partial index so remaining work is one SQL query away
+create index if not exists products_embedding_512_pending_idx
+  on products (id)
+  where embedding_512 is null;
+```
+
+Don't backfill in one pass. Take only the rows that aren't filled yet, in chunks small enough to finish inside an Edge Function's timeout.
+
+```typescript
+// Called by cron every five minutes until it returns done
+async function backfillTo512(supabase: SupabaseClient, batchSize = 200) {
+  const { data: rows } = await supabase
+    .from("products")
+    .select("id, name, category, description")
+    .is("embedding_512", null)
+    .limit(batchSize);
+
+  if (!rows?.length) return { done: true, processed: 0 };
+
+  const res = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: rows.map((r) => `${r.name}\n${r.category}\n${r.description}`),
+      dimensions: 512,
+    }),
+  });
+  const { data } = await res.json();
+
+  await Promise.all(
+    rows.map((r, i) =>
+      supabase
+        .from("products")
+        .update({ embedding_512: data[i].embedding, embedding_version: 2 })
+        .eq("id", r.id)
+        // Don't overwrite if another path filled it during the round trip
+        .is("embedding_512", null)
+    )
+  );
+  // Expected output: { done: false, processed: 200 }
+  return { done: false, processed: rows.length };
+}
+```
+
+Build the index after the backfill finishes. Indexing an empty column means paying construction cost on every single insert that follows.
+
+```sql
+-- Once every row is filled, build without blocking writes
+create index concurrently products_embedding_512_hnsw
+  on products using hnsw (embedding_512 vector_cosine_ops)
+  with (m = 16, ef_construction = 64);
+```
+
+`concurrently` cannot run inside a transaction. The Supabase SQL editor wraps statements in one, so this particular statement is best run through psql. I got rejected twice before I understood why.
+
+The cutover replaces only the body of the RPC. Not a line of app code changes.
+
+```sql
+create or replace function match_products(
+  query_embedding vector(512),
+  match_threshold float,
+  match_count int
+)
+returns table (id bigint, name text, similarity float)
+language sql stable
+as $$
+  select p.id, p.name, 1 - (p.embedding_512 <=> query_embedding) as similarity
+  from products p
+  where p.embedding_512 is not null
+    and 1 - (p.embedding_512 <=> query_embedding) > match_threshold
+  order by p.embedding_512 <=> query_embedding
+  limit match_count;
+$$;
+```
+
+Drop the old column last. The temptation is to shorten the overlap — I cut mine over after two days, and only noticed five days later that recall had slipped for queries containing proper nouns. Now I keep both columns for a week, logging recall@10 side by side, before I throw anything away.
+
+```sql
+-- Only after a week of agreement between the two columns
+alter table products drop column embedding;
+alter table products rename column embedding_512 to embedding;
+```
+
+Right after the rename, run `create or replace` on the RPC once more. The function body doesn't follow a renamed column on its own.
+
+Knowing the size of the move helps you commit to it. A stored vector is `float4` at 4 bytes per dimension plus an 8-byte header: 6,152 bytes at 1536 dimensions, 2,056 bytes at 512. For 120,000 rows that works out to roughly 704 MB becoming 235 MB, before TOAST and fill factor. The backfill costs one full pass of embedding — about $0.43 under this article's assumptions. You pay it once, and every query and every gigabyte after that is lighter.
+
+**A dimension is a type, and types are things you migrate.** Swapping the embedding model itself follows exactly the same steps.
+
 
 ## Choosing Between HNSW and IVFFlat by Measurement
 
@@ -905,6 +1020,10 @@ One caveat if your content isn't English: `to_tsvector` relies on a dictionary a
 
 If you see `ERROR: column "embedding" is of type vector but expression is of type text`, the vector data is being sent as a string. The Supabase JavaScript client automatically casts arrays to the `vector` type when you pass them directly — make sure you're not wrapping the array in `JSON.stringify`.
 
+### Dimension Mismatch
+
+`ERROR: expected 1536 dimensions, not 512` means the vector you're sending doesn't match the column's declared dimension count. It shows up the moment you change the `dimensions` parameter, and the migration path is in "Changing Dimensions Without Taking Search Down" above. Because the dimension written into the function signature is never checked, this error always surfaces at write time rather than at call time.
+
 ### Edge Function Timeouts
 
 When the OpenAI API is slow, Edge Functions can time out. For batch processing, keep each invocation under 50 items and design your workflow to make multiple calls as needed.
@@ -922,7 +1041,7 @@ reindex index products_embedding_idx;
 
 Getting pgvector to run takes a few lines of SQL and one Edge Function. The hard part comes after: **continuously proving to yourself that the approximation isn't dropping results.**
 
-Measure recall@10 whenever you add an index. Rebuild embeddings only for rows whose content hash moved. Let full-text search cover the proper nouns your vectors blur together, and fuse the two by rank. Put those three in from the start and the design survives a tenfold increase in data.
+Measure recall@10 whenever you add an index. Rebuild embeddings only for rows whose content hash moved. Let full-text search cover the proper nouns your vectors blur together, and fuse the two by rank. Put those three in from the start and the design survives a tenfold increase in data. When the day comes to change dimensions or models, start by adding one shadow column.
 
 For your next step, write just twenty evaluation queries and measure recall@10 against the search you're running in production today. The number will tell you where to start.
 

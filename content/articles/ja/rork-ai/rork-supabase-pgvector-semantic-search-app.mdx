@@ -18,16 +18,16 @@ highlights:
 
 自分の癒し系アプリに検索窓を付けた初日、「眠れない夜に見たい」と入力されたログが残っていました。返ってきた結果は 0 件。データベースには「静寂」「月あかり」「安眠」とタグ付けされた画像が何百枚もあったのに、キーワードが一文字も一致しなかったのです。
 
-言葉ではなく意味で引き当てる仕組みが要る。そう腹に落ちてから、pgvector に手を伸ばしました。
+キーワードではなく意味で引き当てる仕組みが要るのだと、そのログを眺めながら腹に落ちました。pgvector に手を伸ばしたのは、その翌日のことです。
 
 ここでは Rork で構築したモバイルアプリに **Supabase pgvector** を組み込み、セマンティック検索と AI レコメンデーションを実装します。個人開発の規模（十数万件のレコード、Supabase の小さなインスタンス）でも破綻しない構成を前提にしております。Supabase の認証やリアルタイム機能については [Rork × Supabase 認証＆リアルタイム機能実装ガイド](/articles/rork-dev/rork-supabase-auth-realtime-guide) をご覧ください。
 
 構築するアプリの全体像は次の通りです。
 
-1. ユーザーが検索クエリを自然言語で入力する
-2. Supabase Edge Function が OpenAI Embeddings API でクエリをベクトル化する
-3. pgvector がコサイン類似度でデータベースを検索する
-4. 結果をスコア付きで Rork アプリに返却する
+1. ユーザーによる自然言語の検索クエリ入力
+2. Supabase Edge Function での OpenAI Embeddings API を用いたクエリのベクトル化
+3. pgvector によるコサイン類似度検索
+4. スコア付きの結果を Rork アプリへ返却
 
 動かすだけなら、ここまでで足ります。実運用に載せた瞬間に効いてくるのは、この後半で扱うインデックスの選び方と、埋め込みをいつ作り直すかの判断です。
 
@@ -651,7 +651,122 @@ const embeddingResponse = await fetch(
 // 期待する出力: 512次元の浮動小数点数配列
 ```
 
-次元を変更する場合は、テーブル定義とインデックスも合わせて変更が必要です。
+### 次元を変えるときは、無停止で移す
+
+「テーブル定義とインデックスも合わせて変える」——長らくこの一行で済ませていて、一度足をすくわれました。
+
+`dimensions: 512` を指定したコードを、`vector(1536)` のカラムを持ったままデプロイすると、最初の書き込みで pgvector がこう返します。
+
+```text
+ERROR: expected 1536 dimensions, not 512
+```
+
+pgvector のカラムは、次元数まで含めて型です。送る側だけ変えても通りません。ここで一つ、気づくまで時間のかかったことがあります。**関数の引数に書いた `vector(1536)` は、PostgreSQL では強制されません。** 関数パラメータの型修飾子は宣言としてしか働かないので、RPC の署名を直しても次元の取り違えは素通りします。止めてくれるのはカラム側の型だけです。
+
+かといって本番のカラムを `alter column ... type vector(512)` で作り替えれば、既存の 1536 次元のベクトルはその場で失われます。十数万件を埋め直しているあいだ、検索は 0 件を返し続ける——利用者から見れば障害です。
+
+私は影のカラムを一本足して、どちらの世代の埋め込みが入っているかをレコード自身に持たせる形に落ち着きました。
+
+```sql
+-- 新しい次元のカラムを NULL 許容で追加する（既存行には触れない）
+alter table products add column if not exists embedding_512 vector(512);
+
+-- どの世代の埋め込みが入っているかを記録する
+alter table products add column if not exists embedding_version smallint default 1;
+
+-- 残件を数えるための部分インデックス（進捗が SQL 一本で見える）
+create index if not exists products_embedding_512_pending_idx
+  on products (id)
+  where embedding_512 is null;
+```
+
+埋め直しは一気にやりません。まだ入っていない行だけを、Edge Function のタイムアウトに収まる粒度で少しずつ進めます。
+
+```typescript
+// cron から 5 分おきに叩き、done が返るまで繰り返す
+async function backfillTo512(supabase: SupabaseClient, batchSize = 200) {
+  const { data: rows } = await supabase
+    .from("products")
+    .select("id, name, category, description")
+    .is("embedding_512", null)
+    .limit(batchSize);
+
+  if (!rows?.length) return { done: true, processed: 0 };
+
+  const res = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small",
+      input: rows.map((r) => `${r.name}\n${r.category}\n${r.description}`),
+      dimensions: 512,
+    }),
+  });
+  const { data } = await res.json();
+
+  await Promise.all(
+    rows.map((r, i) =>
+      supabase
+        .from("products")
+        .update({ embedding_512: data[i].embedding, embedding_version: 2 })
+        .eq("id", r.id)
+        // 往復のあいだに別経路で埋まっていたら上書きしない
+        .is("embedding_512", null)
+    )
+  );
+  // 期待する出力: { done: false, processed: 200 }
+  return { done: false, processed: rows.length };
+}
+```
+
+インデックスは埋め直しが終わってから貼ります。空のカラムに先に貼ると、行が入るたびに構築のコストを払うことになるからです。
+
+```sql
+-- 全行が埋まってから、書き込みを止めずに構築する
+create index concurrently products_embedding_512_hnsw
+  on products using hnsw (embedding_512 vector_cosine_ops)
+  with (m = 16, ef_construction = 64);
+```
+
+`concurrently` はトランザクションの中では実行できません。Supabase の SQL エディタは文をトランザクションで包むため、ここだけは psql で接続して流すのが確実です。私はこれを知らずに二度弾かれました。
+
+切り替えは RPC の中身だけを差し替えます。呼び出し側のアプリは一行も変えません。
+
+```sql
+create or replace function match_products(
+  query_embedding vector(512),
+  match_threshold float,
+  match_count int
+)
+returns table (id bigint, name text, similarity float)
+language sql stable
+as $$
+  select p.id, p.name, 1 - (p.embedding_512 <=> query_embedding) as similarity
+  from products p
+  where p.embedding_512 is not null
+    and 1 - (p.embedding_512 <=> query_embedding) > match_threshold
+  order by p.embedding_512 <=> query_embedding
+  limit match_count;
+$$;
+```
+
+古いカラムを落とすのは最後です。並走の期間は短くしたくなります。私も最初は 2 日で切り替えてしまい、固有名詞を含むクエリだけ recall が落ちていたことに気づいたのは、その 5 日後でした。いまは 1 週間、両方のカラムで recall@10 を並べて記録してから捨てるようにしております。
+
+```sql
+-- 1 週間の並走で数字が落ちていないことを確かめてから
+alter table products drop column embedding;
+alter table products rename column embedding_512 to embedding;
+```
+
+リネームの直後は、`embedding_512` を参照している RPC をもう一度 `create or replace` してください。カラム名だけが変わっても、関数本体は追随しません。
+
+移行の重さも見積もっておくと踏ん切りがつきます。1 行あたりのベクトルは `float4` 4 バイト × 次元数 + 8 バイトのヘッダですから、1536 次元で 6,152 バイト、512 次元で 2,056 バイト。12 万件ならおよそ 704 MB が 235 MB になる計算です（TOAST や FILLFACTOR の分は含みません）。埋め直しの費用は全件を一度ベクトル化する分だけで、この記事の条件なら $0.43 前後。一度きりの支払いで、以後のクエリとストレージが恒久的に軽くなります。
+
+**次元は型であり、型は移行対象です。** 埋め込みモデルそのものを差し替えるときも、手順はこれと同じでした。
+
 
 ## HNSW と IVFFlat を実測で選ぶ
 
@@ -905,6 +1020,10 @@ $$;
 
 `ERROR: column "embedding" is of type vector but expression is of type text` が出る場合は、ベクトルデータが文字列として送信されています。Supabase JavaScript クライアントでは、配列を直接渡せば自動で `vector` 型にキャストされます。
 
+### 次元数の不一致
+
+`ERROR: expected 1536 dimensions, not 512` は、送っているベクトルの次元とカラムの型が食い違っています。`dimensions` パラメータを変えたときに起きるもので、直し方は「次元を変えるときは、無停止で移す」の節にまとめました。関数の引数に書いた次元は検査に使われないため、エラーは必ず書き込みの瞬間に出ます。
+
 ### Edge Function のタイムアウト
 
 OpenAI API の応答が遅い場合、Edge Function がタイムアウトすることがあります。バッチ処理では、1 回の呼び出しで処理する件数を 50 件以内に抑え、必要に応じて複数回呼び出す設計にしてください。
@@ -922,7 +1041,7 @@ reindex index products_embedding_idx;
 
 pgvector を動かすところまでは、SQL 数行と Edge Function 一本で辿り着けます。難しいのはその先、**近似で取りこぼしていないかを自分で測り続けること**でした。
 
-インデックスを貼ったら recall@10 を測る。埋め込みは content_hash で差分だけ作り直す。固有名詞はベクトルに任せず全文検索と順位を融合する。この 3 つを最初から入れておけば、データが 10 倍になっても設計は持ちこたえます。
+インデックスを貼ったら recall@10 を測ります。埋め込みは content_hash を見て差分だけ作り直します。固有名詞はベクトルに任せず、全文検索と順位を融合します。この 3 つを最初から入れておけば、データが 10 倍になっても設計は持ちこたえてくれるのだと感じています。次元やモデルを変える日が来たら、影のカラムを一本足すところから始めてください。
 
 次の一歩として、まずは評価クエリを 20 本だけ書き出して、いま本番で動いている検索の recall@10 を測ってみてください。数字が出た瞬間に、どこから直すべきかが決まります。
 
