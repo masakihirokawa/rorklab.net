@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EVENT — 本日9月9日、Apple が「Surprise and Shine」と題したイベントを開きます。日本時間では9月10日の未明2時からです",
-    "EXPECT — iPhone 18 Pro と Pro Max、折りたたみ機、2nm プロセスの A20 Pro チップ、そして iOS 27 以下の配信日発表が見込まれています",
-    "WAIT — この記事を書いている時点ではまだ開催前です。噂の段階で書いたものと発表後に書いたものが混ざると、読む側には区別がつきません",
-    "MAX — Rork Max がネイティブ Swift を生成する以上、Apple の動きは他人事ではありません。標準の Rork は React Native、という線引きは繰り返し確認したいところです",
-    "SIMULATOR — Rork Max はクラウド上の Mac でコンパイルし、ブラウザ内で動くストリーミングの iOS シミュレータで確認できます。Xcode も Mac の実機も要りません",
-    "SEASON — OS が新しくなる時期は、自動生成の足場がいちばん揺れます。便利さを謳う記事ほど、この揺れに触れないと不誠実になると感じています",
+    "IOS27 — iOS 27 と iPadOS 27 は9月14日に配信されます。ノーコードや AI で組み立てたアプリにとって、新しい OS が降りてくる週は足場がいちばん揺れます",
+    "DUO — Apple 初の折りたたみ iPhone Duo が 1,999 ドルから。新しい画面形状は、生成されたレイアウトが最初に壊れる場所でもあります",
+    "SPLIT — 標準 Rork は Expo 経由の React Native、Rork Max はネイティブ Swift の生成です。折りたたみへの追随の速さも壊れ方も、同じにはならないはずです",
+    "SUBMIT — 提出の自動化は、Apple 側の仕様変更をそのまま受けます。便利さを語る記事ほど、この揺れに触れないと不誠実になってしまいます",
+    "RATING — 9月から年齢レーティング質問票への回答が必須になりました。ノーコードで作ったアプリも例外ではありません",
+    "SILICON — iPhone 18 Pro の A20 Pro は TSMC の 2nm ノードで作られる初の大量生産スマートフォン向けプロセッサだと報じられています",
   ],
   en: [
-    "EVENT — Apple holds its Surprise and Shine event today, September 9, starting at 10:00 Pacific. That lands in the small hours of September 10 in Japan",
-    "EXPECT — Expected are the iPhone 18 Pro and Pro Max, a foldable, the 2nm A20 Pro chip, and release dates for iOS 27 and its sibling updates",
-    "WAIT — As this is written the event has not happened yet. Rumor-stage writing and post-announcement writing look identical once they are mixed together",
-    "MAX — Since Rork Max generates native Swift, Apple news is not somebody else's problem. Worth repeating that the standard product still writes React Native",
-    "SIMULATOR — Rork Max compiles on cloud Macs and lets you check the result in a streaming iOS simulator inside the browser, with no Xcode and no Mac hardware",
-    "SEASON — A new OS is when automated build pipelines wobble most. An article selling convenience owes its readers a word about that wobble",
+    "IOS27 — iOS 27 and iPadOS 27 land on September 14. For apps assembled with no-code or AI tooling, the week a new OS ships is when the ground moves most",
+    "DUO — Apple's first foldable, the iPhone Duo, starts at $1,999. A new screen shape is also the first place a generated layout tends to break",
+    "SPLIT — Standard Rork produces React Native through Expo. Rork Max generates native Swift. Neither will adapt to a folding screen at the same pace, or fail in the same way",
+    "SUBMIT — Automated submission absorbs every change Apple makes to the process. An article praising the convenience owes its readers that caveat",
+    "RATING — Answering the age rating questionnaire became mandatory in September. Apps built without code are no exception",
+    "SILICON — The A20 Pro in the iPhone 18 Pro is reported to be the first high-volume smartphone processor built on TSMC's 2nm node",
   ],
 };
 
