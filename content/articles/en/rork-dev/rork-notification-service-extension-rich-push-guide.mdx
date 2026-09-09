@@ -12,7 +12,7 @@ tags: ["Rork", "Notification Service Extension", "Rich Push", "APNs", "Swift", "
 highlights:
   - "If your push notifications never seem to show images and your open rates aren't moving, you'll walk away with a working Rich Push implementation today"
   - "You'll learn how to encrypt APNs payloads on the server and decrypt them on-device inside the extension, including the Swift code and the Keychain access group setup that usually trips people up"
-  - "You'll get a battle-tested pattern for staying inside the 30-second runtime and 50 MB memory budget while still doing image downloads, localization, and personalization"
+  - "You'll get a battle-tested pattern for staying inside three separate ceilings — the 30-second runtime, the ~24 MB memory budget, and the attachment size limits — while still doing image downloads, localization, and personalization"
 ---
 
 "The same notification, with and without an image, drives more than 2x the open rate" — when you watch the top App Store apps closely, the teams that have figured out Rich Push are the ones whose retention and revenue charts look very different from the teams that haven't. So it's frustrating when you ship an app with Rork, try to add image notifications, and run straight into "the image doesn't show up even with `mutable-content: 1`," "my Notification Service Extension keeps timing out at 30 seconds," or "this works in the simulator but not in production."
@@ -35,13 +35,15 @@ The thread tying all three together: APNs is not a trusted boundary. The device 
 
 ## The Notification Pipeline, End to End
 
-Before any code, it's worth being clear about when an NSE actually runs and what it can and can't do. Without this mental model, the 30-second deadline and the 50 MB memory ceiling will feel like random gotchas.
+Before any code, it's worth being clear about when an NSE actually runs and what it can and can't do. Without this mental model, the 30-second deadline and the memory ceiling will feel like random gotchas.
 
 For a normal push, APNs hands the payload to the system, which renders it in Notification Center or the lock screen. When the payload contains `mutable-content: 1`, the system instead launches your app's NSE first and hands the notification to your `UNNotificationServiceExtension` subclass.
 
 Inside the extension, `didReceive(_:withContentHandler:)` is called. You can rewrite the title, attach an image you just downloaded, decrypt a sealed payload, swap in a localized template — and when you're done, you call `contentHandler` with the modified content. The system then displays whatever you returned.
 
-The hard constraints: **30 seconds of wall-clock time, ~50 MB of memory**. If you're getting close to 30 seconds, the system calls `serviceExtensionTimeWillExpire()` so you can return your best-effort result before being killed. If you ignore it and overrun, the user sees the original payload — usually meaning no image and no decrypted body. The 50 MB limit bites harder than you'd expect; loading a 4K image with `UIImage(data:)` can blow it out by itself, so always downsample.
+The hard constraints: **30 seconds of wall-clock time, and roughly 24 MB of memory**. If you're getting close to 30 seconds, the system calls `serviceExtensionTimeWillExpire()` so you can return your best-effort result before being killed. If you ignore it and overrun, the user sees the original payload — usually meaning no image and no decrypted body.
+
+The memory number is one I had wrong for a long time. I'd mentally filed extensions together and assumed something near 50 MB, built image handling on that assumption, and only found out when a device crash log came back with `EXC_RESOURCE / RESOURCE_TYPE_MEMORY (limit=24 MB)`. **A notification extension's memory budget can't be estimated from how the main app behaves.** 24 MB is small enough that decoding a single 4K image with `UIImage(data:)` will exceed it on its own, so downsampling isn't an optimization here — it's the only way the path works at all.
 
 One more thing that catches people: **the NSE runs in a different process from your main app**, with its own bundle identifier. Sharing tokens or settings via Keychain or UserDefaults requires explicit App Group and Keychain Access Group configuration. If you skip this, you'll spend an evening debugging `errSecItemNotFound`.
 
@@ -156,7 +158,65 @@ override func didReceive(
 
 The non-obvious rule: **always call `contentHandler`, even on failure**. If you forget on any branch, the system can't render the notification at all and the user just sees nothing. Wire `contentHandler` into every error path.
 
-URLs without a clean extension (CDN URLs with query strings, signed URLs) are particularly nasty. `UNNotificationAttachment` infers MIME type from the file extension, so if you save the file as `imagefile` with no `.jpg`, the system silently drops the attachment. I lost two hours to this once before realizing the cache headers had nothing to do with it.
+URLs without a clean extension (CDN URLs with query strings, signed URLs) are particularly nasty. `UNNotificationAttachment` infers the type from the saved file's extension, so if you save the file as `imagefile` with no `.jpg`, the system silently drops the attachment. I lost two hours to this once before realizing the cache headers had nothing to do with it.
+
+Guessing at filenames is the fragile version. Declaring the type outright is the durable one:
+
+```swift
+import UniformTypeIdentifiers
+
+// Derive the UTI from the response's Content-Type instead of trusting the path
+let mime = (response as? HTTPURLResponse)?.mimeType ?? "image/jpeg"
+let utType = UTType(mimeType: mime) ?? .jpeg
+let attachment = try UNNotificationAttachment(
+    identifier: "image",
+    url: savedURL,
+    options: [UNNotificationAttachmentOptionsTypeHintKey: utType.identifier]
+)
+```
+
+Pass the UTI through `UNNotificationAttachmentOptionsTypeHintKey` and the extension on disk stops mattering. If your CDN returns things like `?w=1024&fm=webp`, I'd make this the default rather than the special case.
+
+## The Third Reason Attachments Disappear — Size and Format Ceilings
+
+`mutable-content: 1` is set. The download returned 200. The image still doesn't show. When those three are all true, the remaining suspect is the attachment itself.
+
+`UNNotificationAttachment` enforces per-type size limits, and anything over the line is rejected at attach time.
+
+<table>
+<thead>
+<tr><th>Type</th><th>Limit</th><th>What you actually see</th></tr>
+</thead>
+<tbody>
+<tr><td>Audio</td><td>5 MB</td><td>Notification delivers. Attachment simply absent</td></tr>
+<tr><td>Image</td><td>10 MB</td><td>Same — and the download log still reads as a success</td></tr>
+<tr><td>Video</td><td>50 MB</td><td>Same</td></tr>
+</tbody>
+</table>
+
+What makes this hard to catch is that the failure arrives as a **valid result** rather than an exception. In the code above, `catch` runs `contentHandler(bestAttemptContent)` and the user gets a perfectly reasonable text notification. Without telemetry, that's indistinguishable from success. Meanwhile the gorgeous 12 MB PNG your designer exported downloads in under a second on office Wi-Fi, so it never reproduces locally.
+
+What worked for me was measuring the file before building the attachment, and skipping — with a log line — anything close to the ceiling. After downsampling you'll usually land around 200 KB, so the check almost never fires. That's the point: when it does fire, it's telling you a CDN variant rule broke.
+
+```swift
+private static let attachmentByteLimit = 10 * 1024 * 1024  // image ceiling
+
+private func makeAttachment(from url: URL, mime: String) throws -> UNNotificationAttachment? {
+    let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+    guard size > 0, size < Self.attachmentByteLimit else {
+        log.error("attachment skipped: bytes=\(size, privacy: .public)")
+        return nil   // drop the attachment, keep the notification
+    }
+    let utType = UTType(mimeType: mime) ?? .jpeg
+    return try UNNotificationAttachment(
+        identifier: "image",
+        url: url,
+        options: [UNNotificationAttachmentOptionsTypeHintKey: utType.identifier]
+    )
+}
+```
+
+**The body is the promise; the attachment is the bonus.** Separating those two has made triage on notification bug reports much faster for me.
 
 ## Decrypting End-to-End Encrypted Payloads
 
@@ -247,7 +307,7 @@ private func renderLocalized(
 
 The main app is responsible for writing the latest message JSON to the App Group container on first launch and after updates. With that in place, the NSE never has to touch the network for localization — which matters because every network round-trip eats into the 30-second budget and the battery.
 
-## Living Inside 30 Seconds and 50 MB
+## Living Inside 30 Seconds and 24 MB
 
 The biggest production trap with NSE is resource limits. Things work fine in the simulator, then hit production where images are larger, networks are slower, and parallel downloads are the norm — and suddenly extensions get killed mid-flight or crash on memory.
 
@@ -256,13 +316,14 @@ For time, always implement `serviceExtensionTimeWillExpire()`. The principle: if
 ```swift
 override func serviceExtensionTimeWillExpire() {
     // Image fetch didn't finish — deliver the text-only version
-    if let contentHandler = contentHandler, let bestAttemptContent = bestAttemptContent {
-        contentHandler(bestAttemptContent)
-    }
+    guard let bestAttemptContent else { return }
+    finish(bestAttemptContent, outcome: "expired")   // single exit, defined below
 }
 ```
 
-For memory, downsample aggressively. Loading a full image with `UIImage(data:)` is the easy way to blow past 50 MB. Use `CGImageSourceCreateThumbnailAtIndex` to size the image down to what the notification UI actually needs:
+You'll often see the expiry path call `contentHandler` directly. When it does, that path quietly skips both your timing measurements and your double-call guard. Keep one exit.
+
+For memory, downsample aggressively. Loading a full image with `UIImage(data:)` is the easy way to blow past 24 MB. Use `CGImageSourceCreateThumbnailAtIndex` to size the image down to what the notification UI actually needs:
 
 ```swift
 import ImageIO
@@ -294,7 +355,34 @@ private func downsample(imageAt url: URL, to maxPixelSize: CGFloat) -> URL? {
 }
 ```
 
-Notification UI rarely needs more than 800–1024 px. If your CDN keeps handing you 4K originals, a server-side resized variant is the better fix. Doing it in the NSE is a fallback when you can't change the server.
+Worth wiring the pieces together explicitly, because a helper that exists but never gets called is easy to miss in review — I shipped exactly that for a while, with the download handler attaching the original file. Downsampling belongs immediately before the attachment is built.
+
+```swift
+let task = URLSession.shared.downloadTask(with: imageURL) { [weak self] localURL, response, error in
+    guard let self, let localURL else {
+        self?.finish(bestAttemptContent, outcome: "download_failed")
+        return
+    }
+    let mime = (response as? HTTPURLResponse)?.mimeType ?? "image/jpeg"
+
+    // Never attach the original: shrink it, measure it, then attach it
+    guard let smallURL = self.downsample(imageAt: localURL, to: 1024) else {
+        self.finish(bestAttemptContent, outcome: "downsample_failed")
+        return
+    }
+    if let attachment = try? self.makeAttachment(from: smallURL, mime: mime) {
+        bestAttemptContent.attachments = [attachment]
+        self.finish(bestAttemptContent, outcome: "ok")
+    } else {
+        self.finish(bestAttemptContent, outcome: "attachment_rejected")
+    }
+}
+task.resume()
+```
+
+With `downsample → makeAttachment → finish` as a single line, adding webp support or multiple attachments later only changes the middle.
+
+Notification UI rarely needs more than 800–1024 px. If your CDN keeps handing you 4K originals, a server-side resized variant is the better fix. Doing it in the NSE is a fallback for when you can't change the server.
 
 ## Monitoring, Debugging, and Production Operations
 
@@ -420,7 +508,8 @@ The pieces I'd ship in order if I were building this from scratch today: image a
 The list I run through before shipping any NSE change:
 
 - All image URLs are HTTPS (HTTP is silently blocked by ATS in extensions)
-- Image downsampling is in place; memory peak stays under 20 MB in Xcode's Memory Gauge
+- Image downsampling is in place; memory peak stays under 20 MB in Xcode's Memory Gauge, against a ~24 MB ceiling
+- Byte size is checked before attaching (10 MB images, 5 MB audio, 50 MB video)
 - `serviceExtensionTimeWillExpire()` always returns a text-only fallback
 - App Group is enabled on both the main target and the NSE target
 - Keychain Access Groups match across both targets
@@ -438,4 +527,4 @@ If you've read this far, the one thing worth doing today is **checking your serv
 
 Once you have the NSE in place, A/B test "with image" versus "text only" and watch the open rate. Most apps see image notifications open at 1.5–2x the rate of plain text. As a retention lever, that beats a lot of new-feature work on cost-per-result.
 
-Building native extensions on top of a Rork app is unfamiliar territory at first, but it's also where Rork stops feeling like a no-code tool and starts feeling like a real iOS development environment — one where you can call into any Apple framework you need. In the next piece, I'll dig into the NSE's sibling, the [Notification Content Extension](/articles/rork-dev/rork-callkit-pushkit-voip-implementation-guide), and how far you can push custom UI inside the notification itself.
+Building native extensions on top of a Rork app is unfamiliar territory at first, but it's also where Rork stops feeling like a no-code tool and starts feeling like a real iOS development environment — one where you can call into any Apple framework you need. If you want to go past notifications and into full native call UI, [Rork with CallKit and PushKit for VoIP apps](/articles/rork-dev/rork-callkit-pushkit-voip-implementation-guide) picks up the same thread — receiving a dedicated push on a separate route is the same "finish the work on the device" idea, one layer deeper.
