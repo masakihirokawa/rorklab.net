@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-26T05:30"
-updated: "2026-04-26T05:30"
+updated: "2026-09-09T11:30"
 author: "Rork Lab"
 description: "Rork で作ったアプリに AppsFlyer / Adjust と SKAdNetwork 4.0 を組み込み、ATT 同意・ディープリンク・Conversion Value 設計まで一気通貫で実装する手順を、つまずきポイントとともに丁寧に解説します。"
 tags: ["AppsFlyer", "Adjust", "SKAdNetwork", "ATT", "Attribution", "Rork", "iOS"]
@@ -14,7 +14,7 @@ highlights:
   - "SKAdNetwork 4.0 の Conversion Value 設計と ATT 同意 UI の実装パターンを、コピペで動くコード付きで習得できる"
   - "TikTok・Meta・Apple Search Ads などの媒体別キャンペーンで LTV を見ながら投下予算を最適化する判断軸が手に入る"
 ---
-私が iOS 14.5 のアップデート後に最初に痛感したのは、「広告を打っても、どのキャンペーンが効いているのか以前のように見えない」という事実でした。前まではざっくり眺めていれば成果が分かっていたのに、ある日急に管理画面のインストール数が半分になり、CPA が二倍になったように見える。実際にはユーザーが減ったわけではなく、IDFA を取得できないことで計測がズレているだけだったのですが、原因に辿り着くまでに数週間を消費しました。
+私が iOS 14.5 のアップデート後に最初に痛感したのは、「広告を打っても、どのキャンペーンが効いているのか以前のように見えない」という事実でした。前まではざっくり眺めていれば成果が分かっていたのに、ある日を境に管理画面のインストール数が半分になり、CPA が二倍に膨らんだように見えました。実際にはユーザーが減ったわけではなく、IDFA を取得できないことで計測がズレているだけだったのですが、原因に辿り着くまでに数週間を消費しました。
 
 Rork で作ったアプリでも事情はまったく同じで、SDK 統合や SKAdNetwork 4.0 の Conversion Value 設計を疎かにすると、広告予算をいくら積んでも判断材料が手に入りません。ここでは私が個人開発のアプリ複数本で運用してきた中で「これだけはやっておくべき」と感じた構成を、コードと判断軸まで含めてまとめます。読み終えるころには、AppsFlyer / Adjust のどちらを選ぶべきかの基準と、Rork (Expo + React Native) プロジェクトで本番運用に耐える実装が手元に揃っているはずです。
 
@@ -133,9 +133,34 @@ SKAN 4.0 で最も時間をかけて設計すべきなのが Conversion Value �
 
 これを `fine` の 0〜63 にマッピングし、`coarse` は LTV の上位 30% を high、上位 70% を medium、それ以外を low に振り分けます。`coarse` は postback window 1（インストール後 3〜7 日）で最も効果を発揮するので、サブスクリプション型のアプリでは特に重要です。
 
+ここで、私が最初に書いて長らく気づけなかった実装を先にお見せします。読み飛ばしたくなるくらい素直なコードですが、この形には二つの穴が空いています。
+
+```typescript
+// ❌ 私が最初に書いた版。動くように見えて、二か所で計測を失います
+let cumulativeScore = 0;
+
+export async function reportEvent(event: Event): Promise<void> {
+  const next = Math.min(63, cumulativeScore + SCORE_MAP[event]);
+  if (next > cumulativeScore) {
+    cumulativeScore = next;
+    appsFlyer.updateConversionValueWithErrorCallback(next, (e) => console.warn(e));
+  }
+}
+```
+
+一つ目は、`cumulativeScore` がプロセス内の変数だという点です。アプリを一度落として翌日に開き直すと 0 に戻りますので、そこから積み上げ直した値は前回の到達点より低くなります。SKAN は単調増加でしか値を受け取らないため、この低い値は黙って捨てられます。エラーも警告も出ません。オンボーディング完了までは正しく、課金トライアルの 32 点だけが永遠に届かない——という歪み方をします。
+
+二つ目は、`fine` しか更新していない点です。SKAN 4.0 では `fine` を運べるのは最初のポストバック（インストール後 2 日まで）だけで、2 回目と 3 回目は `coarse` しか運べません。`coarse` を一度も設定していなければ、後続のポストバックには `coarse: none` が入って返ってきます。ダッシュボードで「window 1 以降が空っぽ」に見える原因の多くはここです。`coarse` の設計を熱心に語っておきながら、コードが SKAN 3.0 のままだった、というのが当時の私でした。
+
+**設計は 4.0、実装は 3.0——このズレは、レポートが空になるまで誰も教えてくれません。**
+
+両方を塞いだ形が次です。
+
 ```typescript
 // src/lib/conversion-value.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import appsFlyer from 'react-native-appsflyer';
+import { updateSkanConversionValue, type CoarseValue } from './skan';
 
 type Event =
   | 'app_open'
@@ -152,7 +177,20 @@ const SCORE_MAP: Record<Event, number> = {
   trial_started: 32,
 };
 
-let cumulativeScore = 0;
+const STORE_KEY = 'skan:cumulative-fine';
+
+// fine の到達点から coarse を決めます。しきい値は自分の LTV 分布に合わせて調整してください
+function toCoarse(fine: number): CoarseValue {
+  if (fine >= 32) return 'high';   // 課金トライアル到達
+  if (fine >= 8) return 'medium';  // 初回コンテンツ閲覧以降
+  return 'low';
+}
+
+async function readScore(): Promise<number> {
+  const raw = await AsyncStorage.getItem(STORE_KEY);
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 export async function reportEvent(event: Event, payload?: Record<string, unknown>): Promise<void> {
   // 1. AppsFlyer に通常イベントを送信（ダッシュボードで分析用）
@@ -160,21 +198,67 @@ export async function reportEvent(event: Event, payload?: Record<string, unknown
     console.warn('[Attribution] logEvent error', err);
   });
 
-  // 2. SKAN 用に累積スコアを更新（既存値より下げない）
-  const next = Math.min(63, cumulativeScore + SCORE_MAP[event]);
-  if (next > cumulativeScore) {
-    cumulativeScore = next;
-    appsFlyer.updateConversionValueWithErrorCallback(
-      next,
-      (e) => console.warn('[Attribution] updateCV error', e),
-    );
+  // 2. 累積スコアはストレージから読み直す（プロセス内変数だと再起動で 0 に戻ります）
+  const current = await readScore();
+  const next = Math.min(63, current + SCORE_MAP[event]);
+  if (next <= current) return;
+
+  await AsyncStorage.setItem(STORE_KEY, String(next));
+
+  // 3. fine と coarse を同時に更新する。トライアル到達時は window を閉じて即座に送出させる
+  await updateSkanConversionValue({
+    fine: next,
+    coarse: toCoarse(next),
+    lockWindow: event === 'trial_started',
+  });
+}
+```
+
+`updateSkanConversionValue` の中身は、iOS 16.1 以降の `SKAdNetwork.updatePostbackConversionValue(_:coarseValue:lockWindow:)` を呼ぶだけの薄いブリッジです。Expo Modules API で 30 行ほど書けば済みますので、MMP の SDK が対応するのを待つ必要はありません。
+
+```swift
+// modules/skan/ios/SkanModule.swift — Expo Modules API の薄いブリッジ
+import ExpoModulesCore
+import StoreKit
+
+public class SkanModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("Skan")
+
+    AsyncFunction("update") { (fine: Int, coarse: String, lockWindow: Bool, promise: Promise) in
+      // iOS 16.1 未満は coarse の概念そのものが無いため fine だけを送ります
+      guard #available(iOS 16.1, *) else {
+        if #available(iOS 15.4, *) {
+          SKAdNetwork.updatePostbackConversionValue(fine) { error in
+            if let error { promise.reject("skan", error.localizedDescription) } else { promise.resolve(nil) }
+          }
+        } else {
+          promise.resolve(nil)
+        }
+        return
+      }
+
+      let coarseValue: SKAdNetwork.CoarseConversionValue = {
+        switch coarse {
+        case "high": return .high
+        case "medium": return .medium
+        default: return .low
+        }
+      }()
+
+      SKAdNetwork.updatePostbackConversionValue(fine, coarseValue: coarseValue, lockWindow: lockWindow) { error in
+        if let error { promise.reject("skan", error.localizedDescription) } else { promise.resolve(nil) }
+      }
+    }
   }
 }
 ```
 
-Conversion Value を「下げてはいけない」という制約は重要です。SKAN は単調増加でしか値を更新できず、誤って下方修正しようとすると無視されます。設計段階で「最大値が 63 を超えないか」「途中の重み付けが反転しないか」を必ず机上検証してください。
+一点だけ線引きが必要です。AppsFlyer の SKAN Conversion Studio のようにサーバ側で Conversion Value を決める仕組みを有効にしている場合、アプリ側からの自前更新と二重に走らせてはいけません。どちらが最後に書いたかで値が決まってしまい、原因の切り分けが難しくなります。**Conversion Value を書く主体は、アプリかサーバのどちらか一方に必ず寄せます。** 私は自前で持つ側を選んでいますが、媒体を増やすほどサーバ側に寄せる利点が効いてきますので、規模が変わったら見直すつもりでおります。
 
-期待する出力: AppsFlyer のダッシュボードで `Cohort Report → SKAN Postbacks` を開くと、postback window 0/1/2 のそれぞれで Conversion Value の分布が確認できるようになります。
+`lockWindow` を `true` にすると、その window の残り時間を待たずにポストバックが送出されます。トライアル開始のように「これ以上スコアが動かない」と分かる地点でだけ立てるのが要点で、闇雲に立てると後続イベントの計測機会を捨てることになります。
+
+期待する出力: AppsFlyer のダッシュボードで `Cohort Report → SKAN Postbacks` を開くと、postback window 0 に `fine` の分布が、window 1 と 2 に `coarse` の low / medium / high の分布が現れます。window 1 以降が `none` で埋まっているうちは、まだ `coarse` が届いていない証拠です。
 
 ## ATT 同意 UI を設計し、opt-in 率を最大化する
 
@@ -286,7 +370,7 @@ export function teardownDeepLinking() {
 
 `deep_link_value` という汎用キーに「ドメイン:ID」形式で値を入れる設計にすると、media partner が変わってもアプリ側のロジックを書き換えずに済みます。私は `campaign:`, `content:`, `referral:` の三種類を最初から決めておき、新しい広告先が増えてもこの命名規則で吸収できる形にしています。
 
-ディープリンクの基礎については[Rork × Universal Links と Deep Linking の完全ガイド](/articles/rork-dev/rork-max-deep-linking-universal-links)で図解しているので、Universal Links の `apple-app-site-association` ファイル設置でつまずいている方はそちらも参照してください。
+ディープリンクの基礎については[Rork Max でのディープリンク・ユニバーサルリンク実装](/articles/rork-dev/rork-max-deep-linking-universal-links)で図解しているので、Universal Links の `apple-app-site-association` ファイル設置でつまずいている方はそちらも参照してください。
 
 ## 広告 SDK を本番リリース前にデバッグする実践テクニック
 
@@ -329,6 +413,7 @@ export function fireDebugEvents() {
 4. **Hermes / Expo Modules のバージョン不整合で SDK 初期化失敗**: Expo SDK のメジャーアップデート後に `react-native-appsflyer` のメジャーバージョンを上げ忘れると、ネイティブモジュールのリンクが解けて起動時にクラッシュします。アップデートは Expo SDK と AppsFlyer SDK をセットで揃えるのが安全です。
 5. **デバッグビルドで本番イベントが流れる**: `__DEV__` ガードを忘れると、開発中の `logEvent` 呼び出しが本番計測に混入し、Conversion Rate を歪めます。ヘルパー関数で必ず `if (__DEV__)` を挟むか、AppsFlyer の `setIsSandbox(true)` をデバッグ時に呼んでサンドボックス環境に隔離しましょう。
 6. **App Store Connect の Bundle ID と AppsFlyer の App ID が一致していない**: 私はリリースの直前にこれで一度詰まりました。Bundle ID をリブランドした際に AppsFlyer 側の設定を更新し忘れ、初日の計測がすべて欠損しました。リネーム時は両側を必ず確認してください。
+7. **累積スコアをメモリだけで持っている**: 前述のとおり、アプリを再起動すると 0 に戻り、以降の更新が単調増加の制約で捨てられます。手元で再現するなら、オンボーディング完了まで進めてからアプリを完全終了し、再起動して課金トライアルまで進めてください。ポストバックの `fine` が 4 のまま止まっていれば、この穴に落ちています。
 
 ## TikTok / Meta / Apple Search Ads と組み合わせた最適化ループ
 
@@ -336,9 +421,9 @@ export function fireDebugEvents() {
 
 媒体ごとの特性を私は次のように捉えています。
 
-- **TikTok Ads**: 認知獲得に強く、`fine` の低スコア帯（起動・オンボーディング完了）でターゲティング最適化が効きやすい。クリエイティブの賞味期限が短い（2〜3週間で枯れる）ため、`coarse` まで見て高 LTV クリエイティブを残す運用が向いています。
-- **Meta Ads**: 高 LTV ユーザーの獲得に強く、`coarse` の high レンジで配信最適化を回すと CPI は上がるが ROAS は伸びる傾向。AAA（Advantage+ App Campaigns）と SKAN 4.0 の相性は良い。
-- **Apple Search Ads**: 検索意図が明確なユーザーが入ってくるので、課金率と継続率がもっとも高い。Apple Search Ads は SKAN ポストバックを直接受け取るため、AppsFlyer 経由でも独自の Search Ads Attribution API を併用すると精度が上がる。
+- **TikTok Ads**: 認知獲得に強く、`fine` の低スコア帯（起動・オンボーディング完了）でターゲティング最適化が効きやすい媒体です。クリエイティブの賞味期限が短く 2〜3 週間で枯れますので、`coarse` まで見て高 LTV のクリエイティブだけを残す運用が向いています。
+- **Meta Ads**: 高 LTV ユーザーの獲得に強く、`coarse` の high レンジで配信最適化を回すと CPI は上がるものの ROAS は伸びる傾向があります。Advantage+ App Campaigns と SKAN 4.0 の組み合わせは相性が良いと感じています。
+- **Apple Search Ads**: 検索意図が明確なユーザーが入ってきますので、課金率と継続率がもっとも高くなります。Apple Search Ads は SKAN ポストバックを直接受け取りますので、AppsFlyer 経由でも独自の Search Ads Attribution API を併用すると精度が上がります。
 
 Apple Search Ads の運用と組み合わせる場合は、[Apple Search Ads の高度な運用戦略](/articles/rork-business/rork-apple-search-ads-advanced-strategy-guide)で書いたキーワード階層化と組み合わせると効果が読みやすくなります。
 
@@ -349,16 +434,20 @@ Apple Search Ads の運用と組み合わせる場合は、[Apple Search Ads の
 AppsFlyer から Adjust に移行する場合、もしくは最初から Adjust で構築する場合、SDK の API そのものは似ていますが、Conversion Value の更新方法と Callback Parameter の概念が少し異なります。Adjust は `addCallbackParameter` で任意のキー値を後から追加できる柔軟性があり、特定の媒体（例: TikTok）からの流入だけ別の Conversion Schema を当てたい場合に便利です。
 
 ```typescript
-// src/lib/attribution-adjust.ts
+// src/lib/attribution-adjust.ts — react-native-adjust v5 系
 import { Adjust, AdjustConfig, AdjustEvent } from 'react-native-adjust';
 
 export function initAdjust(appToken: string) {
-  const config = new AdjustConfig(appToken, AdjustConfig.EnvironmentProduction);
+  const config = new AdjustConfig(
+    appToken,
+    __DEV__ ? AdjustConfig.EnvironmentSandbox : AdjustConfig.EnvironmentProduction,
+  );
   config.setLogLevel(__DEV__ ? AdjustConfig.LogLevelDebug : AdjustConfig.LogLevelError);
   config.setAttributionCallbackListener((attribution) => {
     console.log('[Adjust] attribution', attribution);
   });
-  Adjust.create(config);
+  // v4 では Adjust.create(config) でした。v5 で initSdk に変わっています
+  Adjust.initSdk(config);
 }
 
 export function trackPurchase(eventToken: string, amount: number, currency: string) {
@@ -370,7 +459,9 @@ export function trackPurchase(eventToken: string, amount: number, currency: stri
 }
 ```
 
-私の経験上、AppsFlyer から Adjust への移行時に最も詰まりやすいのは「ATT 同意フローを再実装する手間」です。両 SDK ともネイティブの ATT API をラップしてはいますが、初期化順序の最適解が微妙に違います。Adjust の場合は `Adjust.create` を ATT 確定前に呼んでも内部で待機してくれるので、起動時の体感速度が AppsFlyer より一段速く感じられます。
+ここで一度つまずいたのが SDK のメジャーバージョンでした。react-native-adjust は v5 で初期化のエントリポイントが変わり、v4 までの `Adjust.create(config)` は `Adjust.initSdk(config)` になっています。古い記事やサンプルをそのまま写すと、`Adjust.create is not a function` で起動直後に落ちますので、まず `package.json` の系列を確かめてください。あわせて、セッション単位のコールバックパラメータも `addSessionCallbackParameter` から `addGlobalCallbackParameter` へ改名されています（イベント単位の `addCallbackParameter` はそのままです）。移行の詳細は [Adjust 公式の SDK v5 移行ガイド](https://dev.adjust.com/en/sdk/migration/react-native/v4-to-v5/) に一覧があります。
+
+私の経験上、AppsFlyer から Adjust への移行時に最も詰まりやすいのは「ATT 同意フローを再実装する手間」です。両 SDK ともネイティブの ATT API をラップしてはいますが、初期化順序の最適解が微妙に違います。Adjust の場合は `Adjust.initSdk` を ATT 確定前に呼んでも内部で待機してくれるので、起動時の体感速度が AppsFlyer より一段速く感じられます。
 
 ## RevenueCat / StoreKit のサブスクリプションイベントを SKAN に紐付ける
 
@@ -378,25 +469,39 @@ export function trackPurchase(eventToken: string, amount: number, currency: stri
 
 ```typescript
 // src/lib/revenuecat-skan-bridge.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Purchases, { CustomerInfo } from 'react-native-purchases';
 import { reportEvent } from './conversion-value';
+
+const SENT_KEY_PREFIX = 'skan:sent:';
+
+// リスナーはリニューアルでも発火します。同じイベントを二度送らないための門番です
+async function sendOnce(event: 'trial_started' | 'paid_started', payload: Record<string, unknown>) {
+  const key = `${SENT_KEY_PREFIX}${event}`;
+  if (await AsyncStorage.getItem(key)) return;
+  await AsyncStorage.setItem(key, '1');
+  await reportEvent(event, payload);
+}
 
 export function bindRevenueCatToSKAN() {
   Purchases.addCustomerInfoUpdateListener((info: CustomerInfo) => {
     const active = info.entitlements.active['pro'];
-    if (active) {
-      if (active.periodType === 'trial') {
-        void reportEvent('trial_started', { product: active.productIdentifier });
-      } else {
-        // 本課金開始時は累積スコアを最大値（63）にクランプして、媒体側の ROAS 最大値を確実に反映
-        void reportEvent('trial_started', { product: active.productIdentifier });
-      }
+    if (!active) return;
+
+    const payload = { product: active.productIdentifier };
+    // periodType は 'TRIAL' / 'NORMAL' / 'INTRO' を返します。大文字小文字の取り違えに注意
+    if (String(active.periodType).toUpperCase() === 'TRIAL') {
+      void sendOnce('trial_started', payload);
+    } else {
+      void sendOnce('paid_started', payload);
     }
   });
 }
 ```
 
-注意点として、RevenueCat の `customerInfo` は購読の更新（リニューアル）でも発火するため、初回のみ送信したい場合は `originalPurchaseDate` を見て初回かどうかを判定する処理を挟みましょう。リニューアルのたびに `trial_started` を送ると Conversion Value が単調増加の制約に当たり、結果的に何も更新されなくなります。
+先ほどの版では、トライアルと本課金の分岐が両方とも `trial_started` を送っていました。コメントには「本課金は最大値にクランプする」と書きながら、実際には同じイベントが飛んでいたわけです。SKAN の単調増加の制約に守られて例外もエラーも出ないため、レポートの `high` がいつまでも増えないという形でしか現れません。分岐を書いたら、両方の枝を声に出して読み上げる——これは私が自分に課している確認です。
+
+もう一点、`customerInfo` は購読の更新（リニューアル）でも発火します。毎回送っても単調増加の制約で無視されるだけなので実害は小さいのですが、ダッシュボードのイベント数だけが膨らみ、本当の初回課金がどこだったのか読めなくなります。上のように送信済みフラグを永続化しておくと、後からログを追うときに助かります。`paid_started` を `SCORE_MAP` に追加するのを忘れないでください。
 
 ## サーバ to サーバ ポストバック検証のセットアップ
 

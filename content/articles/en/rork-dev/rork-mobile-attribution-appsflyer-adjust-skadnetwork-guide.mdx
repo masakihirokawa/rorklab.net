@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-26T05:30"
-updated: "2026-04-26T05:30"
+updated: "2026-09-09T11:30"
 author: "Rork Lab"
 description: "A complete walkthrough of wiring AppsFlyer or Adjust into a Rork (Expo + React Native) app, designing SKAdNetwork 4.0 conversion values, building a high-opt-in ATT prompt, and integrating deep links — with copy-paste code and the pitfalls I hit in production."
 tags: ["AppsFlyer", "Adjust", "SKAdNetwork", "ATT", "Attribution", "Rork", "iOS"]
@@ -17,7 +17,7 @@ highlights:
 
 The first thing I felt right after the iOS 14.5 update was a strange disconnect: I was running ads, but I could no longer see which campaigns were actually working. Where I used to glance at the dashboard and just *know*, suddenly installs were halved overnight and CPA looked doubled. Users had not gone away — IDFA was simply unavailable, and my measurement was lying to me. It took weeks to track down.
 
-Apps shipped with Rork are no different. If you skip SDK setup or rush the SKAdNetwork 4.0 conversion-value design, every dollar of ad spend becomes a guessing game. In this guide I'm sharing the exact stack I now run on multiple indie apps — from picking between AppsFlyer and Adjust, to wiring everything into a Rork (Expo + React Native) project that actually holds up in production.
+Apps shipped with Rork are no different. If you skip SDK setup or rush the SKAdNetwork 4.0 conversion-value design, every dollar of ad spend becomes a guessing game. What follows is the exact stack I now run on multiple indie apps — how I pick between AppsFlyer and Adjust, and how the pieces get wired into a Rork (Expo + React Native) project that holds up in production.
 
 ## Why iOS 14.5+ Made Attribution So Hard
 
@@ -134,9 +134,34 @@ Here is the baseline I usually start from. Adjust the numbers to your app, but t
 
 Map the cumulative score to `fine` (cap at 63), and bucket `coarse` so the top 30% of LTV lands in `high`, the next 40% in `medium`, and the rest in `low`. `coarse` shines in postback window 1 (3–7 days post-install), which is exactly when subscription apps separate winners from losers.
 
+Before the working version, here's the one I shipped first. It reads perfectly well, and it has two holes in it.
+
+```typescript
+// ❌ My first attempt. Looks fine, loses measurement in two places.
+let cumulativeScore = 0;
+
+export async function reportEvent(event: Event): Promise<void> {
+  const next = Math.min(63, cumulativeScore + SCORE_MAP[event]);
+  if (next > cumulativeScore) {
+    cumulativeScore = next;
+    appsFlyer.updateConversionValueWithErrorCallback(next, (e) => console.warn(e));
+  }
+}
+```
+
+The first hole is that `cumulativeScore` lives in process memory. Kill the app, reopen it the next morning, and it starts from 0 — so every value you compute from there is lower than what you already reported. SKAN accepts monotonically increasing values only, so the low value is dropped. No error, no warning. The shape of the failure is oddly specific: everything up to onboarding looks right, and the 32-point trial signal never arrives.
+
+The second hole is that only `fine` is ever set. Under SKAN 4.0, `fine` can only ride the first postback (activity up to two days post-install); postbacks two and three can carry `coarse` only. If you never set a coarse value, those postbacks come back as `coarse: none`. That is the most common reason a dashboard shows a healthy window 0 and nothing after it. I had written a whole section about coarse buckets while my code was still SKAN 3.0.
+
+**Designing for 4.0 while implementing 3.0 fails silently — the report just goes empty.**
+
+Here's the version that closes both.
+
 ```typescript
 // src/lib/conversion-value.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import appsFlyer from 'react-native-appsflyer';
+import { updateSkanConversionValue, type CoarseValue } from './skan';
 
 type Event =
   | 'app_open'
@@ -153,7 +178,20 @@ const SCORE_MAP: Record<Event, number> = {
   trial_started: 32,
 };
 
-let cumulativeScore = 0;
+const STORE_KEY = 'skan:cumulative-fine';
+
+// Derive coarse from where fine landed. Tune the cutoffs to your own LTV distribution.
+function toCoarse(fine: number): CoarseValue {
+  if (fine >= 32) return 'high';   // reached trial
+  if (fine >= 8) return 'medium';  // first content view and beyond
+  return 'low';
+}
+
+async function readScore(): Promise<number> {
+  const raw = await AsyncStorage.getItem(STORE_KEY);
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 export async function reportEvent(event: Event, payload?: Record<string, unknown>): Promise<void> {
   // 1. Send the regular event for dashboard analytics
@@ -161,21 +199,67 @@ export async function reportEvent(event: Event, payload?: Record<string, unknown
     console.warn('[Attribution] logEvent error', err);
   });
 
-  // 2. Update SKAN cumulative score (must never decrease)
-  const next = Math.min(63, cumulativeScore + SCORE_MAP[event]);
-  if (next > cumulativeScore) {
-    cumulativeScore = next;
-    appsFlyer.updateConversionValueWithErrorCallback(
-      next,
-      (e) => console.warn('[Attribution] updateCV error', e),
-    );
+  // 2. Read the cumulative score from storage — a module variable resets to 0 on relaunch
+  const current = await readScore();
+  const next = Math.min(63, current + SCORE_MAP[event]);
+  if (next <= current) return;
+
+  await AsyncStorage.setItem(STORE_KEY, String(next));
+
+  // 3. Update fine and coarse together; close the window once the trial signal lands
+  await updateSkanConversionValue({
+    fine: next,
+    coarse: toCoarse(next),
+    lockWindow: event === 'trial_started',
+  });
+}
+```
+
+`updateSkanConversionValue` is a thin bridge over `SKAdNetwork.updatePostbackConversionValue(_:coarseValue:lockWindow:)`, available from iOS 16.1. It's about thirty lines with the Expo Modules API, so there's no need to wait for your MMP's SDK to expose it.
+
+```swift
+// modules/skan/ios/SkanModule.swift — a thin Expo Modules bridge
+import ExpoModulesCore
+import StoreKit
+
+public class SkanModule: Module {
+  public func definition() -> ModuleDefinition {
+    Name("Skan")
+
+    AsyncFunction("update") { (fine: Int, coarse: String, lockWindow: Bool, promise: Promise) in
+      // Below iOS 16.1 there is no coarse value at all, so send fine only.
+      guard #available(iOS 16.1, *) else {
+        if #available(iOS 15.4, *) {
+          SKAdNetwork.updatePostbackConversionValue(fine) { error in
+            if let error { promise.reject("skan", error.localizedDescription) } else { promise.resolve(nil) }
+          }
+        } else {
+          promise.resolve(nil)
+        }
+        return
+      }
+
+      let coarseValue: SKAdNetwork.CoarseConversionValue = {
+        switch coarse {
+        case "high": return .high
+        case "medium": return .medium
+        default: return .low
+        }
+      }()
+
+      SKAdNetwork.updatePostbackConversionValue(fine, coarseValue: coarseValue, lockWindow: lockWindow) { error in
+        if let error { promise.reject("skan", error.localizedDescription) } else { promise.resolve(nil) }
+      }
+    }
   }
 }
 ```
 
-The "must never decrease" property is critical. SKAN only accepts monotonically increasing values; downward updates are silently dropped. Sanity-check on paper that your max score never exceeds 63 and that no event's weight contradicts another.
+One boundary matters here. If you've enabled a server-side conversion-value product such as AppsFlyer's SKAN Conversion Studio, do not also update values from the app. Whichever writes last wins, and debugging that is miserable. **Pick one owner for the conversion value — the app or the server — and keep it.** I keep it in the app today, though the server side gets more attractive as the number of media partners grows, so I expect to revisit that.
 
-Expected output: open `Cohort Report → SKAN Postbacks` in the AppsFlyer dashboard and you'll see the conversion-value distribution split across postback windows 0/1/2.
+Setting `lockWindow: true` sends the postback without waiting out the rest of the window. Reserve it for a point where you know the score can't move again, such as trial start; setting it eagerly throws away measurement opportunities for everything that follows.
+
+Expected output: open `Cohort Report → SKAN Postbacks` in the AppsFlyer dashboard and you'll see a `fine` distribution in postback window 0, and low/medium/high `coarse` distributions in windows 1 and 2. As long as windows 1 and 2 read `none`, your coarse value still isn't landing.
 
 ## An ATT Pre-prompt that Actually Lifts Opt-in Rates
 
@@ -330,6 +414,7 @@ If your numbers still look off, the cause is almost always one of the following.
 4. **Hermes / Expo Modules version drift.** Skipping the `react-native-appsflyer` major bump after an Expo SDK upgrade unlinks the native module and crashes the app on launch. Upgrade Expo SDK and the AppsFlyer package together.
 5. **Debug events leaking into production.** Forget the `__DEV__` guard once and your "self test" events corrupt production conversion rates. Wrap debug helpers in `if (__DEV__)`, or call `setIsSandbox(true)` to isolate them.
 6. **Bundle ID drift.** I learned this one hard way — a rebrand-time Bundle ID change wasn't mirrored in AppsFlyer, and the first day's installs were lost. Always verify both sides on rename.
+7. **Keeping the cumulative score in memory only.** As above, a relaunch resets it to 0 and every later update is dropped by the monotonic guard. To reproduce it locally: reach onboarding-completed, force-quit the app, relaunch, then push through to trial start. If the postback's `fine` is still stuck at 4, you're in this hole.
 
 ## Optimization Loops with TikTok, Meta, and Apple Search Ads
 
@@ -348,16 +433,20 @@ For per-channel conversion-value tuning, use SKAN 4.0's `lockWindow` to freeze v
 If you're switching from AppsFlyer to Adjust — or starting fresh with Adjust — the SDK surface looks similar, but conversion-value updates and the callback-parameter model differ in subtle ways. Adjust's `addCallbackParameter` lets you tag arbitrary key/values onto an event after the fact, which is genuinely useful when, say, only TikTok-sourced installs need a different conversion-value schema.
 
 ```typescript
-// src/lib/attribution-adjust.ts
+// src/lib/attribution-adjust.ts — react-native-adjust v5
 import { Adjust, AdjustConfig, AdjustEvent } from 'react-native-adjust';
 
 export function initAdjust(appToken: string) {
-  const config = new AdjustConfig(appToken, AdjustConfig.EnvironmentProduction);
+  const config = new AdjustConfig(
+    appToken,
+    __DEV__ ? AdjustConfig.EnvironmentSandbox : AdjustConfig.EnvironmentProduction,
+  );
   config.setLogLevel(__DEV__ ? AdjustConfig.LogLevelDebug : AdjustConfig.LogLevelError);
   config.setAttributionCallbackListener((attribution) => {
     console.log('[Adjust] attribution', attribution);
   });
-  Adjust.create(config);
+  // v4 used Adjust.create(config). v5 renamed this to initSdk.
+  Adjust.initSdk(config);
 }
 
 export function trackPurchase(eventToken: string, amount: number, currency: string) {
@@ -369,7 +458,9 @@ export function trackPurchase(eventToken: string, amount: number, currency: stri
 }
 ```
 
-The most common stumbling block in an AppsFlyer → Adjust migration is having to re-implement the ATT consent flow. Both SDKs wrap the native ATT API, but their preferred initialization order differs. Adjust will internally wait for ATT to resolve even if you call `Adjust.create` early, which makes the launch sequence feel marginally snappier than the AppsFlyer equivalent. You may also need to update your CMP rules — Adjust expects "tracking" consent in slightly different terminology than AppsFlyer.
+Check your major version before you copy anything. react-native-adjust v5 moved the entry point: the v4 `Adjust.create(config)` is now `Adjust.initSdk(config)`, and pasting an older sample gets you `Adjust.create is not a function` at launch. Session-level callback parameters were renamed too — `addSessionCallbackParameter` became `addGlobalCallbackParameter`, while the event-level `addCallbackParameter` stayed put. Adjust's [SDK v5 migration guide](https://dev.adjust.com/en/sdk/migration/react-native/v4-to-v5/) lists the rest.
+
+The most common stumbling block in an AppsFlyer → Adjust migration is having to re-implement the ATT consent flow. Both SDKs wrap the native ATT API, but their preferred initialization order differs. Adjust will internally wait for ATT to resolve even if you call `Adjust.initSdk` early, which makes the launch sequence feel marginally snappier than the AppsFlyer equivalent. You may also need to update your CMP rules — Adjust expects "tracking" consent in slightly different terminology than AppsFlyer.
 
 A migration checklist that has saved me time: keep both SDKs running in parallel for a 2-week shadow period, compare daily install totals, and only flip ad networks over to the new MMP after the numbers reconcile to within 2–3%. SKAN's per-device randomization means a small variance is normal; anything wider usually points to schema or token mismatches.
 
@@ -379,25 +470,39 @@ For subscription apps, mapping the trial → paid → cancellation lifecycle int
 
 ```typescript
 // src/lib/revenuecat-skan-bridge.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Purchases, { CustomerInfo } from 'react-native-purchases';
 import { reportEvent } from './conversion-value';
+
+const SENT_KEY_PREFIX = 'skan:sent:';
+
+// The listener also fires on renewals. This is the gate that keeps each signal to one send.
+async function sendOnce(event: 'trial_started' | 'paid_started', payload: Record<string, unknown>) {
+  const key = `${SENT_KEY_PREFIX}${event}`;
+  if (await AsyncStorage.getItem(key)) return;
+  await AsyncStorage.setItem(key, '1');
+  await reportEvent(event, payload);
+}
 
 export function bindRevenueCatToSKAN() {
   Purchases.addCustomerInfoUpdateListener((info: CustomerInfo) => {
     const active = info.entitlements.active['pro'];
     if (!active) return;
 
-    if (active.periodType === 'trial') {
-      void reportEvent('trial_started', { product: active.productIdentifier });
+    const payload = { product: active.productIdentifier };
+    // periodType returns 'TRIAL' / 'NORMAL' / 'INTRO' — mind the casing
+    if (String(active.periodType).toUpperCase() === 'TRIAL') {
+      void sendOnce('trial_started', payload);
     } else {
-      // First paid period: ensure the cumulative score lands at the top of the SKAN range
-      void reportEvent('trial_started', { product: active.productIdentifier });
+      void sendOnce('paid_started', payload);
     }
   });
 }
 ```
 
-A subtle gotcha: `customerInfo` fires on subscription renewals too, not just first purchase. If you naively call `reportEvent('trial_started')` on every renewal, you'll hit SKAN's monotonic-increase guard, the call becomes a no-op, and you'll think nothing's wrong. To send the conversion exactly once, gate the call by checking `originalPurchaseDate` and persisting an "already reported" flag in `AsyncStorage`.
+In the earlier version, both branches sent `trial_started`. The comment promised a clamp to the top of the range for the first paid period; the code sent the same event either way. SKAN's monotonic guard swallows the duplicate without an error, so the only symptom is a `high` bucket that never grows. Read both branches of a conditional out loud — that's the habit I've settled on after this one.
+
+`customerInfo` also fires on renewals. Sending every time is mostly harmless thanks to the monotonic guard, but your event counts inflate and you lose the ability to tell where the first purchase actually was. Persisting a "sent" flag, as above, pays off the first time you have to reconstruct a cohort from logs. Don't forget to add `paid_started` to `SCORE_MAP`.
 
 The same pattern works for in-app consumables. Map small purchases to a `+8` jump in `fine`, larger ones to `+16`, and you'll start to see realistic per-channel ROAS in the AppsFlyer or Adjust cohort builder within 2–3 weeks of consistent volume.
 
