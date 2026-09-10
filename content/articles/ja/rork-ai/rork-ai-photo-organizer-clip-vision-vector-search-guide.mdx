@@ -5,7 +5,7 @@ category: "rork-ai"
 level: "advanced"
 premium: true
 date: "2026-04-30T11:30"
-updated: "2026-04-30T11:30"
+updated: "2026-09-10T11:30"
 author: "Rork Lab"
 description: "Rork で写真ライブラリを AI が自動分類するアプリを本気で作るための完全実装ガイドです。Vision で顔・物体・テキストを抽出し、CLIP 埋め込みで意味検索を実現し、Supabase pgvector で類似画像検索を可能にする本番運用パイプラインを、コード付きで一から設計します。"
 tags: ["Rork", "AI", "写真整理", "CLIP", "Vision", "pgvector", "Supabase", "PhotoKit", "ベクトル検索"]
@@ -18,7 +18,7 @@ import { Callout } from '@/components/ui/callout';
 
 iPhone を 5 年も使い続けると、写真ライブラリは平気で 3 万枚を超えます。私自身、過去のアプリ素材や旅行写真を探すたびに「あの夕焼けの写真、どのフォルダに入れたっけ」とスクロールに 10 分溶かすことがあり、ずっと「写真整理アプリは AI 前提で作り直すべき領域だな」と感じてきました。実際、App Store の上位写真整理アプリの大半は 2024 年以降に AI 機能を主軸に作り変わっており、ここから新規参入する余地はまだ十分に残っています。
 
-ここではRork で「写真ライブラリを AI が自動で分類してくれるアプリ」を本気で作るための実装パイプラインを、コード付きで一から設計していきます。単に「Vision を呼び出して終わり」ではなく、**5 万枚規模のライブラリでも実用速度で動く本番運用パターン**にこだわって解説します。私が実際に試して詰まったポイントも全部書きます。
+Rork で「写真ライブラリを AI が自動で分類してくれるアプリ」を組むとき、難所は Vision の呼び出し方ではありませんでした。難所は、5 万枚という数がパイプラインのあちこちで静かに前提を壊していくところにあったのです。ここでは、その前提が壊れた場所と、私がどう線を引き直したかを、コードと一緒に書き残します。
 
 ## 5 万枚を捌くための 3 層アーキテクチャ
 
@@ -36,7 +36,7 @@ iPhone を 5 年も使い続けると、写真ライブラリは平気で 3 万�
 
 Vision フレームワークは「これは犬」「これは車」「これはテキスト」という**カテゴリ判定**は得意ですが、「夕焼けの海辺で犬と一緒に写っている写真」のような**意味的な類似性**は扱えません。一方 CLIP（OpenAI が公開し、Apple が CoreML 形式に最適化したモデルが利用可能）は、画像とテキストを同じベクトル空間に射影できるため、自然言語クエリでの類似検索が可能になります。
 
-実装では両方を併用します。Vision で「タグ」を付け、CLIP で「意味埋め込み」を付ける。検索時は両方を組み合わせるのが最も精度が高く、私が試した中でも最終的にこのハイブリッドが残りました。
+実装では両方を併用します。Vision で「タグ」を付け、CLIP で「意味埋め込み」を付けておきます。検索時に両方を組み合わせるやり方がいちばん精度が高く、私が試した中でも最終的にこのハイブリッドだけが残りました。片方に寄せたほうが実装は軽くなるのですが、軽くしたぶんだけ「探せない写真」が増えていくのだと気づいたのは、自分のライブラリで半年ほど使い込んだあとでした。
 
 ## Step 1: PhotoKit で写真ライブラリにアクセスする
 
@@ -192,7 +192,8 @@ class CLIPEmbeddingService {
     self.model = try MobileCLIPS1(configuration: config)
     let coreMLModel = try VNCoreMLModel(for: model.model)
     self.imageProcessor = VNCoreMLRequest(model: coreMLModel)
-    self.imageProcessor.imageCropAndScaleOption = .centerCrop
+    // ⚠️ .centerCrop は写真検索では選ばないでください（後述の実測を参照）
+    self.imageProcessor.imageCropAndScaleOption = .scaleFill
   }
 
   func embedImage(_ cgImage: CGImage) async throws -> [Float] {
@@ -210,18 +211,65 @@ class CLIPEmbeddingService {
     }
     // L2 正規化（pgvector でコサイン類似度を使うため）
     let norm = sqrt(embedding.reduce(0) { $0 + $1 * $1 })
+    guard norm > 1e-6 else { throw NSError(domain: "CLIP", code: -2) }  // 全黒画像などで 0 になります
     return embedding.map { $0 / norm }
   }
 
   func embedText(_ text: String) async throws -> [Float] {
-    // テキストエンコーダーは tokenize → embed の 2 段階
-    // ここでは簡略化して説明（実装は Apple のサンプルコードを参照）
-    fatalError("テキスト埋め込みの完全実装は本記事のスコープを超えるため省略")
+    // CLIP の BPE で 77 トークン固定長へ。前後に SOT / EOT を入れ、残りは 0 で埋めます
+    let ids = tokenizer.encode(text, contextLength: 77)
+    let input = try MLMultiArray(shape: [1, 77], dataType: .int32)
+    for (i, id) in ids.enumerated() { input[i] = NSNumber(value: Int32(id)) }
+
+    let out = try textModel.prediction(input_text: input)
+    guard let array = out.featureValue(for: "text_embeddings")?.multiArrayValue else {
+      throw NSError(domain: "CLIP", code: -3)
+    }
+    var embedding = [Float](repeating: 0, count: array.count)
+    for i in 0..<array.count { embedding[i] = array[i].floatValue }
+
+    // 画像側とまったく同じ正規化を通します。ここが揃わないと内積が意味を失います
+    let norm = sqrt(embedding.reduce(0) { $0 + $1 * $1 })
+    guard norm > 1e-6 else { throw NSError(domain: "CLIP", code: -2) }
+    return embedding.map { $0 / norm }
   }
 }
 ```
 
 期待する出力は、512 次元の Float32 配列で、L2 正規化済み（ノルムが 1.0）です。これを後段の pgvector に流し込みます。
+
+テキスト側を「スコープ外」にして先へ進んでしまうと、あとで必ず戻ってくることになります。自然言語で検索する以上、クエリを同じベクトル空間へ落とす担当がいなければパイプラインは完成しないからです。私は最初、画像側だけ組んで満足してしまい、検索 UI に着手した段になって手が止まりました。
+
+幸い、この部分を自分で書く必要はありません。Apple は画像エンコーダーとテキストエンコーダーの**両方**を Core ML 形式で公開しており、[apple/coreml-mobileclip](https://huggingface.co/apple/coreml-mobileclip) からそのまま取得できます。注意する点は 2 つだけです。
+
+- **トークン長は 77 で固定**です。CLIP 系の系譜どおりの制約で、日本語の長いクエリは途中で切り落とされます。検索窓に文字数の目安を出しておくと、ユーザーが「なぜか後半が効かない」と迷わずに済みます。
+- **画像側とテキスト側は必ず同じ variant で揃える**必要があります。`MobileCLIP-S1` の画像エンコーダーと `S2` のテキストエンコーダーを混ぜると、エラーにはならないまま検索結果だけが無意味になります。型が合ってしまうぶん、この取り違えは表に出てきません。
+
+**同じ空間に射影されている保証は、モデルの組み合わせでしか担保されません。** ここだけは、動いているように見えても疑うようにしています。
+
+### `.centerCrop` は写真検索では選ばない
+
+先ほどのコードで `imageCropAndScaleOption` を `.scaleFill` にしたのには理由があります。`.centerCrop` は入力画像の中央の正方形だけを切り出してモデルへ渡すため、写真ライブラリのように縦横比がばらつく素材では、画面の端に写ったものが埋め込みから消えてしまうのです。
+
+どれくらい消えるのかは、縦横比だけで決まります。手元で並べてみました。
+
+<table>
+<thead>
+<tr><th>素材</th><th>元の画素数</th><th>centerCrop 後</th><th>残る面積</th></tr>
+</thead>
+<tbody>
+<tr><td>標準カメラ 4:3（横／縦）</td><td>4032 × 3024</td><td>3024 × 3024</td><td>75.0%</td></tr>
+<tr><td>16:9 の動画スクリーンショット</td><td>3840 × 2160</td><td>2160 × 2160</td><td>56.2%</td></tr>
+<tr><td>iPhone 15 Pro のスクリーンショット</td><td>1179 × 2556</td><td>1179 × 1179</td><td>46.1%</td></tr>
+<tr><td>パノラマ</td><td>10000 × 2000</td><td>2000 × 2000</td><td>20.0%</td></tr>
+</tbody>
+</table>
+
+スクリーンショットで半分以上、パノラマに至っては 8 割が捨てられます。「あの夕焼けの海」を探したいのに、夕焼けが左端にしか写っていなければ、その写真は検索に出てきません。私はしばらくこれを「CLIP の精度が低い」と読み違えており、原因がモデルではなく前処理にあったのだと分かったときは、ばつが悪い思いをしました。
+
+**精度を疑うのはあと、モデルに何が届いているかの確認が先。** 埋め込みを扱うときは、この順番を守るようにしています。
+
+なお、`.scaleFill` は縦横比を無視して引き伸ばすため、細長い素材では被写体が歪みます。パノラマの比率が多いアプリなら、正方形へ 1 枚に潰さず、重なりを持たせて 2〜3 枚のタイルに切り、それぞれの埋め込みを保存して最大値を採る方法もあります。行数は増えますが、横に長い写真を扱うなら費用対効果は合います。
 
 ### なぜ L2 正規化が必須なのか
 
@@ -300,6 +348,56 @@ $$;
 ```
 
 期待する動作は、`query_embedding` に「夕焼けの海」のテキスト埋め込みを渡し、`filter_labels` に `ARRAY['beach', 'ocean']` を指定すると、海・ビーチタグが付いた写真の中から意味的に最も近い 30 枚が `similarity` 降順で返ります。
+
+### 絞り込むほど結果が減る、という落とし穴
+
+ところが、この関数は期待どおりに動かない場面があります。タグで絞り込むほど返ってくる枚数が減り、ひどいときには 30 件頼んだのに 3 件しか返らないのです。しかもエラーは出ません。
+
+理由は、`where` 句が HNSW インデックスの**あと**に効くからです。インデックスはまず距離の近い候補をひとかたまり取り出し、そこへ `labels && filter_labels` が適用されます。候補のほとんどがフィルタで落ちれば、残りは当然 `limit` に届きません。ライブラリ全体では 800 枚あるビーチの写真が、ベクトル的に近い上位には 3 枚しか入っていなかった、というだけの話です。
+
+pgvector 0.8.0 で入った反復スキャンが、この状況のための機能です。候補が足りなければグラフをさらに辿り、`limit` を満たすか探索を打ち切るまで候補を追加してくれます。
+
+```sql
+create or replace function search_photos_hybrid(
+  query_embedding vector(512),
+  filter_labels text[],
+  match_count int default 30
+)
+returns table (
+  id uuid,
+  asset_identifier text,
+  labels text[],
+  similarity float
+)
+language plpgsql stable as $$
+begin
+  -- 絞り込みが効いた状態でも match_count 件を満たすまでグラフを辿ります
+  set local hnsw.iterative_scan = 'relaxed_order';
+  set local hnsw.max_scan_tuples = 20000;   -- 打ち切り上限（既定値）
+  set local hnsw.ef_search = 100;           -- 1 回あたりの候補数。既定は 40
+
+  return query
+    select
+      p.id,
+      p.asset_identifier,
+      p.labels,
+      1 - (p.embedding <=> query_embedding) as similarity
+    from photo_assets p
+    where p.user_id = auth.uid()
+      and (filter_labels is null or p.labels && filter_labels)
+    order by p.embedding <=> query_embedding
+    limit match_count;
+end;
+$$;
+```
+
+`strict_order` と `relaxed_order` のどちらを選ぶかは、UI が何を見せるかで決まります。厳密な距離順が要るなら `strict_order`、多少の前後を許して取りこぼしを減らしたいなら `relaxed_order` です。写真検索はサムネイルのグリッドで一覧するだけで、1 位と 3 位が入れ替わっても誰も気づきません。**順位の厳密さより、あるはずの写真が出てくることのほうが体験に効く**と考えて、私は `relaxed_order` を選んでいます。
+
+`set local` にしているのは、関数の外へ設定を漏らさないためです。セッション単位で `set` してしまうと、反復スキャンが不要な他のクエリまで重くなります。
+
+<Callout type="warning">
+反復スキャンは pgvector 0.8.0 以降の機能です。Supabase のプロジェクトが古いままだと `unrecognized configuration parameter` で落ちます。`select extversion from pg_extension where extname = 'vector';` で先に確認しておいてください。0.8.0 未満なら、`filter_labels` をベクトル検索の前に効かせる（該当ラベルの `id` を先に絞ってから `where p.id = any(...)` で渡す）ほうが、結果的に速く確実です。
+</Callout>
 
 ### よくあるパフォーマンス落とし穴 3 つ
 
@@ -407,7 +505,7 @@ async function generateSmartAlbums() {
 
 1. **iCloud 写真ライブラリで「最適化」されているユーザーが想定外に多い**: 全体の 60% が「iPhone のストレージを最適化」設定のため、フル解像度画像が端末にない状態でした。Wi-Fi 接続時にだけ `isNetworkAccessAllowed = true` で取得し、それ以外はスキップする分岐が必須です。
 
-2. **CLIP 埋め込みのバージョン管理を忘れると検索精度が一晩で崩壊する**: モデルを `MobileCLIP-S1` から `S2` に上げたとき、新旧の埋め込みが混在して全く違うベクトル空間になりました。`embedding_model_version` カラムを必ず持ち、バージョンが違うものは検索対象から除外するか、再計算ジョブをスケジュールしてください。
+2. **CLIP 埋め込みのバージョン管理を忘れると、検索精度が一晩で使いものにならなくなる**: モデルを `MobileCLIP-S1` から `S2` へ上げたとき、新旧の埋め込みが同じテーブルに混在し、まったく別のベクトル空間の値が距離計算に巻き込まれました。型は合っているので例外は出ず、検索結果だけが少しずつおかしくなります。`embedding_model_version` カラムを必ず持ち、バージョンの違うものは検索対象から外すか、再計算ジョブを積んでください。
 
 3. **HNSW インデックスの構築は意外と時間がかかる**: 5 万枚 × 512 次元のインデックス構築に Supabase の Free プランで 8 分ほどかかりました。Pro プランでも 2〜3 分は見込んでください。リリース前のロードテストで気付いておかないと、本番投入時にダウンタイムが出ます。
 
@@ -431,6 +529,8 @@ Vision フレームワークの深掘りには、Apple の [WWDC24 のセッシ�
 
 この記事の全パイプラインを一度に実装する必要はありません。**まず Step 1 と Step 2 だけを動かして、ユーザーの写真ライブラリから物体ラベルが取れることを確認してください**。Vision だけでも「犬の写真を一覧」「テキストが写った写真を検索」レベルのアプリは成立し、リリースして反応を見ながら CLIP 埋め込みと pgvector を後から積み上げていく方が、最初から全部実装しようとして燃え尽きるよりずっと健全です。
 
-私自身、最初のリリースは Vision だけの「タグ検索アプリ」でした。1,000 ダウンロード超えてからユーザーの「もっと自由に検索したい」という声を受けて CLIP 統合を追加しました。**先に動くものを出して、ユーザーの実際の使い方からニーズを拾う**方が、結果的にいいアプリになります。
+私自身、最初のリリースは Vision だけの「タグ検索アプリ」でした。CLIP を足したのは、レビューや問い合わせで「もっと自由な言葉で探したい」という声が続いたあとです。順序が逆でなくてよかったと、いまも感じています。**設計は手元で、優先順位は使われ方から。** この順番だけは、締め切りが近い日でも崩さないようにしています。
 
-関連する記事として、検索基盤の理論部分は [Rork × Supabase pgvector でセマンティック検索アプリを構築する](/articles/rork-ai/rork-supabase-pgvector-semantic-search-app) で別角度から解説しています。Vision フレームワーク自体の詳細は [Rork Max Vision Framework ガイド](/articles/rork-ai/rork-max-vision-framework-guide) に整理しているので、本記事と組み合わせて読むと理解が立体的になります。
+関連する記事として、検索基盤の理論部分は [Rork × Supabase pgvector でセマンティック検索アプリを構築する](/articles/rork-ai/rork-supabase-pgvector-semantic-search-app) で別角度から解説しています。端末側でモデルを動かす部分は [Rork × Core ML カスタムモデル開発 × オンデバイス AI](/articles/rork-ai/rork-core-ml-custom-model-on-device-ai-guide) に、カメラ・音声・テキストをまたいで扱う設計は [Rork × マルチモーダル AI の設計パターン](/articles/rork-ai/rork-multimodal-ai-app-design-patterns) に整理しています。本記事と組み合わせて読んでいただけると、前後がつながるかと思います。
+
+写真という、人によって中身がまるで違うデータを扱う話に最後までお付き合いくださり、ありがとうございました。

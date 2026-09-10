@@ -5,7 +5,7 @@ category: "rork-ai"
 level: "advanced"
 premium: true
 date: "2026-04-30T11:30"
-updated: "2026-04-30T11:30"
+updated: "2026-09-10T11:30"
 author: "Rork Lab"
 description: "A complete implementation guide for building an AI-powered photo organizer app with Rork. Extract faces, objects, and text with the Vision framework, generate semantic embeddings with CLIP, and run similarity search at scale using Supabase pgvector — designed as a production pipeline from day one."
 tags: ["Rork", "AI", "Photo Organizer", "CLIP", "Vision", "pgvector", "Supabase", "PhotoKit", "Vector Search"]
@@ -192,7 +192,8 @@ class CLIPEmbeddingService {
     self.model = try MobileCLIPS1(configuration: config)
     let coreMLModel = try VNCoreMLModel(for: model.model)
     self.imageProcessor = VNCoreMLRequest(model: coreMLModel)
-    self.imageProcessor.imageCropAndScaleOption = .centerCrop
+    // Do not use .centerCrop for photo search — see the measurements below
+    self.imageProcessor.imageCropAndScaleOption = .scaleFill
   }
 
   func embedImage(_ cgImage: CGImage) async throws -> [Float] {
@@ -210,18 +211,63 @@ class CLIPEmbeddingService {
     }
     // L2 normalize so pgvector's cosine distance behaves correctly
     let norm = sqrt(embedding.reduce(0) { $0 + $1 * $1 })
+    guard norm > 1e-6 else { throw NSError(domain: "CLIP", code: -2) }  // all-black frames land here
     return embedding.map { $0 / norm }
   }
 
   func embedText(_ text: String) async throws -> [Float] {
-    // Text encoding is a tokenize -> embed pipeline.
-    // Full text-side implementation is out of scope here; refer to Apple's sample.
-    fatalError("Full text encoder implementation is outside the scope of this article")
+    // CLIP BPE into a fixed 77-token window: SOT, tokens, EOT, then zero padding
+    let ids = tokenizer.encode(text, contextLength: 77)
+    let input = try MLMultiArray(shape: [1, 77], dataType: .int32)
+    for (i, id) in ids.enumerated() { input[i] = NSNumber(value: Int32(id)) }
+
+    let out = try textModel.prediction(input_text: input)
+    guard let array = out.featureValue(for: "text_embeddings")?.multiArrayValue else {
+      throw NSError(domain: "CLIP", code: -3)
+    }
+    var embedding = [Float](repeating: 0, count: array.count)
+    for i in 0..<array.count { embedding[i] = array[i].floatValue }
+
+    // Exactly the same normalization as the image side, or the dot product stops meaning anything
+    let norm = sqrt(embedding.reduce(0) { $0 + $1 * $1 })
+    guard norm > 1e-6 else { throw NSError(domain: "CLIP", code: -2) }
+    return embedding.map { $0 / norm }
   }
 }
 ```
 
 Expected output: a 512-dimensional `Float32` array, L2-normalized (norm = 1.0). That goes straight into pgvector.
+
+I originally left the text side as a stub and moved on, which cost me a day. If you are searching with natural language, something has to project the query into the same space — without it the pipeline simply does not close. I only noticed when I sat down to build the search UI and had nothing to hand it.
+
+The good news is that you don't have to write it. Apple publishes **both** the image and text encoders in Core ML form at [apple/coreml-mobileclip](https://huggingface.co/apple/coreml-mobileclip). Two things to watch:
+
+- **The token window is fixed at 77.** That's inherited from CLIP, and long queries get silently truncated. Showing a character hint next to the search field saves your users from wondering why the tail of their query had no effect.
+- **Keep the image and text encoders on the same variant.** Pairing a `MobileCLIP-S1` image encoder with an `S2` text encoder throws no error — the shapes line up — and quietly returns meaningless results.
+
+**Living in the same vector space is guaranteed by the pairing, not by the types.** That's the one thing here I re-check even when everything looks fine.
+
+### Why `.centerCrop` Is the Wrong Choice for Photo Search
+
+`.centerCrop` hands the model only the centre square of the input, so on a library full of mixed aspect ratios anything near the edges disappears from the embedding entirely. How much disappears is pure geometry:
+
+<table>
+<thead>
+<tr><th>Source</th><th>Original pixels</th><th>After centerCrop</th><th>Area retained</th></tr>
+</thead>
+<tbody>
+<tr><td>Standard camera 4:3 (either orientation)</td><td>4032 × 3024</td><td>3024 × 3024</td><td>75.0%</td></tr>
+<tr><td>16:9 video screenshot</td><td>3840 × 2160</td><td>2160 × 2160</td><td>56.2%</td></tr>
+<tr><td>iPhone 15 Pro screenshot</td><td>1179 × 2556</td><td>1179 × 1179</td><td>46.1%</td></tr>
+<tr><td>Panorama</td><td>10000 × 2000</td><td>2000 × 2000</td><td>20.0%</td></tr>
+</tbody>
+</table>
+
+Screenshots lose more than half. Panoramas lose four fifths. If the sunset you're hunting for sits at the left edge, that photo will never surface. I spent a while blaming CLIP's accuracy for this, and finding the cause in my own preprocessing was a humbling afternoon.
+
+**Check what reaches the model before you question the model.** I run that check first now, every time.
+
+One caveat: `.scaleFill` ignores aspect ratio, so very elongated images get stretched. If panoramas are common in your domain, consider slicing wide images into two or three overlapping tiles, embedding each, and taking the maximum similarity across them. It's more code, but for wide-format libraries the trade is worth it.
 
 ### Why L2 Normalization Is Non-Negotiable
 
@@ -300,6 +346,56 @@ $$;
 ```
 
 Pass the text-encoded "sunset at the beach" embedding as `query_embedding` and `ARRAY['beach', 'ocean']` as `filter_labels`, and you'll get the 30 most semantically similar photos that also carry a beach or ocean tag, ordered by similarity descending.
+
+### The Tighter You Filter, the Fewer Results You Get
+
+Except that it often doesn't behave that way. The more you narrow by tag, the fewer rows come back — sometimes 3 rows when you asked for 30. And nothing errors.
+
+The reason is that the `where` clause runs *after* the HNSW index has already chosen its candidates. The index pulls a batch of near neighbours, then `labels && filter_labels` filters that batch. If most candidates fail the filter, what's left never reaches your `limit`. Your library might hold 800 beach photos, but only 3 of them made the vector-nearest shortlist.
+
+pgvector 0.8.0 added iterative index scans for exactly this. When the filtered batch comes up short, the index keeps walking the graph until the `limit` is satisfied or the scan budget runs out.
+
+```sql
+create or replace function search_photos_hybrid(
+  query_embedding vector(512),
+  filter_labels text[],
+  match_count int default 30
+)
+returns table (
+  id uuid,
+  asset_identifier text,
+  labels text[],
+  similarity float
+)
+language plpgsql stable as $$
+begin
+  -- Keep walking the graph until match_count rows survive the filter
+  set local hnsw.iterative_scan = 'relaxed_order';
+  set local hnsw.max_scan_tuples = 20000;   -- scan budget (default)
+  set local hnsw.ef_search = 100;           -- candidates per pass; default is 40
+
+  return query
+    select
+      p.id,
+      p.asset_identifier,
+      p.labels,
+      1 - (p.embedding <=> query_embedding) as similarity
+    from photo_assets p
+    where p.user_id = auth.uid()
+      and (filter_labels is null or p.labels && filter_labels)
+    order by p.embedding <=> query_embedding
+    limit match_count;
+end;
+$$;
+```
+
+Choosing between `strict_order` and `relaxed_order` comes down to what the UI shows. Photo search renders a grid of thumbnails, and nobody notices when rank 1 and rank 3 swap places. **Surfacing the photo that exists matters more here than ordering it perfectly**, so I use `relaxed_order`.
+
+The `set local` matters: session-level `set` would leave iterative scanning switched on for every other query in the connection, including the ones that don't need it.
+
+<Callout type="warning">
+Iterative scans require pgvector 0.8.0 or newer. On an older Supabase project this fails with `unrecognized configuration parameter`. Check first with `select extversion from pg_extension where extname = 'vector';`. Below 0.8.0, apply the label filter *before* the vector search — resolve matching `id`s first, then pass them in with `where p.id = any(...)`. It ends up both faster and more predictable.
+</Callout>
 
 ### Three Performance Pitfalls You Will Hit
 
@@ -497,8 +593,10 @@ If your numbers don't pencil out at this granularity, something is wrong with th
 
 You don't need to ship the whole pipeline at once. **Start with Steps 1 and 2 only and confirm you can extract object labels from a user's library.** Vision alone is enough to ship "list all dog photos" or "search photos containing text" — release that, listen to your users, then layer CLIP and pgvector in based on actual demand instead of guessing.
 
-My own first release was Vision-only. After crossing 1,000 downloads I added CLIP integration in response to user requests for richer search. **Shipping something that works first and learning what users actually need beats trying to build everything up front and burning out.**
+My own first release was Vision-only. CLIP came later, after reviews and support mail kept asking for freer, more natural search. I'm glad the order wasn't reversed. **Design at your desk, prioritise from how it gets used.** That's the sequence I hold onto even when a deadline is close.
 
 The same logic applies to your server side. You don't need pgvector on day one — start with a fully on-device experience using SQLite for vector storage, and migrate to Supabase pgvector only when you need cross-device sync or when local search at scale starts to feel slow. Each step you defer is a step that doesn't risk killing momentum during the riskiest period of a new app: the first hundred days. The architecture in this article is the destination, not the starting line. Plot a path through it that matches your tolerance for risk and the time you have available.
 
-For deeper context, the theory side of the search backend lives in [Building a Semantic Search App with Rork × Supabase pgvector](/en/articles/rork-ai/rork-supabase-pgvector-semantic-search-app), and the Vision framework itself is covered from a different angle in the [Rork Max Vision Framework guide](/en/articles/rork-ai/rork-max-vision-framework-guide). Reading them alongside this article gives you a fuller picture of the moving pieces.
+For deeper context, the theory side of the search backend lives in [Building a Semantic Search App with Rork × Supabase pgvector](/en/articles/rork-ai/rork-supabase-pgvector-semantic-search-app), the on-device model side is covered in [Rork × Core ML Custom Models and On-Device AI](/en/articles/rork-ai/rork-core-ml-custom-model-on-device-ai-guide), and the cross-modal design work in [Rork × Multimodal AI Design Patterns](/en/articles/rork-ai/rork-multimodal-ai-app-design-patterns). Reading them alongside this article gives you a fuller picture of the moving pieces.
+
+Thank you for staying with a long one.
