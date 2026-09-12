@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "iOS 27 — 9月14日配信まであと2日です。新しい OS が出た直後は、AI が生成したアプリの足場がいちばん揺れます",
-    "待ち方 — 標準 Rork は Expo と React Native の版が上がるのを待ちます。追随の速さを自分で短くできない、という性質があります",
-    "MAX — Rork Max はネイティブ Swift を生成しますので、Xcode と SDK が対応すれば追随できます。待ち行列がひとつ短いわけです",
-    "新 API — ただし新しい API を生成に使えるかは、モデルが新 SDK を知っているかに依存します。ここは Max でも即座には解決しません",
-    "折りたたみ — iPhone Duo のような新しい画面形状は、生成されたレイアウトが最初に壊れる場所です。固定幅とセーフエリアからご確認ください",
-    "数値 — 資金調達額は二次情報で割れたままです。$15M のシードと Paperline 買収の発表は2026年4月9日。裏が取れない数字には触れないのが安全です",
+    "iOS 27 — 配信は明日9月14日です。新しい OS が出た直後の数日は、AI が生成したアプリの足場がいちばん揺れる期間になります",
+    "提出 — App Store Connect への iOS 27 / macOS 27 向け提出は9月10日から受付が始まっています。Xcode 27 は RC が配布中です",
+    "2027年4月 — それ以降にアップロードするアプリは iOS 27 / iPadOS 27 SDK 以上でのビルドが必須になります。SDK の版を自分で選べない方ほど早めの確認を",
+    "Swift 6 — Xcode 27 の新しいビルドシステムは既定が Swift 6 モードです。iOS 27 同梱は Swift 6.4。既存プロジェクトは並行性まわりの検査に注意してください",
+    "年齢 — Time Allowances 等に伴う新しい年齢レーティングの設問への回答が必要です。提出そのものが止まる項目ですので、手順の早い段階で",
+    "待ち方 — 標準 Rork は Expo と React Native の版を待ち、Rork Max は Xcode と SDK を待ちます。追随の速さは生成物の種類で決まります",
   ],
   en: [
-    "iOS 27 — Two days out from the September 14 release. The days right after a new OS are when AI-generated apps wobble most",
-    "WAITING — Standard Rork waits on Expo and React Native to ship their updates, and that wait is not something you can shorten yourself",
-    "MAX — Rork Max writes native Swift, so it can follow along as soon as Xcode and the SDK are ready. One fewer queue to stand in",
-    "NEW APIS — Whether a new API can actually be generated still depends on whether the model has seen the new SDK. Max does not solve that overnight",
-    "FOLDABLE — A new screen shape like iPhone Duo is where generated layouts break first. Start with fixed widths and safe areas",
-    "NUMBERS — Funding figures still disagree across secondary sources. The $15M seed and the Paperline acquisition were announced on April 9, 2026",
+    "iOS 27 — It ships tomorrow, September 14. The days right after a new OS lands are when AI-generated apps stand on the least stable ground",
+    "SUBMISSIONS — App Store Connect has been accepting builds for iOS 27 and macOS 27 since September 10, and Xcode 27 is available as a release candidate",
+    "APRIL 2027 — From then on, anything uploaded to App Store Connect must be built with the iOS 27 or iPadOS 27 SDK. Worth checking early if you cannot pick your own SDK version",
+    "SWIFT 6 — Xcode 27's new build system defaults to Swift 6 mode, and iOS 27 ships with Swift 6.4. Existing projects may meet concurrency checks they have not met before",
+    "AGE RATINGS — New age rating questions tied to features like Time Allowances now need answers. This one can hold up a submission, so handle it early",
+    "WAITING — Standard Rork waits on Expo and React Native; Rork Max waits on Xcode and the SDK. What a tool waits for decides how fast it catches up",
   ],
 };
 
