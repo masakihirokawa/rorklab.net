@@ -5,6 +5,7 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-07-24T14:00"
+updated: "2026-09-12T11:30"
 author: "Rork Lab"
 description: "When several components fire the same API call at launch, you get a burst of identical requests. Here is a single-flight layer that shares one in-flight promise instead: how to build the key that decides the folding, the trap of handing out a failed promise forever, the trap of one caller's abort cancelling everyone, and the test that keeps it all from regressing, with the real network numbers alongside."
 tags: ["Rork", "React Native", "API", "Performance", "Architecture"]
@@ -273,6 +274,87 @@ async function fetchEntitlements(signal: AbortSignal) {
 
 Now, as long as you pass the same `key`, no matter how many components call it, the actual network request is folded to one.
 
+## Trap three: the request count doubles in development only
+
+The morning after I added reference counting and called it done, I opened the inspector again and `/me/entitlements` was still listed twice. One of the two carried the abort marker. I had counting in place and still could not get to one request, and for a while I just sat there.
+
+React StrictMode was behind it. In development builds, StrictMode runs every effect twice in the order setup → cleanup → setup. From the point of view of `useCoalescedQuery`, that means `release` is called once immediately after mount. Even with three screens asking for the same key, the moment all three of those first cleanups run, `refs` drops to zero, the in-flight request is aborted right there, and the second round of setups fires a fresh one.
+
+I reproduced the same ordering locally and counted the fetches that actually ran, with three callers asking for one key.
+
+<table>
+  <thead>
+    <tr><th><code>release</code> implementation</th><th>Fetches that ran</th><th>Aborted</th><th>Completed</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Immediate <code>abort()</code> (the code above)</td><td>2</td><td>1</td><td>1</td></tr>
+    <tr><td>Grace-period <code>release</code></td><td>1</td><td>0</td><td>1</td></tr>
+  </tbody>
+</table>
+
+StrictMode is off in release builds, so none of this doubling reaches your users. But if the number you look at during development is always twice the real one, your fold-rate instrument is wrong and so is every decision you draw from it. While I was rereading the coalescer convinced the implementation was broken, what was actually broken was the premise of the measurement. If any of this looks familiar, I may be missing a subtler cause in your case, but StrictMode is worth suspecting before the code is.
+
+The fix is plain enough. Do not abort the instant `refs` hits zero — wait for one beat. If someone comes back during that beat, cancel the abort you scheduled.
+
+```ts
+type Entry<T> = {
+  promise: Promise<T>;
+  controller: AbortController;
+  refs: number;
+  pendingAbort: ReturnType<typeof setTimeout> | null;
+};
+
+const inflight = new Map<string, Entry<unknown>>();
+const ABORT_GRACE_MS = 0; // one setTimeout tick is enough to span StrictMode's round trip
+
+export function coalesce<T>(
+  key: string,
+  run: (signal: AbortSignal) => Promise<T>,
+): { promise: Promise<T>; release: () => void } {
+  let entry = inflight.get(key) as Entry<T> | undefined;
+
+  if (!entry) {
+    const controller = new AbortController();
+    const promise = run(controller.signal).finally(() => {
+      inflight.delete(key); // trap one: always delete on settle
+    });
+    entry = { promise, controller, refs: 0, pendingAbort: null };
+    inflight.set(key, entry as Entry<unknown>);
+  }
+
+  // someone came back, so cancel the abort we scheduled
+  if (entry.pendingAbort !== null) {
+    clearTimeout(entry.pendingAbort);
+    entry.pendingAbort = null;
+  }
+
+  entry.refs += 1;
+
+  let released = false; // calling the same release twice must do nothing
+  const release = () => {
+    if (released) return;
+    released = true;
+    entry!.refs -= 1;
+    if (entry!.refs > 0) return;
+
+    entry!.pendingAbort = setTimeout(() => {
+      if (entry!.refs <= 0 && inflight.get(key) === entry) {
+        entry!.controller.abort();
+        inflight.delete(key);
+      }
+    }, ABORT_GRACE_MS);
+  };
+
+  return { promise: entry.promise, release };
+}
+```
+
+A grace of `0` is enough, because a single `setTimeout` already spans the gap between StrictMode's cleanup and its second setup. On tabs the user flips back and forth, stretching it to 50–100ms also saves the refetch when they return. The longer you make it, though, the longer a genuinely abandoned request keeps running. What worked for me was leaving the default at zero and raising it only on the few screens that see heavy back-and-forth.
+
+The `released` flag earns its line too. As the conditions around a caller grow, cleanups really do run twice. Without the flag, `refs` goes negative and the abort fires while someone is still waiting. When I checked it locally, one of two callers calling `release` twice was enough to hand the other one — which had done nothing wrong — an `AbortError`.
+
+**The right to stop something shared belongs to the last person leaving, one beat after they are gone.** I thought reference counting had already drawn that line, and StrictMode showed me it had not. Looking back, the hard part was never the counting itself but deciding when the counting is finished.
+
 ## What you must not coalesce: writes
 
 Coalescing works only for reads — where calling repeatedly yields the same result. Get this wrong and you lose data silently.
@@ -396,6 +478,6 @@ First, attach a network inspector right after launch and look for the same URL r
 
 Remote config in particular is a strong candidate, since nearly every screen pulls it at launch. The distribution side of flags is covered in [Making Feature Flags Survive Production: Kill Switches and Gradual Rollouts in Rork Max](/articles/rork-dev/rork-max-feature-flags-remote-config), and how the received values stack against defaults and user preferences in [Resolving App Config in Three Layers: Merging Defaults, User, and Remote With Bounded Overrides](/articles/rork-dev/rork-config-precedence-resolver-bounded-override-typed-layer). Keeping the layer that folds fetches separate from the layer that decides values lets you swap either one later without touching the other.
 
-The coalescer fits in one file. You do not need to rewrite all existing fetch code at once. Swap only the reads that are firing in duplicate onto `coalesce`, and as long as you keep the two points — deleting in `finally` and the reference count — it quietly starts to help.
+The coalescer fits in one file. You do not need to rewrite all existing fetch code at once. Swap only the reads that are firing in duplicate onto `coalesce`, and as long as you keep the three points — deleting in `finally`, the reference count, and the grace before aborting — it starts helping from the moment you swap it in.
 
 I am still working on my own networking base. I hope this is of some use to anyone facing the same problem. Thank you for reading.
