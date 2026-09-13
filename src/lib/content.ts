@@ -1,4 +1,18 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
+
+/**
+ * フロントマターの日付はタイムゾーン無しの JST（"2026-09-12T15:00"）。
+ * Workers の V8 は UTC なので、そのまま new Date() すると 9 時間未来の lastmod / datePublished になる。
+ * +09:00 を補って ISO 8601 に正規化する（sitemap・JSON-LD・OG・RSS 共通）。
+ */
+export function toIsoJst(value?: string | null): string {
+  if (!value) return "";
+  if (/[Zz]$|[+-]\d{2}:\d{2}$/.test(value)) return value;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return `${value}T00:00:00+09:00`;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return `${value}:00+09:00`;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(value)) return `${value}+09:00`;
+  return value;
+}
 import articlesData from "@/generated/articles.json";
 import blogData from "@/generated/blog.json";
 
@@ -50,8 +64,10 @@ export interface Article {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const articles = articlesData as Record<string, any[]>;
 
-export function getArticles(locale: string): ArticleMeta[] {
-  const entries = articles[locale] || [];
+export function getArticles(locale: string, includeNoindex = false): ArticleMeta[] {
+  // 既定で noindex（剪定済み）記事を除外する。一覧・関連・タグ・フィードは keep 記事だけを露出し、
+  // 剪定記事へ内部リンクを流さない（2026-09-13 構造監査）。全件が要るのは検索 API と Bing sitemap のみ。
+  const entries = (articles[locale] || []).filter((entry) => includeNoindex || !entry.noindex);
   return entries.map((entry) => ({
     title: entry.title || "",
     slug: entry.slug || "",
@@ -115,7 +131,7 @@ export function getAllArticleSlugs(
  * Used for tag cloud authority signal (Simon Willison-style: "ai 2024").
  */
 export function getTagCounts(locale: string): Map<string, number> {
-  const entries = articles[locale] || [];
+  const entries = (articles[locale] || []).filter((e) => !e.noindex);
   const counts = new Map<string, number>();
   for (const e of entries) {
     for (const t of (e.tags || []) as string[]) {
@@ -131,7 +147,7 @@ export function getTagCounts(locale: string): Map<string, number> {
  * Count articles with a specific tag (case-insensitive).
  */
 export function countArticlesByTag(locale: string, tag: string): number {
-  const entries = articles[locale] || [];
+  const entries = (articles[locale] || []).filter((e) => !e.noindex);
   const needle = (tag || "").toLowerCase();
   let count = 0;
   for (const e of entries) {

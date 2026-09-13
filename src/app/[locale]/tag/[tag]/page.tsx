@@ -38,6 +38,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     description,
     openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }] },
     robots: { index: false, follow: true },
+    // 自己 canonical。無指定だとルート layout の canonical（トップ）を継承していた（2026-09-13）
+    alternates: { canonical: `https://rorklab.net${locale === "ja" ? "" : `/${locale}`}/tag/${encodeURIComponent(decoded)}` },
   };
 }
 

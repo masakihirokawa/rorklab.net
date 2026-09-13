@@ -1,4 +1,4 @@
-import { getArticles, getBlogPosts } from "@/lib/content";
+import { getArticles, getBlogPosts, toIsoJst } from "@/lib/content";
 
 export async function GET() {
   const baseUrl = "https://rorklab.net";
@@ -36,7 +36,7 @@ export async function GET() {
       .replace(/'/g, "&apos;");
 
   const toRFC822 = (dateStr: string) => {
-    const d = new Date(dateStr);
+    const d = new Date(toIsoJst(dateStr));
     return d.toUTCString();
   };
 

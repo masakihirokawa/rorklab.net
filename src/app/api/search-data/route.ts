@@ -7,7 +7,7 @@ export async function GET(request: NextRequest) {
   const cookieLocale = request.cookies.get("NEXT_LOCALE")?.value;
   const locale = cookieLocale === "en" ? "en" : "ja";
 
-  const articles = getArticles(locale).map((a) => ({
+  const articles = getArticles(locale, true).map((a) => ({
     title: a.title,
     slug: a.slug,
     category: a.category,

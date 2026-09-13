@@ -38,6 +38,8 @@ function getTagCounts(locale: string): { tag: string; count: number }[] {
   }
   return Array.from(map.entries())
     .map(([tag, count]) => ({ tag, count }))
+    // 1 本しか無いタグはタグページが記事 1 本の薄い一覧になるので載せない（2026-09-13）
+    .filter((t) => t.count >= 2)
     .sort((a, b) => b.count - a.count);
 }
 

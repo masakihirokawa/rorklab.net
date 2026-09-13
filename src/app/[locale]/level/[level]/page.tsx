@@ -76,7 +76,11 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
     },
   };
 
-  // Pagination: rely on canonical (to page 1) instead of noindex for GSC compatibility
+  // page>=2 は自己 canonical + noindex,follow（page1 への canonical は Google 非推奨・2026-09-13）
+  if (currentPage > 1) {
+    metadata.alternates = { canonical: `${canonical}?page=${currentPage}` };
+    metadata.robots = { index: false, follow: true };
+  }
   return metadata;
 }
 
@@ -123,6 +127,7 @@ export default async function LevelPage({ params, searchParams }: Props) {
   /* Pagination */
   const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
   const totalPages = Math.ceil(articles.length / ARTICLES_PER_PAGE);
+  if (currentPage > Math.max(1, totalPages)) notFound(); // 範囲外の ?page= は 404
   const safePage = Math.min(currentPage, Math.max(1, totalPages));
   const startIdx = (safePage - 1) * ARTICLES_PER_PAGE;
   const paginatedArticles = articles.slice(startIdx, startIdx + ARTICLES_PER_PAGE);

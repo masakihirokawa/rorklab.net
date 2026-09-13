@@ -1,5 +1,5 @@
 import type { MetadataRoute } from "next";
-import { getAllArticleSlugs, getArticles, getBlogPosts } from "@/lib/content";
+import { getAllArticleSlugs, getArticles, getBlogPosts, toIsoJst } from "@/lib/content";
 
 export default function sitemap(): MetadataRoute.Sitemap {
   const baseUrl = "https://rorklab.net";
@@ -26,7 +26,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   const _jaBlog = getBlogPosts("ja");
   function _latestDate(items: ReadonlyArray<{ updated?: string; date?: string }>): Date {
     const dates = items
-      .map(a => new Date(a.updated || a.date || 0))
+      .map(a => new Date(toIsoJst(a.updated || a.date) || 0))
       .filter(d => !isNaN(d.getTime()) && d.getTime() > 0);
     return dates.length > 0
       ? new Date(Math.max(...dates.map(d => d.getTime())))
@@ -36,7 +36,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   const latestBlogDate = _latestDate(_jaBlog);
   const categoryLastmod: Record<string, Date> = {};
   for (const a of _jaArts) {
-    const d = new Date(a.updated || a.date || 0);
+    const d = new Date(toIsoJst(a.updated || a.date) || 0);
     if (!isNaN(d.getTime()) && d.getTime() > 0) {
       const cur = categoryLastmod[a.category];
       if (!cur || d.getTime() > cur.getTime()) categoryLastmod[a.category] = d;
@@ -101,7 +101,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     const jaUrl = `${baseUrl}/articles/${article.category}/${article.slug}`;
     const enUrl = `${baseUrl}/en/articles/${article.category}/${article.slug}`;
     const date = article.updated || article.date;
-    const _artBase = date ? new Date(date) : SITE_LAUNCHED_FALLBACK;
+    const _artBase = date ? new Date(toIsoJst(date)) : SITE_LAUNCHED_FALLBACK;
     const _artOff = _artSlugOffset.get(article.slug) || 0;
     const _artLastMod = _artOff > 0 ? new Date(_artBase.getTime() + _artOff * 60000) : _artBase;
 
@@ -146,7 +146,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     const jaUrl = `${baseUrl}/blog/${post.slug}`;
     const enUrl = `${baseUrl}/en/blog/${post.slug}`;
 
-    const _blogBase = post.date ? new Date(post.date) : SITE_LAUNCHED_FALLBACK;
+    const _blogBase = post.date ? new Date(toIsoJst(post.date)) : SITE_LAUNCHED_FALLBACK;
     const _blogOff = _blogSlugOffset.get(post.slug) || 0;
     const _blogLastMod = _blogOff > 0 ? new Date(_blogBase.getTime() + _blogOff * 60000) : _blogBase;
 

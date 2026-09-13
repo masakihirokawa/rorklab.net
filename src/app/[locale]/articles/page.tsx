@@ -1,3 +1,4 @@
+import { notFound } from "next/navigation";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
@@ -14,7 +15,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const isJa = locale === "ja";
   const page = parseInt(sp.page || "1", 10) || 1;
 
-  return {
+  const metadata: Metadata = {
     title: isJa ? "すべての記事" : "All Articles",
     description: isJa
       ? "Rork Lab に掲載しているすべての記事の一覧です。Rork と Rork Max の使い方、React Native の開発テクニック、Gemini や Claude との AI 連携、広告やサブスクリプションによる収益化まで、カテゴリを横断して探せます。"
@@ -35,6 +36,20 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
       },
     },
   };
+  // page>=2 は自己 canonical + noindex,follow（page1 への canonical は Google 非推奨）。
+  // ?category=X（page1）は本物のカテゴリページ /articles/X の重複なのでそちらへ canonical（2026-09-13）。
+  const filterCat = CATEGORIES.some((c) => c.id === sp.category) ? (sp.category || "") : "";
+  const listBase = locale === "ja" ? "https://rorklab.net/articles" : "https://rorklab.net/en/articles";
+  if (page > 1) {
+    const qs = new URLSearchParams();
+    if (filterCat) qs.set("category", filterCat);
+    qs.set("page", String(page));
+    metadata.alternates = { canonical: `${listBase}?${qs.toString()}` };
+    metadata.robots = { index: false, follow: true };
+  } else if (filterCat) {
+    metadata.alternates = { canonical: `${listBase}/${filterCat}` };
+  }
+  return metadata;
 }
 
 const LEVEL_LABELS: Record<string, Record<string, string>> = {
@@ -64,6 +79,7 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
 
   const totalArticles = articles.length;
   const totalPages = Math.ceil(totalArticles / ARTICLES_PER_PAGE);
+  if (currentPage > Math.max(1, totalPages)) notFound(); // 範囲外の ?page= は 200 で page1 を返さず 404
   const safePage = Math.min(currentPage, Math.max(1, totalPages));
   const startIdx = (safePage - 1) * ARTICLES_PER_PAGE;
   const paginatedArticles = articles.slice(startIdx, startIdx + ARTICLES_PER_PAGE);
