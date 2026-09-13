@@ -59,7 +59,7 @@ export default async function TagsPage({ params }: Props) {
       <div style={{ marginBottom: 40 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
             TAGS
           </span>
         </div>
@@ -140,7 +140,7 @@ export default async function TagsPage({ params }: Props) {
               <span
                 style={{
                   fontSize: 11,
-                  fontFamily: "'DM Mono', monospace",
+                  fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                   color: "var(--text-dim)",
                   marginLeft: 8,
                   flexShrink: 0,

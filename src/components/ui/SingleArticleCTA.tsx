@@ -180,7 +180,7 @@ export function SingleArticleCTA({ locale, slug, category }: SingleArticleCTAPro
         }}
       >
         <div style={{ flex: 1, height: 1, background: "var(--border-subtle)" }} />
-        <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+        <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
           {labels.orSeparator}
         </span>
         <div style={{ flex: 1, height: 1, background: "var(--border-subtle)" }} />

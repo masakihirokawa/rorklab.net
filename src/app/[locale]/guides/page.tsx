@@ -80,7 +80,7 @@ export default async function GuidesPage({ params }: Props) {
       <div style={{ marginBottom: 48 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
             SYSTEMATIC GUIDES
           </span>
         </div>
@@ -140,7 +140,7 @@ export default async function GuidesPage({ params }: Props) {
                         transition: "background 0.2s",
                       }}
                     >
-                      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-faint)", minWidth: 20 }}>
+                      <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-faint)", minWidth: 20 }}>
                         {String(j + 1).padStart(2, "0")}
                       </span>
                       <span style={{ fontSize: 14, color: "var(--text-secondary)" }}>

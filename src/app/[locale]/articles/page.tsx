@@ -114,7 +114,7 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
       <div style={{ marginBottom: 32 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
             ARTICLES
           </span>
         </div>
@@ -129,7 +129,7 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
           href={`${prefix}/articles`}
           style={{
             fontSize: 12,
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             padding: "6px 14px",
             borderRadius: 6,
             border: `1px solid ${!filterCategory ? "var(--accent)" : "var(--border)"}`,
@@ -151,7 +151,7 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
               href={`${prefix}/articles?category=${cat.id}`}
               style={{
                 fontSize: 12,
-                fontFamily: "'DM Mono', monospace",
+                fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                 padding: "6px 14px",
                 borderRadius: 6,
                 border: `1px solid ${isActive ? cat.color : "var(--border)"}`,
@@ -188,11 +188,11 @@ export default async function ArticlesPage({ params, searchParams }: Props) {
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>
+                <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em" }}>
                   {catIcon(article.category)} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                 </span>
                 <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                   {article.date?.split("T")[0]}
                 </span>
                 <LevelBadge

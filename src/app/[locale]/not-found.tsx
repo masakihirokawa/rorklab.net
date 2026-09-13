@@ -37,7 +37,7 @@ export default async function NotFound() {
     >
       <div
         style={{
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           fontSize: 80,
           fontWeight: 300,
           color: "var(--accent-coral)",
@@ -75,7 +75,7 @@ export default async function NotFound() {
           display: "inline-block",
           padding: "10px 24px",
           fontSize: 13,
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           letterSpacing: "0.04em",
           color: "var(--accent-coral)",
           border: "1px solid color-mix(in srgb, var(--accent-coral) 25%, transparent)",

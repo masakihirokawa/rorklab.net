@@ -67,7 +67,7 @@ const SOCIAL_CHIP: React.CSSProperties = {
   background: "var(--bg-surface)",
   color: "var(--text-muted)",
   fontSize: 12,
-  fontFamily: "'DM Mono', monospace",
+  fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
   textDecoration: "none",
   letterSpacing: "0.03em",
   transition: "border-color 0.3s, color 0.3s",
@@ -85,7 +85,7 @@ export default async function AboutPage({ params }: Props) {
       {/* Badge */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
         <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+        <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
           ABOUT
         </span>
       </div>
@@ -156,7 +156,7 @@ function JaContent() {
         <p style={{ fontSize: 20, fontWeight: 400, color: "var(--text-primary)", marginBottom: 4, lineHeight: 1.4 }}>
           廣川政樹
         </p>
-        <p style={{ fontSize: 14, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.04em" }}>
+        <p style={{ fontSize: 14, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.04em" }}>
           Masaki Hirokawa
         </p>
         <p style={{ fontSize: 13, color: "var(--text-muted)", marginTop: 4 }}>
@@ -326,7 +326,7 @@ function EnContent() {
         <p style={{ fontSize: 20, fontWeight: 400, color: "var(--text-primary)", marginBottom: 4, lineHeight: 1.4 }}>
           Masaki Hirokawa
         </p>
-        <p style={{ fontSize: 14, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.04em" }}>
+        <p style={{ fontSize: 14, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.04em" }}>
           廣川政樹
         </p>
         <p style={{ fontSize: 13, color: "var(--text-muted)", marginTop: 4 }}>

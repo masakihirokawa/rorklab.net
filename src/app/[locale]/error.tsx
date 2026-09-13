@@ -42,7 +42,7 @@ export default function Error({
     >
       <div
         style={{
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           fontSize: 64,
           fontWeight: 300,
           color: "var(--accent-blue)",
@@ -85,7 +85,7 @@ export default function Error({
           style={{
             padding: "10px 24px",
             fontSize: 13,
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             letterSpacing: "0.04em",
             color: "var(--accent-coral)",
             border: "1px solid color-mix(in srgb, var(--accent-coral) 25%, transparent)",
@@ -107,7 +107,7 @@ export default function Error({
           style={{
             padding: "10px 24px",
             fontSize: 13,
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             letterSpacing: "0.04em",
             color: "var(--text-muted)",
             border: "1px solid var(--border-subtle)",
@@ -126,7 +126,7 @@ export default function Error({
             alignItems: "center",
             padding: "10px 24px",
             fontSize: 13,
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             letterSpacing: "0.04em",
             color: "var(--text-muted)",
             border: "1px solid var(--border-subtle)",

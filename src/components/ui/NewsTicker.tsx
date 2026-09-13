@@ -57,7 +57,7 @@ export function NewsTicker() {
             style={{
               fontSize: 11,
               color: "var(--text-muted)",
-              fontFamily: "'DM Mono', monospace",
+              fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
               letterSpacing: "0.03em",
               display: "flex",
               alignItems: "center",

@@ -47,7 +47,7 @@ export function RelatedArticles({
           fontSize: 14,
           fontWeight: 600,
           color: "var(--text-primary)",
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           letterSpacing: "0.04em",
           marginBottom: 20,
         }}
@@ -75,7 +75,7 @@ export function RelatedArticles({
                   style={{
                     fontSize: 11,
                     color: aCat?.color || "var(--text-dim)",
-                    fontFamily: "'DM Mono', monospace",
+                    fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                   }}
                 >
                   {aCat?.icon} {CATEGORY_LABELS[locale]?.[article.category] || article.category}

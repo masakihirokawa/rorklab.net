@@ -243,7 +243,7 @@ export default async function ArticlePage({ params }: Props) {
             fontSize: 12,
             color: "var(--text-dim)",
             textDecoration: "none",
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             letterSpacing: "0.06em",
           }}
         >
@@ -254,7 +254,7 @@ export default async function ArticlePage({ params }: Props) {
           style={{
             fontSize: 12,
             color: catInfo?.color || "var(--text-dim)",
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             letterSpacing: "0.06em",
           }}
         >
@@ -269,14 +269,14 @@ export default async function ArticlePage({ params }: Props) {
             style={{
               fontSize: 12,
               color: catInfo?.color || "var(--text-muted)",
-              fontFamily: "'DM Mono', monospace",
+              fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
               letterSpacing: "0.06em",
             }}
           >
             {catInfo?.icon} {CATEGORY_LABELS[locale]?.[category] || category}
           </span>
           <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-          <span style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+          <span style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
             {article.meta.date?.split("T")[0]}
           </span>
           <LevelBadge
@@ -309,7 +309,7 @@ export default async function ArticlePage({ params }: Props) {
               // keep 記事が 2 本未満のタグは一覧にならないのでリンクしない（薄い noindex タグページへの内部リンクを断つ）
               if (count < 2) {
                 return (
-                  <span key={tag} style={{ fontSize: 11, padding: "2px 10px", borderRadius: 3, border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+                  <span key={tag} style={{ fontSize: 11, padding: "2px 10px", borderRadius: 3, border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                     {tag}
                   </span>
                 );
@@ -324,7 +324,7 @@ export default async function ArticlePage({ params }: Props) {
                     borderRadius: 3,
                     border: "1px solid var(--border-subtle)",
                     color: "var(--text-dim)",
-                    fontFamily: "'DM Mono', monospace",
+                    fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                     textDecoration: "none",
                     transition: "all 0.2s",
                   }}
@@ -349,7 +349,7 @@ export default async function ArticlePage({ params }: Props) {
 
       {/* Premium badge */}
       {article.meta.premium && (
-        <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: 4, border: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace", marginBottom: 24 }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: 4, border: "1px solid var(--border-subtle)", fontSize: 11, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", marginBottom: 24 }}>
           ✦ {locale === "ja" ? "プレミアム記事" : "Premium Article"}
         </div>
       )}

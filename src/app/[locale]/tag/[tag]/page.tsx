@@ -75,7 +75,7 @@ export default async function TagPage({ params, searchParams }: Props) {
         <div style={{ marginBottom: 32 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
             <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-blue) 40%, transparent)" }} />
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+            <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
               TAG
             </span>
           </div>
@@ -89,7 +89,7 @@ export default async function TagPage({ params, searchParams }: Props) {
           </p>
         </div>
         <div style={{ marginBottom: 40 }}>
-          <h2 style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 12, fontFamily: "'DM Mono', monospace", letterSpacing: "0.15em" }}>
+          <h2 style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 12, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.15em" }}>
             {locale === "ja" ? "カテゴリで探す" : "BROWSE BY CATEGORY"}
           </h2>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -113,7 +113,7 @@ export default async function TagPage({ params, searchParams }: Props) {
         </div>
         {popularTags.length > 0 && (
           <div>
-            <h2 style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 12, fontFamily: "'DM Mono', monospace", letterSpacing: "0.15em" }}>
+            <h2 style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 12, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.15em" }}>
               {locale === "ja" ? "人気のタグ" : "POPULAR TAGS"}
             </h2>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -169,7 +169,7 @@ export default async function TagPage({ params, searchParams }: Props) {
       <div style={{ marginBottom: 32 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
             TAG
           </span>
         </div>
@@ -184,7 +184,7 @@ export default async function TagPage({ params, searchParams }: Props) {
               borderRadius: 4,
               background: "color-mix(in srgb, var(--accent-coral) 10%, transparent)",
               color: "var(--accent-coral)",
-              fontFamily: "'DM Mono', monospace",
+              fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             }}
           >
             {articles.length} {locale === "ja" ? "記事" : "articles"}
@@ -196,7 +196,7 @@ export default async function TagPage({ params, searchParams }: Props) {
             fontSize: 12,
             color: "var(--text-dim)",
             textDecoration: "none",
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             letterSpacing: "0.06em",
             transition: "color 0.2s",
           }}
@@ -208,7 +208,7 @@ export default async function TagPage({ params, searchParams }: Props) {
       {/* Related Tags */}
       {relatedTags.length > 0 && (
         <div style={{ marginBottom: 32 }}>
-          <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.1em", marginRight: 12 }}>
+          <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.1em", marginRight: 12 }}>
             {locale === "ja" ? "関連タグ:" : "Related:"}
           </span>
           <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap" }}>
@@ -223,7 +223,7 @@ export default async function TagPage({ params, searchParams }: Props) {
                   border: "1px solid var(--border-subtle)",
                   textDecoration: "none",
                   color: "var(--text-muted)",
-                  fontFamily: "'DM Mono', monospace",
+                  fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                   transition: "all 0.2s",
                   whiteSpace: "nowrap",
                 }}
@@ -256,11 +256,11 @@ export default async function TagPage({ params, searchParams }: Props) {
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>
+                <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em" }}>
                   {catIcon(article.category)} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                 </span>
                 <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                   {article.date?.split("T")[0]}
                 </span>
                 <LevelBadge

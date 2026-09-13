@@ -91,7 +91,7 @@ export default async function CategoryPage({ params }: Props) {
       <div style={{ marginBottom: 48 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: `color-mix(in srgb, ${cat?.color || "var(--accent-coral)"} 40%, transparent)` }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
             {cat?.icon} {catName}
           </span>
         </div>
@@ -122,7 +122,7 @@ export default async function CategoryPage({ params }: Props) {
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                   {article.date?.split("T")[0]}
                 </span>
                 <LevelBadge
@@ -145,7 +145,7 @@ export default async function CategoryPage({ params }: Props) {
       <div style={{ marginTop: 40 }}>
         <a
           href={`/${locale === "ja" ? "" : locale + "/"}articles`}
-          style={{ fontSize: 13, color: "var(--text-muted)", textDecoration: "none", fontFamily: "'DM Mono', monospace", letterSpacing: "0.04em" }}
+          style={{ fontSize: 13, color: "var(--text-muted)", textDecoration: "none", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.04em" }}
         >
           ← {locale === "ja" ? "すべての記事" : "All Articles"}
         </a>

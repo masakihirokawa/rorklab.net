@@ -60,7 +60,7 @@ export default async function BlogPostPage({ params }: Props) {
         <a
           href={`${prefix}/blog`}
           style={{
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             fontSize: 12,
             color: "var(--text-dim)",
             textDecoration: "none",
@@ -76,7 +76,7 @@ export default async function BlogPostPage({ params }: Props) {
         <time
           dateTime={post.meta.date?.split("T")[0]}
           style={{
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             fontSize: 12,
             color: "var(--text-faint)",
             letterSpacing: "0.04em",
@@ -108,7 +108,7 @@ export default async function BlogPostPage({ params }: Props) {
               key={tag}
               style={{
                 fontSize: 10,
-                fontFamily: "'DM Mono', monospace",
+                fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                 color: "var(--text-dim)",
                 background: "var(--bg-surface)",
                 border: "1px solid var(--border-subtle)",

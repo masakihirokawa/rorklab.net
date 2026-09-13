@@ -37,7 +37,7 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
           justifyContent: "center",
           fontSize: 10,
           color: "var(--text-dim)",
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           letterSpacing: "0.06em",
           borderRadius: 4,
           border: "1px solid var(--border-subtle)",
@@ -68,7 +68,7 @@ export function LocaleSwitcher({ mobile }: { mobile?: boolean } = {}) {
       style={{
         fontSize: 10,
         color: "var(--text-dim)",
-        fontFamily: "'DM Mono', monospace",
+        fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
         letterSpacing: "0.06em",
         padding: "4px 8px",
         borderRadius: 3,

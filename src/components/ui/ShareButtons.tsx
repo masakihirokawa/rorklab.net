@@ -108,7 +108,7 @@ export function ShareButtons({ title, url, tags = [], siteName = "" }: ShareButt
         style={{
           fontSize: 11,
           color: "var(--text-dim)",
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           letterSpacing: "0.08em",
           textTransform: "uppercase",
           marginRight: 4,
@@ -168,7 +168,7 @@ export function ShareButtons({ title, url, tags = [], siteName = "" }: ShareButt
           background: copied ? "color-mix(in srgb, var(--accent-coral) 8%, transparent)" : "transparent",
           color: copied ? "var(--accent-coral)" : "var(--text-muted)",
           fontSize: 11,
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           letterSpacing: "0.04em",
           cursor: "pointer",
           transition: "all 0.2s ease",

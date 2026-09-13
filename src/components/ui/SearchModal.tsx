@@ -200,7 +200,7 @@ export function SearchModal({ open, onClose, articles }: SearchModalProps) {
           <kbd
             style={{
               fontSize: 10,
-              fontFamily: "'DM Mono', monospace",
+              fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
               color: "var(--text-dim)",
               border: "1px solid var(--border-subtle)",
               borderRadius: 4,
@@ -240,7 +240,7 @@ export function SearchModal({ open, onClose, articles }: SearchModalProps) {
                   <span
                     style={{
                       fontSize: 10,
-                      fontFamily: "'DM Mono', monospace",
+                      fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                       color: item.type === "blog" ? "var(--accent-green)" : "var(--accent-coral)",
                       letterSpacing: "0.06em",
                       textTransform: "uppercase",
@@ -252,7 +252,7 @@ export function SearchModal({ open, onClose, articles }: SearchModalProps) {
                     <span
                       style={{
                         fontSize: 9,
-                        fontFamily: "'DM Mono', monospace",
+                        fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                         color: LEVEL_COLORS[item.level] || "var(--text-dim)",
                         border: `1px solid ${LEVEL_COLORS[item.level] || "var(--border)"}`,
                         borderRadius: 3,
@@ -285,7 +285,7 @@ export function SearchModal({ open, onClose, articles }: SearchModalProps) {
                             background: "color-mix(in srgb, var(--accent) 10%, transparent)",
                             borderRadius: 3,
                             padding: "1px 6px",
-                            fontFamily: "'DM Mono', monospace",
+                            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                           }}
                         >
                           #{tag}
@@ -309,10 +309,10 @@ export function SearchModal({ open, onClose, articles }: SearchModalProps) {
               alignItems: "center",
             }}
           >
-            <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+            <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
               {results.length} {locale === "ja" ? "件" : results.length === 1 ? "result" : "results"}
             </span>
-            <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+            <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
               ↑↓ {locale === "ja" ? "移動" : "navigate"} · ↵ {locale === "ja" ? "開く" : "open"}
             </span>
           </div>

@@ -22,7 +22,7 @@ export function LevelBadge({ level, label }: LevelBadgeProps) {
         borderRadius: 3,
         background: colors.bg,
         color: colors.text,
-        fontFamily: "'DM Mono', monospace",
+        fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
         letterSpacing: "0.03em",
       }}
     >

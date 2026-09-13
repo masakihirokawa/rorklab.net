@@ -43,7 +43,7 @@ function SectionLabel({ text }: { text: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
       <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-      <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+      <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
         {text}
       </span>
     </div>
@@ -113,7 +113,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
           className={mounted && !skipAnim ? "animate-fade-up" : ""}
           style={{ position: "relative", zIndex: 1, padding: "0 24px", opacity: mounted || skipAnim ? 1 : 0 }}
         >
-          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.2em", marginBottom: 24 }}>
+          <div style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.2em", marginBottom: 24 }}>
             POWERED BY <a href="https://dolice.net" target="_blank" rel="noopener" style={{ color: "var(--text-dim)", textDecoration: "underline", textUnderlineOffset: "3px" }}>DOLICE</a>
           </div>
 
@@ -214,7 +214,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
           <SectionLabel text={t("sections.latestArticles")} />
           <a
             href={`/${locale === "ja" ? "" : locale + "/"}articles`}
-            style={{ fontSize: 12, color: "var(--text-dim)", textDecoration: "none", fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em", transition: "color 0.3s" }}
+            style={{ fontSize: 12, color: "var(--text-dim)", textDecoration: "none", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em", transition: "color 0.3s" }}
             onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
             onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
           >
@@ -224,7 +224,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
 
         <div>
           {articles.length === 0 ? (
-            <p style={{ color: "var(--text-dim)", fontSize: 14, fontFamily: "'DM Mono', monospace" }}>
+            <p style={{ color: "var(--text-dim)", fontSize: 14, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
               {locale === "ja" ? "記事を準備中です..." : "Articles coming soon..."}
             </p>
           ) : (
@@ -245,11 +245,11 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
                 onMouseLeave={() => setHoveredArticle(null)}
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                  <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>
+                  <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em" }}>
                     {t(`categories.${article.category}.label`)}
                   </span>
                   <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-                  <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>{article.date?.split("T")[0]}</span>
+                  <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>{article.date?.split("T")[0]}</span>
                   <LevelBadge level={article.level} label={t(`levels.${article.level}`)} />
                 </div>
                 <h3 style={{ fontSize: "clamp(16px, 2.5vw, 19px)", fontWeight: 500, color: hoveredArticle === i ? "var(--text-primary)" : "var(--text-secondary)", transition: "color 0.3s", marginBottom: 6, lineHeight: 1.5 }}>
@@ -318,7 +318,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
                   <LevelBadge level={guide.level} label={t(`levels.${guide.level}`)} />
-                  <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+                  <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                     {t("articles.count", { count })}
                   </span>
                 </div>

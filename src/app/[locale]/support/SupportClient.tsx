@@ -364,7 +364,7 @@ export function SupportClient({
                     borderRadius: 4,
                     background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
                     fontSize: 10,
-                    fontFamily: "'DM Mono', monospace",
+                    fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                     fontWeight: 700,
                     letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
                     color: "#fff",
@@ -589,7 +589,7 @@ export function SupportClient({
             <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", marginBottom: 2 }}>
               {loading === "tip" ? "..." : content.tipLabel}
             </div>
-            <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+            <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
               {content.tipSub}
             </div>
           </div>
@@ -643,7 +643,7 @@ export function SupportClient({
                 <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text-primary)", marginBottom: 2 }}>
                   {m.label}
                 </div>
-                <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+                <div style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                   {m.sub}
                 </div>
               </div>

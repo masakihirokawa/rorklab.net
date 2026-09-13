@@ -361,7 +361,7 @@ export function BookRecommendation({ locale, category }: BookRecommendationProps
         <span style={{ fontSize: 16 }}>📚</span>
         <span
           style={{
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             fontSize: 11,
             color: "var(--text-dim)",
             letterSpacing: "0.12em",
@@ -411,7 +411,7 @@ export function BookRecommendation({ locale, category }: BookRecommendationProps
               style={{
                 flexShrink: 0,
                 fontSize: 10,
-                fontFamily: "'DM Mono', monospace",
+                fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                 color: "var(--accent-coral)",
                 padding: "2px 8px",
                 borderRadius: 3,

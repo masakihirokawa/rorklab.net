@@ -99,7 +99,7 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
           fontSize: 11,
           fontWeight: 600,
           color: "var(--text-dim)",
-          fontFamily: "'DM Mono', monospace",
+          fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
           letterSpacing: "0.08em",
           textTransform: "uppercase",
           marginBottom: 12,
@@ -136,7 +136,7 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
           >
             <span
               style={{
-                fontFamily: "'DM Mono', monospace",
+                fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                 fontSize: 11,
                 lineHeight: 1.6,
                 color: activeId === item.id ? "var(--accent-coral)" : "var(--text-dim)",

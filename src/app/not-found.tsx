@@ -37,7 +37,7 @@ export default function GlobalNotFound() {
         >
           <div
             style={{
-              fontFamily: "'DM Mono', monospace",
+              fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
               fontSize: 80,
               fontWeight: 300,
               color: "var(--accent-coral)",
@@ -67,7 +67,7 @@ export default function GlobalNotFound() {
             style={{
               padding: "10px 24px",
               fontSize: 13,
-              fontFamily: "'DM Mono', monospace",
+              fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
               letterSpacing: "0.04em",
               color: "var(--accent-coral)",
               border: "1px solid rgba(232, 150, 125, 0.25)",

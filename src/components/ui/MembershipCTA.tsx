@@ -123,7 +123,7 @@ export function MembershipCTA({ locale, relatedPremiumArticles }: MembershipCTAP
                 lineHeight: 1.5,
               }}
             >
-              <span style={{ fontSize: 10, color: "var(--accent-coral)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.08em", marginRight: 8 }}>
+              <span style={{ fontSize: 10, color: "var(--accent-coral)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.08em", marginRight: 8 }}>
                 PREMIUM
               </span>
               {a.title}

@@ -1,4 +1,5 @@
 import { NextIntlClientProvider, hasLocale } from "next-intl";
+import { DM_Sans, DM_Mono } from "next/font/google";
 import { notFound } from "next/navigation";
 import { routing } from "@/i18n/routing";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
@@ -16,9 +17,14 @@ import type { Metadata } from "next";
 const nameShim = `if(typeof __name==="undefined"){window.__name=function(f,n){try{Object.defineProperty(f,"name",{value:n,configurable:true})}catch(e){}return f}};`;
 const themeScript = `${nameShim}(function(){try{var t=localStorage.getItem('rorklab-theme');document.documentElement.setAttribute('data-theme',t||'dark')}catch(e){}})()`;
 
-// Non-blocking Google Fonts loader
-const fontUrl = "https://fonts.googleapis.com/css2?family=DM+Mono:wght@400&family=DM+Sans:wght@300;400;500&family=Noto+Sans+JP:wght@300;400;500;700&display=swap";
-const fontScript = `(function(){var l=document.createElement('link');l.rel='stylesheet';l.href='${fontUrl}';document.head.appendChild(l)})()`;
+// フォント配信（2026-09-13 構造改修）:
+// - 和文は Web フォントを配信しない。端末の Noto Sans JP / Hiragino Sans / Yu Gothic を使う（globals.css）。
+//   Google Fonts の Noto Sans JP は CSS だけで 122KB、next/font で自己ホストしても 33KB(br) の描画ブロック CSS になり、
+//   PSI モバイルの FCP 4〜7 秒の主因だった。
+// - 欧文 DM Sans / DM Mono は next/font で自己ホスト（Latin サブセットのみ・数 KB・size-adjust 付き fallback）。
+//   fonts.googleapis.com への外部接続と head 内スクリプトによる stylesheet 挿入は全廃。
+const dmSans = DM_Sans({ subsets: ["latin"], weight: ["300", "400", "500"], display: "swap", variable: "--font-dm-sans" });
+const dmMono = DM_Mono({ subsets: ["latin"], weight: ["400"], display: "swap", variable: "--font-dm-mono" });
 
 const LOCALE_TITLES: Record<string, string> = {
   ja: "Rork Lab — Rork Max 日本語ナレッジベース",
@@ -51,7 +57,7 @@ export default async function LocaleLayout({
   const messages = (await import(`@/i18n/messages/${locale}.json`)).default;
 
   return (
-    <html lang={locale} suppressHydrationWarning>
+    <html lang={locale} className={`${dmSans.variable} ${dmMono.variable}`} suppressHydrationWarning>
       <head>
         <script
           type="application/ld+json"
@@ -78,17 +84,6 @@ export default async function LocaleLayout({
         <script async src="https://www.googletagmanager.com/gtag/js?id=G-H9JTCV49KJ" />
         <script dangerouslySetInnerHTML={{ __html: `window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments)}gtag('js',new Date());gtag('config','G-H9JTCV49KJ')` }} />
         <link rel="alternate" type="application/rss+xml" title="Rork Lab RSS" href={locale === "ja" ? "/feed.xml" : "/en/feed.xml"} />
-        {/* Font loading: preconnect + async load (non-render-blocking) */}
-        <link rel="dns-prefetch" href="https://fonts.googleapis.com" />
-        <link rel="dns-prefetch" href="https://fonts.gstatic.com" />
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link rel="preload" as="style" href={fontUrl} />
-        <script dangerouslySetInnerHTML={{ __html: fontScript }} />
-        <noscript>
-          {/* eslint-disable-next-line @next/next/no-page-custom-font */}
-          <link href={fontUrl} rel="stylesheet" />
-        </noscript>
       </head>
       <body>
         <ThemeProvider>

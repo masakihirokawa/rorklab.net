@@ -168,7 +168,7 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
         </p>
         {highlights && highlights.length > 0 && (
           <div style={{ textAlign: "left", marginBottom: 28, padding: "12px 16px", borderRadius: 8, background: "color-mix(in srgb, var(--accent-coral) 2%, var(--bg-primary))" }}>
-            <div style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", letterSpacing: "0.12em", color: "var(--accent-coral)", marginBottom: 8 }}>
+            <div style={{ fontSize: 10, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.12em", color: "var(--accent-coral)", marginBottom: 8 }}>
               {locale === "ja" ? "この記事で得られること" : "WHAT YOU'LL LEARN"}
             </div>
             {highlights.map((h, i) => (
@@ -229,7 +229,7 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
               borderRadius: 4,
               background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
               fontSize: 10,
-              fontFamily: "'DM Mono', monospace",
+              fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
               fontWeight: 700,
               letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
               color: "#fff",

@@ -130,7 +130,7 @@ export function Header() {
         {/* Logo */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           <a href={prefix || "/"} style={{ display: "flex", alignItems: "center", gap: 10, textDecoration: "none" }}>
-            <span className="logo-icon" style={{ fontFamily: "'DM Mono', monospace", fontSize: 15, color: "var(--accent-coral)", fontWeight: 400, position: "relative", top: isMobile ? 0 : 2 }}>
+            <span className="logo-icon" style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 15, color: "var(--accent-coral)", fontWeight: 400, position: "relative", top: isMobile ? 0 : 2 }}>
               ◉
             </span>
             <span style={{ fontSize: 15, fontWeight: 500, letterSpacing: "0.04em", color: "var(--text-primary)" }}>
@@ -276,7 +276,7 @@ export function Header() {
                 color: "var(--text-muted)",
                 fontSize: 12,
                 cursor: "pointer",
-                fontFamily: "'DM Mono', monospace",
+                fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                 letterSpacing: "0.04em",
                 whiteSpace: "nowrap",
               }}
@@ -374,7 +374,7 @@ export function Header() {
           {/* Mobile Level Buttons — top position */}
           <div style={{ width: "100%", paddingBottom: 4 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, justifyContent: "center" }}>
-              <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 9, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+              <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 9, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
                 LEVEL
               </span>
             </div>
@@ -386,7 +386,7 @@ export function Header() {
                   onClick={() => setMobileOpen(false)}
                   style={{
                     fontSize: 11,
-                    fontFamily: "'DM Mono', monospace",
+                    fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                     padding: "5px 10px",
                     borderRadius: 6,
                     border: `1px solid ${color}`,

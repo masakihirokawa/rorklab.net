@@ -22,7 +22,7 @@ const FOOTER_LINK = {
   fontSize: 12,
   color: "var(--text-faint)",
   textDecoration: "none" as const,
-  fontFamily: "'DM Mono', monospace" as const,
+  fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" as const,
   letterSpacing: "0.04em",
   transition: "color 0.3s",
 };
@@ -115,7 +115,7 @@ export function Footer() {
       >
         <span
           style={{
-            fontFamily: "'DM Mono', monospace",
+            fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
             fontSize: 13,
             color: "var(--text-faint)",
             letterSpacing: "0.08em",
@@ -189,7 +189,7 @@ export function Footer() {
           ))}
         </div>
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace", letterSpacing: "0.1em" }}>
+          <span style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.1em" }}>
             DOLICE LABS
           </span>
           {SISTER_SITES.map((site) => (

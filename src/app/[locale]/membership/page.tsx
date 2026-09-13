@@ -135,7 +135,7 @@ export default async function MembershipPage({ params }: Props) {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
           <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--accent-coral)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--accent-coral)", letterSpacing: "0.15em" }}>
             {t.badge}
           </span>
         </div>
@@ -184,7 +184,7 @@ export default async function MembershipPage({ params }: Props) {
       <section>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
           <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-          <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+          <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
             PREMIUM ARTICLES
           </span>
         </div>
@@ -192,7 +192,7 @@ export default async function MembershipPage({ params }: Props) {
           <h2 style={{ fontSize: "clamp(22px, 3.5vw, 32px)", fontWeight: 300, color: "var(--text-primary)", letterSpacing: "-0.02em" }}>
             {t.premiumArticles}
           </h2>
-          <span style={{ fontSize: 13, color: "var(--text-dim)", fontFamily: "'DM Mono', monospace" }}>
+          <span style={{ fontSize: 13, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
             {t.premiumCount(premiumArticles.length)}
           </span>
         </div>
@@ -217,7 +217,7 @@ export default async function MembershipPage({ params }: Props) {
                   <span
                     style={{
                       fontSize: 10,
-                      fontFamily: "'DM Mono', monospace",
+                      fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
                       letterSpacing: "0.1em",
                       padding: "2px 8px",
                       borderRadius: 4,
@@ -227,11 +227,11 @@ export default async function MembershipPage({ params }: Props) {
                   >
                     {t.locked}
                   </span>
-                  <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>
+                  <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em" }}>
                     {catIcon(article.category)} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                   </span>
                   <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-                  <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "'DM Mono', monospace" }}>
+                  <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                     {article.date?.split("T")[0]}
                   </span>
                   <LevelBadge
