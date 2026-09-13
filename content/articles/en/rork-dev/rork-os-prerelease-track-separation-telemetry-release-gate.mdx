@@ -12,6 +12,7 @@ highlights:
   - "Deriving os_track from Platform.Version with a remote GA baseline that self-corrects on GA day"
   - "Split crash-free thresholds — 99.5% for ga, 98.0% for prerelease — so alerts stop crying wolf"
   - "A release gate that keeps prerelease findings in warnings instead of quietly shelving them"
+  - "Measuring rollback, fat-fingered and missing-date baselines across 10,000 device inputs, then closing them with rejection rules and track sanity checks"
 ---
 
 The morning after the fall OS release shipped, I opened Crashlytics and stopped scrolling.
@@ -296,6 +297,193 @@ Returning `warnings` while excluding them from `pass` is the whole point of the 
 
 Warnings also need a destination. Mine go straight onto the next build's milestone. A warning with nowhere to go stops being read by the third occurrence.
 
+## Doubting the baseline delivery itself
+
+After running this design through a full cycle, I read my own implementation again. The separation was working. What I had barely questioned was the JSON the separation rests on.
+
+So I pulled the classification logic out on its own and measured what happens when delivery breaks. On Node v22.23.2 I built an input set of 10,000 devices with iOS majors spread from 24 to 27, pinned the reference date to release day, and let the resolver classify them. The population is a modeled shape of how devices move on that day, not a distribution of real users.
+
+<table>
+  <thead>
+    <tr>
+      <th>Delivery scenario</th>
+      <th>Baseline accepted</th>
+      <th>prerelease share</th>
+      <th>GA share</th>
+      <th>baseline_stale_days</th>
+      <th>90-day warning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>A Normal (bumped to 27 on the day)</td>
+      <td>ios=27</td>
+      <td>0.00%</td>
+      <td>100.00%</td>
+      <td>0</td>
+      <td>silent (correct)</td>
+    </tr>
+    <tr>
+      <td>B <code>updatedAt</code> missing</td>
+      <td>ios=27</td>
+      <td>0.00%</td>
+      <td>100.00%</td>
+      <td><strong>NaN</strong></td>
+      <td>silent</td>
+    </tr>
+    <tr>
+      <td>C Rolled back (25)</td>
+      <td>ios=25</td>
+      <td><strong>81.00%</strong></td>
+      <td><strong>19.00%</strong></td>
+      <td>0</td>
+      <td>silent</td>
+    </tr>
+    <tr>
+      <td>D Fat-fingered (99)</td>
+      <td>ios=99</td>
+      <td><strong>0.00%</strong></td>
+      <td>100.00%</td>
+      <td>0</td>
+      <td>silent</td>
+    </tr>
+    <tr>
+      <td>E Delivery down → cache</td>
+      <td>ios=26</td>
+      <td>20.00%</td>
+      <td>80.00%</td>
+      <td>25</td>
+      <td>silent (correct)</td>
+    </tr>
+    <tr>
+      <td>F Forgot to swap on the day</td>
+      <td>ios=26</td>
+      <td>20.00%</td>
+      <td>80.00%</td>
+      <td>96</td>
+      <td>fires (correct)</td>
+    </tr>
+  </tbody>
+</table>
+
+B happens because `isValid` only checks the types of `ios` and `android` and never looks at `updatedAt`. A JSON payload missing the date gets accepted, `new Date(undefined)` yields `NaN`, and `baseline_stale_days` carries the string `"NaN"` into every crash report. The 90-day warning I wrote about above catches F, where I simply forgot to update — but it stays quiet for the more dangerous case where the date is absent entirely. The attribute I added for monitoring turned out to be very good at hiding a hole in that monitoring.
+
+D is the premise of this entire article coming back around. prerelease share: 0.00%. I deleted the filtering branch, and one wrong number in a config file reproduced the same blind spot. `unknown` stays at 0.00% too, so the unknown-share check from the previous section has nothing to say.
+
+C runs the other way: the GA share thins out to 19.00%. Four fifths of the people actually running the shipped OS get judged against 98.0%, the threshold I deliberately loosened for beta devices.
+
+## I fed both to the gate, and one of them said nothing
+
+I passed C and D straight into `evaluateGate` from the previous section.
+
+<table>
+  <thead>
+    <tr>
+      <th>State</th>
+      <th>pass</th>
+      <th>blockers</th>
+      <th>warnings</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Healthy (beta window, tracks separated)</td>
+      <td>true</td>
+      <td>none</td>
+      <td>prerelease needs fixing</td>
+    </tr>
+    <tr>
+      <td>D Misdelivery, prerelease empty</td>
+      <td>false</td>
+      <td>GA crash-free 99.19% below threshold</td>
+      <td>none</td>
+    </tr>
+    <tr>
+      <td>C Rollback, GA at 19%</td>
+      <td><strong>true</strong></td>
+      <td><strong>none</strong></td>
+      <td><strong>none</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+D does stop the release — for the wrong reason. Beta crashes merge into GA, 99.71% drops to 99.19%, and whoever is on call goes looking for a GA regression that does not exist. The cause sits in a config file, and nothing on screen points there.
+
+C says nothing at all. GA sessions come to 1,900, above the 500 floor; the rate is 99.85%, above its threshold; prerelease sits at 99.25%, above the looser 98.0%. On the numbers alone it looks healthy. It looks healthy precisely because four fifths of users are wearing the wrong label.
+
+**A baseline is accepted on how it moved since last time, not on whether it arrived.** A shipping release advances the major by one per cycle. Writing that obvious property into validation stops both the rollback and the fat-fingered value at the door.
+
+```ts
+// src/telemetry/gaBaseline.ts (validation, replaced)
+export type BaselineLoad = {
+  baseline: GaBaseline;
+  rejected: "rollback" | "jump" | "malformed" | null;
+};
+
+function isValid(v: unknown): v is GaBaseline {
+  const b = v as Partial<GaBaseline> | null;
+  if (!b || typeof b.ios !== "number" || typeof b.android !== "number") return false;
+  if (b.ios <= 0 || b.android <= 0) return false;
+  // Validate updatedAt here, or staleDays turns into NaN downstream
+  if (typeof b.updatedAt !== "string") return false;
+  return Number.isFinite(Date.parse(b.updatedAt));
+}
+
+function accept(next: GaBaseline, prev: GaBaseline): BaselineLoad["rejected"] {
+  if (next.ios < prev.ios || next.android < prev.android) return "rollback";
+  // Shipping releases move one major at a time; +2 or more is a delivery accident
+  if (next.ios > prev.ios + 1 || next.android > prev.android + 1) return "jump";
+  return null;
+}
+
+export function reconcile(remote: unknown, prev: GaBaseline): BaselineLoad {
+  if (!isValid(remote)) return { baseline: prev, rejected: "malformed" };
+  const rejected = accept(remote, prev);
+  return rejected ? { baseline: prev, rejected } : { baseline: remote, rejected: null };
+}
+
+export function staleDays(baseline: GaBaseline): number | null {
+  const t = Date.parse(baseline.updatedAt);
+  return Number.isFinite(t) ? Math.floor((Date.now() - t) / 86_400_000) : null;
+}
+```
+
+I ran the same 10,000-device input back through with this validation in place. B, C and D are all rejected, the previous value of ios=26 holds, the prerelease share reads 20.00%, and `baseline_stale_days` comes out as 75. Scenario A — the legitimate bump — passes through untouched and 27 is accepted.
+
+Rejection does not happen quietly. `rejected` travels to both the crash attributes and the gate.
+
+```ts
+// scripts/releaseGate.ts (additions)
+const GA_MIN_SHARE = 0.5;
+
+export type GateContext = {
+  baselineRejected: string | null;
+  betaWindowOpen: boolean; // is a beta for the next major currently distributed
+};
+
+export function evaluateTrackSanity(stats: TrackStats[], ctx: GateContext): string[] {
+  const warnings: string[] = [];
+  const total = stats.reduce((sum, s) => sum + s.sessions, 0);
+  const ga = stats.find((s) => s.track === "ga");
+  const pre = stats.find((s) => s.track === "prerelease");
+
+  if (ctx.baselineRejected) {
+    warnings.push(`Baseline delivery rejected (${ctx.baselineRejected}) — classifying on the previous value`);
+  }
+  if (total > 0 && ga && ga.sessions / total < GA_MIN_SHARE) {
+    warnings.push(`GA track is only ${pct(ga.sessions / total)} of sessions — baseline may have advanced too far`);
+  }
+  if (ctx.betaWindowOpen && (!pre || pre.sessions === 0)) {
+    warnings.push("Zero prerelease sessions during a beta window — separation may not be working");
+  }
+  return warnings;
+}
+```
+
+With those three checks added, C — the one that had stayed silent — reported `GA track is only 19.00% of sessions`, and D, now rejected upstream, reported `Baseline delivery rejected (jump)`. The zero-prerelease-during-a-beta-window check is the last net, for the day something slips past rejection anyway.
+
+What I went back and forth on was strictness: reject too eagerly and you block the legitimate swap on release day. The compromise I settled on is that rejection means "hold the previous value and tell a human," never "ignore." Classification stays put; the message always lands. I may have had this backwards from the start — the thing worth doubting was never the resolver, but the values flowing into it.
+
 ## Three things that ran opposite to my expectations
 
 The first crashes to surface on prerelease devices weren't in code touching new OS features. They were in screens I hadn't opened in years. New-feature code gets written carefully because you know you don't know it. The dangerous code is whatever you stopped questioning.
@@ -306,16 +494,17 @@ Third: I forgot to update the baseline. On the first GA day under this design, t
 
 Pairing `os_track` with build provenance makes triage faster still — the stamping approach in [Which Generation Introduced This Bug?](/articles/rork-dev/rork-generation-provenance-build-stamp-regression-triage-design) combines cleanly with this one. With both attributes on the crash report, "which OS generation, which generated code" becomes a single filter instead of two investigations.
 
-## What to do before the OS ships
+## Before release day, and on it
 
-The iOS 27 public beta arrived in mid-July, and the runway to the fall release is short. If you have apps live on the App Store, this order has worked well for me:
+iOS 27 and iPadOS 27 ship on September 14. If you have apps live on the App Store, this order has made the day calmer for me:
 
 1. Implement `os_track` resolution and attachment, then verify on a real device that all three values — including `unknown` — reach your crash attributes
 2. Serve the baseline JSON and bump one value to confirm the device-side classification actually changes (this is the only way to test the update path)
-3. Split the alert destinations for ga and prerelease, and drop prerelease to a daily digest
-4. Wire an `evaluateGate`-equivalent check into your phased rollout review, rendering blockers and warnings in separate sections
-5. Put the OS release date on the calendar with "swap the baseline JSON" as an explicit task for that day
+3. Add the rejection rules — monotonic, one major at a time, `updatedAt` validated — then deliberately publish a rollback and a fat-fingered value to watch them get turned away
+4. Split the alert destinations for ga and prerelease, and drop prerelease to a daily digest
+5. Wire an `evaluateGate`-equivalent check into your phased rollout review, rendering blockers and warnings in separate sections
+6. On the day itself, treat "swap the baseline JSON" and "check the GA share afterward" as one task, not two
 
 Deleting the filter branch takes under an hour. What takes real time is deciding how you'll respond to the separated numbers. Skip that and you've only added visible noise.
 
-I spent a summer's worth of evidence learning this, and found out in the fall. If it saves you the same detour, the write-up has done its job.
+If you want one place to start, delete `updatedAt` from your own baseline JSON once and see what lands in `baseline_stale_days`. That is where I found the hole in my own monitoring.
