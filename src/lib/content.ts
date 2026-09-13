@@ -64,10 +64,12 @@ export interface Article {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const articles = articlesData as Record<string, any[]>;
 
-export function getArticles(locale: string, includeNoindex = false): ArticleMeta[] {
-  // 既定で noindex（剪定済み）記事を除外する。一覧・関連・タグ・フィードは keep 記事だけを露出し、
-  // 剪定記事へ内部リンクを流さない（2026-09-13 構造監査）。全件が要るのは検索 API と Bing sitemap のみ。
-  const entries = (articles[locale] || []).filter((entry) => includeNoindex || !entry.noindex);
+export function getArticles(locale: string): ArticleMeta[] {
+  // 一覧は全件を返す。noindex（剪定）記事も読者と Bing には見せる（2026-09-13 revert）。
+  // 一度 noindex 記事を一覧から外したが、メンバーシップのプレミアムが 159→111 本に減って
+  // 購入導線が細り、実流入の 7 割を占める Bing 向けの内部リンクも失われたため元に戻した。
+  // Google への「出さない」宣言は sitemap.xml 側の除外と googlebot noindex で足りる。
+  const entries = articles[locale] || [];
   return entries.map((entry) => ({
     title: entry.title || "",
     slug: entry.slug || "",
@@ -131,7 +133,7 @@ export function getAllArticleSlugs(
  * Used for tag cloud authority signal (Simon Willison-style: "ai 2024").
  */
 export function getTagCounts(locale: string): Map<string, number> {
-  const entries = (articles[locale] || []).filter((e) => !e.noindex);
+  const entries = articles[locale] || [];
   const counts = new Map<string, number>();
   for (const e of entries) {
     for (const t of (e.tags || []) as string[]) {
@@ -147,7 +149,7 @@ export function getTagCounts(locale: string): Map<string, number> {
  * Count articles with a specific tag (case-insensitive).
  */
 export function countArticlesByTag(locale: string, tag: string): number {
-  const entries = (articles[locale] || []).filter((e) => !e.noindex);
+  const entries = articles[locale] || [];
   const needle = (tag || "").toLowerCase();
   let count = 0;
   for (const e of entries) {

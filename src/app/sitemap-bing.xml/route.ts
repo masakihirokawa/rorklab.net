@@ -8,7 +8,7 @@ export const dynamic = "force-static";
 export function GET() {
   const baseUrl = "https://rorklab.net";
   const urls: string[] = [];
-  for (const a of getArticles("ja", true)) {
+  for (const a of getArticles("ja")) {
     const d = (a.updated || a.date || "2026-01-01").slice(0, 10);
     urls.push(`<url><loc>${baseUrl}/articles/${a.category}/${a.slug}</loc><lastmod>${d}</lastmod></url>`);
     urls.push(`<url><loc>${baseUrl}/en/articles/${a.category}/${a.slug}</loc><lastmod>${d}</lastmod></url>`);

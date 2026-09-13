@@ -133,7 +133,7 @@ export default async function ArticlePage({ params }: Props) {
 
   if (!article) {
     // カテゴリ違いの URL（旧カテゴリ・Google の推測 URL）は正しいカテゴリへ恒久移転（2026-09-07・#124）
-    const moved = getArticles(locale, true).find((a) => a.slug === slug);
+    const moved = getArticles(locale).find((a) => a.slug === slug);
     if (moved && moved.category !== category) {
       permanentRedirect(`${locale === "ja" ? "" : `/${locale}`}/articles/${moved.category}/${slug}`);
     }
@@ -306,7 +306,7 @@ export default async function ArticlePage({ params }: Props) {
           <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
             {article.meta.tags.map((tag) => {
               const count = tagCounts.get(tag) || 0;
-              // keep 記事が 2 本未満のタグは一覧にならないのでリンクしない（薄い noindex タグページへの内部リンクを断つ）
+              // 記事 1 本だけのタグはリンクしない（タグページが 1 本の薄い一覧になるため）
               if (count < 2) {
                 return (
                   <span key={tag} style={{ fontSize: 11, padding: "2px 10px", borderRadius: 3, border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
