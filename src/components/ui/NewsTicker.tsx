@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
-    "SWIFTUI — Rork の新規プロジェクトは Expo ではなくなりました。iPhone は Swift と SwiftUI、Android は Kotlin と Jetpack Compose、Web は React です。既存の Expo プロジェクトはこれまでどおり動きます",
-    "EXPOGO — iOS 版 Expo Go は、ターミナル側とアプリ側の両方で同じアカウントにログインしていないと QR から起動しなくなりました。Android と development build は対象外です",
-    "11/01 — Google Play の target API 36 要件、延長申請の終点まで残り48日です。11月2日を越えると、非準拠のアプリは新しい端末で見つけてもらえなくなります",
-    "SIGSEGV — expo-doctor が 20/20 で通っているのに、Samsung 端末で Expo Go が無言で落ちる報告があります。診断が全部緑のときは adb のログを見に行くところからです",
-    "NEW — そのAPIキー、アプリの中に入っていませんか。Rork の環境変数と Supabase Edge Function の使い分けを書きました",
-    "CREDITS — AI 側のエラーにはクレジットを使わない、という説明がどこまでを指すのか。同じ修正を三度頼んだ日の消費を記録すると、線が見えてきます",
+ja: [
+    "BILLING — 残高は Build クレジットと Cloud クレジットの二本立てです。Cloud 側は完成したアプリが実行時に使う分で、プロジェクトのトグルが off のままだと AI 機能は従来の挙動に留まります",
+    "11/01 — Google Play の target API 36 要件、延長申請の終点まで残り47日です。非準拠のまま越えると、新しい端末で見つけてもらえなくなります",
+    "SDK56 — Android 版 Expo Go 56.0.1 が、素のテンプレートを含むすべての SDK 56 プロジェクトを互換性なしとして拒む報告が出ています。QR も EAS Update も開けません",
+    "NEW — Rork の新規作成から Expo が消えました。手元のプロジェクトを残すか作り直すかを書きました",
+    "DEVTOOLS — SDK 56 の Expo Go で DevTools の Console が式を評価せず、Sources も空のままになる報告があります。開発ビルドに切り替えると戻る例が挙がっています",
+    "COMPANION — Companion は現在、Swift のアプリを USB で iPhone に入れるためのデスクトップアプリという位置づけです。以前の説明を前提にした手順書は見直しどきかもしれません",
   ],
   en: [
-    "SWIFTUI — New Rork projects are no longer Expo. iPhone is Swift and SwiftUI, Android is Kotlin and Jetpack Compose, Web is React. Existing Expo projects still build and ship",
-    "EXPO GO — On iOS, Expo Go now needs the same account signed in on both the terminal and the app before a QR code will launch anything. Android and development builds are unaffected",
-    "NOV 1 — Forty-eight days until the extension deadline for Google Play's target API 36 requirement. After November 2, non-compliant apps stop reaching new devices",
-    "SIGSEGV — Expo Go dies silently on some Samsung devices while expo-doctor reports a clean 20 out of 20. When every check is green, the adb log is where to look next",
-    "NEW — Is that API key sitting inside your app? When to use Rork environment variables and when to reach for a Supabase Edge Function",
-    "CREDITS — How far does it go, the promise that AI-side errors do not cost credits? Log what a day of asking for the same fix three times actually consumes, and the line starts to show",
+    "BILLING — Your balance is really two: Build credits and Cloud credits. Cloud credits cover what a finished app spends at runtime, and while the project toggle stays off, AI features keep their old behaviour",
+    "NOV 1 — Forty-seven days until the extension deadline for Google Play's target API 36 requirement. Cross it non-compliant and your app stops reaching new devices",
+    "SDK 56 — Expo Go 56.0.1 on Android is reported to reject every SDK 56 project as incompatible, including a bare template. Neither the QR code nor EAS Update will open",
+    "NEW — Rork no longer creates Expo projects. How we thought through keeping the existing one versus rebuilding",
+    "DEVTOOLS — On SDK 56, Expo Go leaves the DevTools console unable to evaluate anything and the Sources tab empty. Switching to a development build has restored it for some",
+    "COMPANION — Companion is now positioned as a desktop app for loading Swift apps onto an iPhone over USB. If your notes describe something else, this is a good moment to revisit them",
   ],
 };
 
