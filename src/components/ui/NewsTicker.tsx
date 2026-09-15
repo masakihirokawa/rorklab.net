@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "BILLING — 残高は Build クレジットと Cloud クレジットの二本立てです。Cloud 側は完成したアプリが実行時に使う分で、プロジェクトのトグルが off のままだと AI 機能は従来の挙動に留まります",
-    "11/01 — Google Play の target API 36 要件、延長申請の終点まで残り47日です。非準拠のまま越えると、新しい端末で見つけてもらえなくなります",
-    "SDK56 — Android 版 Expo Go 56.0.1 が、素のテンプレートを含むすべての SDK 56 プロジェクトを互換性なしとして拒む報告が出ています。QR も EAS Update も開けません",
-    "NEW — Rork の新規作成から Expo が消えました。手元のプロジェクトを残すか作り直すかを書きました",
-    "DEVTOOLS — SDK 56 の Expo Go で DevTools の Console が式を評価せず、Sources も空のままになる報告があります。開発ビルドに切り替えると戻る例が挙がっています",
-    "COMPANION — Companion は現在、Swift のアプリを USB で iPhone に入れるためのデスクトップアプリという位置づけです。以前の説明を前提にした手順書は見直しどきかもしれません",
+    "PLANS — 公式のプラン表は Free が Design mode のみ、Rork Pro が月20ドルで100クレジット、Rork Max が200ドルからという構成です",
+    "EXPOGO — Expo Go で開発中のプロジェクトを動かすには、CLI とアプリの両方で同じアカウントにログインすることが必要になりました。現時点では iOS 版のみです",
+    "11/01 — Google Play の target API 36 要件は、延長を申請していても11月1日で終わります。残り46日です",
+    "APKENV — JS のソースを変えずに EXPO_PUBLIC_ の値だけ変えると、Gradle が最新と判定して前回のバンドルを使い回す報告があります。本番の向き先がずれる形です",
+    "NEW — 思ったより早く残高が減る前に、Build クレジットと Cloud クレジットを分けて見る。2本立ての残高を切り分けた記録です",
+    "PLIST — lsapplicationqueriesschemes は Apple の現行ドキュメントでは404になります。正本はアーカイブ側の Launch Services Keys です",
   ],
   en: [
-    "BILLING — Your balance is really two: Build credits and Cloud credits. Cloud credits cover what a finished app spends at runtime, and while the project toggle stays off, AI features keep their old behaviour",
-    "NOV 1 — Forty-seven days until the extension deadline for Google Play's target API 36 requirement. Cross it non-compliant and your app stops reaching new devices",
-    "SDK 56 — Expo Go 56.0.1 on Android is reported to reject every SDK 56 project as incompatible, including a bare template. Neither the QR code nor EAS Update will open",
-    "NEW — Rork no longer creates Expo projects. How we thought through keeping the existing one versus rebuilding",
-    "DEVTOOLS — On SDK 56, Expo Go leaves the DevTools console unable to evaluate anything and the Sources tab empty. Switching to a development build has restored it for some",
-    "COMPANION — Companion is now positioned as a desktop app for loading Swift apps onto an iPhone over USB. If your notes describe something else, this is a good moment to revisit them",
+    "PLANS — The official table lists Free as Design mode only, Rork Pro at $20 a month for 100 credits, and Rork Max starting at $200",
+    "EXPOGO — Running a project in Expo Go during development now requires signing in to the same account from both the CLI and the app. For the moment this applies to iOS only",
+    "11/01 — Google Play's target API 36 requirement ends on November 1 even for apps granted an extension. Forty-six days remain",
+    "APKENV — Change only an EXPO_PUBLIC_ value without touching the JS and Gradle may call the bundle up to date, reusing the previous one. The shipped build can point somewhere unintended",
+    "NEW — Before the balance drains faster than expected, read build credits and cloud credits separately. Notes on telling the two apart",
+    "PLIST — lsapplicationqueriesschemes now returns a 404 in Apple's current documentation. The authoritative page is the archived Launch Services Keys reference",
   ],
 };
 
