@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-ja: [
-    "PLANS — 公式のプラン表は Free が Design mode のみ、Rork Pro が月20ドルで100クレジット、Rork Max が200ドルからという構成です",
-    "EXPOGO — Expo Go で開発中のプロジェクトを動かすには、CLI とアプリの両方で同じアカウントにログインすることが必要になりました。現時点では iOS 版のみです",
-    "11/01 — Google Play の target API 36 要件は、延長を申請していても11月1日で終わります。残り46日です",
-    "APKENV — JS のソースを変えずに EXPO_PUBLIC_ の値だけ変えると、Gradle が最新と判定して前回のバンドルを使い回す報告があります。本番の向き先がずれる形です",
-    "NEW — 思ったより早く残高が減る前に、Build クレジットと Cloud クレジットを分けて見る。2本立ての残高を切り分けた記録です",
-    "PLIST — lsapplicationqueriesschemes は Apple の現行ドキュメントでは404になります。正本はアーカイブ側の Launch Services Keys です",
+  ja: [
+    "SWIFT — 新規プロジェクトは iPhone が Swift、Android が Kotlin、Web が React です。既にある Expo プロジェクトはビルドも公開も GitHub への出力も続けられます",
+    "10/02 — gemini-2.5-flash-image の停止まで残り 15 日です。アプリ内で画像生成を呼んでいる場合は後継モデルへの差し替えを見ておきます",
+    "EAS — EAS Build が async-storage の変種解決で止まる報告が、未解決のまま残っています。既存の Expo プロジェクトを抱えたままの方は踏みやすい箇所です",
+    "NEW — 消したはずのトークンが再起動で戻ってきます。SecureStore の削除失敗を検知する設計を書きました",
+    "ENV — eas env:list の出力を CI に渡す前に、平文・機微・secret の 3 種を分けて数えます。secret は EAS のサーバーから出ない仕様です",
+    "EXPOGO — SDK 53 以降、Expo Go ではプッシュ通知を受け取れません。通知が来ない理由をここで一度つなげておきます",
   ],
   en: [
-    "PLANS — The official table lists Free as Design mode only, Rork Pro at $20 a month for 100 credits, and Rork Max starting at $200",
-    "EXPOGO — Running a project in Expo Go during development now requires signing in to the same account from both the CLI and the app. For the moment this applies to iOS only",
-    "11/01 — Google Play's target API 36 requirement ends on November 1 even for apps granted an extension. Forty-six days remain",
-    "APKENV — Change only an EXPO_PUBLIC_ value without touching the JS and Gradle may call the bundle up to date, reusing the previous one. The shipped build can point somewhere unintended",
-    "NEW — Before the balance drains faster than expected, read build credits and cloud credits separately. Notes on telling the two apart",
-    "PLIST — lsapplicationqueriesschemes now returns a 404 in Apple's current documentation. The authoritative page is the archived Launch Services Keys reference",
+    "SWIFT — New projects are Swift on iPhone, Kotlin on Android and React on the web. An Expo project you already have still builds, publishes and exports to GitHub",
+    "10/02 — Fifteen days until gemini-2.5-flash-image shuts down. If your app calls image generation, plan the move to its replacement now",
+    "EAS — Reports of EAS Build stalling on async-storage variant resolution are still open. It is easy to hit if you are carrying an existing Expo project",
+    "NEW — A token you deleted comes back after a restart. We wrote up a design that catches a failed SecureStore delete",
+    "ENV — Before piping eas env:list into CI, separate plain, sensitive and secret variables and count them. Secrets are designed never to leave the EAS servers",
+    "EXPOGO — Since SDK 53, Expo Go cannot receive push notifications. Worth connecting that to the silence before you go hunting elsewhere",
   ],
 };
 
