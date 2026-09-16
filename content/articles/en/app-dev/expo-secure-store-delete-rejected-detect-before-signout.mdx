@@ -1,0 +1,185 @@
+---
+title: "The Token I Deleted Came Back After a Restart — Detecting Failed SecureStore Deletes"
+slug: "expo-secure-store-delete-rejected-detect-before-signout"
+category: "app-dev"
+level: "intermediate"
+premium: false
+date: "2026-09-16T14:30"
+author: "Rork Lab"
+description: "On Android, getItemAsync can report null right after sign-out while the value is still sitting on disk. Here is how I rewrote a sign-out path that was verifying deletion by reading instead of by the delete result."
+tags: ["expo-secure-store", "Expo", "Android", "sign-out", "Rork"]
+---
+
+I had checked the sign-out flow on a device. Tap the button, land back on the sign-in screen — that part worked. What caught me out was rebooting the phone and opening the app again. The signed-in screen came up as if nothing had happened.
+
+The code looked reasonable. Call `SecureStore.deleteItemAsync`, confirm that `getItemAsync` returns `null`, then navigate to sign-in. The check passed every time. The value was still there anyway.
+
+The problem wasn't a gap in the API. It was the way I was checking. And it's the kind of mistake anyone writing cleanup for tokens or API keys can walk into.
+
+## A null right after sign-out doesn't mean the value is gone
+
+Expo's reference is clear that `deleteItemAsync` returns "a promise that rejects if the value can't be deleted" ([SecureStore — Expo Documentation](https://docs.expo.dev/versions/latest/sdk/securestore/)). So far, so straightforward.
+
+On Android, though, the key can already be out of the in-process map before that rejection happens. Reads consult that map to decide whether an entry exists, so **for as long as the process stays alive, `null` keeps coming back**. The encrypted value is still sitting in the file on disk.
+
+Restart the app and the map gets rebuilt from disk. That's why the value reappeared on my device.
+
+<table>
+<thead><tr><th>What you see</th><th>What is actually true</th><th>When you'd notice</th></tr></thead>
+<tbody>
+<tr><td>Delete succeeded, user signed out</td><td>Gone from disk too</td><td>—</td></tr>
+<tr><td>Delete threw, exception swallowed, read returns <code>null</code></td><td>Still on disk</td><td>After a restart, or from another process</td></tr>
+<tr><td>Delete threw and you handled it</td><td>Still on disk</td><td>Immediately</td></tr>
+</tbody>
+</table>
+
+The middle row is the awkward one. On screen it is indistinguishable from the first.
+
+## Why Android answers "not there"
+
+On Android, SecureStore values live in `SharedPreferences`, encrypted with a key from the Android Keystore. On iOS they go into the keychain as `kSecClassGenericPassword`. Same API surface, very different containers underneath.
+
+This behaviour is written up on the Expo tracker: when a delete rejects because it never reached disk, the in-memory map has already been emptied, and reads gated on that map keep reporting the entry as absent ([expo/expo issue #49934](https://github.com/expo/expo/issues/49934)). Start a fresh process and the value is back. Nothing overwrote it, after all.
+
+There is one more path where `null` means something other than "deleted". The reference notes that entries stored with `requireAuthentication: true` get their key **invalidated when the user's biometric enrolment changes** — adding a fingerprint, for instance — and reads against an invalidated key also resolve to `null`. A user who never signed out can lose a value they still expect to be there, and a read cannot tell you that either.
+
+So `null` from a read is collapsing at least three states into one: there is no entry, the delete failed and only the map was emptied, or the key was invalidated. Handling all three with a single `if` was the real mistake.
+
+There's a second trap pointing the other way on iOS. The docs state plainly that keychain values can **survive an uninstall** when the app is reinstalled with the same bundle ID. On Android they do not. So your intuition about "is it gone yet" drifts in opposite directions depending on the platform.
+
+## Don't swallow the delete result
+
+Here's roughly what I had written.
+
+```ts
+// Before: I assumed "if I can't read it, it's fine"
+async function signOut() {
+  try {
+    await SecureStore.deleteItemAsync('session_token');
+  } catch {
+    // swallowed right here
+  }
+
+  const left = await SecureStore.getItemAsync('session_token');
+  if (left === null) {
+    navigateToSignIn();
+  }
+}
+```
+
+Verifying by reading works fine when everything is fine. The trouble is that it **lies in exactly the case you care about**. The read returns `null` precisely on the runs where the delete failed, so as a check it points the wrong way.
+
+What I rewrote was a single function.
+
+```ts
+import * as SecureStore from 'expo-secure-store';
+
+type ClearResult = { cleared: boolean; reason?: string };
+
+export async function clearSecret(key: string): Promise<ClearResult> {
+  try {
+    await SecureStore.deleteItemAsync(key);
+    return { cleared: true };
+  } catch (e) {
+    return {
+      cleared: false,
+      reason: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+```
+
+All it does is lift the exception into a return value instead of dropping it. Callers can now look at `cleared` and decide whether they're allowed to declare the sign-out complete.
+
+**Whether a delete succeeded is answered by the delete, not by a read.** I settled on that line first, then rearranged the code around it.
+
+I did consider overwriting the entry with a dummy value before deleting it. If the write lands, the original becomes unreadable, which shrinks the risk of leftovers. But that write can fail too, so I kept the overwrite as a belt-and-braces step and left the decision resting on the return value.
+
+## Recovering on the next launch
+
+Once you can detect the failure, you need somewhere for it to go. You can't hold the user on a spinner while you retry, so I push the work to the next cold start.
+
+The bookkeeping doesn't need secure storage. All it holds is the key name — never the value.
+
+```ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const PENDING_KEY = 'secure_cleanup_pending';
+
+async function readPending(): Promise<string[]> {
+  const raw = await AsyncStorage.getItem(PENDING_KEY);
+  return raw ? (JSON.parse(raw) as string[]) : [];
+}
+
+export async function requestClear(key: string): Promise<boolean> {
+  const result = await clearSecret(key);
+  if (result.cleared) {
+    return true;
+  }
+
+  const pending = await readPending();
+  if (!pending.includes(key)) {
+    pending.push(key);
+    await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(pending));
+  }
+  return false;
+}
+
+// Call once on launch, before the first screen renders
+export async function retryPendingClears(): Promise<void> {
+  const pending = await readPending();
+  if (pending.length === 0) {
+    return;
+  }
+
+  const stillLeft: string[] = [];
+  for (const key of pending) {
+    const result = await clearSecret(key);
+    if (!result.cleared) {
+      stillLeft.push(key);
+    }
+  }
+
+  if (stillLeft.length > 0) {
+    await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(stillLeft));
+  } else {
+    await AsyncStorage.removeItem(PENDING_KEY);
+  }
+}
+```
+
+Running `retryPendingClears` **at launch** is the part that matters. Right after the map has been rebuilt from disk, a delete that failed last time often goes through. On my device, that single retry cleared the leftovers.
+
+The queue lives in `AsyncStorage` on purpose. If SecureStore is the thing that can't write right now, writing the bookkeeping into SecureStore doesn't help. And since the only thing stored is a key name, there's nothing sensitive in there to protect.
+
+The retry is written to be safe to run repeatedly. Deleting a key that is already gone resolves without throwing, so a spurious entry costs nothing. If a key stays in the queue across several launches, I treat that as a signal that something else is wrong with storage on that device and start looking there instead.
+
+Adding work to startup carries its own risks, and I've written separately about where I draw that line in [designing a safe-mode launch so users can escape a poisoned cache on their own](/en/articles/rork-dev/rork-expo-boot-loop-guard-safe-mode-poisoned-state-reset).
+
+## Revoke on the server before you clean up the device
+
+Having said all of the above: you cannot fully control whether a value survives on the device. Storage pressure, an OS-level refusal — the outcome is the same either way.
+
+So I changed the order.
+
+1. Send the revocation to the server and wait for it to succeed
+2. Clear the local value with `clearSecret`
+3. If it won't clear, record it and retry on the next launch
+
+That ordering leaves one obvious hole: what happens when someone taps sign-out with no connectivity. You can't wait for step 1, so you can't move on.
+
+What I settled on was raising a local flag first — a marker that says this session is no longer to be used. While the flag is set, the app will not attach that token to an API call even if it can still read it. The revocation request and the local delete both go into their queues, and each retries on its own trigger: the next successful network call, and the next launch. From the user's side, sign-out finished the moment they tapped.
+
+It isn't as tidy as a single atomic operation, and I spent a while wishing one existed. But a flag the app checks before every request is something I fully control, which the contents of the device's storage are not.
+
+With that ordering, steps 2 and 3 can both stumble and what's left on the device is a string that no longer opens anything. **Deleting locally is cleanup, not the safety guarantee.** That's the one part of the sequence I try not to reorder, even on a rushed day.
+
+If you're revisiting where secrets live in the first place, it also helps to separate them from values baked into the build. I wrote that up in [EAS secrets are not a "keep it out of the app" setting — decide the prefix and the visibility separately](/en/articles/rork-dev/expo-public-prefix-eas-visibility-two-axes).
+
+## One place to look today
+
+Open the `catch` in your sign-out path. If there's an empty pair of braces sitting there, turning it into a return value is enough to start. One function's worth of work, and you can finally see how often "I thought it was deleted" is actually happening.
+
+I'm working through my published apps one at a time with this check. It isn't fast work, but it's the kind of gap you can't recover from after the fact, so I'd rather keep going quietly than assume.
+
+If this saves you one confusing restart, I'm glad it was written down.
