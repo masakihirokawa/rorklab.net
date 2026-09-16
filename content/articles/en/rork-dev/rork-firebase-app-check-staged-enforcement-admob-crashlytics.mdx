@@ -6,7 +6,7 @@ level: "advanced"
 premium: true
 date: "2026-05-19T15:00"
 author: "Rork Lab"
-description: "A practical, staged rollout for Firebase App Check in Rork apps that keeps Crashlytics reporting, Realtime Database listeners, and AdMob payouts intact — written from years of running AdMob-funded indie apps in production."
+description: "A practical, staged rollout for Firebase App Check in Rork apps that keeps Crashlytics reporting, Realtime Database listeners, and AdMob payouts intact — written from running AdMob-funded indie apps in production."
 tags: ["Firebase", "App Check", "AdMob", "Crashlytics", "Rork", "Production"]
 highlights:
   - "A four-stage rollout (0% / 10% / 50% / 100%) driven by Remote Config that lets you compare crash-free sessions between enforced and non-enforced cohorts before flipping the whole base"
@@ -16,7 +16,7 @@ highlights:
 
 One Monday morning, my Crashlytics dashboard went almost completely quiet. For a few seconds I was happy — crash-free sessions had jumped to 99.97%. Then it sank in. Crashes were not down. Reports were not arriving. The night before, I had flipped Firebase App Check from "unenforced" to "enforced" on both Realtime Database and Crashlytics, and a chunk of my legitimate traffic was being rejected silently.
 
-App Check is well documented and the official setup guides are clear enough. What they tend not to dwell on is how easy it is to take a production app down by toggling a single switch from a console UI. As an indie developer who has been running AdMob-funded apps since 2014, App Check is still the one piece of Firebase infrastructure that makes me nervous every time I roll it out. So this is the design I now use for Rork apps, written from the side of someone who has already taken the blast.
+App Check is well documented and the official setup guides are clear enough. What they tend not to dwell on is how easy it is to take a production app down by toggling a single switch from a console UI. As an indie developer whose apps are funded by ads, App Check is still the one piece of Firebase infrastructure that makes me nervous every time I roll it out. So this is the design I now use for Rork apps, written from the side of someone who has already taken the blast.
 
 ## Why "instant enforce" is a bad default in production
 
@@ -176,7 +176,7 @@ export function isAppCheckEnforced(): boolean {
 }
 ```
 
-I use a similar hash-bucket primitive across roughly ten years of AdMob-driven rollouts. It is the cheapest stable bucketing I have found that does not require any server-side state. The literal `'anonymous'` fallback keeps signed-out users in a deterministic bucket; whether to include them at all is governed by a separate Remote Config flag, because some apps want anonymous traffic excluded from sensitive enforcement during the rollout window.
+I reach for the same hash-bucket primitive for every ad-related rollout I run. It is the cheapest stable bucketing I have found that does not require any server-side state. The literal `'anonymous'` fallback keeps signed-out users in a deterministic bucket; whether to include them at all is governed by a separate Remote Config flag, because some apps want anonymous traffic excluded from sensitive enforcement during the rollout window.
 
 ## The order in which you enforce Firebase products matters
 
@@ -237,6 +237,88 @@ In the opposite direction, the AdMob SDK itself does not consume App Check, so e
 
 The practical recommendation, from someone whose entire indie business runs on AdMob, is that the more central AdMob is to your revenue, the sooner you want App Check in. Combined with Play Integrity, it reduces the chance of policy-violation reports and stabilizes payouts in a way that compounds over months.
 
+## Where each rejection shows up — and where it doesn't
+
+Staging the rollout only helps if you know where to look for rejections. The awkward part is that App Check rejections surface in a different place for each Firebase product — and for one of them, nowhere at all. Here is what I found by checking them one at a time against my own apps.
+
+<table>
+<thead>
+<tr><th>Product</th><th>Where the rejection is recorded</th><th>How it looks in the app</th><th>Realistic time to notice</th></tr>
+</thead>
+<tbody>
+<tr><td>Cloud Functions</td><td>Cloud Logging (invocation logs)</td><td>Caller receives an error</td><td>Minutes</td></tr>
+<tr><td>Cloud Storage</td><td>Cloud Logging</td><td>Images fail to load</td><td>Minutes</td></tr>
+<tr><td>Realtime Database</td><td>Drop in concurrent connections</td><td>Listeners simply never attach</td><td>Half a day to a day</td></tr>
+<tr><td>Remote Config</td><td>Unverified request count in the App Check console</td><td>App keeps running on cached values</td><td>Over a day</td></tr>
+<tr><td>Crashlytics</td><td>Nowhere — the send fails client-side</td><td>Reports stop arriving</td><td>You may never notice</td></tr>
+</tbody>
+</table>
+
+The bottom two rows cannot be caught by hunting for rejection logs. That Monday morning I described at the top was exactly this: I was looking for something that had failed, and the place I was looking had itself gone quiet.
+
+**You cannot count rejections. You can only count arrivals.** For as long as I had that backwards, none of my alerts ever fired.
+
+So alongside the real request paths, I keep one callable whose whole job is to report the verification result instead of acting on it. Leave `enforceAppCheck` as `false` on that one function and log whether `request.app` was populated — the outcome lands in your logs as data rather than as a failure.
+
+```ts
+// functions/src/appCheckHeartbeat.ts
+import { onCall } from 'firebase-functions/v2/https';
+import { logger } from 'firebase-functions';
+
+export const appCheckHeartbeat = onCall(
+  // This path exists to count arrivals, so it must never reject
+  { enforceAppCheck: false },
+  async (request) => {
+    logger.info('app_check_heartbeat', {
+      // request.app is only populated when the App Check token verified
+      verified: request.app !== undefined,
+      enforced: request.data?.enforced === true,
+      version: request.data?.version ?? 'unknown',
+    });
+    return { ok: true };
+  },
+);
+```
+
+The client calls it once per session and swallows the result. Failure to arrive is the signal, so nothing here may throw.
+
+```ts
+// lib/appCheckHeartbeat.ts
+import functions from '@react-native-firebase/functions';
+import { nativeApplicationVersion, nativeBuildVersion } from 'expo-application';
+import { isAppCheckEnforced } from './appCheckGate';
+
+let sentThisSession = false;
+
+export async function sendAppCheckHeartbeat() {
+  if (sentThisSession) return;
+  sentThisSession = true;
+
+  try {
+    await functions().httpsCallable('appCheckHeartbeat')({
+      enforced: isAppCheckEnforced(),
+      version: `${nativeApplicationVersion}(${nativeBuildVersion})`,
+    });
+  } catch {
+    // Not arriving is the measurement. Nothing to do here.
+  }
+}
+```
+
+In the morning, this is the only query I run. Unverified sessions come back broken down by app version.
+
+```bash
+gcloud logging read \
+  'jsonPayload.message="app_check_heartbeat" AND jsonPayload.verified=false' \
+  --project "$FIREBASE_PROJECT_ID" --freshness=24h \
+  --format='value(jsonPayload.version)' \
+  | sort | uniq -c | sort -rn
+```
+
+If old build numbers sit at the top of that list, the cause is not your enforcement — it is those versions still being out in the wild. If the newest build is at the top, suspect a forgotten debug provider or the first-launch attestation window instead. The App Check console cannot split unverified requests by app version, and this heartbeat log has been the only practical way I have found to do it.
+
+The cost is honest enough: one extra callable per session. I run it for everyone during the two weeks of a rollout, then dial it down to about 10% with a Remote Config percentage once things settle. Every real request path stays at `enforceAppCheck: true`. This single function is the only thing I loosen.
+
 ## What to watch in the first week after 100%
 
 When `appCheckRolloutPercent = 100` and the Firebase console is set to enforced, here is the metric set I check every morning for seven days.
@@ -247,7 +329,7 @@ Remote Config `fetchAndActivate` success rate. If the 200-response ratio for the
 
 The AdMob `ad_request → impression` ratio. App Check should not move this directly, but if your ad routing depends on Realtime Database flags and Realtime Database is being rejected, fill rate will quietly slip.
 
-The "unverified requests" count in the App Check console itself. If this is still non-zero after a full 100% rollout, the most likely culprits are forgotten debug providers on staff devices, or older app versions still in the wild. Older versions need a forced upgrade strategy of their own, but in the meantime a Remote Config flag like `appCheckMinVersion` lets you scope enforcement only to clients above a given build number.
+The "unverified requests" count in the App Check console itself. If this is still non-zero after a full 100% rollout, the most likely culprits are forgotten debug providers on staff devices, or older app versions still in the wild. Which of the two it is comes straight out of the heartbeat log from the previous section, so that is the first thing I open. Older versions need a forced upgrade strategy of their own, but in the meantime a Remote Config flag like `appCheckMinVersion` lets you scope enforcement only to clients above a given build number.
 
 If I keep those four numbers on a single spreadsheet and look at them for seven minutes each morning, App Check stops being scary and becomes routine. If I skip that habit and just leave enforcement on, I end up on the wrong side of a Monday morning where Crashlytics is "wonderfully quiet."
 
