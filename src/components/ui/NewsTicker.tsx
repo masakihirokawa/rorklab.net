@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
-    "SWIFT — 新規プロジェクトは iPhone が Swift、Android が Kotlin、Web が React です。既にある Expo プロジェクトはビルドも公開も GitHub への出力も続けられます",
-    "10/02 — gemini-2.5-flash-image の停止まで残り 15 日です。アプリ内で画像生成を呼んでいる場合は後継モデルへの差し替えを見ておきます",
-    "EAS — EAS Build が async-storage の変種解決で止まる報告が、未解決のまま残っています。既存の Expo プロジェクトを抱えたままの方は踏みやすい箇所です",
-    "NEW — 消したはずのトークンが再起動で戻ってきます。SecureStore の削除失敗を検知する設計を書きました",
-    "ENV — eas env:list の出力を CI に渡す前に、平文・機微・secret の 3 種を分けて数えます。secret は EAS のサーバーから出ない仕様です",
-    "EXPOGO — SDK 53 以降、Expo Go ではプッシュ通知を受け取れません。通知が来ない理由をここで一度つなげておきます",
+ja: [
+    "SDK58 — Expo SDK 58 のベータが始まりました。React Native 0.88 の RC を同梱し、ベータ期間は3〜4週間と公式に書かれています",
+    "11/01 — Google Play の対象 API レベル、延長を申請した場合の配信期限は11月1日です。残り44日です",
+    "EASENV — ローカルビルドに渡したはずの秘密が、中身ではなく変数名の文字列のまま届く、という報告が長く開いたままです",
+    "NEW — 推奨された移行先が、すでに停止していました。廃止表を74行突き合わせた記録です",
+    "UISCENE — iOS 27 では新しい画面ライフサイクルが必須です。SDK 57 では自分で有効にする設定で、既定になるのは 58 からです",
+    "CREDIT — 「AI のエラーには消費しない」がどこまでを指すのかは、同じ修正を何度か頼んだ日の記録を取ると見えてきます",
   ],
   en: [
-    "SWIFT — New projects are Swift on iPhone, Kotlin on Android and React on the web. An Expo project you already have still builds, publishes and exports to GitHub",
-    "10/02 — Fifteen days until gemini-2.5-flash-image shuts down. If your app calls image generation, plan the move to its replacement now",
-    "EAS — Reports of EAS Build stalling on async-storage variant resolution are still open. It is easy to hit if you are carrying an existing Expo project",
-    "NEW — A token you deleted comes back after a restart. We wrote up a design that catches a failed SecureStore delete",
-    "ENV — Before piping eas env:list into CI, separate plain, sensitive and secret variables and count them. Secrets are designed never to leave the EAS servers",
-    "EXPOGO — Since SDK 53, Expo Go cannot receive push notifications. Worth connecting that to the silence before you go hunting elsewhere",
+    "SDK58 — The Expo SDK 58 beta is open. It ships the React Native 0.88 release candidate, and the beta period is stated as three to four weeks",
+    "11/01 — For anyone who requested an extension, Google Play's target API deadline lands on November 1. Forty-four days out",
+    "EASENV — A long-open report: secrets handed to a local build arrive as the literal variable name rather than its value, and the damage surfaces much later",
+    "NEW — The replacement the table recommended had already shut down. A record of reconciling all 74 rows of the deprecation list",
+    "UISCENE — iOS 27 requires the new scene lifecycle. SDK 57 makes it something you opt into; it only becomes the default in 58",
+    "CREDIT — What \"AI errors don't cost credits\" actually covers becomes clear once you record a day of asking for the same fix more than once",
   ],
 };
 
