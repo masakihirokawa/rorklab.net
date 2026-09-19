@@ -7,14 +7,16 @@ premium: false
 date: "2026-04-14T05:15"
 updated: "2026-04-14T05:15"
 author: "Rork Lab"
-description: "A complete guide to building an AI video editing app with Rork Max. Covers Whisper API subtitle generation, Gemini Flash highlight detection, Supabase Storage chunked uploads, and Stripe credit-based monetization with working code examples."
+description: "An implementation log from building an AI video editor with Rork Max: TUS resumable uploads on Supabase Storage, Whisper subtitle generation, Gemini highlight detection and the 100MB boundary nobody warns you about, plus Stripe credit billing."
 tags: ["Rork Max", "AI video editor", "Whisper API", "Supabase", "Stripe", "video app", "subtitle generation"]
 
 ---
 
-Short-form video has rewritten the rules of content consumption, and the demand for apps that automatically transform raw footage into polished clips is accelerating fast. But for indie developers, the technical challenges pile up quickly: how do you process video server-side without breaking the bank, how do you stitch AI transcription together with actual video editing, and how do you charge users in a way that aligns with the value you deliver?
+I uploaded a 47MB travel clip, watched the progress bar fill all the way to 100%, then opened the Supabase dashboard and found a 4.7MB file sitting there. Of the ten chunks I thought I had sent, only the last one had survived.
 
-This guide walks through a complete implementation — from chunked video upload through AI subtitle generation, highlight detection, and Stripe credit billing — using Rork Max as the mobile frontend. Every code block is designed to run in production, not just in a sandbox.
+No error was ever thrown. The fault was in my own upload code: if you write to the same object path ten times with `upsert` enabled, the tenth write is the only one that remains. I had been overwriting a file while believing I was assembling one.
+
+What follows is the implementation log, that mistake included — video upload, automatic subtitles, highlight detection, and Stripe credit billing, with Rork Max as the frontend. Working code, and the places where I got stuck along the way.
 
 ## Why AI Video Editing Is a Real Opportunity for Solo Developers
 
@@ -46,79 +48,125 @@ The technology stack:
 - **Payments**: Stripe (credit packs)
 - **Real-time**: Supabase Realtime (postgres_changes subscription)
 
-## Implementing Chunked Video Upload with Progress Tracking
+## Resumable Upload — From "I Thought I Was Chunking" to TUS
 
-Videos range from tens of megabytes to several gigabytes. A single-request upload fails too often to be viable in production. The implementation below splits the file into 5MB chunks and uploads them sequentially with progress callbacks.
+That 4.7MB file came from code like this: read the video in 5MB slices, then call `upload()` on the same storage path with `upsert: true` for each slice.
+
+Supabase Storage's `upload()` writes whole objects. It is not an append API. Ten writes to one key leave you with the tenth, and because `upsert` is set, nothing complains. Looking back, the silence was the expensive part — a loud failure would have cost me an afternoon instead of a week.
+
+The Base64 round trip was the second problem. React Native has no built-in `Buffer`, and Base64 inflates the payload by roughly 1.33x before it ever reaches the network. Holding a few hundred megabytes in memory that way is not something a phone forgives.
+
+Supabase Storage speaks the [TUS protocol](https://tus.io/) for resumable uploads. Chunking, retrying, and resuming belong to the protocol. What you write is configuration.
+
+**Push the heavy work to the server, and push the fragile work into the protocol.** Upload-related support mail stopped arriving the week I deleted my own chunking loop.
 
 ```typescript
 // services/videoUpload.ts
-import * as FileSystem from 'expo-file-system';
+import * as tus from 'tus-js-client';
 import { supabase } from './supabaseClient';
 
-const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+const PROJECT_ID = 'YOUR_PROJECT_ID';
 
-export async function uploadVideoWithProgress(
-  videoUri: string,
-  fileName: string,
-  onProgress: (progress: number) => void
-): Promise<{ path: string; error: Error | null }> {
-  try {
-    const fileInfo = await FileSystem.getInfoAsync(videoUri);
-    if (!fileInfo.exists) {
-      throw new Error('Video file not found at the provided URI');
-    }
+// Use the direct storage hostname for large files
+const RESUMABLE_ENDPOINT =
+  `https://${PROJECT_ID}.storage.supabase.co/storage/v1/upload/resumable`;
 
-    // Android requires explicit type assertion for size
-    const fileSizeBytes = (fileInfo as FileSystem.FileInfo & { size: number }).size;
-    const totalChunks = Math.ceil(fileSizeBytes / CHUNK_SIZE);
+export interface PickedVideo {
+  uri: string;   // the file:// URI returned by expo-image-picker
+  name: string;
+  type: string;  // 'video/mp4', etc.
+}
 
-    // Sanitize filename for storage path
-    const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const storagePath = `videos/${Date.now()}_${sanitizedName}`;
-
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-      const start = chunkIndex * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, fileSizeBytes);
-
-      const chunk = await FileSystem.readAsStringAsync(videoUri, {
-        encoding: FileSystem.EncodingType.Base64,
-        position: start,
-        length: end - start,
-      });
-
-      const chunkBuffer = Buffer.from(chunk, 'base64');
-
-      const { error: uploadError } = await supabase.storage
-        .from('video-uploads')
-        .upload(storagePath, chunkBuffer, {
-          contentType: 'video/mp4',
-          upsert: chunkIndex > 0, // overwrite after first chunk
-          duplex: 'half',
-        });
-
-      // Supabase returns "object already exists" for subsequent chunks — that is expected
-      if (uploadError && uploadError.message !== 'The object already exists') {
-        throw new Error(
-          `Chunk ${chunkIndex + 1}/${totalChunks} failed: ${uploadError.message}`
-        );
-      }
-
-      const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
-      onProgress(progress);
-    }
-
-    return { path: storagePath, error: null };
-
-  } catch (err) {
-    const error = err instanceof Error
-      ? err
-      : new Error('An unexpected error occurred during upload');
-    return { path: '', error };
+export async function uploadVideoResumable(
+  file: PickedVideo,
+  bucketName: string,
+  objectName: string,
+  onProgress: (percent: number) => void
+): Promise<string> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) {
+    throw new Error('You need to be signed in to upload');
   }
+
+  return new Promise<string>((resolve, reject) => {
+    const upload = new tus.Upload(file as unknown as tus.UploadInput, {
+      endpoint: RESUMABLE_ENDPOINT,
+      retryDelays: [0, 3000, 5000, 10000, 20000],
+      headers: {
+        authorization: `Bearer ${session.access_token}`,
+        // only when overwriting the same path is acceptable
+        // 'x-upsert': 'true',
+      },
+      uploadDataDuringCreation: true,
+      removeFingerprintOnSuccess: true,
+      metadata: {
+        bucketName,
+        objectName,
+        contentType: file.type,
+        cacheControl: '3600',
+      },
+      // Must stay at 6MB — the server implementation assumes it
+      chunkSize: 6 * 1024 * 1024,
+      onError: (error) => {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+      onProgress: (uploaded, total) => {
+        onProgress(Math.round((uploaded / total) * 100));
+      },
+      onSuccess: () => resolve(objectName),
+    });
+
+    // Resume an interrupted upload if one is on record
+    upload.findPreviousUploads().then((previous) => {
+      if (previous.length > 0) {
+        upload.resumeFromPreviousUpload(previous[0]);
+      }
+      upload.start();
+    });
+  });
 }
 ```
 
-The Rork Max UI component that ties this together:
+Four of these settings only made sense to me after running them in production.
+
+<table>
+<thead>
+<tr><th>Setting</th><th>Behavior</th><th>What it means in practice</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>chunkSize</strong></td>
+<td>Fixed at 6MB — do not change it</td>
+<td>Tuning it down for weak networks is tempting, but the server assumes this value. Tune throughput by choosing the direct storage hostname instead</td>
+</tr>
+<tr>
+<td><strong>Upload URL lifetime</strong></td>
+<td>Valid for up to 24 hours</td>
+<td>Nothing resumes past that window. Don't leave a "resume upload" affordance in the UI forever</td>
+</tr>
+<tr>
+<td><strong>Two clients, same upload URL</strong></td>
+<td>One succeeds, the rest get 409 Conflict</td>
+<td>409 here is the design working, not a transient fault — keep it out of your retry path</td>
+</tr>
+<tr>
+<td><strong>Two clients, same path, different URLs</strong></td>
+<td>First to finish wins; with <code>x-upsert</code>, last to finish wins</td>
+<td>Put the job ID in the object name and this branch stops mattering</td>
+</tr>
+</tbody>
+</table>
+
+One capability is genuinely missing on React Native. tus-js-client persists upload URLs through the Web Storage API, which React Native does not implement — so `findPreviousUploads()` always returns an empty array and **resuming after an app restart does not work out of the box**. If you want cross-session resume, pass your own `urlStorage` backed by AsyncStorage. Retrying through a dropped connection within the same session works as written.
+
+### Handling the URI the picker hands you
+
+`launchImageLibraryAsync` from `expo-image-picker` copies the selected video into the app's cache and returns a `file://` URI. On React Native, tus-js-client accepts an object with a `uri` property and resolves it internally, so the picker result can be passed straight through.
+
+A `ph://` URI shows up when you enumerate assets with `expo-media-library` instead. Those need `getAssetInfoAsync()` first, so you can read `localUri`. Same user action, different module, different URI contract.
+
+Also worth updating if you're reading older code: passing `ImagePicker.MediaTypeOptions.Videos` to `mediaTypes` is deprecated. Pass an array of strings such as `['videos']`.
+
 
 ```typescript
 // components/VideoUploader.tsx
@@ -127,9 +175,9 @@ import {
   View, Text, TouchableOpacity, ActivityIndicator, StyleSheet
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { uploadVideoWithProgress } from '../services/videoUpload';
+import { uploadVideoResumable } from '../services/videoUpload';
 import { triggerVideoProcessing } from '../services/videoProcessing';
-import { validateVideo } from '../utils/videoValidation';
+import { planHighlightRoute } from '../utils/videoValidation';
 
 interface VideoUploaderProps {
   onJobStarted: (jobId: string) => void;
@@ -151,18 +199,17 @@ export function VideoUploader({ onJobStarted }: VideoUploaderProps) {
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+      mediaTypes: ['videos'],
       quality: 1,
       videoMaxDuration: 1800, // 30 minutes maximum
-      copyToCacheDirectory: true, // required to avoid ph:// URIs on iOS
     });
 
     if (result.canceled || !result.assets?.[0]) return;
 
     const asset = result.assets[0];
-    const validationError = validateVideo(asset);
-    if (validationError) {
-      setError(validationError);
+    const { error: validationError, route } = planHighlightRoute(asset);
+    if (validationError || !route) {
+      setError(validationError ?? 'This video cannot be processed.');
       return;
     }
 
@@ -174,17 +221,22 @@ export function VideoUploader({ onJobStarted }: VideoUploaderProps) {
     setUploading(true);
     setStatusMessage('Uploading video...');
 
-    const { path, error: uploadError } = await uploadVideoWithProgress(
-      asset.uri,
-      asset.fileName,
-      (p) => {
-        setProgress(p);
-        setStatusMessage(`Uploading... ${p}%`);
-      }
-    );
+    const objectName = `videos/${Date.now()}_${asset.fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
 
-    if (uploadError) {
-      setError(`Upload failed: ${uploadError.message}`);
+    let path: string;
+    try {
+      path = await uploadVideoResumable(
+        { uri: asset.uri, name: asset.fileName, type: asset.mimeType ?? 'video/mp4' },
+        'video-uploads',
+        objectName,
+        (p) => {
+          setProgress(p);
+          setStatusMessage(`Uploading... ${p}%`);
+        }
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      setError(`Upload failed: ${message}`);
       setUploading(false);
       return;
     }
@@ -195,6 +247,8 @@ export function VideoUploader({ onJobStarted }: VideoUploaderProps) {
       generateSubtitles: true,
       detectHighlights: true,
       language: 'en',
+      // tells the Edge Function whether to hand Gemini a URL or upload via the Files API
+      highlightRoute: route,
     });
 
     if (processingError) {
@@ -261,7 +315,7 @@ const styles = StyleSheet.create({
 });
 ```
 
-One important note about iOS video URIs: `expo-image-picker` can sometimes return a `ph://` scheme URI rather than a local file URI, especially on older Expo SDK versions. The `copyToCacheDirectory: true` option forces a local copy, which is required for `FileSystem.readAsStringAsync` to work correctly.
+A note on the progress bar: tus-js-client reports bytes sent, so the number jumps in 6MB steps at chunk boundaries. Smoothing that out is possible, but distinguishing "sending" from "retrying" in the copy did far more for my support inbox than any animation did.
 
 ## The Supabase Edge Function — Whisper and Gemini in One Pipeline
 
@@ -469,6 +523,10 @@ Respond ONLY with this exact JSON format (no other text):
 });
 ```
 
+A `file_data.file_uri` for video accepts a Files API URI, a public URL, or a pre-signed URL — the API fetches the content while processing the request. That path carries a size limit worth knowing about, which the pitfalls section covers below.
+
+The code above calls `gemini-2.5-flash`. When you move up a generation, two things are worth checking before anything else: whether the model family supports URL-based file input at all (the Gemini 2.0 family does not), and how the response is constrained to JSON. Every time a model swap broke for me, it was one of those two.
+
 ## Receiving Completion Notifications with Supabase Realtime
 
 The client-side hook subscribes to postgres_changes on the processing_jobs table. When the Edge Function updates the row to `status: 'completed'`, the subscription fires and the app can display results immediately.
@@ -623,7 +681,7 @@ Call this function from within the Edge Function before starting AI processing. 
 
 The Stripe Checkout flow itself works best with session creation in an Edge Function and the success redirect handled via deep link back into the app. If you later move toward usage-based pricing, [Usage-Based Billing for Rork AI Apps with Stripe Meter](/articles/rork-dev/rork-stripe-meter-billing-usage-based-pricing) walks through that design in detail.
 
-## Five Production Pitfalls and How to Avoid Them
+## Six Production Pitfalls and How to Avoid Them
 
 ### 1. Video orientation rotates after upload
 
@@ -643,27 +701,64 @@ For videos requiring more than 10 minutes of processing time, the WebSocket conn
 
 The Edge Function fetches the video via a signed URL. If processing takes longer than the URL's validity period, Gemini's request to that URL fails with a 403. The 7200-second (2-hour) expiry in the code above handles most cases, but for very large files it's safer to re-generate the URL immediately before passing it to each AI API, rather than reusing the same URL for both Whisper and Gemini calls.
 
-### 5. Gemini context window overflow for long videos
+### 5. A signed URL only carries 100MB
 
-Gemini 2.5 Flash can analyze videos up to roughly 1 hour in length. Beyond that, the request will fail with a context window error. Enforce limits in the client before upload:
+This is the one that held me up longest. Passing a signed URL in `file_uri` is capped at **100MB per request**. The 2GB ceiling my client-side validation allowed contradicted that limit outright, so here is the corrected version.
+
+Anything above 100MB has to go through the Files API instead: upload it, then pass back the URI you get. The Files API accepts up to 2GB per file and keeps it for 48 hours. A duration cap (30 minutes, say) is still worth having for cost and latency reasons — but the byte boundary is the one you hit first.
+
+<table>
+<thead>
+<tr><th>Input method</th><th>Size limit</th><th>Persistence</th><th>Best for</th></tr>
+</thead>
+<tbody>
+<tr><td>Inline (base64 in the payload)</td><td>100MB per request</td><td>None</td><td>Short clips, quick tests</td></tr>
+<tr><td>External URL (public or signed)</td><td>100MB per request</td><td>None — fetched each time</td><td>Videos already in Storage, under 100MB</td></tr>
+<tr><td>Files API upload</td><td>2GB per file</td><td>48 hours</td><td>Anything larger, or reused across requests</td></tr>
+</tbody>
+</table>
 
 ```typescript
 // utils/videoValidation.ts
-import { ImagePicker } from 'expo-image-picker';
+import type { ImagePickerAsset } from 'expo-image-picker';
 
-const MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes
-const MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024; // 2GB
+const MAX_DURATION_MS = 30 * 60 * 1000;           // duration cap: cost and latency
+const EXTERNAL_URL_LIMIT = 100 * 1024 * 1024;     // signed-URL input ceiling
+const FILES_API_LIMIT = 2 * 1024 * 1024 * 1024;   // Files API ceiling
 
-export function validateVideo(asset: ImagePicker.ImagePickerAsset): string | null {
+export type HighlightRoute = 'signed-url' | 'files-api';
+
+export interface VideoPlan {
+  error: string | null;
+  route: HighlightRoute | null;
+}
+
+export function planHighlightRoute(asset: ImagePickerAsset): VideoPlan {
   if (asset.duration && asset.duration > MAX_DURATION_MS) {
-    return `Video too long (max ${MAX_DURATION_MS / 60_000} minutes). Please trim it first.`;
+    return {
+      error: `Video too long (max ${MAX_DURATION_MS / 60_000} minutes). Please trim it first.`,
+      route: null,
+    };
   }
-  if (asset.fileSize && asset.fileSize > MAX_FILE_SIZE_BYTES) {
-    return `File too large (max 2GB).`;
+
+  const size = asset.fileSize ?? 0;
+
+  if (size > FILES_API_LIMIT) {
+    return { error: 'File too large (max 2GB).', route: null };
   }
-  return null;
+
+  // 100MB decides whether we hand over a URL or upload to the Files API
+  return { error: null, route: size > EXTERNAL_URL_LIMIT ? 'files-api' : 'signed-url' };
 }
 ```
+
+### 6. A failed URL fetch still returns a 200
+
+One more behavior cost me real time. URLs passed in `file_uri` go through a content safety check, and when one is rejected you get a `url_retrieval_status` of `URL_RETRIEVAL_STATUS_UNSAFE`. Login-gated pages and expired URLs fail here too.
+
+The awkward part is that **the request still returns 200, with a plausible-looking highlights array attached**. A model that never saw your video will happily invent five timestamped segments from the prompt alone. I only noticed because the reasons it gave described footage I had never uploaded.
+
+The fix is ordinary: check `url_retrieval_status` — or verify that no highlight range exceeds the video's duration — and fall back to no highlights when anything looks off. **Don't trust the returned JSON until you've confirmed the fetch succeeded.** Skip that and all you're left with is complaints you can't reproduce.
 
 ## Parsing VTT Subtitles for the In-App Player
 
@@ -744,7 +839,11 @@ The pipeline built in this guide — chunked upload, Whisper transcription, Gemi
 
 **Thumbnail generation**: Use Gemini's vision capabilities to analyze the highlight frames and identify the single best frame for a thumbnail — high visual clarity, expressive face or action, minimal motion blur. Offer this as a 2-credit add-on to every processed video. It is fast, cheap to run, and extremely useful for anyone posting to YouTube or App Store previews.
 
-Start by getting the local Supabase development environment running (`supabase start`), deploying the Edge Function with `supabase functions serve process-video`, and testing the full pipeline with a short test video before optimizing for edge cases. Once the core path works end-to-end, each additional AI feature becomes a matter of adding another API call to the pipeline and a new entry in the credit cost constants.
+Start with `supabase start`, put the Edge Function on hot reload with `supabase functions serve process-video`, and then push **one video of about 120MB** through the pipeline. One file that crosses the 100MB boundary, deliberately. That single run exercises both the signed-URL path and the Files API path on your own machine. A 10MB test clip lets you ship without ever seeing the place that breaks.
+
+Hand the chunking and resuming to the protocol, and keep the boundary decisions in code you own — that's the split I plan to carry into the next app.
+
+Thank you for reading. If this spares even one person the week I spent on the 100MB wall, it was worth writing down.
 
 ## Database Schema — Setting Up the Foundation
 
