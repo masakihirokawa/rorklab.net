@@ -5,14 +5,14 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-08-10T10:00"
-updated: "2026-08-10T10:00"
+updated: "2026-09-20T11:30"
 author: "Rork Lab"
-description: "Signed URLs rewrite their query string on every expiry, so a URL-keyed cache never hits. Here is how to derive a stable key and drive expo-image's writeToCacheAsync and readFromCacheAsync yourself, with measured results."
+description: "Signed URLs rewrite their query string on every expiry, so a URL-keyed cache never hits. Here is how to pin the key with source.cacheKey, what the cache read and write APIs actually return, and what changed when I re-ran the measurements."
 tags: ["Rork", "expo-image", "signed URLs", "cache design", "React Native"]
 highlights:
   - "You can pinpoint why your bandwidth climbed after moving to signed URLs, and decide exactly which layer to fix"
-  - "You get working code that manages expo-image cache keys yourself through writeToCacheAsync and readFromCacheAsync"
-  - "You can estimate how much of your hit rate a key redesign would actually recover, using your own access distribution"
+  - "You get the real signatures of source.cacheKey, writeToCacheAsync, readFromCacheAsync and getCachePathAsync, and know which one to reach for"
+  - "You can estimate how much of your hit rate a key redesign would recover, by fitting the skew exponent from your own view logs"
 ---
 
 The week after I moved image delivery behind signed URLs, one graph moved: bandwidth. Same catalog, same resolutions, same screens. The only thing that changed was the shape of the URL.
@@ -20,6 +20,8 @@ The week after I moved image delivery behind signed URLs, one graph moved: bandw
 The culprit was the cache key. A signed URL rewrites `X-Amz-Signature` and `X-Amz-Date` every time the expiry rolls over. To the library, that is not yesterday's image. It is an image it has never seen.
 
 As an indie developer running image-heavy wallpaper apps, I spent an embarrassing amount of time raising the disk cache ceiling before I understood this. Raising the ceiling does nothing. The cache was not full. It was never being hit.
+
+> **Updated 2026-09-20.** I went back through this article against the Expo API reference and found two things I had gotten wrong: the call shape of `writeToCacheAsync`, the return type of `readFromCacheAsync`, and — separately — the skew exponent I quoted alongside my own measurements. All of it is rewritten below, and I have left the corrections visible rather than editing them out of existence.
 
 ## Every new signature makes the same image a different image
 
@@ -48,6 +50,8 @@ The path is identical. The string is not. That gap is the whole problem.
 
 The key should encode *which object, in what shape* — never *who authorized it, and when*.
 
+**A URL is the delivery slip. The key is the shelf number.** The slip gets reprinted on every pickup; there is no reason to renumber the shelf along with it.
+
 ## Where the default cache key actually comes from
 
 `expo-image` derives its on-disk location from the `source.uri` string. `cachePolicy` selects which layers store the bytes, memory or disk. It does not change how the key is built. Conflating the two is how you end up with `cachePolicy="memory-disk"` set correctly and nothing being reused.
@@ -61,27 +65,44 @@ The key should encode *which object, in what shape* — never *who authorized it
 />
 ```
 
-The bytes do land on disk. They simply become entries nobody will ever request again, quietly consuming your disk budget. The bloat side of that story is covered in [Your Rork App's "Documents & Data" Keeps Growing](/en/articles/rork-dev/rork-expo-image-disk-cache-bloat-fix), but when signed URLs are involved, tuning the ceiling will not help. The problem is the key, not the capacity.
+The bytes do land on disk. They simply become entries nobody will ever request again, consuming your disk budget for nothing. The bloat side of that story is covered in [Your Rork App's "Documents & Data" Keeps Growing](/en/articles/rork-dev/rork-expo-image-disk-cache-bloat-fix), but when signed URLs are involved, tuning the ceiling will not help. The problem is the key, not the capacity.
 
-## Separating the cache key from the URL
+## The shortest fix: pass source.cacheKey
 
-The approach is straightforward: treat the URL as a disposable means of fetching, and let a separate function decide identity.
+Before anything else, I want to say this: the library already gives you the dial. `ImageSource` has a `cacheKey` field, documented as "the cache key used to query and store this specific image. If not provided, the `uri` is used also as the cache key" ([Expo Image API reference](https://docs.expo.dev/versions/latest/sdk/image/)).
+
+Which means you can solve this declaratively, before you touch the cache API at all.
+
+```tsx
+// The URL is free to change. Pin the key, and reads and writes land on the same shelf.
+<Image
+  source={{ uri: signedUrl, cacheKey: "v1:/wallpapers/w042.webp?w=1080&fm=webp" }}
+  cachePolicy="memory-disk"
+  style={styles.thumb}
+/>
+```
+
+When I first wrote this article I had skipped past that field and hand-rolled the read and write path instead. The detour was not wasted — it taught me where the library's responsibility ends and mine begins — but it was a detour. **Check whether the declarative option covers you, then hand-write only the remainder.** Skip that order and the code always grows.
+
+You choose the key string yourself, so the helper only has to normalize.
 
 ```ts
 // lib/imageKey.ts
-import * as Crypto from "expo-crypto";
 
 /** Params that belong in the key. Anything not listed here cannot affect identity. */
 const VARIANT_PARAMS = ["w", "h", "fm", "q", "dpr"] as const;
 
+/** Key scheme version. Bump this on the day you change schemes. */
+const KEY_VERSION = "v1";
+
 /**
  * Derives a signature-independent key from a signed URL.
- * Same object plus same transform yields the same string, whatever the signature.
+ * Synchronous. Same object plus same transform yields the same string, whatever the signature.
  */
-export async function stableImageKey(url: string): Promise<string> {
+export function stableImageKey(url: string): string {
   const u = new URL(url);
 
-  // Pull only the transform params, in a fixed order
+  // Pull only the transform params, in the array's fixed order
   const variant = VARIANT_PARAMS
     .map((p) => {
       const v = u.searchParams.get(p);
@@ -91,49 +112,70 @@ export async function stableImageKey(url: string): Promise<string> {
     .join("&");
 
   // Host is deliberately excluded so a CDN migration does not nuke the cache
-  const canonical = variant ? `${u.pathname}?${variant}` : u.pathname;
+  const path = u.pathname.replace(/\/+$/, "").toLowerCase();
 
-  return Crypto.digestStringAsync(
-    Crypto.CryptoDigestAlgorithm.SHA256,
-    canonical
-  );
+  return variant
+    ? `${KEY_VERSION}:${path}?${variant}`
+    : `${KEY_VERSION}:${path}`;
 }
 
 // Expected output (two URLs differing only in signature)
 // stableImageKey(".../w042.webp?w=1080&X-Amz-Signature=6f1c...")
-//   -> "3b7c9f..."  same
+//   -> "v1:/wallpapers/w042.webp?w=1080"   same
 // stableImageKey(".../w042.webp?w=1080&X-Amz-Signature=a93e...")
-//   -> "3b7c9f..."  same
+//   -> "v1:/wallpapers/w042.webp?w=1080"   same
 // stableImageKey(".../w042.webp?w=540&X-Amz-Signature=a93e...")
-//   -> "e14a02..."  different transform, different key
+//   -> "v1:/wallpapers/w042.webp?w=540"    different transform, different key
 ```
+
+The first version of this function ran the canonical string through `expo-crypto` and returned a SHA-256 digest. It no longer does, and the reason is not cost. `digestStringAsync` returns a Promise, so a list puts one async hop per row in front of rendering — which drags `useEffect` and `useState` along with it. Making a synchronous decision asynchronous is how a simple key turns into a loading state.
+
+The hash itself stayed cheap. On Node v22.23.2, hashing a canonical string of the same length 100,000 times took 132.8 ms, about 1.33 microseconds per call. That is nothing. But cheap is not the same as necessary, and this one was not necessary.
 
 Leaving the host out pays off later. If flipping your delivery origin invalidates every cached byte, your migration day shows up as a bandwidth spike. Object identity is determined by the path, not by where the bytes happen to be served from, so the key should reflect that.
 
 The allowlist in `VARIANT_PARAMS` follows the same logic. A denylist breaks the moment your CDN appends one analytics parameter. Naming what you include is the safer direction.
 
-## Owning the read and write with writeToCacheAsync and readFromCacheAsync
+## What writeToCacheAsync and readFromCacheAsync actually take and return
 
-Once the key is settled, you perform both sides of the operation against it. The `expo-image` cache API accepts an explicit key for writes and reads.
+There is still a case `source.cacheKey` does not cover: seeding the cache with a file that is already on the device — one returned by `expo-image-picker`, or downloaded with `expo-file-system` — without a network round trip. That is what the write API is for.
+
+I had both of these APIs wrong in the first version. Here they are as documented.
+
+<table>
+  <thead>
+    <tr><th>API</th><th>Arguments</th><th>Returns</th><th>Easy to get wrong</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>writeToCacheAsync(source, cacheKey)</code></td><td>Two positional args. <code>source</code> is a <strong>local file URI or ImageRef</strong></td><td><code>Promise&lt;void&gt;</code></td><td>A remote URL will not do, and there is no options object. You cannot read a path back from the return value</td></tr>
+    <tr><td><code>readFromCacheAsync(cacheKey)</code></td><td>Key string only</td><td><code>Promise&lt;ImageRef | null&gt;</code></td><td>Not a local path. Pass it straight to <code>source</code>, without wrapping it in a uri object</td></tr>
+    <tr><td><code>getCachePathAsync(cacheKey)</code></td><td>Key string only</td><td><code>Promise&lt;string | null&gt;</code></td><td>This is the one that gives you a path, and doubles as an existence check</td></tr>
+  </tbody>
+</table>
+
+One documented caveat on the write side: seeding an animated image (GIF, APNG, animated WebP) from an ImageRef flattens it to a single frame, because the reference holds the decoded image rather than the original bytes. To keep the animation, pass the local file URI instead.
+
+Corrected, the read-and-write path looks like this.
 
 ```ts
 // lib/imageCache.ts
-import { Image } from "expo-image";
+import { Image, type ImageRef } from "expo-image";
+import * as FileSystem from "expo-file-system";
 import { stableImageKey } from "./imageKey";
 
 type Resolver = (objectPath: string) => Promise<string>; // issues a signed URL
 
 /**
  * Looks up the stable key first, and only signs and fetches on a miss.
- * Returns a local path you can hand straight to <Image source={{ uri }} />.
+ * Returns an ImageRef you can hand straight to <Image source={ref} />.
  */
 export async function resolveCachedImage(
   objectPath: string,        // e.g. "/wallpapers/w042.webp"
   variantQuery: string,      // e.g. "w=1080&fm=webp"
   sign: Resolver
-): Promise<string> {
-  // Key derivation needs no signature at all. That is the point.
-  const key = await stableImageKey(
+): Promise<ImageRef | null> {
+  // Key derivation needs no signature, and finishes synchronously
+  const key = stableImageKey(
     `https://placeholder.invalid${objectPath}?${variantQuery}`
   );
 
@@ -144,40 +186,44 @@ export async function resolveCachedImage(
 
   // Only now do we sign. The number of signing calls drops with it.
   const signed = await sign(`${objectPath}?${variantQuery}`);
-  const written = await Image.writeToCacheAsync(signed, { cacheKey: key });
 
-  return written ?? signed; // a failed write must not block rendering
+  // writeToCacheAsync wants a local file, so land it on disk first
+  const tmp = `${FileSystem.cacheDirectory}${encodeURIComponent(key)}`;
+  const { uri: localUri } = await FileSystem.downloadAsync(signed, tmp);
+  await Image.writeToCacheAsync(localUri, key); // returns void
+
+  return Image.readFromCacheAsync(key);
 }
 ```
 
 Order matters more than anything else here. You do not sign and then check the cache; you check the cache and sign only when you must. If signing means an API round trip or an edge function invocation, that ordering alone visibly reduces your call volume.
 
-The call site looks like this:
+That said, this path is only worth taking when the bytes are already on the device. If you are fetching over the network anyway, `source.cacheKey` from the previous section removes the download-then-write-back round trip entirely.
+
+The call site becomes much smaller:
 
 ```tsx
 // components/WallpaperThumb.tsx
-import { useEffect, useState } from "react";
 import { Image } from "expo-image";
-import { resolveCachedImage } from "../lib/imageCache";
-import { signObject } from "../lib/sign";
+import { stableImageKey } from "../lib/imageKey";
 
-export function WallpaperThumb({ objectPath }: { objectPath: string }) {
-  const [uri, setUri] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    resolveCachedImage(objectPath, "w=1080&fm=webp", signObject)
-      .then((u) => alive && setUri(u))
-      .catch(() => alive && setUri(null)); // keep the placeholder on failure
-    return () => {
-      alive = false; // guards against fast-scroll unmounts
-    };
-  }, [objectPath]);
+export function WallpaperThumb({
+  objectPath,
+  signedUrl,
+}: {
+  objectPath: string;
+  signedUrl: string | undefined;
+}) {
+  const cacheKey = stableImageKey(
+    `https://placeholder.invalid${objectPath}?w=1080&fm=webp`
+  );
 
   return (
     <Image
-      source={uri ? { uri } : undefined}
-      cachePolicy="memory"   // disk is managed by hand now, so memory only
+      // never undefined, even before the URL arrives (see pitfall 3)
+      source={{ uri: signedUrl ?? "", cacheKey }}
+      cachePolicy="memory-disk"
+      recyclingKey={cacheKey}   // stops the previous row's image showing in FlashList
       style={{ width: 120, height: 213 }}
       transition={120}
     />
@@ -185,17 +231,17 @@ export function WallpaperThumb({ objectPath }: { objectPath: string }) {
 }
 ```
 
-Dropping `cachePolicy` to `memory` avoids double bookkeeping. Writing to disk both yourself and through the library's default leaves two copies of identical bytes. For how this interacts with prefetching during scroll, see [When Rork-Built Lists Stutter](/en/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design).
+`recyclingKey` is there to blank the view before the new source resolves, which is what kills the flash of the previous row in a recycling list. For how this interacts with prefetching during scroll, see [When Rork-Built Lists Stutter](/en/articles/rork-dev/rork-image-cache-prefetch-scroll-performance-design).
 
-## What the numbers looked like: 17.7% to 59.3% hit rate
+## The numbers, and the exponent I got wrong
 
-How much you recover depends entirely on your access distribution, so guessing is pointless. I wrote a simulator matching the shape of my own catalog and ran it on Node v22.22.3.
+How much you recover depends entirely on your access distribution, so guessing is pointless. I wrote a simulator matching the shape of my own catalog and ran it.
 
-The parameters: 300 objects in the catalog, 60 viewed per session, 20 sessions, 1.8 MB average per image, a 256 MB disk budget, and a popularity-skewed access pattern (power law, exponent 2.2). Signatures are reissued every session.
+The figures I published originally came from these parameters: 300 objects in the catalog, 60 viewed per session, 20 sessions, 1.8 MB average per image, a 256 MB disk budget, LRU eviction. Signatures are reissued every session.
 
 <table>
   <thead>
-    <tr><th>Key strategy</th><th>Hit rate</th><th>Downloaded over 20 sessions</th><th>LRU evictions</th></tr>
+    <tr><th>Key strategy</th><th>Hit rate</th><th>Bytes transferred over 20 sessions</th><th>LRU evictions</th></tr>
   </thead>
   <tbody>
     <tr><td>Full URL as key (the default)</td><td>17.7%</td><td>1.74 GB</td><td>846</td></tr>
@@ -205,9 +251,105 @@ The parameters: 300 objects in the catalog, 60 viewed per session, 20 sessions, 
 
 That is a 50.6% reduction in total bytes transferred. The eviction count is the more revealing figure: 846 down to 346. Dead entries were crowding out the budget, which meant genuinely popular wallpapers were being pushed out to make room for URLs that would never be requested again. The damage compounded.
 
-I also measured the cost of deriving the key itself: 100,000 hash derivations in 207.7 ms, roughly 2.08 microseconds each. Against a 16.7 ms frame budget, that is not worth optimizing away.
+Re-running it, all of that still holds. What did not hold was the sentence I attached to it: "a popularity-skewed access pattern (power law, exponent 2.2)."
 
-These figures come from a simulation, not from devices. Relax the power-law exponent to 1.5 and the gap narrows; push it to 2.5 and it widens. Fit the exponent from your own view logs and rerun it — that is what tells you whether the work pays for itself.
+Sweeping the exponent with everything else fixed, the run that reproduces those numbers sits at **exponent 0.6**. At 2.2 the top handful of images absorb roughly seventy percent of all views, and under that much skew even a URL key clears an 86% hit rate. I had simply written down the wrong parameter.
+
+Here is the sweep, averaged over ten seeds.
+
+<table>
+  <thead>
+    <tr><th>Skew exponent</th><th>URL key hit rate</th><th>Stable key hit rate</th><th>URL key transfer</th><th>Stable key transfer</th><th>Reduction</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>0.6</strong> (reproduces the published figures)</td><td>17.1%</td><td>58.7%</td><td>1.75 GB</td><td>0.87 GB</td><td>50.2%</td></tr>
+    <tr><td>0.8</td><td>26.2%</td><td>68.1%</td><td>1.55 GB</td><td>0.67 GB</td><td>56.7%</td></tr>
+    <tr><td>1.0</td><td>38.7%</td><td>78.0%</td><td>1.29 GB</td><td>0.46 GB</td><td>64.1%</td></tr>
+    <tr><td>1.2</td><td>52.0%</td><td>85.1%</td><td>1.01 GB</td><td>0.31 GB</td><td>69.2%</td></tr>
+    <tr><td>1.5</td><td>68.7%</td><td>91.1%</td><td>0.66 GB</td><td>0.19 GB</td><td>71.7%</td></tr>
+    <tr><td>2.0</td><td>83.5%</td><td>96.3%</td><td>0.35 GB</td><td>0.08 GB</td><td>77.8%</td></tr>
+    <tr><td>2.2</td><td>86.6%</td><td>97.3%</td><td>0.28 GB</td><td>0.06 GB</td><td>80.4%</td></tr>
+  </tbody>
+</table>
+
+This table also retracts my original guidance that "relaxing the exponent to 1.5 narrows the gap and pushing it to 2.5 widens it." For one thing, 1.5 is not a relaxation of 0.6. For another, more skew *narrows* the hit-rate gap, not widens it: 41.6 points at 0.6, down to 10.7 points at 2.2.
+
+Meanwhile the transfer reduction moves the other way, climbing from 50.2% to 80.4%. With heavy skew the popular handful simply stays resident, so a larger share of wasted re-downloads disappears. Two metrics moving in opposite directions, and I had compressed them into one sentence pointing the wrong way.
+
+**Fit the exponent from your own logs before you copy anyone's.** Skip that and the numbers stay correct while the reading of them goes wrong.
+
+The bench is short enough to include, so you can run it yourself:
+
+```js
+// cache_sim.mjs — node cache_sim.mjs
+// Compares cache key strategies under signed URLs (LRU with a disk ceiling)
+const CATALOG = 300, VIEWS = 60, SESSIONS = 20;
+const AVG = 1.8 * 1024 * 1024, CAP = 256 * 1024 * 1024;
+
+// Reproducible PRNG (mulberry32)
+function rng(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Cumulative table for a power-law popularity distribution
+function zipf(n, s) {
+  const w = []; let sum = 0;
+  for (let i = 1; i <= n; i++) { const x = 1 / Math.pow(i, s); w.push(x); sum += x; }
+  const c = []; let a = 0;
+  for (const x of w) { a += x / sum; c.push(a); }
+  return c;
+}
+
+function pick(c, r) {
+  let lo = 0, hi = c.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (r <= c[m]) hi = m; else lo = m + 1; }
+  return lo;
+}
+
+function run(mode, s, seed) {
+  const c = zipf(CATALOG, s), rand = rng(seed), lru = new Map();
+  let used = 0, hit = 0, miss = 0, dl = 0, ev = 0;
+  for (let ss = 0; ss < SESSIONS; ss++) {
+    const sig = `sig${ss}`;                    // the signature rotates each session
+    for (let v = 0; v < VIEWS; v++) {
+      const id = pick(c, rand());
+      const size = Math.round(AVG * (0.6 + 0.8 * rand()));
+      const key = mode === "url"
+        ? `/img/${id}.webp?w=1080&${sig}`      // default: whole URL
+        : `/img/${id}.webp?w=1080`;            // stable key
+      if (lru.has(key)) {                      // on a hit, move to the MRU end
+        hit++; const b = lru.get(key); lru.delete(key); lru.set(key, b); continue;
+      }
+      miss++; dl += size; lru.set(key, size); used += size;
+      while (used > CAP) {                     // evict oldest until under the ceiling
+        const o = lru.keys().next().value;
+        used -= lru.get(o); lru.delete(o); ev++;
+      }
+    }
+  }
+  return { h: hit / (hit + miss), g: dl / 1073741824, e: ev };
+}
+
+const seeds = [1,2,3,4,5,6,7,8,9,10];
+for (const s of [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.2]) {
+  const agg = (m) => {
+    let h = 0, g = 0, e = 0;
+    for (const sd of seeds) { const r = run(m, s, sd); h += r.h; g += r.g; e += r.e; }
+    return { h: h / seeds.length, g: g / seeds.length, e: e / seeds.length };
+  };
+  const a = agg("url"), b = agg("stable");
+  console.log(
+    `s=${s}\tURL ${(a.h*100).toFixed(1)}% ${a.g.toFixed(2)}GB\tstable ${(b.h*100).toFixed(1)}% ${b.g.toFixed(2)}GB\tsaved ${((1-b.g/a.g)*100).toFixed(1)}%`
+  );
+}
+```
+
+These are simulated figures, not device measurements. Swap in your own `CATALOG`, `VIEWS` and `CAP`, then fit the exponent: take the share of total views your top N images absorb, and read back the `s` that produces the same share from the table above. That number, not mine, tells you whether the work pays for itself.
 
 ## The re-fetch path when a signature has expired
 
@@ -243,31 +385,34 @@ export async function fetchWithResign(
 
 Capping the retry at one matters because a misconfigured key returns 403 permanently. Without the cap you retry forever and the only thing that grows is your bill. Persistent 403s usually trace back to bucket policy rather than to expiry; [Supabase Storage Returns 403 After Image Upload](/en/articles/rork-dev/rork-supabase-storage-403-image-url-fix) walks through that diagnosis.
 
-## Three things that bit me
+## Four things that bit me
 
-**Query order splits the key.** Depending on the CDN or SDK, you will see both `?w=1080&fm=webp` and `?fm=webp&w=1080`. Concatenating `URLSearchParams` in enumeration order gives one image two keys. Fixing the order to the `VARIANT_PARAMS` array is what prevents that.
+**Pitfall 1 — query order splits the key.** Depending on the CDN or SDK, you will see both `?w=1080&fm=webp` and `?fm=webp&w=1080`. Concatenating `URLSearchParams` in enumeration order gives one image two keys. Fixing the order to the `VARIANT_PARAMS` array is what prevents that.
 
-**Case and trailing slashes.** Anywhere a path is assembled by hand, `/Wallpapers/` and `/wallpapers/` eventually coexist. Either normalize before deriving, or make it structurally impossible by generating paths in exactly one place. I moved path construction into a single catalog-layer function and banned string concatenation in components.
+**Pitfall 2 — case and trailing slashes.** Anywhere a path is assembled by hand, `/Wallpapers/` and `/wallpapers/` eventually coexist. Either normalize before deriving, or make it structurally impossible by generating paths in exactly one place. I moved path construction into a single catalog-layer function and banned string concatenation in components.
 
-**Switching key schemes spikes bandwidth once.** Everything cached under the old scheme becomes a miss. Ship that on release day with no staging and it registers as a bandwidth incident. Hold it at 5% rollout for a day and watch both disk usage and transfer before widening.
+**Pitfall 3 — an undefined `uri` blocks the read, even with a valid key.** This one is specific to signed URLs. If you fetch the signature in a `useEffect`, then before it resolves — or after it fails offline — your `uri` is `undefined`. The `cacheKey` is right there, so the cached bytes ought to render. They do not. A minimal reproduction of exactly this setup is filed as [expo/expo issue #40442](https://github.com/expo/expo/issues/40442), along with the workaround: pass an empty string `""` instead of `undefined` and it loads. It fails on the offline first paint, which is the worst place to discover it, so the component above uses `signedUrl ?? ""`.
+
+**Pitfall 4 — changing key schemes spikes bandwidth once.** Everything cached under the old scheme becomes a miss. Ship that on release day with no staging and it registers as a bandwidth incident. Hold it at 5% rollout for a day and watch both disk usage and transfer before widening. The `v1:` prefix on the key exists partly so you can trigger that reset deliberately rather than by accident.
 
 ## Deciding whether this is worth it
 
-This is not a change everyone should make. Three conditions decide it.
+This is not a change everyone should make. Four conditions decide it.
 
 <table>
   <thead>
-    <tr><th>Condition</th><th>Value of a custom key</th><th>Why</th></tr>
+    <tr><th>Condition</th><th>Worth the work?</th><th>Why</th></tr>
   </thead>
   <tbody>
     <tr><td>Signature TTL is shorter than a typical session</td><td>High</td><td>Keys split even within one session</td></tr>
     <tr><td>Users revisit the same images across sessions</td><td>High</td><td>Recovered hit rate translates directly</td></tr>
+    <tr><td>Weak popularity skew (exponent under 1.0)</td><td>High</td><td>The default key cannot reach a 40% hit rate</td></tr>
     <tr><td>Images are viewed once (generated per request)</td><td>Low</td><td>The cache has no work to do</td></tr>
     <tr><td>Public bucket, no signing</td><td>None</td><td>The default key is already stable</td></tr>
   </tbody>
 </table>
 
-For a solo project the added code lands under 100 lines. But owning the key means owning invalidation, migration, and recovery from corruption too. Build the escape hatch in from the start: I prefix the canonical string with `v1:` before hashing. On the day I want to change schemes, one character becomes `v2:` and every entry regenerates itself.
+If all you do is pass `source.cacheKey`, the addition is the twenty-line normalizer and nothing else. Take over the reads and writes and you take over invalidation, migration, and recovery from corruption too — worth weighing before you start. Either way, build the escape hatch into the key from day one. On the day you want to change schemes, one character becomes `v2:` and every entry regenerates itself.
 
 Format selection and decode cost live in the same layer, so reading [Half the Bytes, the Same Wait](/en/articles/rork-dev/rork-image-format-avif-webp-decode-cost-cdn-negotiation) alongside this makes it easier to sequence which layer to touch first.
 
@@ -275,4 +420,4 @@ Format selection and decode cost live in the same layer, so reading [Half the By
 
 Start by logging two sessions' worth of signed URLs for the same image and putting them side by side. A minute of reading tells you exactly which components move. Once you can see that, what belongs in the key stops being a design question.
 
-Cache work is invisible when it succeeds. Watching a bandwidth graph settle back down is a quiet kind of satisfaction, and I will take it.
+Cache work is invisible when it succeeds, and watching a bandwidth graph settle back down is a quiet kind of satisfaction. Re-measuring my own article and finding the exponent wrong was rather less comfortable — but I would rather be uncomfortable here than send you off with a parameter that does not hold.
