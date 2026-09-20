@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "SDK58 — Expo SDK 58 のベータが始まりました。iOS 27 の UIScene ライフサイクルを採用し、Android のリリースビルドでは R8 が既定で有効になります",
-    "SWIFT — Rork では Expo プロジェクトを新しく作れなくなりました。新規は Swift・Kotlin・React の3択で、既存のプロジェクトはこれまでどおり動きます",
-    "11/01 — Google Play の対象 API レベル、延長を申請した方の配信期限まで残り42日です。過ぎると新しい端末の新規利用者に表示されなくなります",
-    "EXPOGO — Expo Go で QR を読んでも開かない、という声が出ています。9月3日から iOS 版はターミナル側とアプリ側の両方でログインが要ります",
-    "NEW — prebuild が Swift の AppDelegate を求めて止まったときに、どこを直したかの記録です",
-    "XCODE27 — いま Xcode 27 が要るわけではありません。EAS Build の latest イメージは現在も 26.6 で、27 のイメージは準備中です",
+    "SDK58 — Expo SDK 58 のベータは3〜4週間と案内されています。安定版は React Native 0.88 が出たあと、とだけ書かれており、日付は公表されていません",
+    "0.88RC1 — その React Native 0.88 は9月16日に rc.1 まで進みました。SDK 58 は 0.86 から 0.88 へ一気に上がるため、0.87 の片づけも同時に踏みます",
+    "9/30 — Google Play のデベロッパー確認と Play Console 登録が未了のアプリは、9月30日以降の削除対象です。残り9日で、個人名義で出している方も対象になります",
+    "KEYWINDOW — 依存の自動更新でクライアントパッケージだけ先に上がると、CI は通るのに iOS の本番ビルドだけが落ちる、という報告が出ています",
+    "NEW — Expo Go がプレビューを開かなくなった日に、最初に見るところ",
+    "RNREPO — React Native のリポジトリが facebook/react-native から react/react-native へ移りました。リンクやスクリプトの参照先を確かめておきたいところです",
   ],
   en: [
-    "SDK58 — The Expo SDK 58 beta is open. It adopts the iOS 27 UIScene lifecycle, and R8 is now on by default for Android release builds",
-    "SWIFT — Rork no longer creates new Expo projects. New apps are Swift, Kotlin or React, and existing Expo projects keep building as before",
-    "11/01 — Forty-two days remain for anyone who filed an extension on Google Play's target API level. Miss it and new users on newer devices stop seeing the app",
-    "EXPOGO — Scanning the QR code in Expo Go stopped working for some people. Since September 3, iOS requires you to be signed in on both the terminal and the app",
-    "NEW — What I changed when prebuild stopped and asked for the standard Swift AppDelegate",
-    "XCODE27 — Xcode 27 is not required yet. The latest EAS Build image is still 26.6, and the 27 image is listed as coming soon",
+    "SDK58 — The Expo SDK 58 beta is described as three to four weeks. Stable lands after React Native 0.88 ships, and no date has been published",
+    "0.88RC1 — React Native 0.88 reached rc.1 on September 16. SDK 58 jumps from 0.86 straight to 0.88, so you take the 0.87 cleanup at the same time",
+    "9/30 — Apps without completed Google Play developer verification and Play Console registration are subject to removal from September 30, nine days away. Solo publishers are included",
+    "KEYWINDOW — When automated dependency updates bump only the client packages, CI stays green and the production iOS build is the thing that fails",
+    "NEW — Expo Go stopped opening your preview. Here is the first thing to check",
+    "RNREPO — The React Native repository moved from facebook/react-native to react/react-native. Worth checking any links or scripts that point at the old path",
   ],
 };
 
