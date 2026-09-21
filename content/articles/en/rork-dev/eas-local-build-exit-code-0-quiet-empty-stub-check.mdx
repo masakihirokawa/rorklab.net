@@ -1,0 +1,166 @@
+---
+title: "A build that stops with exit code 0 — the flag that silenced the log, and the check that let an empty file through"
+slug: "eas-local-build-exit-code-0-quiet-empty-stub-check"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-09-21T14:30"
+author: "Rork Lab"
+description: "Two reports landed in the same week: eas build --local stopping with exit code 0 but produced no further output, and a zero-byte stub that never got embedded. Both came down to settings that reduce output. Here is how to audit your own scripts."
+tags: ["Rork", "Expo", "EAS Build", "xcodebuild", "Troubleshooting", "iOS"]
+---
+
+If you export a Rork project to GitHub and move the build onto your own Mac, there is a particular kind of failure waiting for you. The last line in the terminal reads like this, and nothing follows it.
+
+```
+error: the following command failed with exit code 0 but produced no further output
+```
+
+I sat and looked at that line for a while. Zero has meant success for as long as I have used a shell. Seeing it next to the word *error* leaves you unsure which half of the sentence to believe.
+
+In the same week a second report showed up. That one builds fine, installs fine, and then dies the instant the app opens on a device. Neither had anything to do with application code. Both came from a small setting made somewhere in the build path.
+
+## Exit code 0 is not "it worked" — it is "I had nothing to say"
+
+The first report comes from a stable setup: Expo SDK 57 with React Native 0.86, running `eas build --platform ios --local` under Xcode 27. It stops while assembling the `expo-modules-jsi` xcframework, leaving only the line above ([expo/expo#50311](https://github.com/expo/expo/issues/50311)).
+
+What the reporter found was that `xcodebuild` was being invoked with `-quiet` at that step. The flag is meant to suppress warnings and progress noise, but what it suppresses also includes the actual error output. From the outside, the child process looks like it finished without saying anything — hence that strange phrasing about a command that failed yet produced no further output.
+
+Dropping `-quiet` brought the swallowed lines back, and after the fix the build made it all the way through submission to App Store Connect.
+
+So the order of suspicion matters more than anything else here. **Before you suspect your code, check whether something in that step is reducing output.** Reverse the order and you can spend half a day hunting a bug that was never there.
+
+When you reproduce it locally, keep the quiet output but give it somewhere to land.
+
+```bash
+# Drop -quiet only while reproducing, and send the output to a file instead of nowhere
+set -o pipefail   # so tee does not swallow xcodebuild's exit status
+
+xcodebuild \
+  -project ios/YourApp.xcodeproj \
+  -scheme YourApp \
+  -configuration Release \
+  -destination 'generic/platform=iOS' \
+  build 2>&1 | tee "build-$(date +%Y%m%d-%H%M%S).log"
+
+echo "exit=${PIPESTATUS[0]}"   # read xcodebuild's status, not tee's
+```
+
+Without `set -o pipefail` and `${PIPESTATUS[0]}`, the status you end up testing belongs to `tee`. Which means a failed build reports zero. You would be building the same trap the original report fell into, by hand.
+
+## The second silence was a check that counted a zero-byte file as present
+
+The second report is an app built through EAS for a physical device that crashes in dyld the moment it launches ([expo/expo#50236](https://github.com/expo/expo/issues/50236)). The log shows this.
+
+```
+Library not loaded: @rpath/ExpoModulesJSI.framework/ExpoModulesJSI
+```
+
+After three rounds of digging, the reporter traced it to the official build script `create-stub-xcframework.sh`, which checks whether the stub has already been produced using `-f`.
+
+`-f` only asks whether a regular file exists. An empty one still counts. If an earlier build died partway and left a zero-byte file behind, the script decides the work is done, skips rebuilding, and the Embed Frameworks phase passes something with no substance inside it. The app assembles cleanly and fails on launch.
+
+The fix was to change the test to `-s`.
+
+```bash
+# Before: present is good enough (a zero-byte file passes)
+if [ -f "$STUB_PATH" ]; then
+  echo "stub already built"; exit 0
+fi
+
+# After: present AND non-empty
+if [ -s "$STUB_PATH" ]; then
+  echo "stub already built ($(wc -c < "$STUB_PATH") bytes)"; exit 0
+fi
+
+# Safer still: clear the broken leftover before deciding anything
+if [ -f "$STUB_PATH" ] && [ ! -s "$STUB_PATH" ]; then
+  echo "found a zero-byte stub, removing it"
+  rm -f "$STUB_PATH"
+fi
+```
+
+One character apart, and completely different in meaning. Here are the tests worth keeping straight.
+
+<table>
+  <thead>
+    <tr><th>Test</th><th>True when</th><th>For build artifacts</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>-e</code></td><td>Something exists at the path (directories too)</td><td>Far too weak for output checks</td></tr>
+    <tr><td><code>-f</code></td><td>A regular file exists (zero bytes still passes)</td><td>Lets leftovers from an aborted run through</td></tr>
+    <tr><td><code>-s</code></td><td>Exists and has a size greater than zero</td><td>Where cache checks should start</td></tr>
+    <tr><td><code>-d</code></td><td>A directory exists</td><td>Use this for <code>.xcframework</code> and <code>.app</code></td></tr>
+  </tbody>
+</table>
+
+A `.xcframework` or `.app` is a directory, so `-s` cannot measure it. Name the binary inside and check that instead.
+
+```bash
+# .xcframework is a directory, so look at the binary inside it
+FW="build/ExpoModulesJSI.xcframework"
+BIN=$(find "$FW" -name 'ExpoModulesJSI' -type f -size +0 2>/dev/null | head -1)
+
+if [ -z "$BIN" ]; then
+  echo "xcframework is present but empty — rebuilding" >&2
+  rm -rf "$FW"
+else
+  echo "ok: $BIN ($(wc -c < "$BIN") bytes)"
+fi
+```
+
+One more thing both issues share: a bot closed them automatically for insufficient reproduction steps, even though the steps and the root cause are written out in the body. I am citing the numbers here so that anyone searching the same symptom does not read "closed" as "solved".
+
+## A ten-minute audit of your own scripts
+
+As an indie developer with several apps to keep shipping, I reach a point in every project where the wall of build output becomes tiresome and I add a `-q` or a `2>/dev/null`. It feels like an improvement that day. Six months later it comes back as a failure with no visible cause. I have done this to my own release scripts more than once.
+
+This is the order I work through now.
+
+1. Count the places where output is being reduced.
+
+```bash
+grep -rnE -- '-quiet|(^| )-q( |$)|2>\s*/dev/null|&>\s*/dev/null|> */dev/null' \
+  scripts/ ios/ .github/ 2>/dev/null
+```
+
+2. Of those, keep only the ones attached to **commands that can fail**. Silencing `echo` or `which` costs nothing. Silencing `xcodebuild`, `pod install`, `gradle` or `codesign` removes the only diagnostic you will get.
+
+3. Sweep the existence checks on build outputs.
+
+```bash
+grep -rnE '\[ +-f +"?\$' scripts/ ios/ 2>/dev/null
+```
+
+4. For the silence you want to keep, build an escape hatch. Skip the screen, never skip the file.
+
+```bash
+LOG="/tmp/ios-build-$(date +%s).log"
+if ! xcodebuild -quiet ... build > "$LOG" 2>&1; then
+  echo "build failed. last 40 lines:" >&2
+  tail -40 "$LOG" >&2          # quiet by default, loud on failure
+  exit 1
+fi
+```
+
+5. Finally, look for zero-byte files sitting in your output directory.
+
+```bash
+find ios/build -type f -size 0 2>/dev/null
+```
+
+The value of these five steps is highest on a day when the build is working. Run them after something breaks and you no longer know which part used to be fine. If you want to double-check that the dependency versions themselves match what you assume, I wrote about that in [Nine Expo patches in thirty days — finding out which one your app actually has](/en/articles/rork-basics/expo-patch-cadence-which-version-your-app-actually-has), and the related assumption about what gets uploaded is covered in [Adding .easignore means .gitignore is no longer read](/en/articles/rork-dev/easignore-replaces-gitignore-eas-build-upload-scope).
+
+## If you reduce output, give it one place to land
+
+Reading the two reports side by side, what struck me is that nobody did anything wrong. `-quiet` is a reasonable way to shorten a log. `-f` is the plain way to ask whether a file exists. The trouble came from one thing only: **the information that was removed had nowhere to go.**
+
+For a long time I treated a shorter log as an improvement in itself. That did not serve me well. Every line I removed was a line I did not have on the day something failed. I keep one rule now.
+
+**You may silence only the places that can speak again when they fail.**
+
+This is not specific to projects exported from Rork. On the way to the store, your logs move between your Mac, CI and EAS, and each move is a chance for them to land nowhere. Decide where they land each time.
+
+Before your next build, open one line where you call `xcodebuild` and check only this: where does its output go when the command fails? If the answer is `/dev/null`, changing that to a file under `/tmp` is enough to start with. That is where I started, too.
+
+If you find a silenced step I did not think of, I would be glad to hear about it — I am still filling in the gaps in my own scripts.
