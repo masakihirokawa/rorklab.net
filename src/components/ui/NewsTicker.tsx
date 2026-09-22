@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "R8 — Expo SDK 58 から、Android のリリースビルドで R8 が既定で有効になります。同じコードで前後を測っておくと、縮んだ分と壊れた箇所が見えます",
-    "XCODE26.6 — EAS Build の Xcode 27 イメージはまだ準備中で、latest はいまも Xcode 26.6 です。手元の Xcode を 27 に上げているかどうかで、踏む不具合が変わります",
-    "11/01 — Google Play の target API level の延長申請は11月1日までです。残り40日。新規と更新は API 36 以上、既存アプリは API 35 以上が要ります",
-    "FETCH — expo/fetch が iOS では応答を返さないまま止まり、Android では切り詰めた本文を 200 のまま返すという報告です。例外が飛ばないため、タイムアウトは自分で被せる形になります",
-    "NEW — exit code 0 で止まるビルド — ログを黙らせていた設定と、空ファイルを通した存在チェック",
-    "SCENE — SDK 57 のまま Xcode 27 で起動させるための opt-in が expo@57.0.23 に入りました。expo-build-properties の ios.enableSceneSupport で有効にします",
+    "SDK58BETA — Expo SDK 58 はベータ期間の最中です。公式が言っているのは「3〜4週間」だけで、安定版の日付は一次情報に出ていません。日付を決め打ちしない方が安全です",
+    "RN0.88RC1 — React Native 0.88 は9月16日の rc.1 まで来ました。正式リリース予定は10月12日で、SDK 58 の型まわりの変化はこれと対になっています",
+    "11/01 — Google Play の対象 API レベル、延長申請組の配信期限は11月1日です。残り39日で、延長は Play Console のポリシー ステータスから一度だけ申請できます",
+    "AUDIO — expo-audio が一定回数の再生のあと止まり、status.didJustFinish が来なくなるという報告です。例外は飛ばず、次が鳴らないだけですので気づきにくい形です",
+    "NEW — 1つの Checkout に4種類の商品を載せたあとの分岐設計",
+    "LSAQS — lsapplicationqueriesschemes は検索での表示が22件あってクリックが0です。このサイトで最も大きい実装系の需要が、まだ誰にも答えられていません",
   ],
   en: [
-    "R8 — From Expo SDK 58, R8 is enabled by default for Android release builds. Measuring the same code before and after shows both what shrank and what broke",
-    "XCODE26.6 — The Xcode 27 image for EAS Build is still coming soon, and latest is still Xcode 26.6. Which bugs you hit depends on whether your local Xcode is already on 27",
-    "11/01 — Extension requests for the Google Play target API level close on November 1, forty days away. New and updated apps need API 36 or higher, existing apps API 35 or higher",
-    "FETCH — expo/fetch is reported to hang without settling on iOS, while Android resolves a truncated body as a plain 200. Nothing throws, so the timeout has to be yours",
-    "NEW — A build that stops at exit code 0: the flag that silenced the logs, and the check that let an empty file through",
-    "SCENE — expo@57.0.23 added an opt-in for launching under Xcode 27 while staying on SDK 57. Enable ios.enableSceneSupport through expo-build-properties",
+    "SDK58BETA — Expo SDK 58 is still in beta. The only thing stated officially is \"three to four weeks\", and no stable date appears in any primary source, so it is safer not to plan around one",
+    "RN0.88RC1 — React Native 0.88 reached rc.1 on September 16, with the stable release expected October 12. The type-level changes arriving in SDK 58 are the other half of that story",
+    "11/01 — For anyone who filed a Google Play target API level extension, the delivery deadline is November 1, thirty-nine days away. The extension can be requested once, from Policy status in Play Console",
+    "AUDIO — expo-audio is reported to stop after a certain number of playbacks, with status.didJustFinish never arriving. Nothing throws; the next sound simply never starts, which makes it easy to miss",
+    "NEW — Designing the branch after one Checkout carries four different products",
+    "LSAQS — lsapplicationqueriesschemes shows up 22 times in search with zero clicks. The largest implementation-side demand this site sees still has no answer anywhere on it",
   ],
 };
 
