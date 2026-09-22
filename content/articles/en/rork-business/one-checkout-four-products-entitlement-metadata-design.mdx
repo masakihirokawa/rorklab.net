@@ -1,0 +1,247 @@
+---
+title: "A successful payment never tells you what to unlock. Routing four products through one Checkout"
+slug: "one-checkout-four-products-entitlement-metadata-design"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-09-22T11:00"
+author: "Rork Lab"
+description: "Tips, single articles, monthly plans and lifetime access all came back from Stripe looking identical. Here is how I moved entitlement off the amount and onto metadata, and why I now fail closed when the entitlement store goes quiet."
+tags: ["Stripe", "Monetization", "Entitlements", "Cloudflare Workers", "Billing"]
+highlights:
+  - "You'll be able to rewrite a Stripe Checkout flow that turns payment success straight into access, so that entitlement comes from metadata instead of the amount"
+  - "You'll be able to catch the case where a small tip or a single-article purchase silently unlocks a higher plan, before it reaches production"
+  - "You'll be able to decide which way to fail when your entitlement store is briefly unreachable, instead of writing let them through and moving on"
+---
+
+I was rereading the post-payment handler late one evening, about to add a fourth product. What I found was a single straight line: if the payment completed, write a membership record.
+
+Back when there was exactly one product, that line was correct. Adding a tip, then a monthly plan, then a single-article purchase put the same line in danger three separate times.
+
+The thing worth saying first is that a successful payment only tells you that money moved. Who may see what is something you decide when you create the session, not something the payment processor hands back.
+
+**The amount answers "did they pay". The declaration made at creation time answers "what may they open".** Keeping those two out of the same `if` is the one rule I try not to bend.
+
+## Every product I added changed what success meant
+
+The site I run has four payments with quite different personalities: a small tip, a single-article purchase, a monthly plan, and a one-time lifetime unlock.
+
+They all enter through one Checkout endpoint. Keeping one entrance means the return URL, the locale and the cancel path are handled in a single place.
+
+The exit was the problem. All four come back with `payment_status: paid`, so from the receiving side they wear the same face.
+
+<table>
+<thead>
+<tr><th>Product</th><th>mode</th><th>What it grants</th><th>Retention</th></tr>
+</thead>
+<tbody>
+<tr><td>Tip ($1.50)</td><td>payment</td><td><strong>Nothing at all</strong></td><td>—</td></tr>
+<tr><td>Single article ($1.50)</td><td>payment</td><td>That one slug</td><td>10 years</td></tr>
+<tr><td>Pro ($5/mo)</td><td>subscription</td><td>Membership</td><td>31 days, renewed</td></tr>
+<tr><td>Lifetime ($15)</td><td>payment</td><td>Membership</td><td>10 years</td></tr>
+</tbody>
+</table>
+
+The first row is the easiest one to get wrong. Nobody sets out to write code where a $1.50 thank-you buys lifetime access. It happens because one older line still says "paid, therefore member".
+
+## Keep "they paid" and "they may open this" in separate fields
+
+The temptation to branch on the amount deserves an honest answer, because $1.50 and $15 really are easy to tell apart.
+
+Amounts move, though, and they move for reasons that have nothing to do with access. The day I added a thank-you price, the day I lowered the single-article price, and the day the same product appeared in a second currency, an amount-based table would have needed rewriting each time.
+
+A declared type does not move. "This is a tip" means the same thing after a price change and in any currency.
+
+So the type is fixed at creation and carried out past the payment layer. With Stripe that container is the Checkout Session's `metadata` field, described in [the Checkout Session API reference](https://docs.stripe.com/api/checkout/sessions/create).
+
+## Decide plan_type on the creating side
+
+At the endpoint you only have a price ID. That is the moment to collapse it into one type, so everything downstream reads a single field.
+
+```ts
+// app/api/checkout/route.ts — the type is decided here, once
+const TIP_PRICE_IDS = new Set(["price_tip_usd", "price_tip_jpy"]);
+
+// Keep retired IDs. Older sessions come back carrying the price they were created with
+const ARTICLE_PRICE_IDS = new Set([
+  "price_article_usd_150", // current
+  "price_article_jpy_200",
+  "price_article_usd_175", // retired; dropping it breaks historical lookups
+  "price_article_jpy_250",
+]);
+
+function resolvePlanType(priceId: string, mode: string): PlanType {
+  if (mode === "subscription") return "pro";
+  if (TIP_PRICE_IDS.has(priceId)) return "tip";
+  if (ARTICLE_PRICE_IDS.has(priceId)) return "article";
+  return "premium"; // the default is not the narrowest option, so verify it before every release
+}
+
+const planType = resolvePlanType(priceId, mode);
+
+// A single-article purchase is meaningless without knowing which article
+if (planType === "article" && !articleSlug) {
+  return NextResponse.json(
+    { error: "articleSlug is required for article purchases" },
+    { status: 400 },
+  );
+}
+
+const session = await stripe.checkout.sessions.create({
+  mode,
+  line_items: [{ price: priceId, quantity: 1 }],
+  metadata: {
+    plan_type: planType,
+    ...(articleSlug && { article_slug: articleSlug }),
+    ...(returnUrl && { return_url: returnUrl }),
+  },
+  success_url: `${baseUrl}/api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
+  cancel_url: cancelUrl ?? `${baseUrl}/${locale === "en" ? "en/" : ""}support`,
+});
+```
+
+Defaulting to `premium` is a choice I'd rather explain than hide. My assumption is that an unrecognised price ID belongs to a one-time product I created myself.
+
+The cost of that assumption is real: forget to add a new price to the right Set and the higher entitlement opens. I pay for it with the pre-release check described further down.
+
+Rejecting a missing `articleSlug` with a 400 exists to prevent the state that is hardest to apologise for, where someone has paid and nothing opens. Stopping before the payment starts is simply kinder.
+
+## The receiving side never looks at the amount
+
+The handler's job is not to re-derive the price. It is to follow the declared type and pick where to write.
+
+```ts
+// app/api/verify-session/route.ts — read metadata, nothing else
+const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+if (session.payment_status !== "paid" && session.status !== "complete") {
+  return redirectWithError("payment");
+}
+
+const planType = session.metadata?.plan_type;
+
+// Tip: say thank you, create no entitlement whatsoever
+if (planType === "tip") {
+  return redirectToThanks(session.metadata?.return_url, "tip");
+}
+
+if (planType === "article") {
+  return grantArticleAccess(session); // next section
+}
+
+// Membership: only the retention differs between monthly and lifetime
+const email = session.customer_details?.email?.trim().toLowerCase();
+if (!email) return redirectWithError("email");
+
+const type = session.mode === "subscription" ? "pro" : "premium";
+const ttlSeconds = type === "premium" ? 10 * 365 * 24 * 3600 : 31 * 24 * 3600;
+await kv.put(`site:rorklab:${email}`, JSON.stringify({ type, session_id: sessionId }), {
+  expirationTtl: ttlSeconds,
+});
+```
+
+I sat down with paper to trace where an unknown `planType` lands. In the code above it falls through to the membership branch, so a product shipped without metadata becomes a hole.
+
+My fix was to pin "all four types carry `metadata.plan_type`" with a test on the creating side, and let the receiving side trust the declaration. When both sides guess independently, neither one is authoritative.
+
+Splitting only the retention between monthly and lifetime keeps expiry logic in one place. Monthly lapses on its own after 31 days and is rewritten on renewal; lifetime is held as a long expiry rather than as something genuinely unbounded.
+
+## Only the single-article purchase carries "which one"
+
+For membership, knowing who is enough. For a single article you need who and which, so the shape of the data differs here alone.
+
+```ts
+// Single article: one KV record each, plus an accumulating slug list in a cookie
+const ARTICLE_TTL = 10 * 365 * 24 * 3600;
+const email = session.customer_details?.email?.trim().toLowerCase();
+const slug = session.metadata?.article_slug;
+
+if (kv && email && slug) {
+  await kv.put(
+    `site:rorklab:article:${email}:${slug}`,
+    JSON.stringify({ type: "article", slug, purchased_at: new Date().toISOString() }),
+    { expirationTtl: ARTICLE_TTL },
+  );
+}
+
+// Append, never overwrite: buying a second article must not drop the first
+let slugs: string[] = [];
+const existing = request.cookies.get("article_purchases")?.value;
+if (existing) {
+  try {
+    const decoded = atob(existing);
+    if (decoded.startsWith("{")) slugs = JSON.parse(decoded).slugs ?? [];
+  } catch {
+    slugs = []; // a malformed cookie is rebuilt, not parsed harder
+  }
+}
+if (!slugs.includes(slug)) slugs.push(slug);
+
+response.cookies.set("article_purchases", btoa(JSON.stringify({ email, slugs })), {
+  httpOnly: true, secure: true, sameSite: "lax", maxAge: ARTICLE_TTL, path: "/",
+});
+```
+
+Appending matters because losing the first purchase when the second arrives is the least recoverable failure of the set. From the reader's chair it simply looks like the article they just bought has closed again.
+
+Old cookie formats are rebuilt silently rather than throwing, since an exception here would take down the redirect that happens immediately after payment.
+
+Holding the grant in both KV and a cookie looks redundant, but the two do different jobs. The cookie lets this device through right away; KV lets the same person recover on another device.
+
+## What I decided the night the entitlement store went quiet
+
+This is where my instinct was wrong. When the entitlement store was briefly unreachable, my first version read: cannot check, therefore show it.
+
+As an availability choice that looks perfectly reasonable, and I did not want to lock readers out over an outage on my side.
+
+That single line quietly disables the paywall, though. While the store is down, every paid article opens for everyone, and although you can see the outage itself, you cannot count afterwards what was handed out.
+
+```ts
+// Which way to fail when the entitlement store cannot be read
+async function canViewArticle(email: string | null, slug: string): Promise<boolean> {
+  if (!email) return false;
+
+  try {
+    const kv = getPremiumAccessKV(); // acquiring the binding can fail too
+    if (!kv) return false;           // no binding means deny
+    const member = await kv.get(`site:rorklab:${email}`);
+    if (member) return true;
+    const single = await kv.get(`site:rorklab:article:${email}:${slug}`);
+    return Boolean(single);
+  } catch {
+    return false; // closed on a bad day recovers faster than wide open
+  }
+}
+```
+
+I now fail closed. What was opened by mistake cannot be taken back, while what was closed by mistake can be restored by hand when someone writes in. As an indie developer I would rather choose the recoverable failure.
+
+The same reasoning showed up around revocation in [the four triggers that make IAP disappear under Family Sharing](/en/articles/rork-dev/rork-family-sharing-iap-ask-to-buy-implementation-guide). Entitlements behave better when you hold them as "can I verify this right now" rather than "does this exist".
+
+## On the day I changed a price, an amount-based check would have broken
+
+Lowering the single-article price meant adding one line to a Set of price IDs. The type resolution, the entitlement write and the article-side rendering all stayed untouched.
+
+Branching on the amount would have meant editing the creating side, the receiving side and the rendering side at once. Worse, historical sessions still come back with the retired price, so the old row can never be deleted.
+
+One caveat worth writing down: keeping retired IDs means the Set grows forever. My rule is simply to mark each line as current or retired in a comment, so a future cleanup can tell at a glance which rows are safe to drop.
+
+If you are heading towards usage-based pricing, carrying a declaration matters even more, because a variable unit price makes back-calculating from the amount impossible. I sketched that entry point in [implementing usage-based billing with Stripe Meter](/en/articles/rork-dev/rork-stripe-meter-billing-usage-based-pricing).
+
+## The three checks I run before shipping
+
+Without a written procedure, the step gets skipped on exactly the day a new product ships. These are the three I actually run.
+
+1. **Pin, in a test, that all four types produce a non-empty `metadata.plan_type`.** Calling `resolvePlanType` four ways and comparing the results is enough.
+2. **Put a real test-mode tip through, then open a members-only page.** Watch it stay closed. I keep this manual because "nothing happens" is a state you can forget to assert and still see green.
+3. **Unbind the entitlement store and open a paid article.** The paywall should appear; if the body renders, the fail-closed path is missing.
+
+The third one needs nothing more than emptying one environment variable locally. Waiting for a real outage is not a plan when you work alone, so I break it on purpose instead.
+
+If you are still deciding what to sell rather than how to gate it, [the revenue model comparison for Rork apps](/en/articles/rork-business/rork-app-revenue-model-comparison-ads-subscription-onetime) gives a better sense of how many branches you will end up needing.
+
+## The file to open first tomorrow
+
+Open your post-payment handler and look near the line that reads `payment_status`. If there is no line beside it that reads a declared type, that is where the amount and the entitlement are sharing one `if`.
+
+That is the line I started with too. Thank you for reading.

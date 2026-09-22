@@ -1,0 +1,247 @@
+---
+title: "決済が成功しても、渡してよい権限は決まりません。1つの Checkout に4種類の商品を載せたあとの分岐設計"
+slug: "one-checkout-four-products-entitlement-metadata-design"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-09-22T11:00"
+author: "Rork Lab"
+description: "チップ・記事単体・月額・買い切りの4商品を1つの Checkout に通したところ、決済成功をそのまま権限に変える実装が三度危うくなりました。金額ではなく metadata で分岐させ、権限ストアが読めない日は拒否側へ倒すまでの運用記録です。"
+tags: ["Stripe", "課金設計", "権限管理", "Cloudflare Workers", "収益化"]
+highlights:
+  - "Stripe Checkout の成功をそのまま権限に変えている実装を、金額ではなく metadata で分岐する形へ自分の手で書き換えられるようになります"
+  - "チップや記事単体の支払いで上位プランが開いてしまう事故を、本番に出す前に自分のコードから見つけられるようになります"
+  - "権限ストアが一時的に読めない場面で「とりあえず見せる」と書いてしまう前に、どちらへ倒すかを自分の基準で決められるようになります"
+---
+
+4つ目の商品を足そうとして、決済後の処理を読み返した夜のことでした。そこには、支払いが完了したら会員権を書き込む、という一本道が書いてありました。
+
+商品が1種類しかなかったころは、それで正しかったのです。チップを足し、月額を足し、記事の単体購入を足す段になって、同じ一本道が三度も危うくなりました。
+
+最初にお伝えしたいのは、決済の成功が教えてくれるのは「お金が動いた」という事実だけ、という一点です。誰に何を開けてよいかは、決済側ではなく、こちらが発行のときに決めておくものでした。
+
+**支払いの成否は金額が答え、権限の範囲は発行時の宣言が答えます。** この二つを同じ if 文に押し込まないことだけ、いまは崩さないようにしております。
+
+## 1つ足すたびに、成功の意味が変わりました
+
+私が運用しているサイトには、性格の違う支払いが4つ並んでおります。少額のチップ、記事1本の単体購入、月額のプラン、そして買い切りの永久アクセスです。
+
+入口は1つの Checkout エンドポイントにまとめてあります。まとめたほうが、成功後の戻り先・言語・キャンセル先の扱いを一箇所で揃えられるからです。
+
+問題は出口のほうでした。4つとも `payment_status: paid` で戻ってきますので、受け取り側から見ると全部同じ顔をしております。
+
+<table>
+<thead>
+<tr><th>商品</th><th>mode</th><th>渡すもの</th><th>保持期間</th></tr>
+</thead>
+<tbody>
+<tr><td>チップ（¥150）</td><td>payment</td><td><strong>何も渡しません</strong></td><td>—</td></tr>
+<tr><td>記事単体（¥200）</td><td>payment</td><td>その slug だけ</td><td>10年</td></tr>
+<tr><td>Pro（¥580/月）</td><td>subscription</td><td>会員権</td><td>31日（更新で延長）</td></tr>
+<tr><td>Premium（¥2,480）</td><td>payment</td><td>会員権</td><td>10年</td></tr>
+</tbody>
+</table>
+
+この表の1行目が、いちばん間違えやすいところでした。応援していただいた¥150で永久アクセスが開いてしまう実装は、書こうと思って書くものではありません。「支払いが成功したら会員権」という一行が残っているだけで、そうなってしまうのです。
+
+## 「払われた」と「何を開ける」は、別々に持ちます
+
+金額で判定したくなる誘惑は、最初にきちんと断っておいたほうがよいと感じています。¥150 と ¥2,480 は見分けがつきますので、一見すると成立してしまうのです。
+
+ところが金額は、こちらの都合で動きます。感謝価格を用意した日、単体購入を¥250から¥200へ下げた日、そして同じ商品を別通貨で並べた日に、判定表は毎回作り直しになります。
+
+種別は動きません。「これはチップです」という宣言は、値段を変えても通貨を変えても、意味が変わらないのです。
+
+ですので、発行の時点で種別を確定し、それを決済の外側まで運ぶ形にしました。Stripe の場合は Checkout Session の `metadata` がその器になります。詳しい仕様は [Stripe の Checkout Session ドキュメント](https://docs.stripe.com/api/checkout/sessions/create) に書かれています。
+
+## 発行側で plan_type を確定させます
+
+エンドポイントに来た時点では、まだ priceId しかありません。ここで種別を1つに決めて、あとの処理はそれだけを見るようにしています。
+
+```ts
+// app/api/checkout/route.ts — 発行側で種別を確定する
+const TIP_PRICE_IDS = new Set(["price_tip_jpy", "price_tip_usd"]);
+
+// 価格改定で増えた旧 ID も残す。過去のセッションは旧 ID のまま戻ってくる
+const ARTICLE_PRICE_IDS = new Set([
+  "price_article_jpy_200", // 現行
+  "price_article_usd_150",
+  "price_article_jpy_250", // 旧価格。消すと過去分の判定が落ちる
+  "price_article_usd_175",
+]);
+
+function resolvePlanType(priceId: string, mode: string): PlanType {
+  if (mode === "subscription") return "pro";
+  if (TIP_PRICE_IDS.has(priceId)) return "tip";
+  if (ARTICLE_PRICE_IDS.has(priceId)) return "article";
+  return "premium"; // 既定は最も限定的ではない側なので、下の検算を必ず通す
+}
+
+const planType = resolvePlanType(priceId, mode);
+
+// 記事単体は「どの記事か」が無ければ成立しないので、ここで落とす
+if (planType === "article" && !articleSlug) {
+  return NextResponse.json(
+    { error: "articleSlug is required for article purchases" },
+    { status: 400 },
+  );
+}
+
+const session = await stripe.checkout.sessions.create({
+  mode,
+  line_items: [{ price: priceId, quantity: 1 }],
+  metadata: {
+    plan_type: planType,
+    ...(articleSlug && { article_slug: articleSlug }),
+    ...(returnUrl && { return_url: returnUrl }),
+  },
+  success_url: `${baseUrl}/api/verify-session?session_id={CHECKOUT_SESSION_ID}&locale=${locale}`,
+  cancel_url: cancelUrl ?? `${baseUrl}/${locale === "en" ? "en/" : ""}support`,
+});
+```
+
+`resolvePlanType` の既定値を `premium` にしている点は、正直なところ好みが分かれると思います。私は「知らない priceId が来たら、それは自分が作った買い切り商品のはずだ」という前提を置いております。
+
+そのぶん、価格を追加したのに Set へ入れ忘れると上位の権限が開いてしまいます。ここは後述する公開前の検算で毎回潰すようにしました。
+
+記事単体の `articleSlug` を 400 で落としているのは、ここを通してしまうと「支払い済みだが何も開かない」という、いちばん謝りにくい状態が生まれるためです。決済が始まる前に止めるほうが、はるかに丁寧なのです。
+
+## 受け取り側は金額を見ません
+
+戻ってきた側の仕事は、金額の再確認ではありません。宣言された種別に従って、書き込む先を選ぶことだけです。
+
+```ts
+// app/api/verify-session/route.ts — 受け取り側は metadata だけを見る
+const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+if (session.payment_status !== "paid" && session.status !== "complete") {
+  return redirectWithError("payment");
+}
+
+const planType = session.metadata?.plan_type;
+
+// チップ: 感謝だけを返し、権限は一切作らない
+if (planType === "tip") {
+  return redirectToThanks(session.metadata?.return_url, "tip");
+}
+
+if (planType === "article") {
+  return grantArticleAccess(session); // 次節
+}
+
+// 会員: subscription かどうかで保持期間だけが変わる
+const email = session.customer_details?.email?.trim().toLowerCase();
+if (!email) return redirectWithError("email");
+
+const type = session.mode === "subscription" ? "pro" : "premium";
+const ttlSeconds = type === "premium" ? 10 * 365 * 24 * 3600 : 31 * 24 * 3600;
+await kv.put(`site:rorklab:${email}`, JSON.stringify({ type, session_id: sessionId }), {
+  expirationTtl: ttlSeconds,
+});
+```
+
+`planType` が未知の値だった場合にどこへ落ちるかは、一度紙に書いて確かめました。上のコードでは会員側へ流れますので、`metadata` を書き忘れた商品を足すと、そこが穴になります。
+
+私は発行側のテストで「4種類すべてが `metadata.plan_type` を持つ」ことを先に固定し、受け取り側は宣言を信じる形に寄せました。両側で二重に推測させると、どちらが正なのか分からなくなってしまうのです。
+
+月額と買い切りで保持期間だけを分けているのは、失効の扱いを1箇所に集めたかったからです。月額は31日で自然に切れ、更新のたびに書き直されます。買い切りは実質切れませんが、無期限ではなく長い有効期限として持たせております。
+
+## 記事単体だけは「何を買ったか」まで運びます
+
+会員は「誰か」が分かれば足りますが、記事単体は「誰が、どれを」の二つが揃わないと判定できません。ここだけデータの形が違います。
+
+```ts
+// 記事単体: KV に1件ずつ、Cookie には slug の配列を蓄積する
+const ARTICLE_TTL = 10 * 365 * 24 * 3600;
+const email = session.customer_details?.email?.trim().toLowerCase();
+const slug = session.metadata?.article_slug;
+
+if (kv && email && slug) {
+  await kv.put(
+    `site:rorklab:article:${email}:${slug}`,
+    JSON.stringify({ type: "article", slug, purchased_at: new Date().toISOString() }),
+    { expirationTtl: ARTICLE_TTL },
+  );
+}
+
+// Cookie は「上書き」ではなく「追記」にする。2本目を買った瞬間に1本目が消えるのを防ぐ
+let slugs: string[] = [];
+const existing = request.cookies.get("article_purchases")?.value;
+if (existing) {
+  try {
+    const decoded = atob(existing);
+    if (decoded.startsWith("{")) slugs = JSON.parse(decoded).slugs ?? [];
+  } catch {
+    slugs = []; // 壊れた Cookie は読まずに作り直す
+  }
+}
+if (!slugs.includes(slug)) slugs.push(slug);
+
+response.cookies.set("article_purchases", btoa(JSON.stringify({ email, slugs })), {
+  httpOnly: true, secure: true, sameSite: "lax", maxAge: ARTICLE_TTL, path: "/",
+});
+```
+
+Cookie を追記にしたのは、2本目を買っていただいたときに1本目が消える、という失い方がいちばん取り返しにくいからです。読者からは「さっき買ったはずの記事が閉じた」としか見えません。
+
+古い形式の Cookie が残っている可能性も考えて、JSON として読めないものは黙って作り直す形にしています。ここで例外を投げてしまうと、購入直後のリダイレクトごと落ちてしまうのです。
+
+KV と Cookie の二重持ちは冗長に見えますが、役割が違います。Cookie はその端末をすぐ通すため、KV は端末を変えても復元できるようにするためのものです。
+
+## 権限ストアが読めなかった夜に決めたこと
+
+ここが、いちばん直感に反した部分でした。権限ストアが一時的に読めないとき、私は最初「読めない＝判断できない＝とりあえず見せる」と書いていたのです。
+
+可用性を優先する書き方としては、ごく普通に見えると思います。読者を締め出さないほうが親切だ、という気持ちもありました。
+
+けれども、この一行はペイウォールの意味を静かに無効化します。ストアが落ちているあいだ、すべての有料記事が誰にでも開くからです。落ちていること自体には気づけますが、その間に何が配られたかは後から数えられません。
+
+```ts
+// 権限ストアが読めないときに、どちらへ倒すか
+async function canViewArticle(email: string | null, slug: string): Promise<boolean> {
+  if (!email) return false;
+
+  try {
+    const kv = getPremiumAccessKV(); // 取得自体が失敗しうる
+    if (!kv) return false;           // バインディング無し = 拒否
+    const member = await kv.get(`site:rorklab:${email}`);
+    if (member) return true;
+    const single = await kv.get(`site:rorklab:article:${email}:${slug}`);
+    return Boolean(single);
+  } catch {
+    return false; // 読めない日は閉じる。開けっ放しより回復が早い
+  }
+}
+```
+
+いまは「判断できないときは拒否する」に寄せております。開いてしまった分は取り返せませんが、閉じてしまった分はお問い合わせをいただければ手で戻せるのです。**取り返せる側の失敗を選ぶ**、という言い方を自分にしております。
+
+同じ考え方は、[Family Sharing で IAP が消える4つのトリガー](/articles/rork-dev/rork-family-sharing-iap-ask-to-buy-implementation-guide) で扱った権限の失効まわりにもそのまま当てはまりました。権限は「あるか無いか」ではなく「いま確かめられるか」で持つほうが、運用が落ち着きます。
+
+## 価格を変えた日に、金額判定なら止まっていました
+
+単体購入を¥250から¥200へ下げたとき、コードで触ったのは price ID の Set に1行足すところだけでした。種別の判定も、権限の書き込みも、記事側の表示も、まったく動かしておりません。
+
+金額で分岐していたら、少なくとも発行側・受け取り側・表示側の3箇所を同時に直すことになっていたはずです。そして過去のセッションは旧価格のまま戻ってきますので、旧価格の行を消せません。
+
+注意点を1つだけ書き残します。旧 price ID を Set に残す運用は、裏返すと「使っていない商品 ID が増え続ける」ということでもあります。私は Set の各行に、現行か旧価格かをコメントで書くだけの決まりにしました。棚卸しのときに、消してよい行がひと目で分かるようにするためです。
+
+使用量で課金する形まで広げる場合は、この「宣言を運ぶ」考え方がもう一段効いてきます。単価が可変になるほど、金額からの逆算は成り立たなくなるからです。実装の入口は [Rork × Stripe Meter で使用量課金を実装する](/articles/rork-dev/rork-stripe-meter-billing-usage-based-pricing) に書いております。
+
+## いま公開前に通している3つの確認
+
+手順にしておかないと、商品を足した日に限って抜けてしまいます。私が実際に通しているのは次の3つです。
+
+1. **4種類すべてで、Checkout の `metadata.plan_type` が空でないことをテストで固定します。** 発行側のユニットテストで `resolvePlanType` を4通り呼び、返り値を突き合わせるだけで足ります。
+2. **テスト環境で、チップの決済を1回通して会員ページを開きます。** 会員ページが閉じたままであることを目で見ます。ここを自動化しない理由は、閉じている状態は「何も起きない」ため、アサーションを書き忘れても緑になってしまうからです。
+3. **権限ストアのバインディングを外した状態で、有料記事を開きます。** ペイウォールが出れば正しく、本文が出たら拒否側への倒し方が抜けています。
+
+3つ目は、ローカルで環境変数を1つ空にするだけで再現できます。個人開発ですと障害を待って確かめるわけにもいきませんので、壊した状態を自分で作るのがいちばん早いのです。
+
+商品構成そのものを見直す段階の方は、[Rork アプリの収益モデル比較](/articles/rork-business/rork-app-revenue-model-comparison-ads-subscription-onetime) のほうを先にご覧いただくと、ここで書いた分岐が何本必要になるかの見当が付きやすいと思います。
+
+## 明日、最初に開くファイル
+
+決済後の処理を1つ開いて、`payment_status` を見ている行の近くに、種別を見ている行があるかどうかだけ確かめていただければと思います。無ければ、そこが金額と権限が同じ if 文に同居している場所です。
+
+私もその一行を書き換えるところから始めました。お読みいただきありがとうございました。
