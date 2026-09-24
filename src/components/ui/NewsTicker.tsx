@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "OPUS5.5 — Rork が9月22日に Claude Opus 5.5 をモデルメニューへ加えました。effort は5段階で、Pro と Max に含まれます",
-    "11/01 — Google Play の対象 API レベル、延長申請組の配信期限は11月1日です。残り38日です",
-    "IOS27 — iOS 27 で headerTransparent を指定してもヘッダーが透明にならない、という報告が expo に立っています",
-    "NEW — R8 が既定になる前に測っておく4つの数字",
-    "RN0.88 — React Native 0.88 の安定版は10月12日の予定です。Expo SDK 58 の安定版の日付はまだ公表されていません",
-    "FIRSTAPP — 最初の題材は、入力・保存・集計の3つがそろう小さなアプリにすると、つまずく場所が早いうちに見えてきます",
+    "GPT6SOL — Rork のモデルメニューに9月22日、GPT-6 Sol が加わりました。effort は Low / Medium / High の3段階で、Pro と Max に含まれます",
+    "11/01 — Google Play の対象 API レベルで延長を申請したアプリの配信期限は11月1日です。残り37日です",
+    "EXPOIMAGE — 画像の読み込みに失敗した瞬間にビューの大きさが変わると、Android だけアプリが落ちる、という expo-image の報告が出ています",
+    "NEW — 落ちたはずなのに固まって見える Android の白い画面",
+    "RN0.88 — React Native 0.88 の安定版は10月12日の予定です。SDK 58 安定版の日付はまだ一次情報にありません",
+    "ENROLL — Apple Developer Program を個人で登録するか法人で登録するかは、ストアの表示名とあとからの譲渡に響きます",
   ],
   en: [
-    "OPUS5.5 — Rork added Claude Opus 5.5 to its model menu on September 22, with five effort levels, included on the Pro and Max plans",
-    "11/01 — For anyone who filed a Google Play target API level extension, the delivery deadline is November 1, thirty-eight days away",
-    "IOS27 — An Expo issue reports that headerTransparent no longer makes the header transparent on iOS 27",
-    "NEW — Four numbers to measure before R8 becomes the default",
-    "RN0.88 — React Native 0.88 stable is expected on October 12. No date has been announced yet for a stable Expo SDK 58",
-    "FIRSTAPP — A first project that needs input, saving and a simple total shows you where you will get stuck while the app is still small",
+    "GPT6SOL — Rork added GPT-6 Sol to its model menu on September 22. It offers Low, Medium and High effort and is included in Pro and Max",
+    "11/01 — Apps that were granted a Google Play target API level extension must be updated by November 1, thirty-seven days from now",
+    "EXPOIMAGE — An expo-image report shows Android apps crashing when an image fails to load while its view is being resized",
+    "NEW — When an Android crash leaves a blank screen that looks frozen",
+    "RN0.88 — React Native 0.88 stable is scheduled for October 12. No first-party date for the SDK 58 stable release yet",
+    "ENROLL — Enrolling in the Apple Developer Program as an individual or an organization affects your store name and later transfers",
   ],
 };
 
