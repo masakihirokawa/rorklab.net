@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
-    "GPT6SOL — Rork のモデルメニューに9月22日、GPT-6 Sol が加わりました。effort は Low / Medium / High の3段階で、Pro と Max に含まれます",
-    "11/01 — Google Play の対象 API レベルで延長を申請したアプリの配信期限は11月1日です。残り37日です",
-    "EXPOIMAGE — 画像の読み込みに失敗した瞬間にビューの大きさが変わると、Android だけアプリが落ちる、という expo-image の報告が出ています",
-    "NEW — 落ちたはずなのに固まって見える Android の白い画面",
-    "RN0.88 — React Native 0.88 の安定版は10月12日の予定です。SDK 58 安定版の日付はまだ一次情報にありません",
-    "ENROLL — Apple Developer Program を個人で登録するか法人で登録するかは、ストアの表示名とあとからの譲渡に響きます",
+ja: [
+    "SEATS — App Store Connect では9月16日から、サブスクの複数シート購入が既定で有効になっています。組織向けの Volume Purchasing は10月22日に始まります",
+    "11/01 — Google Play の対象 API レベルで延長を申請したアプリの配信期限は11月1日です。残り35日です",
+    "RUNTIME — Google Play の自動翻訳が expo_runtime_version を書き換え、その言語だけ OTA 更新が届かなくなる、という報告が出ています",
+    "NEW — 一覧画面を Opus 5.5 と GPT-6 Sol で作り分ける、最初の一画面",
+    "XCODE27.1 — Apple は9月18日に Xcode 27.1 beta と iPhone Duo 向けのデザインキットを公開しました。発売は10月23日です",
+    "SCENE — SDK 57 で ios.enableSceneSupport を有効にすると、keyWindow に頼る currentViewController が当てにならない、という Issue が開いています",
   ],
   en: [
-    "GPT6SOL — Rork added GPT-6 Sol to its model menu on September 22. It offers Low, Medium and High effort and is included in Pro and Max",
-    "11/01 — Apps that were granted a Google Play target API level extension must be updated by November 1, thirty-seven days from now",
-    "EXPOIMAGE — An expo-image report shows Android apps crashing when an image fails to load while its view is being resized",
-    "NEW — When an Android crash leaves a blank screen that looks frozen",
-    "RN0.88 — React Native 0.88 stable is scheduled for October 12. No first-party date for the SDK 58 stable release yet",
-    "ENROLL — Enrolling in the Apple Developer Program as an individual or an organization affects your store name and later transfers",
+    "SEATS — Since September 16, multiseat purchases are enabled by default for subscriptions in App Store Connect. Volume Purchasing for organizations opens on October 22",
+    "11/01 — Apps that were granted a Google Play target API level extension must be updated by November 1, thirty-five days from now",
+    "RUNTIME — A report shows Google Play's automatic string translation rewriting expo_runtime_version, so OTA updates stop reaching that one locale",
+    "NEW — Building the same list screen with Opus 5.5 and GPT-6 Sol, one screen at a time",
+    "XCODE27.1 — On September 18 Apple released the Xcode 27.1 beta and design kits for iPhone Duo, which ships on October 23",
+    "SCENE — An open issue notes that with ios.enableSceneSupport on SDK 57, currentViewController still relies on keyWindow and becomes unreliable",
   ],
 };
 
