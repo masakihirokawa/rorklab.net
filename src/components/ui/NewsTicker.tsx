@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-ja: [
-    "SEATS — App Store Connect では9月16日から、サブスクの複数シート購入が既定で有効になっています。組織向けの Volume Purchasing は10月22日に始まります",
-    "11/01 — Google Play の対象 API レベルで延長を申請したアプリの配信期限は11月1日です。残り35日です",
-    "RUNTIME — Google Play の自動翻訳が expo_runtime_version を書き換え、その言語だけ OTA 更新が届かなくなる、という報告が出ています",
-    "NEW — 一覧画面を Opus 5.5 と GPT-6 Sol で作り分ける、最初の一画面",
-    "XCODE27.1 — Apple は9月18日に Xcode 27.1 beta と iPhone Duo 向けのデザインキットを公開しました。発売は10月23日です",
-    "SCENE — SDK 57 で ios.enableSceneSupport を有効にすると、keyWindow に頼る currentViewController が当てにならない、という Issue が開いています",
+  ja: [
+    "SDK58 — Expo SDK 58 は Beta（9/15）のまま。安定版は React Native 0.88 正式（10/12 予定）の後で、Expo Modules 2.0 もベータ扱いです",
+    "10/22 — Apple の Volume Purchasing 開始まで残り24日。複数シート購入は 9/16 から既定で有効なので、残すか外すかを先に決めておく段階です",
+    "REVIEW — 「提出直後の自動チェックで entitlement 不備と言われたが身に覚えがない」という問い。.ipa を開いて確かめ、作り直さずに通した例が出ています",
+    "NEW — 一覧画面を Opus 5.5 と GPT-6 Sol で作り比べ、effort の選び方を記録",
+    "NATIVE — Shopify の back-to-native を受けて、同じアプリを React Native とネイティブで作り実機計測した比較が公開。乗り換え判断の材料になります",
+    "CREDITS — 「AI のエラーにはクレジットを使わない」はどこまでか。同じ修正を3回頼んだ日の消費を記録して、線を引く準備をしています",
   ],
   en: [
-    "SEATS — Since September 16, multiseat purchases are enabled by default for subscriptions in App Store Connect. Volume Purchasing for organizations opens on October 22",
-    "11/01 — Apps that were granted a Google Play target API level extension must be updated by November 1, thirty-five days from now",
-    "RUNTIME — A report shows Google Play's automatic string translation rewriting expo_runtime_version, so OTA updates stop reaching that one locale",
-    "NEW — Building the same list screen with Opus 5.5 and GPT-6 Sol, one screen at a time",
-    "XCODE27.1 — On September 18 Apple released the Xcode 27.1 beta and design kits for iPhone Duo, which ships on October 23",
-    "SCENE — An open issue notes that with ios.enableSceneSupport on SDK 57, currentViewController still relies on keyWindow and becomes unreliable",
+    "SDK58 — Expo SDK 58 is still in beta (September 15). Stable lands after React Native 0.88 ships, planned for October 12, and Expo Modules 2.0 stays beta until then",
+    "10/22 — 24 days until Apple opens Volume Purchasing. Multiseat purchases have been on by default since September 16, so decide now whether to keep them",
+    "REVIEW — A common question: the automated pre-review check flags a missing entitlement you never added. One developer opened the .ipa, confirmed it, and passed without a rebuild",
+    "NEW — Building the same list screen with Opus 5.5 and GPT-6 Sol, and how we chose effort",
+    "NATIVE — After Shopify's back-to-native post, someone built the same app in React Native and native and measured on device. Useful input for any migration debate",
+    "CREDITS — How far does \"no credits for AI errors\" actually go? We are logging a day where the same fix was requested three times to draw the line",
   ],
 };
 
