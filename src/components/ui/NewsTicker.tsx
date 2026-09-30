@@ -4,21 +4,21 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SDK58 — Expo SDK 58 は Beta（9/15）のまま。安定版は React Native 0.88 正式（10/12 予定）の後で、Expo Modules 2.0 もベータ扱いです",
-    "10/22 — Apple の Volume Purchasing 開始まで残り24日。複数シート購入は 9/16 から既定で有効なので、残すか外すかを先に決めておく段階です",
-    "REVIEW — 「提出直後の自動チェックで entitlement 不備と言われたが身に覚えがない」という問い。.ipa を開いて確かめ、作り直さずに通した例が出ています",
-    "NEW — 一覧画面を Opus 5.5 と GPT-6 Sol で作り比べ、effort の選び方を記録",
-    "NATIVE — Shopify の back-to-native を受けて、同じアプリを React Native とネイティブで作り実機計測した比較が公開。乗り換え判断の材料になります",
-    "CREDITS — 「AI のエラーにはクレジットを使わない」はどこまでか。同じ修正を3回頼んだ日の消費を記録して、線を引く準備をしています",
+    "SONNET5.5 — Rork のモデルメニューに Claude Sonnet 5.5 が追加（9月28日）。effort は Low〜Max の5段階、Sonnet 5 より30%以上速く、1M トークンを読みます",
+    "10/12 — React Native 0.88.x の正式リリース予定まで残り12日。Expo SDK 58 安定版はその後で、Expo Go の更新で SDK 57 のサポートが落ちます",
+    "HERMES — 「iOS 26.3.1 で起動直後に Hermes が落ちる」という Issue が未解決のまま。ObjCTurboModule の例外がヒープを壊す症状です",
+    "NEW — 起動のたびに一瞬ログイン画面が出る expo-router アプリを、三状態で組み直す",
+    "SEARCH — GSC で押されたのは「rorkmax」、表示だけ残るのは bgtaskscheduler.shared.submit と migrateFromAsyncStorage。具体的な API 名が入口です",
+    "SDK58 — expo.dev の changelog は 9月15日の SDK 58 Beta が最新のまま。安定版の日付はまだ出ていません",
   ],
   en: [
-    "SDK58 — Expo SDK 58 is still in beta (September 15). Stable lands after React Native 0.88 ships, planned for October 12, and Expo Modules 2.0 stays beta until then",
-    "10/22 — 24 days until Apple opens Volume Purchasing. Multiseat purchases have been on by default since September 16, so decide now whether to keep them",
-    "REVIEW — A common question: the automated pre-review check flags a missing entitlement you never added. One developer opened the .ipa, confirmed it, and passed without a rebuild",
-    "NEW — Building the same list screen with Opus 5.5 and GPT-6 Sol, and how we chose effort",
-    "NATIVE — After Shopify's back-to-native post, someone built the same app in React Native and native and measured on device. Useful input for any migration debate",
-    "CREDITS — How far does \"no credits for AI errors\" actually go? We are logging a day where the same fix was requested three times to draw the line",
-  ],
+    "SONNET5.5 — Claude Sonnet 5.5 joined Rork's model menu on Sep 28: five effort levels from Low to Max, 30%+ faster than Sonnet 5, and a 1M-token context",
+    "10/12 — 12 days until the planned React Native 0.88.x release. Expo SDK 58 stable comes after it, and the Expo Go update drops SDK 57 support",
+    "HERMES — An open Issue: Hermes crashes right at launch on iOS 26.3.1, with an ObjCTurboModule exception corrupting the heap",
+    "NEW — Rebuilding an expo-router app that flashes the sign-in screen on every launch, with a three-state model",
+    "SEARCH — In GSC the only click was rorkmax; impressions cluster on bgtaskscheduler.shared.submit and migrateFromAsyncStorage. Concrete API names are the front door",
+    "SDK58 — expo.dev's changelog still tops out at the Sep 15 SDK 58 Beta. No stable date yet",
+  ]
 };
 
 export function NewsTicker() {
