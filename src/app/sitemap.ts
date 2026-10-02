@@ -15,6 +15,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/articles/rork-ai", priority: 0.8, freq: "daily" as const },
     { path: "/articles/rork-business", priority: 0.8, freq: "daily" as const },
     { path: "/articles/app-dev", priority: 0.8, freq: "daily" as const },
+    { path: "/about", priority: 0.5, freq: "monthly" as const }, // 著者ページ（2026-10-02 追加）
     { path: "/privacy", priority: 0.3, freq: "monthly" as const },
     { path: "/terms", priority: 0.3, freq: "monthly" as const },
     { path: "/tokusho", priority: 0.3, freq: "monthly" as const },

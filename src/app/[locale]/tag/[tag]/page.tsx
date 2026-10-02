@@ -54,7 +54,8 @@ export default async function TagPage({ params, searchParams }: Props) {
   const allArticles = getArticles(locale);
   const articles = allArticles.filter((a) =>
     (a.tags || []).some((t) => t.toLowerCase() === decoded.toLowerCase())
-  );
+  // タグページ（noindex）は indexable 記事を先頭に並べ、Googlebot の検出を keep 記事へ向ける（2026-10-02）
+  ).sort((a, b) => Number(!!a.noindex) - Number(!!b.noindex));
 
   /* Empty tag: return noindex page with navigation fallback.
    * Reverses #84 because the 0-article path was generating 100s of real 404s in GSC
@@ -159,7 +160,11 @@ export default async function TagPage({ params, searchParams }: Props) {
       }
     }
   }
+  // 関連タグは全体で 3 本以上のタグだけ（単発タグへのリンクが noindex タグ URL を数千に増やしていた・2026-10-02）
+  const globalTagCount = new Map<string, number>();
+  for (const a of allArticles) for (const t of a.tags || []) globalTagCount.set(t, (globalTagCount.get(t) || 0) + 1);
   const relatedTags = Array.from(relatedMap.entries())
+    .filter(([t]) => (globalTagCount.get(t) || 0) >= 3)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 12);
 

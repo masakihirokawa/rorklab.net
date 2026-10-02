@@ -306,8 +306,8 @@ export default async function ArticlePage({ params }: Props) {
           <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
             {article.meta.tags.map((tag) => {
               const count = tagCounts.get(tag) || 0;
-              // 記事 1 本だけのタグはリンクしない（タグページが 1 本の薄い一覧になるため）
-              if (count < 2) {
+              // 2 本以下のタグはリンクしない（noindex のタグページへクロールが散るため・2026-10-02 に 2→3）
+              if (count < 3) {
                 return (
                   <span key={tag} style={{ fontSize: 11, padding: "2px 10px", borderRadius: 3, border: "1px solid var(--border-subtle)", color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                     {tag}

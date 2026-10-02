@@ -35,7 +35,9 @@ export function RelatedArticles({
       return { article: a, score };
     })
     .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
+    // indexable（sitemap 掲載）記事を優先（2026-10-02）。剪定記事は Googlebot が頻繁に再クロールするので、
+    // そこからのリンクを keep 記事へ向けて検出を助ける。getArticles() は全件のまま（#129）。足りなければ noindex で補う。
+    .sort((a, b) => (Number(!!a.article.noindex) - Number(!!b.article.noindex)) || (b.score - a.score))
     .slice(0, 3);
 
   if (scored.length === 0) return null;
