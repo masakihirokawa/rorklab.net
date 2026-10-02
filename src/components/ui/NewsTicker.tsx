@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GPT6.1 — Rork のモデルメニューに GPT-6.1 Sol が加わりました（9月29日）。GPT-6 Sol と同価格で、1M トークンの文脈を読みます",
-    "10/12 — React Native 0.88.x の正式リリース予定まで残り10日。Expo SDK 58 安定版はその後で、Expo Go の更新で SDK 57 のサポートが落ちます",
-    "LOCALE — 権限の説明文を多言語化したら InfoPlist.strings に「[object Object]」が書き出された、という報告に修正の PR が出ています",
+    "GPT6.1 — Rork のモデルメニューに GPT-6.1 Sol が加わりました（9月29日）。changelog の最新エントリです",
+    "SONNET — Rork に Claude Sonnet 5.5 が入りました（9月28日）。Sonnet 5 より出力が30%超速く、UI の生成に強いと説明されています",
+    "10/12 — React Native 0.88.x の正式リリース予定まで残り9日。Expo SDK 58 の安定版は、10月上旬としか示されていません",
     "NEW — すでに「有効」になっている複数シート購入を、10月22日の前に残すか外すか決める",
-    "SEARCH — GSC で押されたのは「rorkmax」、表示だけ残るのは bgtaskscheduler.shared.submit と migrateFromAsyncStorage。具体的な API 名が入口です",
-    "SDK58 — expo.dev の changelog は 9月15日の SDK 58 Beta が最新と昨日確認しました。安定版の日付はまだ出ていません",
+    "NPM — SDK 58 の新規プロジェクトで npm install が失敗する問題の修正 PR（#50998）が出ています。安定版を待つ間の注意点です",
+    "SHARED — 凍結された SharedObject を release() すると例外になる不具合の修正（#50970）が入る見込みです。モジュール作者向けの話題です",
   ],
   en: [
-    "GPT6.1 — GPT-6.1 Sol joined Rork's model menu on Sep 29. It costs the same as GPT-6 Sol and reads a 1M-token context",
-    "10/12 — 10 days until the planned React Native 0.88.x release. Expo SDK 58 stable comes after it, and the Expo Go update drops SDK 57 support",
-    "LOCALE — A report says localizing permission descriptions wrote \"[object Object]\" into InfoPlist.strings, and a fix PR is now open",
-    "NEW — Multi-seat purchasing is already on by default: deciding whether to keep it before Oct 22",
-    "SEARCH — What got clicked in GSC was \"rorkmax\"; what only gets impressions is bgtaskscheduler.shared.submit and migrateFromAsyncStorage. Concrete API names are the way in",
-    "SDK58 — As of yesterday, expo.dev's changelog still showed the Sep 15 SDK 58 Beta as the latest. No stable date is out yet",
+    "GPT6.1 — GPT-6.1 Sol joined the Rork model menu (Sep 29). It is the latest entry on the changelog",
+    "SONNET — Claude Sonnet 5.5 is now in Rork (Sep 28). It is described as over 30% faster than Sonnet 5 and strong at UI generation",
+    "10/12 — 9 days left until React Native 0.88.x is due. Expo SDK 58 stable is only described as early October",
+    "NEW — Multiseat purchases are already enabled. Here is how to decide whether to keep or switch them off before October 22",
+    "NPM — A fix PR (#50998) addresses npm install failing on new SDK 58 projects. Worth knowing while you wait for stable",
+    "SHARED — A fix (#50970) is expected for release() throwing on a frozen SharedObject. A topic for module authors",
   ]
 };
 
