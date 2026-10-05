@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
-    "GPT6.1 — Rork のモデルメニューに GPT-6.1 Sol が加わりました（9月29日）。changelog の最新エントリです",
-    "10/12 — React Native 0.88.x の正式リリース予定まで残り7日。Expo SDK 58 の安定版は、10月上旬としか示されていません",
-    "NEW — すでに「有効」になっている複数シート購入を、10月22日の前に残すか外すか決める",
-    "SDK 58 — 新規プロジェクトで npm install が通らない問題の修正 PR（#50998）が審査中です。安定版の日付はまだ示されていません",
-    "SONNET — Rork に Claude Sonnet 5.5 が入りました（9月28日）。Sonnet 5 より出力が30%超速いと説明されています",
-    "iOS 27 — 2027年4月から、App Store へのアップロードは iOS 27 SDK が必須になります。ビルド環境の更新は余裕を持って進められます",
+ja: [
+    "GPT6.1 — Rork のモデルメニューに GPT-6.1 Sol が加わりました（9月29日）。GPT-6 Sol と同価格で、1M トークンの文脈を読みます",
+    "10/12 — React Native 0.88.x の正式リリース予定まで残り6日。Expo SDK 58 安定版はその後で、Expo Go の更新で SDK 57 のサポートが落ちます",
+    "CRYPTO — expo-crypto の digest() が、TypeScript 上は ArrayBuffer を受けるのに Android のネイティブ側は TypedArray を求める、という Issue が出ています（修正 PR あり）",
+    "NEW — モデルメニューの入れ替わりを3種類に分けて、クレジットの行き先を台帳に残します",
+    "SDK58 — SDK 58 の安定版の日付は、昨日の確認時点ではまだ出ていませんでした",
+    "SHEET — expo-ui の BottomSheet で presentationBackground の素材が平らで不透明に描かれる、という報告が出ています",
   ],
   en: [
-    "GPT6.1 — GPT-6.1 Sol joined the Rork model menu (Sep 29). It is the latest entry on the changelog",
-    "10/12 — 7 days left until React Native 0.88.x is due. Expo SDK 58 stable is only described as early October",
-    "NEW — Multiseat Purchases Are Already On: Decide Whether to Keep Them Before October 22",
-    "SDK 58 — A fix PR (#50998) for npm install failing in new projects is under review. No stable date has been given yet",
-    "SONNET — Claude Sonnet 5.5 is now in Rork (Sep 28). It is described as over 30% faster than Sonnet 5",
-    "iOS 27 — From April 2027, App Store uploads require the iOS 27 SDK. There is time to update your build environment calmly",
+    "GPT6.1 — GPT-6.1 Sol joined Rork's model menu on Sep 29. It costs the same as GPT-6 Sol and reads a 1M-token context",
+    "10/12 — 6 days until the planned React Native 0.88.x release. Expo SDK 58 stable comes after it, and the Expo Go update drops SDK 57 support",
+    "CRYPTO — An issue says expo-crypto's digest() accepts ArrayBuffer in TypeScript but the Android native side wants a TypedArray. A fix PR is open",
+    "NEW — Sorting model-menu changes into three types and keeping a ledger of where your credits go",
+    "SDK58 — As of yesterday's check, no stable date for SDK 58 was out yet",
+    "SHEET — A report says expo-ui's BottomSheet renders presentationBackground materials flat and opaque",
   ]
 };
 
