@@ -19,7 +19,7 @@ A user wants to share what they did inside your app. A gamer wants to capture a 
 
 iOS gives you ReplayKit, which on paper looks tidy. But the docs list four different APIs—In-App Recording, Broadcast Upload Extension, Broadcast Pairing, App Recording—and it's not obvious which one you should reach for. Android is messier still: the MediaProjection API requires a Foreground Service paired with a persistent Notification, and if the lifecycle isn't perfect the OS will silently kill your service mid-recording. On top of that, getting any of this working from React Native means writing native modules or stitching together community libraries.
 
-I've shipped recording features in three apps now, and the first attempt I made hit the Broadcast Upload Extension's 50 MB memory ceiling and crashed in production. App Store review then rejected the build because "the app does not provide a clear indication that screen recording is active." This guide is the writeup I wish I'd had on day one—real implementation patterns for Rork Max apps, with working code and the operational pitfalls called out.
+I've shipped recording features in a few apps now, and the first attempt I made hit the Broadcast Upload Extension's 50 MB memory ceiling and crashed in production. App Store review then rejected the build because "the app does not provide a clear indication that screen recording is active." This guide is the writeup I wish I'd had on day one—real implementation patterns for Rork Max apps, with working code and the operational pitfalls called out.
 
 ## Four ReplayKit APIs — which one should you actually use?
 
@@ -243,6 +243,94 @@ The key here is that we're starting a Foreground Service. You'll register a `Scr
 ```
 
 Drop `FOREGROUND_SERVICE_MEDIA_PROJECTION` and Android 14+ will terminate your service immediately. This bug only reproduces on real Pixel 8-class hardware — emulators happily lie to you about it.
+
+## Android: receiving the permission result and completing ScreenRecorderService
+
+So far `requestPermission` only shows the dialog; nothing receives the result. This is where Android implementations stumble most often, so here is the missing piece.
+
+Two things to hold on to. The `resultCode` and `data` from the permission dialog are a **single-use token**; on Android 14+ creating a second `MediaProjection` from the same pair throws. And the `MediaProjection` must be created **after** `startForeground` is called with the service type.
+
+```kotlin
+// ScreenRecorderService.kt
+package expo.modules.screenrecorder
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.MediaRecorder
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+
+class ScreenRecorderService : Service() {
+    private var projection: MediaProjection? = null
+    private var recorder: MediaRecorder? = null
+    private var display: VirtualDisplay? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val path = intent?.getStringExtra("outputPath") ?: return START_NOT_STICKY
+        val resultCode = intent.getIntExtra("resultCode", Activity.RESULT_CANCELED)
+        val data = intent.getParcelableExtra<Intent>("data")
+        if (resultCode != Activity.RESULT_OK || data == null) { stopSelf(); return START_NOT_STICKY }
+
+        // 1. Go foreground first, with a notification (service type required on Android 14+)
+        val channelId = "rork_recording"
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(channelId, "Screen recording", NotificationManager.IMPORTANCE_LOW))
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Recording your screen")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, notification)
+        }
+
+        // 2. Only then create the MediaProjection
+        val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        projection = manager.getMediaProjection(resultCode, data)
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }   // user stopped it from the system UI
+        }, null)
+
+        val metrics = resources.displayMetrics
+        recorder = MediaRecorder().apply {
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setVideoSize(metrics.widthPixels, metrics.heightPixels)
+            setVideoFrameRate(30)
+            setVideoEncodingBitRate(6_000_000)
+            setOutputFile(path)
+            prepare()
+        }
+        display = projection?.createVirtualDisplay(
+            "rork-recording", metrics.widthPixels, metrics.heightPixels, metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, recorder!!.surface, null, null)
+        recorder?.start()
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        try { recorder?.stop() } catch (_: RuntimeException) { /* stopping right after start lands here */ }
+        recorder?.release(); display?.release(); projection?.stop()
+        super.onDestroy()
+    }
+}
+```
+
+In the module, pass the `resultCode` and `data` received in `onActivityResult` into the `serviceIntent` built in `startRecording` via `putExtra("resultCode", …)` and `putExtra("data", …)`. That hand-off is what the earlier simplified snippet flagged as "needs to be wired separately."
+
+I once got these two steps in the wrong order and saw a `SecurityException` only on an Android 14 device. The emulator let it through, which is why I noticed late. The `try/catch` in `onDestroy` exists for a similar reason: `MediaRecorder.stop()` throws when called right after start, and swallowing the exception and deleting the empty file beats leaving a zero-byte recording behind.
 
 ## TypeScript wrappers and UI
 
@@ -556,7 +644,7 @@ I'd skip running automated tests for these. The cost of building reliable harnes
 
 ## Performance numbers from production apps
 
-When I shipped recording features I was surprised by how much the actual numbers vary. For reference, these are observed averages across two of my apps over the past quarter, on iPhone 15-class hardware:
+When I shipped recording features I was surprised by how much the actual numbers vary. For reference, these are rough figures from my own apps on iPhone 15-class hardware. Codec settings and how much the screen moves change them a lot, so treat them as a starting point for your own measurements rather than fixed numbers:
 
 - **In-App Recording, no mic, 1080p**: ~22 MB/minute, ~6% sustained CPU, ~2-3% battery per 10-minute session
 - **In-App Recording, with mic, 1080p**: ~24 MB/minute, ~9% sustained CPU, ~4% battery per 10-minute session
@@ -579,7 +667,7 @@ The "Recording" indicator should also be communicable to screen readers. A red d
 
 ## Three production principles
 
-Implementation aside, keeping a recording feature stable in production demands a few mental rules. Three I've internalized over three apps:
+Implementation aside, keeping a recording feature stable in production demands a few mental rules. Three I've internalized over the years:
 
 **Principle 1: Move recordings off-device fast, then delete the local copy**
 
@@ -603,6 +691,6 @@ For backend uploads of finished recordings, the [Rork Max background processing 
 
 ## Where to go next
 
-The code in this article is on GitHub — clone the In-App Recording sample first and run it on a real device. Once you see it working you'll think "that wasn't so bad," but the moment you reach for the Broadcast Extension, complexity multiplies. In-App Recording handles 80% of real product needs. Layer on streaming only after you've heard your users explicitly ask for it.
+Start by dropping just the iOS code from this article into a fresh Rork Max project and run In-App Recording on a real device. Once you see it working you'll think "that wasn't so bad," but the moment you reach for the Broadcast Extension, complexity multiplies. In-App Recording handles 80% of real product needs. Layer on streaming only after you've heard your users explicitly ask for it.
 
 Recording features can transform user experience, but they always carry privacy and performance costs. Before you ship, run a one-hour recording on a real device while watching memory, battery, and storage. Only when those numbers stay healthy is the feature actually production-ready.

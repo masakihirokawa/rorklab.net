@@ -15,11 +15,11 @@ highlights:
 ---
 ## アプリ内に「録画ボタン」を置きたいだけなのに、なぜこんなに難しいのか
 
-ユーザーが自分のアプリ操作を友人に共有したい。ゲームのハイスコア瞬間を SNS にアップしたい。チュートリアル動画を作って YouTube に投稿したい――そういった要望が出たとき、「画面録画くらいすぐ実装できるだろう」と思って着手すると、想像以上の壁にぶつかります。
+ユーザーが自分のアプリ操作を友人に共有したいと言い出します。ゲームのハイスコアの瞬間を SNS に載せたくなる方もいれば、チュートリアル動画を作って YouTube に投稿したくなる方もいます。そういった要望が届いたとき、「画面録画くらいすぐ実装できるだろう」と思って着手すると、想像以上の壁にぶつかります。
 
 iOS では ReplayKit という公式フレームワークがありますが、ドキュメントには「In-App Recording」「Broadcast Upload Extension」「Broadcast Pairing」「App Recording」と4種類の API が並んでいて、どれを選ぶべきか最初は分かりません。Android はもっと厄介で、MediaProjection API は Foreground Service と Notification の組み合わせを正しく書かないとシステム側に強制終了されます。さらに React Native 上で動かすには、ネイティブモジュールを書くか、コミュニティのライブラリを継ぎ接ぎする必要があります。
 
-私自身、3つほどアプリで画面録画機能を組み込んできましたが、最初に作ったときは Broadcast Upload Extension のメモリ制限（50 MB）に引っかかってクラッシュし、App Store 審査では「録画中であることがユーザーに明示されていない」とリジェクトされました。ここではその失敗を踏まえて、Rork Max ベースのアプリに録画機能を組み込むための実装パターンと運用上の注意点を、動くコード付きでまとめます。
+私自身、いくつかのアプリで画面録画機能を組み込んできましたが、最初に作ったときは Broadcast Upload Extension のメモリ制限（50 MB）に引っかかってクラッシュし、App Store 審査では「録画中であることがユーザーに明示されていない」とリジェクトされました。ここではその失敗を踏まえて、Rork Max ベースのアプリに録画機能を組み込むための実装パターンと運用上の注意点を、動くコード付きでまとめます。
 
 ## 4種類の ReplayKit API、結局どれを使えばいいのか
 
@@ -244,6 +244,94 @@ class ExpoScreenRecorderModule : Module() {
 ```
 
 `FOREGROUND_SERVICE_MEDIA_PROJECTION` を抜くと Android 14 以降ではサービスが即座に停止されます。これは Pixel 8 系の実機で再現する地味なバグなので、エミュレータだけでテストしていると気付きません。
+
+## Android の許可結果を受け取り、ScreenRecorderService を完成させる
+
+ここまでのコードは、`requestPermission` が許可ダイアログを出すだけで、結果を受け取る側が抜けています。ここが Android 実装で一番つまずきやすい箇所なので、省略していた部分を補います。
+
+押さえておきたいのは次の2点です。許可で得た `resultCode` と `data` は **1回限りのトークン** で、Android 14 以降は同じものでの `MediaProjection` 再生成が例外になります。そして `MediaProjection` は、`startForeground` を **サービス型指定付きで呼んだあと** に作る必要があります。
+
+```kotlin
+// ScreenRecorderService.kt
+package expo.modules.screenrecorder
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.MediaRecorder
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+
+class ScreenRecorderService : Service() {
+    private var projection: MediaProjection? = null
+    private var recorder: MediaRecorder? = null
+    private var display: VirtualDisplay? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val path = intent?.getStringExtra("outputPath") ?: return START_NOT_STICKY
+        val resultCode = intent.getIntExtra("resultCode", Activity.RESULT_CANCELED)
+        val data = intent.getParcelableExtra<Intent>("data")
+        if (resultCode != Activity.RESULT_OK || data == null) { stopSelf(); return START_NOT_STICKY }
+
+        // 1. 先に通知付きで Foreground 化（Android 14+ は型指定が必須）
+        val channelId = "rork_recording"
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(channelId, "画面録画", NotificationManager.IMPORTANCE_LOW))
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("画面を録画しています")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, notification)
+        }
+
+        // 2. そのあとで MediaProjection を作る
+        val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        projection = manager.getMediaProjection(resultCode, data)
+        projection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }   // ユーザーが通知やシステムUIから止めたとき
+        }, null)
+
+        val metrics = resources.displayMetrics
+        recorder = MediaRecorder().apply {
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setVideoSize(metrics.widthPixels, metrics.heightPixels)
+            setVideoFrameRate(30)
+            setVideoEncodingBitRate(6_000_000)
+            setOutputFile(path)
+            prepare()
+        }
+        display = projection?.createVirtualDisplay(
+            "rork-recording", metrics.widthPixels, metrics.heightPixels, metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, recorder!!.surface, null, null)
+        recorder?.start()
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        try { recorder?.stop() } catch (_: RuntimeException) { /* 開始直後の停止はここに来る */ }
+        recorder?.release(); display?.release(); projection?.stop()
+        super.onDestroy()
+    }
+}
+```
+
+モジュール側では `onActivityResult` で受け取った `resultCode` と `data` を、`startRecording` で作る `serviceIntent` の `putExtra("resultCode", …)` と `putExtra("data", …)` に載せて渡します。先ほどの簡略化したコードで「別途用意する必要がある」と書いた部分は、この受け渡しのことです。
+
+私はこの順序（Foreground 化 → `MediaProjection` 生成）を逆にして、Android 14 の実機でだけ `SecurityException` が出る状態を経験しました。エミュレータでは通ってしまうので、気づくのが遅れた箇所です。`onDestroy` の `try/catch` も同じ理由で入れています。録画開始の直後に停止すると `MediaRecorder.stop()` が例外を投げるため、空のファイルが残るより、握りつぶしたうえで空ファイルを削除するほうが安全です。
 
 ## TypeScript 側のラッパーと UI 実装
 
@@ -528,7 +616,7 @@ export async function hasSpaceForRecording(estimatedMinutes = 10): Promise<boole
 
 **長時間録画の耐久テスト**: 30分連続録画してメモリ・バッテリー・容量を5分間隔で記録。メモリが直線的に増えるならバッファリーク、たいてい音声経路です。
 
-**バックグラウンド割り込み**: 録画中に着信を受けて戻る。iOS は録画を一時停止・再開しますが、出力ファイルが時刻ズレや音切れを起こさないかを確認します。
+**バックグラウンド割り込み**: 録画中に着信を受けて戻ってきたとき、iOS は録画を一時停止・再開しますが、出力ファイルが時刻ズレや音切れを起こさないかを確認します。
 
 **録画中の画面回転**: フレーム単位で正しい向きが反映されるか。iOS の RPScreenRecorder は自動対応、Android の MediaProjection は開始時の解像度を維持するので注意です。
 
@@ -538,7 +626,7 @@ export async function hasSpaceForRecording(estimatedMinutes = 10): Promise<boole
 
 ## 本番アプリでの実測値
 
-私が運用しているアプリ2本での過去四半期の実測値を共有します。iPhone 15 クラスのハードウェア基準です。
+手元のアプリで計測した目安を共有します。iPhone 15 クラスの実機での値で、コーデック設定や画面の動きの量によって大きく変わるかもしれません。そのままの数字ではなく、自分のアプリで測り直す際の出発点としてお使いください。
 
 - **In-App Recording・マイクなし・1080p**: 約 22 MB/分、CPU 持続 6%、10分セッションでバッテリー 2〜3%
 - **In-App Recording・マイクあり・1080p**: 約 24 MB/分、CPU 持続 9%、10分でバッテリー 4%
@@ -561,7 +649,7 @@ Android はチップセットによる差が大きく、Snapdragon 8 Gen 2 系�
 
 ## 本番運用で意識する3つの設計原則
 
-ここまで実装の話をしてきましたが、本番運用で安定させるには設計面での配慮も欠かせません。私が3つのアプリを通じて学んだ原則を共有します。
+ここまで実装の話をしてきましたが、本番運用で安定させるには設計面での配慮も欠かせません。私がこれまでの実装で学んだ原則を共有します。
 
 **原則1: 録画ファイルは即座に転送・破棄する**
 
@@ -575,7 +663,6 @@ Android はチップセットによる差が大きく、Snapdragon 8 Gen 2 系�
 
 ReplayKit の startRecording は様々な理由で失敗します（ディスク不足、システムリソース不足、他アプリが録画中など）。エラーメッセージをそのままユーザーに見せると意味不明なので、「ストレージの空き容量を確認してください」「コントロールセンターで画面録画が無効になっていないか確認してください」のように、行動可能な日本語に翻訳して表示します。
 
-書籍で体系的に
 
 ## 他の Rork 機能との組み合わせ
 
@@ -587,6 +674,6 @@ ReplayKit の startRecording は様々な理由で失敗します（ディスク
 
 ## 次の一歩
 
-本記事のコードは GitHub に公開しているので、まずは In-App Recording のサンプルアプリをクローンして、自分の手元で動かしてみてください。実機で動くと「画面録画ってこんな簡単だったのか」と感じる一方、Broadcast Extension に手を出すと一気に難易度が上がります。最初は In-App Recording だけで十分なケースが多いので、ユーザーの声を聞きながら段階的に拡張していくのが現実的です。
+まずは本記事の iOS 側コードだけを新規の Rork Max プロジェクトに入れて、In-App Recording を自分の実機で動かしてみてください。実機で動くと「画面録画ってこんな簡単だったのか」と感じる一方、Broadcast Extension に手を出すと一気に難易度が上がります。最初は In-App Recording だけで十分なケースが多いので、ユーザーの声を聞きながら段階的に拡張していくのが現実的です。
 
 録画機能はユーザー体験を大きく変える要素ですが、それゆえにプライバシーとパフォーマンスへの配慮が常に求められます。実装したら必ず実機で1時間以上の録画テストを行い、メモリ・バッテリー・ストレージの推移を計測してから本番に出してください。
