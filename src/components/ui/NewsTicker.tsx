@@ -5,19 +5,19 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
     "GPT6.1 — Rork のモデルメニューに GPT-6.1 Sol が加わりました（9月29日）。GPT-6 Sol と同価格で、1M トークンの文脈を読みます",
-    "10/12 — React Native 0.88.x の正式リリース予定まで残り6日。Expo SDK 58 安定版はその後で、Expo Go の更新で SDK 57 のサポートが落ちます",
-    "CRYPTO — expo-crypto の digest() が、TypeScript 上は ArrayBuffer を受けるのに Android のネイティブ側は TypedArray を求める、という Issue が出ています（修正 PR あり）",
-    "NEW — モデルメニューの入れ替わりを3種類に分けて、クレジットの行き先を台帳に残します",
-    "SDK58 — SDK 58 の安定版の日付は、昨日の確認時点ではまだ出ていませんでした",
-    "SHEET — expo-ui の BottomSheet で presentationBackground の素材が平らで不透明に描かれる、という報告が出ています",
+    "SDK58 — Expo SDK 58 Beta が公開されました（React Native 0.88 RC 同梱）。安定版の日付はまだ確認できていません",
+    "10/12 — React Native 0.88.x の正式リリース予定まで残り5日。Expo Go の更新で SDK 57 のサポートが落ちる流れです",
+    "TESTFLIGHT — Mac なし・Windows だけで iPhone アプリを TestFlight に載せた手順と、つまずいた4か所が Zenn に出ています",
+    "NEW — Sonnet 5.5・GPT-6.1 Sol・Opus 5.5 のどれに頼むかを修正の種類で決め、クレジットの行き先を1週間記録しました",
+    "EXPO — Shopify がネイティブに戻る中で、1人開発では Expo に残る、という判断の記事が Zenn に出ています。確かめる人が1人という点が論点です",
   ],
   en: [
     "GPT6.1 — GPT-6.1 Sol joined Rork's model menu on Sep 29. It costs the same as GPT-6 Sol and reads a 1M-token context",
-    "10/12 — 6 days until the planned React Native 0.88.x release. Expo SDK 58 stable comes after it, and the Expo Go update drops SDK 57 support",
-    "CRYPTO — An issue says expo-crypto's digest() accepts ArrayBuffer in TypeScript but the Android native side wants a TypedArray. A fix PR is open",
-    "NEW — Sorting model-menu changes into three types and keeping a ledger of where your credits go",
-    "SDK58 — As of yesterday's check, no stable date for SDK 58 was out yet",
-    "SHEET — A report says expo-ui's BottomSheet renders presentationBackground materials flat and opaque",
+    "SDK58 — Expo SDK 58 Beta is out, bundling a React Native 0.88 release candidate. A stable date has not been confirmed yet",
+    "10/12 — 5 days until the planned React Native 0.88.x release. The Expo Go update that follows drops SDK 57 support",
+    "TESTFLIGHT — A Zenn post covers putting an iPhone app on TestFlight with no Mac, Windows only, and the four places it snagged",
+    "NEW — I picked between Sonnet 5.5, GPT-6.1 Sol and Opus 5.5 by the kind of fix, and logged where my credits went for a week",
+    "EXPO — As Shopify moves back to native, a Zenn post explains staying on Expo as a solo developer. The one person who verifies is the real point",
   ]
 };
 
