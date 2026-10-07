@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "GPT6.1 — Rork のモデルメニューに GPT-6.1 Sol が加わりました（9月29日）。GPT-6 Sol と同価格で、1M トークンの文脈を読みます",
-    "SDK58 — Expo SDK 58 Beta が公開されました（React Native 0.88 RC 同梱）。安定版の日付はまだ確認できていません",
-    "10/12 — React Native 0.88.x の正式リリース予定まで残り5日。Expo Go の更新で SDK 57 のサポートが落ちる流れです",
-    "TESTFLIGHT — Mac なし・Windows だけで iPhone アプリを TestFlight に載せた手順と、つまずいた4か所が Zenn に出ています",
-    "NEW — Sonnet 5.5・GPT-6.1 Sol・Opus 5.5 のどれに頼むかを修正の種類で決め、クレジットの行き先を1週間記録しました",
-    "EXPO — Shopify がネイティブに戻る中で、1人開発では Expo に残る、という判断の記事が Zenn に出ています。確かめる人が1人という点が論点です",
+    "EXPO — EAS Observe がネイティブクラッシュも記録（10/07）。JavaScript エラーと並べて確認できます",
+    "SDK 58 — SDK 58 Beta は 9/15 公開。stable の日付はまだ未確認です",
+    "RN 0.88 — React Native 0.88.x の正式リリース予定は 10/12、残り4日",
+    "Q&A — expo-widgets が本番ビルドだけ真っ黒になる、という問いが出ています",
+    "RORK — 09-29 に GPT-6.1 Sol を追加。Pro・Max プランで利用できます",
+    "NEW — 日本語の見出しだけ太字にならない Android の切り分け",
   ],
   en: [
-    "GPT6.1 — GPT-6.1 Sol joined Rork's model menu on Sep 29. It costs the same as GPT-6 Sol and reads a 1M-token context",
-    "SDK58 — Expo SDK 58 Beta is out, bundling a React Native 0.88 release candidate. A stable date has not been confirmed yet",
-    "10/12 — 5 days until the planned React Native 0.88.x release. The Expo Go update that follows drops SDK 57 support",
-    "TESTFLIGHT — A Zenn post covers putting an iPhone app on TestFlight with no Mac, Windows only, and the four places it snagged",
-    "NEW — I picked between Sonnet 5.5, GPT-6.1 Sol and Opus 5.5 by the kind of fix, and logged where my credits went for a week",
-    "EXPO — As Shopify moves back to native, a Zenn post explains staying on Expo as a solo developer. The one person who verifies is the real point",
+    "EXPO — EAS Observe now records native crashes next to JavaScript errors (Oct 7)",
+    "SDK 58 — SDK 58 Beta has been out since Sep 15. The stable date is still unconfirmed",
+    "RN 0.88 — React Native 0.88.x is scheduled for Oct 12, 4 days left",
+    "Q&A — People are asking why expo-widgets render blank only in production builds",
+    "RORK — GPT-6.1 Sol was added on Sep 29, available on Pro and Max plans",
+    "NEW — Japanese headings not bold on Android: how to isolate it",
   ]
 };
 
