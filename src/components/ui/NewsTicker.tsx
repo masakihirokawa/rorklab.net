@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "EXPO — EAS Observe がネイティブクラッシュも記録（10/07）。JavaScript エラーと並べて確認できます",
+    "EXPO — EAS Observe がネイティブクラッシュも記録（10/07）。SDK 57 は 57.0.21 以降で確認できます",
     "SDK 58 — SDK 58 Beta は 9/15 公開。stable の日付はまだ未確認です",
-    "RN 0.88 — React Native 0.88.x の正式リリース予定は 10/12、残り4日",
+    "RN 0.88 — React Native 0.88.x の正式リリース予定は 10/12、残り3日",
     "Q&A — expo-widgets が本番ビルドだけ真っ黒になる、という問いが出ています",
     "RORK — 09-29 に GPT-6.1 Sol を追加。Pro・Max プランで利用できます",
-    "NEW — 日本語の見出しだけ太字にならない Android の切り分け",
+    "NEW — クライアントのアプリを作る前に決める、公開アカウントの持ち主",
   ],
   en: [
-    "EXPO — EAS Observe now records native crashes next to JavaScript errors (Oct 7)",
+    "EXPO — EAS Observe now records native crashes (Oct 7). On SDK 57, update to 57.0.21 or later",
     "SDK 58 — SDK 58 Beta has been out since Sep 15. The stable date is still unconfirmed",
-    "RN 0.88 — React Native 0.88.x is scheduled for Oct 12, 4 days left",
+    "RN 0.88 — React Native 0.88.x is scheduled for Oct 12, 3 days left",
     "Q&A — People are asking why expo-widgets render blank only in production builds",
     "RORK — GPT-6.1 Sol was added on Sep 29, available on Pro and Max plans",
-    "NEW — Japanese headings not bold on Android: how to isolate it",
+    "NEW — Building an app for a client? Decide who owns the publishing account first",
   ]
 };
 
