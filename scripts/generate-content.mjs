@@ -114,7 +114,10 @@ async function compileMarkdown(content) {
   // Process custom components first
   const processed = processCallouts(content);
   const result = await processor.process(processed);
-  return String(result);
+  // 2026-10-09: 表は横スクロールの枠で包む（スマホで表がページごと横にはみ出し、ヘッダーのメニューボタンが画面外へ出ていた）
+  return String(result)
+    .replace(/<table\b/g, '<div class="table-scroll"><table')
+    .replace(/<\/table>/g, "</table></div>");
 }
 
 async function generateArticleIndex() {

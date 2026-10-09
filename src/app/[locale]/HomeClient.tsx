@@ -125,7 +125,11 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
           </h1>
 
           <p style={{ fontSize: "clamp(14px, 2vw, 17px)", color: "var(--text-muted)", maxWidth: 520, margin: "0 auto 48px", lineHeight: 1.8, fontWeight: 300, whiteSpace: "pre-line" }}>
-            {t("hero.description")}
+            {t("hero.description").split("\n").map((line, li) => (
+              <span key={li} style={{ display: "block" }}>
+                {line.split("|").map((seg, si) => <span key={si} className="seg">{seg}</span>)}
+              </span>
+            ))}
           </p>
 
           <div style={{ display: "flex", gap: 16, justifyContent: "center", flexWrap: "wrap" }}>

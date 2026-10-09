@@ -50,8 +50,7 @@ const TABLE_ROW: React.CSSProperties = {
 };
 
 const TH_STYLE: React.CSSProperties = {
-  width: 160,
-  minWidth: 120,
+  width: "clamp(96px, 28%, 160px)",
   flexShrink: 0,
   fontSize: 13,
   fontWeight: 600,
@@ -61,6 +60,8 @@ const TH_STYLE: React.CSSProperties = {
 
 const TD_STYLE: React.CSSProperties = {
   flex: 1,
+  minWidth: 0,
+  overflowWrap: "anywhere",
   fontSize: 14,
   color: "var(--text-muted)",
   lineHeight: 1.7,

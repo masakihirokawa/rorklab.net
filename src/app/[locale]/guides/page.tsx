@@ -94,28 +94,46 @@ export default async function GuidesPage({ params }: Props) {
         </p>
       </div>
 
-      {/* Guide Tracks */}
-      <div style={{ display: "grid", gap: 24 }}>
+      {/* Guide Tracks — 2026-10-09: 各トラックを「初級→中級→上級」の 3 段で各 4 本までに絞った（以前はカテゴリの全記事を並べ、1 ページ 1MB 超・リンク 900 本で、スマホでは横にはみ出していた）。
+          残りはカテゴリ一覧（ページ送り）へ。剪定（noindex）記事より索引対象の記事を優先（#132） */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 460px), 1fr))", gap: 24 }}>
         {tracks.map((track, i) => {
-          const trackArticles = articles.filter((a) => track.categories.includes(a.category));
+          const inTrack = articles.filter((a) => track.categories.includes(a.category));
+          const byDate = (x: { date: string }, y: { date: string }) => (y.date || "").localeCompare(x.date || "");
+          const pick = (level: string) => {
+            const lv = inTrack.filter((a) => (level === "intermediate" ? a.level.startsWith("intermediate") : a.level === level));
+            const indexable = lv.filter((a) => !a.noindex).sort(byDate);
+            const rest = lv.filter((a) => a.noindex).sort(byDate);
+            return [...indexable, ...rest].slice(0, 4);
+          };
+          const steps = [
+            { level: "beginner", ja: "初級", en: "Beginner", color: "var(--accent-green)", icon: "◇" },
+            { level: "intermediate", ja: "中級", en: "Intermediate", color: "var(--accent-gold)", icon: "◆" },
+            { level: "advanced", ja: "上級", en: "Advanced", color: "var(--accent-coral)", icon: "◈" },
+          ].map((s) => ({ ...s, items: pick(s.level) })).filter((s) => s.items.length > 0);
           const cat = CATEGORIES.find((c) => c.id === track.categories[0]);
+          const catHref = `/${locale === "ja" ? "" : locale + "/"}articles/${track.categories[0]}`;
+          let n = 0;
 
           return (
-            <div
+            <section
               key={i}
               className="guide-card"
               style={{
-                padding: "32px",
+                minWidth: 0,
+                padding: "clamp(20px, 4vw, 32px)",
                 border: "1px solid var(--border-subtle)",
                 borderRadius: 8,
                 background: "var(--bg-surface)",
+                display: "flex",
+                flexDirection: "column",
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-                <span style={{ fontSize: 16, color: cat?.color || "var(--text-muted)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                <span aria-hidden="true" style={{ fontSize: 16, color: cat?.color || "var(--text-muted)" }}>
                   {cat?.icon}
                 </span>
-                <h2 style={{ fontSize: 18, fontWeight: 500, color: "var(--text-primary)" }}>
+                <h2 style={{ fontSize: 18, fontWeight: 500, color: "var(--text-primary)", lineHeight: 1.5 }}>
                   {track.title[locale] || track.title.en}
                 </h2>
               </div>
@@ -123,38 +141,68 @@ export default async function GuidesPage({ params }: Props) {
                 {track.desc[locale] || track.desc.en}
               </p>
 
-              {trackArticles.length > 0 ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {trackArticles.map((article, j) => (
-                    <a
-                      key={article.slug}
-                      href={`/${locale === "ja" ? "" : locale + "/"}articles/${article.category}/${article.slug}`}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 12,
-                        padding: "10px 16px",
-                        borderRadius: 6,
-                        background: "var(--bg-surface-hover)",
-                        textDecoration: "none",
-                        transition: "background 0.2s",
-                      }}
-                    >
-                      <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-faint)", minWidth: 20 }}>
-                        {String(j + 1).padStart(2, "0")}
-                      </span>
-                      <span style={{ fontSize: 14, color: "var(--text-secondary)" }}>
-                        {article.title}
-                      </span>
-                    </a>
+              {steps.length > 0 ? (
+                <ol style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 18 }}>
+                  {steps.map((step, si) => (
+                    <li key={step.level}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, letterSpacing: "0.1em", color: "var(--text-dim)" }}>
+                        <span>STEP {si + 1}</span>
+                        <span aria-hidden="true" style={{ color: step.color }}>{step.icon}</span>
+                        <span style={{ color: step.color }}>{locale === "ja" ? step.ja : step.en}</span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {step.items.map((article) => {
+                          n += 1;
+                          return (
+                            <a
+                              key={article.slug}
+                              href={`/${locale === "ja" ? "" : locale + "/"}articles/${article.category}/${article.slug}`}
+                              className="guide-step-link"
+                              style={{
+                                display: "grid",
+                                gridTemplateColumns: "auto minmax(0, 1fr)",
+                                alignItems: "baseline",
+                                gap: 12,
+                                padding: "10px 14px",
+                                borderRadius: 6,
+                                border: "1px solid transparent",
+                                background: "var(--bg-surface)",
+                                textDecoration: "none",
+                              }}
+                            >
+                              <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-faint)", minWidth: 18 }}>
+                                {String(n).padStart(2, "0")}
+                              </span>
+                              <span style={{ fontSize: 14, lineHeight: 1.6, color: "var(--text-secondary)", overflowWrap: "anywhere" }}>
+                                {article.title}
+                                {article.premium && (
+                                  <span style={{ marginLeft: 8, fontSize: 10, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.08em", color: "var(--accent-coral)", whiteSpace: "nowrap" }}>
+                                    PREMIUM
+                                  </span>
+                                )}
+                              </span>
+                            </a>
+                          );
+                        })}
+                      </div>
+                    </li>
                   ))}
-                </div>
+                </ol>
               ) : (
                 <p style={{ fontSize: 13, color: "var(--text-faint)", fontStyle: "italic" }}>
                   {locale === "ja" ? "コンテンツ準備中..." : "Content coming soon..."}
                 </p>
               )}
-            </div>
+
+              {inTrack.length > n && (
+                <a
+                  href={catHref}
+                  style={{ marginTop: 20, alignSelf: "flex-start", fontSize: 13, color: "var(--accent-coral)", textDecoration: "none" }}
+                >
+                  {locale === "ja" ? `このテーマの記事をすべて見る（${inTrack.length} 本）→` : `See all ${inTrack.length} articles in this track →`}
+                </a>
+              )}
+            </section>
           );
         })}
       </div>

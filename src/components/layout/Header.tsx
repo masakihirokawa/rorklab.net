@@ -5,6 +5,7 @@ import { useTranslations, useLocale } from "next-intl";
 import { ThemeToggle } from "./ThemeToggle";
 import { LocaleSwitcher } from "./LocaleSwitcher";
 import { SearchModal } from "@/components/ui/SearchModal";
+import { Icon } from "@/components/ui/Icons";
 import { localePrefix } from "@/lib/locale";
 
 interface SearchItem {
@@ -76,6 +77,16 @@ export function Header() {
     });
   }, [searchOpen, searchData.length]);
 
+  // Escape でモバイルメニューを閉じる（2026-10-09）
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mobileOpen]);
+
   // Cmd/Ctrl+K shortcut
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -121,7 +132,7 @@ export function Header() {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          background: scrolled ? "color-mix(in srgb, var(--bg-primary) 85%, transparent)" : "transparent",
+          background: scrolled ? "color-mix(in srgb, var(--bg-primary) 94%, transparent)" : "transparent",
           backdropFilter: scrolled ? "blur(20px)" : "none",
           borderBottom: scrolled ? "1px solid var(--border-subtle)" : "1px solid transparent",
           transition: "all 0.4s",
@@ -178,7 +189,7 @@ export function Header() {
                     top: "100%",
                     left: 0,
                     marginTop: 8,
-                    background: "var(--bg-surface)",
+                    background: "var(--bg-secondary)",
                     border: "1px solid var(--border-subtle)",
                     borderRadius: 8,
                     padding: "8px 0",
@@ -259,7 +270,7 @@ export function Header() {
                 e.currentTarget.style.transform = "scale(1)";
               }}
             >
-              ♥
+              <Icon name="heart" size={15} />
             </a>
             <button
               onClick={() => setSearchOpen(true)}
@@ -301,7 +312,7 @@ export function Header() {
                 fontSize: 14,
               }}
             >
-              ♥
+              <Icon name="heart" size={15} />
             </a>
             <button
               onClick={() => setSearchOpen(true)}
@@ -312,7 +323,7 @@ export function Header() {
                 fontSize: 14,
               }}
             >
-              ⌕
+              <Icon name="search" size={15} />
             </button>
             <LocaleSwitcher mobile />
             <ThemeToggle />
@@ -322,12 +333,9 @@ export function Header() {
               style={{
                 ...MOBILE_ICON_BTN,
                 color: "var(--text-secondary)",
-                fontSize: 18,
-                lineHeight: 1,
-                paddingBottom: 4,
               }}
             >
-              ☰
+              <Icon name="menu" size={18} />
             </button>
           </div>
         )}
@@ -369,7 +377,7 @@ export function Header() {
               cursor: "pointer",
             }}
           >
-            ×
+            <Icon name="close" size={24} strokeWidth={1.4} />
           </button>
           {/* Mobile Level Buttons — top position */}
           <div style={{ width: "100%", paddingBottom: 4 }}>
@@ -430,6 +438,7 @@ export function Header() {
           <a
             href={`${prefix}/support`}
             onClick={() => setMobileOpen(false)}
+            aria-label="Support us"
             style={{
               color: "var(--text-dim)",
               textDecoration: "none",
@@ -439,7 +448,7 @@ export function Header() {
               transition: "color 0.3s",
             }}
           >
-            ♥
+            <Icon name="heart" size={15} />
           </a>
         </div>
       )}
