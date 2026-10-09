@@ -5,19 +5,19 @@ import { useLocale } from "next-intl";
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
     "EXPO — EAS Observe がネイティブクラッシュも記録（10/07）。SDK 57 は 57.0.21 以降で確認できます",
-    "SDK 58 — SDK 58 Beta は 9/15 公開。stable の日付はまだ未確認です",
-    "RN 0.88 — React Native 0.88.x の正式リリース予定は 10/12、残り3日",
-    "Q&A — expo-widgets が本番ビルドだけ真っ黒になる、という問いが出ています",
-    "RORK — 09-29 に GPT-6.1 Sol を追加。Pro・Max プランで利用できます",
-    "NEW — クライアントのアプリを作る前に決める、公開アカウントの持ち主",
+    "RORK — 09-29 に GPT-6.1 Sol、09-28 に Claude Sonnet 5.5 を追加。モデル選択で使えます",
+    "RN 0.88 — React Native 0.88.x の正式リリース予定は 10/12、残り2日",
+    "Q&A — AuthSession が Android の standalone で結果を返さない、という問いが長く続いています",
+    "WINDOWS — Mac がなくても Windows だけで iPhone アプリを出す手順が共有されています",
+    "NEW — Expo Go で通知だけが届かない夜に、先に切り分ける3点",
   ],
   en: [
     "EXPO — EAS Observe now records native crashes (Oct 7). On SDK 57, update to 57.0.21 or later",
-    "SDK 58 — SDK 58 Beta has been out since Sep 15. The stable date is still unconfirmed",
-    "RN 0.88 — React Native 0.88.x is scheduled for Oct 12, 3 days left",
-    "Q&A — People are asking why expo-widgets render blank only in production builds",
-    "RORK — GPT-6.1 Sol was added on Sep 29, available on Pro and Max plans",
-    "NEW — Building an app for a client? Decide who owns the publishing account first",
+    "RORK — GPT-6.1 Sol (Sep 29) and Claude Sonnet 5.5 (Sep 28) are now in the model menu",
+    "RN 0.88 — React Native 0.88.x is scheduled for Oct 12, 2 days left",
+    "Q&A — People keep asking why AuthSession returns no result in Android standalone builds",
+    "WINDOWS — A walkthrough shows how to ship an iPhone app from Windows only, with no Mac",
+    "NEW — When only notifications fail in Expo Go: three checks to run first",
   ]
 };
 
