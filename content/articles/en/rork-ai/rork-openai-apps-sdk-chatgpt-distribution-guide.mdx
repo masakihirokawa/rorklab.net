@@ -5,7 +5,7 @@ category: "rork-ai"
 level: "advanced"
 premium: true
 date: "2026-04-27T11:30"
-updated: "2026-04-27T11:30"
+updated: "2026-10-09T18:30"
 author: "Rork Lab"
 description: "A complete implementation guide for distributing your Rork app's business logic as a ChatGPT-embedded mini app. Covers MCP server design, UI Resources, shared OAuth, Universal Link conversation handoffs, and pricing parity from a real production lens."
 tags: ["Rork", "OpenAI", "Apps SDK", "ChatGPT", "MCP", "Distribution"]
@@ -14,7 +14,7 @@ highlights:
   - "You'll walk away with working code for the MCP server, UI Resources, shared OAuth, and Universal Link handoff — the same patterns I run in production to keep one user identity across ChatGPT and the mobile app"
   - "You'll open a third distribution channel beyond App Store and Google Play, exposing your product directly to the hundreds of millions of people who live inside ChatGPT every day"
 ---
-A new distribution channel quietly opened in late 2025: apps that live inside ChatGPT. For years the App Store and Google Play were the two front doors to mobile, and every other user had to be reached through SEO or paid ads. With the OpenAI Apps SDK, you can now drop your product straight into the conversation surface that hundreds of millions of people use daily. The harder questions are the implementation ones: can you reuse the Rork codebase you've already shipped, do auth and billing become a duplicated nightmare, and where exactly does production tend to break? Public docs are accurate but thin on these realities.
+A new distribution channel opened in late 2025: apps that live inside ChatGPT. For years the App Store and Google Play were the two front doors to mobile, and every other user had to be reached through SEO or paid ads. With the OpenAI Apps SDK, you can now drop your product straight into the conversation surface that hundreds of millions of people use daily. The harder questions are the implementation ones: can you reuse the Rork codebase you've already shipped, do auth and billing become a duplicated nightmare, and where exactly does production tend to break? Public docs are accurate but thin on these realities.
 
 This guide walks through the design choices I make when adding an Apps SDK distribution layer on top of an existing Rork app, with code you can paste into a Cloudflare Workers project. The focus is on the parts that hurt later if you skip them — keeping a single user identity across ChatGPT and the mobile app, handing a conversation off mid-flow into the mobile UI, and keeping pricing coherent even though the payment rails are different. I'll also share the specific failures I ran into during my own integration, because the details that don't make it into official docs are usually where you lose a weekend.
 
@@ -45,20 +45,23 @@ The Apps SDK speaks the Model Context Protocol (MCP). ChatGPT acts as the MCP cl
 ```typescript
 // apps-sdk/src/server.ts
 import { Hono } from "hono";
-import { McpServer } from "@modelcontextprotocol/sdk/server/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { createTask, listTasks } from "@core/tasks";
 
-type Env = { DB: D1Database; OPENAI_APPS_SHARED_SECRET: string };
+type Env = { DB: D1Database; AUTH_JWKS_URL: string };
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.post("/mcp", async (c) => {
-  // Verify OpenAI's signature on every request
-  const sig = c.req.header("x-openai-apps-signature");
-  if (!verifySignature(sig, await c.req.text(), c.env.OPENAI_APPS_SHARED_SECRET)) {
-    return c.json({ error: "invalid_signature" }, 401);
+  // Verify the OAuth access token on every request (audience = your own MCP server)
+  const authed = await verifyBearerToken(c.req.header("authorization"), c.env.AUTH_JWKS_URL);
+  if (!authed) {
+    return c.json({ error: "unauthorized" }, 401, {
+      "WWW-Authenticate":
+        'Bearer resource_metadata="https://your-mcp.example.com/.well-known/oauth-protected-resource"',
+    });
   }
 
   const server = new McpServer({ name: "task-app", version: "1.0.0" });
@@ -74,9 +77,8 @@ app.post("/mcp", async (c) => {
       const userId = await resolveUserId(ctx, c.env.DB);
       const task = await createTask(c.env.DB, { userId, title, dueDate: due_date });
       return {
-        content: [
-          { type: "resource", resource: { uri: `ui://task-card/${task.id}` } },
-        ],
+        // Text the model can add to the conversation (the UI is bound via registerTool's _meta, below)
+        content: [{ type: "text", text: `Created task "${task.title}"` }],
         structuredContent: { taskId: task.id, title: task.title },
       };
     }
@@ -90,25 +92,24 @@ app.post("/mcp", async (c) => {
       const userId = await resolveUserId(ctx, c.env.DB);
       const tasks = await listTasks(c.env.DB, userId);
       return {
-        content: [
-          { type: "resource", resource: { uri: `ui://task-list?count=${tasks.length}` } },
-        ],
+        content: [{ type: "text", text: `${tasks.length} tasks found` }],
         structuredContent: { tasks },
       };
     }
   );
 
-  const transport = new StreamableHTTPServerTransport({});
+  // On Workers, use the transport that speaks web-standard Request / Response
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   await server.connect(transport);
-  return transport.handle(c.req.raw);
+  return transport.handleRequest(c.req.raw);
 });
 
 export default app;
 ```
 
-Two things matter most here. First, ship signature verification on day one. OpenAI sends an HMAC in `x-openai-apps-signature`; store the shared secret in Cloudflare Secrets and verify every request. If you defer this, your MCP endpoint becomes a public RPC for anyone who finds the URL — and someone will, because the manifest you submit lists it.
+Two things matter most here. First, ship authorization checks on day one. When I re-read the official docs, I could not find the request-signature header this article used to describe (an HMAC in `x-openai-apps-signature`), so I've removed it. What the docs do describe is verifying an OAuth 2.1 access token on every request, and confirming that traffic really comes from ChatGPT with mTLS (an OpenAI-managed client certificate) or an allowlist of its published egress IPs. If you defer all of these, your MCP endpoint becomes a public RPC for anyone who finds the URL.
 
-Second, return both `structuredContent` and `content` from every tool. The model uses the structured payload for reasoning later in the conversation; the content array is what users see. I dropped `structuredContent` early on and watched ChatGPT lose track of which task the user had just created — every follow-up question forced a redundant re-fetch. Returning both from the start avoids that whole class of bug.
+Second, return both `structuredContent` and `content` from every tool. The structured payload is concise data the model can reuse in later reasoning; the content array is text that accompanies the conversation. I dropped `structuredContent` early on and watched ChatGPT lose track of which task the user had just created — every follow-up question forced a redundant re-fetch. Returning both from the start avoids that whole class of bug.
 
 Third, pass a description alongside the tool name — that's the second argument to `server.tool()` above. Leave it out and the only clue the model has is the identifier `create_task`. This is the single biggest lever on call accuracy, so it gets its own section next.
 
@@ -170,11 +171,36 @@ if (due_date && !isValidDate(due_date)) {
 }
 ```
 
-After that one branch went in, date-format mismatches started resolving themselves mid-conversation. The user sees nothing; the model quietly retries with the right shape. Write error text as instructions addressed to the model rather than to a human reading a log, and accuracy climbs.
+After that one branch went in, date-format mismatches started resolving themselves mid-conversation. The user sees nothing; the model retries with the right shape. Write error text as instructions addressed to the model rather than to a human reading a log, and accuracy climbs.
 
 ## Reshaping Rork's React Components Into ChatGPT UI Resources
 
-Apps SDK lets your tools return `ui://...` URIs that ChatGPT renders as React-based cards inside the conversation. The trick that keeps this cheap is treating Rork's React Native components as a logic-and-tokens layer, then writing thin Web wrappers for the UI Resources.
+In Apps SDK, a UI is an HTML resource registered under a `ui://` URI and bound to a "render" tool. The binding lives in the tool definition's `_meta.ui.resourceUri` (`_meta["openai/outputTemplate"]` is accepted as a compatibility alias) — not in the tool's return value. The docs say to attach it only to the render tool; data tools just return `structuredContent` so the model can fetch first and render afterwards.
+
+```typescript
+const TEMPLATE_URI = "ui://task-card/v1";
+
+server.registerResource(
+  "task-card",
+  TEMPLATE_URI,
+  { mimeType: "text/html;profile=mcp-app" },
+  async () => ({
+    contents: [{ uri: TEMPLATE_URI, mimeType: "text/html;profile=mcp-app", text: TASK_CARD_HTML }],
+  })
+);
+
+server.registerTool(
+  "show_task_card",
+  {
+    description: "Show one task as a card. Pass content you just fetched with list_tasks.",
+    inputSchema: { taskId: z.string() },
+    _meta: { ui: { resourceUri: TEMPLATE_URI } },
+  },
+  async ({ taskId }) => ({ structuredContent: { taskId } })
+);
+```
+
+If the HTML loads external scripts or images, declare the allowed domains in the resource's `_meta.ui.csp` (`connectDomains` / `resourceDomains`); nested frames are blocked by default. The UI itself can be React-based. The trick that keeps this cheap is treating Rork's React Native components as a logic-and-tokens layer, then writing thin Web wrappers for the UI Resources.
 
 ```typescript
 // apps-sdk/src/ui/task-card.tsx
@@ -207,7 +233,7 @@ A practical detail about layout: ChatGPT renders UI Resources at a constrained w
 
 ## Sharing One User Identity Across ChatGPT and the Mobile App
 
-This is the most common place to crash in production. Apps SDK supports OAuth 2.0 Authorization Code Flow, so you can bind a ChatGPT user to your service's account. The trap is that your Rork app already has its own auth, and a naive integration doubles the user table.
+This is the most common place to crash in production. Apps SDK authentication follows the MCP authorization spec: OAuth 2.1, authorization-code flow with PKCE, so you can bind a ChatGPT user to your service's account. Your authorization server should advertise `S256` in `code_challenge_methods_supported`, validate the `resource` parameter on both authorization and token requests, and issue tokens whose audience is your MCP server. The MCP server publishes `/.well-known/oauth-protected-resource`. Client-ID metadata documents (CIMD) are preferred for registration, DCR works if you expose a `registration_endpoint`, and machine-to-machine grants such as client credentials are not supported. The trap is that your Rork app already has its own auth, and a naive integration doubles the user table.
 
 The pattern I use is a "reverse" flow: from inside the Rork app, the user taps "Connect ChatGPT" and starts the OAuth dance with the ChatGPT side as the relying party. New users still get the standard ChatGPT-initiated flow; existing paying users get the in-app flow. Both land on the same row in the users table.
 
@@ -353,15 +379,32 @@ A few guardrails that save time during this stage. First, log every MCP request 
 
 Once functional testing is green, do a manual round-trip exercise: install the integration, do five different real conversations covering normal usage, edge cases, and error states, and time how long each round-trip takes. If any tool consistently exceeds five seconds even on a fast network, refactor it before you submit. Reviewers do try the integration in real conversations, and slow tools are a common rejection reason. In my own experience, the difference between a one-week approval and a three-week back-and-forth often comes down to whether tool calls feel snappy from the very first interaction the reviewer has.
 
+## Checking This Guide Against the Official Docs (October 9, 2026)
+
+Before revising this article, I compared every code sample against the official documentation. I had assumed the code I pasted late one night would simply run; the places where it didn't only showed up as type errors.
+
+<table>
+<tr><th>Item</th><th>What this article said before</th><th>What I could confirm</th></tr>
+<tr><td><code>McpServer</code> import</td><td><code>server/index.js</code></td><td><code>server/mcp.js</code> (checked against SDK 1.32.1)</td></tr>
+<tr><td>Transport for Workers</td><td><code>StreamableHTTPServerTransport</code> with <code>handle()</code></td><td><code>WebStandardStreamableHTTPServerTransport</code> with <code>handleRequest(request)</code></td></tr>
+<tr><td>Request signing</td><td>HMAC in <code>x-openai-apps-signature</code></td><td>Not documented. OAuth 2.1 token checks, plus mTLS or an IP allowlist</td></tr>
+<tr><td>Binding a UI</td><td>Return a <code>ui://</code> resource from the tool</td><td><code>_meta.ui.resourceUri</code> on the render tool</td></tr>
+<tr><td>OAuth</td><td>OAuth 2.0</td><td>OAuth 2.1 + PKCE (S256), <code>resource</code> parameter</td></tr>
+</table>
+
+I confirmed `handleRequest` from the type definitions shipped inside the SDK package. What I have not done is observe the actual traffic ChatGPT sends, so headers and other wire-level details are limited to what the docs state.
+
+**Before pasting any code, check the import line against the SDK's type definitions once.** I keep that habit even on days when I'm in a hurry.
+
 ## Production Pitfalls I've Hit (And How to Skip Them)
 
 A few things only show up under real load, and almost all of them have 30-minute fixes if you know they exist.
 
-**MCP response-time pressure.** Apps SDK has a tool-response timeout that, in practice, you should treat as roughly ten seconds. If your tool kicks off heavy work — multi-step external API calls, long generations — you need a "show progress immediately, deliver the rest async" pattern using Server-Sent Events or polling. I once chained three Notion API calls inside a single tool and pushed past twelve seconds; ChatGPT showed a timeout error. The fix was to return the first item immediately and let the others stream in.
+**MCP response-time pressure.** I could not find a documented timeout value, so I treat ten seconds as my own budget. If your tool kicks off heavy work — multi-step external API calls, long generations — you need a "show progress immediately, deliver the rest async" pattern using Server-Sent Events or polling. I once chained three Notion API calls inside a single tool and pushed past twelve seconds; ChatGPT showed a timeout error. The fix was to return the first item immediately and let the others stream in.
 
-**UI Resource caching.** ChatGPT caches `ui://` URIs aggressively, so updates to underlying data can be invisible until the user starts a new conversation. Add a version query like `ui://task-card/123?v=<timestamp>`, or set `Cache-Control: no-store` on the resource response.
+**UI template caching.** A template URI such as `ui://task-card/v1` can be reused by the client. If you ship new HTML and still see the old look, bump the version segment (`v1` → `v2`). Pass changing data through `structuredContent` rather than the URI, and the problem mostly disappears.
 
-**Refresh-token expiry.** Refresh tokens issued through Apps SDK quietly invalidate after long periods of inactivity, even if the user never disconnected. Track each user's last access and force a re-auth path if more than 30 days pass between visits — the resulting error handling is much cleaner than reacting to surprise 401s in production.
+**Refresh-token lifetime.** Your authorization server decides it, not ChatGPT. Track each user's last access and pick a policy yourself — for example, require re-authorization after 30 days of silence — so you are never surprised by a 401 in production.
 
 **Image hosting and CORS.** UI Resources can only display images from absolute URLs hosted with proper CORS headers. R2 or any CDN with `Access-Control-Allow-Origin: *` works. Sharing the asset bundle with the Rork side via something like `@rork/assets` is the cheapest path.
 
@@ -375,7 +418,7 @@ Building the integration is half the job; getting it discovered is the other hal
 
 Once users tap through from ChatGPT into your Rork app, switch onboarding behavior. They've already had a focused conversation about their problem; they don't need the standard feature tour. Read the `correlation_id` from the deep link, skip onboarding for that session, and drop them on the relevant screen with the context already loaded. This single change typically lifts ChatGPT-sourced first-day retention significantly.
 
-On the ASO side, mention the integration in your store description: "Talk to this app inside ChatGPT — say '...' to start." After I added one line like this to a store listing, the install conversion rate moved up by about 12% over the next two weeks. Apps SDK isn't only a distribution layer — it's also a credibility cue inside the App Store. The same logic applies to Google Play. Reviewers and users both see "works with ChatGPT" as a quality signal in 2026.
+On the ASO side, mention the integration in your store description: "Talk to this app inside ChatGPT — say '...' to start." After I added one line like this to a store listing, conversion felt like it moved up over the following weeks — but other changes shipped at the same time, so I can't give you an isolated number. Apps SDK isn't only a distribution layer — it's also a credibility cue inside the App Store. The same logic applies to Google Play. Reviewers and users both see "works with ChatGPT" as a quality signal in 2026.
 
 For deeper integration into your marketing funnel, consider making one or two of your most popular tool flows shareable as conversation starter templates. ChatGPT users often pass URLs back and forth that pre-fill prompts; if you provide a shareable URL like `https://chatgpt.com/?model=gpt-4&prompt=...&app=task-manager`, you create organic word-of-mouth distribution that doesn't require any paid acquisition spend.
 
@@ -393,4 +436,4 @@ For deeper investigation, replay matters. Store the raw MCP envelope for every r
 
 Don't try to build everything at once. Stand up `/mcp` with a single tool — `list_tasks` is a great choice — wire up a test OAuth client, and let the UI Resource render `<div>{title}</div>`. From there, your time is best spent on the handoff: the moment a ChatGPT conversation needs to continue inside the Rork app is where most of the user value sits.
 
-ChatGPT is becoming a third storefront alongside the App Store and Google Play. Whether you can be present on all three by the end of 2026 is the kind of strategic question that quietly compounds.
+ChatGPT is becoming a third storefront alongside the App Store and Google Play. Whether you can be present on all three by the end of 2026 is the kind of strategic question that compounds.
