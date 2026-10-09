@@ -53,8 +53,8 @@ const GUIDE_TRACKS: Record<string, { title: Record<string, string>; desc: Record
     {
       title: { ja: "AI モデルを活用する", en: "Leverage AI Models" },
       desc: {
-        ja: "Claude Opus 4.6 を中心とした AI 連携と高度なプロンプト活用術",
-        en: "AI integration with Claude Opus 4.6 and advanced prompting techniques",
+        ja: "Claude・Gemini などとの AI 連携と高度なプロンプト活用術",
+        en: "AI integration with Claude, Gemini, and more, plus advanced prompting techniques",
       },
       categories: ["rork-ai"],
     },
