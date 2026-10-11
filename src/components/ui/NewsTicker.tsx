@@ -6,18 +6,18 @@ const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
     "EXPO — EAS Observe がネイティブクラッシュも記録（10/07）。SDK 57 は 57.0.21 以降で確認できます",
     "RORK — 09-29 に GPT-6.1 Sol、09-28 に Claude Sonnet 5.5 を追加。モデル選択で使えます",
-    "RN 0.88 — 正式リリース予定は 10/12、残り1日。10/07 時点は rc.4",
+    "RN 0.88 — 正式版は予定日の 10/12 時点で未公開。最新は rc.4（10/07）、Latest は 0.87.1 です",
     "Q&A — expo-widgets のウィジェットが本番ビルドだけ真っ黒になる、という報告が出ています",
     "WINDOWS — Mac がなくても Windows だけで iPhone アプリを出す手順が共有されています",
-    "NEW — クライアントのアプリを Rork で作る前に決める、公開アカウントの持ち主",
+    "NEW — Expo Go で通知だけが届かない夜に、先に切り分ける3点",
   ],
   en: [
     "EXPO — EAS Observe now records native crashes (Oct 7). On SDK 57, update to 57.0.21 or later",
     "RORK — GPT-6.1 Sol (Sep 29) and Claude Sonnet 5.5 (Sep 28) are now in the model menu",
-    "RN 0.88 — Scheduled for Oct 12, 1 day left. As of Oct 7 it was at rc.4",
+    "RN 0.88 — The stable release was still unpublished on its Oct 12 target. rc.4 (Oct 7) is the newest; 0.87.1 is Latest",
     "Q&A — Readers report expo-widgets showing a black widget in production builds only",
     "WINDOWS — A walkthrough shows how to ship an iPhone app from Windows only, with no Mac",
-    "NEW — Before building a client's app in Rork, decide who owns the publishing account",
+    "NEW — Three checks to run first when notifications stop arriving in Expo Go",
   ]
 };
 
