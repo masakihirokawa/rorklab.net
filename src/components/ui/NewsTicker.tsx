@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-  ja: [
+ja: [
     "EXPO — EAS Observe がネイティブクラッシュも記録（10/07）。SDK 57 は 57.0.21 以降で確認できます",
     "RORK — 09-29 に GPT-6.1 Sol、09-28 に Claude Sonnet 5.5 を追加。モデル選択で使えます",
-    "RN 0.88 — 正式版は予定日の 10/12 時点で未公開。最新は rc.4（10/07）、Latest は 0.87.1 です",
-    "Q&A — expo-widgets のウィジェットが本番ビルドだけ真っ黒になる、という報告が出ています",
-    "WINDOWS — Mac がなくても Windows だけで iPhone アプリを出す手順が共有されています",
-    "NEW — Expo Go で通知だけが届かない夜に、先に切り分ける3点",
+    "RN 0.88 — 正式版は未公開。最新は rc.4（10/07）、Latest は 0.87.1 です",
+    "Q&A — Expo + Supabase のアプリを TestFlight に出すまでに詰まる4点が共有されています",
+    "ECOSYSTEM — Shopify はネイティブに戻る中、1人開発で Expo に残る理由を整理した記録が出ています",
+    "NEW — 「1週間でリリース」と書く前に、待ち日数の内訳を見る",
   ],
   en: [
-    "EXPO — EAS Observe now records native crashes (Oct 7). On SDK 57, update to 57.0.21 or later",
-    "RORK — GPT-6.1 Sol (Sep 29) and Claude Sonnet 5.5 (Sep 28) are now in the model menu",
-    "RN 0.88 — The stable release was still unpublished on its Oct 12 target. rc.4 (Oct 7) is the newest; 0.87.1 is Latest",
-    "Q&A — Readers report expo-widgets showing a black widget in production builds only",
-    "WINDOWS — A walkthrough shows how to ship an iPhone app from Windows only, with no Mac",
-    "NEW — Three checks to run first when notifications stop arriving in Expo Go",
+    "EXPO — EAS Observe now records native crashes too (Oct 7). Check on SDK 57 at 57.0.21 or later",
+    "RORK — GPT-6.1 Sol (Sep 29) and Claude Sonnet 5.5 (Sep 28) were added to the model menu",
+    "RN 0.88 — Not out yet. The latest is rc.4 (Oct 7), and 0.87.1 is the current Latest",
+    "Q&A — A write-up lists four snags on the way to TestFlight with an Expo + Supabase app",
+    "ECOSYSTEM — With Shopify going back to native, one write-up explains why a solo developer stays on Expo",
+    "NEW — Before you write 'ship in a week', look at the breakdown of waiting days",
   ]
 };
 
