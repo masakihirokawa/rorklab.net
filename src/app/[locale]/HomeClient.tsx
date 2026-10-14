@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useTranslations } from "next-intl";
-import { useTheme } from "next-themes";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import type { ArticleMeta } from "@/lib/content";
 
@@ -14,28 +13,16 @@ const CATEGORIES = [
   { id: "app-dev", icon: "◇", color: "var(--accent-purple)" },
 ];
 
-const GUIDES_DARK = {
-  purple: "linear-gradient(135deg, #20223e 0%, #29236c 55%, #2f207c 100%)",
-  green: "linear-gradient(135deg, #192c21 0%, #1f4431 55%, #244b34 100%)",
-  red: "linear-gradient(135deg, #281c24 0%, #3a1f2e 55%, #492434 100%)",
-};
-
-const GUIDES_LIGHT = {
-  purple: "linear-gradient(135deg, #eeedf8 0%, #e3dff5 55%, #d8d3ef 100%)",
-  green: "linear-gradient(135deg, #eaf5ed 0%, #d8eedf 55%, #c9e6d1 100%)",
-  red: "linear-gradient(135deg, #f7eef0 0%, #f0dde2 55%, #e8d0d7 100%)",
-};
-
-const GUIDES: Record<string, { title: string; desc: string; categories: string[]; level: string; colorKey: keyof typeof GUIDES_DARK; href: string }[]> = {
+const GUIDES: Record<string, { title: string; desc: string; categories: string[]; level: string; colorKey: "gold" | "silver" | "rose"; href: string }[]> = {
   ja: [
-    { title: "Rork Max 完全入門ガイド", desc: "初めての方はここから", categories: ["rork-basics"], level: "beginner", colorKey: "purple", href: "/articles/rork-basics" },
-    { title: "開発ツール連携マニュアル", desc: "外部ツールとの統合を完全解説", categories: ["rork-dev"], level: "intermediate", colorKey: "green", href: "/articles/rork-dev" },
-    { title: "AI連携 × App Store 公開ハンドブック", desc: "AIを組み込んで本格アプリを公開", categories: ["rork-business"], level: "intermediate", colorKey: "red", href: "/articles/rork-business" },
+    { title: "Rork Max 完全入門ガイド", desc: "初めての方はここから", categories: ["rork-basics"], level: "beginner", colorKey: "gold", href: "/articles/rork-basics" },
+    { title: "開発ツール連携マニュアル", desc: "外部ツールとの統合を完全解説", categories: ["rork-dev"], level: "intermediate", colorKey: "silver", href: "/articles/rork-dev" },
+    { title: "AI連携 × App Store 公開ハンドブック", desc: "AIを組み込んで本格アプリを公開", categories: ["rork-business"], level: "intermediate", colorKey: "rose", href: "/articles/rork-business" },
   ],
   en: [
-    { title: "Getting Started with Rork Max", desc: "Start here if you're new", categories: ["rork-basics"], level: "beginner", colorKey: "purple", href: "/en/articles/rork-basics" },
-    { title: "Developer Tools Integration", desc: "Complete guide to external tool integrations", categories: ["rork-dev"], level: "intermediate", colorKey: "green", href: "/en/articles/rork-dev" },
-    { title: "AI to App Store Handbook", desc: "Integrate AI and publish professional apps", categories: ["rork-business"], level: "intermediate", colorKey: "red", href: "/en/articles/rork-business" },
+    { title: "Getting Started with Rork Max", desc: "Start here if you're new", categories: ["rork-basics"], level: "beginner", colorKey: "gold", href: "/en/articles/rork-basics" },
+    { title: "Developer Tools Integration", desc: "Complete guide to external tool integrations", categories: ["rork-dev"], level: "intermediate", colorKey: "silver", href: "/en/articles/rork-dev" },
+    { title: "AI to App Store Handbook", desc: "Integrate AI and publish professional apps", categories: ["rork-business"], level: "intermediate", colorKey: "rose", href: "/en/articles/rork-business" },
   ],
 };
 
@@ -57,7 +44,6 @@ interface HomeClientProps {
 
 export default function HomeClient({ articles, locale }: HomeClientProps) {
   const t = useTranslations();
-  const { theme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const [skipAnim, setSkipAnim] = useState(false);
   const [hoveredCat, setHoveredCat] = useState<string | null>(null);
@@ -71,8 +57,6 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
     }
     setMounted(true);
   }, []);
-
-  const isDark = (!mounted && !skipAnim) || theme === "dark";
 
   const catColor = (id: string) => CATEGORIES.find((c) => c.id === id)?.color || "var(--text-muted)";
 
@@ -306,20 +290,20 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               <a
                 key={i}
                 href={guide.href}
-                className="guide-card"
+                className={`guide-card guide-${guide.colorKey}`}
                 style={{
                   display: "block", padding: "32px 28px", borderRadius: 8,
-                  background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
                   cursor: "pointer",
                   textDecoration: "none",
                 }}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
-                  <LevelBadge level={guide.level} label={t(`levels.${guide.level}`)} />
+                  <span className="guide-badge"><LevelBadge level={guide.level} label={t(`levels.${guide.level}`)} /></span>
                   <span style={{ fontSize: 11, color: "var(--text-dim)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
                     {t("articles.count", { count })}
                   </span>
                 </div>
+                <span className="guide-rule" aria-hidden="true" />
                 <h3 style={{ fontSize: 18, fontWeight: 500, color: "var(--text-primary)", marginBottom: 8, letterSpacing: "0.01em" }}>
                   {guide.title}
                 </h3>
