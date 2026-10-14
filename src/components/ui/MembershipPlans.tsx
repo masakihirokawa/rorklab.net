@@ -117,8 +117,8 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
             position: "absolute" as const, top: -9, right: 12,
             fontSize: 9, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.12em",
             padding: "3px 8px 1px", borderRadius: 4,
-            background: CAMPAIGN.enabled ? "linear-gradient(135deg, #b8860b, #daa520, #f0c040)" : accent,
-            color: CAMPAIGN.enabled ? "#fff" : "var(--bg-primary)",
+            background: CAMPAIGN.enabled ? "linear-gradient(135deg, var(--gold-champagne-deep), var(--gold-champagne-mid), var(--gold-champagne-light))" : accent,
+            color: CAMPAIGN.enabled ? "#2a2114" : "var(--bg-primary)",
             fontWeight: 700,
           }}>
             {t.recommended}
@@ -139,7 +139,7 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
               </span>
             )}
             <span style={{
-              color: CAMPAIGN.enabled ? "#daa520" : accent,
+              color: CAMPAIGN.enabled ? "var(--gold-champagne)" : accent,
               fontWeight: CAMPAIGN.enabled ? 600 : 300,
             }}>
               {t.premiumPrice}

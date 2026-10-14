@@ -192,12 +192,12 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
             padding: "14px 24px",
             borderRadius: 8,
             border: campaign.enabled
-              ? "1px solid color-mix(in srgb, #daa520 50%, transparent)"
+              ? "1px solid color-mix(in srgb, var(--gold-champagne) 50%, transparent)"
               : "1px solid color-mix(in srgb, var(--accent-coral) 50%, transparent)",
             background: campaign.enabled
-              ? "color-mix(in srgb, #daa520 12%, transparent)"
+              ? "color-mix(in srgb, var(--gold-champagne) 12%, transparent)"
               : "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-            color: campaign.enabled ? "#daa520" : "var(--accent-coral)",
+            color: campaign.enabled ? "var(--gold-champagne)" : "var(--accent-coral)",
             fontSize: 14,
             fontWeight: 700,
             cursor: loading ? "wait" : "pointer",
@@ -209,13 +209,13 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
           }}
           onMouseEnter={(e) => {
             if (!loading) {
-              const c = campaign.enabled ? "#daa520" : "var(--accent-coral)";
+              const c = campaign.enabled ? "var(--gold-champagne)" : "var(--accent-coral)";
               e.currentTarget.style.background = `color-mix(in srgb, ${c} 20%, transparent)`;
               e.currentTarget.style.transform = "translateY(-1px)";
             }
           }}
           onMouseLeave={(e) => {
-            const c = campaign.enabled ? "#daa520" : "var(--accent-coral)";
+            const c = campaign.enabled ? "var(--gold-champagne)" : "var(--accent-coral)";
             e.currentTarget.style.background = `color-mix(in srgb, ${c} 12%, transparent)`;
             e.currentTarget.style.transform = "translateY(0)";
           }}
@@ -227,12 +227,12 @@ export function PremiumPaywall({ locale, highlights }: PremiumPaywallProps) {
               right: 12,
               padding: "3px 9px 1px",
               borderRadius: 4,
-              background: "linear-gradient(135deg, #b8860b, #daa520, #f0c040)",
+              background: "linear-gradient(135deg, var(--gold-champagne-deep), var(--gold-champagne-mid), var(--gold-champagne-light))",
               fontSize: 10,
               fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
               fontWeight: 700,
               letterSpacing: locale === "ja" ? "0.1em" : "0.03em",
-              color: "#fff",
+              color: "#2a2114",
               whiteSpace: "nowrap" as const,
             }}>
               {campaign.name}
