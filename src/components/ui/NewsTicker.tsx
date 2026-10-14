@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
-    "EXPO — EAS Observe がネイティブクラッシュも記録（10/07）。SDK 57 は 57.0.21 以降で確認できます",
-    "RORK — 09-29 に GPT-6.1 Sol、09-28 に Claude Sonnet 5.5 を追加。モデル選択で使えます",
-    "SDK 58 — ベータ（9/15）のまま。stable が出る前に、SDK 57 のアプリで確かめておく点を整理しています",
-    "Q&A — CPU が 2 コアだと jest が終わらない。CI で詰まる原因を追った記録が共有されています",
-    "WIDGET — iOS のウィジェットが本番ビルドだけ真っ黒になる原因を追った記録が出ています",
-    "NEW — 個人アカウントで出した iOS アプリを法人へ移せるか。App Transfer の前に外す5つ",
+    "GPT-6.1 SOL — Rork のモデルメニューに追加（09-29）。Low／Medium／High を選べ、Pro・Max に含まれます",
+    "SONNET 5.5 — UI づくりが得意で、Sonnet 5 より出力が速いモデルが選べます（09-28）",
+    "SDK 58 — Beta が 09/15 から。stable の案内はまだなく、Expo Go でのプロジェクト実行は 09/03 からログインが必要です",
+    "WIDGET — iOS のウィジェットが本番ビルドだけ真っ黒になる原因を追った報告が出ています",
+    "OBSERVE — EAS Observe がネイティブクラッシュも記録します（SDK 57.0.21 以降・10/07）",
+    "NEW — 起動広告が、背面から戻った回にしか出ていませんでした。「前面に戻った」合図が、…",
   ],
   en: [
-    "EXPO — EAS Observe now records native crashes (Oct 7). On SDK 57, check for 57.0.21 or later",
-    "RORK — GPT-6.1 Sol (09-29) and Claude Sonnet 5.5 (09-28) are in the model menu",
-    "SDK 58 — Still in beta (since Sep 15). What to check on an SDK 57 app before the stable release",
-    "Q&A — Jest never finishes on a 2-core CPU. A write-up traces the cause in CI",
-    "WIDGET — A write-up traces why an iOS widget goes black only in production builds",
-    "NEW — Moving an iOS app from a personal account to an organization: five things to clear before App Transfer"
+    "GPT-6.1 SOL — Added to Rork's model menu (09-29) with Low, Medium and High effort; included on Pro and Max",
+    "SONNET 5.5 — Claude Sonnet 5.5 is selectable: strong at UI design and faster than Sonnet 5 (09-28)",
+    "SDK 58 — Beta since 09/15 with no stable date yet; running projects in Expo Go has required login since 09/03",
+    "WIDGET — A write-up traces an iOS widget that renders black only in production builds",
+    "OBSERVE — EAS Observe now records native crashes too (SDK 57.0.21 or later, 10/07)",
+    "NEW — My App Open Ad Only Showed When the App…"
   ]
 };
 
