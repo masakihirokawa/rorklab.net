@@ -62,6 +62,7 @@ export function RelatedArticles({
           return (
             <a
               key={article.slug}
+              className="related-card"
               href={`${prefix}/articles/${article.category}/${article.slug}`}
               style={{
                 display: "block",

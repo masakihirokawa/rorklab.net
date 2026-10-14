@@ -110,7 +110,7 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
         />
 
         <div
-          className={mounted && !skipAnim ? "animate-fade-up" : ""}
+          className={mounted && !skipAnim ? "hero-seq" : ""}
           style={{ position: "relative", zIndex: 1, padding: "0 24px", opacity: mounted || skipAnim ? 1 : 0 }}
         >
           <div style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.2em", marginBottom: 24 }}>
@@ -175,7 +175,6 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               <a
                 key={cat.id}
                 href={`${prefix}/articles/${cat.id}`}
-                className={mounted && !skipAnim ? "animate-fade-up" : ""}
                 style={{
                   gridColumn: i < 3 ? "span 2" : "span 3",
                   display: "block", padding: "28px 24px", textDecoration: "none",
@@ -184,7 +183,6 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
                   cursor: "pointer", transition: "all 0.4s cubic-bezier(0.16, 1, 0.3, 1)",
                   position: "relative", overflow: "hidden",
                   transform: hoveredCat === cat.id ? "translateY(-2px)" : "none",
-                  animationDelay: `${i * 0.1}s`,
                 }}
                 onMouseEnter={() => setHoveredCat(cat.id)}
                 onMouseLeave={() => setHoveredCat(null)}
@@ -236,13 +234,10 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               <a
                 key={`${article.category}/${article.slug}`}
                 href={articleUrl(article)}
-                className={mounted && !skipAnim ? "animate-fade-up" : ""}
                 style={{
                   display: "block", padding: "24px 0",
                   borderBottom: "1px solid var(--border-subtle)",
                   cursor: "pointer", transition: "all 0.3s",
-                  paddingLeft: hoveredArticle === i ? 12 : 0,
-                  animationDelay: `${0.3 + i * 0.08}s`,
                   textDecoration: "none",
                 }}
                 onMouseEnter={() => setHoveredArticle(i)}
@@ -311,12 +306,11 @@ export default function HomeClient({ articles, locale }: HomeClientProps) {
               <a
                 key={i}
                 href={guide.href}
-                className={`guide-card${mounted && !skipAnim ? " animate-fade-up" : ""}`}
+                className="guide-card"
                 style={{
                   display: "block", padding: "32px 28px", borderRadius: 8,
                   background: isDark ? GUIDES_DARK[guide.colorKey] : GUIDES_LIGHT[guide.colorKey], border: "1px solid var(--border-subtle)",
                   cursor: "pointer",
-                  animationDelay: `${0.5 + i * 0.1}s`,
                   textDecoration: "none",
                 }}
               >

@@ -235,6 +235,7 @@ export default async function ArticlePage({ params }: Props) {
       dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbLd) }}
     />
     <article style={{ maxWidth: 740, margin: "0 auto", padding: "40px 24px 120px" }}>
+      <div className="read-progress" aria-hidden="true" />
       {/* Breadcrumb */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 32 }}>
         <a
