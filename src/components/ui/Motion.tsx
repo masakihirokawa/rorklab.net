@@ -27,7 +27,7 @@ const RV_SEL = [
 ].join(",");
 
 // ロールオーバーで「入った点から色が広がる」対象（見た目は CSS）
-const FX_SEL = "main a:has(> h3), main [style*='grid-template-columns'] > a, .related-card";
+const FX_SEL = "main a:has(> h3), main [style*='grid-template-columns'] > a, .related-card, [data-fx]";
 
 export function Motion() {
   const pathname = usePathname();
@@ -140,6 +140,49 @@ export function Motion() {
       io.disconnect();
       // 遷移後も隠れたまま残らないよう、監視中のものは表示状態へ戻す
       main.querySelectorAll("[data-rv-h]").forEach((el) => el.removeAttribute("data-rv-h"));
+    };
+  }, [pathname]);
+
+  // 全リンク・全ボタンを実際の見た目で分類し、data-fx を付ける（見た目は CSS 側。React の className/style には触れない）
+  useEffect(() => {
+    const seen = new WeakSet<Element>();
+    const alpha = (c: string) => {
+      if (!c || c === "transparent" || c === "rgba(0, 0, 0, 0)") return 0;
+      const m = c.match(/\/\s*([\d.]+%?)\s*\)/) || c.match(/rgba\([^)]*,\s*([\d.]+)\)/);
+      if (!m) return 1;
+      return m[1].endsWith("%") ? parseFloat(m[1]) / 100 : parseFloat(m[1]);
+    };
+    const classify = (el: HTMLElement) => {
+      if (seen.has(el)) return;
+      seen.add(el);
+      if (el.matches(FX_SEL.replace(", [data-fx]", ""))) return; // 行・カードは専用の演出
+      if (el.closest(".article-content") && el.tagName === "A") return; // 本文リンクは専用
+      const cs = getComputedStyle(el);
+      if (cs.display === "none") return;
+      const bgA = alpha(cs.backgroundColor);
+      const hasBg = cs.backgroundImage !== "none" || bgA > 0.02;
+      const hasBorder = ["Top", "Right", "Bottom", "Left"].some(
+        (s) => parseFloat(cs.getPropertyValue(`border-${s.toLowerCase()}-width`)) > 0 && cs.getPropertyValue(`border-${s.toLowerCase()}-style`) !== "none"
+      );
+      const iconOnly = !!el.querySelector("svg") && !(el.textContent || "").trim();
+      const href = el.getAttribute("href") || "";
+      const brand = !!el.closest("header") && (href === "/" || href === "/en" || href === "/en/");
+      const kind = brand ? "brand" : iconOnly ? "icon" : hasBg || hasBorder ? "btn" : cs.textDecorationLine.includes("underline") ? "ul" : "text";
+      el.setAttribute("data-fx", kind);
+      if (kind === "btn" && bgA > 0.6) el.setAttribute("data-fx-solid", "");
+      if (cs.position === "fixed" || cs.position === "absolute") el.setAttribute("data-fx-abs", "");
+    };
+    const scan = () => document.querySelectorAll<HTMLElement>("a[href], button").forEach(classify);
+    scan();
+    let t = 0;
+    const mo = new MutationObserver(() => {
+      window.clearTimeout(t);
+      t = window.setTimeout(scan, 120);
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      window.clearTimeout(t);
+      mo.disconnect();
     };
   }, [pathname]);
 
