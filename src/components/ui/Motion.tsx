@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { usePathname } from "next/navigation";
 
 /**
@@ -24,13 +24,73 @@ const RV_SEL = [
   "main h2",
   ".article-content > h2",
   ".article-content > :is(pre, table, blockquote, .callout, .table-scroll, figure, [data-rehype-pretty-code-figure])",
+  "footer > *", // フッターの各段
 ].join(",");
+
+// 各ページの本文ブロック（段落・リスト・表・フォーム）。親がすでに演出対象のもの・カード/ボタン/記事本文の中は除く
+const GEN_SEL = "main :is(p, ul, ol, dl, table, form, details):not(.article-content *)";
+const GEN_SKIP = "a, button, nav, [data-rv-h], [data-rv-in], .article-content, [role='dialog']";
 
 // ロールオーバーで「入った点から色が広がる」対象（見た目は CSS）
 const FX_SEL = "main a:has(> h3), main [style*='grid-template-columns'] > a, .related-card, [data-fx]";
 
 export function Motion() {
   const pathname = usePathname();
+  const firstPath = useRef(true);
+
+  // 画面遷移の演出は 2 回目以降のページ移動から（初回表示の LCP を遅らせない）
+  useEffect(() => {
+    if (firstPath.current) {
+      firstPath.current = false;
+      return;
+    }
+    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) document.documentElement.setAttribute("data-nav", "");
+  }, [pathname]);
+
+  // カーソルの金の光（PC のみ）と、後から現れるメニュー・モーダル・バーの登場演出
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const root = document.documentElement;
+    let raf = 0;
+    let x = 0;
+    let y = 0;
+    const move = (e: PointerEvent) => {
+      x = e.clientX;
+      y = e.clientY;
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        root.style.setProperty("--px", `${x}px`);
+        root.style.setProperty("--py", `${y}px`);
+        root.setAttribute("data-glow", "");
+      });
+    };
+    const fine = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+    if (fine) document.addEventListener("pointermove", move, { passive: true });
+
+    const pop = (n: Node) => {
+      if (!(n instanceof HTMLElement) || n.hasAttribute("data-pop")) return;
+      const cs = getComputedStyle(n);
+      if ((cs.position === "fixed" || cs.position === "absolute") && parseInt(cs.zIndex, 10) >= 50) {
+        const full = n.offsetWidth >= window.innerWidth * 0.95 && n.offsetHeight >= window.innerHeight * 0.9;
+        n.setAttribute("data-pop", full ? "fade" : "pop");
+      }
+    };
+    const mo = new MutationObserver((recs) =>
+      recs.forEach((r) =>
+        r.addedNodes.forEach((n) => {
+          pop(n);
+          if (n instanceof HTMLElement) Array.from(n.children).forEach(pop);
+        })
+      )
+    );
+    mo.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      if (fine) document.removeEventListener("pointermove", move);
+      if (raf) cancelAnimationFrame(raf);
+      mo.disconnect();
+    };
+  }, []);
 
   // ロールオーバー: カーソルが入った点（出た点）を --mx / --my に書くだけ（PC のみ）
   useEffect(() => {
@@ -93,9 +153,10 @@ export function Motion() {
 
     const scan = () => {
       const vh = window.innerHeight;
-      main.querySelectorAll<HTMLElement>(RV_SEL).forEach((el) => {
+      document.querySelectorAll<HTMLElement>(`${RV_SEL},${GEN_SEL}`).forEach((el) => {
         if (seen.has(el)) return;
         seen.add(el);
+        if (el.matches(GEN_SEL) && !el.matches(RV_SEL) && el.parentElement?.closest(GEN_SKIP)) return;
         const b = el.getBoundingClientRect();
         // すでに画面内・通り過ぎた要素はそのまま（初回表示を遅らせない・LCP と CLS を悪化させない）
         if (b.top < vh * 0.94) return;
@@ -116,7 +177,7 @@ export function Motion() {
       idle = window.setTimeout(() => {
         v = 0;
         const vh = window.innerHeight;
-        main.querySelectorAll<HTMLElement>("[data-rv-h]").forEach((el) => {
+        document.querySelectorAll<HTMLElement>("[data-rv-h]").forEach((el) => {
           const b = el.getBoundingClientRect();
           if (b.top < vh * 0.94 && b.bottom > 0) reveal(el, 0, false);
         });
@@ -139,7 +200,7 @@ export function Motion() {
       mo.disconnect();
       io.disconnect();
       // 遷移後も隠れたまま残らないよう、監視中のものは表示状態へ戻す
-      main.querySelectorAll("[data-rv-h]").forEach((el) => el.removeAttribute("data-rv-h"));
+      document.querySelectorAll("[data-rv-h]").forEach((el) => el.removeAttribute("data-rv-h"));
     };
   }, [pathname]);
 
