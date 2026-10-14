@@ -2,7 +2,6 @@ import type { Metadata } from "next";
 import { notFound, permanentRedirect } from "next/navigation";
 import { getArticle, getArticles, getArticleContent, getAllArticleSlugs, CATEGORIES, getTagCounts, toIsoJst } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
-import { BookRecommendation } from "@/components/ui/BookRecommendation";
 import { ShareButtons } from "@/components/ui/ShareButtons";
 import { RelatedArticles } from "@/components/ui/RelatedArticles";
 import { TableOfContents } from "@/components/ui/TableOfContents";
@@ -412,8 +411,6 @@ export default async function ArticlePage({ params }: Props) {
         currentTags={article.meta.tags}
       />
 
-      {/* Book Recommendations */}
-      <BookRecommendation locale={locale} category={category} />
     </article>
     </>
   );

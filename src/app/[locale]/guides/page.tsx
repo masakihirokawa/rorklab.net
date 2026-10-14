@@ -1,6 +1,5 @@
 import { getArticles, CATEGORIES } from "@/lib/content";
 import type { Metadata } from "next";
-import { BookRecommendation } from "@/components/ui/BookRecommendation";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -206,7 +205,6 @@ export default async function GuidesPage({ params }: Props) {
           );
         })}
       </div>
-      <BookRecommendation locale={locale} />
     </div>
   );
 }
