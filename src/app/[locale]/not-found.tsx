@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { headers } from "next/headers";
 
 export const metadata: Metadata = {
-  title: "404 — ページが見つかりません | Rork Lab",
+  title: "404 — ページが見つかりません",
   description: "お探しのページは存在しないか、移動された可能性があります。",
   robots: { index: false, follow: false },
   alternates: { canonical: null },

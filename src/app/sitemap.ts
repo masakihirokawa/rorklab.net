@@ -19,6 +19,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/privacy", priority: 0.3, freq: "monthly" as const },
     { path: "/terms", priority: 0.3, freq: "monthly" as const },
     { path: "/tokusho", priority: 0.3, freq: "monthly" as const },
+    { path: "/membership", priority: 0.5, freq: "monthly" as const },
+    { path: "/support", priority: 0.3, freq: "monthly" as const },
   ];
 
   // === Dynamic lastmod helpers (best practice: reflect newest article date) ===

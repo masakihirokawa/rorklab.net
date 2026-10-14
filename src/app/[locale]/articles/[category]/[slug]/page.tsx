@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { notFound, permanentRedirect } from "next/navigation";
 import { getArticle, getArticles, getArticleContent, getAllArticleSlugs, CATEGORIES, getTagCounts, toIsoJst } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
+import { seoTitleFor, seoDescription } from "@/lib/seo-text";
 import { ShareButtons } from "@/components/ui/ShareButtons";
 import { RelatedArticles } from "@/components/ui/RelatedArticles";
 import { TableOfContents } from "@/components/ui/TableOfContents";
@@ -27,8 +28,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const url = `https://rorklab.net${prefix}/articles/${category}/${slug}`;
 
   return {
-    title: article.meta.title,
-    description: article.meta.description,
+    title: seoTitleFor(article.meta.title, locale, getArticles(locale).map((a) => a.title)),
+    description: seoDescription(article.meta.description, locale),
     keywords: article.meta.tags,
     ...(article.meta.noindex ? { robots: { googleBot: { index: false, follow: true } } } : {}),
     openGraph: {

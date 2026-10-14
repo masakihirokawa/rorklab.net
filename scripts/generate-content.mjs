@@ -115,7 +115,10 @@ async function compileMarkdown(content) {
   const processed = processCallouts(content);
   const result = await processor.process(processed);
   // 2026-10-09: 表は横スクロールの枠で包む（スマホで表がページごと横にはみ出し、ヘッダーのメニューボタンが画面外へ出ていた）
+  // 2026-10-14: 本文中の <h1> は <h2> に落とす（ページのタイトルが h1 を持つため、本文側に h1 があると h1 が 2 つになる）
   return String(result)
+    .replace(/<h1(\s[^>]*)?>/g, "<h2$1>")
+    .replace(/<\/h1>/g, "</h2>")
     .replace(/<table\b/g, '<div class="table-scroll"><table')
     .replace(/<\/table>/g, "</table></div>");
 }

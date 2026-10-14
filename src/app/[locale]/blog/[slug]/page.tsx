@@ -1,3 +1,4 @@
+import { seoTitleFor, seoDescription } from "@/lib/seo-text";
 import { getBlogPost, getBlogContent, getBlogPosts } from "@/lib/content";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
@@ -11,8 +12,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const post = getBlogPost(locale, slug);
   if (!post) return {};
   return {
-    title: post.meta.title,
-    description: post.meta.description,
+    title: seoTitleFor(post.meta.title, locale, getBlogPosts(locale).map((a) => a.title)),
+    description: seoDescription(post.meta.description, locale),
     openGraph: {
       title: post.meta.title,
       description: post.meta.description,

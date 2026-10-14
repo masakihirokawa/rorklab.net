@@ -1,11 +1,15 @@
 import { notFound } from "next/navigation";
 import { getArticlesByCategory, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
+import { ArticlePagination } from "@/components/ui/ArticlePagination";
 import type { Metadata } from "next";
 
 interface Props {
   params: Promise<{ locale: string; category: string }>;
+  searchParams: Promise<{ page?: string }>;
 }
+
+const CATEGORY_PER_PAGE = 40;
 
 const LEVEL_LABELS: Record<string, Record<string, string>> = {
   ja: { beginner: "初級", intermediate: "中級", advanced: "上級", "intermediate-advanced": "中〜上級" },
@@ -43,7 +47,7 @@ const CATEGORY_DESC: Record<string, Record<string, string>> = {
   },
 };
 
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
+async function baseCategoryMetadata({ params }: Pick<Props, "params">): Promise<Metadata> {
   const { locale, category } = await params;
   const catName = CATEGORY_NAMES[category]?.[locale] || category;
   const catDesc = CATEGORY_DESC[category]?.[locale] || "";
@@ -72,7 +76,20 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   };
 }
 
-export default async function CategoryPage({ params }: Props) {
+// 2 ページ目以降は自己 canonical + noindex,follow（一覧が数百件になり HTML が 1.5MB に達していたため 40 件ずつに分割・2026-10-14）
+export async function generateMetadata({ params, searchParams }: Props): Promise<Metadata> {
+  const meta = await baseCategoryMetadata({ params });
+  const sp = await searchParams;
+  const page = Math.max(1, parseInt(sp.page || "1", 10) || 1);
+  if (page > 1) {
+    const base = String(meta.alternates?.canonical || "");
+    meta.alternates = { canonical: `${base}?page=${page}` };
+    meta.robots = { index: false, follow: true };
+  }
+  return meta;
+}
+
+export default async function CategoryPage({ params, searchParams }: Props) {
   const { locale, category } = await params;
 
   const validCategories: string[] = CATEGORIES.map((c) => c.id);
@@ -80,7 +97,12 @@ export default async function CategoryPage({ params }: Props) {
     notFound();
   }
 
-  const articles = getArticlesByCategory(locale, category);
+  const allArticles = getArticlesByCategory(locale, category);
+  const sp = await searchParams;
+  const totalPages = Math.max(1, Math.ceil(allArticles.length / CATEGORY_PER_PAGE));
+  const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
+  if (currentPage > totalPages) notFound(); // 範囲外の ?page= は 404
+  const articles = allArticles.slice((currentPage - 1) * CATEGORY_PER_PAGE, currentPage * CATEGORY_PER_PAGE);
   const cat = CATEGORIES.find((c) => c.id === category);
   const catName = CATEGORY_NAMES[category]?.[locale] || category;
   const catDesc = CATEGORY_DESC[category]?.[locale] || "";
@@ -139,6 +161,15 @@ export default async function CategoryPage({ params }: Props) {
             </a>
           ))}
         </div>
+      )}
+
+      {totalPages > 1 && (
+        <ArticlePagination
+          currentPage={currentPage}
+          totalPages={totalPages}
+          basePath={`/${locale === "ja" ? "" : locale + "/"}articles/${category}`}
+          locale={locale}
+        />
       )}
 
       {/* Back link */}
