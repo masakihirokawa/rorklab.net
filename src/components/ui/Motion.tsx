@@ -54,14 +54,21 @@ export function Motion() {
     let raf = 0;
     let x = 0;
     let y = 0;
+    // 光は専用の固定要素（見た目は globals.css の .cursor-glow）。transform だけを書くので再描画も全体のスタイル再計算も起きない
+    let glow: HTMLDivElement | null = null; // 最初にカーソルが動いたときに作る（タッチ端末では作らない）
     const move = (e: PointerEvent) => {
       x = e.clientX;
       y = e.clientY;
       if (raf) return;
       raf = requestAnimationFrame(() => {
         raf = 0;
-        root.style.setProperty("--px", `${x}px`);
-        root.style.setProperty("--py", `${y}px`);
+        if (!glow) {
+          glow = document.createElement("div");
+          glow.className = "cursor-glow";
+          glow.setAttribute("aria-hidden", "true");
+          document.body.appendChild(glow);
+        }
+        glow.style.transform = `translate3d(${x - 380}px, ${y - 380}px, 0)`;
         root.setAttribute("data-glow", "");
       });
     };
@@ -88,6 +95,7 @@ export function Motion() {
     return () => {
       if (fine) document.removeEventListener("pointermove", move);
       if (raf) cancelAnimationFrame(raf);
+      glow?.remove();
       mo.disconnect();
     };
   }, []);
@@ -153,13 +161,18 @@ export function Motion() {
 
     const scan = () => {
       const vh = window.innerHeight;
+      const cands: HTMLElement[] = [];
       document.querySelectorAll<HTMLElement>(`${RV_SEL},${GEN_SEL}`).forEach((el) => {
         if (seen.has(el)) return;
         seen.add(el);
         if (el.matches(GEN_SEL) && !el.matches(RV_SEL) && el.parentElement?.closest(GEN_SKIP)) return;
-        const b = el.getBoundingClientRect();
+        cands.push(el);
+      });
+      // 読み取り（位置）を先にまとめ、そのあと書き込む。交互にすると要素ごとにスタイル再計算が走る（一覧が数百件の /membership 等で重い）
+      const tops = cands.map((el) => el.getBoundingClientRect().top);
+      cands.forEach((el, i) => {
         // すでに画面内・通り過ぎた要素はそのまま（初回表示を遅らせない・LCP と CLS を悪化させない）
-        if (b.top < vh * 0.94) return;
+        if (tops[i] < vh * 0.94) return;
         el.setAttribute("data-rv-h", "");
         io.observe(el);
       });
@@ -179,7 +192,7 @@ export function Motion() {
         const vh = window.innerHeight;
         document.querySelectorAll<HTMLElement>("[data-rv-h]").forEach((el) => {
           const b = el.getBoundingClientRect();
-          if (b.top < vh * 0.94 && b.bottom > 0) reveal(el, 0, false);
+          if (b.top < vh * 0.94) reveal(el, 0, b.bottom <= 0);
         });
       }, 150);
     };
@@ -202,6 +215,20 @@ export function Motion() {
       // 遷移後も隠れたまま残らないよう、監視中のものは表示状態へ戻す
       document.querySelectorAll("[data-rv-h]").forEach((el) => el.removeAttribute("data-rv-h"));
     };
+  }, [pathname]);
+
+  // 先頭の節（ヒーロー）が画面から外れているあいだは常時アニメを止める（見た目は変えず、読んでいる間の無駄な再描画を無くす）
+  useEffect(() => {
+    const top = document.querySelector("main > div > section:first-child");
+    const root = document.documentElement;
+    root.removeAttribute("data-top-off");
+    if (!top) return;
+    const io = new IntersectionObserver(([e]) => {
+      if (e.isIntersecting) root.removeAttribute("data-top-off");
+      else root.setAttribute("data-top-off", "");
+    });
+    io.observe(top);
+    return () => io.disconnect();
   }, [pathname]);
 
   // 全リンク・全ボタンを実際の見た目で分類し、data-fx を付ける（見た目は CSS 側。React の className/style には触れない）
@@ -233,7 +260,30 @@ export function Motion() {
       if (kind === "btn" && bgA > 0.6) el.setAttribute("data-fx-solid", "");
       if (cs.position === "fixed" || cs.position === "absolute") el.setAttribute("data-fx-abs", "");
     };
-    const scan = () => document.querySelectorAll<HTMLElement>("a[href], button").forEach(classify);
+    // 画面（の 240px 手前）に入ったものだけ分類する。全件を一度に getComputedStyle しない（一覧が数百件のページで重い）
+    const watched = new WeakSet<Element>();
+    const io = new IntersectionObserver(
+      (entries) =>
+        entries.forEach((e) => {
+          if (!e.isIntersecting) return;
+          classify(e.target as HTMLElement);
+          io.unobserve(e.target);
+        }),
+      { rootMargin: "240px" }
+    );
+    const scan = () =>
+      document.querySelectorAll<HTMLElement>("a[href], button").forEach((el) => {
+        if (watched.has(el)) return;
+        watched.add(el);
+        io.observe(el);
+      });
+    // 取りこぼし対策: まだ分類されていないものに触れた・押した瞬間にも分類する
+    const lazy = (e: Event) => {
+      const el = (e.target as Element | null)?.closest?.("a[href], button") as HTMLElement | null;
+      if (el) classify(el);
+    };
+    document.addEventListener("pointerover", lazy, { passive: true });
+    document.addEventListener("pointerdown", lazy, { passive: true });
     scan();
     let t = 0;
     const mo = new MutationObserver(() => {
@@ -244,6 +294,9 @@ export function Motion() {
     return () => {
       window.clearTimeout(t);
       mo.disconnect();
+      io.disconnect();
+      document.removeEventListener("pointerover", lazy);
+      document.removeEventListener("pointerdown", lazy);
     };
   }, [pathname]);
 

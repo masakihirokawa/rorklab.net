@@ -54,9 +54,12 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function HomePage({ params }: Props) {
   const { locale } = await params;
-  // トップで本文まで描画するのは最新 10 本。残りは件数計算にしか使わないので description / tags を落とし、
-  // 全記事メタを丸ごと RSC ペイロードに載せていた旧実装（約 480KB）を解消する（2026-09-13）。
-  const articles = getArticles(locale).map((a, i) => (i < 10 ? a : { ...a, description: "", tags: [] }));
+  // トップで本文まで描画するのは最新 10 本だけ。残りは件数にしか使わないので、メタは載せず件数（全体・カテゴリ別）だけを渡す。
+  // 全記事メタを RSC ペイロードに載せていた実装（約 310KB）を解消（2026-10-15）。
+  const all = getArticles(locale);
+  const articles = all.slice(0, 10);
+  const counts: { total: number; byCategory: Record<string, number> } = { total: all.length, byCategory: {} };
+  for (const a of all) counts.byCategory[a.category] = (counts.byCategory[a.category] || 0) + 1;
 
   const prefix = locale === "ja" ? "" : `/${locale}`;
   const jsonLd = {
@@ -79,7 +82,7 @@ export default async function HomePage({ params }: Props) {
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
       />
-      <HomeClient articles={articles} locale={locale} />
+      <HomeClient articles={articles} counts={counts} locale={locale} />
     </>
   );
 }
