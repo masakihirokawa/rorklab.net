@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useTranslations } from "next-intl";
 import { LevelBadge } from "@/components/ui/LevelBadge";
+import { CategoryGlyph } from "@/components/ui/CategoryGlyph";
 import type { ArticleMeta } from "@/lib/content";
 
 const CATEGORIES = [
@@ -172,8 +173,8 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
                 onMouseEnter={() => setHoveredCat(cat.id)}
                 onMouseLeave={() => setHoveredCat(null)}
               >
-                <div style={{ width: 40, height: 40, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, marginBottom: 16, color: cat.color, transition: "transform 0.3s", transform: hoveredCat === cat.id ? "translateX(4px)" : "translateX(0)", lineHeight: 1 }}>
-                  {cat.icon}
+                <div style={{ width: 40, height: 40, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 16, color: cat.color, transition: "transform 0.3s", transform: hoveredCat === cat.id ? "translateX(4px)" : "translateX(0)", lineHeight: 1 }}>
+                  <CategoryGlyph glyph={cat.icon} />
                 </div>
                 <div style={{ fontSize: 16, fontWeight: 500, color: "var(--text-primary)", marginBottom: 6, letterSpacing: "0.02em" }}>
                   {t(`categories.${cat.id}.label`)}
