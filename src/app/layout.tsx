@@ -43,10 +43,16 @@ export const metadata: Metadata = {
       { url: "/favicon-16.png", sizes: "16x16", type: "image/png" },
       { url: "/icon.svg", type: "image/svg+xml" },
     ],
+    // 2026-10-17: 角まで塗った正方形（iOS が自分で角を丸める）。差し替え時は ?v= を上げる（7 日キャッシュ）
     apple: [
-      { url: "/apple-touch-icon.png", sizes: "180x180" },
+      { url: "/apple-touch-icon.png?v=2", sizes: "180x180" },
     ],
   },
+  // ホーム画面に追加したときの名前（無いと iOS はそのページの <title> を使い、記事の題名や「Rork Lab — …」が途中で切れて付いていた）
+  manifest: "/manifest.json",
+  applicationName: "Rork Lab",
+  // capable: false を明示（省略すると Next が mobile-web-app-capable=yes を出し、ホーム画面から開くと戻るボタンの無い全画面になる）
+  appleWebApp: { title: "Rork Lab", capable: false },
   robots: {
     index: true,
     follow: true,

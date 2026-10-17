@@ -202,49 +202,28 @@ export default async function MembershipPage({ params }: Props) {
         ) : (
           <div>
             {premiumArticles.map((article) => (
+              // 行の見た目は globals.css の .ar 系クラス（2026-10-17: 800 行超のインライン style が HTML と RSC で二重になり 1.7〜2.0MB あった）。
+              // border-bottom だけはインラインに残す（行のホバー・出現の演出が [style*="border-bottom"] で行を見分けている）
               <a
                 key={`${article.category}/${article.slug}`}
                 href={`${prefix}/articles/${article.category}/${article.slug}`}
-                style={{
-                  display: "block",
-                  padding: "24px 0",
-                  borderBottom: "1px solid var(--border-subtle)",
-                  textDecoration: "none",
-                  transition: "padding-left 0.3s",
-                }}
+                className="ar"
+                style={{ borderBottom: "1px solid var(--border-subtle)" }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                  <span
-                    style={{
-                      fontSize: 10,
-                      fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
-                      letterSpacing: "0.1em",
-                      padding: "2px 8px",
-                      borderRadius: 4,
-                      background: "color-mix(in srgb, var(--accent-coral) 12%, transparent)",
-                      color: "var(--accent-coral)",
-                    }}
-                  >
-                    {t.locked}
-                  </span>
-                  <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em" }}>
+                <div className="ar-meta">
+                  <span className="ar-lock mono">{t.locked}</span>
+                  <span className="ar-cat mono" style={{ color: catColor(article.category) }}>
                     {catIcon(article.category)} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                   </span>
-                  <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-                  <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
-                    {article.date?.split("T")[0]}
-                  </span>
+                  <span className="ar-sep">/</span>
+                  <span className="ar-sep mono">{article.date?.split("T")[0]}</span>
                   <LevelBadge
                     level={article.level}
                     label={LEVEL_LABELS[locale]?.[article.level] || article.level}
                   />
                 </div>
-                <h3 style={{ fontSize: "clamp(16px, 2.5vw, 19px)", fontWeight: 500, color: "var(--text-secondary)", marginBottom: 6, lineHeight: 1.5 }}>
-                  {article.title}
-                </h3>
-                <p style={{ fontSize: 13, color: "var(--text-dim)", lineHeight: 1.6, maxWidth: 680 }}>
-                  {article.description}
-                </p>
+                <h3 className="ar-title">{article.title}</h3>
+                <p className="ar-desc">{article.description}</p>
               </a>
             ))}
           </div>

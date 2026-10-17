@@ -107,7 +107,8 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
             {t("hero.title1")}
             <br />
             <span style={{ fontWeight: 700 }}>{t("hero.title2")}</span>
-            {t("hero.title3")}
+            {/* 日本語は「使いこなす。」の途中で折り返さない（375px で「す。」だけが 3 行目に落ちていた・2026-10-17） */}
+            {locale === "ja" ? <span className="seg">{t("hero.title3")}</span> : t("hero.title3")}
           </h1>
 
           <p style={{ fontSize: "clamp(14px, 2vw, 17px)", color: "var(--text-muted)", maxWidth: 520, margin: "0 auto 48px", lineHeight: 1.8, fontWeight: 300, whiteSpace: "pre-line" }}>

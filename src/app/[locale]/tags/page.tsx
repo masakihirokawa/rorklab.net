@@ -95,19 +95,11 @@ export default async function TagsPage({ params }: Props) {
             <a
               key={tag}
               href={`${prefix}/tag/${encodeURIComponent(tag)}`}
-              style={{
-                fontSize: size,
-                color: "var(--text-secondary)",
-                textDecoration: "none",
-                opacity,
-                transition: "all 0.2s",
-                padding: "4px 8px",
-                borderRadius: 4,
-                whiteSpace: "nowrap",
-              }}
+              className="tc"
+              style={{ fontSize: +size.toFixed(1), opacity: +opacity.toFixed(2) }}
             >
               {tag}
-              <sup style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: 2 }}>{count}</sup>
+              <sup>{count}</sup>
             </a>
           );
         })}
@@ -120,34 +112,9 @@ export default async function TagsPage({ params }: Props) {
         </h2>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 8 }}>
           {tagCounts.map(({ tag, count }) => (
-            <a
-              key={tag}
-              href={`${prefix}/tag/${encodeURIComponent(tag)}`}
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                padding: "10px 14px",
-                borderRadius: 6,
-                border: "1px solid var(--border-subtle)",
-                textDecoration: "none",
-                fontSize: 13,
-                color: "var(--text-secondary)",
-                transition: "all 0.2s",
-              }}
-            >
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tag}</span>
-              <span
-                style={{
-                  fontSize: 11,
-                  fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
-                  color: "var(--text-dim)",
-                  marginLeft: 8,
-                  flexShrink: 0,
-                }}
-              >
-                {count}
-              </span>
+            <a key={tag} href={`${prefix}/tag/${encodeURIComponent(tag)}`} className="ti">
+              <span>{tag}</span>
+              <span className="mono">{count}</span>
             </a>
           ))}
         </div>

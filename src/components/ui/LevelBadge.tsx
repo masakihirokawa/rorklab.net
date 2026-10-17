@@ -1,10 +1,11 @@
 "use client";
 
-const LEVEL_COLORS: Record<string, { bg: string; text: string }> = {
-  beginner: { bg: "color-mix(in srgb, var(--accent-green) 12%, transparent)", text: "var(--accent-green)" },
-  intermediate: { bg: "color-mix(in srgb, var(--accent-gold) 12%, transparent)", text: "var(--accent-gold)" },
-  advanced: { bg: "color-mix(in srgb, var(--accent-coral) 12%, transparent)", text: "var(--accent-coral)" },
-  "intermediate-advanced": { bg: "color-mix(in srgb, var(--accent-gold) 12%, transparent)", text: "var(--accent-gold)" },
+// 色は globals.css の .lvl 系クラス（2026-10-17: 一覧で数百個並ぶため、インライン style をやめて HTML と RSC を軽く）
+const LEVEL_CLASS: Record<string, string> = {
+  beginner: "lvl-b",
+  intermediate: "lvl-i",
+  advanced: "lvl-a",
+  "intermediate-advanced": "lvl-i",
 };
 
 interface LevelBadgeProps {
@@ -13,20 +14,5 @@ interface LevelBadgeProps {
 }
 
 export function LevelBadge({ level, label }: LevelBadgeProps) {
-  const colors = LEVEL_COLORS[level] || LEVEL_COLORS.intermediate;
-  return (
-    <span
-      style={{
-        fontSize: 11,
-        padding: "2px 8px",
-        borderRadius: 3,
-        background: colors.bg,
-        color: colors.text,
-        fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
-        letterSpacing: "0.03em",
-      }}
-    >
-      {label}
-    </span>
-  );
+  return <span className={`lvl mono ${LEVEL_CLASS[level] || "lvl-i"}`}>{label}</span>;
 }
