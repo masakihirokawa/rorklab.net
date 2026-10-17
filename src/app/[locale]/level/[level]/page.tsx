@@ -244,10 +244,10 @@ export default async function LevelPage({ params, searchParams }: Props) {
                   label={LEVEL_LABELS[locale]?.[article.level] || article.level}
                 />
               </div>
-              <h3 style={{ fontSize: "clamp(16px, 2.5vw, 19px)", fontWeight: 500, color: "var(--text-secondary)", marginBottom: 6, lineHeight: 1.5 }}>
+              <h3 className="ar-title">
                 {article.title}
               </h3>
-              <p style={{ fontSize: 13, color: "var(--text-dim)", lineHeight: 1.6, maxWidth: 680 }}>
+              <p className="ar-desc">
                 {article.description}
               </p>
             </a>

@@ -238,10 +238,10 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
                   <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>{article.date?.split("T")[0]}</span>
                   <LevelBadge level={article.level} label={t(`levels.${article.level}`)} />
                 </div>
-                <h3 style={{ fontSize: "clamp(16px, 2.5vw, 19px)", fontWeight: 500, color: hoveredArticle === i ? "var(--text-primary)" : "var(--text-secondary)", transition: "color 0.3s", marginBottom: 6, lineHeight: 1.5 }}>
+                <h3 className="ar-title" style={{ color: hoveredArticle === i ? "var(--text-primary)" : "var(--text-secondary)", transition: "color 0.3s" }}>
                   {article.title}
                 </h3>
-                <p style={{ fontSize: 13, color: "var(--text-dim)", lineHeight: 1.6, maxWidth: 680 }}>
+                <p className="ar-desc">
                   {article.description}
                 </p>
               </a>
