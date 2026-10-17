@@ -6,7 +6,7 @@ const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
     "GPT-6.1 SOL — Rork のモデルメニューに追加（09-29）。Low／Medium／High を選べ、Pro・Max に含まれます",
     "SONNET 5.5 — UI づくりが得意で、Sonnet 5 より出力が速いモデルが選べます（09-28）",
-    "SDK 58 — Beta が 09/15 から。stable の案内はまだなく、Expo Go でのプロジェクト実行は 09/03 からログインが必要です",
+    "SDK 58 — Expo SDK 58 が 10/15 に正式リリースされました（Beta は 09/15 から）。上げる前に依存の対応状況を確認しましょう",
     "WIDGET — iOS のウィジェットが本番ビルドだけ真っ黒になる原因を追った報告が出ています",
     "OBSERVE — EAS Observe がネイティブクラッシュも記録します（SDK 57.0.21 以降・10/07）",
     "NEW — 起動広告が、背面から戻った回にしか出ていませんでした。「前面に戻った」合図が、…",
@@ -14,7 +14,7 @@ ja: [
   en: [
     "GPT-6.1 SOL — Added to Rork's model menu (09-29) with Low, Medium and High effort; included on Pro and Max",
     "SONNET 5.5 — Claude Sonnet 5.5 is selectable: strong at UI design and faster than Sonnet 5 (09-28)",
-    "SDK 58 — Beta since 09/15 with no stable date yet; running projects in Expo Go has required login since 09/03",
+    "SDK 58 — Expo SDK 58 is out of beta as of 10/15 (beta since 09/15). Check your dependencies before upgrading",
     "WIDGET — A write-up traces an iOS widget that renders black only in production builds",
     "OBSERVE — EAS Observe now records native crashes too (SDK 57.0.21 or later, 10/07)",
     "NEW — My App Open Ad Only Showed When the App…"
