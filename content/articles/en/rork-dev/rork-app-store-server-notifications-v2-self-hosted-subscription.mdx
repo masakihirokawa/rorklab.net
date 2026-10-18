@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-25T20:30"
-updated: "2026-04-25T20:30"
+updated: "2026-10-18T20:30"
 author: "Rork Lab"
 description: "A complete implementation guide for receiving App Store Server Notifications V2 in Cloudflare Workers without RevenueCat — covering JWS verification, idempotent state updates, user binding, and production testing for Rork apps."
 tags: ["StoreKit 2", "App Store Server API", "Cloudflare Workers", "Subscriptions", "JWS"]
@@ -16,7 +16,7 @@ highlights:
 ---
 If you've been running RevenueCat for a year or so, there's a good chance you've quietly started wondering whether the monthly fee will become a problem as MRR keeps climbing. I had the exact same feeling once revenue from three Rork-built apps started to compound. RevenueCat is genuinely a great service and I'd recommend it for the first subscription app you ship. But once the business has matured, it's also natural — perhaps inevitable — to want the verification logic living inside your own codebase.
 
-This guide walks you through that "graduation" at the implementation level. Specifically, we'll build a minimal but production-ready setup: a Rork iOS app that completes purchases through StoreKit 2, a Cloudflare Workers endpoint that receives **App Store Server Notifications V2** (ASSN V2 from here on), JWS verification of those payloads, and idempotent state writes to Cloudflare KV. Everything below is based on a configuration I'm running in production right now, including the missteps I made along the way.
+This guide walks you through that "graduation" at the implementation level. Specifically, we'll build a minimal but production-ready setup: a Rork iOS app that completes purchases through StoreKit 2, a Cloudflare Workers endpoint that receives **App Store Server Notifications V2** (ASSN V2 from here on), JWS verification of those payloads, and idempotent state writes to Cloudflare KV. Everything below is based on the setup I run myself, including the missteps I made along the way.
 
 ## Why Go Self-Hosted — This Isn't an Anti-RevenueCat Pitch
 
@@ -64,6 +64,7 @@ Here's the minimum client code that triggers a purchase from a Rork-generated Ex
 
 ```ts
 // hooks/useSubscriptionPurchase.ts
+import { v5 as uuidv5 } from "uuid";
 import {
   initConnection,
   endConnection,
@@ -74,6 +75,12 @@ import {
 } from "react-native-iap";
 
 const PRODUCT_IDS = ["com.example.app.pro_monthly"];
+const NAMESPACE = "f47ac10b-58cc-4372-a567-0e02b2c3d479"; // any fixed UUID
+
+// appAccountToken must be a UUID, so derive one deterministically from your user ID
+export function userIdToAppAccountToken(userId: string): string {
+  return uuidv5(userId, NAMESPACE);
+}
 
 export async function purchasePro(userId: string): Promise<{ ok: boolean; error?: string }> {
   try {
@@ -82,10 +89,10 @@ export async function purchasePro(userId: string): Promise<{ ok: boolean; error?
     if (products.length === 0) {
       return { ok: false, error: "PRODUCT_NOT_FOUND" };
     }
-    // Embed userId in appAccountToken — ASSN V2 will surface it on the server
+    // Embed the derived UUID in appAccountToken — ASSN V2 returns it verbatim
     const purchase = (await requestSubscription({
       sku: PRODUCT_IDS[0],
-      appAccountToken: userId,
+      appAccountToken: userIdToAppAccountToken(userId),
     })) as SubscriptionPurchase | null;
 
     if (!purchase) {
@@ -103,7 +110,7 @@ export async function purchasePro(userId: string): Promise<{ ok: boolean; error?
 }
 ```
 
-The crucial line is `appAccountToken: userId`. The ASSN V2 payload includes this token verbatim, which means your server can reliably tie "this Apple transaction" to "this user in our database." Skip it, and you'll later find yourself unable to map Apple IDs to your in-app users — making churn analysis and targeted messaging effectively impossible. I lost three months of this mapping in my first implementation by forgetting to set it. The data is gone for good once the purchase is finalized, so please attach it from day one.
+The crucial line is the `appAccountToken` one, fed with a UUID derived from the user ID. The ASSN V2 payload includes this token verbatim, which means your server can reliably tie "this Apple transaction" to "this user in our database." Skip it, and you'll later find yourself unable to map Apple IDs to your in-app users — making churn analysis and targeted messaging effectively impossible. I lost three months of this mapping in my first implementation by forgetting to set it, and I only noticed once those purchases had already piled up. The data is gone for good once the purchase is finalized, so I now decide the token before I write any purchase code. I'd suggest attaching it from day one.
 
 After the purchase resolves, the client should make one quick request to its own backend asking "what entitlement do I have now?" — and that's it. The server will eventually receive the ASSN V2 notification (usually within seconds, sometimes a little longer), and from then on the entitlement is reliably available. While the first response is still pending you can show a friendly "activating your subscription…" state instead of unlocking the UI optimistically. Optimistic unlocks are tempting because they feel snappy, but they create a window where a failed verification produces a worse experience than just waiting a few seconds.
 
@@ -116,6 +123,7 @@ Here's a minimal verification function that runs on Cloudflare Workers (the only
 ```ts
 // src/notifications/verify.ts
 import { decodeProtectedHeader, importX509, jwtVerify } from "jose";
+import { verifyCertChain } from "./chain";
 
 const APPLE_ROOT_CA_G3 = `-----BEGIN CERTIFICATE-----
 MIIBgDCCASagAwIBAgIQ.... (paste Apple Root CA - G3 here)
@@ -136,9 +144,9 @@ export async function verifyAppleJws(signedPayload: string): Promise<{
   const leafPem = `-----BEGIN CERTIFICATE-----\n${header.x5c[0]}\n-----END CERTIFICATE-----`;
   const publicKey = await importX509(leafPem, "ES256");
 
-  // 3. Verify the chain back to Apple's root (omitted for brevity — see "Common Mistakes")
-  //    In production, walk leaf → intermediate → root and confirm the root
-  //    matches Apple Root CA G3.
+  // 3. Walk leaf → intermediate → root and confirm the root is Apple Root CA G3
+  //    (implementation in the next code block)
+  await verifyCertChain(header.x5c);
 
   // 4. Verify the JWS payload itself
   const { payload } = await jwtVerify(signedPayload, publicKey, {
@@ -152,6 +160,35 @@ export async function verifyAppleJws(signedPayload: string): Promise<{
   };
 }
 ```
+
+Chain validation is only a few dozen lines with `@peculiar/x509`, and it runs fine on Workers. The scary part is that everything *appears* to work without it.
+
+```ts
+// src/notifications/chain.ts
+import { X509Certificate } from "@peculiar/x509";
+
+// Paste Apple Root CA - G3 (base64) as published on Apple's PKI page
+const APPLE_ROOT_G3_B64 = "MIICQzCCAcmgAwIBAgIILcX8iNLFS5UwCgYIKoZIzj0EAwMw...";
+
+export async function verifyCertChain(x5c: string[]): Promise<void> {
+  if (x5c.length < 2) throw new Error("CHAIN_TOO_SHORT");
+  const certs = x5c.map((b64) => new X509Certificate(b64));
+  const now = new Date();
+
+  for (let i = 0; i < certs.length - 1; i++) {
+    const ok = await certs[i].verify({ publicKey: certs[i + 1], date: now });
+    if (!ok) throw new Error(`CHAIN_BROKEN_AT_${i}`);
+  }
+
+  // The last certificate must be identical to the root you pinned yourself
+  const pinned = new X509Certificate(APPLE_ROOT_G3_B64);
+  if (!(await pinned.equal(certs[certs.length - 1]))) {
+    throw new Error("ROOT_MISMATCH");
+  }
+}
+```
+
+Replace the string above with the real certificate from Apple's official page; it is only a placeholder to show where the value goes.
 
 After you've decoded `signedPayload`, you'll typically pass `signedTransactionInfo` (a nested JWS) through the same function to extract the transaction ID, expiration date, and so on. The "JWS inside a JWS" structure is one of the parts that genuinely confuses newcomers — once you've seen it, it stops being mysterious.
 
@@ -221,29 +258,20 @@ export async function handleAppleNotification(
   }
 
   // 3. Mark the notification as processed (24h TTL is enough)
-  await env.SUBS_KV.put(dedupeKey, "1", { expirationTtl: 60 * 60 * 24 });
+  await env.SUBS_KV.put(dedupeKey, "1", { expirationTtl: 60 * 60 * 24 * 7 });
   return { ok: true };
 }
 ```
 
-Why a 24-hour TTL on the dedupe key? Apple's retry policy for any single notification almost always finishes inside that window. You can keep it longer, but at scale the KV cost-versus-benefit math made 24 hours the right balance for me.
+Why seven days on the dedupe key? I started with 24 hours, but for production Apple retries a notification that didn't get a 2xx at roughly 1, 12, 24, 48 and 72 hours. A flag that expires after a day lets the later retries slip straight through, so I keep it for a week.
+
+Retries can also arrive out of order. Store the payload's `signedDate` with the user record and refuse to overwrite state with a notification older than what you already hold; otherwise a stale `DID_FAIL_TO_RENEW` could clobber a fresh renewal.
 
 One more subtle thing about idempotency: the read-then-write sequence above is not strictly atomic in KV. If two retries arrive within milliseconds of each other, both can read "not seen" before either writes. Cloudflare Workers' KV is eventually consistent, so this corner case is rare but possible. If you process strictly monotonic side effects (extending an `expiresAt`, never decreasing it), the worst outcome is doing the same work twice — not corrupting state. If you ever introduce a side effect that *can* corrupt state on duplicate, lift it to Durable Objects or a database with transactions. For most subscription bookkeeping, KV is enough.
 
 ## Binding User IDs Reliably — Who Bought What
 
-Because we passed `appAccountToken` from the client, the same value is delivered by ASSN V2 on the server. There's one wrinkle: `appAccountToken` is required to be a **UUID-formatted string**. If your in-app user ID isn't already a UUID, derive a deterministic UUID v5 instead:
-
-```ts
-import { v5 as uuidv5 } from "uuid";
-
-const NAMESPACE = "f47ac10b-58cc-4372-a567-0e02b2c3d479"; // any fixed UUID
-export function userIdToAppAccountToken(userId: string): string {
-  return uuidv5(userId, NAMESPACE);
-}
-```
-
-This gives you a one-to-one mapping between in-app user IDs and the tokens delivered to Apple. To make reverse lookups trivial later, also persist a `token2user:{appAccountToken} → {userId}` entry in KV at first purchase time.
+Because we passed `appAccountToken` from the client, the same value is delivered by ASSN V2 on the server. There's one wrinkle: `appAccountToken` is required to be a **UUID-formatted string**, so an arbitrary in-app user ID won't do. Run it through the `userIdToAppAccountToken` helper shown earlier (a deterministic UUID v5). That gives you a one-to-one mapping between in-app user IDs and the tokens delivered to Apple. To make reverse lookups trivial later, also persist a `token2user:{appAccountToken} → {userId}` entry in KV at first purchase time.
 
 There's a related design question worth deciding early: what happens if the same Apple ID buys the subscription on two of your apps' user accounts? In practice this is rare, but it does happen — friends sharing devices, account migrations, and so on. The cleanest answer I've found is to treat the most recent `appAccountToken` as canonical. When a new purchase arrives carrying a different token for the same `originalTransactionId`, write a small "reassignment" record alongside the user entry. You almost never need to look at it, but on the day support has to ask "wait, why does this user think they're paying twice?", that record is the difference between a five-minute reply and a two-day investigation.
 
@@ -344,4 +372,6 @@ You don't have to ship the whole thing at once. The single most useful first ste
 
 From there, layer on the KV writes, the idempotency check, and the user binding incrementally. By the time those three pieces are in, you have a production-grade subscription receiver that's truly yours — and the framing shifts from "leaving RevenueCat" to "designing the subscription infrastructure that fits this specific business." That's the version that tends to age well.
 
-One last thought from running this in practice. The first time you watch a real ASSN V2 notification land in your own logs — the JWS bytes resolving into a clean JSON payload, the user's `appAccountToken` matching the one your client just sent — there's a small but real shift in how the subscription business feels. It stops being someone else's abstraction and starts being part of your code. That feeling is actually the strongest signal that self-hosting was worth doing. Not the cost savings, not the dashboard control — the simple fact that the entire revenue path now fits in your head.
+One last thought. The first time a real ASSN V2 notification landed in my own logs, with the JWS bytes resolving into a clean JSON payload and the `appAccountToken` matching the one my client had just sent, the subscription business stopped being someone else's abstraction and became part of my code. I'd take that over the cost savings as the signal that self-hosting was worth it.
+
+**One source of truth, as many views as you like.** The client renders; the server's KV record decides. I try to hold that line every time I add a feature.
