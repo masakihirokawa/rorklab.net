@@ -1,0 +1,263 @@
+---
+title: "Why Redeploying Doesn't Fix the Application Error You See Right After a Deploy"
+slug: "why-redeploy-does-not-fix-application-error-stale-html-calls-missing-chunk"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-10-20T11:30"
+author: "Rork Lab"
+description: "Right after I swapped a secret, every page showed Application error. Stale HTML was calling a JS file that no longer existed. Here are a detection script, a build-version check for the edge cache, and a once-only auto-reload, all run and verified."
+tags: ["Cloudflare Workers", "Next.js", "deployment", "caching", "ChunkLoadError"]
+highlights:
+  - "When an Application error appears right after a deploy, you can decide which layer to suspect first instead of redeploying again and again"
+  - "Right after a deploy finishes, you can verify with one script that every JS file your HTML references really exists"
+  - "You can stop old edge-cached HTML from being served ahead of the new build with a few dozen lines added to your own Worker"
+---
+
+It was the day I swapped a single environment variable and waited for the deploy to finish. When I opened the site to check, the screen was white, with just "Application error: a client-side exception has occurred."
+
+The article pages failed, and so did the home page. The server logs were quiet and the build had succeeded. So I deployed again. It still did not recover.
+
+**A redeploy renews the server, but it does not renew the HTML that has already been handed out.** This post records the detour I took before noticing that obvious fact, and the line I drew afterward. As an indie developer running a Next.js site on Cloudflare Workers, I wrote it so that anyone in the same spot can get through that evening faster, with steps and code I actually ran.
+
+## Two red lines in the console
+
+Opening the browser's developer tools, I found two red lines: `__name is not defined` and `ChunkLoadError`.
+
+The first looks like a bug in my own code. But the network tab showed one JS file returning 404, and the body of that 404 was HTML. The browser tried to treat it as JavaScript, and everything after it stopped in a chain.
+
+Every page failed because, I believe, that chunk belonged to a shared part of the app. **Only one file was missing, yet the whole screen stopped.** The first thing to look at was not the code but the name of the file returning 404.
+
+## What was happening: old HTML meets new chunks
+
+Every build puts a hash in the JS file names, and a new build does not ship the files with old hashes. Anyone who still holds old HTML, in the browser or at the edge, is told to fetch the old names.
+
+<table>
+<thead>
+<tr><th>What is held</th><th>File it calls</th><th>In the new build's assets</th></tr>
+</thead>
+<tbody>
+<tr><td>HTML generated before the deploy</td><td>Chunk with the old hash</td><td>Missing. It returns 404</td></tr>
+<tr><td>HTML generated after the deploy</td><td>Chunk with the new hash</td><td>Present. It loads normally</td></tr>
+</tbody>
+</table>
+
+So the problem is not inside the new build. **Old HTML is still being served ahead of the new build.** Changing an environment variable or a secret redeploys the Worker with a new build ID, and right after that the mismatch is especially easy to hit.
+
+If only the browser holds the old HTML, a hard reload fixes it, and on some days that was enough. On other days it was not.
+
+## The counterintuitive part: the edge cache survives a redeploy
+
+I had assumed a deploy replaces everything old. But the HTML I stored in `caches.default` in front of the Worker stays there when the Worker is redeployed.
+
+That is why some people still failed after a hard reload: the edge, not their machine, was returning the stale HTML. No number of redeploys changes what the edge holds. On that first night, redeploying again and again came straight from that mistaken assumption.
+
+In the end I rewrote one comment line in the config to force a rebuild, and added three safeguards: declaring the `ASSETS` binding for static files in the config, providing my own error screen, and giving the edge cache a build version. The code for each follows.
+
+## Decide the order of suspicion in advance
+
+Looking back, the order was clear. I now check from the top of this table.
+
+<table>
+<thead>
+<tr><th>Order</th><th>What to check</th><th>What it tells you</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>In the network tab, the name and content-type of the file returning 404</td><td>If it is text/html, the JS file is simply missing</td></tr>
+<tr><td>2</td><td>Whether that HTML is stale, via `X-Cache` and `X-Deploy-Version`</td><td>HIT with an old version means the edge is serving stale HTML</td></tr>
+<tr><td>3</td><td>Whether the config declares the static-asset binding</td><td>If not, the new chunks are not being served</td></tr>
+<tr><td>4</td><td>Whether you just changed a secret or environment variable</td><td>If so, the mismatch is temporary</td></tr>
+</tbody>
+</table>
+
+I chose this order because the upper rows are faster to check and give a clear yes or no. Suspecting the code can wait until none of the four applies.
+
+## Safeguard 1: after a deploy, verify that every chunk exists
+
+The first thing I built was a detection script. It fetches the HTML, collects every JS file it calls, and checks each one. Letting a machine do this at every deploy is more reliable than eyeballing the network tab.
+
+The script below was run on Node 22. It checks content-type as well as status because some failures return HTML with a 200.
+
+```js
+// check-chunks.mjs — after a deploy, verify that every JS file the HTML references really exists
+// usage: node check-chunks.mjs https://example.com/ https://example.com/en/
+const urls = process.argv.slice(2);
+if (urls.length === 0) {
+  console.error('usage: node check-chunks.mjs <page-url> [...]');
+  process.exit(2);
+}
+
+let failed = 0;
+for (const page of urls) {
+  const res = await fetch(page, { headers: { 'Cache-Control': 'no-cache' } });
+  const html = await res.text();
+  const found = new Set(
+    [...html.matchAll(/(?:src|href)="([^"]*\/_next\/static\/[^"]+\.js[^"]*)"/g)].map((m) => new URL(m[1], page).href),
+  );
+  console.log(`${page} -> HTTP ${res.status}, x-cache=${res.headers.get('x-cache') ?? '-'}, chunks=${found.size}`);
+  for (const chunk of found) {
+    const r = await fetch(chunk);
+    const type = r.headers.get('content-type') ?? '';
+    await r.arrayBuffer();
+    const ok = r.status === 200 && /javascript/.test(type);
+    if (!ok) {
+      failed += 1;
+      console.log(`  NG ${r.status} ${type || '(no content-type)'} ${chunk}`);
+    }
+  }
+}
+console.log(failed === 0 ? 'OK: every chunk came back as JavaScript' : `FAIL: ${failed} chunk(s) could not be loaded`);
+process.exit(failed === 0 ? 0 : 1);
+```
+
+To try it locally, I started a small server that returns HTML calling three chunks. One returns 404 and another returns HTML with a 200. This is the actual output:
+
+```text
+http://127.0.0.1:33939/ -> HTTP 200, x-cache=-, chunks=3
+  NG 404 text/html http://127.0.0.1:33939/_next/static/chunks/b.js
+  NG 200 text/html http://127.0.0.1:33939/_next/static/chunks/c.js
+FAIL: 2 chunk(s) could not be loaded
+```
+
+The exit code is 1, so placing it at the end of your deploy keeps you from finishing a broken deploy without noticing. Note that it sees only what is served at the moment it fetches. To catch stale edge HTML, fetch the same page twice and run the check once the second `x-cache` shows HIT.
+
+## Safeguard 2: stamp cached HTML with the build that made it
+
+Next I treated stale edge HTML as the problem that a redeploy cannot remove. The idea is simple: store the build version with the HTML, compare before serving, and discard and re-render on a mismatch.
+
+```js
+// version-guard.mjs — compare cached HTML with the build that made it before serving it
+const EDGE = 'public, s-maxage=3600';
+const BROWSER = 'public, max-age=0, must-revalidate';
+
+export async function cachedRender(cache, request, render, deployVersion) {
+  const hit = await cache.match(request);
+  if (hit) {
+    if (hit.headers.get('X-Deploy-Version') === deployVersion) {
+      const html = await hit.text();
+      return reply(html, hit.status, deployVersion, 'HIT');
+    }
+    await cache.delete(request); // HTML from an older build survives a redeploy. Drop it here
+  }
+  const fresh = await render(request);
+  const html = await fresh.text();
+  if (fresh.status === 200) {
+    await cache.put(
+      request,
+      new Response(html, {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': EDGE, 'X-Deploy-Version': deployVersion },
+      }),
+    );
+  }
+  return reply(html, fresh.status, deployVersion, 'MISS');
+}
+
+function reply(html, status, version, cacheState) {
+  return new Response(html, {
+    status,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': BROWSER, // Do not let browsers keep it; decide this separately from the edge lifetime
+      'X-Deploy-Version': version,
+      'X-Cache': cacheState,
+    },
+  });
+}
+```
+
+I passed in a fake cache built on a Map and verified four things. The first request is a MISS and the second a HIT. Changing the version from `v1` to `v2` re-renders instead of hitting. The browser-facing `Cache-Control` is `max-age=0, must-revalidate`. And non-200 responses such as a 500 are not stored. All passed as expected.
+
+What I cared about here is that the edge and the browser have separate lifetimes. The edge keeps HTML for an hour through `s-maxage`, but browsers keep nothing. **That keeps the place holding old HTML down to one spot, the edge.** If browsers also kept it for long, there would be no chance to compare versions at all.
+
+Put something in the version value that changes on every deploy; I use a string embedded at build time. If you forget to update it, the comparison always matches and Safeguard 2 does nothing.
+
+When you put this in a real Worker, wrapping `cache.put` in `ctx.waitUntil` so it saves after the response is sent is the usual practice. I wrote it with await here to keep it easy to verify.
+
+## Safeguard 3: auto-reload once from the error screen
+
+Last is the safety net for when it happens anyway. I provide Next.js's `global-error.tsx` and have it reload the page automatically, once, only for chunk-load failures. That spares visitors the hard reload.
+
+I split the decision logic into its own file. The screen component is React, but the decision is an ordinary function, and splitting it out let me verify it in Node without launching a browser.
+
+```js
+// reload-once.mjs — decide whether to auto-reload, only for chunk-load failures and only once
+const PATTERN = /ChunkLoadError|Loading chunk [\w-]+ failed|Failed to fetch dynamically imported module|__name is not defined/;
+
+export function isChunkLoadError(error) {
+  const text = `${error?.name ?? ''} ${error?.message ?? ''}`;
+  return PATTERN.test(text);
+}
+
+// Pass sessionStorage as `storage`. Returns false if we already reloaded within windowMs (loop guard)
+export function shouldReloadOnce(storage, key, now = Date.now(), windowMs = 60_000) {
+  try {
+    const last = Number(storage.getItem(key));
+    if (last > 0 && now - last < windowMs) return false;
+    storage.setItem(key, String(now));
+    return true;
+  } catch {
+    return false; // If storage is unavailable, do not auto-reload (a visible button is safer than an infinite loop)
+  }
+}
+```
+
+`global-error.tsx` calls it. I did not render this component in this verification; what I verified is the decision function above.
+
+```tsx
+'use client';
+import { useEffect } from 'react';
+import { isChunkLoadError, shouldReloadOnce } from './reload-once.mjs';
+
+export default function GlobalError({ error }: { error: Error & { digest?: string } }) {
+  useEffect(() => {
+    if (isChunkLoadError(error) && shouldReloadOnce(window.sessionStorage, 'chunk-reload-at')) {
+      window.location.reload();
+    }
+  }, [error]);
+
+  return (
+    <html lang="en">
+      <body style={{ padding: 24, fontFamily: 'sans-serif' }}>
+        <h1>The page failed to load</h1>
+        <p>Right after the site is updated, a page can briefly fail to load.</p>
+        <button onClick={() => window.location.reload()}>Reload</button>
+      </body>
+    </html>
+  );
+}
+```
+
+For the decision function I confirmed these cases: `ChunkLoadError` and `__name is not defined` count as chunk failures, an unrelated `TypeError` does not, the first call allows a reload, a call 30 seconds later does not, and a call 70 seconds later allows it again. When `sessionStorage` throws, it does not reload. All passed.
+
+## Pitfalls: how a fix can cause a new accident
+
+There were four places I was careful about while adding the three safeguards.
+
+### An infinite reload loop
+
+If a reload still returns stale HTML, the same error appears and it reloads again. Saving a timestamp and refusing to reload within a minute is there for that reason. Without it, visitors' screens flicker forever.
+
+### Environments without sessionStorage
+
+In private browsing, or with storage blocked, reads and writes throw. Falling back to "reload" there cannot stop the loop, so I fall back to not reloading. A button remains, so visitors can press it themselves.
+
+### Caching failures such as a 500
+
+One failure would be handed to everyone for an hour. I store only 200 responses.
+
+### A detection script satisfied by status alone
+
+Failures that return HTML with a 200 cannot be told apart by status, which is why it checks content-type too.
+
+## Where I drew the line: I did not keep old chunks around
+
+Another approach is to keep old chunks for a few generations in every new build, so people holding old HTML still work.
+
+I did not choose it. It increases the files you serve and adds the work of managing how many generations to keep. And serving old HTML for long was the state I wanted to avoid in the first place. **I chose to detect the mismatch and replace things quickly rather than tolerate and preserve it.** For a busy site that deploys often, though, keeping old chunks may fit better. Please choose according to your own site.
+
+## One next step
+
+If you try just one thing today, put the detection script from Safeguard 1 at the end of your deploy. It takes a few minutes to add, and if even one NG appears, you find out before your visitors do.
+
+I never expected that swapping a single secret could make a whole site unreadable. Even now, right after a deploy, I brace a little and run the detection script first.
