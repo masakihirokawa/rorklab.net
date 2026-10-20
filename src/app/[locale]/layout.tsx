@@ -1,5 +1,5 @@
 import { NextIntlClientProvider, hasLocale } from "next-intl";
-import { DM_Sans, DM_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import { notFound } from "next/navigation";
 import { routing } from "@/i18n/routing";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
@@ -22,10 +22,24 @@ const themeScript = `${nameShim}(function(){try{var t=localStorage.getItem('rork
 // - 和文は Web フォントを配信しない。端末の Noto Sans JP / Hiragino Sans / Yu Gothic を使う（globals.css）。
 //   Google Fonts の Noto Sans JP は CSS だけで 122KB、next/font で自己ホストしても 33KB(br) の描画ブロック CSS になり、
 //   PSI モバイルの FCP 4〜7 秒の主因だった。
-// - 欧文 DM Sans / DM Mono は next/font で自己ホスト（Latin サブセットのみ・数 KB・size-adjust 付き fallback）。
+// - 欧文 DM Sans / DM Mono は next/font/local で自己ホスト（Latin サブセットのみ・数 KB・size-adjust 付き fallback）。
 //   fonts.googleapis.com への外部接続と head 内スクリプトによる stylesheet 挿入は全廃。
-const dmSans = DM_Sans({ subsets: ["latin"], weight: ["300", "400", "500"], display: "swap", variable: "--font-dm-sans" });
-const dmMono = DM_Mono({ subsets: ["latin"], weight: ["400"], display: "swap", variable: "--font-dm-mono" });
+// ビルド時に fonts.googleapis.com へ取得に行くと、Cloudflare ビルダーからの一時的な取得失敗でビルドが落ちる
+// （2026-10-21 antigravitylab: next/font/google queries have exactly one entry）。claudelab と同じく Latin サブセットを同梱して配信する。
+const dmSans = localFont({
+  src: "../fonts/DMSans-latin-variable.woff2",
+  weight: "300 500",
+  style: "normal",
+  display: "swap",
+  variable: "--font-dm-sans",
+});
+const dmMono = localFont({
+  src: "../fonts/DMMono-Regular-latin.woff2",
+  weight: "400",
+  style: "normal",
+  display: "swap",
+  variable: "--font-dm-mono",
+});
 
 const LOCALE_TITLES: Record<string, string> = {
   ja: "Rork Lab — Rork Max 日本語ナレッジベース",
