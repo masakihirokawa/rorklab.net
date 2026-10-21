@@ -1,0 +1,304 @@
+---
+title: "My Launch Counter Went Up by Two on Every Launch — Why New Users' Ad-Free Grace Ended Early"
+slug: "launch-counter-called-from-two-places-ad-grace-ended-early-count-in-one-place"
+category: "rork-business"
+level: "advanced"
+premium: true
+date: "2026-10-21T20:30"
+author: "Rork Lab"
+description: "New users' ad-free grace ended early because two callers each advanced the launch counter. A counter that moves once per launch, tested in Node."
+tags: ["launch count", "ads", "AsyncStorage", "race condition", "ops log"]
+highlights:
+  - "You can find every place in your app that advances the launch counter, and measure with a test how far it really moves in a single launch"
+  - "You will understand why an async read-add-write ends up as +1 or +2 depending on call spacing, so you can spot the same bug before shipping"
+  - "You can drop in a counter for AsyncStorage that moves once per launch no matter how many callers it has, and test it separately from the grace rule"
+---
+
+As an indie developer, I run several wallpaper apps. In one of them, new users get a short ad-free grace: no ads for their first few launches. I had set the threshold to three.
+
+Ads started appearing sooner than that. The cause had nothing to do with the ad setup. The code that counts launches was called from both app startup and the first screen's startup, so the counter moved by two on every launch.
+
+With a threshold of three, the counter reads 2 after the first launch and 4 after the second. The grace covered one launch, not three.
+
+What I want to share first is that the fix lived in *where the counting happens*, not in any ad setting. What follows is that idea re-built for Expo (the React Native that Rork exports) and actually run on Node 22.
+
+## When "three launches" stops adding up
+
+The arithmetic, on paper:
+
+<table>
+<thead>
+<tr><th>Launch</th><th>Counter moves by 1 per launch</th><th>Counter moves by 2 (the bug)</th></tr>
+</thead>
+<tbody>
+<tr><td>After launch 1</td><td>1 (grace)</td><td>2 (grace)</td></tr>
+<tr><td>After launch 2</td><td>2 (grace)</td><td>4 (ads shown)</td></tr>
+<tr><td>After launch 3</td><td>3 (grace)</td><td>6 (ads shown)</td></tr>
+<tr><td>After launch 4</td><td>4 (ads shown)</td><td>8 (ads shown)</td></tr>
+</tbody>
+</table>
+
+The grace rule is only "is the counter at or below the threshold?" That rule was fine. The number fed into it was wrong.
+
+Bugs like this are quietly annoying. Nothing crashes and no error appears. New users just get a slightly colder first week than the design intended. **Whether a number is right is something you only learn by going to look at the number**, so that became the first line of my checklist.
+
+## Two callers, each with a good reason
+
+On the Android version, the counter was advanced from both the app-wide startup and the first screen's startup. Each call was written for a sound reason ("we launched, so count it"), and each looks correct alone. Only the overlap was wrong.
+
+An Expo app can grow the same shape easily:
+
+<table>
+<thead>
+<tr><th>Where the call lives</th><th>How many times it runs per launch</th></tr>
+</thead>
+<tbody>
+<tr><td>Module top level (runs when imported)</td><td>Depends on how many times the module is evaluated</td></tr>
+<tr><td>useEffect in the root layout</td><td>Normally once; twice in development with StrictMode on</td></tr>
+<tr><td>useEffect in the first screen</td><td>Normally once; once more each time the screen is recreated</td></tr>
+<tr><td>Right after ad SDK initialization</td><td>Twice, if initialization itself is called twice</td></tr>
+</tbody>
+</table>
+
+Effects also re-run when Fast Refresh picks up a saved file. If you only look at numbers on your dev machine, you will not notice how production differs.
+
+## Reproduce the broken version first
+
+Before fixing anything I reproduced the broken shape. This is a re-creation of the idea, not a quote of the original code. The in-memory store imitates only the one property that matters: reads and writes are asynchronous.
+
+```ts
+// kv.ts — a stand-in for AsyncStorage: only the "async, takes a moment" property
+export interface KV {
+  getItem(key: string): Promise<string | null>;
+  setItem(key: string, value: string): Promise<void>;
+}
+
+export function createMemoryKV(latencyMs = 5): KV & { dump(): Record<string, string> } {
+  const data = new Map<string, string>();
+  const wait = () => new Promise<void>((r) => setTimeout(r, latencyMs));
+  return {
+    async getItem(key) {
+      await wait();
+      return data.has(key) ? (data.get(key) as string) : null;
+    },
+    async setItem(key, value) {
+      await wait();
+      data.set(key, value);
+    },
+    dump: () => Object.fromEntries(data),
+  };
+}
+```
+
+```ts
+// counter-buggy.ts — the broken shape: every call is just read, add one, write
+import type { KV } from "./kv.ts";
+
+export function createBuggyCounter(store: KV, key = "launch_count") {
+  return {
+    async countThisLaunch(): Promise<number> {
+      const raw = await store.getItem(key);
+      const next = (Number.parseInt(raw ?? "0", 10) || 0) + 1;
+      await store.setItem(key, String(next));
+      return next;
+    },
+  };
+}
+```
+
+I ran three launches, each with two callers calling one after the other. The result (labels translated from my test output):
+
+```
+launch 1 count=2 grace=true | launch 2 count=4 grace=false | launch 3 count=6 grace=false
+```
+
+It matches the arithmetic above. A threshold-3 grace was over by the second launch.
+
+## The same code gives +1 or +2, depending on timing
+
+One result went against my intuition. When I called the two callers *at the same time*, the same broken code advanced the counter by only 1.
+
+If both calls finish their read at nearly the same moment, both read the same value (say 0) and both write 1. One of the additions disappears. This is the classic lost update, and it makes the number look right.
+
+I varied how many milliseconds the second caller starts after the first and measured how far the counter moved in a single launch. The storage waits 5 ms per read or write, and two runs gave identical results.
+
+<table>
+<thead>
+<tr><th>Second caller delayed by</th><th>Broken version: increase</th><th>Fixed version: increase</th></tr>
+</thead>
+<tbody>
+<tr><td>0 ms</td><td>1</td><td>1</td></tr>
+<tr><td>3 ms</td><td>1</td><td>1</td></tr>
+<tr><td>8 ms</td><td>2</td><td>1</td></tr>
+<tr><td>12 ms</td><td>2</td><td>1</td></tr>
+<tr><td>20 ms</td><td>2</td><td>1</td></tr>
+<tr><td>40 ms</td><td>2</td><td>1</td></tr>
+</tbody>
+</table>
+
+So the broken version does not always add two; it adds one or two depending on the gap between callers. Real storage latency varies with how busy a device is. That is how you end up with **numbers that look right on your dev device and double on certain phones only**.
+
+"I can't reproduce it on my phone" is not evidence that nothing is wrong. That was the strongest lesson from this incident.
+
+## The fix: move exactly once per launch
+
+The fix has two parts: reuse the result within a launch, and put writes in a single line so reads and writes never overlap.
+
+```ts
+// counter.ts — the fixed shape: the component itself guarantees "once per launch"
+import type { KV } from "./kv.ts";
+
+export function createLaunchCounter(store: KV, key = "launch_count") {
+  let session: Promise<number> | null = null; // result of counting in this JS runtime (= one launch)
+  let queue: Promise<unknown> = Promise.resolve(); // serialize writes
+
+  function bump(): Promise<number> {
+    const run = queue.then(async () => {
+      const raw = await store.getItem(key);
+      const next = (Number.parseInt(raw ?? "0", 10) || 0) + 1;
+      await store.setItem(key, String(next));
+      return next;
+    });
+    queue = run.catch(() => undefined); // a failure must not block later writes
+    return run;
+  }
+
+  return {
+    // however many places call this, however often, it advances once per launch
+    countThisLaunch(): Promise<number> {
+      if (!session) {
+        session = bump().catch((e) => {
+          session = null; // only a failed attempt may be retried by the next call
+          throw e;
+        });
+      }
+      return session;
+    },
+    async peek(): Promise<number> {
+      return Number.parseInt((await store.getItem(key)) ?? "0", 10) || 0;
+    },
+  };
+}
+
+// keep the grace rule a plain function, separate from the counter
+export function isInAdGrace(launchCount: number, graceLaunches: number): boolean {
+  return launchCount <= graceLaunches;
+}
+```
+
+Why it is written this way: `session` holds the Promise itself. A second caller does not count again; it receives the result of the count already in flight. Three callers or four, the increase stays at one.
+
+`queue` is a second safeguard. If someone creates the component twice, or borrows this pattern for another counter later, reads and writes still cannot overlap.
+
+I added one line for failure. When saving fails, `session` is cleared so the next call can try again, instead of handing the same failure to every later caller. If the write had actually succeeded, a retry could overcount by one. Preventing that completely would need a different design that stores a per-launch ID. For an ad grace, I judged the trade-off acceptable.
+
+Five launches with two callers each (labels translated):
+
+```
+[fixed] 1:1:grace | 2:2:grace | 3:3:grace | 4:4:ads allowed | 5:5:ads allowed
+[fixed/retry after failure] count = 1
+```
+
+Grace for launches one to three, ads from the fourth. Exactly as designed.
+
+## What I did on Android: skip calls inside a time window
+
+On Android I first fixed this by skipping repeat calls within a fixed time window, before consolidating callers. Re-written in the same environment:
+
+```ts
+// counter-window.ts — "skip repeat calls inside a window"; a fallback when callers cannot be consolidated
+import type { KV } from "./kv.ts";
+
+export function createWindowCounter(
+  store: KV,
+  now: () => number,
+  windowMs: number,
+  key = "launch_count",
+  stampKey = "launch_count_at",
+) {
+  return {
+    async countThisLaunch(): Promise<number> {
+      const last = Number.parseInt((await store.getItem(stampKey)) ?? "0", 10) || 0;
+      const current = Number.parseInt((await store.getItem(key)) ?? "0", 10) || 0;
+      if (last > 0 && now() - last < windowMs) return current; // just counted: skip
+      const next = current + 1;
+      await store.setItem(key, String(next));
+      await store.setItem(stampKey, String(now()));
+      return next;
+    },
+  };
+}
+```
+
+With a 3-second window I lined up the double call within one launch, a relaunch 1.5 seconds later, and another launch 5 seconds after that:
+
+```
+double call in launch 1 = 1 1 / relaunch after 1.5 s = 1 / after 5 s = 2
+```
+
+The double call is prevented. But the *genuine* second launch 1.5 seconds later fell into the same window and was not counted. A user who reopens the app right after a crash is exactly that case.
+
+So a time window is a fallback for when you cannot make the callers one. When you can, `createLaunchCounter` skips only what should be skipped. A shorter window reduces misses but never to zero. Where I can consolidate, I prefer consolidating.
+
+## Wiring it in: one place counts
+
+Once the component exists, the usage rule matters more. The rule is one line: **only the root layout advances the counter; everything else only reads it.**
+
+```ts
+// launch.ts — the single entry point for the counter, shared across the app
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { createLaunchCounter, isInAdGrace } from "./counter";
+
+export const launchCounter = createLaunchCounter(AsyncStorage);
+
+const GRACE_LAUNCHES = 3; // example: no ads for the first 3 launches
+
+export async function shouldHoldAds(): Promise<boolean> {
+  return isInAdGrace(await launchCounter.peek(), GRACE_LAUNCHES);
+}
+```
+
+```tsx
+// app/_layout.tsx — the only place that advances the counter
+import { useEffect } from "react";
+import { Stack } from "expo-router";
+import { launchCounter } from "../launch";
+
+export default function RootLayout() {
+  useEffect(() => {
+    launchCounter.countThisLaunch().catch(() => {
+      // the app still launches if counting fails; grace just lasts one launch longer
+    });
+  }, []);
+  return <Stack />;
+}
+```
+
+Why split `peek()` from `countThisLaunch()`? So the code that decides whether to show an ad can never advance the counter by accident. Searching for the advancing function lists every place that can move it, and an audit is one search.
+
+To be plain about what was verified: I ran only the Node components (`kv.ts`, `counter.ts`, `counter-window.ts`) and their tests. `app/_layout.tsx` and `launch.ts` were not run in a real Expo app, and I have not measured AsyncStorage latency on a device. The millisecond figures above come from my simulated store and say nothing about how fast any phone is.
+
+## Pitfalls to check before you ship
+
+<table>
+<thead>
+<tr><th>Pitfall</th><th>How to check</th></tr>
+</thead>
+<tbody>
+<tr><td>More than one call advances the counter</td><td>Search the whole project for the advancing function. Anything beyond the root layout gets fixed</td></tr>
+<tr><td>Numbers look right on your dev device</td><td>Write a test that delays the second call by a few to a few dozen milliseconds and confirm the increase is always 1</td></tr>
+<tr><td>Failure handling is undefined</td><td>Confirm that a failed save can be retried by the next call and never stops the app</td></tr>
+<tr><td>Mistaking dev re-runs for production behavior</td><td>Effects run by StrictMode or Fast Refresh may not run in production. Read the number in a production build</td></tr>
+<tr><td>Reinstalls</td><td>A reinstall empties AsyncStorage and the counter returns to 0. Decide whether the grace may start over. I cover that in <a href="/articles/app-dev/rork-expo-reinstall-first-run-keychain-asyncstorage-asymmetry-design">Why Reinstalling Users Don't Return to 'First Run' — A First-Launch and State-Persistence Design for Rork (Expo) Apps</a></td></tr>
+</tbody>
+</table>
+
+How long the grace should be, and how it interacts with ads on resume, is covered separately in [Designing AdMob App Open Ad Frequency Without Hurting Retention — Operational Notes from Wallpaper Apps](/articles/rork-business/rork-admob-app-open-ad-frequency-cap-retention-design). What I fixed here is the number that design depends on.
+
+## Three steps to check your own app
+
+1. Search the project for the name of the function that advances the counter, and count the call sites. If there is one, you are done.
+2. If there are two or more, keep the one in the root and turn the rest into read-only calls.
+3. Add one test that calls the counter a second time with a delay, and confirm the increase is always 1 before you ship.
+
+Whether a number is right is something you only learn by going to look at it. The next time your ads behave oddly, I would suggest printing the counter value once before touching any setting.
