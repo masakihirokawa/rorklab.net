@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-25T11:00"
-updated: "2026-04-25T11:00"
+updated: "2026-10-21T19:46"
 author: "Rork Lab"
 description: "A production-ready implementation guide for uploading 1GB+ videos and high-resolution photos from Rork apps. Covers the TUS protocol, S3/R2 Multipart Upload, iOS background transfers, and a resumable progress UI — all with working code."
 tags: ["Rork", "file upload", "TUS", "S3 Multipart", "Cloudflare R2", "background transfer"]
@@ -14,9 +14,11 @@ highlights:
   - "You'll learn when to pick TUS vs S3 Multipart Upload vs Cloudflare R2, with production-ready client code for each path"
   - "You'll be able to ship background uploads with a progress UI that completes even when users leave the app"
 ---
-"I'm uploading my video and the progress bar jumps back to zero the moment I step into an elevator." A user who hits that twice is done with your app.
+I've simulated a train ride on a 200MB video upload by flipping airplane mode on for ten seconds. The progress bar went from about 80% straight back to 0%. A single-shot `fetch + FormData` upload throws away everything it has sent the moment the connection drops. It had passed every test on my desk Wi-Fi, which is exactly why the result stung.
 
-I ran into this firsthand on a photo-sharing app I used to operate. A 200MB video that uploaded cleanly in testing had a 30–40% failure rate in production, specifically among users who "put their phone in a bag and boarded a train." The cause was simple: a naive `fetch + FormData` single-shot upload clashes head-on with the realities of mobile networks. This guide walks you through the implementation patterns that solve the problem from the root — with code you can ship.
+Large uploads rarely fail because the server falls over. They fail where the assumptions of mobile — connections drop, the OS suspends you, memory runs out — collide with a naive implementation. This guide writes down the implementation that closes that gap, with code you can run.
+
+The thing I'd like you to take away first: the biggest win isn't chunking itself, it's **keeping a record of "how far did it get" on both the device and the server**.
 
 ## Why "just fetch + FormData" breaks in production
 
@@ -26,9 +28,9 @@ If you design mobile file uploads the same way you'd design a browser upload, yo
 
 **② iOS will kill your background process without mercy.** Even if the user doesn't force-quit the app, a standard URLSession stops sending after roughly 30 seconds in the background. Unless you reach for `BGTaskScheduler` or `NSURLSession.background`, the notion that your upload "keeps going in the background" is a fantasy.
 
-**③ Memory constraints are tight.** `readAsDataURL` on a 1GB file will crash. In React Native / Expo, usable foreground memory sits somewhere between 800MB and 1.5GB depending on the device. Loading the full file into memory is an instant loss.
+**③ Memory constraints are tight.** `readAsDataURL` on a 1GB file will crash. Usable foreground memory varies a lot by device, and any design that loads the whole file into memory is one to avoid from the start.
 
-**④ Servers have limits too.** Most PaaS platforms cap request bodies: Cloudflare Workers at 100MB, Vercel Serverless at 4.5MB by default, Lambda behind API Gateway at 10MB. A single POST isn't going to clear those gates.
+**④ Servers have limits too.** Most PaaS platforms cap request bodies: Cloudflare Workers at 100MB (Free / Pro plans), Vercel Serverless at 4.5MB by default, Lambda behind API Gateway at 10MB. A single POST isn't going to clear those gates.
 
 The design that addresses all four simultaneously is a **resumable + chunked + background-capable** upload foundation.
 
@@ -37,10 +39,23 @@ The design that addresses all four simultaneously is a **resumable + chunked + b
 There are three practical ways to do resumable, chunked transfers. Each has its sweet spot.
 
 - **TUS protocol (tus.io)**: An open, HTTP-based standard. Client libraries exist in most languages, and the server side runs as either OSS (tusd) or Supabase Storage / Uppy Companion. Arbitrary chunk sizes, resume, and parallelism are all handled by the spec. **The generalist choice.**
-- **S3 / R2 Multipart Upload**: AWS's official protocol, supported by Cloudflare R2, MinIO, and other S3-compatible storage. Parts range from 5MB to 5GB, can be uploaded in parallel, and the combined object can be up to 5TB. **The right call when you're writing directly to cloud storage.**
+- **S3 / R2 Multipart Upload**: AWS's official protocol, supported by Cloudflare R2, MinIO, and other S3-compatible storage. Parts range from 5MiB to 5GiB (only the last part may be smaller), with up to 10,000 parts per upload; on R2 the combined object can be just under 5TiB. **The right call when you're writing directly to cloud storage.**
 - **Supabase Storage Resumable Upload**: Supabase's storage layer speaks TUS under the hood, so you get resumable upload in a few lines from the JS client. **The fastest path if you're already on Supabase.**
 
 My personal decision tree is straightforward: **Cloudflare R2 as storage → Multipart Upload**, **Supabase backend → Supabase Storage Resumable**, **own API server handling files → TUS**. When in doubt, work down that list.
+
+Here is how they differ in where the resume record lives and what they ask of the device:
+
+<table>
+<thead><tr><th>Approach</th><th>Resume source of truth</th><th>Load on the device</th><th>What the server needs</th></tr></thead>
+<tbody>
+<tr><td>TUS</td><td>The server's Upload-Offset (asked via HEAD)</td><td>Depends on how the client reads the input file</td><td>A TUS server such as tusd</td></tr>
+<tr><td>S3 / R2 Multipart</td><td>The uploadId and the ETags of finished parts, stored on the device</td><td>Small — it reads one part at a time</td><td>Four endpoints: start, sign, complete, abort</td></tr>
+<tr><td>Supabase Resumable</td><td>Same as TUS</td><td>Same as TUS</td><td>Supabase Storage only</td></tr>
+</tbody>
+</table>
+
+Only Multipart keeps the resume record on the device. That is why the code below spends so many lines persisting the uploadId and ETags.
 
 ## Foundation: designing an upload core for progress, cancellation, and resume
 
@@ -55,10 +70,15 @@ Here's a minimal core in React Native + Expo using Zustand. You'll plug the TUS 
 ```typescript
 // store/uploadStore.ts
 import { create } from 'zustand';
-import * as FileSystem from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 type Status = 'idle' | 'uploading' | 'paused' | 'failed' | 'completed';
+
+export interface MultipartState {
+  uploadId: string;
+  key: string;
+  parts: { PartNumber: number; ETag: string }[]; // finished parts
+}
 
 export interface UploadTask {
   id: string;
@@ -69,7 +89,8 @@ export interface UploadTask {
   chunkSize: number;           // in bytes (e.g. 5 * 1024 * 1024)
   uploadedBytes: number;       // offset when resuming
   status: Status;
-  serverUploadUrl?: string;    // TUS URL / Multipart uploadId
+  serverUploadUrl?: string;    // TUS upload URL
+  multipart?: MultipartState;  // what a Multipart resume needs
   errorMessage?: string;
   retryCount: number;
 }
@@ -79,6 +100,7 @@ interface UploadState {
   addTask: (task: UploadTask) => Promise<void>;
   updateProgress: (id: string, uploadedBytes: number) => void;
   setStatus: (id: string, status: Status, error?: string) => void;
+  setMultipart: (id: string, multipart: MultipartState) => void;
   hydrateFromStorage: () => Promise<void>;
 }
 
@@ -117,6 +139,14 @@ export const useUploadStore = create<UploadState>((set, get) => ({
     AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(get().tasks));
   },
 
+  setMultipart: (id, multipart) => {
+    const task = get().tasks[id];
+    if (!task) return;
+    set((s) => ({ tasks: { ...s.tasks, [id]: { ...task, multipart } } }));
+    // The uploadId and finished parts are the lifeline of a resume, so write immediately
+    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(get().tasks));
+  },
+
   hydrateFromStorage: async () => {
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
     if (!raw) return;
@@ -134,7 +164,7 @@ export const useUploadStore = create<UploadState>((set, get) => ({
 }));
 ```
 
-Why "persist every 1MB"? Writing AsyncStorage on every chunk turns I/O into the bottleneck. Balancing progress granularity and write frequency — roughly 20–30% of your chunk size — is a good heuristic in practice.
+Why "persist every 1MB"? Writing AsyncStorage on every chunk turns I/O into the bottleneck. Start around 20–30% of your chunk size and tune on a real device — but never throttle the writes of a resume key such as the uploadId.
 
 ## Implementation 1: building resumable uploads with TUS
 
@@ -143,7 +173,7 @@ For your own server or Supabase Storage, [`tus-js-client`](https://github.com/tu
 ```typescript
 // lib/uploadTus.ts
 import * as tus from 'tus-js-client';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy'; // 'expo-file-system' on SDK 53 and earlier
 import { useUploadStore } from '../store/uploadStore';
 
 // Upload to a TUS server in chunks.
@@ -165,7 +195,7 @@ export async function uploadWithTus(
 
   return new Promise((resolve, reject) => {
     const upload = new tus.Upload(
-      // Lightweight wrapper for React Native
+      // How the file is passed is simplified here — see the note below
       {
         uri: fileUri,
         name: fileName,
@@ -208,7 +238,9 @@ export async function uploadWithTus(
 
 **Expected behavior**: when the app returns from background, `tus-js-client` sends a `HEAD` request to ask the server "where did I leave off?" and picks up from that offset. If the connection dies at 700MB, the resume starts at byte 700MB + 1.
 
-**Expo caveats**: pure `tus-js-client` assumes `File` / `Blob`, so in React Native you'll fall back to `XMLHttpRequest` + `FormData` internally. Expo SDK 52 and later ship `expo-file-system`'s `createUploadTask` with partial TUS compatibility — consider the native approach below if you're rolling your own.
+**Expo caveats**: the file argument in this code is a simplified placeholder. Which inputs (Blob, URI) `tus-js-client` accepts in React Native has changed between versions, so check the library's React Native demo before adopting it. Also, loading a 1GB-class file into memory as a Blob is something to avoid; if you need flat memory use, reading by byte range, as in the Multipart example below, is safer.
+
+Note that `expo-file-system`'s `createUploadTask` does not speak TUS. It sends a whole file in one request, and we use it for a different job further down.
 
 ## Implementation 2: S3 / R2 Multipart Upload with parallel parts
 
@@ -224,30 +256,26 @@ Here's the client core.
 
 ```typescript
 // lib/uploadMultipart.ts
-import * as FileSystem from 'expo-file-system';
-import { useUploadStore } from '../store/uploadStore';
-
-interface InitiateResponse {
-  uploadId: string;
-  key: string;
-}
+import * as FileSystem from 'expo-file-system/legacy'; // 'expo-file-system' on SDK 53 and earlier
+import { useUploadStore, MultipartState } from '../store/uploadStore';
 
 interface PartUrl {
   partNumber: number;
   url: string;
 }
 
-const PART_SIZE = 5 * 1024 * 1024; // R2/S3 minimum is 5MB
-const PARALLELISM = 3;              // 3 is the sweet spot on cellular
+const PART_SIZE = 5 * 1024 * 1024; // R2 / S3 minimum is 5MiB; all parts but the last must be the same size
+const PARALLELISM = 3;              // a starting point — measure on your own devices and networks
 
-// Coordinates with your API to run a multipart upload.
-// Expected behavior: 1GB file splits into 200 parts, uploaded 3-at-a-time.
+// A resumable Multipart upload.
+// Expected behavior: the first run issues and saves an uploadId; later runs send only the missing parts.
 export async function uploadWithMultipart(
   taskId: string,
   fileUri: string,
   fileName: string,
   apiBaseUrl: string,
   authToken: string,
+  shouldStop: () => boolean = () => false, // lets a background window cut us off cleanly
 ): Promise<void> {
   const store = useUploadStore.getState();
   const task = store.tasks[taskId];
@@ -257,96 +285,99 @@ export async function uploadWithMultipart(
   if (!fileInfo.exists) throw new Error('file missing');
   const totalSize = fileInfo.size;
   const totalParts = Math.ceil(totalSize / PART_SIZE);
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${authToken}`,
+  };
+  const partBytes = (n: number) =>
+    Math.min(n * PART_SIZE, totalSize) - (n - 1) * PART_SIZE;
 
   try {
     store.setStatus(taskId, 'uploading');
 
-    // Step 1: initiate multipart
-    const initRes = await fetch(`${apiBaseUrl}/uploads/initiate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: JSON.stringify({ fileName, size: totalSize, totalParts }),
-    });
-    if (!initRes.ok) throw new Error(`initiate failed: ${initRes.status}`);
-    const init = (await initRes.json()) as InitiateResponse;
-
-    // Persist uploadId for resume on next run
-    store.setStatus(taskId, 'uploading');
-
-    // Step 2: get pre-signed URLs for every part
-    const partUrlsRes = await fetch(`${apiBaseUrl}/uploads/part-urls`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: JSON.stringify({
-        uploadId: init.uploadId,
-        key: init.key,
-        totalParts,
-      }),
-    });
-    const { parts } = (await partUrlsRes.json()) as { parts: PartUrl[] };
-
-    // Step 3: upload in parallel
-    const completedParts: { PartNumber: number; ETag: string }[] = [];
-    let uploadedBytes = task.uploadedBytes || 0;
-
-    async function uploadPart(part: PartUrl): Promise<void> {
-      const start = (part.partNumber - 1) * PART_SIZE;
-      const end = Math.min(start + PART_SIZE, totalSize);
-      const partSize = end - start;
-
-      // Read only the byte range for this part
-      const base64 = await FileSystem.readAsStringAsync(fileUri, {
-        encoding: FileSystem.EncodingType.Base64,
-        position: start,
-        length: partSize,
+    // Step 1: if an uploadId is already saved, do NOT call initiate again (that starts a different upload)
+    let current: MultipartState | undefined = task.multipart;
+    if (!current) {
+      const initRes = await fetch(`${apiBaseUrl}/uploads/initiate`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ fileName, size: totalSize }),
       });
-      const binary = decodeBase64ToUint8Array(base64);
+      if (!initRes.ok) throw new Error(`initiate failed: ${initRes.status}`);
+      const init = (await initRes.json()) as { uploadId: string; key: string };
+      current = { uploadId: init.uploadId, key: init.key, parts: [] };
+      store.setMultipart(taskId, current);
+    }
+    const session: MultipartState = current;
 
-      const res = await fetch(part.url, {
-        method: 'PUT',
-        body: binary as any,
+    // Step 2: ask for fresh pre-signed URLs only for the parts still missing (old URLs may have expired)
+    const done = new Set(session.parts.map((p) => p.PartNumber));
+    const pendingNumbers: number[] = [];
+    for (let n = 1; n <= totalParts; n++) if (!done.has(n)) pendingNumbers.push(n);
+
+    let uploadedBytes = session.parts.reduce((sum, p) => sum + partBytes(p.PartNumber), 0);
+    store.updateProgress(taskId, uploadedBytes);
+
+    if (pendingNumbers.length > 0) {
+      const partUrlsRes = await fetch(`${apiBaseUrl}/uploads/part-urls`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ uploadId: session.uploadId, key: session.key, partNumbers: pendingNumbers }),
       });
-      if (!res.ok) throw new Error(`part ${part.partNumber} failed`);
+      if (!partUrlsRes.ok) throw new Error(`part-urls failed: ${partUrlsRes.status}`);
+      const { parts } = (await partUrlsRes.json()) as { parts: PartUrl[] };
 
-      const etag = res.headers.get('ETag')?.replace(/"/g, '') || '';
-      completedParts.push({ PartNumber: part.partNumber, ETag: etag });
+      async function uploadPart(part: PartUrl): Promise<void> {
+        const start = (part.partNumber - 1) * PART_SIZE;
+        const size = partBytes(part.partNumber);
 
-      uploadedBytes += partSize;
-      store.updateProgress(taskId, uploadedBytes);
+        // Read only the byte range we need (never the whole file)
+        const base64 = await FileSystem.readAsStringAsync(fileUri, {
+          encoding: FileSystem.EncodingType.Base64,
+          position: start,
+          length: size,
+        });
+        const res = await fetch(part.url, {
+          method: 'PUT',
+          body: decodeBase64ToUint8Array(base64) as any,
+        });
+        if (!res.ok) throw new Error(`part ${part.partNumber} failed: ${res.status}`);
+
+        const etag = res.headers.get('ETag')?.replace(/"/g, '');
+        if (!etag) throw new Error(`part ${part.partNumber}: ETag missing`);
+
+        // Record after every part — if the app dies, nothing up to here is lost
+        session.parts.push({ PartNumber: part.partNumber, ETag: etag });
+        store.setMultipart(taskId, { ...session, parts: [...session.parts] });
+        uploadedBytes += size;
+        store.updateProgress(taskId, uploadedBytes);
+      }
+
+      const queue = [...parts];
+      const workers = Array.from({ length: PARALLELISM }, async () => {
+        while (queue.length > 0 && !shouldStop()) {
+          const next = queue.shift();
+          if (!next) return;
+          await retryWithBackoff(() => uploadPart(next), 3);
+        }
+      });
+      await Promise.all(workers);
     }
 
-    // Bounded concurrency across all parts
-    const queue = [...parts];
-    const workers = Array.from({ length: PARALLELISM }, async () => {
-      while (queue.length > 0) {
-        const next = queue.shift();
-        if (!next) return;
-        await retryWithBackoff(() => uploadPart(next), 3);
-      }
-    });
-    await Promise.all(workers);
+    // If we were cut off, end as paused and continue next time
+    if (session.parts.length < totalParts) {
+      store.setStatus(taskId, 'paused');
+      return;
+    }
 
-    // Step 4: complete
-    completedParts.sort((a, b) => a.PartNumber - b.PartNumber);
+    // Step 3: Complete
+    const sorted = [...session.parts].sort((a, b) => a.PartNumber - b.PartNumber);
     const completeRes = await fetch(`${apiBaseUrl}/uploads/complete`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: JSON.stringify({
-        uploadId: init.uploadId,
-        key: init.key,
-        parts: completedParts,
-      }),
+      headers,
+      body: JSON.stringify({ uploadId: session.uploadId, key: session.key, parts: sorted }),
     });
-    if (!completeRes.ok) throw new Error('complete failed');
+    if (!completeRes.ok) throw new Error(`complete failed: ${completeRes.status}`);
 
     store.setStatus(taskId, 'completed');
   } catch (e: any) {
@@ -376,69 +407,88 @@ async function retryWithBackoff<T>(fn: () => Promise<T>, max: number): Promise<T
 }
 ```
 
-**Expected behavior**: a 1GB file splits into 200 parts of 5MB each, uploaded 3 at a time. If any single part fails, only that part retries — the rest stays untouched. After the final part, the server calls `CompleteMultipartUpload` and R2 stitches everything into a single object.
+**Expected behavior**: a 1GB file splits into roughly 205 parts of 5MiB, uploaded three at a time. If the app dies midway, the resume reads the saved `uploadId` and the ETags of finished parts, then sends only what is missing. Once every part is in, `CompleteMultipartUpload` stitches them into a single object.
 
-**Why parallelism of 3?** In my measurements, 3 concurrent uploads is the sweet spot over 4G / 5G. Push it past 5 and per-connection throughput drops enough that the total time gets worse. On Wi-Fi you can go 5–6, so reading `NetInfo` and setting the value dynamically is a nice touch.
+An earlier version of this article's code had no such record. If you call `initiate` again on every resume, you get a different `uploadId`, and the parts you already sent stay on the server as orphans. A Multipart upload is only resumable for as long as the device still holds the `uploadId` and the ETags.
 
-## iOS background uploads — pairing with BGTaskScheduler
+**Three-way parallelism is a starting point.** More connections don't make the radio any wider, so on cellular you can hit a ceiling. Branch on the `NetInfo` connection type — raise it on Wi-Fi only, say — and always decide from measurements on your own devices and networks.
 
-To keep an upload going after the user backgrounds your app, you need `BGTaskScheduler` or `URLSessionConfiguration.background`. On Expo, `expo-background-fetch` + `expo-task-manager` is the built-in path.
+## iOS background transfers — separate what keeps going from what picks things back up
+
+Many of us want a transfer started in the foreground to keep going after the user goes home. What I find easiest to get wrong is mixing up what each mechanism is for.
+
+<table>
+<thead><tr><th>Mechanism</th><th>Role</th><th>Good for</th><th>Not for</th></tr></thead>
+<tbody>
+<tr><td><code>expo-file-system</code> <code>createUploadTask</code> (iOS BACKGROUND session)</td><td>The OS carries the transfer itself</td><td>One PUT of one file to a pre-signed URL</td><td>Splitting into parts or resuming midway (it sends the whole file)</td></tr>
+<tr><td><code>expo-background-task</code></td><td>Picks unfinished tasks back up in the short windows the OS grants</td><td>Sending a few more parts of a task that still has its <code>uploadId</code></td><td>Long transfers themselves</td></tr>
+<tr><td>The Multipart code in this article</td><td>Parallel transfer while the app is in front</td><td>Large uploads that must resume</td><td>Running on after the app is closed</td></tr>
+</tbody>
+</table>
+
+The choice comes down to file size and whether "start over on failure" is acceptable. Up to a few hundred MB, handing one pre-signed PUT to a background session is smaller to build and keeps going when the app is closed. A BACKGROUND session works while the app is in the background and keeps retrying until it succeeds or is canceled (per the comment in Expo's type definitions). The price is that a broken transfer restarts from byte zero.
+
+For files beyond 1GB, or on unstable networks, the Multipart resume record earns its keep — and picking that back up after the app goes to the background is the job of the BackgroundTask below.
+
+One more update: `expo-background-fetch`, which an earlier version of this article used, was replaced and deprecated by `expo-background-task` in Expo SDK 53. It uses BGTaskScheduler on iOS and WorkManager on Android.
 
 ```typescript
 // lib/backgroundUpload.ts
-import * as BackgroundFetch from 'expo-background-fetch';
+import * as BackgroundTask from 'expo-background-task';
 import * as TaskManager from 'expo-task-manager';
 import { useUploadStore } from '../store/uploadStore';
 import { uploadWithMultipart } from './uploadMultipart';
 
 const TASK_NAME = 'rork-resumable-upload';
+const TIME_BUDGET_MS = 20 * 1000; // the window is cut short; stop yourself with room to spare
 
-// Background handler picks up any unfinished task and resumes it.
-// Expected behavior: iOS calls defineTask when it deems it a good time.
+// Expected behavior: starts when the OS allows, and advances tasks that still hold an uploadId a few parts at a time
 TaskManager.defineTask(TASK_NAME, async () => {
   try {
     await useUploadStore.getState().hydrateFromStorage();
     const tasks = useUploadStore.getState().tasks;
     const pending = Object.values(tasks).filter(
-      (t) => t.status === 'paused' || t.status === 'failed',
+      (t) => (t.status === 'paused' || t.status === 'failed') && t.multipart,
     );
 
+    const deadline = Date.now() + TIME_BUDGET_MS;
+    const token = await getAuthToken(); // from expo-secure-store
     for (const task of pending) {
+      if (Date.now() > deadline) break;
       try {
         await uploadWithMultipart(
           task.id,
           task.fileUri,
           task.fileName,
           process.env.EXPO_PUBLIC_API_URL!,
-          await getAuthToken(),
+          token,
+          () => Date.now() > deadline,
         );
       } catch (e) {
         console.warn('bg upload failed', task.id, e);
       }
     }
-    return BackgroundFetch.BackgroundFetchResult.NewData;
+    return BackgroundTask.BackgroundTaskResult.Success;
   } catch (e) {
-    return BackgroundFetch.BackgroundFetchResult.Failed;
+    return BackgroundTask.BackgroundTaskResult.Failed;
   }
 });
 
 export async function registerBackgroundUpload(): Promise<void> {
-  await BackgroundFetch.registerTaskAsync(TASK_NAME, {
-    minimumInterval: 60 * 15, // 15 min (iOS ignores smaller values)
-    stopOnTerminate: false,
-    startOnBoot: true,
+  await BackgroundTask.registerTaskAsync(TASK_NAME, {
+    minimumInterval: 15, // minutes; a hint — the OS decides the real interval
   });
 }
 
 async function getAuthToken(): Promise<string> {
-  // Omitted: pull JWT from expo-secure-store
+  // omitted: read the JWT from expo-secure-store
   return '';
 }
 ```
 
-**Understand what iOS actually guarantees**: a `BackgroundFetch` task runs when iOS decides it's a good time — based on usage patterns, battery level, network conditions. You cannot order the OS to "keep uploading now." `minimumInterval` is a hint, and actual invocation can be hours later.
+**What iOS does not promise**: a BackgroundTask runs when iOS decides it's a good time, based on usage patterns, battery state, and network conditions. You cannot order it to "keep sending now," and if the user force-quits the app it may not start at all. That is why this task is designed as a short continuation you can stop yourself with `shouldStop`, not as the thing that carries a long transfer.
 
-**When you need genuine real-time background transfers**, exposing `URLSessionConfiguration.background` through a native module is the only real answer. As of April 2026 there's no fully-featured official Expo module, so you'll either write a native wrapper or adopt something like `react-native-background-upload`.
+**If you need truly uninterrupted transfer**, you need a native module that drives `URLSessionConfiguration.background` directly. Expo's `createUploadTask` covers the one-file-one-request case described above; beyond that you'll look at something like `react-native-background-upload` or your own native code. If you adopt a third-party module, check its maintenance status and its support for your Expo SDK first.
 
 ## UX: progress display, cancellation, and error recovery
 
@@ -508,37 +558,37 @@ const styles = StyleSheet.create({
 
 **Three details that matter more than they look**:
 
-- **Startup resume confirmation**: any task still in `uploading` when the app was killed should demote to `paused` on launch and prompt the user before resuming. Auto-resuming over cellular has caused real billing incidents for users on large transfers.
-- **Cleanup on cancel**: for S3 Multipart, forgetting `AbortMultipartUpload` leaves incomplete parts around for 7 days — which you're paying for. On cancel, always call the server's abort endpoint.
+- **Startup resume confirmation**: any task still in `uploading` when the app was killed should demote to `paused` on launch and ask before resuming. Auto-resuming over cellular can burn through a user's data allowance on a large transfer.
+- **Cleanup on cancel**: skip `AbortMultipartUpload` and the incomplete parts stay in storage. R2 aborts them automatically after 7 days by default, but until then they count toward what you store. On cancel, always call the server's abort endpoint.
 - **Wi-Fi-only mode**: expose a setting so users can restrict uploads to Wi-Fi. Check `NetInfo.fetch()` for connection type and keep tasks in `paused` while on cellular.
 
 A useful companion read is [Debugging Network and API Requests in Rork Apps](/en/articles/rork-basics/rork-network-api-request-debug-guide), which helps you tell apart "slow upload because of code" from "slow upload because of the server."
 
-## Common pitfalls — three real-world failure modes
+## Common pitfalls — four places people trip
 
-Three failure patterns I've seen take down production deployments, and the fixes.
+Four spots where it's easy to stumble once you're following the implementation.
 
-**① Memory leak from un-GC'd Base64 chunks**
+**① Memory: Base64 chunks pile up**
 
-The Base64 you get back from `FileSystem.readAsStringAsync` can linger in the JS heap. Reading 200 chunks of a 1GB file produces enough pressure to OOM partway through. Fix: null out the chunk locals explicitly and keep your `Promise.all` batch size small. My implementation caps memory at **3 concurrent workers × 5MB chunk ≈ 15MB resident.**
+`FileSystem.readAsStringAsync` returns a string about 4/3 the size of the binary. For a 5MiB part, string plus bytes comes to a dozen-odd MB per part, roughly 35MB for three in flight. Because you never read the whole file, memory stays flat even at 1GB — but raise parallelism and part size together and that number grows honestly. Drop your references once a part is sent, and keep the number of parts you queue in `Promise.all` small.
 
-**② Parallelism trap — more isn't always faster**
+**② Parallelism: more isn't always faster**
 
-As noted above, pushing concurrency up on mobile can slow things down. In weak 3G/4G signal, I've measured 2 workers beating 5 workers. Read `NetInfo`'s `cellularGeneration` and dial parallelism dynamically — that's the production-grade answer.
+As noted above, raising parallelism on a weak signal doesn't guarantee a shorter total time. Switch it by `NetInfo` connection type (Wi-Fi or cellular) and decide by measuring.
 
-**③ Charge interruption — iOS Low Power Mode kills background tasks**
+**③ Low Power Mode: fewer chances to run in the background**
 
-Below 20% battery with Low Power Mode enabled, iOS aggressively terminates background work. Detect `lowPowerMode` via `ExpoBattery.getPowerStateAsync` and surface a "plug in to keep uploading" hint — it measurably reduces churn on long transfers.
+iOS offers Low Power Mode when the battery drops to 20%, and it reduces background activity. It doesn't kill your app, but it certainly reduces how often BackgroundTask is called. Check `lowPowerMode` via `getPowerStateAsync` in `expo-battery` and tell the user on screen that "the rest will be sent when you plug in."
 
-**④ Android's background restrictions**
+**④ Android: declaring a foreground service type**
 
-Starting with Android 12, you need an explicit foreground service type or the upload gets chopped when the app closes. Use `react-native-background-actions` with the `dataSync` type, or invoke `WorkManager` from a native module. In Expo EAS, add `FOREGROUND_SERVICE_DATA_SYNC` to `app.json`'s Android permissions.
+From Android 14, a foreground service must declare its type. For data transfer, that means the `dataSync` type and the `FOREGROUND_SERVICE_DATA_SYNC` permission. To keep sending after the app closes, use the `dataSync` type in `react-native-background-actions`, or call `WorkManager` natively. With Expo EAS, add `FOREGROUND_SERVICE_DATA_SYNC` to the Android permissions in `app.json`.
 
-Every one of these only shows up after tens of thousands of production uploads. Skipping them up front makes retrofitting them later dramatically more expensive.
+None of these show up while your test files are small. Settling them in the first implementation is far cheaper than fixing them later.
 
 ## Server-side essentials — the four endpoints you need
 
-The client code above leans on four server endpoints. To make this guide self-contained, here's a minimal Cloudflare Workers implementation using Hono and the R2 binding. Drop this into your existing API and wire the `R2_BUCKET` binding in `wrangler.toml`.
+The client code above leans on four server endpoints. Here is a minimal Cloudflare Workers implementation using Hono and the R2 binding. Add it to your existing API and connect an `R2_BUCKET` binding in `wrangler.toml`.
 
 ```typescript
 // api/uploads.ts (Cloudflare Workers + Hono)
@@ -553,29 +603,40 @@ type Env = {
   R2_BUCKET_NAME: string;
 };
 
+const MAX_SIZE = 5 * 1024 * 1024 * 1024; // the cap your app allows (a value you choose, not R2's limit)
+const MAX_PARTS = 10000;                  // R2 / S3 limit on parts
+
 const app = new Hono<{ Bindings: Env }>();
 
-// 1. Initiate a multipart upload. Returns uploadId + object key.
+// 1. Start a multipart upload: return an uploadId and an object key
 app.post('/uploads/initiate', async (c) => {
-  const { fileName, size, totalParts } = await c.req.json<{
-    fileName: string;
-    size: number;
-    totalParts: number;
-  }>();
-  if (size > 5 * 1024 * 1024 * 1024) return c.json({ error: 'too large' }, 400);
-
-  const key = `u/${crypto.randomUUID()}/${fileName}`;
+  const { fileName, size } = await c.req.json<{ fileName: string; size: number }>();
+  if (!Number.isFinite(size) || size <= 0 || size > MAX_SIZE) {
+    return c.json({ error: 'invalid size' }, 400);
+  }
+  // Don't use the raw file name in the key; keep only safe characters
+  const safeName = String(fileName).replace(/[^\w.\-]+/g, '_').slice(0, 120);
+  const key = `u/${crypto.randomUUID()}/${safeName}`;
   const multipart = await c.env.R2_BUCKET.createMultipartUpload(key);
+  // In production, store size, key and user ID in a DB here and check them in complete
   return c.json({ uploadId: multipart.uploadId, key });
 });
 
-// 2. Mint pre-signed URLs for each part (valid 1 hour).
+// 2. Issue pre-signed URLs for the missing parts (valid for 1 hour)
 app.post('/uploads/part-urls', async (c) => {
-  const { uploadId, key, totalParts } = await c.req.json<{
+  const { uploadId, key, partNumbers } = await c.req.json<{
     uploadId: string;
     key: string;
-    totalParts: number;
+    partNumbers: number[];
   }>();
+  if (
+    !Array.isArray(partNumbers) ||
+    partNumbers.length === 0 ||
+    partNumbers.length > MAX_PARTS ||
+    partNumbers.some((n) => !Number.isInteger(n) || n < 1 || n > MAX_PARTS)
+  ) {
+    return c.json({ error: 'invalid parts' }, 400);
+  }
 
   const aws = new AwsClient({
     accessKeyId: c.env.R2_ACCESS_KEY_ID,
@@ -585,19 +646,23 @@ app.post('/uploads/part-urls', async (c) => {
   });
 
   const endpoint = `https://${c.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-  const parts: { partNumber: number; url: string }[] = [];
-  for (let i = 1; i <= totalParts; i++) {
-    const url = `${endpoint}/${c.env.R2_BUCKET_NAME}/${encodeURIComponent(key)}?partNumber=${i}&uploadId=${uploadId}`;
-    const signed = await aws.sign(url, {
-      method: 'PUT',
-      aws: { signQuery: true, expiresIn: 60 * 60 },
-    });
-    parts.push({ partNumber: i, url: signed.url });
-  }
+  const parts = await Promise.all(
+    partNumbers.map(async (n) => {
+      const url = new URL(`${endpoint}/${c.env.R2_BUCKET_NAME}/${key}`);
+      url.searchParams.set('partNumber', String(n));
+      url.searchParams.set('uploadId', uploadId);
+      url.searchParams.set('X-Amz-Expires', '3600'); // the expiry lives on the URL
+      const signed = await aws.sign(url.toString(), {
+        method: 'PUT',
+        aws: { signQuery: true },
+      });
+      return { partNumber: n, url: signed.url };
+    }),
+  );
   return c.json({ parts });
 });
 
-// 3. Complete the multipart upload once all parts are done.
+// 3. Stitch the parts together once all are uploaded
 app.post('/uploads/complete', async (c) => {
   const { uploadId, key, parts } = await c.req.json<{
     uploadId: string;
@@ -611,7 +676,7 @@ app.post('/uploads/complete', async (c) => {
   return c.json({ ok: true, key: object.key, size: object.size });
 });
 
-// 4. Abort an in-flight upload (client cancel path).
+// 4. The client's cancel path: abort an unfinished multipart upload
 app.post('/uploads/abort', async (c) => {
   const { uploadId, key } = await c.req.json<{ uploadId: string; key: string }>();
   const multipart = c.env.R2_BUCKET.resumeMultipartUpload(key, uploadId);
@@ -622,45 +687,48 @@ app.post('/uploads/abort', async (c) => {
 export default app;
 ```
 
-**Why R2's native binding plus aws4fetch?** R2's Workers binding supports `createMultipartUpload` / `resumeMultipartUpload` directly but doesn't expose pre-signed URLs — and you need pre-signed URLs so the client can PUT parts without proxying through your Worker. `aws4fetch` handles the SigV4 signing for the S3-compatible REST endpoint. The initiate / complete / abort calls go through the binding for speed and simplicity.
+**Why R2's native binding plus aws4fetch?** R2's Workers binding supports `createMultipartUpload` / `resumeMultipartUpload` directly but doesn't expose pre-signed URL generation. For the client to PUT parts without going through your Worker, it needs pre-signed URLs, so only that step uses `aws4fetch` to apply SigV4 against the S3-compatible REST endpoint. Start, complete, and abort are faster and simpler through the binding.
 
-**Adding auth**: wrap these routes with middleware that validates a Bearer token (JWT, Supabase session, whatever you use). Never expose these endpoints unauthenticated — anyone could initiate a multipart upload against your bucket and burn your storage budget.
+R2 Multipart has a rule that **every part except the last must be the same size**. That's one more reason the client pins `PART_SIZE`. If an app update changes the part size, store the part size in the `multipart` record so in-flight uploads don't break.
+
+**Add auth.** Wrap these routes with middleware that validates a Bearer token (a JWT, a Supabase session, whatever you use). Left unauthenticated, anyone can start a Multipart upload and spend your storage budget. In `complete` and `abort`, also check that the `uploadId` and `key` were issued to that user by `initiate`.
 
 ## Testing the upload flow before shipping
 
-Uploads are the category of feature where testing in a good office Wi-Fi environment gives you false confidence. Here's the test matrix I run before every release.
+Uploads are the category of feature where "it worked on office Wi-Fi" proves nothing. Here are the tests worth running before release, with what you should expect.
 
-**① Network Link Conditioner (iOS) / Chrome DevTools throttling**: simulate "Very Bad Network" (1% loss, 500ms RTT). Your upload should still complete for any file size — just slower. Anything less is a bug.
+**① Network Link Conditioner (iOS) / Chrome DevTools throttling**: simulate "Very Bad Network" (1% loss, 500ms RTT). Your upload should still complete for any file size. Taking a long time is fine; ending in failure is a fail.
 
-**② Airplane mode flip test**: start a 200MB upload. At 30% progress, toggle airplane mode on for 10 seconds, then off. The upload should resume automatically within 15 seconds, with progress picking up from the last persisted byte — not zero.
+**② Airplane mode flip**: start a 200MB upload. At 30% progress, toggle airplane mode on for 10 seconds, then off. It should resume automatically and continue from the saved parts, not from zero.
 
-**③ Force-quit recovery**: start a 500MB upload. At 50% progress, force-quit the app from the app switcher. Relaunch 30 seconds later. The task should appear in `paused` state with a "Resume" button. Tapping it should continue from roughly where it left off (a few seconds of re-verification is acceptable).
+**③ Force-quit recovery**: start a 500MB upload and push it to 50%. Force-quit from the app switcher. On relaunch the task should appear as `paused`, and tapping it should skip finished parts and continue. If `initiate` is called again here, your `uploadId` isn't being saved.
 
-**④ Background burst test**: start the upload, immediately press home. Wait 20 minutes, then foreground the app. Progress should have advanced (within iOS's scheduling constraints). Verify you see the `UploadProgressList` reflect updates from the background task on foreground.
+**④ Background behavior**: expectations differ by mechanism. A PUT on a BACKGROUND session should finish even after you go home. A Multipart upload driven by BackgroundTask advances only as far as the windows the OS grants — "done after 20 minutes" is not guaranteed — so check that `UploadProgressList` shows the correct progress when you return to the foreground and that you can continue from there.
 
-**⑤ Cancellation leak test**: upload 10 files, cancel them at random progress. Then query your storage dashboard — there should be zero orphaned multipart uploads. If you see any, your `abort` endpoint isn't wired correctly.
+**⑤ Cancellation leaks**: cancel 10 files at scattered progress points. Your storage should show zero unfinished multipart uploads. If any remain, `abort` isn't being called.
 
-**⑥ Large-file stress test**: upload the largest file your app will realistically handle (say, 2GB of 4K video) on both iOS and Android, Wi-Fi and cellular. Record completion time, failure count, and peak memory. These are the numbers you'll monitor in production.
+**⑥ Large-file stress**: upload the largest file your app will realistically handle (say, 2GB of 4K video) on iOS and Android, over Wi-Fi and 4G/5G. Record completion time, failure count, and peak memory; those become the starting values for what you monitor in production.
 
-Automating 1–5 in CI with Maestro or Detox is the ideal end state, though in my experience a manual QA pass covering these scenarios once per release cycle catches 90% of regressions for a fraction of the upfront cost.
+Automating ① to ⑤ in CI with Maestro or Detox is the ideal end state, but until then a manual pass each release still gives you a net for regressions.
 
 ## Production readiness checklist
 
-Here's what to verify before shipping resumable uploads. The list is long — work through it item by item in the release sprint.
+Here's what to verify before shipping resumable uploads. The list is long, so work through it one item at a time in the release sprint.
 
-- **Server**: `uploadId` TTL is set (S3/R2 don't expire multiparts by default — run a cron that calls `AbortMultipartUpload` after 24h)
-- **Server**: part-number bounds validation (S3 rejects outside 1–10,000) is in place
-- **Server**: the completed file size matches the client-reported size (anti-tampering)
-- **Client**: pre-signed URL expiry (recommended 1 hour) triggers re-issue logic
-- **Client**: `hydrateFromStorage` runs on cold start to surface unfinished tasks
-- **Client**: cancel calls `AbortMultipartUpload` on the server (no silent billing leaks)
-- **UX**: the copy is "safe to close the app" instead of "don't close the app" — teach users to trust the background flow
-- **UX**: failure messages prescribe an action ("reconnect to Wi-Fi and we'll resume") rather than "please try again"
-- **Observability**: Sentry / Firebase Crashlytics dashboards track completion rate, average duration, and failure-reason distribution
-- **Observability**: server tracks per-`uploadId` progress and auto-aborts ones idle for 1+ hour
+- **Server**: no unfinished `uploadId` is left lying around. R2 aborts them after 7 days by default; if you want sooner, set a lifecycle rule or run a cron that calls `abort`
+- **Server**: part numbers are validated to 1–10,000 (anything outside is rejected)
+- **Server**: the size of the finished object matches the size declared in `initiate`
+- **Client**: pre-signed URLs are re-requested on every resume (a URL past its one-hour expiry won't work)
+- **Client**: `hydrateFromStorage` runs on cold start to restore unfinished tasks
+- **Client**: the `uploadId` and finished-part ETags are persisted after every part
+- **Client**: cancel calls `abort` on the server
+- **UX**: the copy tells users accurately whether it is safe to close the app, matched to the mechanism you use
+- **UX**: failure messages prescribe an action ("we'll resume once you're on Wi-Fi") rather than "please try again"
+- **Observability**: Sentry / Firebase Crashlytics dashboards track completion rate, duration, and failure-reason distribution
+- **Observability**: the server tracks per-`uploadId` progress and auto-aborts uploads idle for an hour or more
 
 On the binary-size side, [Slimming Down Rork App Binaries](/en/articles/rork-dev/rork-app-bundle-size-reduction-guide) is worth pairing with this work — upload dependencies tend to bloat, and you'll want to keep both in check. If you're on R2, [Rork × Cloudflare R2 File Storage Implementation](/en/articles/rork-dev/rork-cloudflare-r2-file-storage-guide) has a minimal server snippet for the pre-signed URLs this guide assumes.
 
-An upload foundation is the kind of asset you build once and re-use for every future media feature. Behind a single-line support ticket like "my video keeps failing" is a user whose trust you're losing minute by minute. I hope this gives you the concrete building blocks to make that failure mode disappear.
+**Whether an upload can resume depends on who holds the record.** With TUS it's the server; with Multipart it's the device.
 
-Your first step today: try uploading a 500MB video from your own app while riding a train. Record the failure rate. Once you ship this implementation, you'll have a number to measure the improvement against.
+Your next step: check whether your app actually saves the `uploadId`. If it doesn't, one force-quit test (③) will tell you in a minute.
