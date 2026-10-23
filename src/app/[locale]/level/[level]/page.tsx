@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
+import { siteOgImage } from "@/lib/og";
 
 /* ── Valid levels ── */
 const VALID_LEVELS = ["beginner", "intermediate", "advanced"] as const;
@@ -65,7 +66,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const metadata: Metadata = {
     title,
     description,
-    openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }] },
+    openGraph: { title, description, images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
     alternates: {
       canonical,
       languages: {

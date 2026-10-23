@@ -4,6 +4,7 @@ import { LevelBadge } from "@/components/ui/LevelBadge";
 import { MembershipPlans } from "@/components/ui/MembershipPlans";
 import { PRICES, STRIPE_PRICE_IDS, CAMPAIGN } from "@/config/pricing";
 import { getPremiumAccess } from "@/lib/premium";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -28,7 +29,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   return {
     title: m.title,
     description: m.description,
-    openGraph: { title: m.title, description: m.description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }] },
+    openGraph: { title: m.title, description: m.description, images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
     alternates: {
       canonical:
         locale === "ja"

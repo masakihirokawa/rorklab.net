@@ -2,6 +2,7 @@ import { seoTitleFor, seoDescription } from "@/lib/seo-text";
 import { getBlogPost, getBlogContent, getBlogPosts } from "@/lib/content";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string; slug: string }>;
@@ -19,7 +20,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       description: post.meta.description,
       type: "article",
       publishedTime: post.meta.date,
-      images: [{ url: "https://rorklab.net/og/default.png", width: 1200, height: 1200, alt: post.meta.title, type: "image/png" }],
+      images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: post.meta.title, type: "image/png" }],
     },
     alternates: {
       canonical: locale === "ja" ? `https://rorklab.net/blog/${slug}` : `https://rorklab.net/en/blog/${slug}`,

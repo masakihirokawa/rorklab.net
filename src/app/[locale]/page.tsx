@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { getArticles } from "@/lib/content";
 import HomeClient from "./HomeClient";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -35,11 +36,11 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       type: "website",
       siteName: "Rork Lab",
       locale: locale === "ja" ? "ja_JP" : "en_US",
-      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }],
+      images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
     },
     twitter: {
       card: "summary_large_image",
-      images: [{ url: "https://rorklab.net/og/rorklab-og.png", alt: "Rork Lab" }],
+      images: [{ url: siteOgImage(locale), alt: "Rork Lab" }],
     },
     alternates: {
       canonical: url,

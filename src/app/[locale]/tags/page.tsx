@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { getArticles } from "@/lib/content";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -17,7 +18,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   return {
     title,
     description,
-    openGraph: { title, description, images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }] },
+    openGraph: { title, description, images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }] },
     robots: { index: false, follow: true },
     alternates: {
       canonical: locale === "ja" ? `${base}/tags` : `${base}/en/tags`,

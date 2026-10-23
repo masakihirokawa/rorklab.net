@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -24,7 +25,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     openGraph: {
       title: m.title,
       description: m.description,
-      images: [{ url: "https://rorklab.net/og/default.png", width: 1200, height: 1200 }],
+      images: [{ url: siteOgImage(locale), width: 1200, height: 630 }],
     },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/about" : "https://rorklab.net/en/about",

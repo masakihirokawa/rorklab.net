@@ -3,6 +3,7 @@ import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { ArticlePagination } from "@/components/ui/ArticlePagination";
 import type { Metadata } from "next";
+import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
@@ -25,7 +26,7 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
       description: isJa
         ? "Rork Lab に掲載しているすべての記事の一覧です。Rork と Rork Max の使い方、React Native の開発テクニック、Gemini や Claude との AI 連携、広告やサブスクリプションによる収益化まで、カテゴリを横断して探せます。"
         : "Browse all articles covering Rork Max usage, development techniques, AI integrations, and monetization strategies.",
-      images: [{ url: "https://rorklab.net/og/rorklab-og.png", width: 1200, height: 1200, alt: "Rork Lab", type: "image/png" }],
+      images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: "Rork Lab", type: "image/png" }],
     },
     alternates: {
       canonical: locale === "ja" ? "https://rorklab.net/articles" : "https://rorklab.net/en/articles",

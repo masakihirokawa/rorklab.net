@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 const SITE_NAME = "Rork Lab";
 const SITE_URL = "https://rorklab.net";
-const OG_IMAGE = `${SITE_URL}/og/default.png`;
+const OG_IMAGE = `${SITE_URL}/og/site-ja.png`;
 
 export async function GET(request: NextRequest) {
   const url = request.nextUrl.searchParams.get("url");
@@ -27,7 +27,7 @@ export async function GET(request: NextRequest) {
     provider_url: SITE_URL,
     thumbnail_url: OG_IMAGE,
     thumbnail_width: 1200,
-    thumbnail_height: 1200,
+    thumbnail_height: 630,
     url: url,
     width: 800,
     height: 400,
@@ -45,7 +45,7 @@ export async function GET(request: NextRequest) {
   <provider_url>${SITE_URL}</provider_url>
   <thumbnail_url>${OG_IMAGE}</thumbnail_url>
   <thumbnail_width>1200</thumbnail_width>
-  <thumbnail_height>1200</thumbnail_height>
+  <thumbnail_height>630</thumbnail_height>
   <url>${url}</url>
   <width>800</width>
   <height>400</height>
