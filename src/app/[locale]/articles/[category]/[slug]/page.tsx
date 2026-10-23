@@ -13,7 +13,7 @@ import { TipCTA } from "@/components/ui/TipCTA";
 import { SingleArticleCTA } from "@/components/ui/SingleArticleCTA";
 import { ArticlePurchaseThankYou } from "@/components/ui/ArticlePurchaseThankYou";
 import { getPremiumAccess, getArticleAccess } from "@/lib/premium";
-import { siteOgImage } from "@/lib/og";
+import { articleOgImage, articleOgImageType } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string; category: string; slug: string }>;
@@ -43,13 +43,13 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
       modifiedTime: toIsoJst(article.meta.updated || article.meta.date),
       authors: [article.meta.author],
       tags: article.meta.tags,
-      images: [{ url: siteOgImage(locale), width: 1200, height: 630, alt: article.meta.title, type: "image/png" }],
+      images: [{ url: articleOgImage(locale, category, slug), width: 1200, height: 630, alt: article.meta.title, type: articleOgImageType(articleOgImage(locale, category, slug)) }],
     },
     twitter: {
       card: "summary_large_image",
       title: article.meta.title,
       description: article.meta.description,
-      images: [{ url: siteOgImage(locale), alt: article.meta.title }],
+      images: [{ url: articleOgImage(locale, category, slug), alt: article.meta.title }],
     },
     alternates: {
       canonical: url,
@@ -176,7 +176,7 @@ export default async function ArticlePage({ params }: Props) {
     publisher: { "@type": "Organization", name: "Rork Lab", url: "https://rorklab.net", logo: { "@type": "ImageObject", url: "https://rorklab.net/icon-512.png" } },
     url: articleUrl,
     mainEntityOfPage: { "@type": "WebPage", "@id": articleUrl },
-    image: [siteOgImage(locale)],
+    image: [articleOgImage(locale, category, slug)],
     inLanguage: locale === "ja" ? "ja" : "en",
     keywords: article.meta.tags.join(", "),
     speakable: {
