@@ -1,0 +1,267 @@
+---
+title: "ANR の原因は、画面を閉じるときの「後片付け」でした。トレースから止めている行を拾って分類します"
+slug: "android-anr-trace-main-thread-teardown-and-image-decode-classify-script"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-10-24T20:15"
+author: "Rork Lab"
+description: "Android の ANR トレースを読み、メインスレッドを止めていた行を課金クライアントの終了や画像の同期デコードなどに分類する Python スクリプトです。壁紙アプリで見つけた二つの原因と、直し方の考え方をまとめました。"
+tags: ["Android", "ANR", "メインスレッド", "Play Billing", "個人開発", "トラブルシューティング"]
+highlights:
+  - "ANR のスタックトレースを手で一件ずつ読む代わりに、止めている行を種類別に数えて、最初に直すべき一か所を決められるようになります"
+  - "画面を閉じるときの後片付けや、見えない背景の画像デコードが、低スペックの端末だけで応答なしを起こす理由を、自分のコードで先回りして疑えるようになります"
+  - "「再現できないから直せない」と数週間寝かせてしまう前に、トレースの形から原因の候補を絞る手順を持てるようになります"
+---
+
+Play Console の ANR の欄に、同じような赤い行が並ぶ日があります。手元の端末では一度も再現しません。ところが低スペックの端末の画面ばかりに、応答なしが集まっています。
+
+再現できないものは直せないと考えて、しばらく寝かせてしまった時期がありました。**再現できないときに頼れるのは、端末の中身ではなく、トレースに残った「止まっていた行」です。**
+
+壁紙アプリの運用で、メインスレッドを止めていた原因を二つ見つけました。どちらも機能の本体ではなく、画面を閉じるときの後片付けと、ユーザーの目に見えない背景の準備でした。その見つけ方をスクリプトにしたものと、直した考え方をお伝えします。
+
+## ANR のトレースで、まず見るのは一行だけ
+
+ANR は、メインスレッドが一定時間、入力などの処理を返せなかったときに記録されます。公式の説明では、入力イベントに5秒以内に応答できない場合や、ブロードキャストレシーバーが前面で10秒以内に終わらない場合が、その目安です。つまり、数秒の同期処理が一度あれば足ります。トレースには全スレッドの状態が並びますが、最初に見るのは `"main"` と書かれた塊の、いちばん上の数行です。
+
+そこに自分のアプリの関数名が出ていれば、そこが止めていた場所です。出ていなければ、フレームワークの中で待っていて、その呼び出し元が自分のコードにあります。
+
+1件ずつ読むと、同じ原因の ANR を何度も読むことになります。そこで、`"main"` の塊だけを取り出して、止めていた行を分類し、件数順に並べるスクリプトを作りました。
+
+<table>
+<thead>
+<tr><th>分類</th><th>当たる行の例</th><th>よくある出どころ</th></tr>
+</thead>
+<tbody>
+<tr><td>課金クライアントの終了/接続</td><td><code>BillingClientImpl.endConnection</code></td><td>画面の破棄時に呼んでいる</td></tr>
+<tr><td>画像の同期デコード</td><td><code>BitmapFactory.decodeStream</code></td><td>ページ生成のたびに背景を読んでいる</td></tr>
+<tr><td>SharedPreferences の同期書き込み</td><td><code>QueuedWork.waitToFinish</code></td><td>画面を離れるときの保存待ち</td></tr>
+<tr><td>ファイル/DB の同期アクセス</td><td><code>SQLiteDatabase.</code></td><td>起動直後の読み込み</td></tr>
+<tr><td>ネットワーク(メイン上)</td><td><code>HttpURLConnection</code></td><td>非同期にし忘れた通信</td></tr>
+<tr><td>ロック待ち</td><td><code>waiting to lock</code></td><td>別スレッドとの取り合い</td></tr>
+</tbody>
+</table>
+
+分類のルールは、上の表のとおり正規表現で持たせました。自分のアプリで新しい原因が見つかったら、1行足すだけで増やせます。
+
+## 分類スクリプト
+
+`anr_blockers.py` という名前で置きます。**スクリプトは、手元の Python 3 で実際に走らせて確かめています。** トレースの置き場所とパッケージ名だけ、ご自身のものに変えてください。
+
+```python
+"""ANR のスタックトレース(テキスト)から、メインスレッドを止めた行を拾って分類する。
+
+使い方: python3 anr_blockers.py --pkg com.example.app traces/*.txt
+想定する形式: Android の ANR トレース(`"main" prio=5 tid=1 ...` で始まるスレッドの塊)。
+Play Console の ANR 詳細からコピーしたスタックでも、先頭が `"main"` なら読めます。
+"""
+import argparse, re, sys
+from collections import Counter
+
+# 分類ルール: (ラベル, フレームに含まれる文字列の正規表現)。上から順に最初に当たったものを採用する。
+# 自分のアプリで見つけた原因が増えたら、ここへ1行足していく。
+RULES = [
+    ("課金クライアントの終了/接続", re.compile(r"BillingClient(Impl)?\.(endConnection|startConnection)")),
+    ("画像の同期デコード",       re.compile(r"BitmapFactory\.decode|ImageDecoder\.decode|BitmapDrawable|Drawable\.createFromPath")),
+    ("SharedPreferences の同期書き込み", re.compile(r"SharedPreferencesImpl.*(commit|awaitLoadedLocked|waitToFinish)|QueuedWork\.waitToFinish")),
+    ("ファイル/DB の同期アクセス", re.compile(r"java\.io\.(File|FileInputStream|FileOutputStream)\.|SQLiteDatabase\.|SQLiteConnection\.")),
+    ("ネットワーク(メイン上)",   re.compile(r"java\.net\.|okhttp3\.internal\.connection|HttpURLConnection")),
+    ("ロック待ち",               re.compile(r"waiting to lock|Object\.wait|LockSupport\.park")),
+]
+
+THREAD_HEAD = re.compile(r'^"(?P<name>[^"]+)"\s+prio=\d+')
+FRAME = re.compile(r"^\s+(at\s+)?(?P<fq>[\w.$<>]+)\((?P<src>[^)]*)\)")
+
+
+def main_blocks(text):
+    """トレース全体から "main" スレッドの塊だけを取り出す。"""
+    out, cur = [], None
+    for line in text.splitlines():
+        m = THREAD_HEAD.match(line)
+        if m:
+            if cur is not None:
+                out.append(cur)
+            cur = [] if m.group("name") == "main" else None
+            continue
+        if cur is not None:
+            cur.append(line)
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+def frames_of(block):
+    out = []
+    for line in block:
+        f = FRAME.match(line)
+        if f:
+            out.append(f.group("fq") + "(" + f.group("src") + ")")
+        elif "waiting to lock" in line or "waiting on" in line:
+            out.append(line.strip())
+    return out
+
+
+def classify(frames):
+    for fr in frames:  # 上(新しい呼び出し)から見て、最初に当たったルールを採る
+        for label, rx in RULES:
+            if rx.search(fr):
+                return label, fr
+    return "未分類", frames[0] if frames else "(フレームなし)"
+
+
+def first_own_frame(frames, pkg):
+    for fr in frames:
+        if fr.startswith(pkg):
+            return fr
+    return "(自分のパッケージのフレームなし)"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pkg", required=True, help="自分のアプリのパッケージ名の接頭辞")
+    ap.add_argument("files", nargs="+")
+    a = ap.parse_args()
+
+    by_label, by_site, unknown = Counter(), Counter(), []
+    for path in a.files:
+        text = open(path, encoding="utf-8", errors="replace").read()
+        blocks = main_blocks(text)
+        if not blocks:                      # 読めないファイルは黙って捨てず、必ず報告する
+            unknown.append(path)
+            continue
+        for b in blocks:
+            fr = frames_of(b)
+            label, hit = classify(fr)
+            by_label[label] += 1
+            by_site[(label, first_own_frame(fr, a.pkg))] += 1
+
+    total = sum(by_label.values())
+    print(f"読んだトレース: {len(a.files)} 件 / main の塊: {total} 件 / 読めなかった: {len(unknown)} 件")
+    for label, n in by_label.most_common():
+        print(f"\n[{label}] {n} 件")
+        for (lb, site), c in by_site.most_common():
+            if lb == label:
+                print(f"   {c:>3} 件  最初の自分のフレーム: {site}")
+    for p in unknown:
+        print(f"\n! 読めませんでした: {p}  (先頭が \"main\" prio=… で始まっているか確認)")
+    sys.exit(0 if not unknown else 2)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+何を解決するかというと、「同じ原因の ANR を、何度も目で読む時間」を、一回の実行に置き換えます。
+
+なぜこう書いたかを、三つだけ書き残します。
+
+- `"main"` の塊だけを見ます。他のスレッドの状態は、原因の手がかりになることもありますが、最初の切り分けでは情報が多すぎると私は考えています。
+- ルールは上から順に、最初に当たったものを採ります。フレームは新しい呼び出しが上に来るので、いちばん上に近い原因が、実際に止めていた場所だと判断しています。
+- 読めなかったファイルは、黙って数から外さず、終了コード2と一緒に報告します。数が合わなくなる原因を、あとから探したくないからです。
+
+## 試しに走らせた出力
+
+次は、手元で作った小さなサンプル（課金の終了が2件、画像のデコードが1件、どれにも当たらないものが1件、トレースの形をしていないファイルが1件）を読ませた結果です。**実際のアプリのトレースではありません。** 出力の形を確かめるための例としてご覧ください。
+
+```text
+読んだトレース: 5 件 / main の塊: 4 件 / 読めなかった: 1 件
+
+[課金クライアントの終了/接続] 2 件
+     2 件  最初の自分のフレーム: com.example.wall.billing.BillingManager.release(BillingManager.kt:57)
+
+[画像の同期デコード] 1 件
+     1 件  最初の自分のフレーム: com.example.wall.ui.PagerBackground.build(PagerBackground.kt:44)
+
+[未分類] 1 件
+     1 件  最初の自分のフレーム: com.example.wall.util.Retry.wait(Retry.kt:12)
+
+! 読めませんでした: traces/d_broken.txt  (先頭が "main" prio=… で始まっているか確認)
+```
+
+注目していただきたいのは、分類の見出しの下に「最初の自分のフレーム」が並ぶところです。**分類は原因の種類を、自分のフレームは直す場所を教えてくれます。** 課金クライアントの件であれば、`BillingManager.release` の57行目が、直す場所です。
+
+## 見つかった一つ目：課金クライアントを、画面の破棄時に閉じていた
+
+壁紙アプリで見つけた一つ目は、課金クライアントの接続を終える処理でした。画面が破棄されるタイミングで、メインスレッドから呼んでいました。
+
+端末に余裕がある間は、気づけません。ところが低スペックの端末では、この呼び出しが返るまで画面が固まり、応答なしになっていました。**後片付けは、機能の本体より軽いはずだと思い込んでいたのが、見落としの根でした。**
+
+内部の仕組みまでは追っていません。確かなのは、トレースの上の行にこの呼び出しが出ていたことと、呼び出し先を別のスレッドに移したら止まりが消えたことです。
+
+直し方は、専用の背景スレッドを一本用意して、そこで終わらせる形です。次のコードは、考え方を示す抜粋です。**この抜粋は、ここでは再コンパイルしていません。** ご自身のプロジェクトに合わせて書き換え、実機で確かめてください。
+
+```kotlin
+// 後片付け専用のスレッドを、アプリの寿命と同じだけ持っておく
+private val teardownThread = Executors.newSingleThreadExecutor { r ->
+    Thread(r, "billing-teardown")
+}
+
+fun release() {
+    val c = client ?: return
+    client = null                       // 先に参照を切り、二重に閉じるのを防ぐ
+    teardownThread.execute { c.endConnection() }
+}
+```
+
+ここで大事なのは、参照を先に切ることです。閉じ終わるのを待たずに画面が戻ってきて、新しく接続を作るとき、古いクライアントを触らずに済みます。
+
+公開から4週間ほど経った Play Console の画面では、この種類の ANR は出なくなっていました。件数ではなく、「出なくなった」ことだけを、確かめた事実としてお伝えします。
+
+## 見つかった二つ目：見えない背景を、毎ページ画像から作っていた
+
+二つ目は、ページを作るたびに、フルサイズの画像を背景として読み込んでいた箇所でした。ページめくりのたびにデコードが走り、これもメインスレッドで同期的に行われていました。
+
+厄介なのは、この背景がユーザーの目にはほとんど見えないことでした。前面の壁紙が上から覆うので、背景は透けて見えません。**見えないものに、いちばん重い処理を払っていた**ことになります。
+
+直したのは、背景を単色にして、画像ごと外すことでした。速くする工夫ではなく、仕事そのものをなくした形です。
+
+<table>
+<thead>
+<tr><th>見直す前</th><th>見直したあと</th></tr>
+</thead>
+<tbody>
+<tr><td>ページごとにフルサイズの画像をデコード</td><td>単色の背景（デコードなし）</td></tr>
+<tr><td>見た目は前面の壁紙が覆うので差がない</td><td>見た目は変わらない</td></tr>
+<tr><td>低スペックの端末で応答なし</td><td>この経路では止まらない</td></tr>
+</tbody>
+</table>
+
+画像の同期デコードを減らす工夫（サイズを落とす、背景スレッドで読む）は、あとから考えることです。まず「そもそも、見えているのか」を問うほうが、早く終わります。
+
+## 二つに共通していたこと
+
+並べてみると、どちらも「機能の本体ではない場所」でした。一つは画面を閉じるときの後片付け、もう一つは目に見えない背景の準備です。
+
+この種類の処理は、テストでも通りやすく、レビューでも見られにくい場所にあります。そして低スペックの端末だけで、じわじわと効きます。
+
+私が使っている線引きは、次のとおりです。
+
+- 画面を閉じる処理（`onDestroy` など）では、外部との接続を閉じる呼び出しを、メインで待たないようにします
+- 見えない部分には、重い準備を払わないようにします
+- 原因が分からないときは、再現を探す前に、トレースを集めて種類別に数えます
+
+## 落とし穴：直したつもりで残りやすい三か所
+
+背景スレッドへ移すだけの直しには、いくつか落とし穴があります。私が気をつけているのは次の三つです。
+
+- 参照を切る前に別スレッドへ渡すと、画面が戻ってきたときに同じクライアントを二重に閉じてしまいます。参照を先に外すのを推奨します
+- 後片付け用のスレッドを画面ごとに作ると、スレッドが積み上がります。アプリの寿命と同じだけ、一本を使い回します
+- トレースに自分のフレームが一つも出ないときは、フレームワークの中で待っています。その場合は、呼び出し元をたどって自分のコードを探します。件数が少ない間の分類は、確定ではなく目安として扱います
+
+エラーとして落ちるわけではないので、直したかどうかはトレースが減ったかで確かめます。本番の Play Console で数週間見て初めて、解決したと言えます。
+
+## 古い端末だけで起きるときの順序
+
+もう一つ、ANR を調べるときの順序を書き残します。以前の記事で、古い OS だけでクラッシュする原因を調べたときも、ビルド設定の抜けが原因でした（[Rork Max の Android 版が古い端末で落ちるとき、まずデシュガリングの設定を疑う](/articles/rork-dev/rork-max-android-version-crash-java8-desugaring-fix) に書いています）。ANR も同じで、端末の古さのせいにする前に、止めている行を確かめます。
+
+リリース後にだけ起きる問題は、デバッグで動いていても安心できません。難読化で資源が消える例は [debug では動くのに release だけ落ちたときの記事](/articles/app-dev/android-release-only-crash-resource-looked-up-by-name-keep-xml) に書きました。
+
+## 次の一歩
+
+手順は次の三つです。
+
+1. Play Console の ANR 詳細から、直近のスタックを5件ほどテキストでコピーして保存します
+2. `anr_blockers.py` を走らせて、いちばん多い分類を確かめます
+3. その分類の「最初の自分のフレーム」を、一つだけ開きます
+
+そこが、画面を閉じる処理や、見えない部分の準備だったなら、ここに書いた二つの直し方がそのまま使えるかもしれません。違っていた場合は、`RULES` に1行足して、次の ANR が来たときの手間を減らしておくことをおすすめします。

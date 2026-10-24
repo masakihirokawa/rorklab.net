@@ -1,0 +1,263 @@
+---
+title: "The ANR Was Coming From Cleanup When a Screen Closed: Classifying the Blocking Line From Traces"
+slug: "android-anr-trace-main-thread-teardown-and-image-decode-classify-script"
+category: "rork-dev"
+level: "intermediate"
+premium: true
+date: "2026-10-24T20:15"
+author: "Rork Lab"
+description: "A Python script that reads Android ANR traces and classifies the line that blocked the main thread, such as billing client teardown or synchronous image decoding. Two causes I found in my wallpaper apps, and the thinking behind the fixes."
+tags: ["Android", "ANR", "main thread", "Play Billing", "indie developer", "troubleshooting"]
+highlights:
+  - "You can stop reading ANR stack traces one by one, count the blocking lines by type instead, and decide which single place to fix first"
+  - "You can suspect, ahead of time, the cleanup on screen close and the image decode behind an invisible background that cause ANRs only on low-end devices"
+  - "You can narrow down likely causes from the shape of the trace, instead of letting a bug sit for weeks because you cannot reproduce it"
+---
+
+Some days the ANR section in Play Console fills with the same red rows. I never see them on my own devices. Yet the not-responding reports gather on low-end phones.
+
+If I cannot reproduce it, I cannot fix it. That was my reasoning, and I let one of these sit for a while. **When you cannot reproduce a problem, what you can rely on is not the device but the line the trace says was blocking.**
+
+While running my wallpaper apps as an indie developer, I found two causes that were blocking the main thread. Neither was the feature itself. One was cleanup when a screen closed, the other was preparing a background the user can barely see. Here is the script I use to find them, and how I thought about the fixes.
+
+## In an ANR trace, look at one line first
+
+An ANR is recorded when the main thread cannot get back to input handling within a set time. Per the official description, the rough thresholds are 5 seconds without responding to an input event, or a broadcast receiver running longer than 10 seconds in the foreground. A single synchronous task of a few seconds is enough. The trace lists every thread, but the first place to look is the top few lines of the block labelled `"main"`.
+
+If a function from your own app appears there, that is where it was stuck. If not, it was waiting inside the framework, and the caller is somewhere in your code.
+
+Reading traces one at a time means reading the same cause over and over. So I wrote a script that pulls out only the `"main"` block, classifies the blocking line, and sorts by count.
+
+<table>
+<thead>
+<tr><th>Category</th><th>Example line</th><th>Usual source</th></tr>
+</thead>
+<tbody>
+<tr><td>Billing client teardown/connect</td><td><code>BillingClientImpl.endConnection</code></td><td>Called when a screen is destroyed</td></tr>
+<tr><td>Synchronous image decode</td><td><code>BitmapFactory.decodeStream</code></td><td>A background loaded on every page build</td></tr>
+<tr><td>Synchronous SharedPreferences write</td><td><code>QueuedWork.waitToFinish</code></td><td>Waiting for a save when leaving a screen</td></tr>
+<tr><td>Synchronous file/DB access</td><td><code>SQLiteDatabase.</code></td><td>A load right after launch</td></tr>
+<tr><td>Network on the main thread</td><td><code>HttpURLConnection</code></td><td>A call that was never made async</td></tr>
+<tr><td>Lock wait</td><td><code>waiting to lock</code></td><td>Contention with another thread</td></tr>
+</tbody>
+</table>
+
+The rules are regular expressions, as in the table. When you find a new cause in your own app, adding one line extends them.
+
+## The classification script
+
+Save it as `anr_blockers.py`. **I ran this script on Python 3 here to confirm it works.** Change only the trace folder and the package name to yours.
+
+```python
+"""Read ANR stack traces (plain text) and classify the line that blocked the main thread.
+
+Usage: python3 anr_blockers.py --pkg com.example.app traces/*.txt
+Expected format: Android ANR traces (thread blocks starting with `"main" prio=5 tid=1 ...`).
+Stacks copied from the Play Console ANR detail also work if they start with `"main"`.
+"""
+import argparse, re, sys
+from collections import Counter
+
+# Rules: (label, regex matched against a frame). The first rule that matches wins.
+# When you find a new cause in your own app, add one line here.
+RULES = [
+    ("Billing client teardown/connect", re.compile(r"BillingClient(Impl)?\.(endConnection|startConnection)")),
+    ("Synchronous image decode",       re.compile(r"BitmapFactory\.decode|ImageDecoder\.decode|BitmapDrawable|Drawable\.createFromPath")),
+    ("Synchronous SharedPreferences write", re.compile(r"SharedPreferencesImpl.*(commit|awaitLoadedLocked|waitToFinish)|QueuedWork\.waitToFinish")),
+    ("Synchronous file/DB access", re.compile(r"java\.io\.(File|FileInputStream|FileOutputStream)\.|SQLiteDatabase\.|SQLiteConnection\.")),
+    ("Network on the main thread",   re.compile(r"java\.net\.|okhttp3\.internal\.connection|HttpURLConnection")),
+    ("Lock wait",               re.compile(r"waiting to lock|Object\.wait|LockSupport\.park")),
+]
+
+THREAD_HEAD = re.compile(r'^"(?P<name>[^"]+)"\s+prio=\d+')
+FRAME = re.compile(r"^\s+(at\s+)?(?P<fq>[\w.$<>]+)\((?P<src>[^)]*)\)")
+
+
+def main_blocks(text):
+    """Pull out only the "main" thread blocks from the whole trace."""
+    out, cur = [], None
+    for line in text.splitlines():
+        m = THREAD_HEAD.match(line)
+        if m:
+            if cur is not None:
+                out.append(cur)
+            cur = [] if m.group("name") == "main" else None
+            continue
+        if cur is not None:
+            cur.append(line)
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+def frames_of(block):
+    out = []
+    for line in block:
+        f = FRAME.match(line)
+        if f:
+            out.append(f.group("fq") + "(" + f.group("src") + ")")
+        elif "waiting to lock" in line or "waiting on" in line:
+            out.append(line.strip())
+    return out
+
+
+def classify(frames):
+    for fr in frames:  # Newest call is on top; take the first rule that matches
+        for label, rx in RULES:
+            if rx.search(fr):
+                return label, fr
+    return "Unclassified", frames[0] if frames else "(no frames)"
+
+
+def first_own_frame(frames, pkg):
+    for fr in frames:
+        if fr.startswith(pkg):
+            return fr
+    return "(no frame from your package)"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pkg", required=True, help="prefix of your own app package name")
+    ap.add_argument("files", nargs="+")
+    a = ap.parse_args()
+
+    by_label, by_site, unknown = Counter(), Counter(), []
+    for path in a.files:
+        text = open(path, encoding="utf-8", errors="replace").read()
+        blocks = main_blocks(text)
+        if not blocks:                      # Never drop an unreadable file silently; always report it
+            unknown.append(path)
+            continue
+        for b in blocks:
+            fr = frames_of(b)
+            label, hit = classify(fr)
+            by_label[label] += 1
+            by_site[(label, first_own_frame(fr, a.pkg))] += 1
+
+    total = sum(by_label.values())
+    print(f"Traces read: {len(a.files)} / main blocks: {total} / unreadable: {len(unknown)}")
+    for label, n in by_label.most_common():
+        print(f"\n[{label}] {n}")
+        for (lb, site), c in by_site.most_common():
+            if lb == label:
+                print(f"   {c:>3}  first own frame: {site}")
+    for p in unknown:
+        print(f"\n! Could not read: {p}  (check that it starts with \"main\" prio=...)")
+    sys.exit(0 if not unknown else 2)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+What it solves: the time spent reading the same ANR by eye, replaced by one run.
+
+Three choices worth writing down.
+
+- It looks only at the `"main"` block. Other threads can hold clues, but for a first triage they are too much information.
+- Rules are applied top to bottom and the first match wins. The newest call is at the top of a stack, so the match nearest the top is the place that was actually blocking.
+- Files it cannot read are reported with exit code 2, not silently dropped. I do not want to hunt for why the counts do not add up later.
+
+## What it prints on a small sample
+
+This is the output on a small sample I wrote by hand: two billing teardowns, one image decode, one trace that matches no rule, and one file that is not a trace. **They are not traces from a real app.** Please read them only as an example of the output shape.
+
+```text
+Traces read: 5 / main blocks: 4 / unreadable: 1
+
+[Billing client teardown/connect] 2
+     2  first own frame: com.example.wall.billing.BillingManager.release(BillingManager.kt:57)
+
+[Synchronous image decode] 1
+     1  first own frame: com.example.wall.ui.PagerBackground.build(PagerBackground.kt:44)
+
+[Unclassified] 1
+     1  first own frame: com.example.wall.util.Retry.wait(Retry.kt:12)
+
+! Could not read: traces/d_broken.txt  (check that it starts with "main" prio=...)
+```
+
+Notice that each category heading is followed by a "first own frame". **The category tells you the kind of cause, and the own frame tells you where to fix it.** For the billing case, line 57 of `BillingManager.release` is the place.
+
+## First cause: closing the billing client when a screen was destroyed
+
+The first one I found was the code that ends the billing client connection. I was calling it from the main thread at the moment a screen was destroyed.
+
+On a device with headroom you never notice. On a low-end device, the screen froze until the call returned, and that became a not-responding report. **I had assumed cleanup would be lighter than the feature itself, and that assumption was the root of the miss.**
+
+I have not traced the internals. What I can say for sure is that this call showed up near the top of the trace, and that moving it to another thread made the stall disappear.
+
+The fix is to keep one dedicated background thread and finish the teardown there. The code below is an excerpt to show the idea. **I have not recompiled this excerpt here.** Adapt it to your project and confirm on a real device.
+
+```kotlin
+// Keep a thread just for teardown, alive as long as the app process
+private val teardownThread = Executors.newSingleThreadExecutor { r ->
+    Thread(r, "billing-teardown")
+}
+
+fun release() {
+    val c = client ?: return
+    client = null                       // drop the reference first so it cannot be closed twice
+    teardownThread.execute { c.endConnection() }
+}
+```
+
+Dropping the reference first matters. If the screen comes back before the old client has finished closing, the new connection never touches the old client.
+
+About four weeks after release, the Play Console view no longer showed this kind of ANR. I will not give you a count, only the one thing I confirmed: it stopped appearing.
+
+## Second cause: building an invisible background from an image on every page
+
+The second was a place that loaded a full-size image as a background every time a page was created. Each page turn ran a decode, and it ran synchronously on the main thread.
+
+What made it awkward is that the user can barely see this background. The wallpaper in front covers it. **I was paying the heaviest cost for something nobody could see.**
+
+The fix was to make the background a solid color and drop the image entirely. It is not a speed-up; the work itself is gone.
+
+<table>
+<thead>
+<tr><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td>Decode a full-size image for every page</td><td>Solid-color background (no decode)</td></tr>
+<tr><td>Looks identical because the front wallpaper covers it</td><td>Looks the same</td></tr>
+<tr><td>Not responding on low-end devices</td><td>No stall on this path</td></tr>
+</tbody>
+</table>
+
+Ways to make a synchronous decode cheaper, such as shrinking the image or loading it on a worker thread, can come later. Asking first whether it is even visible ends the work sooner.
+
+## What the two had in common
+
+Side by side, both were places that are not the feature itself. One was cleanup when a screen closes, the other was preparing a background nobody sees.
+
+This kind of work passes tests easily and rarely gets attention in review. And it only shows up slowly, on low-end devices.
+
+These are the rules of thumb I use.
+
+- When a screen closes (`onDestroy` and so on), do not make the main thread wait on closing an external connection
+- Do not spend heavy preparation on anything invisible
+- When the cause is unknown, collect traces and count them by type before hunting for a reproduction
+
+## Pitfalls: three places a fix tends to stay half-done
+
+Moving the call to a background thread has a few traps. These are the three I watch for.
+
+- If you hand the client to another thread before cutting your reference, the screen can come back and close the same client twice. I recommend dropping the reference first
+- Creating a teardown thread per screen piles up threads. Reuse one for the life of the app
+- If none of your own frames show in the trace, the main thread was waiting inside the framework. Walk up to the caller and look for your code. While the count is small, treat the classification as a hint, not a verdict
+
+Because nothing crashes with an error, the only way to know you fixed it is that the traces go down. Only after a few weeks in production in Play Console can I say it is solved.
+
+## When it only happens on older devices
+
+One more thing about the order of investigation. When I looked into a crash that only happened on older OS versions, the cause was a gap in build settings (I wrote it up in [When Rork Max Android Crashes on Older Devices, Suspect Desugaring First](/en/articles/rork-dev/rork-max-android-version-crash-java8-desugaring-fix)). ANRs are the same: before blaming the age of the device, confirm the line that was blocking.
+
+Problems that appear only after release do not go away because debug runs fine. I wrote up one case of obfuscation removing a resource in [a crash that only happened in release builds](/en/articles/app-dev/android-release-only-crash-resource-looked-up-by-name-keep-xml).
+
+## A next step
+
+Start by copying five or so recent stacks from the Play Console ANR detail and saving them as text. Then run `anr_blockers.py` and open just one thing: the "first own frame" under the largest category.
+
+If it turns out to be screen-close cleanup or preparation of something invisible, the two fixes here may apply as they are. If not, add one line to `RULES` so the next ANR costs you less effort.
