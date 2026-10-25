@@ -1,0 +1,180 @@
+---
+title: "Sound Effects Stop at Play #40 — With expo-audio's createAudioPlayer, remove() Alone Isn't Cleanup"
+slug: "expo-audio-createaudioplayer-stops-after-40-plays-remove-needs-release"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-10-25T11:40"
+author: "Rork Lab"
+description: "Creating a createAudioPlayer instance per play in expo-audio can leave Android silent after about 40 plays, with didJustFinish never arriving. What remove() and release() each do, three ways to restructure, and how to notice when it happens."
+tags: ["expo-audio", "createAudioPlayer", "React Native", "Expo", "Android", "troubleshooting"]
+---
+
+I was reviewing the button-sound code in one of my sleep ambient apps one morning. Every tap creates a short sound with `createAudioPlayer`, plays it, and cleans up — a shape I've written many times. Out of caution I searched the Expo issue tracker, and found a report of exactly that shape going silent (expo/expo #41852).
+
+The reproduction is small: create a 1–2 second mp3 player, play it, clean it up, repeat. On Android devices, playback reportedly stopped around the 40th round, and `didJustFinish` never fired after that. No error is thrown.
+
+What I'd like to say first is that **the cause sits on the "I cleaned up" side**. Below I read the issue thread alongside the official docs to work out what's happening and how to restructure. I haven't measured the 40-play threshold on my own devices — this is a reading of reported behavior and documented contracts, and I'd rather be upfront about that.
+
+## It doesn't fail — the completion signal just stops arriving
+
+The issue's repro boils down to this:
+
+```ts
+// Condensed from the repro in issue #41852 (illustrative)
+import { createAudioPlayer, AudioStatus } from 'expo-audio';
+
+async function playOnce(source: number) {
+  const player = createAudioPlayer(source);
+  await new Promise<void>((resolve) => {
+    const sub = player.addListener('playbackStatusUpdate', (s: AudioStatus) => {
+      if (s.didJustFinish) {
+        sub.remove();
+        player.remove(); // ← "cleaned up"
+        resolve();
+      }
+    });
+    player.play();
+  });
+}
+```
+
+Because `resolve()` waits for `didJustFinish`, a signal that never arrives leaves the `await` hanging forever. In a sequential queue, the whole line stops there.
+
+The nasty part is the absence of an exception: no sound, no completion, no error. With all three missing, it's hard to know where to look.
+
+The scope as reported:
+
+- Reproduced in Expo Go and in EAS development builds (several Android phones)
+- A comment in the same thread mentions similar symptoms on iOS after a few minutes
+- A late-July comment says it still reproduces on expo@57.0.8 / expo-audio@57.0.3
+- As of today (October 25), the issue is still open
+
+## remove() and release() clean up different things
+
+The most useful comments said that `remove()` isn't enough and `release()` has to be called too. In a related issue (#42773), a maintainer explains it roughly like this:
+
+- `release()` frees the native object. If you created the player with `createAudioPlayer`, you need to call it when you're done
+- `remove()` takes the player out of the Audio module; a removed player stops
+
+The docs say the same about `createAudioPlayer`: it doesn't release automatically, calling `release()` is your responsibility, and mishandling it can leak memory. `useAudioPlayer`, by contrast, releases the player when the component unmounts.
+
+So with `createAudioPlayer`, you've borrowed the player on the condition that you return it yourself. `remove()` sounds like cleanup, but the part that fulfills that condition is `release()`.
+
+One more thing from the thread, and I'll flag it as someone's reading rather than fact: a commenter who read the code suggested that on iOS `release()` also performs the `remove()`-style teardown, while on Android it doesn't — so you need both there, and `useAudioPlayer` (which only calls `release()`) might leave players behind on Android too. That isn't an official statement, and I haven't verified it myself.
+
+## Three ways to restructure
+
+For short effect sounds, the first option is the sturdiest.
+
+<table>
+  <thead>
+    <tr><th>Option</th><th>Fits when</th><th>Watch out for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A. Hold one player and rewind it</td><td>The same effect plays repeatedly</td><td>For overlapping playback, hold one per concurrent voice</td></tr>
+    <tr><td>B. Tie it to a screen with <code>useAudioPlayer</code></td><td>Sounds that live within one screen</td><td>Released on unmount; mind the Android caveat above</td></tr>
+    <tr><td>C. Keep <code>createAudioPlayer</code>, call both <code>remove()</code> and <code>release()</code></td><td>You genuinely need a new source each time</td><td>Don't leave a path that skips cleanup; add an escape hatch for missing completion</td></tr>
+  </tbody>
+</table>
+
+### A. Hold one, rewind, play
+
+```ts
+import { useAudioPlayer } from 'expo-audio';
+import { Pressable, Text } from 'react-native';
+
+const tap = require('../assets/sounds/tap.mp3');
+
+export function TimerButton() {
+  // One player for as long as the screen exists
+  const player = useAudioPlayer(tap);
+
+  const onPress = () => {
+    // If the position is left at the end, later taps can sound silent — go back to the start
+    player.seekTo(0);
+    player.play();
+  };
+
+  return (
+    <Pressable onPress={onPress}>
+      <Text>Start</Text>
+    </Pressable>
+  );
+}
+```
+
+Since a player isn't created per tap, "play number 40" stops being a meaningful count. For short effects, this shape feels the most natural to me.
+
+### C. If you must keep creating, put cleanup in one place
+
+When the source changes every time, collapse disposal into a single function. If call sites each write their own `remove()` or `release()`, one of them eventually goes missing.
+
+```ts
+import { createAudioPlayer, type AudioPlayer, type AudioSource } from 'expo-audio';
+
+function disposePlayer(player: AudioPlayer) {
+  // Call both, in a fixed order; if one throws, still try the other
+  try { player.remove(); } catch {}
+  try { player.release(); } catch {}
+}
+
+export function playClip(source: AudioSource, maxMs = 8000): Promise<void> {
+  return new Promise((resolve) => {
+    const player = createAudioPlayer(source);
+    let done = false;
+
+    const finish = () => {
+      if (done) return;       // cleanup runs once even if finish and timeout both fire
+      done = true;
+      clearTimeout(timer);
+      sub.remove();
+      disposePlayer(player);
+      resolve();
+    };
+
+    const sub = player.addListener('playbackStatusUpdate', (s) => {
+      if (s.didJustFinish) finish();
+    });
+
+    // Escape hatch for a completion signal that never comes
+    const timer = setTimeout(finish, maxMs);
+
+    player.play();
+  });
+}
+```
+
+Two things matter here: cleanup lives in `disposePlayer`, and `didJustFinish` is not the only exit. In this issue, that signal is exactly the thing that goes missing, and an `await` that depends on it takes the whole queue down with it.
+
+Pick `maxMs` to match your clip length. Treat this as a starting sketch and confirm the behavior on your own devices and sources before shipping it.
+
+## Make the failure noticeable later
+
+What makes this kind of bug awkward is how late you find out. The sound stops, but nothing shows up in crash reports. You learn about it from a review that says "sometimes the sound doesn't play."
+
+So I'd log one line only when the timeout path is taken:
+
+```ts
+const finish = (reason: 'finished' | 'timeout') => {
+  if (done) return;
+  done = true;
+  if (reason === 'timeout') {
+    // Count how often the signal didn't arrive; a rising count suggests leftover players
+    console.warn('[audio] didJustFinish not received, released by timeout');
+  }
+  // ...rest unchanged
+};
+```
+
+If timeout counts climb over the days, something is still holding players. Once it's a number, it's easier to decide how much attention it deserves.
+
+## Checking your own app, in order
+
+1. Search the project for `createAudioPlayer` and count the call sites. Paths hit on every tap or navigation come first
+2. For each, confirm `release()` is called. If only `remove()` is there, fix it
+3. Wherever code waits on `didJustFinish` to move on, check there's a timeout exit
+
+If your audio disappears after the screen locks, that's a different cause — I've split it into three layers in [the screen-lock stop write-up](/en/articles/rork-dev/expo-audio-screen-lock-stop-three-layer-diagnosis). Notes on looped ambient audio are in [the healing-app ambient loop design notes](/en/articles/rork-dev/rork-healing-app-ambient-loop-audio-design-pitfalls).
+
+**Whatever you borrow, decide in one place where it gets returned.** I plan to keep to that line even after restructuring the players. A good first step is to list every `createAudioPlayer` result and mark the lines where `release()` is missing.
