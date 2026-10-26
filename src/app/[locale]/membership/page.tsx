@@ -126,6 +126,7 @@ export default async function MembershipPage({ params }: Props) {
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 24px 120px" }}>
       {/* Hero Section */}
       <section
+        className="ms-hero"
         style={{
           marginBottom: 56,
           padding: "48px 36px",

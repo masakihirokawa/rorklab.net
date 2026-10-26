@@ -56,17 +56,32 @@ export function TableOfContents({ locale, initialItems = [] }: Props) {
       setItems(tocItems);
     }
 
-    // Intersection observer — track active section for highlighting
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting) setActiveId(entry.target.id);
-        }
-      },
-      { rootMargin: "-96px 0px -70% 0px", threshold: 0 }
-    );
-    headings.forEach((h) => observer.observe(h));
-    return () => observer.disconnect();
+    // 現在地: 画面上部 30% の線より上にある最後の見出し（2026-10-27）。
+    // 以前は「帯に入った見出し」を記録するだけで、先頭へ戻っても前の見出しが光ったまま・速いスクロールで帯を飛び越えると更新されなかった。
+    // 見出しは数十個なので、スクロールのたびに位置をまとめて読むだけ（書き込みは値が変わったときの setState 1 回）
+    const list = Array.from(headings) as HTMLElement[];
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const line = Math.min(window.innerHeight * 0.3, 260);
+      let id = "";
+      for (const h of list) {
+        if (h.getBoundingClientRect().top - line > 0) break;
+        id = h.id;
+      }
+      setActiveId((prev) => (prev === id ? prev : id));
+    };
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(update);
+    };
+    update();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, [initialItems]);
 
   if (items.length < 2) return null;

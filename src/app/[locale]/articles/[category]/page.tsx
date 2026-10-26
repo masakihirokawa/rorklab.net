@@ -137,15 +137,11 @@ export default async function CategoryPage({ params, searchParams }: Props) {
             <a
               key={article.slug}
               href={`/${locale === "ja" ? "" : locale + "/"}articles/${article.category}/${article.slug}`}
-              style={{
-                display: "block",
-                padding: "24px 0",
-                borderBottom: "1px solid var(--border-subtle)",
-                textDecoration: "none",
-              }}
+              className="ar"
+              style={{ borderBottom: "1px solid var(--border-subtle)" }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
+              <div className="ar-meta">
+                <span className="ar-sep mono">
                   {article.date?.split("T")[0]}
                 </span>
                 <LevelBadge

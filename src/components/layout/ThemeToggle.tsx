@@ -4,6 +4,9 @@ import { useTheme } from "next-themes";
 import { useEffect, useState, type MouseEvent } from "react";
 import { Icon } from "@/components/ui/Icons";
 
+let vtGen = 0;
+let vtTimer = 0;
+
 export function ThemeToggle() {
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
@@ -34,8 +37,17 @@ export function ThemeToggle() {
     root.style.setProperty("--vt-x", `${x}px`);
     root.style.setProperty("--vt-y", `${y}px`);
     root.style.setProperty("--vt-r", `${far}px`);
+    // 連打の保険（Neo Vidro から移植・2026-10-27）: 前の遷移の終わりが次の遷移の途中で vt-theme を外す／
+    // 遷移が飛ばされて finished が来ず vt-theme（= 全 transition 停止）が残る、の両方を世代番号と 1.4 秒の保険で防ぐ
+    const g = ++vtGen;
     root.classList.add("vt-theme");
-    const end = () => root.classList.remove("vt-theme");
+    window.clearTimeout(vtTimer);
+    const end = () => {
+      if (g !== vtGen) return;
+      window.clearTimeout(vtTimer);
+      root.classList.remove("vt-theme");
+    };
+    vtTimer = window.setTimeout(end, 1400);
     try {
       doc.startViewTransition(apply).finished.then(end, end);
     } catch {

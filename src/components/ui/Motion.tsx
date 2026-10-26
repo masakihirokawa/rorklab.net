@@ -13,7 +13,8 @@ import { usePathname } from "next/navigation";
  *  - React が管理する className/style は触らない（data 属性だけ）。transform ではなく translate を使うので、
  *    既存のホバー用 transform と干渉しない。演出は animation の from だけ指定（終点＝要素本来の状態）。
  *  - 課金導線（MembershipCTA／PremiumPaywall／SingleArticleCTA／Sticky バー）は対象に入れない。
- *  - 出現は 1 回きり。速く送っているとき（約 600px/s 超）は尺を縮めて遅延を外す。
+ *  - 出現は 1 回きり。読む速さに合わせて尺を段階的に縮め（quicken・Saya から移植）、流し読み（約 1100px/s 超）では遅延を外す。
+ *  - ページの最下端に着いたら、下端の余白（rootMargin）で取り残された最後の行・フッターも出す。
  *  - prefers-reduced-motion では何もしない（CSS 側でも止める）。
  */
 const RV_SEL = [
@@ -21,7 +22,8 @@ const RV_SEL = [
   "main [style*='grid-template-columns'] > a", // トップのカテゴリカード
   ".related-card", // 関連記事
   "main > div > section:not(#membership-cta) > div:first-child:not([style*='grid'])", // トップ各節の見出しラベル
-  "main h2",
+  "main h2:not(.sec-label)", // 節ラベル（トップの h2）は包んでいる div ごと出る
+  ".gd-card > p, .gd-step, .guide-step-link, .gd-card > a", // 学習ガイド: 長い手順の列は行ごとに（塊で出すとスマホでは見る前に動き終わる）
   ".article-content > h2",
   ".article-content > :is(pre, table, blockquote, .callout, .table-scroll, figure, [data-rehype-pretty-code-figure])",
   "footer > *", // フッターの各段
@@ -29,10 +31,10 @@ const RV_SEL = [
 
 // 各ページの本文ブロック（段落・リスト・表・フォーム）。親がすでに演出対象のもの・カード/ボタン/記事本文の中は除く
 const GEN_SEL = "main :is(p, ul, ol, dl, table, form, details):not(.article-content *)";
-const GEN_SKIP = "a, button, nav, [data-rv-h], [data-rv-in], .article-content, [role='dialog']";
+const GEN_SKIP = "a, button, nav, [data-rv-h], [data-rv-in], .article-content, [role='dialog'], .gd-card";
 
 // ロールオーバーで「入った点から色が広がる」対象（見た目は CSS）
-const FX_SEL = "main a:has(> h3), main [style*='grid-template-columns'] > a, .related-card, [data-fx]";
+const FX_SEL = "main a:has(> h3), main [style*='grid-template-columns'] > a, .related-card, .bl, [data-fx]"; // .bl＝ブログの行（ボタン扱いで浮かせない）
 
 export function Motion() {
   const pathname = usePathname();
@@ -76,7 +78,7 @@ export function Motion() {
     if (fine) document.addEventListener("pointermove", move, { passive: true });
 
     const pop = (n: Node) => {
-      if (!(n instanceof HTMLElement) || n.hasAttribute("data-pop")) return;
+      if (!(n instanceof HTMLElement) || n.hasAttribute("data-pop") || n.classList.contains("xtap")) return;
       const cs = getComputedStyle(n);
       if ((cs.position === "fixed" || cs.position === "absolute") && parseInt(cs.zIndex, 10) >= 50) {
         const full = n.offsetWidth >= window.innerWidth * 0.95 && n.offsetHeight >= window.innerHeight * 0.9;
@@ -137,6 +139,17 @@ export function Motion() {
     let idle = 0;
     const seen = new WeakSet<Element>();
 
+    // 読む速さ（px/s）→ 演出の再生倍率 1〜1.75。スクロール連動（view()/scroll()）と無限ループのアニメーションには掛けない
+    const rateOf = (speed: number) => Math.min(1.75, Math.max(1, 1 + (speed - 220) / 380));
+    const quicken = (el: Element, r: number) => {
+      if (typeof el.getAnimations !== "function") return;
+      el.getAnimations({ subtree: true }).forEach((a) => {
+        if (a.playbackRate !== 1 || a.timeline !== document.timeline) return;
+        if (a.effect?.getTiming().iterations === Infinity) return;
+        a.playbackRate = r;
+      });
+    };
+
     const reveal = (el: HTMLElement, rd: number, fast: boolean) => {
       el.style.setProperty("--rd", `${rd}ms`);
       if (fast) el.setAttribute("data-rv-fast", "");
@@ -150,11 +163,14 @@ export function Motion() {
         const hits = entries
           .filter((e) => e.isIntersecting)
           .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top || a.boundingClientRect.left - b.boundingClientRect.left);
-        const fast = v > 600;
+        // 600px/s の二択だと iPhone で軽く弾いただけで「速い」になった（智加子 §12-1）→ 流し読みの判定は 1100px/s、その手前は倍率で縮める
+        const fast = v > 1100;
+        const r = fast ? 1 : rateOf(v);
         hits.forEach((e, i) => {
-          // 同じ瞬間に入った要素は 70ms ずつずらして立ち上げる（最大 420ms）
-          reveal(e.target as HTMLElement, fast ? 0 : Math.min(i * 70, 420), fast);
+          // 同じ瞬間に入った要素は 70ms ずつずらして立ち上げる（最大 420ms・速く読んでいるほど詰める）
+          reveal(e.target as HTMLElement, fast ? 0 : Math.round(Math.min(i * 70, 420) / r), fast);
         });
+        if (r > 1.02) requestAnimationFrame(() => hits.forEach((e) => quicken(e.target, r)));
       },
       { rootMargin: "0px 0px -6% 0px", threshold: 0 }
     );
@@ -178,6 +194,16 @@ export function Motion() {
       });
     };
 
+    // 画面内（縦 edge 割まで）にあるのに隠れたままのものを出す。通り過ぎたものは演出なしで
+    const flush = (edge: number) => {
+      const vh = window.innerHeight;
+      document.querySelectorAll<HTMLElement>("[data-rv-h]").forEach((el) => {
+        const b = el.getBoundingClientRect();
+        if (b.top < vh * edge) reveal(el, 0, b.bottom <= 0);
+      });
+    };
+    let bottomRaf = 0;
+
     const onScroll = () => {
       const t = performance.now();
       const y = window.scrollY;
@@ -189,12 +215,14 @@ export function Motion() {
       // 止まったとき、観測の取りこぼしで隠れたまま画面内にいるものを拾う
       idle = window.setTimeout(() => {
         v = 0;
-        const vh = window.innerHeight;
-        document.querySelectorAll<HTMLElement>("[data-rv-h]").forEach((el) => {
-          const b = el.getBoundingClientRect();
-          if (b.top < vh * 0.94) reveal(el, 0, b.bottom <= 0);
-        });
+        flush(0.94);
       }, 150);
+      // 最下端: rootMargin（下 6%）のせいで最後の数行・フッターが出ないまま終わらないように
+      if (!bottomRaf)
+        bottomRaf = requestAnimationFrame(() => {
+          bottomRaf = 0;
+          if (window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 4) flush(1);
+        });
     };
 
     scan();
@@ -210,6 +238,7 @@ export function Motion() {
       window.removeEventListener("scroll", onScroll);
       window.clearTimeout(idle);
       window.clearTimeout(timer);
+      if (bottomRaf) cancelAnimationFrame(bottomRaf);
       mo.disconnect();
       io.disconnect();
       // 遷移後も隠れたまま残らないよう、監視中のものは表示状態へ戻す
@@ -286,7 +315,10 @@ export function Motion() {
     document.addEventListener("pointerdown", lazy, { passive: true });
     scan();
     let t = 0;
-    const mo = new MutationObserver(() => {
+    const onlyTap = (r: MutationRecord) =>
+      [...Array.from(r.addedNodes), ...Array.from(r.removedNodes)].every((n) => n instanceof HTMLElement && n.classList.contains("xtap"));
+    const mo = new MutationObserver((recs) => {
+      if (recs.every(onlyTap)) return; // タップの輪の出し入れでは全リンクを数え直さない
       window.clearTimeout(t);
       t = window.setTimeout(scan, 120);
     });
@@ -299,6 +331,50 @@ export function Motion() {
       document.removeEventListener("pointerdown", lazy);
     };
   }, [pathname]);
+
+  // タップの輪（Saya の TapRing を移植・2026-10-27）: タッチ端末ではホバーの演出が無く、押した手応えが無かった。
+  // 指を離した点に金の輪を 1 つ出して消す。動かした（8px 超）・長押し（900ms 超）・入力欄・無効なボタンでは出さない
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let sx = 0;
+    let sy = 0;
+    let st = 0;
+    let target: Element | null = null;
+    const down = (e: PointerEvent) => {
+      if (e.pointerType === "mouse") return;
+      sx = e.clientX;
+      sy = e.clientY;
+      st = performance.now();
+      target = (e.target as Element | null)?.closest?.("a[href], button, summary, [role='button'], label") ?? null;
+    };
+    const up = (e: PointerEvent) => {
+      const el = target;
+      target = null;
+      if (e.pointerType === "mouse" || !el) return;
+      if (Math.hypot(e.clientX - sx, e.clientY - sy) > 8 || performance.now() - st > 900) return;
+      if ((el as HTMLButtonElement).disabled || el.closest("input, textarea, select, [contenteditable='true']")) return;
+      const ring = document.createElement("span");
+      ring.className = "xtap";
+      ring.setAttribute("aria-hidden", "true");
+      ring.style.left = `${e.clientX}px`;
+      ring.style.top = `${e.clientY}px`;
+      document.body.appendChild(ring);
+      const done = () => ring.remove();
+      ring.addEventListener("animationend", done, { once: true });
+      window.setTimeout(done, 1000);
+    };
+    const cancel = () => {
+      target = null;
+    };
+    document.addEventListener("pointerdown", down, { passive: true });
+    document.addEventListener("pointerup", up, { passive: true });
+    document.addEventListener("pointercancel", cancel, { passive: true });
+    return () => {
+      document.removeEventListener("pointerdown", down);
+      document.removeEventListener("pointerup", up);
+      document.removeEventListener("pointercancel", cancel);
+    };
+  }, []);
 
   return null;
 }

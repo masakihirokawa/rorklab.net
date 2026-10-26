@@ -224,20 +224,15 @@ export default async function LevelPage({ params, searchParams }: Props) {
             <a
               key={`${article.category}/${article.slug}`}
               href={`${prefix}/articles/${article.category}/${article.slug}`}
-              style={{
-                display: "block",
-                padding: "24px 0",
-                borderBottom: "1px solid var(--border-subtle)",
-                textDecoration: "none",
-                transition: "padding-left 0.3s",
-              }}
+              className="ar"
+              style={{ borderBottom: "1px solid var(--border-subtle)" }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em" }}>
+              <div className="ar-meta">
+                <span className="ar-cat mono" style={{ color: catColor(article.category) }}>
                   {catIcon(article.category)} {CATEGORY_LABELS[locale]?.[article.category] || article.category}
                 </span>
-                <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-                <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>
+                <span className="ar-sep">/</span>
+                <span className="ar-sep mono">
                   {article.date?.split("T")[0]}
                 </span>
                 <LevelBadge

@@ -91,7 +91,7 @@ export function MembershipPlans({ locale, stripeConfig, accentColor }: Membershi
   return (
     <>
       {/* Plans */}
-      <div style={{ display: "flex", gap: 20, marginBottom: 32, flexWrap: "wrap" }}>
+      <div className="ms-plans" style={{ display: "flex", gap: 20, marginBottom: 32, flexWrap: "wrap" }}>
         {/* Premium — Recommended */}
         <button
           onClick={() => handleCheckout(stripeConfig.premium.priceId, "payment", "premium")}

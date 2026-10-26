@@ -118,16 +118,7 @@ export default async function GuidesPage({ params }: Props) {
           return (
             <section
               key={i}
-              className="guide-card"
-              style={{
-                minWidth: 0,
-                padding: "clamp(20px, 4vw, 32px)",
-                border: "1px solid var(--border-subtle)",
-                borderRadius: 8,
-                background: "var(--bg-surface)",
-                display: "flex",
-                flexDirection: "column",
-              }}
+              className="guide-card gd-card"
             >
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
                 <span aria-hidden="true" style={{ fontSize: 16, color: cat?.color || "var(--text-muted)" }}>
@@ -142,15 +133,15 @@ export default async function GuidesPage({ params }: Props) {
               </p>
 
               {steps.length > 0 ? (
-                <ol style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 18 }}>
+                <ol className="gd-steps">
                   {steps.map((step, si) => (
                     <li key={step.level}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, letterSpacing: "0.1em", color: "var(--text-dim)" }}>
+                      <div className="gd-step mono">
                         <span>STEP {si + 1}</span>
                         <span aria-hidden="true" style={{ color: step.color }}>{step.icon}</span>
                         <span style={{ color: step.color }}>{locale === "ja" ? step.ja : step.en}</span>
                       </div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div className="gd-items">
                         {step.items.map((article) => {
                           n += 1;
                           return (
@@ -158,25 +149,14 @@ export default async function GuidesPage({ params }: Props) {
                               key={article.slug}
                               href={`/${locale === "ja" ? "" : locale + "/"}articles/${article.category}/${article.slug}`}
                               className="guide-step-link"
-                              style={{
-                                display: "grid",
-                                gridTemplateColumns: "auto minmax(0, 1fr)",
-                                alignItems: "baseline",
-                                gap: 12,
-                                padding: "10px 14px",
-                                borderRadius: 6,
-                                border: "1px solid transparent",
-                                background: "var(--bg-surface)",
-                                textDecoration: "none",
-                              }}
                             >
-                              <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-faint)", minWidth: 18 }}>
+                              <span className="gd-n mono">
                                 {String(n).padStart(2, "0")}
                               </span>
-                              <span style={{ fontSize: 14, lineHeight: 1.6, color: "var(--text-secondary)", overflowWrap: "anywhere" }}>
+                              <span className="gd-t">
                                 {article.title}
                                 {article.premium && (
-                                  <span style={{ marginLeft: 8, fontSize: 10, fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.08em", color: "var(--accent-coral)", whiteSpace: "nowrap" }}>
+                                  <span className="gd-p mono" style={{ color: "var(--accent-coral)" }}>
                                     PREMIUM
                                   </span>
                                 )}

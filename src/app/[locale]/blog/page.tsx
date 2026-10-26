@@ -85,67 +85,29 @@ export default async function BlogPage({ params }: Props) {
             <a
               key={post.slug}
               href={`${prefix}/blog/${post.slug}`}
-              style={{
-                display: "block",
-                padding: "24px 0",
-                borderBottom: "1px solid var(--border-subtle)",
-                textDecoration: "none",
-                color: "inherit",
-                transition: "opacity 0.2s",
-              }}
+              className="bl"
+              style={{ borderBottom: "1px solid var(--border-subtle)" }}
             >
-              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
-                <div style={{ flex: 1, minWidth: 200 }}>
-                  <h2 style={{
-                    fontSize: 17,
-                    fontWeight: 400,
-                    color: "var(--text-primary)",
-                    marginBottom: 6,
-                    lineHeight: 1.5,
-                    letterSpacing: "-0.01em",
-                  }}>
+              <div className="bl-row">
+                <div className="bl-main">
+                  <h2 className="bl-title">
                     {post.title}
                   </h2>
-                  <p style={{
-                    fontSize: 13,
-                    color: "var(--text-muted)",
-                    lineHeight: 1.6,
-                    margin: 0,
-                  }}>
+                  <p className="bl-desc">
                     {post.description}
                   </p>
                 </div>
                 <time
                   dateTime={post.date.split("T")[0]}
-                  style={{
-                    fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
-                    fontSize: 12,
-                    color: "var(--text-faint)",
-                    letterSpacing: "0.04em",
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                    paddingTop: 2,
-                  }}
+                  className="bl-date mono"
                 >
                   {post.date.split("T")[0]}
                 </time>
               </div>
               {post.tags.length > 0 && (
-                <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+                <div className="bl-tags">
                   {post.tags.map((tag) => (
-                    <span
-                      key={tag}
-                      style={{
-                        fontSize: 10,
-                        fontFamily: "var(--font-dm-mono), 'DM Mono', monospace",
-                        color: "var(--text-dim)",
-                        background: "var(--bg-surface)",
-                        border: "1px solid var(--border-subtle)",
-                        borderRadius: 3,
-                        padding: "2px 8px",
-                        letterSpacing: "0.04em",
-                      }}
-                    >
+                    <span key={tag} className="bl-tag mono">
                       {tag}
                     </span>
                   ))}

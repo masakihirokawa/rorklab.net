@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import type React from "react";
 import { useTranslations } from "next-intl";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { CategoryGlyph } from "@/components/ui/CategoryGlyph";
@@ -31,9 +31,9 @@ function SectionLabel({ text }: { text: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
       <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />
-      <span style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.15em" }}>
+      <h2 className="sec-label mono">
         {text}
-      </span>
+      </h2>
     </div>
   );
 }
@@ -46,19 +46,6 @@ interface HomeClientProps {
 
 export default function HomeClient({ articles, counts, locale }: HomeClientProps) {
   const t = useTranslations();
-  const [mounted, setMounted] = useState(false);
-  const [skipAnim, setSkipAnim] = useState(false);
-  const [hoveredCat, setHoveredCat] = useState<string | null>(null);
-  const [hoveredArticle, setHoveredArticle] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (sessionStorage.getItem('rorklab-hero-seen')) {
-      setSkipAnim(true);
-    } else {
-      sessionStorage.setItem('rorklab-hero-seen', '1');
-    }
-    setMounted(true);
-  }, []);
 
   const catColor = (id: string) => CATEGORIES.find((c) => c.id === id)?.color || "var(--text-muted)";
 
@@ -96,8 +83,8 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
         />
 
         <div
-          className={mounted && !skipAnim ? "hero-seq" : ""}
-          style={{ position: "relative", zIndex: 1, padding: "0 24px", opacity: mounted || skipAnim ? 1 : 0 }}
+          className="hero-seq"
+          style={{ position: "relative", zIndex: 1, padding: "0 24px" }}
         >
           <div style={{ fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", fontSize: 11, color: "var(--text-dim)", letterSpacing: "0.2em", marginBottom: 24 }}>
             POWERED BY <a href="https://dolice.net" target="_blank" rel="noopener" style={{ color: "var(--text-dim)", textDecoration: "underline", textUnderlineOffset: "3px" }}>DOLICE</a>
@@ -119,7 +106,7 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
             ))}
           </p>
 
-          <div style={{ display: "flex", gap: 16, justifyContent: "center", flexWrap: "wrap" }}>
+          <div className="hero-ctas">
             <a
               href="#guides"
               className="hero-cta"
@@ -155,42 +142,32 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
           <SectionLabel text={t("sections.categories")} />
         </div>
 
-        <div className="categories-grid" style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 16 }}>
+        <div className="categories-grid home-cats" style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 16 }}>
           {CATEGORIES.map((cat, i) => {
             const prefix = locale === "ja" ? "" : `/${locale}`;
             return (
               <a
                 key={cat.id}
                 href={`${prefix}/articles/${cat.id}`}
+                className="cat-card"
                 style={{
                   gridColumn: i < 3 ? "span 2" : "span 3",
                   display: "block", padding: "28px 24px", textDecoration: "none",
-                  border: `1px solid ${hoveredCat === cat.id ? "var(--border-hover)" : "var(--border-subtle)"}`,
-                  borderRadius: 8, background: hoveredCat === cat.id ? "var(--bg-surface-hover)" : "var(--bg-surface)",
-                  cursor: "pointer", transition: "all 0.4s cubic-bezier(0.16, 1, 0.3, 1)",
+                  border: "1px solid var(--border-subtle)",
+                  borderRadius: 8, background: "var(--bg-surface)",
                   position: "relative", overflow: "hidden",
-                  transform: hoveredCat === cat.id ? "translateY(-2px)" : "none",
                 }}
-                onMouseEnter={() => setHoveredCat(cat.id)}
-                onMouseLeave={() => setHoveredCat(null)}
               >
-                <div style={{ width: 40, height: 40, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 16, color: cat.color, transition: "transform 0.3s", transform: hoveredCat === cat.id ? "translateX(4px)" : "translateX(0)", lineHeight: 1 }}>
+                <div className="cat-icon" style={{ color: cat.color }}>
                   <CategoryGlyph glyph={cat.icon} />
                 </div>
-                <div style={{ fontSize: 16, fontWeight: 500, color: "var(--text-primary)", marginBottom: 6, letterSpacing: "0.02em" }}>
+                <h3 style={{ fontSize: 16, fontWeight: 500, color: "var(--text-primary)", marginBottom: 6, letterSpacing: "0.02em" }}>
                   {t(`categories.${cat.id}.label`)}
-                </div>
+                </h3>
                 <div style={{ fontSize: 13, color: "var(--text-dim)", lineHeight: 1.5 }}>
                   {t(`categories.${cat.id}.desc`)}
                 </div>
-                <div
-                  style={{
-                    position: "absolute", bottom: 0, left: 0, width: "100%", height: 2,
-                    background: cat.color,
-                    transform: hoveredCat === cat.id ? "scaleX(1)" : "scaleX(0)",
-                    transformOrigin: "left", transition: "transform 0.4s cubic-bezier(0.16, 1, 0.3, 1)",
-                  }}
-                />
+                <div className="cat-bar" aria-hidden="true" style={{ background: cat.color }} />
               </a>
             );
           })}
@@ -203,9 +180,7 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
           <SectionLabel text={t("sections.latestArticles")} />
           <a
             href={`/${locale === "ja" ? "" : locale + "/"}articles`}
-            style={{ fontSize: 12, color: "var(--text-dim)", textDecoration: "none", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em", transition: "color 0.3s" }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-muted)")}
-            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-dim)")}
+            className="home-all mono"
           >
             {t("sections.allArticles").replace(" →", "")} ({counts.total}) →
           </a>
@@ -217,28 +192,22 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
               {locale === "ja" ? "記事を準備中です..." : "Articles coming soon..."}
             </p>
           ) : (
-            articles.map((article, i) => (
+            articles.map((article) => (
               <a
                 key={`${article.category}/${article.slug}`}
                 href={articleUrl(article)}
-                style={{
-                  display: "block", padding: "24px 0",
-                  borderBottom: "1px solid var(--border-subtle)",
-                  cursor: "pointer", transition: "all 0.3s",
-                  textDecoration: "none",
-                }}
-                onMouseEnter={() => setHoveredArticle(i)}
-                onMouseLeave={() => setHoveredArticle(null)}
+                className="ar"
+                style={{ borderBottom: "1px solid var(--border-subtle)" }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
-                  <span style={{ fontSize: 11, color: catColor(article.category), fontFamily: "var(--font-dm-mono), 'DM Mono', monospace", letterSpacing: "0.06em" }}>
+                <div className="ar-meta">
+                  <span className="ar-cat mono" style={{ color: catColor(article.category) }}>
                     {t(`categories.${article.category}.label`)}
                   </span>
-                  <span style={{ fontSize: 11, color: "var(--text-faint)" }}>/</span>
-                  <span style={{ fontSize: 11, color: "var(--text-faint)", fontFamily: "var(--font-dm-mono), 'DM Mono', monospace" }}>{article.date?.split("T")[0]}</span>
+                  <span className="ar-sep">/</span>
+                  <span className="ar-sep mono">{article.date?.split("T")[0]}</span>
                   <LevelBadge level={article.level} label={t(`levels.${article.level}`)} />
                 </div>
-                <h3 className="ar-title" style={{ color: hoveredArticle === i ? "var(--text-primary)" : "var(--text-secondary)", transition: "color 0.3s" }}>
+                <h3 className="ar-title">
                   {article.title}
                 </h3>
                 <p className="ar-desc">
@@ -250,27 +219,7 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
           {counts.total > 10 && (
             <a
               href={`${locale === "ja" ? "" : `/${locale}`}/articles`}
-              style={{
-                display: "inline-block",
-                marginTop: 32,
-                fontSize: 13,
-                fontWeight: 600,
-                color: "var(--accent-coral)",
-                textDecoration: "none",
-                padding: "10px 24px",
-                borderRadius: 6,
-                border: "1px solid color-mix(in srgb, var(--accent-coral) 40%, transparent)",
-                background: "color-mix(in srgb, var(--accent-coral) 6%, transparent)",
-                transition: "all 0.25s",
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 14%, transparent)";
-                e.currentTarget.style.transform = "translateY(-1px)";
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.background = "color-mix(in srgb, var(--accent-coral) 6%, transparent)";
-                e.currentTarget.style.transform = "translateY(0)";
-              }}
+              className="home-more" style={{ "--more": "var(--accent-coral)" } as React.CSSProperties}
             >
               {locale === "ja" ? `すべての記事を見る (${counts.total}) →` : `View All Articles (${counts.total}) →`}
             </a>
@@ -284,7 +233,7 @@ export default function HomeClient({ articles, counts, locale }: HomeClientProps
           <SectionLabel text={t("sections.guides")} />
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16 }}>
+        <div className="home-guides" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16 }}>
           {(GUIDES[locale] || GUIDES.ja).map((guide, i) => {
             const count = guide.categories.length > 0
               ? guide.categories.reduce((n, c) => n + (counts.byCategory[c] || 0), 0)
