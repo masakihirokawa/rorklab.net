@@ -18,12 +18,12 @@ const GUIDES: Record<string, { title: string; desc: string; categories: string[]
   ja: [
     { title: "Rork Max 完全入門ガイド", desc: "初めての方はここから", categories: ["rork-basics"], level: "beginner", colorKey: "gold", href: "/articles/rork-basics" },
     { title: "開発ツール連携マニュアル", desc: "外部ツールとの統合を完全解説", categories: ["rork-dev"], level: "intermediate", colorKey: "silver", href: "/articles/rork-dev" },
-    { title: "AI連携 × App Store 公開ハンドブック", desc: "AIを組み込んで本格アプリを公開", categories: ["rork-business"], level: "intermediate", colorKey: "rose", href: "/articles/rork-business" },
+    { title: "AI連携 × App\u00A0Store 公開ハンドブック", desc: "AIを組み込んで本格アプリを公開", categories: ["rork-business"], level: "intermediate", colorKey: "rose", href: "/articles/rork-business" },
   ],
   en: [
     { title: "Getting Started with Rork Max", desc: "Start here if you're new", categories: ["rork-basics"], level: "beginner", colorKey: "gold", href: "/en/articles/rork-basics" },
     { title: "Developer Tools Integration", desc: "Complete guide to external tool integrations", categories: ["rork-dev"], level: "intermediate", colorKey: "silver", href: "/en/articles/rork-dev" },
-    { title: "AI to App Store Handbook", desc: "Integrate AI and publish professional apps", categories: ["rork-business"], level: "intermediate", colorKey: "rose", href: "/en/articles/rork-business" },
+    { title: "AI to App\u00A0Store Handbook", desc: "Integrate AI and publish professional apps", categories: ["rork-business"], level: "intermediate", colorKey: "rose", href: "/en/articles/rork-business" },
   ],
 };
 
