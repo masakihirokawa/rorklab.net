@@ -1,0 +1,285 @@
+---
+title: "Remembering What the AI Decided: Four Marks in the Cache Key Paid Off on Model-Swap Day"
+slug: "ai-answer-cache-key-model-and-prompt-version-sweep-on-swap"
+category: "rork-ai"
+level: "advanced"
+premium: true
+date: "2026-10-27T20:30"
+author: "Rork Lab"
+description: "A small on-device cache for AI answers, with the model name and prompt version in the key so old answers vanish on swap day. TypeScript plus simulated results."
+tags: ["Rork", "cache design", "MMKV", "TypeScript", "AI integration", "model swap", "indie development"]
+highlights:
+  - "You can now copy a small layer that remembers the AI's answers on the device, and cut repeat calls for the same image to almost zero on the second launch"
+  - "You will be able to stop old answers from lingering on screen after you swap a model or a prompt, before you ship"
+  - "You can now spot, before writing it, the bug where one failed request makes every retry fail too"
+---
+
+I was scrolling a wallpaper list slowly one evening. Every time I scrolled back to a picture I had just passed, another classification request went out. Nothing changed on screen. Only the request count, and eventually the bill, changed.
+
+As an indie developer, I use an image-reading AI to sort wallpapers into categories. A few people have asked how to do the same inside an app, so I wrote down the layer I would put in a Rork-built screen: one that remembers answers. The hard part turned out not to be remembering. It was deciding **when to forget**.
+
+Below is the TypeScript for a small cache layer, exactly as I ran it, followed by results from a 400-image simulated catalog on my machine's Node. These are simulated runs with a fixed random seed, not measurements on a phone, and I want to say that up front.
+
+## What to remember, and what not to
+
+Remember answers that can safely stay the same for the same input. A wallpaper category fits: if the image does not change, neither does the answer. A conversational reply does not, because it is allowed to differ each time.
+
+Decide what not to remember, too. If the AI reports low confidence, do not store the answer. A stored low-confidence answer freezes that vagueness in place, and the image keeps the same fuzzy label every time you see it.
+
+<table>
+<thead>
+<tr><th>Situation</th><th>Store it?</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Classification with confidence 0.9</td><td>Yes</td><td>Same image, same answer is fine</td></tr>
+<tr><td>Classification with confidence 0.4</td><td>No</td><td>Storing it would freeze the vagueness</td></tr>
+<tr><td>Network failure or timeout</td><td>No</td><td>A stored failure keeps coming back after the network recovers</td></tr>
+<tr><td>Right after swapping the model or prompt</td><td>Ignore old versions</td><td>Old answers would pass as new ones</td></tr>
+</tbody>
+</table>
+
+## Four marks go in the key
+
+The image ID alone is not enough for a cache key. Put these four side by side.
+
+<table>
+<thead>
+<tr><th>Mark</th><th>Example</th><th>What happens without it</th></tr>
+</thead>
+<tbody>
+<tr><td>task</td><td>wallpaper-category</td><td>Answers for different jobs get mixed up</td></tr>
+<tr><td>model</td><td>claude-sonnet-5-5</td><td>After a model change, the old model's answers keep coming back</td></tr>
+<tr><td>promptVersion</td><td>p3</td><td>Edited instructions still get answers from before the edit</td></tr>
+<tr><td>contentId</td><td>the image ID</td><td>You cannot tell which image an answer belongs to</td></tr>
+</tbody>
+</table>
+
+You can see why the model belongs in the key by trying the naive version. I keyed on the image ID alone with a 30-day expiry, swapped the model, and counted the next 1,000 views. All 1,000 were answers from the old model. An expiry is a way to throw away what has become old; it is not a way to throw away what has been replaced.
+
+For context on timing, Anthropic deprecated Claude Sonnet 4.5 (`claude-sonnet-4-5-20250929`) on September 30, 2026, with API retirement tentatively set for November 30. The recommended replacement is `claude-sonnet-5-5`. I wrote about finding model IDs hard-coded in an app in [Find out whether your Rork app still calls Sonnet 4.5, before November 30](/en/articles/rork-ai/scan-app-for-old-claude-model-ids-before-sonnet-4-5-retires). The layer below is where you land safely once you have found them.
+
+## The cache layer
+
+Storage is reduced to a minimal interface, `KV`, shaped like MMKV. In tests a Map stands in. The layer solves three problems: fewer repeat calls for the same image, one call when identical requests arrive at once, and a clean-up of old versions on swap day.
+
+```ts
+// aiCache.ts — AI の分類結果を端末に覚えさせる小さなキャッシュ層
+// 保存先は MMKV 互換の最小インターフェースに絞っています（テストでは Map で代用）。
+export interface KV {
+  getString(key: string): string | undefined;
+  set(key: string, value: string): void;
+  delete(key: string): void;
+  getAllKeys(): string[];
+}
+
+export interface CacheConfig {
+  task: string;          // 例: "wallpaper-category"
+  model: string;         // 例: "claude-sonnet-5-5"（差し替えの日にここだけ変える）
+  promptVersion: string; // 指示文を直したら上げる。例: "p3"
+  ttlMs: number;         // 例: 30 日
+  maxEntries: number;    // 端末に溜める上限
+  minConfidence: number; // これ未満の答えは覚えない
+}
+
+export interface Answer { label: string; confidence: number }
+interface Stored extends Answer { at: number; model: string; promptVersion: string }
+
+const ROOT = "ai:v1:";
+
+export function createAiCache(
+  kv: KV,
+  cfg: CacheConfig,
+  ask: (contentId: string) => Promise<Answer>,
+  now: () => number = Date.now,
+) {
+  const prefix = `${ROOT}${cfg.task}:${cfg.model}:${cfg.promptVersion}:`;
+  const inflight = new Map<string, Promise<Answer>>();
+  const stats = { hit: 0, miss: 0, joined: 0, skippedLowConfidence: 0, evicted: 0 };
+
+  function read(key: string): Stored | undefined {
+    const raw = kv.getString(key);
+    if (!raw) return undefined;
+    try {
+      const v = JSON.parse(raw) as Stored;
+      // キーに model / promptVersion が入っていても、値側でも照合します（手で書き換えた事故の保険）
+      if (v.model !== cfg.model || v.promptVersion !== cfg.promptVersion) return undefined;
+      if (now() - v.at > cfg.ttlMs) return undefined;
+      if (typeof v.label !== "string" || typeof v.confidence !== "number") return undefined;
+      return v;
+    } catch {
+      kv.delete(key); // 壊れた JSON は残さない
+      return undefined;
+    }
+  }
+
+  function trim() {
+    const mine = kv.getAllKeys().filter((k) => k.startsWith(prefix));
+    if (mine.length <= cfg.maxEntries) return;
+    const aged = mine
+      .map((k) => ({ k, at: (JSON.parse(kv.getString(k) ?? "{}") as Stored).at ?? 0 }))
+      .sort((a, b) => a.at - b.at);
+    for (const { k } of aged.slice(0, mine.length - cfg.maxEntries)) {
+      kv.delete(k);
+      stats.evicted++;
+    }
+  }
+
+  async function classify(contentId: string): Promise<Answer> {
+    const key = prefix + contentId;
+    const hit = read(key);
+    if (hit) { stats.hit++; return { label: hit.label, confidence: hit.confidence }; }
+
+    const running = inflight.get(key);
+    if (running) { stats.joined++; return running; }
+
+    stats.miss++;
+    const p = (async () => {
+      try {
+        const ans = await ask(contentId);
+        if (ans.confidence >= cfg.minConfidence) {
+          const rec: Stored = { ...ans, at: now(), model: cfg.model, promptVersion: cfg.promptVersion };
+          kv.set(key, JSON.stringify(rec));
+          trim();
+        } else {
+          stats.skippedLowConfidence++;
+        }
+        return ans;
+      } finally {
+        inflight.delete(key); // 失敗しても必ず外す。外さないと次の呼び出しが同じ失敗を受け取り続けます
+      }
+    })();
+    inflight.set(key, p);
+    return p;
+  }
+
+  // モデルや指示文を差し替えたあと、古い版の答えを端末から掃除します。
+  function sweepOldVersions(): number {
+    let n = 0;
+    for (const k of kv.getAllKeys()) {
+      if (k.startsWith(`${ROOT}${cfg.task}:`) && !k.startsWith(prefix)) { kv.delete(k); n++; }
+    }
+    return n;
+  }
+
+  return { classify, sweepOldVersions, stats };
+}
+```
+
+Three reasons for the way it is written.
+
+1. **The value also carries model and promptVersion.** Even when the key matches, a mismatched value is discarded. It is insurance in case someone changes how the key string is built later.
+2. **`finally` always removes the in-flight record.** The next section measures what happens if you forget.
+3. **Answers below the confidence threshold are not stored.** The price is that such an image triggers a call on every view. I count that cost below.
+
+## Wiring it into a screen
+
+On the screen side, wrap MMKV in the `KV` shape and pass it in. MMKV method names vary by version (`delete` versus `remove`), so adjust only the wrapper to match the types in your version. For choosing MMKV and migrating to it, see [Three weeks moving six wallpaper apps to MMKV](/en/articles/rork-dev/rork-mmkv-asyncstorage-migration-six-wallpaper-apps-3weeks).
+
+```ts
+// wallpaperCategory.ts — usage from the screen (the MMKV wrapper and hook are a type-checked sketch; I have not run them on a device)
+import { MMKV } from "react-native-mmkv";
+import { createAiCache, type KV } from "./aiCache";
+
+const mmkv = new MMKV({ id: "ai-answers" });
+const kv: KV = {
+  getString: (k) => mmkv.getString(k),
+  set: (k, v) => mmkv.set(k, v),
+  delete: (k) => mmkv.delete(k), // `remove` in some versions
+  getAllKeys: () => mmkv.getAllKeys(),
+};
+
+// On swap day, these two lines are the only thing you change
+const MODEL = "claude-sonnet-5-5";
+const PROMPT_VERSION = "p1";
+
+export const categoryCache = createAiCache(
+  kv,
+  { task: "wallpaper-category", model: MODEL, promptVersion: PROMPT_VERSION,
+    ttlMs: 30 * 24 * 3600 * 1000, maxEntries: 2000, minConfidence: 0.6 },
+  async (id) => {
+    // Point this at your own gateway, such as an Edge Function, so no key ships in the app.
+    const res = await fetch(`https://YOUR_PROJECT.functions.supabase.co/classify?id=${id}`);
+    if (!res.ok) throw new Error(`classify ${res.status}`);
+    return (await res.json()) as { label: string; confidence: number };
+  },
+);
+
+// Once at startup: sweep answers left over from older models or prompts.
+categoryCache.sweepOldVersions();
+```
+
+For building that gateway so keys stay out of the app, see [Take the Prompt Out of the App: An Edge Function Gateway With the Guard on the Output Side](/en/articles/rork-ai/ai-prompt-off-the-app-edge-function-gateway-output-allowlist).
+
+## What I measured by hand
+
+The setup: a 400-image catalog viewed 3,000 times per launch, across two launches, with a seeded random generator that favors popular images. The AI call is a stub that returns confidence 0.4 about 8% of the time and 0.9 otherwise. I ran it on Node 22.
+
+<table>
+<thead>
+<tr><th>What I checked</th><th>No cache / naive version</th><th>This implementation</th></tr>
+</thead>
+<tbody>
+<tr><td>Calls in the first launch (3,000 views)</td><td>3,000</td><td>426</td></tr>
+<tr><td>Calls in the second launch (3,000 views)</td><td>3,000</td><td>4</td></tr>
+<tr><td>Old answers shown in the 1,000 views right after a model swap</td><td>1,000</td><td>0 (363 old entries swept, 356 fresh calls)</td></tr>
+<tr><td>Calls for 20 simultaneous requests for one image</td><td>20</td><td>1</td></tr>
+<tr><td>One failure followed by three retries</td><td>fail, fail, fail (1 call)</td><td>fail, ok, ok (2 calls)</td></tr>
+</tbody>
+</table>
+
+The surprise was the 4 calls in the second launch. All four were low-confidence images. An image I decided not to store gets asked again on every launch. Of the 426 calls in the first launch, 30 were low-confidence answers that were not stored, and those 30 keep generating calls indefinitely.
+
+The cost of swap day is worth stating plainly too. Not using old answers means asking again as images come up. In the simulation, the next 1,000 views triggered 356 calls. On the day you swap, that many extra calls will happen once.
+
+The 400 stored entries came to about 60 KB, roughly 150 bytes each. Once the cache hit its 2,000-entry cap, each write cost about 0.65 ms in Node. A phone will differ, so treat it as a rough guide.
+
+The stuck-failure bug reproduces with this short test. In the version that forgets to remove the in-flight record, the pending promise stays rejected and every retry receives the same failure.
+
+```ts
+// test_inflight.ts — node --experimental-strip-types test_inflight.ts
+import { createAiCache } from "./aiCache.ts";
+import { memKV } from "./mem.ts";
+
+const cfg = { task: "t", model: "m1", promptVersion: "p1", ttlMs: 864e5, maxEntries: 100, minConfidence: 0.6 };
+
+// Forgetful version (removes only inside then)
+const inflight = new Map<string, Promise<number>>();
+let calls = 0;
+const flaky = async () => { calls++; if (calls === 1) throw new Error("timeout"); return 1; };
+const buggy = (k: string) => {
+  const r = inflight.get(k); if (r) return r;
+  const p = flaky().then((v) => { inflight.delete(k); return v; }); // not removed on failure
+  inflight.set(k, p); return p;
+};
+const a: string[] = [];
+for (let i = 0; i < 3; i++) { try { await buggy("k"); a.push("ok"); } catch { a.push("fail"); } }
+console.log("forgetful:", a.join(","), "calls", calls); // fail,fail,fail calls 1
+
+// This implementation
+let fail = true, n = 0;
+const cache = createAiCache(memKV(), cfg, async () => { n++; if (fail) { fail = false; throw new Error("timeout"); } return { label: "x", confidence: 0.9 }; });
+const b: string[] = [];
+for (let i = 0; i < 3; i++) { try { await cache.classify("1"); b.push("ok"); } catch { b.push("fail"); } }
+console.log("this one:", b.join(","), "calls", n); // fail,ok,ok calls 2
+```
+
+## Pitfalls
+
+<table>
+<thead>
+<tr><th>Pitfall</th><th>What happens</th><th>What to do first</th></tr>
+</thead>
+<tbody>
+<tr><td>Keying on the image ID and relying on expiry for freshness</td><td>After a model swap, old answers return until they expire</td><td>Put model and promptVersion in both key and value</td></tr>
+<tr><td>Removing the in-flight record only on success</td><td>One failure sticks, and retries never recover</td><td>Remove it in `finally`</td></tr>
+<tr><td>Storing low-confidence answers</td><td>Vague answers get frozen and are hard to notice</td><td>Skip them, and count the cost of asking again</td></tr>
+<tr><td>Forgetting to sweep on swap day</td><td>Old-version answers sit on the device using space</td><td>Call `sweepOldVersions` at startup</td></tr>
+<tr><td>Editing the prompt without bumping promptVersion</td><td>Answers from before and after the edit get mixed</td><td>Make it a rule: touch the prompt, bump the version</td></tr>
+</tbody>
+</table>
+
+## Next step
+
+The next time you swap a model ID, change just `MODEL` and `PROMPT_VERSION`, and count the calls made right after launch once. That count is your estimate of the extra cost on swap day. If it feels heavy, you can re-ask in order of the most-viewed images first.
+
+Swapping looked like renaming a model, but it was really about deciding what to do with the answers already sitting on the device. **When you let a device remember an answer, write down when it should forget, in the same place**—I intend to hold to that line in whatever I build next.
