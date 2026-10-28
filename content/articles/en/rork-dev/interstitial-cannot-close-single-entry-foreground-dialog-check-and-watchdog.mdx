@@ -1,0 +1,459 @@
+---
+title: "Users Told Me They Could Not Close a Fullscreen Ad. The Entry Points Were Scattered, So I Put the Show-or-Not Check and a Safety Net in One Place"
+slug: "interstitial-cannot-close-single-entry-foreground-dialog-check-and-watchdog"
+category: "rork-dev"
+level: "advanced"
+premium: true
+date: "2026-10-28T20:30"
+author: "Rork Lab"
+description: "An unclosable fullscreen ad came from calls that ignored foreground state, a clash with a permission dialog, and no safety net. A single entry-point component, tested in Node."
+tags: ["interstitial ads", "AdMob", "permission dialog", "AppState", "indie developer", "design"]
+highlights:
+  - "You can narrow down an 'I can't close the ad' report from the moment the ad was shown (foreground or not, prompt on screen or not) before blaming the ad SDK"
+  - "You can gather every ad call into one entry point and unit-test the rule 'never show in the background or during a permission dialog' without the ad SDK"
+  - "You can add a safety net for ads whose close notification never arrives, counted so it never cuts a healthy ad, and prevent the 'can't close it' report before you ship"
+---
+
+Saving a wallpaper makes the phone ask, "Allow adding to Photos?" There were moments when that prompt and a fullscreen ad tried to appear in the same scene, and they collided.
+
+What reached me was a short message: the ad could not be closed. Force-quitting the app gets a person out, but what they remember afterward is less the ad than the fact that they could not close it.
+
+**Decide in one place when a fullscreen ad may appear, and keep the safety net for a missing close notification in that same place.** That sentence is what the fix came down to.
+
+This happened in an iOS wallpaper app I run as an indie developer. Any Expo app that Rork exports can run into the same shape wherever it uses an OS prompt, such as saving photos or asking for notification permission, so I rebuilt the idea in TypeScript and ran it on Node 22. It is not a reproduction of the ad SDK's internals, and it is not a check on a real device. I mark that line wherever it matters.
+
+## The report was one line: "can't close it"
+
+When a report gives you little to go on, it helps to lay out what you can read from it before deciding what to suspect first. The table below is the order of investigation I drew from the report, not a record of what I observed on screen.
+
+<table>
+<thead>
+<tr><th>What the report tells you</th><th>What to check first</th></tr>
+</thead>
+<tbody>
+<tr><td>"Can't close it" (the ad is showing)</td><td>Suspect the moment it was shown, not a load failure</td></tr>
+<tr><td>Which action it followed</td><td>Count how many places in the app call for an ad</td></tr>
+<tr><td>Actions that involve an OS prompt, such as a photo permission</td><td>Check whether the prompt and the ad can be on screen together</td></tr>
+<tr><td>When the "currently showing" flag is cleared</td><td>See whether the flag stays set when the close notification never arrives</td></tr>
+</tbody>
+</table>
+
+Before looking at ad settings or review status, I settled the order: first, in which moment was the ad shown.
+
+## Three things stacked on top of each other
+
+There was not one cause. It took three, together, to produce "can't close it."
+
+The first was that the calls that show an ad were scattered across several places. Each one showed an ad for its own reasons, and none of them looked at whether the app was in the foreground.
+
+The second was the clash with the photo permission dialog. There were moments when the prompt asking for permission and the ad overlapped. I put that overlap into the reproduction as one of the situations in which the close action becomes unreachable.
+
+The third was the missing safety net. The "currently showing" flag tends to be cleared only when the close notification arrives, and if the notification never comes, the flag stays. That is how I wrote it in the reproduction.
+
+The fix was to gather every ad call into one shared component. The check for whether it is a good moment to show, and the safety net, both live inside it.
+
+## Reproducing the broken shape by hand
+
+Before fixing anything, I reproduced the conditions. To avoid waiting in real time, I made a clock that I advance by hand.
+
+```ts
+// clock.ts — a clock you advance by hand: no real waiting, and timer order is preserved
+type Task = { at: number; fn: () => void; every?: number; cancelled: boolean };
+
+export class FakeClock {
+  now = 0;
+  private tasks: Task[] = [];
+
+  after(ms: number, fn: () => void): () => void {
+    const t: Task = { at: this.now + ms, fn, cancelled: false };
+    this.tasks.push(t);
+    return () => void (t.cancelled = true);
+  }
+  every(ms: number, fn: () => void): () => void {
+    const t: Task = { at: this.now + ms, fn, every: ms, cancelled: false };
+    this.tasks.push(t);
+    return () => void (t.cancelled = true);
+  }
+  advanceTo(target: number): void {
+    for (;;) {
+      const due = this.tasks
+        .filter((t) => !t.cancelled && t.at <= target)
+        .sort((a, b) => a.at - b.at)[0];
+      if (!due) break;
+      this.now = due.at;
+      if (due.every) due.at += due.every;
+      else due.cancelled = true;
+      due.fn();
+    }
+    this.now = target;
+  }
+}
+```
+
+The stand-in SDK carries only the condition under which the close action cannot be reached: an ad shown while the app is in the background, or while a prompt is on screen, never returns `closed`. That condition is copied from what happened on the device. It is not a check of how the SDK actually behaves.
+
+```ts
+// fake-sdk.ts — a stand-in for the interstitial SDK. It reproduces only the conditions that were present
+// (It does not model SDK internals. 'The close button cannot be reached' is expressed as 'closed never arrives'.)
+import type { FakeClock } from "./clock.ts";
+
+export interface Env {
+  active: boolean;     // is the app in the foreground?
+  dialogOpen: boolean; // is an OS prompt such as a permission dialog on screen?
+}
+
+export class FakeInterstitial {
+  visible = false;
+  closable = false;
+  shownCount = 0;
+  closedNormally = 0;
+  healthyCuts = 0;      // times the app cut off an ad that was still closable
+  maxConcurrent = 0;
+  onClosed: () => void = () => {};
+  /** when true, closed is never delivered regardless of conditions (a dropped notification) */
+  loseClose = false;
+  private concurrent = 0;
+  private viewed = 0;
+  private env: Env;
+  private viewMs: number;
+
+  constructor(clock: FakeClock, env: Env, viewMs = 20_000) {
+    this.env = env;
+    this.viewMs = viewMs;
+    // viewing time only advances while the app is in the foreground (video assumed paused)
+    clock.every(1_000, () => {
+      if (!this.visible || !this.closable || !this.env.active) return;
+      this.viewed += 1_000;
+      if (this.viewed >= this.viewMs) this.finish(true);
+    });
+  }
+
+  show(): void {
+    this.visible = true;
+    this.viewed = 0;
+    this.shownCount += 1;
+    this.concurrent += 1;
+    this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);
+    // an ad shown while backgrounded, or while a prompt is on screen, cannot be closed
+    this.closable = this.env.active && !this.env.dialogOpen && !this.loseClose;
+  }
+
+  private finish(byUser: boolean): void {
+    if (!this.visible) return;
+    if (byUser) this.closedNormally += 1;
+    this.visible = false;
+    this.closable = false;
+    this.concurrent = Math.max(0, this.concurrent - 1);
+    if (byUser) this.onClosed(); // with loseClose we never get here in the first place
+  }
+
+  /** the app closes it by force (the safety net). No notification is sent back */
+  dismiss(): void {
+    if (this.closable) this.healthyCuts += 1;
+    this.finish(false);
+  }
+}
+```
+
+## One component that owns the entry point
+
+The fixed component is below. Callers just call `request()`, and the component decides whether this is a moment to show. When it declines, it returns the reason.
+
+```ts
+// gate.ts — the single entry point for showing an interstitial
+import type { Env } from "./fake-sdk.ts";
+
+// On a device this is setInterval. Only the needed shape is extracted so a fake clock can be injected
+export interface Ticker {
+  every(ms: number, fn: () => void): () => void;
+}
+// The shape an ad SDK is plugged in as. Give dismiss a body only if you have a way to force-close
+export interface AdLike {
+  show(): void;
+  dismiss(): void;
+  onClosed: () => void;
+}
+
+export type Reason = "shown" | "background" | "system-dialog" | "already-showing";
+export type WatchdogMode = "none" | "wall" | "foreground";
+export interface Policy {
+  checkEnv: boolean;        // check foreground state and whether a prompt is showing
+  watchdog: WatchdogMode;   // how the safety net counts time when no close arrives
+}
+export const WATCHDOG_MS = 45_000;
+const TICK_MS = 1_000;
+
+export class AdGate {
+  private showing = false;
+  private elapsed = 0;
+  forceReleased = 0;
+  history: Reason[] = [];
+
+  private env: Env;
+  private ad: AdLike;
+  private policy: Policy;
+
+  constructor(clock: Ticker, env: Env, ad: AdLike, policy: Policy) {
+    this.env = env;
+    this.ad = ad;
+    this.policy = policy;
+    ad.onClosed = () => this.release();
+    clock.every(TICK_MS, () => this.tick());
+  }
+
+  /** decide whether this is a moment to show an ad; if so, show it. Returns why it did not */
+  request(): Reason {
+    const r = this.decide();
+    this.history.push(r);
+    return r;
+  }
+
+  private decide(): Reason {
+    if (this.policy.checkEnv) {
+      if (!this.env.active) return "background";
+      if (this.env.dialogOpen) return "system-dialog";
+    }
+    if (this.showing) return "already-showing";
+    this.showing = true;
+    this.elapsed = 0;
+    this.ad.show();
+    return "shown";
+  }
+
+  private release(): void {
+    this.showing = false;
+  }
+
+  private tick(): void {
+    if (!this.showing || this.policy.watchdog === "none") return;
+    // wall: count real time / foreground: count only while the app is in the foreground
+    if (this.policy.watchdog === "foreground" && !this.env.active) return;
+    this.elapsed += TICK_MS;
+    if (this.elapsed >= WATCHDOG_MS) {
+      this.forceReleased += 1;
+      this.ad.dismiss(); // close the ad whose closed never came, and release the entry lock
+      this.release();
+    }
+  }
+}
+```
+
+`Policy` switches the checks and the way the safety net counts time. That is not only to show the fixed form: it lets me run the original form and an in-between form under identical conditions.
+
+## Four situations through three designs
+
+I ran the same sequence of events through three designs. "Lock only" is the original form, with no checks and no safety net.
+
+```ts
+// scenarios.ts — run the same sequence of events through three entry-point designs
+import { FakeClock } from "./clock.ts";
+import { FakeInterstitial, type Env } from "./fake-sdk.ts";
+import { AdGate, type Policy, type Reason } from "./gate.ts";
+
+const POLICIES: Record<string, Policy> = {
+  "lock only (original)": { checkEnv: false, watchdog: "none" },
+  "checks + wall-clock net": { checkEnv: true, watchdog: "wall" },
+  "checks + foreground net": { checkEnv: true, watchdog: "foreground" },
+};
+
+interface Result {
+  trapped: boolean;      // at 240 s, is an ad that cannot be closed still on screen?
+  healthyCuts: number;   // times the safety net cut off a healthy ad
+  closedNormally: number;
+  firstRequest: Reason;  // result of the first request
+  forceReleased: number; // times the safety net fired
+  lastRequest: Reason;   // result of a request at 250 s (environment back to normal)
+}
+
+type Script = (c: FakeClock, env: Env, ad: FakeInterstitial, gate: AdGate) => void;
+
+function run(script: Script, policy: Policy): Result {
+  const clock = new FakeClock();
+  const env: Env = { active: true, dialogOpen: false };
+  const ad = new FakeInterstitial(clock, env);
+  const gate = new AdGate(clock, env, ad, policy);
+  script(clock, env, ad, gate);
+  clock.advanceTo(240_000);
+  const trapped = ad.visible && !ad.closable;
+  clock.advanceTo(250_000);
+  const lastRequest = gate.request();
+  clock.advanceTo(300_000);
+  return { firstRequest: gate.history[0], forceReleased: gate.forceReleased, trapped, healthyCuts: ad.healthyCuts, closedNormally: ad.closedNormally, lastRequest };
+}
+
+const scenarios: Record<string, Script> = {
+  // A: a save-complete ad is requested while the photo permission dialog is up
+  "A during permission dialog": (c, env, _ad, gate) => {
+    env.dialogOpen = true;
+    c.after(500, () => void gate.request());
+    c.after(2_000, () => (env.dialogOpen = false));
+  },
+  // B: a download finishes while the app is in the background, and an ad is requested
+  "B app in background": (c, env, _ad, gate) => {
+    env.active = false;
+    c.after(1_000, () => void gate.request());
+    c.after(20_000, () => (env.active = true));
+  },
+  // C: the ad showed normally, but the closed notification was dropped
+  "C dropped notification": (c, _env, ad, gate) => {
+    ad.loseClose = true;
+    c.after(0, () => void gate.request());
+  },
+  // D: the app goes to the background for two minutes mid-ad, then a request arrives on return
+  "D backgrounded mid-ad": (c, env, _ad, gate) => {
+    c.after(0, () => void gate.request());
+    c.after(10_000, () => (env.active = false));
+    c.after(130_000, () => {
+      env.active = true;
+      gate.request();
+    });
+  },
+};
+
+export function runAll(): void {
+  for (const [sname, script] of Object.entries(scenarios)) {
+    console.log(`\n== ${sname}`);
+    for (const [pname, policy] of Object.entries(POLICIES)) {
+      const r = run(script, policy);
+      console.log(
+        `${pname.padEnd(16)} first=${r.firstRequest.padEnd(15)} net-fired=${r.forceReleased} stuck=${String(r.trapped).padEnd(5)} healthy-cuts=${r.healthyCuts} closed-ok=${r.closedNormally} req@250s=${r.lastRequest}`,
+      );
+    }
+  }
+}
+runAll();
+```
+
+The output:
+
+```
+== A during permission dialog
+lock only (original) first=shown           net-fired=0 stuck=true  healthy-cuts=0 closed-ok=0 req@250s=already-showing
+checks + wall-clock net first=system-dialog   net-fired=0 stuck=false healthy-cuts=0 closed-ok=1 req@250s=shown
+checks + foreground net first=system-dialog   net-fired=0 stuck=false healthy-cuts=0 closed-ok=1 req@250s=shown
+
+== B app in background
+lock only (original) first=shown           net-fired=0 stuck=true  healthy-cuts=0 closed-ok=0 req@250s=already-showing
+checks + wall-clock net first=background      net-fired=0 stuck=false healthy-cuts=0 closed-ok=1 req@250s=shown
+checks + foreground net first=background      net-fired=0 stuck=false healthy-cuts=0 closed-ok=1 req@250s=shown
+
+== C dropped notification
+lock only (original) first=shown           net-fired=0 stuck=true  healthy-cuts=0 closed-ok=0 req@250s=already-showing
+checks + wall-clock net first=shown           net-fired=2 stuck=false healthy-cuts=0 closed-ok=0 req@250s=shown
+checks + foreground net first=shown           net-fired=2 stuck=false healthy-cuts=0 closed-ok=0 req@250s=shown
+
+== D backgrounded mid-ad
+lock only (original) first=shown           net-fired=0 stuck=false healthy-cuts=0 closed-ok=2 req@250s=shown
+checks + wall-clock net first=shown           net-fired=1 stuck=false healthy-cuts=1 closed-ok=2 req@250s=shown
+checks + foreground net first=shown           net-fired=0 stuck=false healthy-cuts=0 closed-ok=2 req@250s=shown
+```
+
+The table below pulls out the main points.
+
+<table>
+<thead>
+<tr><th>Situation</th><th>Lock only (original)</th><th>Checks + foreground net</th></tr>
+</thead>
+<tbody>
+<tr><td>A request during the permission dialog</td><td>The ad shows and an unclosable ad is left on screen</td><td>First request declined with <code>system-dialog</code></td></tr>
+<tr><td>B request while in the background</td><td>The ad shows and an unclosable ad is left on screen</td><td>First request declined with <code>background</code></td></tr>
+<tr><td>C dropped close notification</td><td>It stays, and every later request returns <code>already-showing</code></td><td>The net fires after 45 s and later requests go through</td></tr>
+<tr><td>D two minutes in the background mid-ad</td><td>No problem (healthy to begin with)</td><td>No problem, nothing cut off</td></tr>
+</tbody>
+</table>
+
+With the original form, the request at 250 s was still `already-showing` in A, B and C. Once it trips, ads stay off until the app is restarted. With the checks and the net added, the 250 s request went through in all three. The "net-fired 2" in C counts the first ad and the ad requested at 250 s; both are set to drop their close notification.
+
+## The counterintuitive part: counting the net in wall-clock time cuts healthy ads
+
+Written plainly, the safety net is "if the ad has not closed 45 seconds after showing, close it." In situation C, counting wall-clock time or foreground time gives the same result.
+
+The difference appears in D, where the app goes to the background for two minutes while the user is partway through an ad.
+
+<table>
+<thead>
+<tr><th>How the net counts</th><th>Net fired</th><th>Healthy ads cut off</th></tr>
+</thead>
+<tbody>
+<tr><td>Wall-clock (<code>wall</code>)</td><td>1</td><td>1</td></tr>
+<tr><td>Only while in the foreground (<code>foreground</code>)</td><td>0</td><td>0</td></tr>
+</tbody>
+</table>
+
+With wall-clock counting, the 45 seconds pass while the app is in the background, and the net cuts off an ad the user has not finished. An ad only advances while the app is in the foreground, so the net's clock has to run on the same time as the ad. The one line in `tick` in `gate.ts` that skips counting while the app is not in the foreground is the answer to this.
+
+I could not settle how the net should count time in my first design; it only became clear when I put the three designs side by side in the reproduction. A safety net is invisible when it works, which also makes it a component that can cut healthy ads without anyone noticing. I think a test for a situation like D is worth keeping.
+
+## Measure the threshold in your own app
+
+The 45 seconds here was chosen against a stand-in ad that finishes in 20 seconds. It is not a copy of how long real ads last.
+
+Here is how I would decide it. Measure, on a real device, the longest time an ad stays on screen in your app, and add some margin. Too short and you cut healthy ads; too long and the "can't close it" state lasts longer. As a starting point I would suggest 1.5 times the longest time you measured on a real device, then adjusting from there on the device.
+
+## Connecting it to Expo
+
+The component knows nothing about the ad SDK, so in Expo it plugs in like this. I assumed `react-native-google-mobile-ads`, but this wiring has no automated test, so please check it on a real device before relying on it, and confirm names and behavior against the version you use. In the reproduction, the `Env` type sits in `fake-sdk.ts`; in production, move it into `gate.ts`.
+
+```tsx
+// ad-entry.ts — wiring for a real device (untested; check on a device)
+import { AppState } from "react-native";
+import { InterstitialAd, AdEventType } from "react-native-google-mobile-ads";
+import { AdGate } from "./gate";
+
+const env = { active: AppState.currentState === "active", dialogOpen: false };
+AppState.addEventListener("change", (s) => (env.active = s === "active"));
+
+const interstitial = InterstitialAd.createForAdRequest("<unit id>");
+const adLike = {
+  onClosed: () => {},
+  show: () => interstitial.show(),
+  // If your version has no API to close the ad by force, leave this empty.
+  // The safety net then goes only as far as releasing the lock.
+  dismiss: () => {},
+};
+interstitial.addAdEventListener(AdEventType.CLOSED, () => adLike.onClosed());
+interstitial.addAdEventListener(AdEventType.ERROR, () => adLike.onClosed());
+
+const realTicker = {
+  every: (ms: number, fn: () => void) => {
+    const id = setInterval(fn, ms);
+    return () => clearInterval(id);
+  },
+};
+export const gate = new AdGate(realTicker, env, adLike, {
+  checkEnv: true,
+  watchdog: "foreground",
+});
+
+// Wrap any action that shows a permission dialog with these two
+export async function withSystemDialog<T>(run: () => Promise<T>): Promise<T> {
+  env.dialogOpen = true;
+  try {
+    return await run();
+  } finally {
+    env.dialogOpen = false;
+  }
+}
+```
+
+Wrap the photo-save permission like `await withSystemDialog(() => MediaLibrary.requestPermissionsAsync())`. The easy thing to miss is the body of `dismiss`. Some versions have no API for closing the ad screen from the app. In that case the safety net can only release the lock; the ad left on screen stays. That is exactly why the "do not show" check, put in first, does more of the work.
+
+## Pitfalls that tend to remain after a fix
+
+- **Calls that are not actually in one place.** If another screen still calls the SDK directly, it bypasses the checks. After you think you have gathered them, count the call sites again.
+- **The kinds of prompts.** Wrapping only the photo permission leaves the same overlap with the notification permission or the location permission. Keep a list of the actions that raise a prompt, and nothing slips through.
+- **What to do with a declined ad.** Whether to retry a declined ad later is a separate decision. An ad that appears right after someone taps Allow becomes tied to that tap and feels worse. In the reproduction I simply let it go and wait for the next chance. The right answer probably depends on the app.
+
+## A first step you can take today
+
+First, count the places in your app that show a fullscreen ad.
+
+```bash
+grep -rnE "\.show\(\)|showAd|presentAd|interstitial" app src --include="*.ts" --include="*.tsx" | wc -l
+```
+
+If the number is more than 1, the checks may be scattered. Then search the same way for `requestPermissionsAsync` and notification permission requests, and see whether they sit next to an ad call on the same screen. Those pairs are the candidates for this shape.
+
+A related problem with state that outlives a screen is covered in [Fullscreen Ads Stopped Showing After Going Back and Forth Between Screens](/en/articles/rork-dev/fullscreen-ad-stops-after-screen-revisit-holder-keeps-closed-screen-swap-listener-target). For the decision about launch-time ads, see [An App-Open Ad Only Showed on Returns From the Background](/en/articles/rork-dev/app-open-ad-cold-start-never-shown-foreground-signal-before-load), and for how to count launches, [My Launch Counter Went Up by Two on Every Launch](/en/articles/rork-business/launch-counter-called-from-two-places-ad-grace-ended-early-count-in-one-place).
+
+One last thought. Deciding not to show an ad may feel like giving up revenue. But in the reproduction of the original form, a single unclosable ad stopped every later ad for the rest of that launch. Choosing the moments to show turned out to be what keeps ads showing, and that was the lesson here.
