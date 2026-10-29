@@ -1,0 +1,353 @@
+---
+title: "An Image Requested Once Before Its Upload Stayed a 404 at the Edge. I Split the Retention Rules by Status Code and Made Upload and Purge a Single Step"
+slug: "image-404-held-at-edge-split-ttl-by-status-and-pair-upload-with-purge"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-10-29T20:25"
+author: "Rork Lab"
+description: "A new wallpaper stayed missing in some regions because the CDN kept a 404, fetched once before the upload, as long as it kept the image itself. Per-status retention, a two-request diagnosis, and pairing upload with purge, tested in Node."
+tags: ["CDN", "caching", "404", "TTL", "wallpaper app", "indie developer", "operations"]
+highlights:
+  - "You can tell whether a new image is missing from the origin or the edge is holding a 404, using two requests, when it only fails in some regions"
+  - "You can set your own 404 and 5xx retention by counting what a shorter 404 costs (requests reaching the origin) and what a wrongly kept 5xx does, before touching the CDN"
+  - "You can make upload and purge one step, so the next image you add does not fall into the same hole"
+---
+
+I add one wallpaper and refresh the catalog. On my own device it appears right away. From a device in a distant region, that single image stays blank.
+
+The file is on the server. The app code looks fine.
+
+**A 404 means "not here yet", not "never will be". A CDN, depending on its settings, will remember it as if it were a promise.** That sentence is where I landed after the fix.
+
+This happened in the image delivery of a wallpaper app I run as an indie developer. An Expo app that Rork generates can hit the same shape if it serves images from a remote host, so I rebuilt only the retention rule as a small model in JavaScript and ran it on Node 22. It is not a re-creation of any CDN's internals, and it is separate from checking on a real delivery network. I mark that boundary where it matters.
+
+## The report was "just that one image is missing"
+
+Putting the symptoms in a table first makes it harder to suspect things in the wrong order. This is the order I would investigate in, not a record of what I observed on screen.
+
+<table>
+<thead>
+<tr><th>What you see</th><th>What to check first</th></tr>
+</thead>
+<tbody>
+<tr><td>Only new images are missing (old ones load)</td><td>Look at the response for the image URL before the app's loading code</td></tr>
+<tr><td>It works in some regions and not in others</td><td>Edge caches are separate. Suspect one region's memory</td></tr>
+<tr><td>It does not fix itself over time</td><td>Look at how long responses are kept. Find out how many seconds a 404 is remembered</td></tr>
+<tr><td>The file is on the origin</td><td>Suspect not "it is missing" but "a memory of it being missing is still there"</td></tr>
+</tbody>
+</table>
+
+## Three things that stacked up
+
+There was not one cause. Three stacked up before an image stayed a 404 for as long as a year.
+
+The first was order. The catalog update reached devices first, so there was a moment when a device asked for an image before its upload had finished.
+
+The second was the retention rule. In the CDN settings, a 404 was kept for the same one year as the image itself. A "not found" became a one-year memory.
+
+The third was the purge step. In my workflow, nothing purged the path after an upload. Once the file arrived, the edge already held an answer and never went back to the origin.
+
+## Copying only the retention rule
+
+I cannot wait a year, so I wrote a clock I advance by hand and a small model that holds only the retention rule. The edge keys on path plus query, lets a policy decide the seconds per response, and refetches on expiry.
+
+```js
+// clock.mjs — a clock you advance by hand, so a one-year retention never has to be waited out
+export class FakeClock {
+  #now = 0;
+  now() { return this.#now; }
+  advance(sec) { this.#now += sec; }
+}
+```
+
+```js
+// edge.mjs — a model of the edge cache's retention rule only (not a re-creation of any CDN's internals)
+// Key = path + query. A policy picks the retention seconds per response; on expiry the edge refetches.
+export class Edge {
+  constructor({ clock, origin, policy }) {
+    this.clock = clock; this.origin = origin; this.policy = policy;
+    this.store = new Map();
+    this.originHits = 0;
+  }
+  get(url) {
+    const now = this.clock.now();
+    const hit = this.store.get(url);
+    if (hit && now < hit.expiresAt) return { ...hit.res, cache: "HIT" };
+    const res = this.origin.get(url);       // refetch (MISS or EXPIRED)
+    this.originHits += 1;
+    const ttl = this.policy(res.status);
+    if (ttl > 0) this.store.set(url, { res, expiresAt: now + ttl });
+    else this.store.delete(url);
+    return { ...res, cache: hit ? "EXPIRED" : "MISS" };
+  }
+  purge(url) { this.store.delete(url); }
+}
+
+export class Origin {
+  constructor() { this.files = new Map(); this.down = false; }
+  upload(path, bytes) { this.files.set(path, bytes); }
+  get(url) {
+    const path = url.split("?")[0];
+    if (this.down) return { status: 503, bytes: 0 };
+    return this.files.has(path)
+      ? { status: 200, bytes: this.files.get(path) }
+      : { status: 404, bytes: 0 };
+  }
+}
+```
+
+```js
+// policies.mjs — the retention rules before and after, as a table of seconds
+const YEAR = 365 * 24 * 3600;
+export const before = (status) => (status === 200 || status === 404 ? YEAR : 0);         // 404 kept for a year too
+export const after  = (status) => (status === 200 ? YEAR : status === 404 ? 60 : 0);     // 404 for 60 s; 5xx never kept
+```
+
+The 60 seconds in the "after" rule is the value I actually set on the delivery network. Not keeping 5xx responses went in with the same change.
+
+## The same event under two rules
+
+The flow: the app receives the catalog update first and fetches the image, then the upload finishes 30 seconds later.
+
+```js
+// timeline.mjs — when does an image that was requested once before its upload become visible?
+import { FakeClock } from "./clock.mjs";
+import { Edge, Origin } from "./edge.mjs";
+import { before, after } from "./policies.mjs";
+
+function run(name, policy) {
+  const clock = new FakeClock(); const origin = new Origin();
+  const edge = new Edge({ clock, origin, policy });
+  const path = "/img/new_wall_0412.jpg";
+  const rows = [];
+  const hit = (label) => { const r = edge.get(path); rows.push([label, r.status, r.cache]); return r; };
+  hit("prefetch before upload");
+  clock.advance(30); origin.upload(path, 480_000);
+  hit("right after upload (+30 s)");
+  clock.advance(45); hit("+75 s");
+  clock.advance(3600); hit("+about 1 hour");
+  // count the seconds until it becomes visible
+  const probe = new Edge({ clock: new FakeClock(), origin: new Origin(), policy });
+  const o = probe.origin; probe.get(path); o.upload(path, 480_000);
+  let t = 0; const step = 15;
+  while (t < 2 * 365 * 24 * 3600) { probe.clock.advance(step); t += step; if (probe.get(path).status === 200) break; }
+  console.log(`\n== ${name}`);
+  for (const [l, s, c] of rows) console.log(`  ${l.padEnd(28)} status=${s} cache=${c}`);
+  console.log(`  -> seconds from upload until 200: ${t >= 2*365*24*3600 ? "still not 200 after 2 years" : t}`);
+}
+run("before (404 kept for 1 year)", before);
+run("after (404 kept for 60 s)", after);
+```
+
+Here is the output from Node 22.23.
+
+```
+== before (404 kept for 1 year)
+  prefetch before upload       status=404 cache=MISS
+  right after upload (+30 s)   status=404 cache=HIT
+  +75 s                        status=404 cache=HIT
+  +about 1 hour                status=404 cache=HIT
+  -> seconds from upload until 200: 31536000
+
+== after (404 kept for 60 s)
+  prefetch before upload       status=404 cache=MISS
+  right after upload (+30 s)   status=404 cache=HIT
+  +75 s                        status=200 cache=EXPIRED
+  +about 1 hour                status=200 cache=HIT
+  -> seconds from upload until 200: 60
+```
+
+31,536,000 seconds is exactly one year. Under the new rule the image turns into a 200 after 60 seconds. On the real delivery network I also watched the response headers move through MISS, HIT and EXPIRED after the change. Header names differ by service, so I do not list them here.
+
+## The counterintuitive part: count what a shorter 404 costs
+
+Not keeping 404 at all looks safest. The model shows a different picture once lookups for a missing image keep coming.
+
+```js
+// load.mjs — shortening the 404 lifetime sends more lookups to the origin. Count the price.
+import { FakeClock } from "./clock.mjs";
+import { Edge, Origin } from "./edge.mjs";
+const YEAR = 365 * 24 * 3600;
+const cases = {
+  "404 = 1 year ": (s) => (s === 200 || s === 404 ? YEAR : 0),
+  "404 = 60 s   ": (s) => (s === 200 ? YEAR : s === 404 ? 60 : 0),
+  "404 = no keep": (s) => (s === 200 ? YEAR : 0),
+};
+console.log("One missing image, one request per second, for 10 minutes (600 requests)");
+for (const [name, policy] of Object.entries(cases)) {
+  const clock = new FakeClock(); const edge = new Edge({ clock, origin: new Origin(), policy });
+  for (let i = 0; i < 600; i++) { edge.get("/img/ghost.jpg"); clock.advance(1); }
+  console.log(`  ${name} requests that reached the origin: ${String(edge.originHits).padStart(3)}`);
+}
+
+console.log("\nOrigin returns 503 for 5 minutes, then recovers (one request per second throughout)");
+const five = {
+  "5xx kept (wrong)": (s) => (s === 200 ? YEAR : 3600),
+  "5xx not kept    ": (s) => (s === 200 ? YEAR : s === 404 ? 60 : 0),
+};
+for (const [name, policy] of Object.entries(five)) {
+  const clock = new FakeClock(); const origin = new Origin(); origin.upload("/img/ok.jpg", 300_000);
+  const edge = new Edge({ clock, origin, policy });
+  origin.down = true;
+  for (let i = 0; i < 300; i++) { edge.get("/img/ok.jpg"); clock.advance(1); }
+  origin.down = false;
+  const later = [];
+  for (const wait of [1, 60, 600]) { clock.advance(wait); later.push(edge.get("/img/ok.jpg").status); }
+  console.log(`  ${name} status after recovery (+1 s / +61 s / +661 s): ${later.join(" / ")}`);
+}
+```
+
+```
+One missing image, one request per second, for 10 minutes (600 requests)
+  404 = 1 year  requests that reached the origin:   1
+  404 = 60 s    requests that reached the origin:  10
+  404 = no keep requests that reached the origin: 600
+
+Origin returns 503 for 5 minutes, then recovers (one request per second throughout)
+  5xx kept (wrong) status after recovery (+1 s / +61 s / +661 s): 503 / 503 / 503
+  5xx not kept     status after recovery (+1 s / +61 s / +661 s): 200 / 200 / 200
+```
+
+With no retention, all 600 lookups for the same missing URL reach the origin. With 60 seconds it is 10. A one-year rule needs only one, but an image added later never comes back.
+
+The lower block is the bigger difference. Keeping a 5xx kept returning 503 until 661 seconds after the origin had recovered. A short outage gets stretched by the length of the retention. That is why I stated "do not keep 5xx" explicitly.
+
+I chose a short 404 and no 5xx retention. The 60 seconds did not come out of the model. It is my judgment about a length that does not flood the origin and still tolerates a late upload.
+
+## Two requests are enough to tell the cause apart
+
+Fixing the rule does not clear the 404s the edge already holds. First separate "missing on the origin" from "a memory at the edge". A URL with a query string has a different key, so it shows the origin's real state without passing through the edge's memory.
+
+```js
+// probe.mjs — "not on the origin yet" or "the edge is holding a 404"? Two requests tell them apart.
+// A plain URL and a URL with a query string (a different cache key) are read side by side.
+export function diagnose(edge, path, nonce) {
+  const plain = edge.get(path);
+  const fresh = edge.get(`${path}?probe=${nonce}`);
+  let verdict;
+  if (plain.status === 200 && fresh.status === 200) verdict = "ok";
+  else if (plain.status === 404 && fresh.status === 404) verdict = "origin-missing";   // really absent: suspect the upload
+  else if (plain.status === 404 && fresh.status === 200) verdict = "edge-holding-404"; // the origin has it; the edge holds a memory of 404
+  else verdict = `other(${plain.status}/${fresh.status})`;
+  return { path, plain: plain.status, fresh: fresh.status, plainCache: plain.cache, verdict };
+}
+```
+
+I then wrote a sweep that diagnoses a list of newly added images and purges only the ones the edge holds, one by one. It also puts "upload only" next to "upload and purge as one step".
+
+```js
+// sweep.mjs — diagnose newly added images in order; purge only those the edge is holding a 404 for
+import { FakeClock } from "./clock.mjs";
+import { Edge, Origin } from "./edge.mjs";
+import { before } from "./policies.mjs";
+import { diagnose } from "./probe.mjs";
+
+const clock = new FakeClock(); const origin = new Origin();
+const edge = new Edge({ clock, origin, policy: before });          // recreate the state under the old rule
+const added = ["/img/w_0410.jpg", "/img/w_0411.jpg", "/img/w_0412.jpg", "/img/w_0413.jpg"];
+
+edge.get("/img/w_0412.jpg"); edge.get("/img/w_0413.jpg");          // the catalog update arrived first; two were fetched early
+clock.advance(40);
+for (const p of added.slice(0, 3)) origin.upload(p, 400_000);      // only w_0413 is late
+let n = 0;
+const report = added.map((p) => diagnose(edge, p, ++n));
+for (const r of report) console.log(`${r.path.padEnd(18)} plain=${r.plain}(${r.plainCache}) fresh=${r.fresh} -> ${r.verdict}`);
+
+for (const r of report) if (r.verdict === "edge-holding-404") edge.purge(r.path);   // only the held ones, one at a time
+console.log("\nAfter purging (w_0413 is still missing on the origin, so I left it alone)");
+for (const p of added.slice(0, 3)) console.log(`${p.padEnd(18)} -> ${edge.get(p).status}`);
+
+// w_0413 arrives late. Upload only, versus upload and purge as one step
+clock.advance(600);
+const uploadOnly = (p) => origin.upload(p, 400_000);
+const uploadAndPurge = (p) => { origin.upload(p, 400_000); edge.purge(p); };
+uploadOnly("/img/w_0413.jpg");
+console.log(`\nw_0413, upload only -> ${edge.get("/img/w_0413.jpg").status} (${edge.get("/img/w_0413.jpg").cache})`);
+origin.files.delete("/img/w_0413.jpg"); edge.purge("/img/w_0413.jpg"); edge.get("/img/w_0413.jpg"); // rebuild the same situation
+uploadAndPurge("/img/w_0413.jpg");
+console.log(`w_0413, upload and purge as one step -> ${edge.get("/img/w_0413.jpg").status}`);
+```
+
+```
+/img/w_0410.jpg    plain=200(MISS) fresh=200 -> ok
+/img/w_0411.jpg    plain=200(MISS) fresh=200 -> ok
+/img/w_0412.jpg    plain=404(HIT) fresh=200 -> edge-holding-404
+/img/w_0413.jpg    plain=404(HIT) fresh=404 -> origin-missing
+
+After purging (w_0413 is still missing on the origin, so I left it alone)
+/img/w_0410.jpg    -> 200
+/img/w_0411.jpg    -> 200
+/img/w_0412.jpg    -> 200
+
+w_0413, upload only -> 404 (HIT)
+w_0413, upload and purge as one step -> 200
+```
+
+The last two lines are easy to miss. `w_0413` was diagnosed as missing on the origin, so I left it. But the edge for that path still holds the 404, so a later upload does not make it come back by itself. The diagnosis output alone does not show that the images you add later have the same hole.
+
+So I treated the purge as part of the upload, not as cleanup after it. Once the file is in place, the same step purges that path.
+
+## Save the current settings before changing the rule
+
+Changing a retention rule affects the whole delivery. To keep it reversible, I saved the settings from before and printed the values to roll back to before I touched anything.
+
+```js
+// plan.mjs — before changing the retention rules, save the current settings and print the diff and the way back (it touches no real setting)
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
+
+const current = { 200: "1y", 404: "1y", "5xx": "unset" };  // read the current values off the dashboard and copy them by hand (example values here)
+const target  = { 200: "1y", 404: "60s", "5xx": "none" };
+
+if (!existsSync("rules.before.json")) writeFileSync("rules.before.json", JSON.stringify(current, null, 2));
+const saved = JSON.parse(readFileSync("rules.before.json", "utf8"));   // when rolling back, this file is the source of truth
+
+for (const k of Object.keys(target)) {
+  const from = saved[k], to = target[k];
+  console.log(`${String(k).padEnd(4)} ${from.padEnd(5)} -> ${to.padEnd(5)} ${from === to ? "(unchanged)" : `roll back to: ${from}`}`);
+}
+```
+
+```
+200  1y    -> 1y    (unchanged)
+404  1y    -> 60s   roll back to: 1y
+5xx  unset -> none  roll back to: unset
+```
+
+`existsSync` avoids overwriting the file, so a second run does not save the new values as the "before". Read the real values off your dashboard and copy them in. This table is an example of the format, not my settings.
+
+## Connecting it to an Expo app
+
+There are two precautions on the app side.
+
+```ts
+// App side: do not prefetch images until the catalog says they are ready
+// (give each catalog item a ready flag; the server sets it after upload and purge are done)
+type CatalogItem = { id: string; path: string; ready: boolean };
+
+export function visibleItems(items: CatalogItem[]): CatalogItem[] {
+  return items.filter((i) => i.ready);   // items that are not ready appear neither in the list nor in prefetching
+}
+```
+
+The server-side order is upload, purge, then update the catalog. With that order, an image can already be fetched by the time a device receives the catalog. If you cannot add a mechanism to enforce the order, fixing the retention rule at least makes a failed early fetch forgotten after 60 seconds.
+
+## Pitfalls that remain after the fix
+
+- **Do not trust a query-string URL as proof of the fix.** A query string changes the key, which suits diagnosis but does not prove the plain URL is fixed. Open the plain URL from a device in a distant region or on another connection.
+- **Do not copy the model's seconds into production.** The model copies only the retention rule. A real delivery network has other behavior, such as collapsing lookups to the origin. Choose the 60 seconds from your own request volume, not from the model.
+- **The same rule can reach responses other than images.** If you apply it without narrowing by path or extension, it affects everything. After the change, open a few representative non-image URLs too.
+
+## A first step you can take today
+
+Pick one URL of a newly added image and look at its response headers.
+
+```bash
+curl -sI "https://example.com/img/new_wall.jpg" | grep -iE "^(HTTP|age|cache|x-cache|cf-cache)"
+```
+
+Replace `example.com` with your own domain. Header names differ by delivery network, so look for one that shows elapsed retention seconds, such as `age`. Then open one path that does not exist and see whether the 404 carries a cache marker or an age. If it does, your delivery may be remembering 404s too.
+
+I wrote about moving where images live in [I Moved the Thumbnails Assuming the Shipped Build Would Keep Asking for the Old Path](/en/articles/app-dev/remote-thumbnail-path-migration-shipped-version-fallback), and about routing resolutions without changing the URL in [301 or Internal Rewrite for Wallpaper Resolution Routing?](/en/articles/app-dev/image-resolution-routing-301-or-internal-rewrite-same-host-decision). Moving images out of the bundle is covered in [Keeping a wallpaper app's binary small](/en/articles/app-dev/wallpaper-app-binary-size-remote-asset-delivery).
+
+One last thing. I take a shorter 404 less as a safety setting than as a way to make the delivery network tell "not yet" apart from "never". Once it can, the habit that holds it up is finishing the purge in the same step as the upload.

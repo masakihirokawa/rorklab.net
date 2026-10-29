@@ -1,0 +1,356 @@
+---
+title: "アップロード前に一度だけ取りにいかれた画像が、エッジで 404 のまま残りました。保持の規則をステータス別に分け、アップロードと消去を一組にしました"
+slug: "image-404-held-at-edge-split-ttl-by-status-and-pair-upload-with-purge"
+category: "app-dev"
+level: "advanced"
+premium: true
+date: "2026-10-29T20:25"
+author: "Rork Lab"
+description: "新しい壁紙が、一部の地域でだけ 404 のまま表示されない。原因は、アップロード前に一度だけ取りにいかれた 404 を、CDN が画像と同じ長さで保持していたことでした。ステータス別の保持、診断の二本立て、アップロードと消去の一組を、手元で動かして確かめた記録です。"
+tags: ["CDN", "キャッシュ", "404", "TTL", "壁紙アプリ", "個人開発", "運用"]
+highlights:
+  - "新しく足した画像が一部の地域でだけ出ないとき、オリジンにまだ無いのか、エッジが 404 を抱えているのかを、二本の問い合わせで切り分けられるようになります"
+  - "404 と 5xx の保持を画像と分ける前に、短くした代償（オリジンに届く回数）と、誤って保持したときの被害を数えて、自分の設定値を決められるようになります"
+  - "アップロードの直後にそのパスを消す手順を一組にして、次に足す画像が同じ穴に落ちるのを先回りして防げるようになります"
+---
+
+壁紙を一枚足して、一覧を更新します。手元の端末では、ちゃんと表示されます。ところが、離れた地域の端末からは、その一枚だけが空のままです。
+
+何度か見直しても、サーバーにはファイルがあります。アプリの側にも、おかしな点が見当たりません。
+
+**404 は「まだ無い」という知らせであって、「この先もずっと無い」という約束ではありません。ところが CDN は、設定しだいで 404 を約束として長く覚えます。** この一文に、直したあとの考え方が収まりました。
+
+個人開発で運用している壁紙アプリの、画像配信で起きた話です。Rork が書き出す Expo のアプリでも、画像をリモートから配信しているなら同じ型が起きうると考えて、保持の規則だけを写した小さな模型を JavaScript で組み、Node 22 で動かして確かめました。CDN の内部を再現したものではなく、実際の配信網での確認とも別です。その線引きは、各所に書き添えます。
+
+## 声は「その一枚だけ出ない」でした
+
+症状から読み取れることを、先に表へ置いておくと、疑う順番を間違えにくくなります。ここに書いたのは、私が立てた調べる順で、画面を観察した記録ではありません。
+
+<table>
+<thead>
+<tr><th>見えた症状</th><th>最初に調べること</th></tr>
+</thead>
+<tbody>
+<tr><td>新しい画像だけ出ない（古い画像は出る）</td><td>アプリの読み込みより先に、画像の URL の応答を見ます</td></tr>
+<tr><td>地域によって出たり出なかったりする</td><td>キャッシュはエッジごとに別です。ひとつの地域の記憶を疑います</td></tr>
+<tr><td>時間が経っても直らない</td><td>応答の保持時間を見ます。404 が何秒覚えられる設定かを確かめます</td></tr>
+<tr><td>ファイルはオリジンにある</td><td>「無い」ではなく、「無かったという記憶が残っている」を疑います</td></tr>
+</tbody>
+</table>
+
+## 重なっていた三つのこと
+
+原因は一つではなく、三つが重なって、はじめて「1年間 404 のまま」になっていました。
+
+一つ目は、順序です。一覧の更新が先に端末へ届き、アップロードの完了より前に、端末が画像を取りにいく瞬間がありました。
+
+二つ目は、保持の規則です。CDN の設定で、200 だけでなく 404 も、画像と同じ1年の長さで保持する形になっていました。「無かった」という応答が、そのまま1年分の記憶になります。
+
+三つ目は、消す手順です。私の工程では、アップロードのあとに、そのパスのキャッシュを消す作業が組み込まれていませんでした。ファイルが届いても、エッジはすでに答えを持っているので、オリジンを見にいきません。
+
+## 保持の規則だけを、手元で写します
+
+1年は待てないので、時間を手で進める時計と、保持の規則だけを持つ小さな模型を用意しました。エッジはパスとクエリをキーにして、応答ごとにポリシーで秒数を決め、期限が切れたら取り直します。
+
+```js
+// clock.mjs — 手で進める時計。1年分の保持も待たずに確かめるために使います
+export class FakeClock {
+  #now = 0;
+  now() { return this.#now; }
+  advance(sec) { this.#now += sec; }
+}
+```
+
+```js
+// edge.mjs — エッジキャッシュの「保持の規則」だけを写した模型です（CDN の内部を再現したものではありません）
+// キー = パス + クエリ。応答ごとに保持秒数をポリシーで決め、期限が切れたら取り直します。
+export class Edge {
+  constructor({ clock, origin, policy }) {
+    this.clock = clock; this.origin = origin; this.policy = policy;
+    this.store = new Map();
+    this.originHits = 0;
+  }
+  get(url) {
+    const now = this.clock.now();
+    const hit = this.store.get(url);
+    if (hit && now < hit.expiresAt) return { ...hit.res, cache: "HIT" };
+    const res = this.origin.get(url);       // 取り直し（MISS または EXPIRED）
+    this.originHits += 1;
+    const ttl = this.policy(res.status);
+    if (ttl > 0) this.store.set(url, { res, expiresAt: now + ttl });
+    else this.store.delete(url);
+    return { ...res, cache: hit ? "EXPIRED" : "MISS" };
+  }
+  purge(url) { this.store.delete(url); }
+}
+
+export class Origin {
+  constructor() { this.files = new Map(); this.down = false; }
+  upload(path, bytes) { this.files.set(path, bytes); }
+  get(url) {
+    const path = url.split("?")[0];
+    if (this.down) return { status: 503, bytes: 0 };
+    return this.files.has(path)
+      ? { status: 200, bytes: this.files.get(path) }
+      : { status: 404, bytes: 0 };
+  }
+}
+```
+
+```js
+// policies.mjs — 変更前と変更後の保持規則を、秒数の表として持ちます
+const YEAR = 365 * 24 * 3600;
+export const before = (status) => (status === 200 || status === 404 ? YEAR : 0);         // 404 まで1年
+export const after  = (status) => (status === 200 ? YEAR : status === 404 ? 60 : 0);     // 404 は60秒・5xx は保持しない
+```
+
+変更後の「60秒」は、実際に配信網へ入れた値です。5xx を保持しない形も、同じ変更で入れました。
+
+## 同じ出来事を、二つの規則で並べます
+
+アプリが一覧の更新を先に受け取り、画像を取りにいき、30秒後にアップロードが終わる、という流れです。
+
+```js
+// timeline.mjs — 「アップロード前に一度アクセスされた画像」が、いつ見えるようになるかを並べます
+import { FakeClock } from "./clock.mjs";
+import { Edge, Origin } from "./edge.mjs";
+import { before, after } from "./policies.mjs";
+
+function run(name, policy) {
+  const clock = new FakeClock(); const origin = new Origin();
+  const edge = new Edge({ clock, origin, policy });
+  const path = "/img/new_wall_0412.jpg";
+  const rows = [];
+  const hit = (label) => { const r = edge.get(path); rows.push([label, r.status, r.cache]); return r; };
+  hit("アップロード前に先読み");          // アプリが一覧の更新を先に受け取り、画像を取りにいった
+  clock.advance(30); origin.upload(path, 480_000);
+  hit("アップロード直後(+30秒)");
+  clock.advance(45); hit("+75秒");
+  clock.advance(3600); hit("+約1時間");
+  // 見えるようになるまでの秒数を数える
+  const probe = new Edge({ clock: new FakeClock(), origin: new Origin(), policy });
+  const o = probe.origin; probe.get(path); o.upload(path, 480_000);
+  let t = 0; const step = 15;
+  while (t < 2 * 365 * 24 * 3600) { probe.clock.advance(step); t += step; if (probe.get(path).status === 200) break; }
+  console.log(`\n■ ${name}`);
+  for (const [l, s, c] of rows) console.log(`  ${l.padEnd(26)} status=${s} cache=${c}`);
+  console.log(`  → アップロードから 200 が返るまで: ${t >= 2*365*24*3600 ? "2年待っても返らない" : t + " 秒"}`);
+}
+run("変更前（404 も 1 年保持）", before);
+run("変更後（404 は 60 秒）", after);
+```
+
+Node 22.23 で走らせた出力が、次のとおりです。
+
+```
+■ 変更前（404 も 1 年保持）
+  アップロード前に先読み                status=404 cache=MISS
+  アップロード直後(+30秒)             status=404 cache=HIT
+  +75秒                       status=404 cache=HIT
+  +約1時間                      status=404 cache=HIT
+  → アップロードから 200 が返るまで: 31536000 秒
+
+■ 変更後（404 は 60 秒）
+  アップロード前に先読み                status=404 cache=MISS
+  アップロード直後(+30秒)             status=404 cache=HIT
+  +75秒                       status=200 cache=EXPIRED
+  +約1時間                      status=200 cache=HIT
+  → アップロードから 200 が返るまで: 60 秒
+```
+
+31,536,000 秒は、ちょうど1年です。変更後は、60秒で 200 に変わります。実際の配信網でも、設定を変えたあとに MISS、HIT、EXPIRED と遷移していくのを、応答のヘッダで確認しました。ヘッダの名前はサービスごとに違うので、ここでは書きません。
+
+## 直感に反した点：404 を短くした代償を、先に数えます
+
+「404 は保持しない」が一番安全に見えます。ただ、存在しない画像への問い合わせが続く場面を模型で数えると、様子が変わります。
+
+```js
+// load.mjs — 404 を短くすると、存在しない URL への問い合わせがオリジンに届く。その代償を数えます
+import { FakeClock } from "./clock.mjs";
+import { Edge, Origin } from "./edge.mjs";
+const YEAR = 365 * 24 * 3600;
+const cases = {
+  "404=1年   ": (s) => (s === 200 || s === 404 ? YEAR : 0),
+  "404=60秒  ": (s) => (s === 200 ? YEAR : s === 404 ? 60 : 0),
+  "404=保持なし": (s) => (s === 200 ? YEAR : 0),
+};
+console.log("存在しない画像 1 本へ、1 秒に 1 回、10 分間（600 回）");
+for (const [name, policy] of Object.entries(cases)) {
+  const clock = new FakeClock(); const edge = new Edge({ clock, origin: new Origin(), policy });
+  for (let i = 0; i < 600; i++) { edge.get("/img/ghost.jpg"); clock.advance(1); }
+  console.log(`  ${name} オリジンに届いた回数: ${String(edge.originHits).padStart(3)}`);
+}
+
+console.log("\nオリジンが 5 分間 503 を返したあと復旧（その間も 1 秒に 1 回の問い合わせ）");
+const five = {
+  "5xx=保持(誤)": (s) => (s === 200 ? YEAR : 3600),
+  "5xx=保持なし ": (s) => (s === 200 ? YEAR : s === 404 ? 60 : 0),
+};
+for (const [name, policy] of Object.entries(five)) {
+  const clock = new FakeClock(); const origin = new Origin(); origin.upload("/img/ok.jpg", 300_000);
+  const edge = new Edge({ clock, origin, policy });
+  origin.down = true;
+  for (let i = 0; i < 300; i++) { edge.get("/img/ok.jpg"); clock.advance(1); }
+  origin.down = false;
+  const later = [];
+  for (const wait of [1, 60, 600]) { clock.advance(wait); later.push(edge.get("/img/ok.jpg").status); }
+  console.log(`  ${name} 復旧後の status (+1秒/+61秒/+661秒): ${later.join(" / ")}`);
+}
+```
+
+```
+存在しない画像 1 本へ、1 秒に 1 回、10 分間（600 回）
+  404=1年    オリジンに届いた回数:   1
+  404=60秒   オリジンに届いた回数:  10
+  404=保持なし オリジンに届いた回数: 600
+
+オリジンが 5 分間 503 を返したあと復旧（その間も 1 秒に 1 回の問い合わせ）
+  5xx=保持(誤) 復旧後の status (+1秒/+61秒/+661秒): 503 / 503 / 503
+  5xx=保持なし  復旧後の status (+1秒/+61秒/+661秒): 200 / 200 / 200
+```
+
+保持なしにすると、同じ存在しない URL への問い合わせが 600 回、すべてオリジンに届きます。60秒なら10回で、保持なしに比べて約98%少なく済みます。1年は1回で済みますが、その代わりに、あとからファイルを足した画像が戻ってきません。
+
+下の段は、もっと大きな差です。5xx を保持してしまうと、オリジンが復旧したあとも 661 秒後まで 503 を返し続けました。短い障害が、保持の長さの分だけ延びます。5xx を「保持しない」と明示した理由は、ここにあります。保持の長さを迷う場合は、短いほうへ寄せる形を推奨します。
+
+私は、404 を短く、5xx を保持しない形に決めました。60秒という値は、模型から導いたものではなく、オリジンへの問い合わせが増えすぎず、アップロードの遅れも許せる長さとして選んだ、私の判断です。
+
+## 原因の切り分けは、問い合わせ二本で足ります
+
+保持の規則を直しても、すでにエッジが抱えている404は残ります。まず、いま抱えているのが「オリジンに無い」のか「エッジの記憶」なのかを分けます。クエリ付きの URL はキーが別になるので、エッジの記憶を通らずにオリジンの実際の姿が見えます。
+
+```js
+// probe.mjs — 「オリジンにまだ無い」のか「エッジが 404 を抱えている」のかを、2 本の問い合わせで分けます
+// 通常の URL と、クエリ付きの URL（キーが別になる）を並べて見ます。
+export function diagnose(edge, path, nonce) {
+  const plain = edge.get(path);
+  const fresh = edge.get(`${path}?probe=${nonce}`);
+  let verdict;
+  if (plain.status === 200 && fresh.status === 200) verdict = "ok";
+  else if (plain.status === 404 && fresh.status === 404) verdict = "origin-missing";   // 本当に無い。アップロードを疑う
+  else if (plain.status === 404 && fresh.status === 200) verdict = "edge-holding-404"; // オリジンにはある。エッジが抱えている
+  else verdict = `other(${plain.status}/${fresh.status})`;
+  return { path, plain: plain.status, fresh: fresh.status, plainCache: plain.cache, verdict };
+}
+```
+
+新しく足した画像の一覧を順に診断し、エッジが抱えているものだけを1本ずつ消す走査を作りました。あわせて、アップロードだけで終えた場合と、消去まで一組にした場合を並べています。
+
+```js
+// sweep.mjs — 新しく足した画像を順に診断し、エッジが 404 を抱えているものだけを消します
+// あわせて「アップロードしたら、同じ手順でそのパスを消す」一組にしておく理由を確かめます
+import { FakeClock } from "./clock.mjs";
+import { Edge, Origin } from "./edge.mjs";
+import { before } from "./policies.mjs";
+import { diagnose } from "./probe.mjs";
+
+const clock = new FakeClock(); const origin = new Origin();
+const edge = new Edge({ clock, origin, policy: before });          // 変更前の規則で起きた状態を作る
+const added = ["/img/w_0410.jpg", "/img/w_0411.jpg", "/img/w_0412.jpg", "/img/w_0413.jpg"];
+
+edge.get("/img/w_0412.jpg"); edge.get("/img/w_0413.jpg");          // 一覧の更新が先に届き、2 本は先に取りにいかれた
+clock.advance(40);
+for (const p of added.slice(0, 3)) origin.upload(p, 400_000);      // w_0413 だけアップロードが遅れている
+let n = 0;
+const report = added.map((p) => diagnose(edge, p, ++n));
+for (const r of report) console.log(`${r.path.padEnd(18)} plain=${r.plain}(${r.plainCache}) fresh=${r.fresh} → ${r.verdict}`);
+
+for (const r of report) if (r.verdict === "edge-holding-404") edge.purge(r.path);   // 抱えているものだけ、1 本ずつ
+console.log("\n消したあと（w_0413 はまだオリジンに無いので触っていません）");
+for (const p of added.slice(0, 3)) console.log(`${p.padEnd(18)} → ${edge.get(p).status}`);
+
+// w_0413 が遅れて届く。アップロードだけで終えた場合と、消すところまで一組にした場合
+clock.advance(600);
+const uploadOnly = (p) => origin.upload(p, 400_000);
+const uploadAndPurge = (p) => { origin.upload(p, 400_000); edge.purge(p); };
+uploadOnly("/img/w_0413.jpg");
+console.log(`\nw_0413 をアップロードだけで終えた場合 → ${edge.get("/img/w_0413.jpg").status}（${edge.get("/img/w_0413.jpg").cache}）`);
+origin.files.delete("/img/w_0413.jpg"); edge.purge("/img/w_0413.jpg"); edge.get("/img/w_0413.jpg"); // 同じ状況を作り直す
+uploadAndPurge("/img/w_0413.jpg");
+console.log(`w_0413 をアップロードと消去の一組にした場合 → ${edge.get("/img/w_0413.jpg").status}`);
+```
+
+```
+/img/w_0410.jpg    plain=200(MISS) fresh=200 → ok
+/img/w_0411.jpg    plain=200(MISS) fresh=200 → ok
+/img/w_0412.jpg    plain=404(HIT) fresh=200 → edge-holding-404
+/img/w_0413.jpg    plain=404(HIT) fresh=404 → origin-missing
+
+消したあと（w_0413 はまだオリジンに無いので触っていません）
+/img/w_0410.jpg    → 200
+/img/w_0411.jpg    → 200
+/img/w_0412.jpg    → 200
+
+w_0413 をアップロードだけで終えた場合 → 404（HIT）
+w_0413 をアップロードと消去の一組にした場合 → 200
+```
+
+見落としやすいのは、最後の二行です。`w_0413` は診断の時点で「オリジンに無い」と出たので、消さずに残しました。ところが、そのパスのエッジは404を抱えたままなので、あとでアップロードしても、そのままでは戻ってきません。「あとから足すものにも、同じ穴が空いている」という点が、診断の出力だけでは見えにくいところです。
+
+だから、消去はアップロードの後始末ではなく、アップロードの一部として扱いました。ファイルを置いたら、同じ手順の中で、そのパスを消します。
+
+## 規則を変える前に、現在の設定を保存します
+
+保持の規則を変えるのは、配信全体に効く変更です。戻せない変更にしないために、変更前の設定を保存し、戻す値を表にしてから触りました。
+
+```js
+// plan.mjs — 保持規則を変える前に、現在の設定を保存し、差分と戻し方を表にします（設定そのものは触りません）
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
+
+const current = { 200: "1y", 404: "1y", "5xx": "unset" };  // 現在値は管理画面で読み取って手で写す（ここは例の値）
+const target  = { 200: "1y", 404: "60s", "5xx": "none" };
+
+if (!existsSync("rules.before.json")) writeFileSync("rules.before.json", JSON.stringify(current, null, 2));
+const saved = JSON.parse(readFileSync("rules.before.json", "utf8"));   // 戻すときはこのファイルが正本
+
+for (const k of Object.keys(target)) {
+  const from = saved[k], to = target[k];
+  console.log(`${String(k).padEnd(4)} ${from.padEnd(5)} → ${to.padEnd(5)} ${from === to ? "(変更なし)" : `戻す値: ${from}`}`);
+}
+```
+
+```
+200  1y    → 1y    (変更なし)
+404  1y    → 60s   戻す値: 1y
+5xx  unset → none  戻す値: unset
+```
+
+`existsSync` で上書きを避けているのは、二度目に走らせたとき、変更後の値を「変更前」として保存し直してしまう事故を防ぐためです。実際の値は、管理画面で読み取って写してください。この表は、私の設定ではなく、書き方の例です。
+
+## Expo のアプリにつなぐとき
+
+アプリの側でできる備えは、二つあります。
+
+```ts
+// アプリ側：一覧が「準備できた」と言うまで、画像を先読みしない
+// （一覧に ready を持たせ、サーバーはアップロードと消去が終わってから ready を立てる）
+type CatalogItem = { id: string; path: string; ready: boolean };
+
+export function visibleItems(items: CatalogItem[]): CatalogItem[] {
+  return items.filter((i) => i.ready);   // ready でないものは、一覧にも先読みにも出さない
+}
+```
+
+サーバー側の順序は、アップロード、消去、一覧の更新です。この順にすれば、端末が一覧を受け取った時点で、画像はすでに取れる状態になっています。順序を守る仕組みを足せない場合でも、保持の規則を直しておけば、失敗した取りにいきの記憶は60秒で消えます。
+
+## 落とし穴：直したつもりで残りやすい三か所
+
+本番運用に出してから気づくと、対処が後手に回りやすい箇所です。あとから足す画像に空く穴は、アップロードと消去を一組にすることで回避できます。
+
+- **クエリ付きの URL で確かめて、安心しないこと。** クエリを付けるとキーが別になるので、診断には向きますが、通常の URL が直った証拠にはなりません。直ったかどうかは、通常の URL を、遠い地域の端末や別の回線から開いて見ます。
+- **模型の秒数を、そのまま本番に写さないこと。** 模型は、保持の規則だけを写したものです。実際の配信網には、オリジンへの問い合わせをまとめる仕組みなど、別の動きがあります。60秒という値は、模型からでなく、自分の配信での問い合わせの量から決めてください。
+- **画像以外の応答にも、同じ規則が及ぶこと。** 規則を応答の種類（パスや拡張子）で絞らずに入れると、画像以外にも効きます。変更後は、画像以外の代表的な URL も、いくつか開いて確かめます。
+
+## 今日できる最初の一歩
+
+新しく足した画像の URL を一本選んで、応答のヘッダを見てください。
+
+```bash
+curl -sI "https://example.com/img/new_wall.jpg" | grep -iE "^(HTTP|age|cache|x-cache|cf-cache)"
+```
+
+`example.com` は自分のドメインに読み替えます。ヘッダの名前は配信網によって違うので、`age` のように保持の経過秒数が出るものを探します。次に、存在しないパスを一本開いて、404 に保持の印や経過秒数が付いているかを見ます。付いていれば、あなたの配信でも、404 が覚えられている可能性があります。
+
+画像の置き場所を動かす話は [サムネイルの移設は、配信中の版が旧パスを要求し続ける前提で組みました](/articles/app-dev/remote-thumbnail-path-migration-shipped-version-fallback) に、同じ配信の中で URL を変えずに解像度を振り分ける話は [壁紙の解像度の振り分けを 301 にするか、内部リライトにするか](/articles/app-dev/image-resolution-routing-301-or-internal-rewrite-same-host-decision) にまとめています。画像をバンドルから切り離す判断は [壁紙アプリのバイナリサイズを抑える](/articles/app-dev/wallpaper-app-binary-size-remote-asset-delivery) でも扱っています。
+
+最後に一つだけ。404 を短くするのは、安全のためというより、「まだ無い」と「ずっと無い」を、配信網に区別させるための設定だと、私は受け取っています。区別を持たせたあとは、足した画像をアップロードの直後に消すところまでを、一組で終える習慣が支えになります。
