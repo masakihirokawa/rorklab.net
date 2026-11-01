@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "../generated/shiki-tokens.css";
 
 export const metadata: Metadata = {
   title: {
@@ -53,6 +54,8 @@ export const metadata: Metadata = {
   applicationName: "Rork Lab",
   // capable: false を明示（省略すると Next が mobile-web-app-capable=yes を出し、ホーム画面から開くと戻るボタンの無い全画面になる）
   appleWebApp: { title: "Rork Lab", capable: false },
+  // コード中の数字列（バージョン・ポート・ID）を iOS が電話番号リンクにしないように（2026-11-01・Neo Vidro から持ち帰り）
+  formatDetection: { telephone: false, email: false, address: false },
   robots: {
     index: true,
     follow: true,

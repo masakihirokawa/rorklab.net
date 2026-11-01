@@ -4,7 +4,9 @@ import { useState, useEffect } from "react";
 import { useTranslations, useLocale } from "next-intl";
 import { ThemeToggle } from "./ThemeToggle";
 import { LocaleSwitcher } from "./LocaleSwitcher";
-import { SearchModal } from "@/components/ui/SearchModal";
+import dynamic from "next/dynamic";
+// 2026-11-01 軽量化: 検索モーダルは初めて開いたときに読み込む（全ページの初回 JS から外す）
+const SearchModal = dynamic(() => import("@/components/ui/SearchModal").then((m) => m.SearchModal), { ssr: false });
 import { Icon } from "@/components/ui/Icons";
 import { localePrefix } from "@/lib/locale";
 
@@ -35,7 +37,9 @@ export function Header() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  useEffect(() => { if (searchOpen) setSearchMounted(true); }, [searchOpen]);
   const [searchData, setSearchData] = useState<SearchItem[]>([]);
+  const [searchMounted, setSearchMounted] = useState(false);
   const [levelOpen, setLevelOpen] = useState(false);
 
   useEffect(() => {
@@ -454,7 +458,7 @@ export function Header() {
       )}
 
       {/* Search Modal */}
-      <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} articles={searchData} />
+      {searchMounted && <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} articles={searchData} />}
     </>
   );
 }

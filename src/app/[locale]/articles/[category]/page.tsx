@@ -107,9 +107,34 @@ export default async function CategoryPage({ params, searchParams }: Props) {
   const cat = CATEGORIES.find((c) => c.id === category);
   const catName = CATEGORY_NAMES[category]?.[locale] || category;
   const catDesc = CATEGORY_DESC[category]?.[locale] || "";
+  // カテゴリ一覧の構造化データ（2026-11-01）: CollectionPage＋パンくず。2 ページ目以降（noindex）には出さない
+  const siteBase = locale === "ja" ? "https://rorklab.net" : "https://rorklab.net/en";
+  const catLd = currentPage === 1 ? [
+    {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      name: catName,
+      description: catDesc,
+      url: `${siteBase}/articles/${category}`,
+      inLanguage: locale === "ja" ? "ja" : "en",
+      isPartOf: { "@type": "WebSite", name: "Rork Lab", url: "https://rorklab.net" },
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Home", item: siteBase },
+        { "@type": "ListItem", position: 2, name: locale === "ja" ? "記事一覧" : "Articles", item: `${siteBase}/articles` },
+        { "@type": "ListItem", position: 3, name: catName, item: `${siteBase}/articles/${category}` },
+      ],
+    },
+  ] : [];
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 24px 120px" }}>
+      {catLd.map((ld, i) => (
+        <script key={i} type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ld) }} />
+      ))}
       {/* Header */}
       <div style={{ marginBottom: 48 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>

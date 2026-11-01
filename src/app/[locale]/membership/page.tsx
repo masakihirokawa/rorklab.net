@@ -1,4 +1,6 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import { ArticlePagination } from "@/components/ui/ArticlePagination";
 import { getArticles, CATEGORIES } from "@/lib/content";
 import { LevelBadge } from "@/components/ui/LevelBadge";
 import { MembershipPlans } from "@/components/ui/MembershipPlans";
@@ -8,7 +10,12 @@ import { siteOgImage } from "@/lib/og";
 
 interface Props {
   params: Promise<{ locale: string }>;
+  searchParams: Promise<{ page?: string }>;
 }
+
+// 2026-11-01 軽量化: プレミアム記事の一覧は 1 ページ 30 本（全件 400 本前後を 1 ページに並べて HTML 1.0〜1.2MB あった）。
+// 本数の表示（premiumCount）は全件のまま。2 ページ目以降は /articles と同じく自己 canonical＋noindex,follow。
+const MEMBERSHIP_PER_PAGE = 30;
 
 const META = {
   ja: {
@@ -23,7 +30,18 @@ const META = {
   },
 };
 
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
+export async function generateMetadata(props: Props): Promise<Metadata> {
+  const md = await baseMembershipMetadata(props);
+  const sp = (await props.searchParams) || {};
+  const page = Math.max(1, parseInt(sp.page || "1", 10) || 1);
+  if (page > 1) {
+    const canon = typeof md.alternates?.canonical === "string" ? md.alternates.canonical : "";
+    return { ...md, alternates: { canonical: `${canon}?page=${page}` }, robots: { index: false, follow: true } };
+  }
+  return md;
+}
+
+async function baseMembershipMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const m = META[locale as keyof typeof META] || META.en;
   return {
@@ -107,8 +125,10 @@ const PAGE_TEXT = {
   },
 };
 
-export default async function MembershipPage({ params }: Props) {
+export default async function MembershipPage({ params, searchParams }: Props) {
   const { locale } = await params;
+  const sp = (await searchParams) || {};
+  const currentPage = Math.max(1, parseInt(sp.page || "1", 10) || 1);
   const t = PAGE_TEXT[locale as keyof typeof PAGE_TEXT] || PAGE_TEXT.en;
   const prefix = locale === "ja" ? "" : `/${locale}`;
 
@@ -116,6 +136,9 @@ export default async function MembershipPage({ params }: Props) {
 
   const allArticles = getArticles(locale);
   const premiumArticles = allArticles.filter((a) => a.premium);
+  const totalPages = Math.max(1, Math.ceil(premiumArticles.length / MEMBERSHIP_PER_PAGE));
+  if (currentPage > totalPages) notFound();
+  const pagedPremium = premiumArticles.slice((currentPage - 1) * MEMBERSHIP_PER_PAGE, currentPage * MEMBERSHIP_PER_PAGE);
 
   const catColor = (id: string) =>
     CATEGORIES.find((c) => c.id === id)?.color || "var(--text-muted)";
@@ -203,7 +226,7 @@ export default async function MembershipPage({ params }: Props) {
           <p style={{ color: "var(--text-dim)", fontSize: 15 }}>{t.noArticles}</p>
         ) : (
           <div>
-            {premiumArticles.map((article) => (
+            {pagedPremium.map((article) => (
               // 行の見た目は globals.css の .ar 系クラス（2026-10-17: 800 行超のインライン style が HTML と RSC で二重になり 1.7〜2.0MB あった）。
               // border-bottom だけはインラインに残す（行のホバー・出現の演出が [style*="border-bottom"] で行を見分けている）
               <a
@@ -229,6 +252,14 @@ export default async function MembershipPage({ params }: Props) {
               </a>
             ))}
           </div>
+        )}
+        {totalPages > 1 && (
+          <ArticlePagination
+            currentPage={currentPage}
+            totalPages={totalPages}
+            basePath={`${prefix}/membership`}
+            locale={locale}
+          />
         )}
       </section>
     </div>

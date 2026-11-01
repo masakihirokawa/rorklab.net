@@ -81,8 +81,26 @@ export default async function AboutPage({ params }: Props) {
   const { locale } = await params;
   const isJa = locale === "ja";
 
+  // 著者の実在性（E-E-A-T）: 記事の Article.author と同じ @id の Person をここで定義する（2026-11-01）
+  const profileLd = {
+    "@context": "https://schema.org",
+    "@type": "ProfilePage",
+    url: isJa ? "https://rorklab.net/about" : "https://rorklab.net/en/about",
+    inLanguage: isJa ? "ja" : "en",
+    mainEntity: {
+      "@type": "Person",
+      "@id": "https://rorklab.net/about#person",
+      name: "Masaki Hirokawa",
+      alternateName: "廣川政樹",
+      url: "https://dolice.net",
+      jobTitle: isJa ? "現代美術家・デジタルクリエイター・アプリデベロッパー" : "Contemporary artist, digital creator, and app developer",
+      sameAs: [...SOCIAL_LINKS.map((l) => l.href), "https://dolice.net", "https://dolice.design"],
+    },
+  };
+
   return (
     <div style={{ maxWidth: 720, margin: "0 auto", padding: "40px 24px 120px" }}>
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(profileLd) }} />
       {/* Badge */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
         <div style={{ width: 20, height: 1, background: "color-mix(in srgb, var(--accent-coral) 40%, transparent)" }} />

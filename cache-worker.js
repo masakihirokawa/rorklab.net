@@ -44,6 +44,19 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // ── 重複ホストの封鎖（2026-11-01）────────────────────────
+    // *.workers.dev（プレビュー URL を含む）が本番と同じ内容を 200 で返していた。ページは本番ドメインへ 301、
+    // /api/（Stripe webhook 等）は動かしたまま X-Robots-Tag: noindex だけ付ける。
+    if (url.hostname.endsWith(".workers.dev")) {
+      if ((request.method === "GET" || request.method === "HEAD") && !url.pathname.startsWith("/api/")) {
+        return Response.redirect(`https://rorklab.net${url.pathname}${url.search}`, 301);
+      }
+      const r = await nextHandler.fetch(request, env, ctx);
+      const h = new Headers(r.headers);
+      h.set("X-Robots-Tag", "noindex");
+      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+    }
+
     // ── Manual cache purge ────────────────────────────────────
     if (url.pathname === "/api/purge-cache") {
       const cache = caches.default;
