@@ -6,16 +6,16 @@ const NEWS_ITEMS: Record<string, string[]> = {
 ja: [
     "GPT-6.1 SOL — Rork のモデルメニューに追加（09-29）。Low／Medium／High を選べ、Pro・Max に含まれます",
     "SONNET 5.5 — UI づくりが得意で、Sonnet 5 より出力が速いモデルが選べます（09-28）",
-    "SONNET 4.5 — Claude API での提供終了は 11/30、残り28日。API 連携を足したアプリは移行先の確認を",
-    "SDK 58 ISSUE — Android ウィジェットが定期更新されない、Stripe が静的リンクになるなど初期報告が出ています",
+    "SONNET 4.5 — Claude API での提供終了は 11/30、残り27日。API 連携を足したアプリは移行先の確認を",
+    "SDK 58 — React Native 0.88 に更新されました。Android のリリース版で R8 が既定オンになり、iOS は SceneDelegate を生成します",
     "OBSERVE — EAS Observe がネイティブクラッシュも記録します（SDK 57.0.21 以降・10/07）",
     "NEW — 起動広告が、背面から戻った回にしか出ていませんでした。「前面に戻った」合図が、…",
   ],
   en: [
     "GPT-6.1 SOL — Added to Rork's model menu (09-29) with Low, Medium and High effort; included on Pro and Max",
     "SONNET 5.5 — Claude Sonnet 5.5 is selectable: strong at UI design and faster than Sonnet 5 (09-28)",
-    "SONNET 4.5 — Retires on the Claude API on 11/30, 28 days left. If your app calls it, check the migration target",
-    "SDK 58 ISSUE — Early reports include Android widgets not refreshing on a schedule and Stripe linking statically",
+    "SONNET 4.5 — Retires on the Claude API on 11/30, 27 days left. If your app calls it, check the migration target",
+    "SDK 58 — Moves to React Native 0.88. R8 is now on by default in Android release builds, and iOS prebuild generates a SceneDelegate",
     "OBSERVE — EAS Observe now records native crashes too (SDK 57.0.21 or later, 10/07)",
     "NEW — My App Open Ad Only Showed When the App…"
   ]
