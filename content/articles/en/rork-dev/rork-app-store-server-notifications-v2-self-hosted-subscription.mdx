@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-25T20:30"
-updated: "2026-10-18T20:30"
+updated: "2026-11-03T19:30"
 author: "Rork Lab"
 description: "A complete implementation guide for receiving App Store Server Notifications V2 in Cloudflare Workers without RevenueCat — covering JWS verification, idempotent state updates, user binding, and production testing for Rork apps."
 tags: ["StoreKit 2", "App Store Server API", "Cloudflare Workers", "Subscriptions", "JWS"]
@@ -41,7 +41,7 @@ Before any code, let's pin down the data flow:
 4. From the verified payload we extract `originalTransactionId` and `notificationType`, then write idempotently to Cloudflare KV
 5. On app launch, the client asks the server for its current entitlement instead of relying purely on local state
 
-The key idea is that the source of truth lives along the Apple → Workers → KV path. Trusting `Transaction.currentEntitlements` on the client alone leaves you exposed to clock manipulation and receipt tampering, and — just as importantly — your server has no idea who currently has an active subscription, which kills any downstream operation like targeted email or churn-prediction work.
+The key idea is that the source of truth lives along the Apple → Workers → KV path. Trusting `Transaction.currentEntitlements` on the client alone means your server has no idea who currently has an active subscription, which kills any downstream operation like targeted email, web-side membership, or churn-prediction work. On-device checks are convenient; they just make a poor source of truth across devices and the web.
 
 There's also a more subtle benefit to this layout. Because the client's role shrinks to "trigger the purchase, then ask the server what's true," you stop accumulating fragile state on devices. Lost devices, restored backups, switched Apple IDs — all of these become server-side reconciliation problems instead of client-side bugs. That alignment with the server is, to me, the single biggest reason this architecture pays off in the long run. It also turns out to be how you sleep well at night: when something does go wrong, you can answer it from inside your own code, with logs you wrote and data you control, instead of refreshing someone else's status page and hoping their team is awake.
 
@@ -52,15 +52,14 @@ Assuming your subscription products are already configured, here's what you need
 - In App Store Connect, open **App Information → App Store Server Notifications**
 - Set both **Production Server URL** and **Sandbox Server URL** to your Cloudflare Workers endpoint (for example, `https://api.example.com/apple/notifications`)
 - Set **Notifications Version** to **Version 2**
-- Set the **Subscription Status URL** to the same endpoint
 
-You'll also want an **App Store Connect API key** so you can call App Store Server API endpoints from your server. Generate one under **Users and Access → Keys**, and store the Issuer ID, Key ID, and the p8 private key as Cloudflare Workers secrets. Even though we won't use the API for the basic notification path, having it ready means you can later add features like fetching the current subscription status on-demand, refunding a charge programmatically, or mass-extending grace periods during an outage — all without revisiting the Apple Developer console.
+You'll also want a key for calling App Store Server API endpoints from your server — and this is where I lost half a day. I first generated a regular App Store Connect API key and could not work out why authentication kept failing. The Server API uses an **In-App Purchase key**, created under **Users and Access → Integrations → In-App Purchase**. Store its Issuer ID, Key ID, and the p8 private key as Cloudflare Workers secrets (the p8 can only be downloaded once, right after you generate it). Even though we won't use the API for the basic notification path, having it ready means you can later add features like fetching the current subscription status on-demand, refunding a charge programmatically, or mass-extending grace periods during an outage — all without revisiting the Apple Developer console.
 
-There's one trap here that has burned more than a few indie developers: Sandbox notifications go to a **different URL** than Production. Make sure both are filled in. If only one is set, you'll see the maddening pattern of TestFlight working perfectly while production silently drops notifications (or vice versa), and tracking it down is no fun. I've also seen developers accidentally point production at their dev Worker. Use distinct subdomains for dev vs. prod and you'll avoid the worst of these mix-ups.
+There's one trap here that has burned more than a few indie developers: Sandbox notifications go to a **different URL** than Production. Make sure both are filled in. If only one is set, you'll see the maddening pattern of TestFlight working perfectly while production silently drops notifications (or vice versa), and tracking it down is no fun. One more detail from Apple's documentation: retries exist only in production. In Sandbox, Apple sends a notification exactly once, so a notification your Worker drops there is not coming back — plan your checks around that. I've also seen developers accidentally point production at their dev Worker. Use distinct subdomains for dev vs. prod and you'll avoid the worst of these mix-ups.
 
 ## Client Side: Calling StoreKit 2 from Rork / Expo
 
-Here's the minimum client code that triggers a purchase from a Rork-generated Expo project, using `react-native-iap`. The deliberate design choice is that the React Native side is purely a trigger — the source of truth comes back through ASSN V2, not from the client.
+Here's the minimum client code that triggers a purchase from a Rork-generated Expo project, using `react-native-iap`. The deliberate design choice is that the React Native side is purely a trigger — the source of truth comes back through ASSN V2, not from the client. Note that `react-native-iap` renames some APIs between major versions — this code assumes a version that still exposes `requestSubscription` and `getSubscriptions`. If you have a newer release installed, check its migration guide for how `appAccountToken` is passed before copying anything.
 
 ```ts
 // hooks/useSubscriptionPurchase.ts
@@ -124,10 +123,6 @@ Here's a minimal verification function that runs on Cloudflare Workers (the only
 // src/notifications/verify.ts
 import { decodeProtectedHeader, importX509, jwtVerify } from "jose";
 import { verifyCertChain } from "./chain";
-
-const APPLE_ROOT_CA_G3 = `-----BEGIN CERTIFICATE-----
-MIIBgDCCASagAwIBAgIQ.... (paste Apple Root CA - G3 here)
------END CERTIFICATE-----`;
 
 export async function verifyAppleJws(signedPayload: string): Promise<{
   notificationType: string;
@@ -234,6 +229,9 @@ export async function handleAppleNotification(
     return { ok: true, reason: "ALREADY_PROCESSED" };
   }
 
+  // 1b. Out-of-order guard: signedDate is a top-level millisecond field on the payload
+  const signedDate = (verified as unknown as { signedDate?: number }).signedDate ?? 0;
+
   // 2. Update subscription state from the inner transaction info
   const txInfo = verified.data.signedTransactionInfo;
   if (txInfo) {
@@ -244,10 +242,19 @@ export async function handleAppleNotification(
       expiresDate: number;
       appAccountToken?: string;
     };
-    const userKey = `user:${txData.appAccountToken ?? "unknown"}`;
+    // Purchases without an appAccountToken (older app builds, restores) must not
+    // all collapse onto one shared key — fall back to originalTransactionId
+    const userKey = txData.appAccountToken
+      ? `user:${txData.appAccountToken}`
+      : `orig:${txData.originalTransactionId}`;
+    const prev = JSON.parse((await env.SUBS_KV.get(userKey)) ?? "null") as { signedDate?: number } | null;
+    if (prev?.signedDate && prev.signedDate > signedDate) {
+      return { ok: true, reason: "STALE_NOTIFICATION" };
+    }
     await env.SUBS_KV.put(
       userKey,
       JSON.stringify({
+        signedDate,
         productId: txData.productId,
         expiresAt: txData.expiresDate,
         originalTransactionId: txData.originalTransactionId,
@@ -257,7 +264,7 @@ export async function handleAppleNotification(
     );
   }
 
-  // 3. Mark the notification as processed (24h TTL is enough)
+  // 3. Mark the notification as processed (kept for seven days, see below)
   await env.SUBS_KV.put(dedupeKey, "1", { expirationTtl: 60 * 60 * 24 * 7 });
   return { ok: true };
 }
@@ -286,13 +293,15 @@ A solid test loop looks like this:
 - Wait one cycle — in Sandbox, 5 minutes equals one month — and confirm `DID_RENEW` arrives
 - Cancel through TestFlight and confirm `EXPIRED` is handled correctly
 
+You can also check the endpoint before making a single purchase. App Store Server API's **Request a Test Notification** makes Apple send a `TEST` notification to your Server URL, which isolates "is the signature-verification path alive?" from "is my purchase flow right?". **Get Notification History** then tells you whether Apple sent it and what your server answered — the quickest way to separate "sent but not received" from "never sent".
+
 That single loop covers purchase, renewal, and cancellation — the full subscription lifecycle — before you go to production.
 
 A practical note on Sandbox renewals: out of the box, Apple renews a subscription up to six times in a 24-hour Sandbox session before treating it as canceled. That's enough to exercise `DID_RENEW` and the eventual `EXPIRED`, but not enough to simulate the long tail of a yearly subscription. If you need to verify behavior across longer cycles, lean on App Store Server API's `Get All Subscription Statuses` endpoint and feed synthetic timestamps into your handler in unit tests instead of trying to coax Sandbox into doing it for you.
 
 ## Defense in Depth: Adding App Store Server API as a Fallback
 
-ASSN V2 is the primary channel, but it shouldn't be the only one. Notifications can be delayed by minutes during Apple's busy hours, and on rare occasions they don't arrive at all (typically due to misconfigured URLs or a brief outage on either side). A small App Store Server API fallback path closes the gap.
+ASSN V2 is the primary channel, but it shouldn't be the only one. Notifications can be delayed by minutes during Apple's busy hours, and on rare occasions they don't arrive at all (typically due to misconfigured URLs or a brief outage on either side). Apple's own documentation points the same way: after an outage, you can recover missed transactions with Get Transaction History and Get All Subscription Statuses, and missed V2 notifications with Get Notification History. A small App Store Server API fallback path closes the gap.
 
 The pattern I rely on is this: when a client opens the app and asks the server for its entitlement, if the server's KV record is missing or stale (older than, say, two hours after the expected renewal time), the server calls App Store Server API's `Get All Subscription Statuses` for that `originalTransactionId` and reconciles. The cost is a single signed JWT request to Apple, and the benefit is that you stop seeing edge-case "I paid but the app says I'm not subscribed" support tickets.
 
@@ -362,7 +371,7 @@ Things I or fellow indie developers have gotten wrong, in roughly the order of h
 - **Forgetting `notificationUUID` deduping**: Everything looks fine until the day a network retry doubles a renewal or processes `EXPIRED` twice. By then the KV state is wrong and you have to reconcile manually.
 - **Missing the Sandbox URL in App Store Connect**: Easy to forget, painful to debug — TestFlight works but production drops everything (or the reverse). Always fill in both.
 - **Not setting `appAccountToken`**: This is the one I personally got wrong, and it cost me three months of unrecoverable user-to-Apple mapping. There is no retroactive fix. Set it on every purchase from day one.
-- **Treating `Transaction.currentEntitlements` as truth**: Clock manipulation and receipt tampering can fool the client. Treat the server's KV record as the source of truth, and have the client merely render what the server reports.
+- **Treating `Transaction.currentEntitlements` as truth**: A device-only check can't tell you what the web or your other devices should show. Treat the server's KV record as the source of truth, and have the client merely render what the server reports.
 
 For broader server-side hardening, the [Rork × App Attest / Play Integrity Server-Side Validation Guide](/articles/rork-dev/rork-app-attest-play-integrity-server-validation-guide) is a useful complement. If you want to firm up StoreKit 2 fundamentals first, the [Rork Max StoreKit 2 In-App Purchase Guide](/articles/rork-dev/rork-max-storekit-2-in-app-purchase) is a good starting point.
 
