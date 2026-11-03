@@ -3,13 +3,16 @@ import ogArticles from "@/generated/og-articles.json";
 /**
  * OGP 画像（1200×630）。日英で別の画像を返す。
  * 旧 /og/default.png（1200×1200 正方形）は横長カードで下部の文字が切れるため 2026-10-23 に置き換え。
- * 画像は public/og/site-ja.png・site-en.png（生成元: Dolice Labs/_material/og/gen_site_og.py）。
+ * 画像は public/og/site-ja.png・site-en.png（2026-11-03 v3: dolice.net の Labs カードと同じ意匠・
+ * 生成元 Dolice Labs/_material/og/gen_site_og_v3.py）。画像を差し替えたら SITE_OG_VER を上げる（SNS のキャッシュ更新）。
  */
 export const OG_WIDTH = 1200;
 export const OG_HEIGHT = 630;
 
+export const SITE_OG_VER = "3";
+
 export function siteOgImage(locale: string): string {
-  return `https://rorklab.net/og/site-${locale === "ja" ? "ja" : "en"}.png`;
+  return `https://rorklab.net/og/site-${locale === "ja" ? "ja" : "en"}.png?v=${SITE_OG_VER}`;
 }
 
 /**

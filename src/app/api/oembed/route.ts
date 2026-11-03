@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 const SITE_NAME = "Rork Lab";
 const SITE_URL = "https://rorklab.net";
-const OG_IMAGE = `${SITE_URL}/og/site-ja.png`;
+const OG_IMAGE = `${SITE_URL}/og/site-ja.png?v=3`;
 
 export async function GET(request: NextRequest) {
   const url = request.nextUrl.searchParams.get("url");
