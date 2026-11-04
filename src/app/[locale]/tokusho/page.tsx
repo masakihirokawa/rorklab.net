@@ -22,7 +22,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale } = await params;
   const m = META[locale as keyof typeof META] || META.en;
   return {
-    title: m.title,
+    // レイアウトの title.template が「| サイト名」を付けるので、ここでは外す（OG は template 非適用のため m.title のまま）
+    title: m.title.replace(/ — [^—]+$/, ""),
     description: m.description,
     openGraph: {
       title: m.title,
