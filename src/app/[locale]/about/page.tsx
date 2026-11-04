@@ -5,14 +5,15 @@ interface Props {
   params: Promise<{ locale: string }>;
 }
 
+// 事実の正本: dolice.net とアーティストプロファイル（Dolice/_documents/Artist Documents/ARTIST_PROFILE_JA/EN.md）。2026-11-04 に同期
 const META = {
   ja: {
     title: "運営者について — Rork Lab",
-    description: "Rork Lab 運営者・廣川政樹のプロフィール。現代美術家・デジタルクリエイター・アプリデベロッパー。国際芸術賞17冠。",
+    description: "Rork Lab 運営者・廣川政樹のプロフィール。現代美術家・デジタルクリエイター・アプリデベロッパー。国際芸術賞17冠、欧州・アジア・米州で展示。",
   },
   en: {
     title: "About — Rork Lab",
-    description: "About the founder of Rork Lab — Masaki Hirokawa. Contemporary artist, digital creator, and app developer. Recipient of 17 international art awards.",
+    description: "About the founder of Rork Lab — Masaki Hirokawa. Contemporary artist, digital creator, and app developer. Recipient of 17 international art awards, exhibited across Europe, Asia, and the Americas.",
   },
 };
 
@@ -45,7 +46,7 @@ const SOCIAL_LINKS = [
   { label: "Instagram", href: "https://www.instagram.com/dolice/" },
   { label: "Threads", href: "https://www.threads.net/@dolice" },
   { label: "X", href: "https://x.com/dolice" },
-  { label: "Facebook", href: "https://www.facebook.com/dolice.masakihirokawa" },
+  { label: "Facebook", href: "https://www.facebook.com/dolice.masakihirokawa/" },
   { label: "LinkedIn", href: "https://www.linkedin.com/in/dolice/" },
   { label: "TikTok", href: "https://www.tiktok.com/@masaki.hirokawa" },
   { label: "note", href: "https://note.com/dolice" },
@@ -74,6 +75,16 @@ const SOCIAL_CHIP: React.CSSProperties = {
   transition: "border-color 0.3s, color 0.3s",
 };
 
+const LEAD: React.CSSProperties = { color: "var(--text-muted)", fontSize: 13, marginBottom: 16 };
+
+function Ext({ href, children }: { href: string; children: React.ReactNode }) {
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>
+      {children}
+    </a>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /*  Page component                                                    */
 /* ------------------------------------------------------------------ */
@@ -94,7 +105,13 @@ export default async function AboutPage({ params }: Props) {
       alternateName: "廣川政樹",
       url: "https://dolice.net",
       jobTitle: isJa ? "現代美術家・デジタルクリエイター・アプリデベロッパー" : "Contemporary artist, digital creator, and app developer",
-      sameAs: [...SOCIAL_LINKS.map((l) => l.href), "https://dolice.net", "https://dolice.design"],
+      sameAs: [
+        ...SOCIAL_LINKS.map((l) => l.href),
+        "https://dolice.net",
+        "https://dolice.design",
+        "https://linktr.ee/masakihirokawa",
+        "https://designer.org/!315944",
+      ],
     },
   };
 
@@ -130,16 +147,16 @@ export default async function AboutPage({ params }: Props) {
         {/* ── Websites ── */}
         <h2 style={{ marginTop: 40 }}>{isJa ? "ウェブサイト" : "Websites"}</h2>
         <p>
-          <a href="https://dolice.net" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.net</a>
-          {isJa ? "（公式サイト）" : " (Official)"}
+          <Ext href={isJa ? "https://dolice.net" : "https://dolice.net/en/"}>dolice.net</Ext>
+          {isJa ? "（公式サイト）" : " (Official Website)"}
           <br />
-          <a href="https://dolice.design" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.design</a>
+          <Ext href="https://dolice.design">dolice.design</Ext>
           {isJa ? "（アート・ポートフォリオ）" : " (Art Portfolio)"}
           <br />
-          <a href="https://dolice.base.shop" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>dolice.base.shop</a>
-          {isJa ? "（ストア）" : " (Store)"}
+          <Ext href="https://dolice.base.shop">dolice.base.shop</Ext>
+          {isJa ? "（アートショップ）" : " (Art Shop)"}
           <br />
-          <a href="https://linktr.ee/masakihirokawa" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>linktr.ee/masakihirokawa</a>
+          <Ext href="https://linktr.ee/masakihirokawa">linktr.ee/masakihirokawa</Ext>
           {isJa ? "（全てのリンク）" : " (All Links)"}
         </p>
 
@@ -165,6 +182,140 @@ export default async function AboutPage({ params }: Props) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Shared data（受賞歴・リンクは日英で同じ順）                         */
+/* ------------------------------------------------------------------ */
+const AWARDS_JA = [
+  "2025–2026年 DAC – Design Classifications「世界14位（World’s 14th Best Designer）」選出（A’ Design Award 主催）",
+  "2026年 POPDES 世界ランキング #115 選出（A’ Design Award 主催）",
+  "2025年 Award of Achievement（ギリシャ・ハニア 人道文化領事館 主催）",
+  "2025年 The New Great Masters in New York（Fondazione Effetto Arte 主催）",
+  "2025年 W* Recognition（A’ Design Award 主催）",
+  "2021–2025年 Meritorious Service to the Arts Award（Luxembourg Art Prize 主催・5年連続受賞）",
+  "2024年 Phoenix for the Arts（Fondazione Effetto Arte 主催）",
+  "2024年 Global Art Virtuoso Award（Contemporary Art Collectors 主催）",
+  "2023年 Harmony for Humanity Art Prize（Contemporary Art Collectors 主催）",
+  "2023年 Career Art Award（Fondazione Effetto Arte 主催）",
+  "2023年 The Genius of Italy – ミケランジェロ国際芸術賞（Fondazione Effetto Arte 主催）",
+  "2023年 A’ Design Award Golden Award（写真・フォトマニピュレーション部門）",
+  "2022年 第12回 ITSLIQUID International Contest 栄誉賞",
+  "2022年 BEST COVER ARTIST AWARD（365 Art+ Business Magazine 主催）",
+  "2022年 A’ Design Award Iron Award（グラフィックデザイン部門）",
+  "2022年 第11回 ITSLIQUID International Contest 栄誉賞",
+  "2021年 ARTIST OF THE YEAR（ITSLIQUID Group 主催）",
+  "2006年 MTV SO-ZO Competition supported by AMD『Webスクリーンセーバー部門』優秀賞",
+];
+
+const AWARDS_EN = [
+  "2025–2026 – World’s 14th Best Designer (DAC – Design Classifications, organized by A’ Design Award)",
+  "2026 – POPDES World Ranking #115 (A’ Design Award)",
+  "2025 – Award of Achievement (The Consulate of Humanitarian & Culture in Chania, Greece)",
+  "2025 – The New Great Masters in New York (Fondazione Effetto Arte)",
+  "2025 – W* Recognition (A’ Design Award)",
+  "2021–2025 – Meritorious Service to the Arts Award (Luxembourg Art Prize, five consecutive years)",
+  "2024 – Phoenix for the Arts (Fondazione Effetto Arte)",
+  "2024 – Global Art Virtuoso Award (Contemporary Art Collectors)",
+  "2023 – Harmony for Humanity Art Prize (Contemporary Art Collectors)",
+  "2023 – Career Art Award (Fondazione Effetto Arte)",
+  "2023 – The Genius of Italy – Michelangelo International Art Prize (Fondazione Effetto Arte)",
+  "2023 – A’ Design Award Golden Award (Photography & Photo Manipulation)",
+  "2022 – ITSLIQUID International Contest – 12th Edition, Honorable Mention",
+  "2022 – BEST COVER ARTIST AWARD (365 Art+ 6 Stars AWARDS)",
+  "2022 – A’ Design Award Iron Award (Graphic Design)",
+  "2022 – ITSLIQUID International Contest – 11th Edition, Honorable Mention",
+  "2021 – ARTIST OF THE YEAR (ITSLIQUID Group)",
+  "2006 – Excellence Prize, Web Screensaver Category, MTV SO-ZO Competition supported by AMD",
+];
+
+const INTERVIEWS = [
+  { label: "Featured Artist", href: "https://www.itsliquid.com/featuredartist-masakihirokawa.html" },
+  { label: "Interview Ⅰ", href: "https://www.itsliquid.com/interview-masakihirokawa.html" },
+  { label: "Ⅱ", href: "https://www.itsliquid.com/interview-masakihirokawa01.html" },
+  { label: "Ⅲ", href: "https://www.itsliquid.com/interview-masakihirokawa-03.html" },
+  { label: "Ⅳ", href: "https://www.itsliquid.com/interview-masakihirokawa-04.html" },
+];
+
+const APPS = [
+  {
+    ja: "綺麗な壁紙 4K/HDR", en: "Beautiful 4K/HDR Wallpapers", page: "beautiful-wallpapers",
+    ios: "https://apps.apple.com/app/id706533906",
+    android: "https://play.google.com/store/apps/details?id=net.dolice.beautifulwallpapers",
+    noteJa: "人の目で選んだ10万枚以上の壁紙を4K・HDRで。2013年の公開から毎日更新",
+    noteEn: "Over 100,000 hand-picked wallpapers in 4K/HDR, updated daily since 2013",
+  },
+  {
+    ja: "浮世絵壁紙", en: "Ukiyo-e Wallpapers", page: "ukiyoe-wallpapers",
+    ios: "https://apps.apple.com/app/id835559799",
+    android: "https://play.google.com/store/apps/details?id=net.dolice.ukiyoe",
+    noteJa: "北斎・広重・歌麿・写楽ほか2,000点以上。古紙の皺や染みを AI に頼らず手作業で修復",
+    noteEn: "2,000+ masterpieces by Hokusai, Hiroshige, Utamaro, and Sharaku, restored by hand without AI",
+  },
+  {
+    ja: "引き寄せの法則", en: "Law of Attraction", page: "law-of-attraction",
+    ios: "https://apps.apple.com/app/id841157677", android: "",
+    noteJa: "望みを言葉にし、毎日それに立ち返るための願望実現サポートアプリ",
+    noteEn: "Put a wish into words and return to it every day",
+  },
+  {
+    ja: "リラックス・ヒーリング", en: "Relaxing Healing", page: "relaxing-healing",
+    ios: "https://apps.apple.com/app/id694492667", android: "",
+    noteJa: "ヒーリング音楽と環境音。タイマーとともに音が少しずつ遠ざかる睡眠・リラックスアプリ",
+    noteEn: "Healing music and ambient sounds that fade gently with a sleep timer",
+  },
+];
+
+function AppList({ isJa }: { isJa: boolean }) {
+  return (
+    <p>
+      {APPS.map((a, i) => (
+        <span key={a.page}>
+          {i > 0 && <br />}
+          <strong>{isJa ? a.ja : a.en}</strong>
+          {" — "}
+          <Ext href={a.ios}>iOS</Ext>
+          {a.android && (
+            <>
+              {" / "}
+              <Ext href={a.android}>Android</Ext>
+            </>
+          )}
+          {" / "}
+          <Ext href={`https://dolice.net/${isJa ? "" : "en/"}apps/${a.page}/`}>{isJa ? "詳細" : "Details"}</Ext>
+          <br />
+          <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{isJa ? a.noteJa : a.noteEn}</span>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+function Lines({ items }: { items: string[] }) {
+  return (
+    <p>
+      {items.map((t, i) => (
+        <span key={t}>
+          {i > 0 && <br />}
+          {t}
+        </span>
+      ))}
+    </p>
+  );
+}
+
+function InterviewLinks() {
+  return (
+    <>
+      ITSLIQUID Group:{" "}
+      {INTERVIEWS.map((v, i) => (
+        <span key={v.href}>
+          {i > 0 && "・"}
+          <Ext href={v.href}>{v.label}</Ext>
+        </span>
+      ))}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Japanese content                                                  */
 /* ------------------------------------------------------------------ */
 function JaContent() {
@@ -183,12 +334,25 @@ function JaContent() {
         </p>
       </div>
 
-      {/* Statement */}
+      {/* Statement（dolice.net「廣川政樹について」と同文） */}
       <p>
-        国際芸術賞17冠のグラフィック／現代美術家・アプリデベロッパー。欧州・アジア・米州での展示や、美術書・学術誌への掲載を通じて、日本特有の祈りを背景に、集団心理と認知世界の構造、根源意識を主題として制作しています。
+        国際芸術賞17冠のグラフィック／現代美術家・アプリデベロッパーとして、欧州・アジア・米州での展示や、美術書・国際誌への掲載を通じて、日本特有の祈りを背景に、集団心理と認知世界の構造、根源意識を主題として制作しています。
       </p>
       <p>
-        アートとテクノロジーの両領域を架橋し、デジタルと詩的感性の狭間に宿る表現を追求し続けています。その創作は、繊細な共感覚と静かな神秘性が共存する、静謐で超現実的な世界を立ち上げます。
+        自然のシンボリズム、哲学的考察、そして現代科学に着想を得たイメージを織り交ぜながら、聖なるものと世俗的なものとの隔たりをやわらげ、人間と自然界との間にある微細な絆を回復させることを試みています。制作の全体には、繊細な共感覚的感受性と、静かで神秘的なインスピレーションが共存しています。
+      </p>
+      <p>
+        1997年、独学のWebデザインから歩みを始め、基幹システム開発、グラフィック専門誌への執筆、ゲーム開発を経て、2013年に独立系アプリ事業を創業。2019年よりグラフィックアート制作を本格的に再開し、以来、アートとテクノロジーの両領域を架橋しながら、デジタルと詩的感性の狭間に宿る表現を追求しています。
+      </p>
+
+      {/* Fields */}
+      <h2>活動の領域</h2>
+      <p>
+        <strong>制作</strong> — 現代美術・グラフィックアート（フォトコラージュ／フォトレタッチ、デジタルメディア）。作品はすべて AI を使わず自身の手で制作しています。<br />
+        <strong>展示</strong> — 欧州・アジア・米州（ミラノ、マテーラ、ローマ、ヴェネツィア、マドリード、バルセロナ、パリ、ロンドン、ロサンゼルス、安山、東京ほか）<br />
+        <strong>アプリ</strong> — iPhone／Android アプリの個人開発13年。企画・開発からグローバル ASO・多言語展開まで一貫して担当。<br />
+        <strong>技術</strong> — C／Java／Python／Kotlin／Swift ほか。ネイティブアプリ、基幹システム、シェーダ・映像処理。<br />
+        <strong>受託</strong> — ランディングページ・WordPress・ウェブサイト制作、運用・保守、フォトレタッチ、ストアセット制作・グローバル ASO（<Ext href="https://dolice.net/#brand">Branding &amp; Craft</Ext>）
       </p>
 
       {/* Bio */}
@@ -197,10 +361,16 @@ function JaContent() {
         1997年に独学でWebデザインとプログラミングを学び始め、1999年に株式会社国和システムへDTPオペレーターとして入社。2002年には株式会社NTT DATAにてプログラマー／システムエンジニアとして基幹システム開発に従事し、2005年よりフリーランスとして独立しました。以降、Webデザイン、プログラミング、グラフィック制作、インタラクティブムービー制作など、幅広い領域で活動を展開しています。
       </p>
       <p>
+        2006年、MTV SO-ZO コンペティション（AMD 協賛）にてWebスクリーンセーバー部門優秀賞を受賞し、同年より国内外での展示を開始。2008年以降は、グラフィック専門誌やデザイン書籍への寄稿・執筆を多数手がけてきました。
+      </p>
+      <p>
         2011年にはテクニカルアーティストとしてゲーム開発に参加し、2013年には独立系スマートフォンアプリ事業を開始。現在に至るまで累計5,000万ダウンロードを超え、月間アクティブユーザー300万人超のユーザーに支えられながら、開発・グローバルマーケティング・運営を継続しています。
       </p>
       <p>
         2019年よりグラフィックアート制作を本格的に再開し、欧州・アジア・米州を中心に国際展への出展を活発化。作品は、人間の意識、美、崩壊の狭間にある象徴的世界を描き出し、夢と現実の境界を詩的にたどります。
+      </p>
+      <p>
+        2021年以降、A’ Design Award、Fondazione Effetto Arte、Contemporary Art Collectors、ITSLIQUID Group など、世界各国の芸術機関から受賞を重ねています。近年では、ギリシャの The Consulate of Humanitarian &amp; Culture による Award of Achievement や、Luxembourg Art Prize における Meritorious Service to the Arts Award などを受けています。
       </p>
 
       {/* Career */}
@@ -210,12 +380,12 @@ function JaContent() {
         累計5,000万DL、月間300万人超。開発、グローバルASO、経営統括を担当。
       </p>
       <p>
-        <strong>クリエイター</strong>（Web／UX、プログラミング、グラフィック）、2005年–現在<br />
-        UX／UI設計から実装まで一貫して担当。2008年以降、デザイン書籍への寄稿多数。
-      </p>
-      <p>
         <strong>テクニカルアーティスト</strong>（ゲーム開発）、2011年<br />
         制作統括。
+      </p>
+      <p>
+        <strong>クリエイター</strong>（Web／UX、プログラミング、グラフィック）、2005年–現在<br />
+        UX／UI設計から実装まで一貫して担当。2008年以降、寄稿多数。
       </p>
       <p>
         <strong>プログラマー／SE</strong>（株式会社 NTT データ）、2002年<br />
@@ -228,36 +398,39 @@ function JaContent() {
 
       {/* Awards */}
       <h2>受賞歴</h2>
-      <p>
-        2025–2026年 DAC – Design Classifications「世界14位」選出（A&apos; Design Award 主催）<br />
-        2025年 Award of Achievement（ギリシャ・ハニア 人道文化領事館 主催）<br />
-        2025年 The New Great Masters in New York（Fondazione Effetto Arte 主催）<br />
-        2025年 W* Recognition（A&apos; Design Award 主催）<br />
-        2024年 Meritorious Service to the Arts Award（Luxembourg Art Prize 主催）<br />
-        2024年 Phoenix for the Arts（Fondazione Effetto Arte 主催）<br />
-        2024年 Global Art Virtuoso Award（Contemporary Art Collectors 主催）<br />
-        2023年 Harmony for Humanity Art Prize（Contemporary Art Collectors 主催）<br />
-        2023年 Career Art Award（Fondazione Effetto Arte 主催）<br />
-        2023年 The Genius of Italy – ミケランジェロ国際芸術賞（Fondazione Effetto Arte 主催）<br />
-        2023年 A&apos; Design Award Golden Award（写真・フォトマニピュレーション部門）<br />
-        2022年 第12回 ITSLIQUID International Contest 栄誉賞<br />
-        2022年 BEST COVER ARTIST AWARD（365 Art+ Business Magazine 主催）<br />
-        2022年 A&apos; Design Award Iron Award（グラフィックデザイン部門）<br />
-        2021年 第11回 ITSLIQUID International Contest 栄誉賞<br />
-        2021年 ARTIST OF THE YEAR（ITSLIQUID Group 主催）<br />
-        2006年 MTV SO-ZO Competition supported by AMD『Webスクリーンセーバー部門』優秀賞受賞
-      </p>
+      <Lines items={AWARDS_JA} />
 
       {/* Exhibitions */}
       <h2>主な展覧会</h2>
       <p>
-        LA Art Show（ロサンゼルス）、Ansan International Photo Festival（韓国・安山）、RenovArt Project（イタリア・マテーラ）、Rome International Art Fair（ローマ）、Paris International Contemporary Art Fair（パリ）、CONTEMPORARY VENICE（ヴェネツィア）、LONDON CONTEMPORARY（ロンドン）、KINTSUGI／TRACES OF DREAMS（M.A.D.S. ART GALLERY／ミラノ）ほか多数。
+        2026年 Rewrite（JAPONICA-JAPONICA／東京芸術劇場 ギャラリー2／東京）<br />
+        2026年 A Beautiful Horizon（European Museum of Modern Art〔MEAM〕／スペイン・バルセロナ）<br />
+        2025年 Ansan International Photo Festival（Ansan Culture &amp; Arts Center／韓国・安山）<br />
+        2025年 KINTSUGI／TRACES OF DREAMS（M.A.D.S. ART GALLERY／イタリア・ミラノ）<br />
+        2024年 LA ART SHOW – Los Angeles Art Market（Fondazione Effetto Arte／アメリカ・ロサンゼルス）<br />
+        2023年 International Good Design Exhibition（A’ Design Award／イタリア・ローマ）<br />
+        2023年 RenovArt（ApuliaAste／イタリア・マテーラ）<br />
+        2023年 FROM THE DISTANCE（VAN GOGH Art Gallery／スペイン・マドリード）<br />
+        2023年 Paris 2023 International Contemporary Art Fair（VAN GOGH Art Gallery／フランス・パリ）<br />
+        2022年 BRAIN CAKE 2022（M.A.D.S. ART GALLERY／スペイン・バルセロナ／カサ・ミラ）<br />
+        2022年 LONDON CONTEMPORARY 2022（ITSLIQUID Group／イギリス・ロンドン）<br />
+        2022年 CONTEMPORARY VENICE 2022（ITSLIQUID Group／イタリア・ヴェネツィア）<br />
+        2022年 ROME INTERNATIONAL ART FAIR 2022（ITSLIQUID Group／イタリア・ローマ）<br />
+        ほか多数（全展覧会歴はアーティストプロファイル PDF に掲載）
       </p>
 
       {/* Publications */}
       <h2>掲載誌・書籍（抜粋）</h2>
       <p>
-        Le Musee Plus Magazine、365 Art+ Magazine、The Best Contemporary Masters、Imago（Galleria Tilde）、ANTHOLOGY THE LAST DECADE 2015–2025、Digital Art Creators、The Luxury Collection of Contemporary Artistry、MacPeople、MdN 各誌ほか。
+        Le Musée Plus Magazine Vol. 1〜3、365 Art+ Magazine、365 Art+ Mars City Project Vol. 1、ANTHOLOGY THE LAST DECADE 2015–2025、Imago／Imago 2（Galleria Tilde）、Digital Art Creators、The Best Contemporary Masters 2024、The Luxury Collection of Contemporary Artistry、AATONAU 特集記事、MacPeople、MdN 各誌ほか。
+      </p>
+
+      {/* Interviews */}
+      <h2>インタビュー・掲載</h2>
+      <p>
+        <InterviewLinks />
+        <br />
+        A’ Design Award メンバープロフィール: <Ext href="https://designer.org/!315944">Designer.org</Ext>
       </p>
 
       {/* Influences */}
@@ -295,40 +468,25 @@ function JaContent() {
 
       {/* Apps */}
       <h2>運営中のアプリ</h2>
-      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 16 }}>
-        2013年の独立アプリ事業開始以降、現在も継続して運営しているアプリ群です。累計5,000万ダウンロードを超え、月間アクティブユーザー300万人超を維持しています。
+      <p style={LEAD}>
+        2013年の独立アプリ事業開始以降、継続して運営しているアプリです。累計5,000万ダウンロードを超え、月間300万人を超える方々にご利用いただいています。
       </p>
-      <p>
-        <strong>綺麗な壁紙 4K/HDR</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id706533906" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+      <AppList isJa />
+      <p style={{ fontSize: 13 }}>
+        <Ext href="https://apps.apple.com/developer/masaki-hirokawa/id617664044">App Store デベロッパーページ</Ext>
         {" / "}
-        <a href="https://play.google.com/store/apps/details?id=net.dolice.beautifulwallpapers" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
-        <br />
-        <strong>浮世絵壁紙</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id835559799" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
-        {" / "}
-        <a href="https://play.google.com/store/apps/details?id=net.dolice.ukiyoe" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
-        <br />
-        <strong>望みが叶う！引き寄せの法則アプリ</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id841157677" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
-        <br />
-        <strong>リラックス・ヒーリング</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id694492667" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        <Ext href="https://play.google.com/store/apps/dev?id=4986905301241236390">Google Play デベロッパーページ</Ext>
       </p>
 
       {/* Documents */}
       <h2>プロフィール資料</h2>
-      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 12 }}>
-        ご利用・ご参照用の PDF 資料です。展覧会・出版・取材等にお役立てください。
-      </p>
+      <p style={LEAD}>ご利用・ご参照用の PDF 資料です。展覧会・出版・取材等にお役立てください。</p>
       <p>
-        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アーティストプロフィール（日本語版）PDF</a>
+        <Ext href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf">アーティストプロファイル（日本語版）PDF</Ext>
         <br />
-        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>アートワーク・ドキュメンテーション PDF</a>
+        <Ext href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf">アーティストプロファイル（英語版）PDF</Ext>
+        <br />
+        <Ext href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf">作品資料 Artwork Documentation（日英併記）PDF</Ext>
       </p>
     </>
   );
@@ -353,39 +511,61 @@ function EnContent() {
         </p>
       </div>
 
-      {/* Statement */}
+      {/* Statement (same text as dolice.net “About Masaki Hirokawa”) */}
       <p>
-        Graphic and contemporary artist and app developer, recipient of 17 international art awards. Through exhibitions across Europe, Asia, and the Americas, as well as features in art books and academic journals, he creates work grounded in Japan&apos;s distinctive sense of prayer, exploring collective psychology, the cognitive world, and fundamental consciousness.
+        A graphic and contemporary artist and app developer, recipient of 17 international art awards. Through exhibitions across Europe, Asia, and the Americas, and features in art books and international magazines, he creates work grounded in Japan’s distinctive sense of prayer — exploring collective psychology, the cognitive world, and fundamental consciousness.
       </p>
       <p>
-        Bridging art and technology, Hirokawa continues to pursue expressions that inhabit the space between the digital and the poetic. His practice evokes a serene yet surreal world in which subtle synesthetic sensibilities and a quietly mystical inspiration coexist.
+        Drawing on natural symbolism, philosophical reflection, and imagery inspired by contemporary science, he seeks to soften the divide between the sacred and the secular, and to restore the subtle bonds between human beings and the natural world. Across his practice, subtle synesthetic sensibilities and a quietly mystical inspiration coexist.
+      </p>
+      <p>
+        Beginning with self-taught web design in 1997, his path led through systems engineering, writing for design publications, and game development to founding an independent app business in 2013. Since 2019 he has resumed full-scale art production — bridging art and technology, pursuing expressions that inhabit the space between the digital and the poetic.
+      </p>
+
+      {/* Fields */}
+      <h2>Areas of Work</h2>
+      <p>
+        <strong>Practice</strong> — Contemporary and graphic art (photo collage / photo retouching, digital media). Every work is made by his own hand, without AI.<br />
+        <strong>Exhibitions</strong> — Europe, Asia, and the Americas (Milan, Matera, Rome, Venice, Madrid, Barcelona, Paris, London, Los Angeles, Ansan, Tokyo, and more)<br />
+        <strong>Apps</strong> — 13 years of independent iOS and Android development, from planning and development to global ASO and multilingual releases.<br />
+        <strong>Engineering</strong> — C, Java, Python, Kotlin, Swift, and more: native apps, enterprise systems, shaders and video processing.<br />
+        <strong>Client Work</strong> — Landing pages, WordPress and website development, maintenance, photo retouching, app store assets and global ASO (<Ext href="https://dolice.net/en/#brand">Branding &amp; Craft</Ext>)
       </p>
 
       {/* Bio */}
       <h2>Biography</h2>
       <p>
-        Self-taught in web design and programming since 1997, Hirokawa joined Kokuwa System Co., Ltd. in 1999 as a DTP operator. In 2002, he worked at NTT DATA Corporation as a programmer and systems engineer, contributing to core system development. In 2005, he became an independent creator and expanded his activities across web design, programming, graphic production, and interactive movie projects.
+        Masaki Hirokawa is a Japanese multidisciplinary artist, UI/UX designer, and app developer whose practice bridges visual art, digital media, and interactive technology.
       </p>
       <p>
-        In 2011, he participated in game development as a technical artist, and in 2013 he launched an independent smartphone app business that has since surpassed 50 million cumulative downloads worldwide, with more than 3 million monthly active users. He continues to lead development, global marketing, and operations.
+        He began self-studying web design and programming in 1997, and joined Kokuwa System Co., Ltd. in 1999 as a DTP operator. In 2002, he worked at NTT DATA Corporation as a programmer and systems engineer, contributing to core system development. In 2005, he became an independent creator and expanded his activities across web design, programming, graphic production, and interactive movie projects.
+      </p>
+      <p>
+        In 2006, he received the Excellence Prize in the Web Screensaver category at the MTV SO-ZO Competition (supported by AMD), marking the beginning of exhibitions in Japan and abroad. From 2008 onward, he contributed to and authored numerous graphic design magazines and books.
+      </p>
+      <p>
+        In 2011, he participated in game development as a technical artist, and in 2013 he launched an independent smartphone app business. To date, his apps have surpassed 50 million cumulative downloads worldwide, with more than 3 million monthly active users. He continues to lead development, global marketing, and operations.
       </p>
       <p>
         Since 2019, Hirokawa has resumed full-scale production of graphic art and has actively exhibited in international shows across Europe, Asia, and the Americas. His works depict a symbolic world at the intersection of human consciousness, beauty, and decay, poetically tracing the boundary between dream and reality.
+      </p>
+      <p>
+        Since 2021, he has received numerous honors from institutions including the A’ Design Award, Fondazione Effetto Arte, Contemporary Art Collectors, and ITSLIQUID Group. In recent years, he has further consolidated international recognition with distinctions such as the Award of Achievement (The Consulate of Humanitarian &amp; Culture, Greece) and the Meritorious Service to the Arts Award (Luxembourg Art Prize).
       </p>
 
       {/* Career */}
       <h2>Professional Experience</h2>
       <p>
         <strong>Founder / Lead Developer</strong> (Independent App Business), 2013–present<br />
-        50M+ total downloads, 3M+ MAU. Leading development, global ASO, and business management.
-      </p>
-      <p>
-        <strong>Creator</strong> (Web/UX, Programming, Graphic Design), 2005–present<br />
-        End-to-end UX/UI design and implementation. Frequent contributor to design publications since 2008.
+        50M+ total downloads and 3M+ monthly active users worldwide; leading development, global ASO, and overall business management.
       </p>
       <p>
         <strong>Technical Artist</strong> (Game Development), 2011<br />
         Production oversight and supervision.
+      </p>
+      <p>
+        <strong>Creator</strong> (Web/UX, Programming, Graphic Design), 2005–present<br />
+        End-to-end UX/UI design and implementation; frequent contributor to design publications since 2008.
       </p>
       <p>
         <strong>Programmer / Systems Engineer</strong> (NTT DATA Corporation), 2002<br />
@@ -398,36 +578,39 @@ function EnContent() {
 
       {/* Awards */}
       <h2>Awards</h2>
-      <p>
-        2025–2026 – World&apos;s 14th Best Designer, DAC – Design Classifications (A&apos; Design Award)<br />
-        2025 – Award of Achievement (The Consulate of Humanitarian &amp; Culture in Chania, Greece)<br />
-        2025 – The New Great Masters in New York (Fondazione Effetto Arte)<br />
-        2025 – W* Recognition (A&apos; Design Award)<br />
-        2024 – Meritorious Service to the Arts Award (Luxembourg Art Prize)<br />
-        2024 – Phoenix for the Arts (Fondazione Effetto Arte)<br />
-        2024 – Global Art Virtuoso Award (Contemporary Art Collectors)<br />
-        2023 – Harmony for Humanity Art Prize (Contemporary Art Collectors)<br />
-        2023 – Career Art Award (Fondazione Effetto Arte)<br />
-        2023 – The Genius of Italy – Michelangelo International Art Prize (Fondazione Effetto Arte)<br />
-        2023 – A&apos; Design Award Golden Award (Photography &amp; Photo Manipulation)<br />
-        2022 – ITSLIQUID International Contest – 12th Edition, Honorable Mention<br />
-        2022 – BEST COVER ARTIST AWARD (365 Art+ 6 Stars AWARDS)<br />
-        2022 – A&apos; Design Award Iron Award (Graphic Design)<br />
-        2021 – ITSLIQUID International Contest – 11th Edition, Honorable Mention<br />
-        2021 – ARTIST OF THE YEAR (ITSLIQUID Group)<br />
-        2006 – Excellence Prize, Web Screensaver Category, MTV SO-ZO Competition supported by AMD
-      </p>
+      <Lines items={AWARDS_EN} />
 
       {/* Exhibitions */}
       <h2>Selected Exhibitions</h2>
       <p>
-        LA Art Show (Los Angeles), Ansan International Photo Festival (Ansan, South Korea), RenovArt Project (Matera, Italy), Rome International Art Fair (Rome), Paris International Contemporary Art Fair (Paris), CONTEMPORARY VENICE (Venice), LONDON CONTEMPORARY (London), KINTSUGI / TRACES OF DREAMS (M.A.D.S. ART GALLERY, Milan), and many more.
+        2026 – Rewrite (JAPONICA-JAPONICA, Tokyo Metropolitan Theatre Gallery 2, Tokyo, Japan)<br />
+        2026 – A Beautiful Horizon (European Museum of Modern Art (MEAM), Barcelona, Spain)<br />
+        2025 – Ansan International Photo Festival (Ansan Culture &amp; Arts Center, Ansan, South Korea)<br />
+        2025 – KINTSUGI / TRACES OF DREAMS (M.A.D.S. ART GALLERY, Milan, Italy)<br />
+        2024 – LA ART SHOW – Los Angeles Art Market (Fondazione Effetto Arte, Los Angeles, USA)<br />
+        2023 – International Good Design Exhibition (A’ Design Award, Rome, Italy)<br />
+        2023 – RenovArt (ApuliaAste, Matera, Italy)<br />
+        2023 – FROM THE DISTANCE (VAN GOGH Art Gallery, Madrid, Spain)<br />
+        2023 – Paris 2023 International Contemporary Art Fair (VAN GOGH Art Gallery, Paris, France)<br />
+        2022 – BRAIN CAKE 2022 (M.A.D.S. ART GALLERY, Casa Milà, Barcelona, Spain)<br />
+        2022 – LONDON CONTEMPORARY 2022 (ITSLIQUID Group, London, UK)<br />
+        2022 – CONTEMPORARY VENICE 2022 (ITSLIQUID Group, Venice, Italy)<br />
+        2022 – ROME INTERNATIONAL ART FAIR 2022 (ITSLIQUID Group, Rome, Italy)<br />
+        and many more (the full list is in the Artist Profile PDF)
       </p>
 
       {/* Publications */}
       <h2>Selected Publications</h2>
       <p>
-        Le Musee Plus Magazine, 365 Art+ Magazine, The Best Contemporary Masters, Imago (Galleria Tilde), ANTHOLOGY THE LAST DECADE 2015–2025, Digital Art Creators, The Luxury Collection of Contemporary Artistry, MacPeople, MdN publications, and others.
+        Le Musée Plus Magazine Vol. 1–3, 365 Art+ Magazine, 365 Art+ Mars City Project Vol. 1, ANTHOLOGY THE LAST DECADE 2015–2025, Imago / Imago 2 (Galleria Tilde), Digital Art Creators, The Best Contemporary Masters 2024, The Luxury Collection of Contemporary Artistry, AATONAU feature article, MacPeople, MdN publications, and others.
+      </p>
+
+      {/* Interviews */}
+      <h2>Interviews &amp; Features</h2>
+      <p>
+        <InterviewLinks />
+        <br />
+        A’ Design Award member profile: <Ext href="https://designer.org/!315944">Designer.org</Ext>
       </p>
 
       {/* Influences */}
@@ -436,7 +619,7 @@ function EnContent() {
         Around 1997, when I was sixteen, I found myself deeply drawn to what was then the still-new world of the internet. That encounter led me to teach myself web design. Through this online space, I was able to connect across borders with designers, programmers, and artists, and those encounters greatly broadened my perspective. They nurtured in me a way of looking at things that naturally crosses disciplines and fields.
       </p>
       <p>
-        At the same time, there was a quieter form of inheritance at work. Both of my grandfathers were miyadaiku — master carpenters involved in the construction and restoration of shrines and temples. From them, I seem to have absorbed the sense that form and space can become vessels for what cannot be seen, and that the act of working with one&apos;s hands can itself be a kind of devotion. Even during the years when I was working in fields that might appear, at first glance, to be far removed from art, this feeling continued to flow quietly at the foundation of my practice.
+        At the same time, there was a quieter form of inheritance at work. Both of my grandfathers were miyadaiku — master carpenters involved in the construction and restoration of shrines and temples. From them, I seem to have absorbed the sense that form and space can become vessels for what cannot be seen, and that the act of working with one’s hands can itself be a kind of devotion. Even during the years when I was working in fields that might appear, at first glance, to be far removed from art, this feeling continued to flow quietly at the foundation of my practice.
       </p>
       <p>
         My path later expanded into core system development, interactive movie production, authoring books on graphic design, game development, and app development, and from 2019 onward I decisively shifted my focus back to graphic art. In late autumn of that same year, under the night sky above Kichijōji Station in Tokyo, I witnessed a mysterious ring of light. It felt like a wordless directive, almost as though someone were speaking to me in Latin, telling me to devote my lifeblood from now on to visual expression. That experience became a major turning point, propelling me into the intense creation of symbolic and dreamlike works.
@@ -465,40 +648,25 @@ function EnContent() {
 
       {/* Apps */}
       <h2>Mobile Apps in Production</h2>
-      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 16 }}>
-        Apps actively maintained since the independent app business launched in 2013. Combined downloads exceed 50 million, with over 3 million monthly active users.
+      <p style={LEAD}>
+        Apps actively maintained since the independent app business launched in 2013. Together they have passed 50 million downloads, with more than 3 million people using them every month.
       </p>
-      <p>
-        <strong>Beautiful HD Wallpapers</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id706533906" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+      <AppList isJa={false} />
+      <p style={{ fontSize: 13 }}>
+        <Ext href="https://apps.apple.com/developer/masaki-hirokawa/id617664044">App Store Developer Page</Ext>
         {" / "}
-        <a href="https://play.google.com/store/apps/details?id=net.dolice.beautifulwallpapers" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
-        <br />
-        <strong>Ukiyo-e Wallpapers</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id835559799" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
-        {" / "}
-        <a href="https://play.google.com/store/apps/details?id=net.dolice.ukiyoe" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Android</a>
-        <br />
-        <strong>Law of Attraction Everyday</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id841157677" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
-        <br />
-        <strong>Relaxing Healing</strong>
-        {" — "}
-        <a href="https://apps.apple.com/app/id694492667" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>iOS</a>
+        <Ext href="https://play.google.com/store/apps/dev?id=4986905301241236390">Google Play Developer Page</Ext>
       </p>
 
       {/* Documents */}
       <h2>Press Kit</h2>
-      <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 12 }}>
-        PDF documents available for press, exhibitions, publications, and interviews.
-      </p>
+      <p style={LEAD}>PDF documents available for press, exhibitions, publications, and interviews.</p>
       <p>
-        <a href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artist Profile (English) PDF</a>
+        <Ext href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa.pdf">Artist Profile (English) PDF</Ext>
         <br />
-        <a href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf" target="_blank" rel="noopener noreferrer" style={LINK_STYLE}>Artwork Documentation PDF</a>
+        <Ext href="https://dolice.net/pub/Artist_Profile_Masaki_Hirokawa_Japanese.pdf">Artist Profile (Japanese) PDF</Ext>
+        <br />
+        <Ext href="https://dolice.net/pub/Artwork_Details_Masaki_Hirokawa.pdf">Artwork Documentation (Bilingual) PDF</Ext>
       </p>
     </>
   );
