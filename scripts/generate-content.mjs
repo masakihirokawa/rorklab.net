@@ -156,6 +156,8 @@ async function compileMarkdown(content) {
   return compactShikiStyles(String(result))
     .replace(/<h1(\s[^>]*)?>/g, "<h2$1>")
     .replace(/<\/h1>/g, "</h2>")
+    // 2026-11-04: 表のセル内の `…` はマークダウンとして処理されずバッククォートのまま表示されていた → <code> に
+    .replace(/<table\b[\s\S]*?<\/table>/g, (t) => t.replace(/(<t[dh]\b[^>]*>)([\s\S]*?)(<\/t[dh]>)/g, (_m, a, b, c) => a + b.replace(/`([^`<\n]+)`/g, "<code>$1</code>") + c))
     .replace(/<table\b/g, '<div class="table-scroll"><table')
     .replace(/<\/table>/g, "</table></div>");
 }

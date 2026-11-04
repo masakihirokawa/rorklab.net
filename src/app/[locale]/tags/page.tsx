@@ -89,7 +89,8 @@ export default async function TagsPage({ params }: Props) {
           marginBottom: 48,
         }}
       >
-        {tagCounts.map(({ tag, count }) => {
+        {/* 2026-11-04: 雲は上位 60 個だけ（数百個の小さな字が並んで読めず、HTML と RSC で二重に重かった）。全タグは下の索引に */}
+        {tagCounts.slice(0, 60).map(({ tag, count }) => {
           const size = minSize + ((count - 1) / Math.max(maxCount - 1, 1)) * (maxSize - minSize);
           const opacity = 0.5 + (count / maxCount) * 0.5;
           return (
