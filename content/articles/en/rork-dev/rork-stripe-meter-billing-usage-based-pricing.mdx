@@ -5,461 +5,294 @@ category: "rork-dev"
 level: "advanced"
 premium: true
 date: "2026-04-26T11:15"
-updated: "2026-07-02T20:45"
+updated: "2026-11-11T15:20"
 author: "Rork Lab"
-description: "Implement usage-based billing in your Rork AI app with Stripe Meter — meter setup, Cloudflare Workers reporting, retry queues, event aggregation, and how to choose between metered billing and prepaid credits."
+description: "Implement usage-based billing in your Rork AI app with Stripe Meter — server-side reporting, identifier-based de-duplication, retry queues, aggregation with a self-built monthly cap, and metered vs prepaid credits, with what was verified and what wasn't."
 tags: ["Stripe", "Meter Billing", "Usage-Based Pricing", "Cloudflare Workers", "AI Monetization", "Subscription", "Indie Dev"]
 highlights:
-  - "Working Cloudflare Queues retry code that recovers failed usage reports without double-billing"
-  - "A Durable Object aggregation pattern that keeps meter events under Stripe rate limits"
+  - "Retry design with Cloudflare Queues and a Durable Object that reuses a pre-decided identifier (logic exercised against a mock)"
+  - "Why Stripe has no hard usage cap per its docs, and how to enforce a monthly cap yourself"
   - "A prepaid-credits vs. metered-billing comparison with App Store review boundaries for choosing your model"
 
 ---
 
-The month one of my users sent over 3,000 messages to my AI chat app, I learned a hard lesson about flat-rate subscriptions. The AI API bill for that single user exceeded their monthly subscription fee — and I still had 29 days left in the billing cycle. I wasn't losing a lot of money, but I could see the trend line, and it was pointing in the wrong direction.
+There was a night I put two users side by side in a spreadsheet. One sends 50 messages a month to an AI chat feature; the other sends 200 a day. I assumed a cost of 3 yen per call — a placeholder — and the second user's cost came to more than 18,000 yen a month. Charging both the same flat fee stopped making sense right there, on paper.
 
-Flat subscriptions work well for software with predictable server costs, but for AI-powered apps where heavy users can consume 100× more than light users, they create a structural imbalance. The users generating the most value (and the most likely to stick around and recommend your app) are also the ones costing you the most to serve. At some point, that math stops working.
+A flat subscription is easy to explain, but for AI features it tends to make light users carry heavy ones. That is where Stripe's **Meter Billing** (usage-based billing) earns a look: you send usage as events, and Stripe handles the per-period aggregation and the invoice.
 
-The answer is **usage-based billing** — charging users based on what they actually consume. Stripe's Meter Billing, generally available since late 2024, is now the cleanest server-side way to implement this. This guide walks through the complete implementation: creating a Stripe Meter, reporting events from Cloudflare Workers, integrating with a Rork app, designing a hybrid pricing model, and handling the edge cases that will trip you up before your first billing cycle is over.
+This guide walks through wiring Meter Billing into a Rork AI app, focusing on the server side. Along the way I'll point out a design flaw in my own first draft, and I've tried to separate what I actually ran from what I could not verify.
 
-## Why Flat Pricing Breaks Down for AI Apps
+## Why AI Apps Need Usage-Based Billing
 
-Before getting into the implementation, it's worth being precise about the problem, because the solution should match the actual failure mode.
+Flat pricing has a structural skew. In AI apps, per-user usage routinely differs by 10× to 100× or more, so a 50-message user and a 200-a-day user paying the same amount means your cost grows with every heavy user you win.
 
-The issue with flat pricing for AI features isn't just about cost — it's about **misalignment between perceived value and price**. A user who sends 20 messages a month and a user who sends 2,000 messages pay the same amount. The light user might feel the price is expensive relative to their usage. The heavy user is getting enormous value and wouldn't blink at paying more.
+Usage-based billing gives you three things:
 
-With a flat subscription, you're essentially forcing light users to subsidize heavy users. That might sound like a reasonable trade-off, but in practice it leads to:
+- Fairness — users pay in proportion to what they use, and you stop absorbing cost growth alone.
+- A low entry plan — "300 yen base plus usage" lowers the door for people who just want to try it.
+- A billing foundation that extends to API and B2B offerings.
 
-**Higher churn among light users.** They feel like they're paying for something they barely use and eventually cancel. These are often your word-of-mouth advocates — casual users who'd happily recommend your app if they didn't feel the price was hard to justify.
+Whether churn actually improves depends on your app and your prices; I have no evidence that adopting it guarantees retention. What I'd check first is the relationship between your unit cost and your unit price.
 
-**Hesitation to acquire power features.** If you want to add a more expensive AI capability (like video analysis or long-context reasoning), you either have to raise prices for everyone or eat the cost for heavy users. Neither is great.
+## How Stripe Meter Billing Fits Together
 
-**No natural upsell path.** With flat pricing, getting users to pay more requires convincing them to switch plans. With usage-based billing, users who use more automatically pay more — no conversation required.
+A meter setup has three parts:
 
-Usage-based billing aligns your revenue with the value you deliver. When it works well, it feels fair to users ("I pay for what I use"), sustainable for you ("my margin is consistent"), and creates a natural relationship between product success and revenue growth.
+- **Meter** — defines what you count, with a Sum, Count, or Last aggregation.
+- **Meter Event** — the usage report your server sends to Stripe.
+- **Price with Meter** — a price billed on the meter's aggregate for the period.
 
-After switching one of my apps to a hybrid model — base fee plus metered overage — churn among light users dropped. They no longer felt trapped by a flat fee for something they used occasionally. And when power users' bills went up, they didn't cancel; they told me they were happy to pay for a tool they relied on daily.
-
-## Understanding Stripe Meter Architecture
-
-Stripe Meter is a server-side billing primitive that counts events you report and uses the accumulated count to calculate charges at the end of a billing period. There are three components you need to understand before writing any code.
-
-**Meter** defines what you're counting. You create a meter in the Stripe dashboard (or via API) and give it an event name — a string like `ai_api_call` that you'll use when reporting usage. The meter also defines how values are aggregated: by default, each event counts as 1, but you can configure it to use a numeric value from the event payload (useful for token-based billing where different operations have different weights).
-
-**Meter Event** is a server-side API call you make every time the countable action occurs. You send `stripe.billing.meterEvents.create()` with the customer's Stripe ID and the event name. Stripe accumulates these throughout the billing period.
-
-**Metered Price** is a price object attached to a subscription that references your meter. At the end of the billing period, Stripe queries the meter for the customer's accumulated usage and charges accordingly.
-
-The complete request flow:
+The flow:
 
 ```
-User triggers AI feature in Rork app
+Rork app → your backend (Cloudflare Workers): AI request
     ↓
-App calls Cloudflare Workers backend (/api/meter-event)
+Workers authenticates the user, calls the AI, decides the usage after success
     ↓
-Workers validates request and calls stripe.billing.meterEvents.create()
+Workers → stripe.billing.meterEvents.create()
     ↓
-Stripe accumulates events throughout the month
-    ↓
-At billing period end, Stripe calculates charges from meter data
-    ↓
-Customer's saved payment method is charged automatically
+Stripe aggregates per billing period and invoices
 ```
 
-One rule you absolutely must not break: **meter events must be reported from your server, never from the client app.** Calling the Stripe Meter Event API directly from the Rork app would require your Stripe Secret Key to be present in the app bundle — which means anyone who reverse-engineers the app can find it and submit fraudulent events or access your Stripe account. Always proxy through a backend like Cloudflare Workers.
+The one point to hold onto: **the server that calls the AI counts the usage and reports it.** My first draft had the app report "what it used". That means shipping a shared key inside the app, and any user could stop reporting — or send events against someone else's customer ID.
 
-## Step 1: Create a Meter in the Stripe Dashboard
+> **Count where you spend.** The moment reporting is delegated to the client, the basis for the invoice rests on trust alone.
 
-Open the Stripe dashboard and navigate to **Billing → Meters**. Click "Create meter" and fill in the following:
+## Step 1: Create the Meter and the Price
 
-- **Display name**: `AI API Calls` (shown in the dashboard — make it human-readable)
-- **Event name**: `ai_api_call` (this exact string goes in your code — use snake_case)
-- **Value settings**: Default (each event counts as 1) — or "Custom event payload value" if you want to report weighted values like token counts
-
-Once created, you'll get a meter ID in the format `mtr_xxxxxxxxxxxxxxxx`. Copy this — you'll need it when querying usage summaries to show users their current consumption.
-
-Next, create a Price linked to this meter. From your Product in the Stripe dashboard, add a new Price:
-
-- **Billing period**: Monthly
-- **Pricing model**: Usage-based
-- **Meter**: Select the meter you just created
-- **Unit amount**: Your per-unit price (e.g., $0.01 per API call)
-
-You can also choose **Graduated Pricing** to implement free allowances — I'll cover that configuration in Step 4 since it's where most of the pricing design happens.
-
-A note on test vs. production: Stripe creates separate meter objects in test and live modes. The `mtr_` IDs are different between environments. Store both in your environment variables and use the correct one based on your deployment context.
-
-## Step 2: Report Meter Events from Cloudflare Workers
-
-This is the backend handler that receives usage from your Rork app and forwards it to Stripe:
+You can use Billing → Meters in the dashboard, but I'll show the API so the setup is reproducible.
 
 ```typescript
-// cloudflare-workers/src/handlers/meter.ts
+// One-time setup script
+const meter = await stripe.billing.meters.create({
+  display_name: 'AI usage units',
+  event_name: 'ai_usage', // key used when sending events
+  default_aggregation: { formula: 'sum' }, // sum the `value` you send
+  customer_mapping: { event_payload_key: 'stripe_customer_id', type: 'by_id' },
+  value_settings: { event_payload_key: 'value' }, // payload field holding the amount (default: value)
+});
+```
+
+The aggregation choice is something the old version of this article missed. **Count counts events and ignores `value`.** If you bill by tokens or weighted units, you need Sum. Leaving the dashboard on "count each event as 1" while sending a `value` means your token numbers never reach the invoice.
+
+Next, the price attached to the meter:
+
+```typescript
+const meteredPrice = await stripe.prices.create({
+  currency: 'jpy',
+  product: 'prod_xxxxxxxx',
+  recurring: { interval: 'month', usage_type: 'metered', meter: meter.id },
+  billing_scheme: 'tiered',
+  tiers_mode: 'graduated',
+  tiers: [
+    { up_to: 100, unit_amount_decimal: '0' },     // free allowance
+    { up_to: 500, unit_amount_decimal: '1' },     // 1 yen per unit
+    { up_to: 'inf', unit_amount_decimal: '0.7' }, // cheaper beyond 500
+  ],
+});
+```
+
+Fractions of a yen can't be expressed in `unit_amount`, so use `unit_amount_decimal`. I have not confirmed in test mode how a fractional yen rate is rounded on the invoice; please issue one small test invoice before launch.
+
+## Step 2: Call the AI and Report Usage from Workers
+
+Accept only authenticated users, and look up the customer ID from your own mapping table. Never accept `customerId` from the client.
+
+```typescript
 import Stripe from 'stripe';
 
 interface Env {
   STRIPE_SECRET_KEY: string;
-  INTERNAL_API_KEY: string; // for authenticating calls from your Rork app
+  METER_RETRY: Queue<RetryPayload>;
 }
 
-interface MeterEventBody {
+interface RetryPayload {
   customerId: string;
-  eventName: string;
-  value?: number;   // optional weighted value (e.g., token count)
-  sessionId: string; // client-generated ID for idempotency
+  value: number;
+  identifier: string;
 }
 
-export async function handleMeterEvent(
-  request: Request,
-  env: Env
-): Promise<Response> {
-  // Authenticate the request from your Rork app
-  const authHeader = request.headers.get('Authorization');
-  if (authHeader !== `Bearer ${env.INTERNAL_API_KEY}`) {
-    return new Response(
-      JSON.stringify({ error: 'Unauthorized' }),
-      { status: 401, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
-
-  // Parse and validate the request body
-  let body: MeterEventBody;
-  try {
-    body = await request.json();
-  } catch {
-    return new Response(
-      JSON.stringify({ error: 'Invalid JSON body' }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
-
-  if (!body.customerId || !body.eventName || !body.sessionId) {
-    return new Response(
-      JSON.stringify({ error: 'customerId, eventName, and sessionId are required' }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
-
-  const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
-    apiVersion: '2024-11-20.acacia',
+function stripeClient(env: Env) {
+  // On Workers, being explicit about the fetch-based HTTP client is the safe choice
+  return new Stripe(env.STRIPE_SECRET_KEY, {
+    httpClient: Stripe.createFetchHttpClient(),
   });
+}
 
-  // Build idempotency key to prevent duplicate events on retry
-  const idempotencyKey = `meter_${body.customerId}_${body.sessionId}`;
+export async function sendMeterEvent(env: Env, p: RetryPayload): Promise<void> {
+  await stripeClient(env).billing.meterEvents.create({
+    event_name: 'ai_usage',
+    identifier: p.identifier, // a resend with the same identifier is treated as a duplicate
+    payload: {
+      stripe_customer_id: p.customerId,
+      value: String(p.value),
+    },
+  });
+}
 
+// Return the AI answer even if reporting fails; queue only failures a resend can fix
+export async function recordUsage(env: Env, p: RetryPayload): Promise<void> {
   try {
-    const meterEvent = await stripe.billing.meterEvents.create(
-      {
-        event_name: body.eventName, // e.g., 'ai_api_call'
-        payload: {
-          stripe_customer_id: body.customerId,
-          // Only include value if explicitly provided
-          ...(body.value !== undefined && { value: String(body.value) }),
-        },
-      },
-      { idempotencyKey }
-    );
-
-    return new Response(
-      JSON.stringify({ success: true, identifier: meterEvent.identifier }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    // Handle Stripe-specific errors separately from general errors
-    if (error instanceof Stripe.errors.StripeInvalidRequestError) {
-      // 400 signals to the client that retrying the same request won't help
-      return new Response(
-        JSON.stringify({ error: 'Invalid Stripe request', detail: error.message }),
-        { status: 400, headers: { 'Content-Type': 'application/json' } }
-      );
+    await sendMeterEvent(env, p);
+  } catch (e) {
+    if (e instanceof Stripe.errors.StripeInvalidRequestError) {
+      console.error('meter event rejected (fix the request):', e.message);
+      return; // malformed request; resending will not help
     }
-
-    if (error instanceof Stripe.errors.StripeConnectionError ||
-        error instanceof Stripe.errors.StripeAPIError) {
-      // 503 signals to the client that a retry may succeed
-      return new Response(
-        JSON.stringify({ error: 'Stripe service unavailable, please retry' }),
-        { status: 503, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-
-    console.error('Unexpected meter event error:', error);
-    return new Response(
-      JSON.stringify({ error: 'Internal server error' }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
+    await env.METER_RETRY.send(p); // 5xx, rate limit, network failure
   }
 }
 ```
 
-Several things are worth explaining here.
+De-duplication relies on the Meter Event's `identifier`. According to the [Meter Event API reference](https://docs.stripe.com/api/billing/meter-event/create), Stripe enforces uniqueness within a rolling period of at least 24 hours. An HTTP Idempotency-Key also prevents double execution, but I prefer `identifier` because it works at the level of the event that justifies the invoice line.
 
-The internal API key check prevents anyone other than your Rork app from submitting meter events to your Workers endpoint. Generate a long random string, store it as a Cloudflare Worker secret (`wrangler secret put INTERNAL_API_KEY`), and put the same value in your app's environment variables.
-
-The `idempotencyKey` built from `customerId + sessionId` ensures that if the same event is sent twice (network retry, double-tap on a button), Stripe only records it once. The key is valid for 24 hours, so short-lived session IDs are safe to use.
-
-The error response codes are intentional: a 400 tells the client "this request is broken, don't retry with the same data," while a 503 tells it "the upstream service is unavailable, retry later." Your client-side retry logic should respect these distinctions.
-
-## Step 3: Integrate Usage Reporting in the Rork App
-
-In your Rork app, you'll call the Workers endpoint after each successful AI operation. The timing matters: **report usage only after the AI call succeeds**, so you never charge for failed operations.
+The handler:
 
 ```typescript
-// rork-app/src/services/aiService.ts
-import * as Crypto from 'expo-crypto'; // for generating session IDs
+// Implement authenticate() for your auth stack (Supabase, etc.):
+// verify the JWT, get the userId, look up stripeCustomerId from your mapping.
+export async function handleChat(request: Request, env: Env, ctx: ExecutionContext) {
+  const user = await authenticate(request, env);
+  if (!user) return new Response('Unauthorized', { status: 401 });
 
-interface ChatResult {
-  message: string;
-  tokensUsed: number;
+  const { message, requestId } = await request.json<{ message: string; requestId: string }>();
+
+  const answer = await callModel(message, env); // throws on failure → no charge
+
+  ctx.waitUntil(
+    recordUsage(env, {
+      customerId: user.stripeCustomerId,
+      value: 1, // one message = one unit
+      identifier: `chat_${user.id}_${requestId}`, // identical on every resend
+    })
+  );
+
+  return Response.json({ message: answer });
 }
+```
 
-export async function sendChatMessage(
-  userMessage: string,
-  stripeCustomerId: string
-): Promise<ChatResult> {
-  // Generate a unique ID for this interaction — used for idempotency
-  const sessionId = Crypto.randomUUID();
+`requestId` is a UUID the app generates once per send. If a double tap or a network retry delivers the same request twice, the `identifier` is identical and you are charged once.
 
-  // Step 1: Call the AI API
-  // If this fails, an exception is thrown — no usage is reported
-  const aiResult = await callGeminiAPI(userMessage);
+## Step 3: The Rork App Sends Only an Auth Token
 
-  // Step 2: Report usage after confirmed success
-  // Failure here must NOT block the user from receiving their response
-  try {
-    await reportUsage({
-      customerId: stripeCustomerId,
-      eventName: 'ai_api_call',
-      value: aiResult.tokensUsed,
-      sessionId,
-    });
-  } catch (reportError) {
-    // Log the failure and add to a retry queue
-    // The user gets their response regardless
-    console.warn('Usage reporting failed, queuing retry:', { sessionId, reportError });
-    await enqueueUsageRetry({
-      customerId: stripeCustomerId,
-      tokensUsed: aiResult.tokensUsed,
-      sessionId,
-      failedAt: Date.now(),
-    });
-  }
+The app holds no Stripe IDs and no shared key.
 
-  return aiResult;
-}
+```typescript
+import * as Crypto from 'expo-crypto';
 
-async function reportUsage(params: {
-  customerId: string;
-  eventName: string;
-  value?: number;
-  sessionId: string;
-}): Promise<void> {
-  const backendUrl = process.env.EXPO_PUBLIC_API_URL;
-  const apiKey = process.env.EXPO_PUBLIC_INTERNAL_API_KEY;
-
-  const response = await fetch(`${backendUrl}/api/meter-event`, {
+export async function sendChatMessage(message: string, accessToken: string) {
+  const res = await fetch('https://your-worker.example.workers.dev/api/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
+      Authorization: `Bearer ${accessToken}`, // the signed-in user's token
     },
-    body: JSON.stringify(params),
+    body: JSON.stringify({ message, requestId: Crypto.randomUUID() }),
   });
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-    // Preserve the status code — callers may want to distinguish 400 vs 503
-    const err = new Error(`Usage report failed: ${error.error}`);
-    (err as any).status = response.status;
-    throw err;
-  }
+  if (res.status === 429) throw new Error('monthly_cap_reached');
+  if (!res.ok) throw new Error(`chat failed: ${res.status}`);
+  return (await res.json()) as { message: string };
 }
 ```
 
-The retry queue (`enqueueUsageRetry`) is worth implementing even if you start with something simple like `AsyncStorage`. A missed usage report means you provided a service you didn't get paid for. For production apps, process the retry queue in a background task that runs when the app comes back to the foreground, or sync it to your backend for server-side retry.
+Anything in an `EXPO_PUBLIC_` variable ends up in the app bundle; it is not a place for secrets. When you retry, reuse the same `requestId`.
 
-## Step 4: Hybrid Pricing — Base Fee Plus Metered Overage
+## Step 4: Base Fee Plus Metered Usage
 
-Pure pay-per-use can feel unpredictable to users who don't want to think about every action they take. A hybrid model — fixed base fee plus metered overage — gives users a predictable minimum cost while still aligning revenue with heavy usage.
-
-In Stripe, you create this by attaching multiple prices to a single subscription:
+Pure pay-per-use makes revenue hard to read, so I find a base fee plus metered usage easier to live with. Put a fixed price and the meter price on one subscription:
 
 ```typescript
-// Backend: Create a hybrid subscription for a new subscriber
-async function createHybridSubscription(
-  stripe: Stripe,
-  customerId: string,
-  basePriceId: string,    // fixed monthly fee
-  meteredPriceId: string  // metered overage price
-): Promise<Stripe.Subscription> {
-  const subscription = await stripe.subscriptions.create({
-    customer: customerId,
-    items: [
-      { price: basePriceId },    // e.g., $3/month base fee
-      { price: meteredPriceId }, // e.g., $0.01/call after free tier
-    ],
-    payment_behavior: 'default_incomplete',
-    payment_settings: {
-      save_default_payment_method: 'on_subscription',
-    },
-    expand: ['latest_invoice.payment_intent'],
-  });
-
-  return subscription;
-}
+const subscription = await stripe.subscriptions.create({
+  customer: customerId,
+  items: [
+    { price: 'price_base_monthly_300yen' }, // base fee
+    { price: meteredPrice.id },             // metered (no quantity needed)
+  ],
+  payment_behavior: 'default_incomplete',
+  payment_settings: { save_default_payment_method: 'on_subscription' },
+  expand: ['latest_invoice.payment_intent'],
+});
 ```
 
-For the metered price, use **Graduated Pricing** in the Stripe dashboard to set up tiered rates with a free allowance:
+On API version 2025-03-31.basil and later, expanding `latest_invoice.payment_intent` no longer works and `latest_invoice.confirmation_secret` replaces it (that's my understanding, not verified in my environment). Adjust to the API version you pin.
+
+## Step 5: Free Allowance and Tiered Rates
+
+The free allowance is just the first graduated tier set to 0 yen. No code changes; tiers restart each billing period.
 
 ```
-Tier 1:  0 – 100 calls  →  $0.000 each  (free monthly allowance)
-Tier 2:  101 – 500 calls →  $0.010 each
-Tier 3:  501+ calls      →  $0.007 each  (volume discount for heavy users)
+Tier 1: 0–100 units    → 0 yen (free allowance)
+Tier 2: 101–500 units  → 1 yen
+Tier 3: 501+ units     → 0.7 yen
 ```
 
-With this structure:
-- Light users (under 100 calls) pay only the base fee — no per-call charges
-- Medium users pay a reasonable per-call rate
-- Heavy users get a discount that keeps them from shopping for alternatives
+For different allowances per plan, create one price per plan — for example 100 for Light and 500 for Standard.
 
-A practical example for an AI chat app: Base fee $3/month + 100 free messages + $0.02 per message beyond that. For a user who sends 200 messages, their total bill is $3 + (100 × $0.02) = $5. For someone who sends 20 messages, it's just $3. That's a much more defensible pricing structure than $8/month flat.
+## Step 6: Stripe Won't Cap Spend for You
 
-## Step 5: Spend Caps — Protecting Users from Bill Shock
+This is where my first draft was most wrong. It said you could set a spend cap in Billing Controls, and that `billing_thresholds` could act as a ceiling.
 
-Variable billing makes some users nervous, especially when they can't predict their usage. Stripe's **Billing Controls** lets you set a maximum amount a customer can be charged in a period, regardless of their usage.
+Reading the official docs again, I found no hard limit that stops usage:
 
-Configure this in the Stripe dashboard under a customer's Billing Controls, or programmatically when creating the subscription:
+- **Billing Alerts** send a `billing.alert.triggered` webhook when usage crosses a threshold. They tell you; they don't stop anything.
+- **`billing_thresholds`** *create an invoice early* when a threshold is reached. They don't stop charging or usage.
+
+So a "this month ends here" ceiling has to live in your own code. I show it together with the monthly counter in the aggregation section below. If you promise users a cap, verify first that your own code actually enforces it.
+
+## Step 7: Showing Usage in the App
+
+Drive the number shown in the UI from your own counter rather than from Stripe. Stripe processes usage asynchronously, so aggregates may not yet include recent events (the docs give no specific delay).
+
+To check Stripe's side, fetch daily summaries:
 
 ```typescript
-async function createSubscriptionWithCap(
-  stripe: Stripe,
-  customerId: string,
-  basePriceId: string,
-  meteredPriceId: string,
-  maxMonthlyChargeUSD: number // e.g., 20 for a $20 cap
-): Promise<Stripe.Subscription> {
-  return await stripe.subscriptions.create({
-    customer: customerId,
-    items: [
-      { price: basePriceId },
-      { price: meteredPriceId },
-    ],
-    billing_thresholds: {
-      // Optional: issue invoice when amount reaches threshold (before period end)
-      amount_gte: maxMonthlyChargeUSD * 100, // in cents
-    },
-    payment_behavior: 'default_incomplete',
-    expand: ['latest_invoice.payment_intent'],
-  });
-}
-```
-
-Communicate the spend cap clearly during onboarding: "You'll never be charged more than $20 in a single month, no matter how much you use the app." That single sentence removes a lot of hesitation. In my experience, users who see a spend cap are more likely to try premium features freely — and more likely to upgrade when they consistently hit the cap.
-
-## Step 6: Showing Real-Time Usage to Users
-
-Displaying current-month usage directly in the app is one of the highest-ROI features you can add to a metered billing system. Users who can see "47 / 100 messages used this month" are less likely to be surprised at billing time and more likely to upgrade when they see they're approaching their limit.
-
-```typescript
-// Backend: Get a customer's current month usage
-async function getCurrentMonthUsage(
-  stripe: Stripe,
-  customerId: string,
-  meterId: string
-): Promise<{ used: number; freeAllowance: number }> {
+async function usageThisMonth(stripe: Stripe, meterId: string, customerId: string) {
   const now = new Date();
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) / 1000;
+  const end = Math.floor(now.getTime() / 86400000 + 1) * 86400; // next 00:00 UTC
   const summaries = await stripe.billing.meters.listEventSummaries(meterId, {
     customer: customerId,
-    start_time: Math.floor(startOfMonth.getTime() / 1000),
-    end_time: Math.floor(now.getTime() / 1000),
-    value_grouping_window: 'month',
+    start_time: start,
+    end_time: end,
+    value_grouping_window: 'day', // only 'day' or 'hour' are allowed; day aligns to 00:00 UTC
   });
-
-  const totalUsed = summaries.data.reduce(
-    (sum, summary) => sum + summary.aggregated_value,
-    0
-  );
-
-  return {
-    used: totalUsed,
-    freeAllowance: 100, // match your pricing configuration
-  };
+  return summaries.data.reduce((sum, s) => sum + s.aggregated_value, 0);
 }
 ```
 
-Cache this response for a few minutes on the client side — you don't need real-time precision, and Stripe's API has rate limits. Refreshing usage data every 5 minutes when the app is in the foreground is more than sufficient.
+The old version used `value_grouping_window: 'month'`; only `day` and `hour` are valid. Note too that this computes the UTC calendar month, which can differ from the billing period.
 
-## Three Pitfalls That Will Catch You Off Guard
+## Pitfalls
 
-### Pitfall 1: Duplicate Meter Events from Retries
+### Pitfall 1: Resends That Change the Idempotency Key
 
-Network failures, app backgrounding, and double-taps all cause clients to retry requests. Without deduplication, the same usage gets reported multiple times and your customer gets overcharged — which is a trust-destroying experience.
+My first retry code built its key from a five-minute window number. If a resend crossed a window boundary, the key changed and the usage was counted twice. The fix: decide the `identifier` before the first send and carry it through every retry. That is why `RetryPayload` includes `identifier`.
 
-The fix is Stripe's Idempotency Key, which you saw in Step 2. The key insight is that the idempotency key needs to be generated **before** the retry-able operation, not after. In practice, this means generating the `sessionId` at the start of the user action and threading it through all the way to the Stripe API call:
+### Pitfall 2: Meter IDs Differ Between Environments
 
-```typescript
-// Generate at the start of the user action — before any network calls
-const sessionId = Crypto.randomUUID();
+Test and live modes have different meter IDs. Keep them out of the code and in a Worker variable. `process.env.NODE_ENV` isn't reliable on Workers; switch via `wrangler.toml` vars or secrets.
 
-// Use the same sessionId whether this is the first attempt or a retry
-await reportUsage({ customerId, eventName: 'ai_api_call', sessionId });
-```
+### Pitfall 3: Mapping App Users to Stripe Customers
 
-If you generate a new `sessionId` on each retry, you lose the deduplication benefit. Generate it once per user action and persist it in state across retry attempts.
-
-### Pitfall 2: Meter Summary Lag in Test Mode
-
-After sending a Meter Event in Stripe test mode, usage summaries take 5–10 minutes to update. If you call `listEventSummaries` immediately after creating an event in a test environment, you'll see 0 — and may waste significant debugging time assuming something is broken.
-
-The right way to verify events are arriving is to check **Developers → Events** in the Stripe dashboard. The event should appear there within seconds of being created. Once you've confirmed the event is arriving, wait 5–10 minutes and then check the usage summary.
-
-In production, the lag is similar. Your usage display UI should include a note like "Usage data is updated every few minutes" to set correct expectations.
-
-### Pitfall 3: Customer ID Mapping Goes Missing
-
-Your app's internal `userId` and Stripe's `customerId` are different identifiers. If you don't persist the mapping between them at signup, you'll eventually hit a situation — usually during a major refactor or database migration — where you can't determine which Stripe Customer a Meter Event should be attributed to.
+Create the Stripe Customer at sign-up and store it against your app's user ID. Without that table you won't know which customer to report against.
 
 ```typescript
-// At signup: create Stripe Customer and persist the mapping immediately
-async function onUserSignUp(
-  userId: string,
-  email: string,
-  db: Database
-): Promise<string> {
-  const stripe = new Stripe(env.STRIPE_SECRET_KEY);
-
-  // Create Stripe Customer with app userId in metadata for reverse lookup
-  const customer = await stripe.customers.create({
-    email,
-    metadata: { app_user_id: userId },
-  });
-
-  // Persist synchronously — don't fire-and-forget this
-  await db.users.update({
-    where: { id: userId },
-    data: { stripe_customer_id: customer.id },
-  });
-
-  return customer.id;
-}
+const customer = await stripe.customers.create({
+  email,
+  metadata: { app_user_id: userId },
+});
+await supabase.from('users').update({ stripe_customer_id: customer.id }).eq('id', userId);
 ```
 
-Store the `stripe_customer_id` in a column on your users table with a unique constraint. Index it. You'll be querying by it frequently. The `metadata.app_user_id` on the Stripe Customer object also lets you look up your user from the Stripe side, which is useful when handling webhooks.
+### Pitfall 4: An Accepted Event Isn't Necessarily on the Invoice
 
-If you're adding metered billing to an existing app that doesn't have Stripe Customer IDs for all users, build the migration script before you launch. It's much easier to run a one-time migration on a Sunday than to retroactively patch six months of missing usage data.
+Accepting an event is not the same as it landing on an invoice. Timestamps must be within the past 35 days or up to 5 minutes in the future, and events that arrive after an invoice is finalized can show up in summaries without changing it. Invalid events are reported asynchronously (`v1.billing.meter.error_report_triggered`), so subscribe to that webhook.
 
-## A Retry Queue That Doesn't Lose Usage Reports
+## Not Losing Failed Reports: A Retry Queue
 
-Back in Step 3, the failure path simply pushed the report into a "retry queue" and moved on. Let's build that queue for real.
-
-My first instinct as an indie developer was to skip this entirely — log the failure, fix it by hand later. That plan survived about two weeks of production traffic. Report failures don't arrive one at a time; they arrive in clusters, triggered by a flaky network window or a transient 5xx on Stripe's side. Backfilling them manually stopped being realistic almost immediately.
-
-Cloudflare Queues lets you keep the whole retry mechanism inside Workers. First, define the queue in `wrangler.toml`:
+Step 2 queued the failures a resend can fix. First `wrangler.toml`:
 
 ```toml
-# wrangler.toml
 [[queues.producers]]
 queue = "meter-retry"
 binding = "METER_RETRY"
@@ -471,228 +304,173 @@ max_retries = 5
 dead_letter_queue = "meter-retry-dlq"
 ```
 
-When the Stripe call in your Step 2 handler fails, enqueue the report from the `catch` block:
+The consumer resends with the same `identifier`:
 
 ```typescript
-// Called from the catch block of the Step 2 handler
-await env.METER_RETRY.send({
-  customerId: body.customerId,
-  eventName: body.eventName,
-  value: body.value,
-  idempotencyKey, // carry the SAME key used on the first attempt
-  failedAt: Date.now(),
-});
-```
-
-The consumer is a `queue()` handler in the same Worker:
-
-```typescript
-interface RetryPayload {
-  customerId: string;
-  eventName: string;
-  value?: number;
-  idempotencyKey: string;
-  failedAt: number;
-}
-
 export default {
   async queue(batch: MessageBatch<RetryPayload>, env: Env): Promise<void> {
-    const stripe = new Stripe(env.STRIPE_SECRET_KEY);
     for (const msg of batch.messages) {
       try {
-        await stripe.billing.meterEvents.create(
-          {
-            event_name: msg.body.eventName,
-            payload: {
-              stripe_customer_id: msg.body.customerId,
-              ...(msg.body.value !== undefined && { value: String(msg.body.value) }),
-            },
-          },
-          { idempotencyKey: msg.body.idempotencyKey }
-        );
+        await sendMeterEvent(env, msg.body); // same identifier as the first attempt
         msg.ack();
       } catch {
-        msg.retry({ delaySeconds: 300 }); // try again in 5 minutes
+        msg.retry({ delaySeconds: 300 });
       }
     }
   },
 };
 ```
 
-Two design decisions matter here.
+Two points. **Decide the `identifier` before the first send and reuse it on every retry.** And decide up front that usage which falls into the DLQ after `max_retries` is not billed — I would rather under-collect a little than lose a user's trust. Since `identifier` uniqueness is only guaranteed for at least 24 hours, keep the total retry span inside that; this configuration is up to five attempts five minutes apart, roughly 25 minutes.
 
-First, **generate the idempotency key before the first attempt and reuse it on every retry**. If you mint a fresh key per retry, the case where the original request actually reached Stripe — but the response got lost — turns into a double charge. The `sessionId`-based key from the pitfalls section travels inside the queue payload for exactly this reason.
+## Fewer Calls: Aggregation and a Monthly Cap
 
-Second, **decide up front that anything landing in the dead-letter queue does not get billed**. Overcharging users costs you trust you can't buy back; undercharging costs you a few cents. Check the DLQ count weekly — if it grows steadily, the problem is usually in the producer's payload shape, not in Stripe.
+Stripe's live-mode Meter Event endpoint is limited to 1,000 calls per second (the v2 event stream for high throughput is separate, at 10,000 events per second). It's worth knowing the aggregate-first design before you need it.
 
-## Aggregating High-Frequency Events Before They Hit Stripe
-
-Sending one meter event per chat message is perfectly fine at launch. As usage grows, though, you start brushing against Stripe's API rate limits and paying for a Workers invocation per message. Retrofitting aggregation under load is painful, so it's worth knowing the pattern before you need it.
-
-The idea is simple: **accumulate usage on your side and flush it to Stripe periodically**. A Durable Object holds a per-customer counter and an alarm flushes every five minutes as a single event:
+Give each user a Durable Object, buffer usage there, and flush it in an alarm. Keeping a monthly counter in the same place lets you do the Step 6 cap check here too.
 
 ```typescript
-// Durable Object: buffer per-customer usage, flush every 5 minutes
+const WINDOW_MS = 5 * 60 * 1000;
+
 export class MeterBuffer {
-  constructor(
-    private state: DurableObjectState,
-    private env: Env
-  ) {}
+  constructor(private state: DurableObjectState, private env: Env) {}
 
   async fetch(request: Request): Promise<Response> {
-    const { customerId, value } = await request.json<{
-      customerId: string;
-      value: number;
-    }>();
+    const store = this.state.storage;
+    const monthKey = `month:${new Date().toISOString().slice(0, 7)}`; // UTC calendar month
+    const monthTotal = (await store.get<number>(monthKey)) ?? 0;
 
-    // Persist the counter so a DO restart can't lose counts
-    const key = `count:${customerId}`;
-    const current = (await this.state.storage.get<number>(key)) ?? 0;
-    await this.state.storage.put(key, current + value);
-
-    // Schedule a flush if one isn't already pending
-    if ((await this.state.storage.getAlarm()) === null) {
-      await this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
+    if (new URL(request.url).pathname === '/peek') {
+      return Response.json({ monthTotal });
     }
-    return new Response('ok');
+
+    const { customerId, value } = await request.json<{ customerId: string; value: number }>();
+    const pending = (await store.get<number>('pending')) ?? 0;
+    await store.put({ [monthKey]: monthTotal + value, pending: pending + value, customerId });
+
+    if ((await store.getAlarm()) === null) {
+      await store.setAlarm(Date.now() + WINDOW_MS);
+    }
+    return Response.json({ monthTotal: monthTotal + value });
   }
 
   async alarm(): Promise<void> {
-    const stripe = new Stripe(this.env.STRIPE_SECRET_KEY);
-    const windowId = Math.floor(Date.now() / (5 * 60 * 1000)); // 5-minute window ID
-    const entries = await this.state.storage.list<number>({ prefix: 'count:' });
+    const store = this.state.storage;
+    const sending = (await store.get<number>('pending')) ?? 0;
+    if (sending <= 0) return;
+    const customerId = (await store.get<string>('customerId'))!;
+    const seq = (await store.get<number>('seq')) ?? 0;
 
-    for (const [key, total] of entries) {
-      const customerId = key.slice('count:'.length);
-      await stripe.billing.meterEvents.create(
-        {
-          event_name: 'ai_api_call',
-          payload: {
-            stripe_customer_id: customerId,
-            value: String(total),
-          },
-        },
-        { idempotencyKey: `flush_${customerId}_${windowId}` }
-      );
-      await this.state.storage.delete(key);
-    }
+    // If this throws, the alarm is retried automatically with the same seq and identifier
+    await sendMeterEvent(this.env, {
+      customerId,
+      value: sending,
+      identifier: `flush_${customerId}_${seq}`,
+    });
+
+    // Keep what arrived during the send; subtract only what was sent
+    const rest = ((await store.get<number>('pending')) ?? 0) - sending;
+    await store.put({ pending: Math.max(rest, 0), seq: seq + 1 });
+    if (rest > 0) await store.setAlarm(Date.now() + WINDOW_MS);
   }
 }
 ```
 
-If a flush fails, it plugs straight into the retry queue from the previous section. The counters live in Durable Object storage rather than memory so that hibernation or a restart can't silently drop usage.
+My first draft deleted the key after sending, which also deleted any usage added while the Stripe call was in flight. It also derived its window number from the clock, so an alarm retry could produce a different `identifier`. Advancing a sequence number only on a successful send closes both holes at once.
 
-The trade-off is honest to state: your in-app real-time usage display now lags by up to one aggregation window. My resolution is to keep two counters with different jobs — the Stripe meter is the billing source of truth, and a lightweight app-side counter (or KV value) is the fast display estimate. Keep the window in the 5–15 minute range; stretch it much further and a flush can straddle the billing period boundary at month end, which is a genuinely annoying bug to chase.
-
-## Application Patterns for Different App Types
-
-**AI chat app**: Charge per message. Show "X / 100 messages this month" in the UI. Use "messages" rather than "tokens" as the unit — it's more intuitive for consumer apps, and you can adjust the internal token-to-message ratio as AI models change without confusing users.
-
-**Image generation app**: Weight the meter value by generation complexity:
+Using it from the handler:
 
 ```typescript
-// Different AI operations have different cost profiles
-const OPERATION_WEIGHTS = {
-  text_generation: 1,
-  image_generation: 5,      // image gen costs ~5x text gen
-  video_generation: 20,     // video gen costs ~20x text gen
-  audio_transcription: 2,   // per minute of audio
-} as const;
+const id = env.METER_BUFFER.idFromName(user.stripeCustomerId);
+const buffer = env.METER_BUFFER.get(id);
 
-type OperationType = keyof typeof OPERATION_WEIGHTS;
-
-async function reportWeightedUsage(
-  customerId: string,
-  operation: OperationType,
-  sessionId: string
-): Promise<void> {
-  const weight = OPERATION_WEIGHTS[operation];
-  await reportUsage({
-    customerId,
-    eventName: 'ai_api_call',
-    value: weight,
-    sessionId,
-  });
+const { monthTotal } = await (await buffer.fetch('https://do/peek')).json<{ monthTotal: number }>();
+if (monthTotal >= user.monthlyCap) {
+  return Response.json({ error: 'monthly_cap_reached' }, { status: 429 }); // your own cap
 }
+
+const answer = await callModel(message, env);
+ctx.waitUntil(buffer.fetch('https://do/add', {
+  method: 'POST',
+  body: JSON.stringify({ customerId: user.stripeCustomerId, value: 1 }),
+}));
 ```
 
-This lets you use a single Meter across all AI operations while pricing them proportionally to their actual cost. As underlying model pricing changes, you only need to update the `OPERATION_WEIGHTS` constants.
+Aggregation has a cost: Stripe lags by up to a window. Read the number you show users from the Durable Object's `monthTotal`, and treat Stripe as the basis for the invoice. With aggregation in place the alarm owns retries, so the queue above drops out of the path.
 
-**Document processing app**: Set `value` to the number of pages or words processed. "Per page processed" is a unit that enterprise customers especially find easy to reason about when forecasting their costs.
+**What I ran:** I exercised this Durable Object logic against a mock of storage, alarms, and Stripe, and confirmed that (1) a failed send is resent with the same `identifier`, (2) usage added mid-send is not lost, and (3) the sequence number advances only after success. Behavior on real Cloudflare and real latency are not verified.
 
-**Code generation app**: Charge per code generation request. For developer-focused apps, sophisticated users often appreciate the transparency of seeing their exact usage data — consider exposing a usage API that they can query programmatically.
+## Choosing the Unit
 
-## Prepaid Credits vs. Metered Billing — Choosing the Right Model
+The unit is the most hands-on design decision here.
 
-Everything so far has assumed postpaid metering, but there's a second way to charge fairly for usage: sell credits up front — "500 yen for 100 messages" — and burn them down. Which model fits is mostly decided by how you distribute the app, so here's the comparison I wish I'd had earlier.
+- **AI chat** — one message, one unit, is easiest for users to grasp. Token billing is more accurate but needs thought in how you present it.
+- **Image or video generation** — weight by how heavy the operation is.
+- **Transcription and summaries** — use minutes of audio.
+
+```typescript
+const OPERATION_WEIGHTS = {
+  text: 1,
+  image: 5,
+  audio_minute: 2,
+} as const; // placeholder weights — derive real ones from your cost ratios
+
+// e.g. an image generation is 5 units
+await buffer.fetch('https://do/add', {
+  method: 'POST',
+  body: JSON.stringify({ customerId, value: OPERATION_WEIGHTS.image }),
+});
+```
+
+When costs change, you only edit this constant; the meter and the price stay as they are.
+
+## Prepaid Credits as the Alternative
+
+There is a second way to charge fairly: sell usage up front, like "500 yen for 100 messages". Which fits is mostly decided by how you distribute the app, so here is the comparison.
 
 <table>
 <thead>
 <tr><th>Aspect</th><th>Metered billing (Stripe Meter)</th><th>Prepaid credits (consumable IAP)</th></tr>
 </thead>
 <tbody>
-<tr><td>Revenue timing</td><td>Postpaid — collected at month end</td><td>Prepaid — locked in at purchase</td></tr>
+<tr><td>Revenue timing</td><td>Postpaid — billed at period end</td><td>Prepaid — locked in at purchase</td></tr>
 <tr><td>User psychology</td><td>"What will this month cost me?" anxiety</td><td>Fixed spend, known up front</td></tr>
 <tr><td>iOS-only apps</td><td>Limited applicability under Guideline 3.1.1</td><td>Rides the App Store's standard machinery</td></tr>
 <tr><td>Engineering focus</td><td>Reliable reporting and aggregation</td><td>Balance ledger, restore flows, expiry policy</td></tr>
 <tr><td>Unused allowance</td><td>Never exists</td><td>Needs an expiry and refund policy</td></tr>
-<tr><td>B2B and web expansion</td><td>Extends naturally to invoicing and API billing</td><td>Requires a separate web checkout path</td></tr>
+<tr><td>B2B and web expansion</td><td>Extends to invoicing and API billing</td><td>Needs a separate web checkout path</td></tr>
 </tbody>
 </table>
 
-My own split works like this: **for digital features consumed entirely inside an iOS app, use consumable IAP credits; the moment you have a web version or a B2B API surface, Stripe Meter earns its keep**. From a review standpoint, purchases of digital services consumed in-app are expected to go through In-App Purchase, so a mobile-only app rarely has a good reason to pick Stripe Meter. If you run both, unify the internal usage counter and let the app decrement a credit balance while web users get metered postpaid — one measurement layer, two billing frontends.
+My own split: **digital features consumed entirely inside an iOS app get consumable IAP credits; once you have a web version or a B2B API, Stripe Meter earns its keep.** Billing for digital services consumed inside an app generally has to go through In-App Purchase ([App Store Review Guidelines 3.1.1](https://developer.apple.com/app-store/review/guidelines/#in-app-purchase)). Treatment of external payments varies by region and has been changing, so please read the current text before you submit.
 
-Prepaid also has an underrated financial property: revenue is certain at the moment of purchase. When you're an indie developer fronting the AI API costs out of pocket, getting paid before you incur the inference bill smooths cash flow more than I expected it to.
+If you sell on both, unify the internal usage counter: the app draws down credit balance, web users pay by Meter afterward. Prepaid also makes revenue certain at purchase, which helps cash flow if you front the AI API costs.
 
 ## Pre-Launch Checklist
 
-Before going live with metered billing, verify these items:
+- The Step 2 Worker accepts no unauthenticated requests.
+- You have issued an invoice for a small amount of usage to confirm the free allowance and tiered rates.
+- Your own monthly cap behaves correctly just below and just above the limit.
+- You receive webhooks for `billing.alert.triggered` and `v1.billing.meter.error_report_triggered`.
+- Terms and onboarding state the model plainly — "first 100 free, then 1 yen each".
 
-**Stripe Billing Alerts are configured.** Set alerts at 50% and 90% of your expected monthly volume. If one user is consuming 10× the average, you want to know before the invoice is generated.
+For Stripe fundamentals, see [Rork × Stripe Subscription Implementation](/articles/rork-business/rork-stripe-subscription-monetization-guide); for the Workers foundation, [Building REST APIs with Hono and Cloudflare Workers](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide).
 
-**Your pricing page explains the model clearly.** "First 100 messages free, then $0.02 each — capped at $20/month" is clear. "Usage-based billing applies" is not. Show worked examples for light, medium, and heavy users.
+## Three Numbers to Watch Once It's Live
 
-**App store compliance is confirmed.** For iOS App Store distribution, Apple requires In-App Purchase for digital goods and services consumed within the app. Stripe Meter Billing is suitable for B2B apps, web apps accessed through a WebView, physical goods, and services consumed outside the app. Confirm your use case against [App Store Review Guidelines 3.1.1](https://developer.apple.com/app-store/review/guidelines/#in-app-purchase) before your next app review.
-
-**Webhook handling is in place.** Specifically, handle `invoice.payment_failed` to notify users of failed charges and `customer.subscription.deleted` to revoke access when subscriptions lapse.
-
-For more on setting up Cloudflare Workers as a Rork app backend, see [Building REST APIs with Hono and Cloudflare Workers](/articles/rork-dev/rork-hono-cloudflare-workers-rest-api-guide). For Stripe subscription fundamentals, [Rork × Stripe Subscription Implementation](/articles/rork-business/rork-stripe-subscription-monetization-guide) covers the basics in depth.
-
-## Monitoring Usage in Production
-
-Once your metered billing is live, three operational metrics matter most.
-
-**Per-user cost versus revenue.** Query your Stripe meter summaries weekly and compare each user's accumulated usage against their subscription plan. Users consistently hitting the overage tiers are your upgrade candidates — consider triggering an in-app message when someone reaches 80% of their free allowance: "You've used 80 out of 100 free messages this month. Upgrade to remove limits."
-
-**Anomaly detection.** A single user with 10× average usage can be a genuine power user or a bot abusing your service. Set a Stripe Billing Alert at 3× your average monthly per-user spend. When it fires, check whether the usage pattern looks organic — consistent usage throughout the day, or all concentrated in a 10-minute window.
-
-**API cost ratio.** Track your actual AI API costs (from OpenAI, Gemini, or Anthropic dashboards) against the usage-based revenue you're collecting. This ratio should stay below 0.4 (40 cents of AI cost per dollar of revenue). If it drifts above that, your per-unit pricing is too low or your free tier is too generous.
+First, the **cost-to-revenue ratio**: compare your AI API bills with metered revenue. As a starting point, treat cost above about 40% of revenue as a warning line, then re-set it for your own margins.
 
 ```typescript
-// Example: calculate cost ratio for the current month
-async function calculateCostRatio(
-  aiApiCostUSD: number,
-  meteredRevenue: number
-): Promise<{ ratio: number; status: 'healthy' | 'warning' | 'critical' }> {
-  const ratio = aiApiCostUSD / meteredRevenue;
-  return {
-    ratio,
-    status: ratio < 0.4 ? 'healthy' : ratio < 0.6 ? 'warning' : 'critical',
-  };
+function costRatio(aiApiCost: number, meteredRevenue: number) {
+  const ratio = meteredRevenue > 0 ? aiApiCost / meteredRevenue : Infinity;
+  return { ratio, status: ratio < 0.4 ? 'healthy' : ratio < 0.6 ? 'warning' : 'critical' } as const;
 }
 ```
 
-When the cost ratio enters warning territory, the usual culprits are one or two heavy users on a plan that's priced too low for their usage pattern. Reach out to those users directly — in my experience, they're often happy to upgrade to a custom plan, because they're already getting significant value.
+Second, **free-allowance consumption**: telling people in-app at 80% means no bill-day surprises, and it doubles as a natural path to a higher plan.
 
-## Getting Started: The Minimum Viable Implementation
+Third, **outliers**: a user at 10× the average is either a devoted fan or automated abuse. Set Billing Alerts at a few times the average, and when the webhook arrives, look at when the usage happened.
 
-If you want to validate the concept before building the full system, here's the minimum path to a working implementation:
+## Where to Start
 
-1. Create one Meter in the Stripe test dashboard (5 minutes)
-2. Add a single Workers function that calls `stripe.billing.meterEvents.create()` (1 hour)
-3. Call that function after your most important AI operation (30 minutes)
-4. Create a Stripe test subscription with a metered price and verify that events accumulate (15 minutes)
-
-That's it for the first iteration. You don't need the retry queue, the spend caps, or the usage display UI to start. Build those progressively as you learn how your users actually use the app.
-
-Usage-based billing is worth the engineering investment for any app where AI is a core feature and your per-user costs vary significantly. The fair pricing model it enables is good for users, and the sustainable unit economics it creates are good for you. Start with one meter, one event type, and one integration — and build from there.
+Create one meter in Stripe test mode and send a few events by hand. Send the same `identifier` twice and watch the duplicate collapse into one — that alone explains half of this design. It's where I started when re-checking my own.
