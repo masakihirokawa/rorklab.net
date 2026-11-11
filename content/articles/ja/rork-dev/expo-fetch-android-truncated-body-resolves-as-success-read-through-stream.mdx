@@ -1,0 +1,138 @@
+---
+title: "Android の expo/fetch は途切れた応答を成功として返します — 本文をストリームで読む形に替えた理由"
+slug: "expo-fetch-android-truncated-body-resolves-as-success-read-through-stream"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-11-11T10:20"
+author: "Rork Lab"
+description: "通信が途中で切れても Android の expo/fetch では text() が成功し、途中までの文字列が返ります。JSON の SyntaxError に見える理由と、ストリーム読みに替える短い関数をお伝えします。"
+tags: ["expo/fetch", "Android", "ネットワーク", "トラブルシューティング", "Expo SDK"]
+---
+壁紙の一覧を JSON で取ってくる画面で、Android の実機だけ、ごくまれに「JSON Parse error」が出るとしたら——私ならまずサーバー側のレスポンスを疑います。ログに残った文字列の末尾が、閉じ括弧のないところで終わっていれば、なおさらです。
+
+ところが、Expo の GitHub に 11 月 7 日付で上がった報告を読んで、疑う順番を変えることにしました。いま思えば、私は「通信が切れたならエラーになるはず」と信じ込んでいたのだと思います。サーバーは正しく返していて、壊れていたのは「通信が途中で切れた」という事実の伝わり方のほうかもしれない、という内容だったからです。
+
+最初にお伝えしたいのは、いまの Android の `expo/fetch` では、本文の途中で接続が切れても `response.text()` がエラーにならず、届いた分だけの文字列で成功として返ってくる、ということです。
+
+## 何が起きているのか
+
+報告されている条件は、リリースビルドの Android 16 エミュレーターで、`expo` を 57.0.31 に固定した環境です。サーバー側でわざと本文の途中で接続を切るテストを 7 本並べ、結果を表にまとめています。そのうち Android 側の要点を抜き出します（出典: [expo/expo の Issue 53152](https://github.com/expo/expo/issues/53152)）。
+
+<table>
+<thead>
+<tr><th>状況</th><th>期待される動き</th><th>Android での結果</th></tr>
+</thead>
+<tbody>
+<tr><td>本文の途中で接続が切れ、`text()` で読む</td><td>reject（失敗）</td><td>resolve。`{"partial":` まで届いた文字列が返る</td></tr>
+<tr><td>同じ切断を、グローバルの `fetch` 経由で読む</td><td>reject</td><td>resolve（同じ結果）</td></tr>
+<tr><td>読み取り中に `abort()` する</td><td>中断エラーで reject</td><td>resolve。途中までの文字列が返る</td></tr>
+<tr><td>本文が 1 バイトも来ないまま切れる</td><td>`fetch()` か読み取りが reject</td><td>resolve。空文字列が返る</td></tr>
+<tr><td>同じ切断を、`res.body`（ストリーム）で読む</td><td>reject</td><td>reject。「unexpected end of stream」</td></tr>
+</tbody>
+</table>
+
+見ていただきたいのは最後の行です。同じ切断でも、ストリームで読んだときだけ、きちんと失敗として伝わります。
+
+報告者の調べでは、原因は Android 側のコードで状態が上書きされることにあります。本文を読み込む処理が通信エラーを記録したあと、後続の処理が無条件で「完了」の状態に書き換えてしまうのだそうです。`text()` と `arrayBuffer()` は「完了」だけを待っているため、エラーが見えないまま、手元にあった分が返ります。iOS 側にも別の形の不具合があり、そちらは修正済みと書かれています。
+
+JSON を読む場面では、これが `SyntaxError` として現れます。通信の失敗なのに、サーバーが壊れた JSON を返したように見える——ここが、疑う先を間違えやすいところです。
+
+## 私が「疑う順番」を変えた理由
+
+個人開発で壁紙アプリの一覧を読み込む処理を書いてきた私の経験でも、Rork で書き出したコードの多くは、`fetch(url).then(r => r.json())` という形で通信しています。SDK 56 以降は `expo/fetch` がグローバルの `fetch` として入るため、この形のコードがそのまま影響を受けます。別の Issue（[expo/expo の Issue 50213](https://github.com/expo/expo/issues/50213)）にも、その旨が書かれています。
+
+失敗の出方は、次の三通りに分かれます。
+
+- JSON を読む画面では、`SyntaxError` になります。エラー画面は出ますが、原因の見立てを誤りやすいのです
+- テキストを読む画面では、途中で切れた文章がそのまま表示されます
+- ファイルや画像を `arrayBuffer()` で受ける処理では、欠けたデータを正常として保存してしまいます
+
+三番目がいちばん厄介だと感じています。エラーが一度も出ないまま、欠けたファイルが端末に残るからです。気づくのは、あとでそのファイルを開いた誰かが首をかしげたときになります。
+
+## 本文をストリームで読む関数に替える
+
+修正が入るまでの当座の策として、`res.body` を最後まで読んでから文字列にする関数を一つ用意しました。何を解決するかといえば、「途切れたら必ず例外にする」ことだけです。
+
+```ts
+// readBodyText.ts
+// 目的: expo/fetch の text() に頼らず、途切れを必ず例外として受け取る。
+export async function readBodyText(res: Response): Promise<string> {
+  if (!res.body) {
+    // 本文なし（204 など）。ここは text() に任せても安全。
+    return res.text();
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+
+  while (true) {
+    // 切断されると、ここで reject される（報告では "unexpected end of stream"）。
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+  }
+
+  // Content-Length が分かるときだけ、受け取った量と照合する。
+  // 圧縮された応答では、ヘッダーが無いことがあるので、その場合は照合しない。
+  const expected = Number(res.headers.get("content-length"));
+  if (Number.isFinite(expected) && expected > 0 && received !== expected) {
+    throw new Error(`body length mismatch: expected ${expected}, got ${received}`);
+  }
+
+  // チャンクを 1 本につないでから、一度だけ UTF-8 としてデコードする。
+  const merged = new Uint8Array(received);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder("utf-8").decode(merged);
+}
+
+export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const text = await readBodyText(res);
+  return JSON.parse(text) as T;
+}
+```
+
+なぜこう書くのか、三点だけ書き残します。
+
+一つ目は、チャンクを文字列にしてから足さず、バイトのままつないでから一度だけデコードしていることです。日本語は 1 文字が複数バイトで、チャンクの切れ目が文字の途中に来ると、文字化けの原因になります。
+
+二つ目は、`Content-Length` の照合を「あれば行う」にとどめたことです。応答が圧縮されている場合、ヘッダーの値と読み取った量が一致しないことがあり、照合を必須にすると、正常な応答まで弾いてしまいます。ストリームの失敗検知が本命で、長さの照合はお守りです。
+
+三つ目は、`TextDecoder` を使っている点です。お使いの SDK の組み合わせで利用できるかは、一度実機で確かめてください。使えない場合は、ここだけ別の方法に置き換える必要があります。
+
+## 呼び出し側は「一度だけ」やり直します
+
+読み取りが例外になれば、通信の失敗として扱えます。ただし、むやみに繰り返すのは避けたいところです。冪等でない通信（購入や投稿）を再送すると、二重に処理される危険があります。再送の考え方は [Rork アプリの API 通信を堅くする — トークン更新・再試行・冪等性の設計](/articles/rork-dev/rork-api-client-token-refresh-retry-idempotency-design) に書きました。読み取り専用の GET に限って、一度だけやり直す形にしています。
+
+```ts
+// 読み取り専用の GET だけ、1 回やり直す。
+export async function fetchJsonWithOneRetry<T>(url: string): Promise<T> {
+  try {
+    return await fetchJson<T>(url);
+  } catch (e) {
+    // 2 回目も失敗したら、そのまま上に投げる（画面側で再読み込みを案内する）。
+    await new Promise((r) => setTimeout(r, 600));
+    return await fetchJson<T>(url);
+  }
+}
+```
+
+返ってきた JSON の形を検証する層は、別の記事で [Rork が生成した fetch コードに、Zod の検証境界を1枚だけ挟む](/articles/rork-dev/rork-generated-fetch-zod-validation-boundary-layer) 手順を書いています。途切れの検知と形の検証は、役割が違うので、両方置いておく価値があります。
+
+## 修正が入ったら、この関数は外します
+
+報告では、Android 側の修正を提案した変更がまだ取り込まれていない旨が書かれています。状況は日々変わるはずなので、この関数を入れる前に、Issue の最新の状態をご確認ください。修正が入った版に上げたあとは、`fetchJson` を元の書き方に戻すほうが、コードは短く保てます。
+
+戻すときの目印として、関数の先頭に Issue の番号をコメントで残しておくと、数か月後の自分が助かります。
+
+**欠けたデータは、失敗として受け取ります。** 通信が不安定な端末でも、この線引きだけは外さないようにしております。
+
+まずは、アプリの中で `r.json()` や `.text()` を呼んでいる箇所を検索して、読み取り専用で、欠けると困る通信を一つだけ選んでみてください。その一か所を `fetchJson` に替えるところから始めていただければと思います。

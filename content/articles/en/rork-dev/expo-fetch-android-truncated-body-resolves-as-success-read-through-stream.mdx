@@ -1,0 +1,139 @@
+---
+title: "On Android, expo/fetch can return a cut-off response as a success — why I read the body as a stream"
+slug: "expo-fetch-android-truncated-body-resolves-as-success-read-through-stream"
+category: "rork-dev"
+level: "intermediate"
+premium: false
+date: "2026-11-11T10:20"
+author: "Rork Lab"
+description: "If the connection drops mid-response, Android's expo/fetch can still resolve text() with the partial string. Here is why it looks like a JSON SyntaxError, and a short stream-reading helper."
+tags: ["expo/fetch", "Android", "Networking", "Troubleshooting", "Expo SDK"]
+---
+Say a screen that loads a wallpaper list as JSON throws "JSON Parse error" on an Android phone, and only now and then. My first instinct would be to blame the server. If the logged string ended in the middle of an object, with no closing brace, I'd be even more sure.
+
+A report filed on the Expo repository on November 7 made me change the order of my suspicion. The server may have answered correctly. What broke was how the news of a dropped connection reached the app.
+
+Here is the short version. On Android today, if the connection dies in the middle of a response body, `response.text()` does not fail. It resolves with whatever bytes had arrived, as if that were the whole answer.
+
+## What is actually happening
+
+The report uses a release build on an Android 16 emulator, with `expo` pinned to 57.0.31. The author wrote a server that deliberately kills the socket mid-body and ran seven tests. These are the Android rows that matter (source: [Issue 53152 on expo/expo](https://github.com/expo/expo/issues/53152)).
+
+<table>
+<thead>
+<tr><th>Situation</th><th>Expected</th><th>Android result</th></tr>
+</thead>
+<tbody>
+<tr><td>Socket dies mid-body, read with `text()`</td><td>reject</td><td>resolves with `{"partial":`</td></tr>
+<tr><td>Same failure through the global `fetch`</td><td>reject</td><td>resolves, same string</td></tr>
+<tr><td>`abort()` while a read is pending</td><td>reject with an abort error</td><td>resolves with the partial string</td></tr>
+<tr><td>Socket dies before any body bytes</td><td>`fetch()` or the read rejects</td><td>resolves with an empty string</td></tr>
+<tr><td>Same failure read through `res.body` (stream)</td><td>reject</td><td>rejects: "unexpected end of stream"</td></tr>
+</tbody>
+</table>
+
+The last row is the one to look at. The same failure is reported correctly when you read the body as a stream.
+
+According to the reporter, the cause is a state being overwritten in the Android code. The body pump records the I/O error, and the calling code then marks the response as completed no matter what. Since `text()` and `arrayBuffer()` wait only for "completed", the error never reaches them, and they hand back what they have. iOS had its own variant of the problem, and the report says that one has been fixed.
+
+With JSON, this surfaces as a `SyntaxError`. A network failure ends up looking like a server that sent broken JSON — which is exactly the wrong place to go looking.
+
+## Why I changed the order of my suspicion
+
+Much of the code that Rork exports calls `fetch(url).then(r => r.json())`. Since SDK 56, `expo/fetch` is installed as the global `fetch`, so that pattern is affected as is. Another issue ([Issue 50213 on expo/expo](https://github.com/expo/expo/issues/50213)) says so explicitly.
+
+It fails in three different ways:
+
+- Screens that parse JSON: a `SyntaxError`. You see an error, but it points you at the wrong cause.
+- Screens that show text: a sentence that stops halfway, displayed as if it were complete.
+- Code that saves files through `arrayBuffer()`: a damaged file stored as a good one.
+
+The third is the worst. No error ever appears, and a broken file sits on the device until someone opens it later and wonders what went wrong.
+
+## A helper that reads the body as a stream
+
+Until a fix lands, I use one small function that reads `res.body` to the end and only then builds the string. All it solves is this: a cut-off response always becomes an exception.
+
+```ts
+// readBodyText.ts
+// Goal: do not rely on text(); make a truncated body throw.
+export async function readBodyText(res: Response): Promise<string> {
+  if (!res.body) {
+    // No body (204 and similar). text() is safe here.
+    return res.text();
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+
+  while (true) {
+    // On a dropped connection this rejects ("unexpected end of stream" in the report).
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+  }
+
+  // Compare with Content-Length only when the header is present.
+  // Compressed responses may not carry it, so we skip the check then.
+  const expected = Number(res.headers.get("content-length"));
+  if (Number.isFinite(expected) && expected > 0 && received !== expected) {
+    throw new Error(`body length mismatch: expected ${expected}, got ${received}`);
+  }
+
+  // Join the raw bytes first, then decode as UTF-8 exactly once.
+  const merged = new Uint8Array(received);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder("utf-8").decode(merged);
+}
+
+export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const text = await readBodyText(res);
+  return JSON.parse(text) as T;
+}
+```
+
+A few notes on the choices in that code.
+
+First, chunks are joined as bytes and decoded once. A Japanese character takes several bytes, and if a chunk boundary lands inside one, decoding per chunk garbles the text.
+
+Second, the `Content-Length` comparison is optional by design. With compressed responses the header and the bytes you read may not match, and making the check mandatory would reject healthy responses. The stream failure is the real detection; the length check is a talisman.
+
+Third, this uses `TextDecoder`. Please confirm on a real device that it is available in your SDK combination, and swap that one line if it is not.
+
+## Retry once, and only for reads
+
+Once a cut-off body throws, you can treat it as a network failure. I would still not retry blindly: re-sending a non-idempotent request such as a purchase or a post can process it twice. I wrote about that boundary in [Hardening Rork app API calls: token refresh, retries, and idempotency](/articles/rork-dev/rork-api-client-token-refresh-retry-idempotency-design). For read-only GETs, one retry is what I allow.
+
+```ts
+// One retry, for read-only GET requests only.
+export async function fetchJsonWithOneRetry<T>(url: string): Promise<T> {
+  try {
+    return await fetchJson<T>(url);
+  } catch (e) {
+    // If the second attempt fails too, let it propagate
+    // so the screen can offer a reload.
+    await new Promise((r) => setTimeout(r, 600));
+    return await fetchJson<T>(url);
+  }
+}
+```
+
+Checking the shape of the JSON that comes back is a separate layer, which I covered in [One Zod validation boundary for fetch code that Rork generates](/articles/rork-dev/rork-generated-fetch-zod-validation-boundary-layer). Detecting a cut-off and validating a shape do different jobs, so both are worth having.
+
+## When the fix ships, remove the helper
+
+The report notes that a change proposing an Android fix had not been merged at the time of writing. Things move quickly, so please check the current state of the issue before you add this. After you upgrade to a version that includes the fix, going back to the plain call keeps your code shorter.
+
+Leave the issue number in a comment at the top of the function. It will help you in a few months.
+
+**A partial answer should arrive as a failure.** I hold that line even when the connection is poor.
+
+As a first step, search your app for `r.json()` and `.text()`, pick one read-only request where missing data would hurt, and move just that one to `fetchJson`. As an indie developer, I would begin with a single list screen and widen from there.
