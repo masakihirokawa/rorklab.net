@@ -3,21 +3,21 @@
 import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
-ja: [
-    "GPT-6.1 SOL — Rork のモデルメニューに追加（09-29）。Low／Medium／High を選べ、Pro・Max に含まれます",
-    "SONNET 5.5 — UI づくりが得意で、Sonnet 5 より出力が速いモデルが選べます（09-28）",
-    "SONNET 4.5 — Claude API での提供終了は 11/30、残り20日。API 連携を足したアプリは移行先の確認を",
-    "SDK 58 — React Native 0.88 に更新されました。Android のリリース版で R8 が既定オンになり、iOS は SceneDelegate を生成します",
-    "OBSERVE — EAS Observe がネイティブクラッシュも記録します（SDK 57.0.21 以降・10/07）",
-    "NEW — 起動広告が、背面から戻った回にしか出ていませんでした。「前面に戻った」合図が、…",
+  ja: [
+    "EXPO 58.0.25 — expo パッケージの 58.0.25 が公開されました（11/12）",
+    "SUPABASE — Expo の新機能で、ターミナルから Supabase を作り、鍵を各環境へ入れられるようになりました（11/10）",
+    "SONNET 4.5 — Claude API での提供終了は 11/30、残り17日。API 連携を足したアプリは移行先の確認を",
+    "AUDIO — expo-audio の play() が iOS で無音のまま止まるという報告が出ています",
+    "MODELS — Fable 5.2 と Gemini 4 Hydrogen が各社で GA に。Rork のモデルメニューへの反映はまだ確認できていません",
+    "NEW — Android の expo/fetch が途切れた応答を成功扱いする件",
   ],
   en: [
-    "GPT-6.1 SOL — Added to Rork's model menu (09-29) with Low, Medium and High effort; included on Pro and Max",
-    "SONNET 5.5 — Claude Sonnet 5.5 is selectable: strong at UI design and faster than Sonnet 5 (09-28)",
-    "SONNET 4.5 — Retires on the Claude API on 11/30, 20 days left. If your app calls it, check the migration target",
-    "SDK 58 — Moves to React Native 0.88. R8 is now on by default in Android release builds, and iOS prebuild generates a SceneDelegate",
-    "OBSERVE — EAS Observe now records native crashes too (SDK 57.0.21 or later, 10/07)",
-    "NEW — My App Open Ad Only Showed When the App…"
+    "EXPO 58.0.25 — The expo package 58.0.25 is out (11/12)",
+    "SUPABASE — Expo can now create a Supabase project and put its keys into every environment from the terminal (11/10)",
+    "SONNET 4.5 — Retires on the Claude API on 11/30, 17 days left. If your app calls it, check the migration target",
+    "AUDIO — Reports say expo-audio play() can stall silently on iOS",
+    "MODELS — Fable 5.2 and Gemini 4 Hydrogen are now GA; their arrival in Rork's model menu is not confirmed yet",
+    "NEW — Android expo/fetch Treats Truncated Bodies as Success",
   ]
 };
 
