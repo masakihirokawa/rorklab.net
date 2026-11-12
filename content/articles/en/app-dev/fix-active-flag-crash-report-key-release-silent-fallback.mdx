@@ -1,0 +1,281 @@
+---
+title: "For the Day a Crash You Fixed Refuses to Go Away: Give Every Fix a Flag That Says It Is Active"
+slug: "fix-active-flag-crash-report-key-release-silent-fallback"
+category: "app-dev"
+level: "intermediate"
+premium: true
+date: "2026-11-12T22:30"
+author: "Rork Lab"
+description: "A fix that worked in debug was silently disabled in release by code shrinking. Record whether each fix is active as a crash-report key and a log line, and confirm it on release day in an Expo Android app."
+tags: ["Expo", "Android", "R8", "Crashlytics", "Release Verification"]
+highlights:
+  - "When a crash you fixed keeps showing up, you will be able to tell from the crash report's key column alone whether the fix is not running in production or the app is failing along another path"
+  - "You can now write fail-safe code that falls back quietly for users but always reports that it fell back, so you avoid waiting weeks without knowing a fix never took effect"
+  - "You will be able to launch a release build once on a local device and check from the log, mechanically, that every fix you shipped is active"
+---
+
+A few days after shipping the version with the fix, I opened the crash list one morning. The most frequent exception was still sitting at the top. Instead of dropping, the count was slowly climbing.
+
+This happened in the Android version of one of my wallpaper apps. An exception thrown inside the page-swiping component accounted for most of the crashes at the time. With the fix in place, I could fling through pages on a debug build on a real device as much as I liked and it never crashed.
+
+Yet production did not improve. It was the kind of moment where you want to believe there must be another path. In reality, the fix itself had been disabled in its entirety, only in production.
+
+**Code that steps back to stay safe must always report that it stepped back.** That is the line I drew most firmly from this episode. As an indie developer, I am writing it down here, translated into the setting of an Android app built with Expo.
+
+## What was actually happening
+
+The fix replaced the "layout manager" inside the page-swiping component with a version that swallowed the exception. Because it is an internal part, there is no public way to swap it. So I located the internal field **by name** and replaced it through reflection.
+
+In case the swap failed, I also added code that restored the original manager. It was an ordinary safety net, meant to keep the app from crashing.
+
+In release builds, R8 renames classes and fields to short names. The field I was looking up by name could not be found, so the safety net kicked in and restored the original. The app did not crash. But the fix was not running either, and nothing anywhere reported that.
+
+In debug, R8 does not run, so names stay as written. That is why the fix looked correct during on-device testing.
+
+<table>
+  <thead>
+    <tr><th>Step</th><th>debug</th><th>release</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Look up the field by name</td><td>Found</td><td>Not found (the name changed)</td></tr>
+    <tr><td>Swap</td><td>Succeeds</td><td>Safety net restores the original</td></tr>
+    <tr><td>App behavior</td><td>Exception disappears</td><td>No crash from the swap, but the same exception as before</td></tr>
+    <tr><td>Visible from outside</td><td>Nothing</td><td>Nothing</td></tr>
+  </tbody>
+</table>
+
+The last row was the real problem. In neither build could I confirm from the outside whether the fix was in effect.
+
+## Where the same thing can happen in an Expo project
+
+In an Expo Android project, the gap between debug and release opens the moment you enable shrinking for release. Some projects leave it off by default, so it is worth checking your own settings once.
+
+With shrinking enabled, anything that relies on names becomes fragile:
+
+- A config plugin or native module that looks up a library's internal field or method by name
+- A class name passed as a string to `Class.forName`
+- A resource ID looked up from a string (a separate hole I wrote about in [a release build that crashed on launch because a resource could not be found](/en/articles/app-dev/android-release-only-crash-resource-looked-up-by-name-keep-xml))
+
+The JavaScript side has a similar gap. Code inside `if (__DEV__)` is stripped from the release bundle. If you place a fix in a development-only branch, it simply does not exist in production.
+
+## Look it up by type, not by name
+
+The approach I eventually settled on was to look the field up by its type. Comparing class objects is not affected by renaming.
+
+If two fields share the same type, though, you can no longer tell which one you grabbed. So I treated it as success only when exactly one match was found, and as failure otherwise.
+
+```kotlin
+import java.lang.reflect.Field
+
+/**
+ * Find a field in owner (and its superclasses) assignable to type.
+ * Return it only when exactly one matches; return null for zero or two or more.
+ * Because it searches by type, not by name, R8 renaming does not affect it.
+ */
+fun findSingleFieldByType(owner: Class<*>, type: Class<*>): Field? {
+    val hits = mutableListOf<Field>()
+    var c: Class<*>? = owner
+    while (c != null && c != Any::class.java) {
+        for (f in c.declaredFields) {
+            if (type.isAssignableFrom(f.type)) hits.add(f)
+        }
+        c = c.superclass
+    }
+    if (hits.size != 1) return null   // ambiguous: do not grab anything, treat as failure
+    return hits[0].apply { isAccessible = true }
+}
+```
+
+Even after switching to type-based lookup, I added a rule to the shrinker configuration as insurance to keep the names. In Expo you can write it with `extraProguardRules` in `expo-build-properties`, and it survives every prebuild.
+
+```json
+{
+  "expo": {
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "extraProguardRules": "-keepclassmembernames class androidx.viewpager2.widget.ViewPager2 { <fields>; }"
+          }
+        }
+      ]
+    ]
+  }
+}
+```
+
+`-keepclassmembernames` does not protect members from removal; it prevents the members that remain from being renamed. Which rule you need depends on whether you want to stop removal or stop renaming. Replace the target class with the component you are actually patching.
+
+I think of this rule as insurance, not the main fix. If a library update changes the field's actual name, the name you protected no longer helps.
+
+## Give the fix a flag that says it is active
+
+This is the heart of it. Type-based lookup closes this particular hole. But if the next fix stops working for a different reason, I might again go weeks without noticing.
+
+So I built a small helper that records, for each fix, whether it became active in production, writing it both to a crash-report key and to the device log. When a crash happens, the keys at that moment arrive with it.
+
+```kotlin
+import android.util.Log
+import com.google.firebase.crashlytics.FirebaseCrashlytics
+
+/**
+ * Record a per-fix "active" flag.
+ * - Crashlytics custom key: arrives together with production crashes
+ * - logcat (tag FixFlags): for checking a release build locally
+ */
+object FixFlags {
+    private const val TAG = "FixFlags"
+
+    fun record(id: String, active: Boolean, detail: String = "") {
+        val key = "fix_$id"   // e.g. fix_pager_guard
+        try {
+            FirebaseCrashlytics.getInstance().setCustomKey(key, active)
+            if (detail.isNotEmpty()) {
+                FirebaseCrashlytics.getInstance().setCustomKey("${key}_why", detail.take(100))
+            }
+        } catch (t: Throwable) {
+            // never let a recording failure take the app down
+        }
+        Log.i(TAG, "$key=$active ${detail.take(100)}")
+    }
+}
+```
+
+At the call site, always write `false` inside the branch where the safety net steps back. Forget that, and you are back to the original "quietly fall back" shape.
+
+```kotlin
+import androidx.recyclerview.widget.RecyclerView
+import androidx.viewpager2.widget.ViewPager2
+
+fun installPagerGuard(pager: ViewPager2) {
+    val field = findSingleFieldByType(ViewPager2::class.java, RecyclerView.LayoutManager::class.java)
+    if (field == null) {
+        FixFlags.record("pager_guard", false, "field not resolved")
+        return   // keep the original manager, but the step-back is now recorded
+    }
+    try {
+        // perform the swap here (replace with your own fix)
+        FixFlags.record("pager_guard", true)
+    } catch (t: Throwable) {
+        FixFlags.record("pager_guard", false, t.javaClass.simpleName)
+    }
+}
+```
+
+Put only a short clue such as an exception class name in `detail`. Do not include device details or anything tied to a user.
+
+## The same flag for JavaScript-side fixes
+
+Workarounds you add in the React Native layer can be recorded the same way. If you use `@react-native-firebase/crashlytics`, send them as attributes.
+
+```ts
+import crashlytics from '@react-native-firebase/crashlytics';
+
+/** Record whether a JS-side workaround became active in production */
+export async function recordFix(id: string, active: boolean, detail = '') {
+  const key = `fix_${id}`;
+  try {
+    await crashlytics().setAttribute(key, String(active));
+    if (detail) await crashlytics().setAttribute(`${key}_why`, detail.slice(0, 100));
+  } catch {
+    // ignore recording failures (never block the app)
+  }
+  console.info(`[FixFlags] ${key}=${active}`);
+}
+
+// Example: apply the workaround outside __DEV__ and record whether it applied
+export function applyListGuard(listRef: { current: unknown }) {
+  const ok = listRef.current != null;
+  void recordFix('list_guard', ok, ok ? '' : 'ref missing');
+  return ok;
+}
+```
+
+The point to watch is that the call to `recordFix` does not end up inside `if (__DEV__)`. If the flag itself becomes development-only, production tells you nothing.
+
+## Launch release locally and check the flags
+
+Before shipping, launch the release build once on a device or emulator and check from the log that every flag is present. Write down the list of flags you expect, and fail if any is missing or `false`.
+
+```bash
+#!/usr/bin/env bash
+# After launching a release build, check that every FixFlags entry is true
+# Usage: ./check-fix-flags.sh pager_guard list_guard
+set -euo pipefail
+[ "$#" -ge 1 ] || { echo "Pass at least one expected flag id"; exit 2; }
+
+# Clear the log, then launch the app and walk through the screens
+adb logcat -c
+echo "Launch the app, pass through the screens the fixes touch, then press Enter"
+read -r _
+
+LOG="$(adb logcat -d -s FixFlags:I ReactNativeJS:I)"
+FAIL=0
+for id in "$@"; do
+  line="$(printf '%s\n' "$LOG" | grep -E "fix_${id}=" | tail -1 || true)"
+  if [ -z "$line" ]; then
+    echo "NG  fix_${id}: no record found (the call may not be in the release build)"; FAIL=1
+  elif printf '%s' "$line" | grep -q "fix_${id}=true"; then
+    echo "OK  fix_${id}"
+  else
+    echo "NG  fix_${id}: ${line##*FixFlags*: }"; FAIL=1
+  fi
+done
+exit "$FAIL"
+```
+
+`adb logcat -s` filters by tag. React Native's `console` output normally appears in logcat under the `ReactNativeJS` tag. If your release setup strips `console`, it will not appear, so check the JS-side flags through the crash-report attributes instead.
+
+You can build with `npx expo run:android --variant release`. Passing this script on a debug build tells you almost nothing. The whole point is to pass it on release.
+
+## How to read the keys in production
+
+After release, open an event for any remaining exception and look at its keys. There are only a few readings.
+
+<table>
+  <thead>
+    <tr><th>Key value</th><th>Meaning</th><th>Next step</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>fix_pager_guard = true</td><td>The fix is active, and it still crashed</td><td>Look for another path the fix does not cover</td></tr>
+    <tr><td>fix_pager_guard = false</td><td>The fix stepped back</td><td>Fix the lookup failure using the _why value</td></tr>
+    <tr><td>No key</td><td>An older version without the fix, or a crash before the flag was written</td><td>Check the version and where the flag is written</td></tr>
+  </tbody>
+</table>
+
+In this case, once I shipped the version with type-based lookup, the exception stopped appearing on that version. Because the keys were in place too, even if it had persisted I could have separated "not active" from "another path" on the same day. Compared with weeks of simply waiting for a count to drop, it felt far lighter.
+
+## Pitfalls when adding flags
+
+### Writing the flag too late
+
+If you do not write it right after the swap, events that crash before the flag is written carry no key. Write it in the same function that applies the fix.
+
+### Forgetting false in the fallback branch
+
+If you only write `true` on success, failure shows up as "no key", which you cannot tell apart from an old version. The failure branch is exactly where you must write it.
+
+### More fields of the same type appear
+
+If a library update adds another field of the same type, type-based lookup becomes ambiguous too. The code above treats that as failure, so the flag turns `false` and you notice.
+
+### Too many keys
+
+Crashlytics limits how many custom keys you can set. Keep one key per fix (plus one for the reason), and remove flags that have served their purpose in the next version. When you remove one, leaving a single line in the changelog saying why saves you from hunting for the same flag later.
+
+### Reading true as "fixed"
+
+A flag only says the fix was applied. Whether the problem is solved depends on whether the exception disappeared on the versions where it was applied.
+
+## The first thing to do tomorrow
+
+There are only three steps.
+
+1. Find just one place in your project where you wrote "fall back if it fails" or "do nothing if it is not found".
+2. Add a line that writes a flag in both that branch and the success branch.
+3. Launch a release build once and check that `true` appears in the log.
+
+With only that, the next time you step into the same kind of hole, you will notice in a day rather than in weeks.
+
+Safety nets that prevent crashes are essential for protecting users. But a safety net that steps back in silence hides the failure from the person who built it. Precisely because, as an indie developer, I am the only one watching, I make sure that any step back is always reported.
