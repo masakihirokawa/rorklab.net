@@ -4,12 +4,12 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EXPO 58.0.25 — expo パッケージの 58.0.25 が公開されました（11/12）",
-    "SUPABASE — Expo の新機能で、ターミナルから Supabase を作り、鍵を各環境へ入れられるようになりました（11/10）",
-    "SONNET 4.5 — Claude API での提供終了は 11/30、残り17日。API 連携を足したアプリは移行先の確認を",
-    "AUDIO — expo-audio の play() が iOS で無音のまま止まるという報告が出ています",
-    "MODELS — Fable 5.2 と Gemini 4 Hydrogen が各社で GA に。Rork のモデルメニューへの反映はまだ確認できていません",
-    "NEW — Android の expo/fetch が途切れた応答を成功扱いする件",
+    "EXPO 58.0.25 — expo パッケージは 11/12 公開の 58.0.25 が最新です",
+    "HYDROGEN — Gemini 4 Hydrogen が GA に（11/12）。Rork のモデルメニューへの反映はまだ確認できていません",
+    "SONNET 4.5 — Claude API での提供終了は 11/30、残り16日。API 連携を足したアプリは移行先の確認を",
+    "EXPO GO — ターミナルで a を押すと古い Expo Go APK を取りに行き失敗する、という報告が出ています",
+    "PRICE — Gemini 4 Carbon の導入価格は 11/30 まで。Gemini を呼ぶアプリは 12 月の単価を確認しておくと安心です",
+    "NEW — 直したはずのクラッシュが減らない日に、修正そのものを疑う",
   ],
   en: [
     "EXPO 58.0.25 — The expo package 58.0.25 is out (11/12)",
