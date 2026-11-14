@@ -50,6 +50,7 @@ const SOCIAL_LINKS = [
   { label: "Facebook", href: "https://www.facebook.com/dolice.masakihirokawa/" },
   { label: "LinkedIn", href: "https://www.linkedin.com/in/dolice/" },
   { label: "TikTok", href: "https://www.tiktok.com/@masaki.hirokawa" },
+  { label: "YouTube", href: "https://www.youtube.com/@dolice.masakihirokawa" },
   { label: "note", href: "https://note.com/dolice" },
   { label: "stand.fm", href: "https://stand.fm/channels/692fec268ddb67b39656f211" },
 ];

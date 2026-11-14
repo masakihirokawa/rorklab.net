@@ -11,6 +11,7 @@ const SNS_LINKS = [
   { label: "LinkedIn", href: "https://www.linkedin.com/in/dolice/" },
   { label: "Facebook", href: "https://www.facebook.com/masakihirokawa" },
   { label: "TikTok", href: "https://www.tiktok.com/@masaki.hirokawa" },
+  { label: "YouTube", href: "https://www.youtube.com/@dolice.masakihirokawa" },
 ];
 
 const SISTER_SITES = [
