@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EXPO 58.0.25 — expo パッケージは 11/12 公開の 58.0.25 が最新です",
-    "HYDROGEN — Gemini 4 Hydrogen が GA に（11/12）。Rork のモデルメニューへの反映はまだ確認できていません",
-    "SONNET 4.5 — Claude API での提供終了は 11/30、残り16日。API 連携を足したアプリは移行先の確認を",
-    "EXPO GO — ターミナルで a を押すと古い Expo Go APK を取りに行き失敗する、という報告が出ています",
-    "PRICE — Gemini 4 Carbon の導入価格は 11/30 まで。Gemini を呼ぶアプリは 12 月の単価を確認しておくと安心です",
-    "NEW — 直したはずのクラッシュが減らない日に、修正そのものを疑う",
+    "EXPO 58 — expo パッケージは 11/12 公開の 58.0.25 が最新です",
+    "GEMINI 2.5 — gemini-2.5-flash は 12/1 に API で停止、残り16日。アプリ内のモデル名を確かめてください",
+    "SPEECH — Android で expo-speech の読み上げが無音のまま戻らない、という報告が出ています",
+    "HYDROGEN — Gemini 4 Hydrogen（11/12 GA）の Rork への反映は、changelog にはまだ載っていません",
+    "APPLE ID — Apple Developer Program を個人と法人のどちらで登録するかは、ストアの表示名から考えると決めやすくなります",
+    "NEW — Rork への依頼、日本語と英語で比べて分かったこと",
   ],
   en: [
-    "EXPO 58.0.25 — The expo package 58.0.25 is out (11/12)",
-    "SUPABASE — Expo can now create a Supabase project and put its keys into every environment from the terminal (11/10)",
-    "SONNET 4.5 — Retires on the Claude API on 11/30, 17 days left. If your app calls it, check the migration target",
-    "AUDIO — Reports say expo-audio play() can stall silently on iOS",
-    "MODELS — Fable 5.2 and Gemini 4 Hydrogen are now GA; their arrival in Rork's model menu is not confirmed yet",
-    "NEW — Android expo/fetch Treats Truncated Bodies as Success",
+    "EXPO 58 — The expo package's latest release is 58.0.25, published 11/12",
+    "GEMINI 2.5 — gemini-2.5-flash shuts down on the API on 12/1, 16 days left. Check the model names inside your app",
+    "SPEECH — On Android, expo-speech reportedly stays silent after the TTS engine dies or the activity is recreated",
+    "HYDROGEN — Gemini 4 Hydrogen (GA 11/12) has not appeared in Rork's changelog yet",
+    "APPLE ID — Individual or organization enrollment in the Apple Developer Program? Start from the seller name you want on the store",
+    "NEW — Prompting Rork in Japanese vs English: What We Learned",
   ]
 };
 
