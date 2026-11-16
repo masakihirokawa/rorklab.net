@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EXPO 58 — 週末の新規はなく、expo パッケージは 58.0.25（11/12）が最新です",
-    "GEMINI 2.5 — gemini-2.5-flash は 12/1 に API で停止、残り15日。アプリ内のモデル名を確かめてください",
-    "CAMERA — cameraPermission を false にすると iOS のカメラ説明文まで消える、という報告が出ています",
-    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 に提供終了、AI 連携を足したアプリは移行先の確認を",
-    "PLIST — 公開前に、アプリが使う権限と説明文の対応を一覧で確かめると審査で戻されにくくなります",
-    "NEW — Rork への依頼、日本語と英語で比べて分かったこと",
+    "EXPO 58 — Expo の最新は expo@58.0.25（11/12）のまま、新しいリリースは出ていません",
+    "RORK — rork.com の changelog は 9/29 の更新が最新のままです",
+    "GEMINI 2.5 — gemini-2.5-flash・pro の API 停止は 12/1、残り14日。アプリに埋め込んだモデル名は審査待ちも見込んでください",
+    "AGE RANGE — iOS 27 で増えた年齢確認のエラー3種を、アプリ側でどう見分けるかという問いが出ています",
+    "WATERMARK — Claude の生成テキストに 11/16 から透かしが入ります。AI で書いた説明文を使うアプリは一度確かめておくと安心です",
+    "NEW — cameraPermission を false にしたら QR 読み取りが止まった",
   ],
   en: [
-    "EXPO 58 — Nothing new over the weekend; the expo package is still at 58.0.25 (11/12)",
-    "GEMINI 2.5 — gemini-2.5-flash shuts down on the API on 12/1, 15 days left. Check the model names inside your app",
-    "CAMERA — Setting cameraPermission to false reportedly strips the iOS camera usage description too",
-    "SONNET 4.5 — Sonnet 4.5 retires on the Claude API on 11/30. Apps with an AI feature should confirm their replacement",
-    "PLIST — Listing every permission your app uses next to its usage text before release helps avoid review rejections",
-    "NEW — Prompting Rork in Japanese vs English: What We Learned",
+    "EXPO 58 — Expo is still on expo@58.0.25 (11/12), with no newer release yet",
+    "RORK — The rork.com changelog still shows 9/29 as its latest entry",
+    "GEMINI 2.5 — gemini-2.5-flash and pro shut down on the API on 12/1, 14 days left. Allow for review time if model names ship in your app",
+    "AGE RANGE — Developers ask how to tell apart the three new iOS 27 age-range errors in their apps",
+    "WATERMARK — Claude-generated text carries a watermark from 11/16; worth checking if your app ships AI-written copy",
+    "NEW — Turning Off cameraPermission Broke QR Scanning",
   ]
 };
 
