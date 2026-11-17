@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EXPO 58 — Expo の最新は expo@58.0.25（11/12）のまま、新しいリリースは出ていません",
+    "EXPO 58 — Expo は expo@58.0.26 と expo-web-browser@58.1.0 を 11/17 に公開しました",
     "RORK — rork.com の changelog は 9/29 の更新が最新のままです",
-    "GEMINI 2.5 — gemini-2.5-flash・pro の API 停止は 12/1、残り14日。アプリに埋め込んだモデル名は審査待ちも見込んでください",
-    "AGE RANGE — iOS 27 で増えた年齢確認のエラー3種を、アプリ側でどう見分けるかという問いが出ています",
-    "WATERMARK — Claude の生成テキストに 11/16 から透かしが入ります。AI で書いた説明文を使うアプリは一度確かめておくと安心です",
-    "NEW — cameraPermission を false にしたら QR 読み取りが止まった",
+    "GEMINI 2.5 — gemini-2.5-flash・pro の API 停止は 12/1、残り13日。アプリに埋め込んだモデル名は審査待ちも見込んでください",
+    "AUTH TAB — Android でログイン用のタブを開いている間にアプリが落とされる、という問いが出ています",
+    "APP ICON — アイコンを差し替えても古いままのときは、キャッシュ・ビルド番号・ストア反映の順に確かめると早く片づきます",
+    "NEW — iOS 27 の年齢確認エラーを「待つ・進む・直す」に分ける",
   ],
   en: [
-    "EXPO 58 — Expo is still on expo@58.0.25 (11/12), with no newer release yet",
+    "EXPO 58 — Expo shipped expo@58.0.26 and expo-web-browser@58.1.0 on 11/17",
     "RORK — The rork.com changelog still shows 9/29 as its latest entry",
-    "GEMINI 2.5 — gemini-2.5-flash and pro shut down on the API on 12/1, 14 days left. Allow for review time if model names ship in your app",
-    "AGE RANGE — Developers ask how to tell apart the three new iOS 27 age-range errors in their apps",
-    "WATERMARK — Claude-generated text carries a watermark from 11/16; worth checking if your app ships AI-written copy",
-    "NEW — Turning Off cameraPermission Broke QR Scanning",
+    "GEMINI 2.5 — gemini-2.5-flash and pro shut down on the API on 12/1, 13 days left. Allow for review time if model names ship in your app",
+    "AUTH TAB — Developers ask why Android kills their app while the login Custom Tab is open",
+    "APP ICON — Icon still old after replacing it? Check the cache, then the build number, then store propagation",
+    "NEW — When Age Checks Fail on iOS 27, Sort the Errors Into Wait, Continue, or Fix",
   ]
 };
 
