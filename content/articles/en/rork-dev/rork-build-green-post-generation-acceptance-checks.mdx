@@ -5,7 +5,7 @@ category: "rork-dev"
 level: "intermediate"
 premium: true
 date: "2026-08-21T11:00"
-updated: "2026-08-21T11:00"
+updated: "2026-11-17T14:42"
 author: "Rork Lab"
 description: "A successful build does not mean a shippable build. Here are the four failure classes an AI build loop cannot see, and a dependency-free script that inspects the artifact itself before you submit."
 tags: ["Rork", "Expo", "Android", "Release", "Quality"]
@@ -91,14 +91,15 @@ import re
 import sys
 import zipfile
 
-# 1) Desugaring: references to java.util.function.* without the
-#    rewritten classes will crash on devices below minSdk 24
-DESUGARED_TARGETS = [
-    b"Ljava/util/function/Supplier;",
-    b"Ljava/util/function/Consumer;",
-    b"Ljava/util/Optional;",
-    b"Ljava/time/Duration;",
-]
+# 1) Desugaring: each API has its own minimum level
+#    (java.util.function and Optional need 24, java.time needs 26)
+DESUGARED_TARGETS = {
+    b"Ljava/util/function/Supplier;": 24,
+    b"Ljava/util/function/Consumer;": 24,
+    b"Ljava/util/Optional;": 24,
+    b"Ljava/time/Duration;": 26,
+    b"Ljava/time/LocalDate;": 26,
+}
 DESUGARED_PREFIX = b"Lj$/"
 
 # 4) Files that must never ship inside the artifact
@@ -108,7 +109,7 @@ FORBIDDEN_PATTERNS = [
     re.compile(r"\.(keystore|jks|p8|p12|pem)$"),  # signing / API keys
 ]
 
-DENSITY_RE = re.compile(r"^res/drawable-([a-z]*dpi)(-v\d+)?/(.+)$")
+DENSITY_RE = re.compile(r"^(?:[^/]+/)?res/drawable-([a-z]*dpi)(-v\d+)?/(.+)$")
 KNOWN_DENSITIES = ["ldpi", "mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]
 HERMES_MAGIC = bytes([0xC6, 0x1F, 0xBC, 0x03, 0xC1, 0x03, 0x19, 0x1F])
 
@@ -119,11 +120,11 @@ def check_desugaring(zf, min_sdk):
     if not dex_names:
         return ["No classes.dex found (for an AAB, look under base/dex/)"]
     raw = b"".join(zf.read(n) for n in dex_names)
-    has_desugared = DESUGARED_PREFIX in raw
-    missing = [t.decode() for t in DESUGARED_TARGETS if t in raw]
-    if min_sdk >= 24 or not missing:
-        return []
-    if has_desugared:
+    if DESUGARED_PREFIX in raw:
+        return []  # rewriting is active
+    missing = [t.decode() for t, api in DESUGARED_TARGETS.items()
+               if t in raw and min_sdk < api]
+    if not missing:
         return []
     return [
         "minSdk %d references %s but no rewritten classes (Lj$/...) "
@@ -212,19 +213,82 @@ Run a deliberately broken artifact through it and all four fire:
 ```
 $ python3 preflight_artifact.py bad.aab --min-sdk 23
 FAIL Backward compatibility (desugaring)
-   - minSdk 23 references Ljava/util/function/Supplier;, Ljava/util/Optional; but no rewritten classes (Lj$/...) are present in the artifact
+   - minSdk 23 references Ljava/util/function/Supplier;, Ljava/util/Optional;, Ljava/time/Duration; but no rewritten classes (Lj$/...) are present in the artifact
 FAIL Density bucket coverage
    - hero_banner.png exists only in xxhdpi (move to drawable-nodpi/ or supply every density)
 FAIL JS bundle format
-   - assets/index.android.bundle is not Hermes bytecode (leading bytes 766172205f5f4255)
+   - base/assets/index.android.bundle is not Hermes bytecode (leading bytes 766172205f5f4255)
 FAIL Forbidden files
-   - Must not ship: assets/index.android.bundle.map
-   - Must not ship: assets/.env.production
+   - Must not ship: base/assets/index.android.bundle.map
+   - Must not ship: base/assets/.env.production
 ---
 4 findings across 4 checks
 ```
 
-Run the same artifact with `--min-sdk 24` and only the first check drops out. Whether desugaring matters is decided by your distribution target rather than by the artifact, so pass that flag explicitly and keep it aligned with your Gradle value.
+Run the same artifact with `--min-sdk 24` and the `Supplier` and `Optional` findings disappear, but `Duration` stays. `java.time` arrived in API 26, so devices on API 24 and 25 still lack it. Only at `--min-sdk 26` does the first check go quiet. Whether desugaring matters is decided by your distribution target rather than by the artifact, so pass that flag explicitly and keep it aligned with your Gradle `minSdkVersion`.
+
+I'll admit the first version of this script missed exactly that. It had a single condition — "24 or above, everything passes." The check stayed green while an app that had just started using `java.time` crashed the same way the original one did, and that was how I learned the check itself had inherited my assumption. Each target class now carries its own minimum API level.
+
+## Which artifact to scan: AAB versus APK
+
+A production profile on EAS Build hands you the `.aab` you upload to Play. The script opens both `.aab` and `.apk`, but they show you slightly different things.
+
+<table>
+<thead><tr><th>Artifact</th><th>Path shape</th><th>Good for</th><th>Watch out for</th></tr></thead>
+<tbody>
+<tr><td>.aab (what you submit)</td><td>base/dex/, base/res/, base/assets/</td><td>All four checks, on exactly what you ship</td><td>Not the post-split shape a device receives</td></tr>
+<tr><td>Universal .apk</td><td>classes.dex, res/, assets/</td><td>Desugaring, bundle format, forbidden files</td><td>Depending on resource shrinking settings, res paths may be shortened, so the density check silently finds nothing</td></tr>
+<tr><td>Device-specific APKs from bundletool</td><td>Split APKs per device</td><td>"Does this image actually reach this device?"</td><td>One extraction per device configuration</td></tr>
+</tbody>
+</table>
+
+My rule of thumb: **run the acceptance check once on the .aab you submit, and reach for bundletool only when a specific device worries you.** Extraction uses Google's bundletool (official docs: [bundletool](https://developer.android.com/tools/bundletool)).
+
+```bash
+# Capture the connected device's configuration (density, ABI, locales, SDK level)
+bundletool get-device-spec --output=device.json
+
+# Build the APK set, then pull out only what that device would receive
+bundletool build-apks --bundle=app-release.aab --output=app.apks
+bundletool extract-apks --apks=app.apks --output-dir=extracted --device-spec=device.json
+
+# See whether the image made it into any of the extracted splits
+for f in extracted/*.apk; do unzip -l "$f" | grep hero_banner && echo "  <- $f"; done
+```
+
+If nothing prints, that device never gets the image. You have confirmed check 2's finding in the actual delivery shape rather than taking the script's word for it.
+
+## Triage table for when a check fires
+
+When the script reports a failure, this is the order I work through so I don't stall on where to start.
+
+<table>
+<thead><tr><th>Symptom (script output)</th><th>Likely cause</th><th>How to confirm</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Desugaring fails and there is no Lj$/ at all</td><td>coreLibraryDesugaringEnabled never reached the build</td><td>Open android/app/build.gradle after prebuild and look for it</td><td>Inject it with a config plugin instead of hand-editing (prebuild wipes manual edits)</td></tr>
+<tr><td>Desugaring fails with only java.time left</td><td>minSdk 24–25 while referencing java.time</td><td>Rerun with --min-sdk matching Gradle</td><td>Enable desugaring, or avoid the API</td></tr>
+<tr><td>Density coverage fails</td><td>An image lives in a single drawable-*dpi folder</td><td>Extract for a low-density device with bundletool and check for the file</td><td>Move it to drawable-nodpi/ or supply every density</td></tr>
+<tr><td>Bundle format fails (leading bytes 7661…)</td><td>Hermes disabled or an engine setting mismatch</td><td>hermesEnabled in android/gradle.properties after prebuild</td><td>Align on Hermes, regenerate source maps, re-upload them</td></tr>
+<tr><td>A .map file in forbidden files</td><td>Source map output written under assets</td><td>Check the output path in your build script</td><td>Write it outside the artifact and upload to your crash tool separately</td></tr>
+<tr><td>A .env file in forbidden files</td><td>.env sitting inside a bundled folder</td><td>unzip -l to confirm the path</td><td>Move .env out and keep real secrets on a server</td></tr>
+</tbody>
+</table>
+
+That last row deserves a caveat. Variables prefixed with `EXPO_PUBLIC_` are not shipped as files — they are inlined as strings into the JavaScript bundle. The script only catches what slipped in *as a file*; values baked into the bundle are invisible to it. Where API keys should actually live is covered in [Rork environment variables versus a Supabase Edge Function](/articles/rork-ai/rork-api-key-placement-env-variables-vs-supabase-edge-function).
+
+## Three misconceptions worth correcting
+
+1. **"With minSdk 24 or higher you don't need desugaring."** `java.util.function` and `Optional` arrived in API 24, but `java.time` is API 26. Android's own documentation ([Java 8+ API desugaring](https://developer.android.com/studio/write/java8-support)) describes library desugaring as filling in APIs that the device's API level does not yet have. The boundary differs per API.
+2. **"Inspecting the APK tells you what users get."** A universal APK carries every density and ABI, so a skewed image will still be found. The skew only becomes a symptom after Play splits the bundle per device. To see the post-split shape, extract it with bundletool.
+3. **"If the build passed, the source maps match."** A source map is a separate file and only means something when paired with its bundle. Shipping Hermes bytecode while uploading a plain JavaScript source map is a mismatch the build status never reports.
+
+## A note on fixing config in an Expo project
+
+Projects that come out of Rork are Expo projects, and the `android/` folder is regenerated on every `npx expo prebuild`. Put the desugaring line straight into `android/app/build.gradle` and the next prebuild erases it. I did exactly that once and watched a fixed crash return in the following release.
+
+These days the Gradle change lives in a config plugin registered under `plugins` in `app.json`. Fix in the project config, verify in the artifact — keeping those two places separate means the check keeps giving the same answer across prebuilds. The injection itself is in the desugaring article linked near the top.
+
+
 
 ## Putting the gate outside the loop
 
@@ -236,12 +300,38 @@ The arrangement I settled on is deliberately plain:
 
 1. Let the generate-and-build cycle run untouched — intervening to add iterations has rarely been worth it in my experience
 2. Run the acceptance check exactly once, the moment an artifact exists
-3. Send only passing artifacts into staged rollout, raising the percentage while Crash-free users stays at or above 99.7%
+3. Send only passing artifacts into staged rollout, raising the percentage only while Crash-free users holds above the target I set for myself
 
 Running the check when you receive the artifact rather than the night before submission matters because a finding is still actionable then — it folds back into the regeneration prompt. Discovered late, your options narrow to shipping it or delaying.
+
+**Green is the loop's word; shipping is the artifact's call.** I still feel the urge to meddle with the generation loop now and then, but this is the line I don't move.
+
+To make "right after the build" automatic, I fold fetching and checking into one script. `eas build` with `--json` and `--wait` returns machine-readable output, so the artifact URL can go straight into the check.
+
+```bash
+#!/usr/bin/env bash
+# build -> download artifact -> acceptance check, in one pass
+set -euo pipefail
+MIN_SDK=23   # keep in step with minSdkVersion (android/app/build.gradle or expo-build-properties)
+
+URL=$(eas build --platform android --profile production --non-interactive --wait --json \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["artifacts"]["buildUrl"])')
+curl -sSL -o app-release.aab "$URL"
+python3 preflight_artifact.py app-release.aab --min-sdk "$MIN_SDK"
+```
+
+Because of `set -e`, the script stops the moment the check exits with 1. If you chain a submit command after it, a failing artifact never gets that far.
+
+## Where staged rollout trips you up next
+
+Passing the acceptance check does not cover the variety of real devices and real people. That is staged rollout's job, and the next question is what percentage to hold at and what to watch before moving on.
+
+Android vitals in Play Console defines a bad behavior threshold for user-perceived crash rate: 1.09% overall and 8% on any single device model, beyond which Google says your app's visibility on Play can be affected (as of November 2026, per [Android vitals: crashes](https://developer.android.com/google/play/vitals/crash)). I don't treat those numbers as my target; my own stop line sits well before them. In the first few percent, though, the sample is small and a good-looking number means little. How many users it takes before you can trust it is worked through in [reading Crash-free in the first 5% of a staged rollout](/articles/app-dev/staged-rollout-first-five-percent-crash-free-needs-sample-size-wait-before-proceed).
+
+The acceptance check owns what you can know before shipping; staged rollout owns what you can only learn by shipping. Keeping those two jobs apart has been the most useful distinction in my own release routine.
 
 ## What to try on your next release
 
 Take the most recent artifact you have and run it through the script. An already-published one works too. Which of the four fires tells you which failure class your project is structurally prone to.
 
-Running six apps in parallel, I found the answer differed per app. Image-heavy ones tripped the density check; dependency-heavy ones tripped the forbidden-files check. Rather than fixing everything at once, work down the list of checks that actually fired on your own artifacts. That is the version of this habit that survives contact with a real release schedule.
+Maintaining several apps in parallel, I found the answer differed per app. Image-heavy ones tripped the density check; dependency-heavy ones tripped the forbidden-files check. Rather than fixing everything at once, work down the list of checks that actually fired on your own artifacts. That is the version of this habit that survives contact with a real release schedule.
