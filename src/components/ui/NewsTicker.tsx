@@ -4,19 +4,19 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "EXPO 58 — Expo は expo@58.0.26 と expo-web-browser@58.1.0 を 11/17 に公開しました",
-    "RORK — rork.com の changelog は 9/29 の更新が最新のままです",
-    "GEMINI 2.5 — gemini-2.5-flash・pro の API 停止は 12/1、残り13日。アプリに埋め込んだモデル名は審査待ちも見込んでください",
-    "AUTH TAB — Android でログイン用のタブを開いている間にアプリが落とされる、という問いが出ています",
-    "APP ICON — アイコンを差し替えても古いままのときは、キャッシュ・ビルド番号・ストア反映の順に確かめると早く片づきます",
+    "GPT 6.2 — 11/18 に Rork のモデル選択へ GPT-6.2 Astra と Sol が入り、旧版を選んでいた場合は同じ effort のまま新版に切り替わります",
+    "REVIEW — 同じ日の更新で、in-app event が待機中だと App Review への送信が失敗する問題が直りました",
+    "GEMINI 2.5 — gemini-2.5-flash・pro の API 停止は 12/1、残り12日。アプリに埋め込んだモデル名は審査待ちも見込んでください",
+    "WEBP — 画像ライブラリの事前ビルドに古い libwebp が入っていた、という問いが出ています",
+    "SPLASH — 起動画面で止まるときは、アセット・設定・初回の読み込みの順に確かめると早く片づきます",
     "NEW — iOS 27 の年齢確認エラーを「待つ・進む・直す」に分ける",
   ],
   en: [
-    "EXPO 58 — Expo shipped expo@58.0.26 and expo-web-browser@58.1.0 on 11/17",
-    "RORK — The rork.com changelog still shows 9/29 as its latest entry",
-    "GEMINI 2.5 — gemini-2.5-flash and pro shut down on the API on 12/1, 13 days left. Allow for review time if model names ship in your app",
-    "AUTH TAB — Developers ask why Android kills their app while the login Custom Tab is open",
-    "APP ICON — Icon still old after replacing it? Check the cache, then the build number, then store propagation",
+    "GPT 6.2 — Rork added GPT-6.2 Astra and Sol on 11/18; if you had the older version picked, it now builds with the new one at the same effort",
+    "REVIEW — The same update fixes App Review submissions failing while an in-app event is waiting",
+    "GEMINI 2.5 — gemini-2.5-flash and pro shut down on the API on 12/1, 12 days left. Allow for review time if model names ship in your app",
+    "WEBP — Developers flagged an outdated libwebp inside a prebuilt image library",
+    "SPLASH — Stuck on the splash screen? Check assets, then config, then the first data load",
     "NEW — When Age Checks Fail on iOS 27, Sort the Errors Into Wait, Continue, or Fix",
   ]
 };
