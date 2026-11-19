@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "GPT 6.2 — 11/18 に Rork のモデル選択へ GPT-6.2 Astra と Sol が入り、旧版を選んでいた場合は同じ effort のまま新版に切り替わります",
-    "REVIEW — 同じ日の更新で、in-app event が待機中だと App Review への送信が失敗する問題が直りました",
-    "GEMINI 2.5 — gemini-2.5-flash・pro の API 停止は 12/1、残り12日。アプリに埋め込んだモデル名は審査待ちも見込んでください",
-    "WEBP — 画像ライブラリの事前ビルドに古い libwebp が入っていた、という問いが出ています",
-    "SPLASH — 起動画面で止まるときは、アセット・設定・初回の読み込みの順に確かめると早く片づきます",
-    "NEW — iOS 27 の年齢確認エラーを「待つ・進む・直す」に分ける",
+    "PLUGINS — 11/19 に Rork の Connectors が Plugins に。Gmail・Google Drive・Slack・Zoom など7つが加わりました",
+    "SONNET 4.5 — Claude API の Sonnet 4.5 提供終了は 11/30、残り10日。アプリに埋め込んだモデル名を確かめてください",
+    "OOM — 古い Android で expo-image の画像がメモリに残り続ける、という問いが出ています",
+    "NEW — 絞り込みにだけ新作が出ない日の点検表",
+    "SPM — CocoaPods Trunk の更新停止を受けて、Expo アプリでも SwiftPM への移行に備える動きが出ています",
+    "ICON — アプリのアイコンが更新されないときは、アセット・キャッシュ・ビルド番号の順に見ると早く片づきます",
   ],
   en: [
-    "GPT 6.2 — Rork added GPT-6.2 Astra and Sol on 11/18; if you had the older version picked, it now builds with the new one at the same effort",
-    "REVIEW — The same update fixes App Review submissions failing while an in-app event is waiting",
-    "GEMINI 2.5 — gemini-2.5-flash and pro shut down on the API on 12/1, 12 days left. Allow for review time if model names ship in your app",
-    "WEBP — Developers flagged an outdated libwebp inside a prebuilt image library",
-    "SPLASH — Stuck on the splash screen? Check assets, then config, then the first data load",
-    "NEW — When Age Checks Fail on iOS 27, Sort the Errors Into Wait, Continue, or Fix",
+    "PLUGINS — On 11/19 Rork renamed Connectors to Plugins and added seven, including Gmail, Google Drive, Slack and Zoom",
+    "SONNET 4.5 — Sonnet 4.5 retires on the Claude API on 11/30, 10 days left. Check any model names shipped in your app",
+    "OOM — Developers report expo-image holding bitmaps in memory on older Android versions",
+    "NEW — A Checklist for When New Items Skip Your Category Filter",
+    "SPM — With CocoaPods Trunk frozen, Expo teams are getting ready to move to SwiftPM",
+    "ICON — App icon won't update? Check the asset, then caches, then the build number",
   ]
 };
 
