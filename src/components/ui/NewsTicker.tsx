@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PLUGINS — 11/19 に Rork の Connectors が Plugins に。Gmail・Google Drive・Slack・Zoom など7つが加わりました",
-    "SONNET 4.5 — Claude API の Sonnet 4.5 提供終了は 11/30、残り10日。アプリに埋め込んだモデル名を確かめてください",
-    "OOM — 古い Android で expo-image の画像がメモリに残り続ける、という問いが出ています",
-    "NEW — 絞り込みにだけ新作が出ない日の点検表",
-    "SPM — CocoaPods Trunk の更新停止を受けて、Expo アプリでも SwiftPM への移行に備える動きが出ています",
-    "ICON — アプリのアイコンが更新されないときは、アセット・キャッシュ・ビルド番号の順に見ると早く片づきます",
+    "QR — 11/20 から、作った Android アプリを QR コードで自分の端末に入れられます",
+    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り9日です",
+    "SPLASH — 更新の巻き戻りのあと起動画面から進まない、という報告が Expo で出ています",
+    "NEW — 新着：Plugins で Google Docs の仕様メモを読ませる前に確かめること",
+    "ENROLL — Apple Developer Program は個人か法人か。表示名と後からの移し替えで選ぶと迷いません",
+    "PHASED — 段階公開（Phased Release）を使うと、不具合が出ても影響を小さく抑えられます",
   ],
   en: [
-    "PLUGINS — On 11/19 Rork renamed Connectors to Plugins and added seven, including Gmail, Google Drive, Slack and Zoom",
-    "SONNET 4.5 — Sonnet 4.5 retires on the Claude API on 11/30, 10 days left. Check any model names shipped in your app",
-    "OOM — Developers report expo-image holding bitmaps in memory on older Android versions",
-    "NEW — A Checklist for When New Items Skip Your Category Filter",
-    "SPM — With CocoaPods Trunk frozen, Expo teams are getting ready to move to SwiftPM",
-    "ICON — App icon won't update? Check the asset, then caches, then the build number",
+    "QR — Since 11/20, you can install your Android app on your phone from a QR code",
+    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 9 days left",
+    "SPLASH — Expo users report apps stuck on the splash screen after an update rollback",
+    "NEW — New: what to check before letting Plugins read your Google Docs spec",
+    "ENROLL — Individual or organization for the Apple Developer Program? Decide by seller name and transfers",
+    "PHASED — A phased release keeps the impact small if a bug slips through",
   ]
 };
 
