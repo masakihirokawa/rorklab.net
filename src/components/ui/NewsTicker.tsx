@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "QR — 11/20 から、作った Android アプリを QR コードで自分の端末に入れられます",
-    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り9日です",
-    "SPLASH — 更新の巻き戻りのあと起動画面から進まない、という報告が Expo で出ています",
-    "NEW — 新着：Plugins で Google Docs の仕様メモを読ませる前に確かめること",
-    "ENROLL — Apple Developer Program は個人か法人か。表示名と後からの移し替えで選ぶと迷いません",
-    "PHASED — 段階公開（Phased Release）を使うと、不具合が出ても影響を小さく抑えられます",
+    "MCP — Rork で、自前の MCP サーバーを Plugins の中で追加・管理できるようになりました（11/21）",
+    "2.5 ROUTE — 12/1 から、アプリに埋め込んだ gemini-2.5-flash は 3.5 Flash-Lite へ自動で回り、料金も変わります（残り9日）",
+    "CHANNEL — Expo Go で Android の通知チャネルの読み書きが失敗する、という報告が出ています",
+    "NEW — 新着：「起動画面から進みません」に返信する前の3つの手がかり",
+    "EXPORT — プランを下げる・解約する前は、先にプロジェクトをエクスポートしておくと安心です",
+    "SONNET 4.5 — API 連携で Sonnet 4.5 を使っているアプリは、11/30 の提供終了前に移行先へ切り替えておきましょう",
   ],
   en: [
-    "QR — Since 11/20, you can install your Android app on your phone from a QR code",
-    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 9 days left",
-    "SPLASH — Expo users report apps stuck on the splash screen after an update rollback",
-    "NEW — New: what to check before letting Plugins read your Google Docs spec",
-    "ENROLL — Individual or organization for the Apple Developer Program? Decide by seller name and transfers",
-    "PHASED — A phased release keeps the impact small if a bug slips through",
+    "MCP — Rork now lets you add and manage your own MCP servers inside Plugins (11/21)",
+    "2.5 ROUTE — From 12/1, apps calling gemini-2.5-flash are routed to 3.5 Flash-Lite and billed at its rates (9 days left)",
+    "CHANNEL — Users report Android notification channel reads and writes failing in Expo Go",
+    "NEW — New: three clues to check before replying to a stuck-on-splash review",
+    "EXPORT — Export your projects before you downgrade or cancel a plan",
+    "SONNET 4.5 — Apps that call Sonnet 4.5 through the API should switch before it retires on 11/30",
   ]
 };
 
