@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "MCP — Rork で、自前の MCP サーバーを Plugins の中で追加・管理できるようになりました（11/21）",
-    "2.5 ROUTE — 12/1 から、アプリに埋め込んだ gemini-2.5-flash は 3.5 Flash-Lite へ自動で回り、料金も変わります（残り9日）",
-    "CHANNEL — Expo Go で Android の通知チャネルの読み書きが失敗する、という報告が出ています",
-    "NEW — 新着：「起動画面から進みません」に返信する前の3つの手がかり",
-    "EXPORT — プランを下げる・解約する前は、先にプロジェクトをエクスポートしておくと安心です",
-    "SONNET 4.5 — API 連携で Sonnet 4.5 を使っているアプリは、11/30 の提供終了前に移行先へ切り替えておきましょう",
+    "ARCHIVE — 11/22 の更新で、プロジェクトを削除せずアーカイブできるようになりました。Archived から戻せます",
+    "PLAY FIX — Google Play 向けの Expo アプリで Rork の AI キーが消え、AI 機能が失敗していた問題が直りました",
+    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り7日です。API を足したアプリは呼び出し先を確かめます",
+    "SPLASH — 更新を前の版へ巻き戻したあと、起動画面から進まないという報告が Expo に出ています",
+    "NEW — 新着：「起動画面から進まない」レビューに返信する前の3つの手がかり",
+    "2.5 ROUTE — 12/1 から Gemini 2.5 系は別モデルへ自動で回り、料金も変わります。残り8日です",
   ],
   en: [
-    "MCP — Rork now lets you add and manage your own MCP servers inside Plugins (11/21)",
-    "2.5 ROUTE — From 12/1, apps calling gemini-2.5-flash are routed to 3.5 Flash-Lite and billed at its rates (9 days left)",
-    "CHANNEL — Users report Android notification channel reads and writes failing in Expo Go",
-    "NEW — New: three clues to check before replying to a stuck-on-splash review",
-    "EXPORT — Export your projects before you downgrade or cancel a plan",
-    "SONNET 4.5 — Apps that call Sonnet 4.5 through the API should switch before it retires on 11/30",
+    "ARCHIVE — Since 11/22 you can archive a Rork project instead of deleting it, and bring it back from Archived",
+    "PLAY FIX — Fixed: Expo apps built for Google Play losing their Rork AI key, which broke AI features",
+    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 7 days left. Check which model your app calls",
+    "SPLASH — Expo users report apps stuck on the splash screen after rolling back to an earlier update",
+    "NEW — New: Three clues to check before replying to a \"stuck on the splash screen\" review",
+    "2.5 ROUTE — From 12/1, Gemini 2.5 requests reroute to newer models at new rates. 8 days left",
   ]
 };
 
