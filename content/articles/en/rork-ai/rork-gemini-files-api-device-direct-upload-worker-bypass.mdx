@@ -5,13 +5,15 @@ category: "rork-ai"
 level: "advanced"
 premium: true
 date: "2026-07-17T14:00"
+updated: "2026-11-23T10:43"
 author: "Rork Lab"
-description: "How I rerouted video uploads to the Gemini Files API from a Cloudflare Workers relay to a direct device-to-Google path — why the 128MB isolate limit breaks the relay, how to hand out a resumable upload URL without leaking your API key, what Expo SDK 54 broke on the device side, and how the 20GB project ceiling and media resolution decide the bill."
+description: "How I rerouted video uploads to the Gemini Files API from a Cloudflare Workers relay to a direct device-to-Google path — why the 128MB isolate limit breaks the relay, how to hand out a resumable upload URL without leaking your API key, what Expo SDK 54 broke on the device side and how SDK 56's progress-aware upload task fixes it, a symptom-first troubleshooting table, and how the 20GB project ceiling and media resolution decide the bill (as of November 2026)."
 tags: ["Rork", "Gemini", "Files API", "Video Analysis", "Cloudflare Workers", "Expo", "Indie Dev"]
 highlights:
   - "Why loading a video into a Worker's arrayBuffer collides with the 128MB isolate ceiling, and the upload path that removes the problem instead of tuning around it"
   - "Working Worker and Expo code that keeps the API key server-side while the video travels straight from the device to Google"
-  - "What Expo SDK 54 did to createUploadTask, the expo/fetch rewrite that replaces it, and the upload progress you give up by moving"
+  - "What Expo SDK 54 did to createUploadTask, and how SDK 56's File.createUploadTask lets you move to the new API without giving up upload progress"
+  - "A symptom-first table for 413s, intermittent 500s, next-day 403s and FAILED files, plus how to choose between four upload paths"
   - "Keeping the 20GB project-wide Files API ceiling visible once the bytes stop passing through your server, plus fps and media resolution as billing controls"
 ---
 
@@ -254,7 +256,7 @@ Honest progress reporting came free with the change. Relaying through the Worker
 
 That code needs a footnote.
 
-Expo SDK 54 rebuilt `expo-file-system`. The new API that shipped as `expo-file-system/next` back in SDK 52 was promoted to stable, the `next` entry point disappeared, and the old API moved to `expo-file-system/legacy`. Which means: leave your import as `expo-file-system`, bump the SDK, and `FileSystem.createUploadTask` is simply not there anymore. If you're lucky the types catch it. In plain JavaScript you get `undefined is not a function` at the moment the user picks a video, and it took me a few round trips through the logs to realize the failure wasn't in the upload — it was in the thing that was supposed to start the upload.
+Expo SDK 54 rebuilt `expo-file-system`. The new API that shipped as `expo-file-system/next` back in SDK 52 was promoted to stable, the `next` entry point disappeared, and the old API moved to `expo-file-system/legacy`. Which means: leave your import as `expo-file-system`, bump the SDK, and `FileSystem.createUploadTask` becomes a stub that throws the moment you call it. The message reads `Method createUploadTask imported from "expo-file-system" is deprecated.` — still true in the latest release as of November 2026 (58.0.14). If you're lucky the types catch it first. If the call sits inside a broad try/catch, though, all the user sees is "upload failed", and it took me a few round trips through the logs to realize the failure wasn't in the upload at all — it was at the front door of the function meant to start it.
 
 That's why the import above points at `expo-file-system/legacy`. It works. But the legacy upload helpers are deprecated as of SDK 54, and the recommended path now is `expo/fetch`.
 
@@ -300,9 +302,75 @@ There is a cost. **`expo/fetch` gives you no upload progress callback** — the 
   </tbody>
 </table>
 
-I'm still on legacy for now. Uploading a video is the longest wait this app asks of anyone, and a progress bar that appears frozen there costs me more than one deprecation warning in the build log does. **Deprecated is not a deadline; it's notice that a destination exists.** I'd rather move once I can render progress myself.
+Back on SDK 54, I chose to stay on legacy. Uploading a video is the longest wait this app asks of anyone, and a progress bar that appears frozen there costs me more than one deprecation warning in the build log does. **Deprecated is not a deadline; it's notice that a destination exists.** I decided to move once a destination existed that could still report progress.
 
 If I were starting fresh, I'd probably go the other way. For anything where progress doesn't need showing — syncing a settings file, shipping a log bundle — `expo/fetch` is the simpler choice from day one.
+
+### SDK 56 removed the reason to stay behind
+
+That trade-off has a sequel. Expo SDK 56 (`expo-file-system` 56.0.0, May 2026) added `upload()` and `createUploadTask()` to the new `File` class. The changelog describes them as legacy-compatible uploads with progress callbacks and `AbortSignal` support — which is precisely the gap that had kept me on legacy.
+
+Here's the shape I checked against the type definitions in the latest release as of November 2026 (SDK 58 / `expo-file-system` 58.0.14).
+
+```typescript
+// app/lib/uploadVideoTask.ts — SDK 56+. Progress and cancellation on the new API
+import { File, UploadType } from 'expo-file-system';
+
+export function startVideoUpload(
+  uploadUrl: string,
+  localUri: string,
+  onProgress: (ratio: number) => void
+) {
+  const file = new File(localUri);
+  const controller = new AbortController();
+
+  const task = file.createUploadTask(uploadUrl, {
+    httpMethod: 'POST',
+    uploadType: UploadType.BINARY_CONTENT, // already the default; stated so nobody "fixes" it to MULTIPART
+    headers: {
+      'Content-Length': String(file.size),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    onProgress: ({ bytesSent, totalBytes }) => {
+      // On iOS these have been reported to arrive as bigint at runtime (expo/expo #52411, #53916)
+      const sent = Number(bytesSent);
+      const total = Number(totalBytes);
+      if (total > 0) onProgress(Math.min(sent / total, 1));
+    },
+    signal: controller.signal,
+  });
+
+  const done = task.uploadAsync().then((res) => {
+    // Resolves on non-2xx too. It only rejects on unreadable file, network failure, or cancellation
+    if (res.status >= 300) throw new Error(`upload_failed_${res.status}`);
+    return JSON.parse(res.body) as { file: { name: string; uri: string; state: string } };
+  });
+
+  return { done, cancel: () => controller.abort() };
+}
+```
+
+Two details are worth slowing down for.
+
+First, `uploadAsync()` **resolves on 4xx and 5xx responses**. The type docs say it rejects only when the file can't be read, the request fails, or the task is cancelled. If you carry over the `fetch` habit of "no exception means success", you'll show a success screen while Google is returning a 400. The one-line status check is not optional.
+
+Second, the progress values. There are open reports in Expo's own repository that on iOS `bytesSent` arrives as a `bigint` at runtime, and dividing it by a `number` throws. Wrapping both in `Number()` costs nothing and stays harmless once that's fixed.
+
+<table>
+  <thead>
+    <tr><th>As of November 2026</th><th>legacy createUploadTask</th><th>expo/fetch + File</th><th>File.createUploadTask (SDK 56+)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Status</td><td>Deprecated; throws at runtime if imported from the package root</td><td>Recommended</td><td>Recommended</td></tr>
+    <tr><td>Upload progress</td><td>Callback</td><td>None</td><td>onProgress</td></tr>
+    <tr><td>Cancellation</td><td>cancelAsync()</td><td>AbortSignal</td><td>AbortSignal or cancel()</td></tr>
+    <tr><td>Non-2xx responses</td><td>Check the returned status</td><td>Check res.ok</td><td>Resolves — check status</td></tr>
+    <tr><td>Loads into JS heap</td><td>No</td><td>No</td><td>No</td></tr>
+  </tbody>
+</table>
+
+**Uploads people wait on go through `File.createUploadTask`; uploads nobody watches go through `expo/fetch`.** On SDK 56 and later, that's the line I draw. The only apps with a reason to keep legacy are the ones still on SDK 55 or earlier. If an SDK bump is on your list, [Find the native edits expo prebuild will erase before you upgrade to SDK 57](/articles/rork-dev/rork-expo-sdk-57-prebuild-clean-native-changes-audit) covers what else tends to disappear on the way.
 
 ## How long ACTIVE takes scales with the video
 
@@ -478,6 +546,10 @@ export async function analyze(
 }
 ```
 
+Those token figures come from Google's video understanding docs. Counting rules can shift between model generations, so I'd measure once against `usageMetadata.promptTokenCount` in a real response before trusting any estimate.
+
+The `-latest` aliases are a choice too. If you've hard-coded `gemini-2.5-flash` or `gemini-2.5-pro`, Google's deprecations page says requests will be routed to a different model from December 1, 2026, at the new model's price (as of November 2026). An alias won't get rerouted out from under you, but its contents can change without notice. For features where the output shape must stay fixed, I'd rather pin a versioned name and check the deprecation table on a schedule — I walked through that audit in [The recommended replacement was already gone](/articles/rork-ai/gemini-deprecation-recommended-replacement-already-shutdown-audit).
+
 Notice that `planFor` branches on intent rather than duration. That was a deliberate reversal.
 
 I used to decide by length: under 30 seconds, analyze precisely; over three minutes, go coarse. But looking at a five-second swing coarsely tells you nothing, and studying a ten-minute lecture in high resolution adds nothing either. Length drives the bill; it has no bearing on the precision the task needs. Confuse the two and you overpay on short clips while missing the point on long ones.
@@ -485,6 +557,39 @@ I used to decide by length: under 30 seconds, analyze precisely; over three minu
 Clipping earned its keep immediately. A swing analysis really only needs about two seconds. Let the user record thirty and cut the range server-side: pulling the relevant window at 4fps came out cheaper than scanning the whole thing at 1fps, and more accurate.
 
 For the broader cost picture, [How I Cut My Rork App's AI Costs from $350 to $35/Month](/articles/rork-dev/rork-cloudflare-ai-gateway-cost-optimization-guide) covers the caching layer, and [Rork × Multimodal AI: Design Patterns for Camera, Voice, and Text](/articles/rork-ai/rork-multimodal-ai-app-design-patterns) covers handling these inputs together in one app.
+
+## When it stalls: a symptom-first table
+
+"The upload never comes back" can fail at almost any point along the path. Here's everything above folded into one table you can read from the symptom, ordered roughly from the device end toward Google's end (based on each vendor's official docs as of November 2026, and what I saw on my own builds).
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>Likely cause</th><th>How to confirm</th><th>Fix</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Throws right after picking a video</td><td>SDK 54+, legacy function called from the package root</td><td>Error text contains "imported from "expo-file-system" is deprecated"</td><td>Import from legacy, or move to File.createUploadTask</td></tr>
+    <tr><td>Progress is NaN or throws, iOS only</td><td>Progress values arriving as bigint</td><td>Log typeof bytesSent once</td><td>Wrap in Number() before dividing</td></tr>
+    <tr><td>413 on large videos only</td><td>Workers request body limit (100MB on Free and Pro)</td><td>Does the same file pass when sent without the Worker?</td><td>Stop routing video through the Worker</td></tr>
+    <tr><td>Intermittent 500s under concurrent use</td><td>128MB memory per isolate</td><td>Worker logs show a memory-exceeded outcome</td><td>Drop arrayBuffer(); keep only URL issuance</td></tr>
+    <tr><td>X-Goog-Upload-URL is null</td><td>Missing start headers or a bad API key</td><td>Log initResponse status and body</td><td>Check the Protocol and Command headers; return 502</td></tr>
+    <tr><td>Upload succeeds but isn't treated as video</td><td>Sent as MULTIPART, body wrapped in boundaries</td><td>Inspect uploadType</td><td>Set BINARY_CONTENT explicitly</td></tr>
+    <tr><td>Failure shows a success screen</td><td>New API's uploadAsync() resolves on non-2xx</td><td>Log res.status</td><td>Throw when status is 300 or above</td></tr>
+    <tr><td>Short clips work, long ones time out</td><td>Fixed PROCESSING wait</td><td>Record how files.get state changes</td><td>Derive the wait budget from duration</td></tr>
+    <tr><td>Never succeeds no matter how often retried</td><td>State is FAILED (corrupt file, unsupported codec)</td><td>files.get state</td><td>Don't offer retry; ask for a new recording</td></tr>
+    <tr><td>403 from yesterday's history</td><td>fileUri expired after 48 hours</td><td>Time since upload</td><td>47-hour KV TTL; re-upload after expiry</td></tr>
+    <tr><td>Tapping upload does nothing at all</td><td>The 20GB project-wide storage ceiling</td><td>Sum sizes from files.list</td><td>Delete analyzed files early with files.delete</td></tr>
+  </tbody>
+</table>
+
+I started at the bottom of this table — the model, Google's side — and worked my way up. Reading it top-down would have saved me that first hour.
+
+## Three misconceptions worth correcting
+
+**"A paid plan raises the 128MB limit."** It doesn't. Cloudflare's limits page lists 128MB per isolate on both Free and Paid (as of November 2026). What changes with the plan is CPU time and request allowances, not room to hold a video.
+
+**"Inline data now goes up to 100MB, so the Files API is unnecessary."** In January 2026 Google raised the Gemini API's inline data limit from 20MB to 100MB. But inline means the bytes ride in the request body. As long as a Worker attaches your key and relays the request, the video still passes through Worker memory — and you resend the same bytes for every follow-up question. If users will ask about the same clip more than once within 48 hours, the Files API keeps the path lighter.
+
+**"Store the fileUri and you can always come back to it."** As covered above, it expires in 48 hours. What deserves storage is the analysis text and the original video on the device.
 
 ## What was left after the rewiring
 
@@ -510,6 +615,30 @@ There were losses too, and they belong in the record.
 With video no longer crossing the Worker, I cannot inspect it server-side anymore. Things I could have rejected by reading the bytes now go through. For now I accept that. As a solo indie developer, detecting bad input from the analysis output is more realistic than running content inspection on a server I do not want to operate. For other subject matter, that trade would not hold.
 
 The other loss: low media resolution stops reading fine print. On lecture slides it caught the body text and dropped the footnotes. Fine for summaries, disqualifying if you promise a transcript of the whiteboard. The 3x discount is charging you for something.
+
+## Choosing a path, and the next walls after going direct
+
+As of November 2026, there are four reasonable ways to get a video in front of Gemini.
+
+<table>
+  <thead>
+    <tr><th>Path</th><th>Where the video travels</th><th>Good fit</th><th>Watch out for</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Relay through a Worker</td><td>Device → Worker → Google</td><td>Images of a few MB, short audio</td><td>128MB memory and 100MB body limits</td></tr>
+    <tr><td>Direct to the Files API (this article)</td><td>Device → Google</td><td>Long videos, repeat questions on the same clip</td><td>You count the 20GB ceiling and 48-hour expiry yourself</td></tr>
+    <tr><td>Inline (up to 100MB)</td><td>Request body</td><td>A short clip asked about once</td><td>Passes through a relaying Worker; resent on every question</td></tr>
+    <tr><td>Signed URL or Cloud Storage reference</td><td>Your storage → Google</td><td>Apps that already keep videos in their own storage</td><td>Check supported formats and sizes in the official file input methods docs. I haven't run this path in production</td></tr>
+  </tbody>
+</table>
+
+**If you don't keep the video, send it straight to the Files API; if you already store it, point Gemini at it by URL.** When I'm unsure, that's the sentence I decide by.
+
+Two walls tend to show up right after you switch to direct uploads.
+
+The first is the app closing mid-upload. The new API's `UploadOptions` has an iOS-only `sessionType`, and it defaults to `'background'`. Per its type docs, the native transfer may keep going after the app is suspended, but if the app is terminated or relaunched, the JavaScript `UploadTask` is not restored — the promise, progress, and cancellation only exist while the original runtime is alive. On relaunch, I think the clean move is to look up the `display_name` you set at issuance via `files.list`, and skip re-uploading if the file is already `ACTIVE`. I haven't verified that branch in production yet, so treat it as a sketch.
+
+The second is a 1GB-plus video on a flaky connection. Sending the second leg of the resumable upload in one shot, as here, means a dropped connection starts over from zero. Chunking and resuming from where it broke is the subject of [Getting a 1GB Video Out of a Rork App Without Losing It](/articles/rork-dev/rork-large-file-upload-resumable-multipart-guide).
 
 ## Ask whether the video needs to pass through at all
 
