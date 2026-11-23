@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "ARCHIVE — 11/22 の更新で、プロジェクトを削除せずアーカイブできるようになりました。Archived から戻せます",
-    "PLAY FIX — Google Play 向けの Expo アプリで Rork の AI キーが消え、AI 機能が失敗していた問題が直りました",
-    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り7日です。API を足したアプリは呼び出し先を確かめます",
-    "SPLASH — 更新を前の版へ巻き戻したあと、起動画面から進まないという報告が Expo に出ています",
-    "NEW — 新着：「起動画面から進まない」レビューに返信する前の3つの手がかり",
-    "2.5 ROUTE — 12/1 から Gemini 2.5 系は別モデルへ自動で回り、料金も変わります。残り8日です",
+    "RESET — 11/23 の更新で、iPhone プレビューを新規インストールの状態に戻せる Reset が入りました",
+    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り6日です。AI 機能の呼び出し先を確かめます",
+    "AUTH TAB — Android でログインの画面を開いている間にアプリが終了されることがある、という報告が Expo に出ています",
+    "NEW — 新着：一覧を片づけるなら削除ではなくアーカイブ、の線引き",
+    "2.5 ROUTE — 12/1 から Gemini 2.5 系は別モデルへ自動で回り、料金も変わります。残り7日です",
+    "COCOAPODS — CocoaPods Trunk の更新停止に備え、Expo アプリの SwiftPM 移行を考える記事が出ています",
   ],
   en: [
-    "ARCHIVE — Since 11/22 you can archive a Rork project instead of deleting it, and bring it back from Archived",
-    "PLAY FIX — Fixed: Expo apps built for Google Play losing their Rork AI key, which broke AI features",
-    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 7 days left. Check which model your app calls",
-    "SPLASH — Expo users report apps stuck on the splash screen after rolling back to an earlier update",
-    "NEW — New: Three clues to check before replying to a \"stuck on the splash screen\" review",
-    "2.5 ROUTE — From 12/1, Gemini 2.5 requests reroute to newer models at new rates. 8 days left",
+    "RESET — Since 11/23, Reset in the iPhone preview opens your app like a fresh install",
+    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 6 days left. Check which model your AI features call",
+    "AUTH TAB — Expo users report Android apps being killed while the sign-in tab is open",
+    "NEW — New: Archive or delete? Where to draw the line when tidying projects",
+    "2.5 ROUTE — From 12/1, Gemini 2.5 requests reroute to newer models at new rates. 7 days left",
+    "COCOAPODS — With CocoaPods Trunk going read-only, developers are weighing a move to SwiftPM for Expo apps",
   ]
 };
 
