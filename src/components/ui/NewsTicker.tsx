@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "PREVIEW — 11/24 の更新で、作り直している間もプレビューが消えず、前の版を使い続けられるようになりました",
-    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り5日です。AI 機能の呼び出し先を確かめます",
-    "DOCKER — Metro を Docker で動かすと、デバッガーへのアクセスで dev サーバーが落ちるという報告が Expo に出ています",
-    "NEW — 新着：起動直後のカルーセルで1枚目だけ空白になるとき",
-    "2.5 ROUTE — 12/1 から Gemini 2.5 系は別モデルへ自動で回り、料金も変わります。残り6日です",
-    "PRICING — プランを選ぶ前に、ひと月に作り直す回数を数えておくと上限を決めやすくなります",
+    "EXPORT — 11/25 の更新で、GitHub 同期やダウンロードで書き出したプロジェクトが Rork の外でもそのまま動くようになりました",
+    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り4日です。AI 機能の呼び出し先を確かめます",
+    "CRYPTO — Android 8.1 で expo-crypto の復号結果が16バイト長くなるという報告が Expo に出ています",
+    "NEW — 新着：12/1 の切り替え前に gemini-2.5-flash の答えを比べる",
+    "PLATFORM — 新しいプロジェクトは、最初のメッセージで頼んだ iPhone・Android・Web で始まるようになりました",
+    "APP ICON — アプリのアイコンが更新されないときの解説が、いまいちばん読まれています",
   ],
   en: [
-    "PREVIEW — Since 11/24, the preview stays up while Rork rebuilds, so you can keep using the previous version",
-    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 5 days left. Check which model your AI features call",
-    "DOCKER — Expo users report the dev server exiting on a debugger request when Metro runs in Docker",
-    "NEW — New: The first carousel page is blank at launch? Here's why",
-    "2.5 ROUTE — From 12/1, Gemini 2.5 requests reroute to newer models at new rates. 6 days left",
-    "PRICING — Before picking a plan, count how often you rebuild in a month — it makes the limit easier to set",
+    "EXPORT — Since 11/25, projects you sync to GitHub or download run outside Rork as they are",
+    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 4 days left. Check which model your AI features call",
+    "CRYPTO — Expo users report expo-crypto returning 16 extra bytes when decrypting on Android 8.1",
+    "NEW — New: Compare gemini-2.5-flash answers before the 12/1 switch",
+    "PLATFORM — A new project now starts on the platform your first message asks for: iPhone, Android or web",
+    "APP ICON — Our guide to an app icon that won't update is the most-read page right now",
   ]
 };
 
