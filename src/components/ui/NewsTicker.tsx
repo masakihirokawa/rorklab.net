@@ -4,20 +4,20 @@ import { useLocale } from "next-intl";
 
 const NEWS_ITEMS: Record<string, string[]> = {
   ja: [
-    "SEARCH — ⌘K の検索が全プロジェクトを対象に。以前は最近開いた12件しか見つかりませんでした（11/26）",
-    "PREVIEW — Safari と iPhone・iPad のブラウザで、iPhone・Android のプレビューが再び動くようになりました",
-    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り3日です。連携しているアプリは移行先を確認してください",
-    "HMR — 開発サーバーを2つ動かすと、HMR が別のバンドルを拾ってサーバーが落ちるという報告が出ています",
-    "GEMINI 2.5 — 12/1 から gemini-2.5 系は別モデルへ自動で回ります。残り4日、アプリに埋め込んだモデル名を確認しましょう",
-    "APP STORE — App Store の提出が capability 不足で断られたとき、Rork が名前と直し方を示すようになりました",
+    "EXPO 58.1 — expo@58.1.0（11/26）で、読み込み前の分割チャンクが誤って致命的エラーになる問題が直りました",
+    "SONNET 4.5 — Claude API の Sonnet 4.5 は 11/30 で提供終了、残り2日です。連携しているアプリは移行先を確認してください",
+    "IME — iOS 18 以降、日本語の変換中に TextField が落ちるという報告が出ています",
+    "SEARCH — ⌘K の検索で、最近開いたもの以外のプロジェクトも見つかるようになりました（11/26）",
+    "GEMINI 2.5 — 12/1 から gemini-2.5 系は別モデルへ自動で回ります。残り3日、アプリに埋め込んだモデル名を確認しましょう",
+    "ICON — アプリのアイコンが更新されないときの解説が、よく読まれています",
   ],
   en: [
-    "SEARCH — Cmd+K search now covers every project, not just the 12 you opened most recently (11/26)",
-    "PREVIEW — iPhone and Android previews work again in Safari and in iPhone and iPad browsers",
-    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 3 days left. Check what your app calls next",
-    "HMR — Users report HMR picking up a bundle from a second dev server, which then shuts the server down",
-    "GEMINI 2.5 — From 12/1, gemini-2.5 models reroute to newer ones. 4 days left to check model names in your app",
-    "APP STORE — When an App Store upload is refused over a missing capability, Rork now names it and how to fix it",
+    "EXPO 58.1 — expo@58.1.0 (11/26) fixes false fatal errors when loading split chunks that weren't preloaded",
+    "SONNET 4.5 — Sonnet 4.5 retires from the Claude API on 11/30, 2 days left. Check what your app calls next",
+    "IME — Users report TextField crashing on iOS 18+ while composing Japanese or other CJK text",
+    "SEARCH — Cmd+K search now finds any project, not just the ones you opened recently (11/26)",
+    "GEMINI 2.5 — From 12/1, gemini-2.5 models reroute to newer ones. 3 days left to check model names in your app",
+    "ICON — Our guide to app icons that won't update is one of the most-read pages",
   ]
 };
 
